@@ -10,7 +10,7 @@ that pattern to this repository.
 
 | Effort | Status | Coordination |
 |--------|--------|--------------|
-| [agent-bridge AHP Convergence](active/agent-bridge-ahp-convergence/README.md) | Draft | #1266 |
+| [agent-bridge AHP Convergence](active/agent-bridge-ahp-convergence/README.md) | Active | #1266, #1308 |
 | [Marketplace-Scoped Installations](active/marketplace-scoped-installations/README.md) | Active | #1096 |
 | [Native-Construct Convergence](active/native-construct-convergence/README.md) | Active | #985 |
 | [Plugin Process Hygiene](active/plugin-process-hygiene/README.md) | Active | #736 |
