@@ -1131,11 +1131,15 @@ def apply_plan(
     _log = log or (lambda _m: None)
 
     def _default_runner(argv: Sequence[str]) -> int:
+        child_environment = os.environ.copy()
+        child_environment.pop("COPILOT_PLUGIN_ROOT", None)
+        child_environment.pop("PYTHONPATH", None)
         proc = subprocess.run(  # noqa: S603 -- argv from our own plan builder
             list(argv),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            env=child_environment,
         )
         if proc.stdout:
             for line in proc.stdout.splitlines():

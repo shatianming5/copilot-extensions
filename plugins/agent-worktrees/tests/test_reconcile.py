@@ -1032,8 +1032,41 @@ def test_apply_plan_default_is_runtime_only(env):
     )
     assert calls == []
     assert summary["executed"] == []
+
+
+def test_apply_plan_default_runner_clears_payload_environment(env, monkeypatch):
+    """Target installers must not inherit the caller payload's identity."""
+    import time
+
+    env.write_settings({f"agent-bridge@{MKT}": True})
+    env.install_payload("agent-bridge", "2.0.0", scope="universal")
+    env.deploy_runtime("agent-bridge", "1.0.0")
+    reconcile.save_cache({"plugins": {"agent-bridge": {"last_payload_update": time.time()}}})
+    monkeypatch.setenv("COPILOT_PLUGIN_ROOT", "/caller/payload")
+    monkeypatch.setenv("PYTHONPATH", "/caller/python")
+    monkeypatch.setenv("RECONCILE_TEST_SENTINEL", "preserved")
+
+    calls: list = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout="")
+
+    monkeypatch.setattr(reconcile.subprocess, "run", fake_run)
+
+    summary = reconcile.apply_plan(env.repo, machine="anywhere", passes=1)
+
+    assert summary["executed"][0]["ok"] is True
+    child_environment = calls[0][1]["env"]
+    assert "COPILOT_PLUGIN_ROOT" not in child_environment
+    assert "PYTHONPATH" not in child_environment
+    assert child_environment["RECONCILE_TEST_SENTINEL"] == "preserved"
+
+
+def test_apply_plan_records_nonzero_runner_exit(env):
     """A non-zero runner exit is recorded as ok=False, never raised."""
     import time
+
     env.write_settings({f"agent-bridge@{MKT}": True})
     env.install_payload("agent-bridge", "2.0.0", scope="universal")
     env.deploy_runtime("agent-bridge", "1.0.0")
