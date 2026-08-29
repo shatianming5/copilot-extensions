@@ -1050,14 +1050,20 @@ def test_apply_plan_default_runner_clears_payload_environment(env, monkeypatch):
 
     def fake_run(argv, **kwargs):
         calls.append((list(argv), kwargs))
-        return subprocess.CompletedProcess(argv, 0, stdout="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     monkeypatch.setattr(reconcile.subprocess, "run", fake_run)
 
     summary = reconcile.apply_plan(env.repo, machine="anywhere", passes=1)
 
     assert summary["executed"][0]["ok"] is True
-    child_environment = calls[0][1]["env"]
+    runner_calls = [
+        kwargs for _argv, kwargs in calls
+        if kwargs.get("stdout") is subprocess.PIPE
+        and kwargs.get("stderr") is subprocess.STDOUT
+    ]
+    assert len(runner_calls) == 1
+    child_environment = runner_calls[0]["env"]
     assert "COPILOT_PLUGIN_ROOT" not in child_environment
     assert "PYTHONPATH" not in child_environment
     assert child_environment["RECONCILE_TEST_SENTINEL"] == "preserved"
