@@ -444,7 +444,8 @@ def test_make_embody_spawn_records_handle_on_success(monkeypatch):
     from agent_dispatch.supervisor import make_embody_spawn
 
     def fake_spawn_embodied_worker(
-        task_id, *, worker_id, driver, project=None, route="", verify_timeout=0
+        task_id, *, worker_id, driver, project=None, route="", worktree_id=None,
+        verify_timeout=0
     ):
         return subprocess.CompletedProcess(
             args=[], returncode=0,
@@ -458,6 +459,76 @@ def test_make_embody_spawn_records_handle_on_success(monkeypatch):
     assert ok is True
     assert handle["worktree"] == "wt-9"
     assert handle["session"] == "sess-9"
+
+
+def test_make_embody_spawn_prefers_reserved_worktree(monkeypatch):
+    import subprocess
+
+    from agent_dispatch import embody
+    from agent_dispatch.supervisor import make_embody_spawn
+
+    captured = {}
+
+    def fake_spawn_embodied_worker(
+        task_id, *, worker_id, driver, project=None, route="", worktree_id=None,
+        verify_timeout=0
+    ):
+        captured["worktree_id"] = worktree_id
+        return subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout='{"worktree_id": "wt-old", "session_id": "sess-old"}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(embody, "spawn_embodied_worker", fake_spawn_embodied_worker)
+
+    ok, handle = make_embody_spawn()(
+        {
+            "id": "t",
+            "repo": "gitea.example/org/widgets",
+            "spawn_worktree": "wt-old",
+        }
+    )
+
+    assert ok is True
+    assert captured["worktree_id"] == "wt-old"
+    assert handle["worktree"] == "wt-old"
+
+
+def test_make_embody_spawn_falls_back_when_soft_reuse_fails(monkeypatch):
+    import subprocess
+
+    from agent_dispatch import embody
+    from agent_dispatch.supervisor import make_embody_spawn
+
+    calls: list[str | None] = []
+
+    def fake_spawn_embodied_worker(
+        task_id, *, worker_id, driver, project=None, route="", worktree_id=None,
+        verify_timeout=0
+    ):
+        calls.append(worktree_id)
+        if worktree_id == "wt-reaped":
+            return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="missing")
+        return subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout='{"worktree_id": "wt-new", "session_id": "sess-new"}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(embody, "spawn_embodied_worker", fake_spawn_embodied_worker)
+
+    ok, handle = make_embody_spawn()(
+        {
+            "id": "t",
+            "repo": "gitea.example/org/widgets",
+            "spawn_worktree": "wt-reaped",
+        }
+    )
+
+    assert ok is True
+    assert calls == ["wt-reaped", None]
+    assert handle["worktree"] == "wt-new"
 
 
 def test_parse_handle_accepts_nested_worktree_object():

@@ -223,17 +223,21 @@ def spawn_embodied_worker(
     driver: str = DEFAULT_DRIVER,
     project: str | None = None,
     route: str = "",
+    worktree_id: str | None = None,
     verify_timeout: int = 0,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess:
     """Spawn a CLI-backed autopilot worker via ``agent-worktrees embody``.
 
-    Runs ``agent-worktrees [--project <project>] embody --new --seed "<autopilot
-    seed>" --driver <driver> --json`` -- creating a fresh parallel worktree and a
-    detached mux+Copilot session seeded to claim + execute ``task_id``
-    autonomously. The ``--driver`` label stamps the "driven by <agent>" banner so
-    the session is legible in Neuron Forge. Raises :class:`EmbodyUnavailable` if
-    the ``agent-worktrees`` CLI is not on PATH; the caller degrades from there.
+    Runs ``agent-worktrees [--project <project>] embody --worktree-id <id>`` when
+    ``worktree_id`` is supplied, otherwise ``embody --new``. The latter creates
+    a fresh parallel worktree; the former resumes/reuses the existing one so a
+    logical task family can keep one reviewer/worktree identity across episodes.
+    In both cases the detached mux+Copilot session is seeded to claim + execute
+    ``task_id`` autonomously. The ``--driver`` label stamps the "driven by
+    <agent>" banner so the session is legible in Neuron Forge. Raises
+    :class:`EmbodyUnavailable` if the ``agent-worktrees`` CLI is not on PATH; the
+    caller degrades from there.
 
     ``project`` names the target project explicitly (the agent-worktrees
     ``--project`` global). It is **required in practice for a CWD-neutral caller**
@@ -254,7 +258,12 @@ def spawn_embodied_worker(
         # `embody` subcommand. It lets a CWD-neutral caller name the target
         # project instead of relying on git-like CWD discovery.
         cmd += ["--project", project]
-    cmd += ["embody", "--new", "--seed", seed, "--driver", driver, "--json"]
+    cmd += ["embody"]
+    if worktree_id:
+        cmd += ["--worktree-id", worktree_id]
+    else:
+        cmd += ["--new"]
+    cmd += ["--seed", seed, "--driver", driver, "--json"]
     if verify_timeout:
         cmd += ["--verify-timeout", str(verify_timeout)]
     return subprocess.run(  # noqa: S603 -- fixed argv, launcher resolved locally

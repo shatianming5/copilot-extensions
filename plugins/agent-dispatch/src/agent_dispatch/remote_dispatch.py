@@ -160,6 +160,10 @@ def build_remote_create_argv(
         argv += ["--target-repo", args.target_repo]
     if getattr(args, "target_worktree", None):
         argv += ["--target-worktree", args.target_worktree]
+    if getattr(args, "exclusive_key", None):
+        argv += ["--exclusive-key", args.exclusive_key]
+    if getattr(args, "supersede_exclusive_key", False):
+        argv += ["--supersede-exclusive-key"]
     if getattr(args, "source", None):
         argv += ["--source", args.source]
     if getattr(args, "dedup_key", None):

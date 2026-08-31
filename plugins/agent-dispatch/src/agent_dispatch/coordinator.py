@@ -289,6 +289,8 @@ class CreateBody(BaseModel):
     target_machine: str | None = None
     target_worktree: str | None = None
     target_repo: str | None = None
+    exclusive_key: str | None = None
+    supersede_exclusive_key: bool = False
     source: str | None = None
     origin_ref: str | None = None
     dedup_key: str | None = None
@@ -476,6 +478,14 @@ class DirectoryHeartbeatBody(BaseModel):
 
 def _task_dict(task: Task) -> dict:
     return asdict(task)
+
+
+def _task_with_spawn_dict(queue: TaskQueue, task: Task) -> dict:
+    result = asdict(task)
+    latest = queue.latest_reservation(task.id)
+    if latest is not None:
+        result["spawn_reservation"] = asdict(latest)
+    return result
 
 
 def _bulk_task_dict(task: Task) -> dict:
@@ -933,7 +943,7 @@ def create_app(
 
     @app.get("/tasks/{task_id}")
     def get_task(task_id: str) -> dict:
-        return _task_dict(_require(queue.get(task_id)))
+        return _task_with_spawn_dict(queue, _require(queue.get(task_id)))
 
     @app.get("/tasks/{task_id}/result")
     def get_result(task_id: str) -> dict:

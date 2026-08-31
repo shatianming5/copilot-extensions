@@ -271,6 +271,10 @@ class Task:
     target_machine: str | None = None
     target_worktree: str | None = None
     target_repo: str | None = None
+    #: Optional logical resource key whose spawn is mutually exclusive across
+    #: tasks. A head-specific task may change while the resource (for example a
+    #: PR) stays the same; this key prevents two spawned workers from sharing it.
+    exclusive_key: str | None = None
     source: str | None = None
     origin_ref: str | None = None
     dedup_key: str | None = None
@@ -358,6 +362,7 @@ class Task:
             target_machine=row["target_machine"],
             target_worktree=row["target_worktree"],
             target_repo=row["target_repo"],
+            exclusive_key=row["exclusive_key"],
             source=row["source"],
             origin_ref=row["origin_ref"],
             dedup_key=row["dedup_key"],
@@ -448,6 +453,7 @@ class SpawnReservation:
     task_id: str
     attempt: int
     state: str
+    exclusive_key: str | None = None
     reserved_by: str | None = None
     session_handle: str | None = None
     worktree: str | None = None
@@ -462,6 +468,7 @@ class SpawnReservation:
             task_id=row["task_id"],
             attempt=row["attempt"],
             state=row["state"],
+            exclusive_key=row["exclusive_key"],
             reserved_by=row["reserved_by"],
             session_handle=row["session_handle"],
             worktree=row["worktree"],
@@ -550,6 +557,7 @@ _COLUMNS: dict[str, str] = {
     "target_machine": "TEXT",
     "target_worktree": "TEXT",
     "target_repo": "TEXT",
+    "exclusive_key": "TEXT",
     "source": "TEXT",
     "origin_ref": "TEXT",
     "dedup_key": "TEXT",
@@ -802,6 +810,7 @@ class TaskQueue:
                 "  task_id TEXT NOT NULL,"
                 "  attempt INTEGER NOT NULL,"
                 "  state TEXT NOT NULL,"
+                "  exclusive_key TEXT,"
                 "  reserved_by TEXT,"
                 "  session_handle TEXT,"
                 "  worktree TEXT,"
@@ -810,9 +819,20 @@ class TaskQueue:
                 "  updated_at REAL NOT NULL"
                 ")"
             )
+            spawn_columns = {
+                r["name"] for r in conn.execute("PRAGMA table_info(spawn_reservations)")
+            }
+            if "exclusive_key" not in spawn_columns:
+                conn.execute(
+                    "ALTER TABLE spawn_reservations ADD COLUMN exclusive_key TEXT"
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_spawn_res_task "
                 "ON spawn_reservations(task_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_spawn_res_exclusive "
+                "ON spawn_reservations(exclusive_key)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_spawn_res_state "
@@ -1048,6 +1068,7 @@ class TaskQueue:
         target_machine: str | None = None,
         target_worktree: str | None = None,
         target_repo: str | None = None,
+        exclusive_key: str | None = None,
         source: str | None = None,
         origin_ref: str | None = None,
         dedup_key: str | None = None,
@@ -1055,6 +1076,7 @@ class TaskQueue:
         done_criteria: str | None = None,
         not_before: float = 0.0,
         claim_as: str | None = None,
+        supersede_exclusive_key: bool = False,
         now: float | None = None,
     ) -> Task:
         """Insert a task (default status ``queued``; ``proposed`` for a draft).
@@ -1068,6 +1090,13 @@ class TaskQueue:
 
         If ``dedup_key`` collides with an existing task, no new row is created
         and the *existing* task is returned (ideation-time duplicate guard).
+
+        ``exclusive_key`` names a logical resource whose spawned worker must be
+        singleton across head-specific or otherwise episode-specific tasks. When
+        ``supersede_exclusive_key`` is true, older queued/proposed tasks with the
+        same key are abandoned in the same transaction as the new insert. Held
+        tasks are never yanked; the spawn reservation for the key prevents a
+        second live worker while the incumbent finishes or yields.
 
         ``claim_as`` makes this an **atomic create-and-claim**: a brand-new task
         is inserted already ``claimed`` by that owner in the *same* transaction,
@@ -1102,10 +1131,10 @@ class TaskQueue:
             conn.execute(
                 "INSERT INTO tasks (id, title, prompt, status, repo, requires, excludes,"
                 " affinity, labels, payload_ref, payload_inline, target_machine,"
-                " target_worktree, target_repo,"
+                " target_worktree, target_repo, exclusive_key,"
                 " source, origin_ref, dedup_key, goal, done_criteria,"
                 " not_before, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     task_id,
                     title,
@@ -1121,6 +1150,7 @@ class TaskQueue:
                     target_machine,
                     target_worktree,
                     target_repo,
+                    exclusive_key,
                     source,
                     origin_ref,
                     dedup_key,
@@ -1131,6 +1161,27 @@ class TaskQueue:
                     ts,
                 ),
             )
+            if exclusive_key and supersede_exclusive_key:
+                rows = conn.execute(
+                    "SELECT id, status FROM tasks "
+                    "WHERE exclusive_key = ? AND id <> ? "
+                    "AND status IN (?, ?)",
+                    (exclusive_key, task_id, Status.PROPOSED, Status.QUEUED),
+                ).fetchall()
+                for row in rows:
+                    conn.execute(
+                        "UPDATE tasks SET status = ?, owner = NULL, "
+                        "lease_expires_at = NULL, updated_at = ? WHERE id = ?",
+                        (Status.ABANDONED, ts, row["id"]),
+                    )
+                    self._audit(
+                        conn,
+                        row["id"],
+                        ts=ts,
+                        from_status=row["status"],
+                        to_status=Status.ABANDONED,
+                        note=f"superseded by exclusive task {task_id}",
+                    )
             self._audit(conn, task_id, ts=ts, from_status=None, to_status=status, note="create")
             if claim_as and status == Status.QUEUED:
                 # Atomic create-and-claim: flip the just-inserted row to claimed
@@ -3027,8 +3078,9 @@ class TaskQueue:
         Semantics (all under one write lock):
 
         * If an **active** reservation (``reserving``/``spawned``) already exists
-          for the task, return it with ``False`` -- the task is already being
-          spawned; the caller must **not** spawn.
+          for the task -- or for the task's ``exclusive_key`` when present --
+          return it with ``False``. The logical resource is already being
+          spawned; the caller must **not** spawn a second worker for it.
         * Otherwise mint a fresh reservation. ``attempt`` is ``max(prior
           attempts) + 1`` (``1`` for the first), keyed
           ``dispatch-task:<task_id>:<attempt>``, in state ``reserving``. Return
@@ -3044,11 +3096,18 @@ class TaskQueue:
             if task is None:
                 conn.execute("COMMIT")
                 raise TaskError(f"no such task {task_id!r}")
-            rows = conn.execute(
+            task_rows = conn.execute(
                 "SELECT * FROM spawn_reservations WHERE task_id = ? ORDER BY attempt ASC",
                 (task_id,),
             ).fetchall()
-            for row in rows:
+            group_rows: list[sqlite3.Row] = []
+            if task.exclusive_key:
+                group_rows = conn.execute(
+                    "SELECT * FROM spawn_reservations "
+                    "WHERE exclusive_key = ? ORDER BY reserved_at ASC",
+                    (task.exclusive_key,),
+                ).fetchall()
+            for row in (*task_rows, *group_rows):
                 if row["state"] in SpawnState.ACTIVE:
                     conn.execute("COMMIT")
                     return SpawnReservation._from_row(row), False
@@ -3058,13 +3117,34 @@ class TaskQueue:
                     f"task {task_id!r} is {task.status!r} with owner "
                     f"{task.owner!r}; spawn reservation requires queued and unowned"
                 )
-            attempt = (max(r["attempt"] for r in rows) + 1) if rows else 1
+            affinity = task.affinity if isinstance(task.affinity, dict) else {}
+            prior_worktree = task.target_worktree or affinity.get("worktree")
+            if task.exclusive_key:
+                prior = conn.execute(
+                    "SELECT worktree FROM spawn_reservations "
+                    "WHERE exclusive_key = ? AND worktree IS NOT NULL "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (task.exclusive_key,),
+                ).fetchone()
+                prior_worktree = prior["worktree"] if prior else prior_worktree
+            attempt = (max(r["attempt"] for r in task_rows) + 1) if task_rows else 1
             key = spawn_key(task_id, attempt)
             conn.execute(
                 "INSERT INTO spawn_reservations "
-                "(key, task_id, attempt, state, reserved_by, reserved_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (key, task_id, attempt, SpawnState.RESERVING, reserved_by, ts, ts),
+                "(key, task_id, attempt, state, reserved_by, worktree, "
+                "exclusive_key, reserved_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    key,
+                    task_id,
+                    attempt,
+                    SpawnState.RESERVING,
+                    reserved_by,
+                    prior_worktree,
+                    task.exclusive_key,
+                    ts,
+                    ts,
+                ),
             )
             row = conn.execute(
                 "SELECT * FROM spawn_reservations WHERE key = ?", (key,)

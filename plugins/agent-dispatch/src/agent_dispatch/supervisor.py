@@ -372,11 +372,27 @@ def make_embody_spawn(
                 driver=driver,
                 project=embody.project_for_task(task),
                 route=route,
+                worktree_id=(
+                    task.get("target_worktree")
+                    or task.get("spawn_worktree")
+                ),
                 verify_timeout=verify_timeout,
             )
         except embody.EmbodyUnavailable as exc:
             return False, {"error": str(exc)}
         if result.returncode != 0:
+            preferred = task.get("target_worktree") or task.get("spawn_worktree")
+            if preferred and not task.get("target_worktree"):
+                retry = embody.spawn_embodied_worker(
+                    task["id"],
+                    worker_id=worker_id,
+                    driver=driver,
+                    project=embody.project_for_task(task),
+                    route=route,
+                    verify_timeout=verify_timeout,
+                )
+                if retry.returncode == 0:
+                    return True, embody.parse_handle(retry)
             return False, {"error": (result.stderr or "").strip()[:200] or "nonzero exit"}
         handle = embody.parse_handle(result)
         return True, handle
@@ -1405,8 +1421,10 @@ class Supervisor:
                 continue
             if not resp.get("reserved"):
                 continue  # already actively reserved -> never double-spawn
-            key = resp["reservation"]["key"]
-            ok, handle = self.spawn_fn(task)
+            reservation = resp["reservation"]
+            key = reservation["key"]
+            spawn_task = {**task, "spawn_worktree": reservation.get("worktree")}
+            ok, handle = self.spawn_fn(spawn_task)
             try:
                 if ok:
                     self.client.record_spawn(
