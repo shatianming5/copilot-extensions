@@ -75,8 +75,18 @@ class QueueBackedClient:
             )
         )
 
-    def yield_task(self, task_id, worker_id, *, note=None, exclude=None):
-        return asdict(self._q.yield_task(task_id, worker_id, note=note, exclude=exclude))
+    def yield_task(
+        self, task_id, worker_id, *, note=None, exclude=None, release_spawn=True
+    ):
+        return asdict(
+            self._q.yield_task(
+                task_id,
+                worker_id,
+                note=note,
+                exclude=exclude,
+                release_spawn=release_spawn,
+            )
+        )
 
     def progress_log(self, task_id):
         return self._q.progress_log(task_id)
@@ -92,12 +102,13 @@ def client(q):
     return QueueBackedClient(q)
 
 
-def _ok_spawn(handle=None):
+def _ok_spawn(handle=None, *, worktree=None):
     calls = []
 
     def spawn(task):
         calls.append(task["id"])
-        return True, (handle or {"session": "sess-1", "worktree": "wt-1"})
+        default = {"session": "sess-1", "worktree": worktree or "wt-1"}
+        return True, (handle or default)
 
     spawn.calls = calls  # type: ignore[attr-defined]
     return spawn
@@ -178,6 +189,25 @@ def test_requeued_task_is_not_double_spawned(q, client):
     # the supervisor must NOT re-spawn it (reservation still 'spawned')
     assert sup.poll_once() == []
     assert spawn.calls == [t.id]  # still just the one spawn
+
+
+def test_yielded_exclusive_task_releases_for_new_head_reuse(q, client):
+    old = q.create("old head", exclusive_key="review:repo:42")
+    new = q.create("new head", exclusive_key="review:repo:42")
+    spawn = _ok_spawn(worktree="wt-reviewer")
+    sup = Supervisor(client, spawn_fn=spawn, repo=TEST_REPO, max_concurrent=5)
+    sup.poll_once()
+    old_res = q.latest_reservation(old.id)
+    assert old_res is not None and old_res.state == SpawnState.SPAWNED
+
+    q.claim_one("m/wt-reviewer", task_id=old.id, machine="m", worktree="wt-reviewer")
+    q.start(old.id, "m/wt-reviewer")
+    q.yield_task(old.id, "m/wt-reviewer", note="older head")
+
+    assert q.latest_reservation(old.id).state == SpawnState.SETTLED
+    new_res, reserved = q.reserve_spawn(new.id)
+    assert reserved is True
+    assert new_res.worktree == "wt-reviewer"
 
 
 def test_reconcile_settles_terminal_then_allows_respawn(q, client):

@@ -328,6 +328,7 @@ class YieldBody(BaseModel):
     worker_id: str
     note: str | None = None
     exclude: str | None = None
+    release_spawn: bool = True
 
 
 class SuspendBody(BaseModel):
@@ -1075,7 +1076,11 @@ def create_app(
     def yield_task(task_id: str, body: YieldBody) -> dict:
         return _guard(
             lambda: queue.yield_task(
-                task_id, body.worker_id, note=body.note, exclude=body.exclude
+                task_id,
+                body.worker_id,
+                note=body.note,
+                exclude=body.exclude,
+                release_spawn=body.release_spawn,
             ),
             "task.yielded",
         )

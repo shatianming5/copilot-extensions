@@ -1696,6 +1696,7 @@ class TaskQueue:
                 "last_liveness": None,
             },
             release_spawn=True,
+            release_spawn_detail="task released from suspension",
         )
 
     def yield_task(
@@ -1705,6 +1706,7 @@ class TaskQueue:
         *,
         note: str | None = None,
         exclude: str | None = None,
+        release_spawn: bool = True,
         now: float | None = None,
     ) -> Task:
         """Return an owned task to ``queued`` with updates.
@@ -1744,6 +1746,8 @@ class TaskQueue:
             now=now,
             note=note or "yield",
             extra=extra,
+            release_spawn=release_spawn,
+            release_spawn_detail="task yielded",
         )
 
     def abandon(
@@ -2828,6 +2832,7 @@ class TaskQueue:
         stamp: str | None = None,
         extra: dict[str, object] | None = None,
         release_spawn: bool = False,
+        release_spawn_detail: str = "task released from suspension",
         wake_requested: bool = False,
         wake_message: str | None = None,
         bump_generation: bool = False,
@@ -2918,7 +2923,7 @@ class TaskQueue:
                     (
                         SpawnState.SETTLED,
                         ts,
-                        "task released from suspension",
+                        release_spawn_detail,
                         task_id,
                         SpawnState.RESERVING,
                         SpawnState.SPAWNED,
