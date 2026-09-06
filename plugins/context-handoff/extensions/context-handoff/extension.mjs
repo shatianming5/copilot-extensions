@@ -17,14 +17,14 @@
 //    agent via session.send() (replaces onPostToolUse additionalContext). The
 //    nudge JUST tells the agent to invoke the context-handoff skill; it does
 //    not prescribe tool calls or a "write a file" outcome -- the skill owns the
-//    sequencing (a live cutover under mux).
+//    sequencing (a live cutover through the active Herdr or mux host).
 //
 // The /handoff gesture is handled as a skill invocation (context-handoff
 // skill), not a slash command. The skill triggers the agent to call
 // generate_handoff_prompt, compose prose, and call save_handoff_prompt. The
 // PRIMARY path then performs a live cutover (continue_handoff) -- spinning up a
-// successor in the same mux and retiring this session, hands-free -- and only
-// falls back to a copy/paste reply when no mux session is present.
+// successor through the current Herdr pane or mux host, hands-free -- and only
+// falls back to a copy/paste reply when no live host is available.
 
 import {
   existsSync,
@@ -41,7 +41,6 @@ import {
 import { execSync, execFileSync } from "node:child_process";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
-import { approveAll } from "@github/copilot-sdk";
 import { joinSession } from "@github/copilot-sdk/extension";
 import {
   CONTINUATION_DIRECTIVE,
@@ -52,6 +51,15 @@ import { supersededHandoffIds } from "./handoff-tasks.mjs";
 import { loadContextHandoffConfig } from "./config.mjs";
 import { contextPressure, formatContextUsage } from "./thresholds.mjs";
 import { AGENT_WORKTREES_QUERY_TIMEOUT_MS } from "./cli-timeouts.mjs";
+import {
+  herdrHandoffDir,
+  isHerdrPane,
+  resolveHandoffCwd,
+  resolveHerdrPredecessorIdentity,
+  retireHerdrPredecessorAfterConsume,
+  runHandoffCutover,
+  herdrStartupPendingMessage,
+} from "./handoff-core.mjs";
 
 // --- State ---
 const handoffConfig = loadContextHandoffConfig(process.cwd());
@@ -67,6 +75,7 @@ const state = {
   hardLogShown: false,            // session.log shown to user
   handoffGenerated: false,
   firstUserPrompt: null,          // first user message (for topic bias)
+  pendingCutover: null,           // { seed, permissionMode } from the last save
   // Context window tracking (from session.usage_info events)
   currentTokens: 0,
   tokenLimit: 0,
@@ -87,6 +96,12 @@ function ensureState(invocation) {
   if (!state.cwd) {
     state.cwd = process.cwd();
   }
+}
+
+function currentHandoffCwd() {
+  const result = resolveHandoffCwd(state.cwd || process.cwd());
+  if (result.cwd) state.cwd = result.cwd;
+  return result;
 }
 
 function getGitInfo(cwd) {
@@ -115,7 +130,7 @@ function getGitInfo(cwd) {
 // Collect structured handoff data from current session state.
 // Used by both the generate_handoff_prompt tool and the /handoff command.
 function collectHandoffData(sid, overrides = {}) {
-  const cwd = state.cwd || process.cwd();
+  const cwd = currentHandoffCwd().cwd || state.cwd || process.cwd();
   const git = getGitInfo(cwd);
   const utilPct = state.tokenLimit > 0
     ? Math.round(state.lastUtilization * 100)
@@ -148,14 +163,14 @@ function collectHandoffData(sid, overrides = {}) {
 
 // --- agent-dispatch integration (soft dependency) ---
 // When an agent-dispatch coordinator is reachable, a handoff is stored as a
-// *task* (payload = the handoff markdown) instead of a worktree-state file, so
+// *task* (payload = the handoff markdown) instead of a machine-local file, so
 // it becomes durable, browsable, and claimable. It is picked up two ways, with
 // two completion models: a LIVE CUTOVER successor (the primary path) uses
 // `agent-dispatch consume <id> --defer-complete` and completes the task
 // explicitly when it reaches the goal (deferred); a human paste / /resume-handoff
 // uses `agent-dispatch consume <id>` (baton -- completed on pickup). context-
 // handoff sits *on top of* agent-dispatch when it exists, and falls back to the
-// worktree-state file flow when it doesn't. All best-effort: any failure returns null / a safe
+// machine-local file flow when it doesn't. All best-effort: any failure returns null / a safe
 // default so the caller degrades to the file path.
 
 // True if the `agent-dispatch` CLI answers a health probe (a live coordinator).
@@ -235,6 +250,7 @@ const HANDOFF_META_SUFFIX = "-->";
 // full brief still lives in the task/file; this is only the durable pointer.
 // Best-effort -- a miss never affects the handoff itself.
 function noteHandoffInRecord(cwd, sid, ref, title) {
+  if (isHerdrPane()) return;
   try {
     const argv = ["note-handoff"];
     if (ref) argv.push("--task", ref);
@@ -253,6 +269,7 @@ function safePathSegment(value) {
 }
 
 function currentPaneId() {
+  if (isHerdrPane()) return null;
   return process.env.TMUX_PANE || process.env.PSMUX_PANE || null;
 }
 
@@ -279,13 +296,19 @@ function processAlive(pid) {
 }
 
 function worktreeInfo(cwd, sid) {
+  if (isHerdrPane()) {
+    return { wtDir: null, worktree: null, stateDir: null };
+  }
   const wtDir = agentWorktreesGet("worktree-dir", cwd, sid);
   const worktree = wtDir ? basename(wtDir) : null;
   const stateDir = agentWorktreesGet("worktree-state-dir", cwd, sid);
   return { wtDir, worktree, stateDir };
 }
 
-function makeHandoffMetadata({ sid, cwd, title, storage, taskId = null }) {
+function makeHandoffMetadata({
+  sid, cwd, title, storage, taskId = null, predecessor = null,
+  nativeContinuation = null,
+}) {
   const { wtDir, worktree, stateDir } = worktreeInfo(cwd, sid);
   const id = `handoff-${safePathSegment(sid)}`;
   return {
@@ -301,6 +324,8 @@ function makeHandoffMetadata({ sid, cwd, title, storage, taskId = null }) {
     worktreeDir: wtDir,
     oldPane: currentPaneId(),
     muxSession: currentMuxSession(),
+    predecessor,
+    nativeContinuation,
     stateDir,
     createdAt: new Date().toISOString(),
   };
@@ -331,6 +356,8 @@ function decodeHandoffPayload(raw) {
 }
 
 function handoffDirFor(cwd, sid) {
+  const herdrDir = herdrHandoffDir(cwd);
+  if (herdrDir) return herdrDir;
   const stateDir = agentWorktreesGet("worktree-state-dir", cwd, sid);
   return stateDir ? join(stateDir, "handoff") : null;
 }
@@ -345,9 +372,20 @@ function writeJsonAtomic(path, value) {
   }
 }
 
-function saveFileHandoff(promptText, sid, cwd, title) {
-  const metadata = makeHandoffMetadata({ sid, cwd, title, storage: "file" });
-  const dir = metadata.stateDir ? join(metadata.stateDir, "handoff") : null;
+function saveFileHandoff(
+  promptText, sid, cwd, title, nativeContinuation = null,
+) {
+  const identity = resolveHerdrPredecessorIdentity(sid);
+  if (identity.error) return { error: identity.error };
+  const metadata = makeHandoffMetadata({
+    sid,
+    cwd,
+    title,
+    storage: "file",
+    predecessor: identity.predecessor,
+    nativeContinuation,
+  });
+  const dir = handoffDirFor(cwd, sid);
   if (!dir) {
     const resolution = agentWorktreesGetResult(
       "worktree-state-dir", cwd, sid,
@@ -409,61 +447,6 @@ function markFileHandoffConsumed(path, record, sid) {
 // SHAPE -- notably the bash-first task-cutover invariant, GitHub issue #853 --
 // is independently unit-testable and clean-room-importable without loading this
 // whole session extension. See that module for the rationale.
-
-// A live cutover spawns a *seeded successor* Copilot in a new window of this
-// worktree's mux session and cuts the operator over to it. The successor
-// retires the predecessor only after it consumes the stored handoff. The mux choreography lives in
-// `agent-worktrees handoff-cutover`; this extension is a thin trigger. All
-// best-effort: any failure returns null / a safe default so the caller falls
-// back to the normal store-task-and-reply flow.
-// Spawn the successor + cut over. `seed` is the successor's first interactive
-// prompt (copilot -i). Returns a structured result so the caller can give an
-// accurate reason on failure:
-//   { ok: true, old_pane, new_pane }                         -- cutover started
-//   { ok: false, reason: "no-worktree" | "no-mux" | "error", // failed
-//     error: "<host message>" }
-// The host verb distinguishes the two common bare-resume failure modes by exit
-// code: 2 = could not resolve a worktree id from cwd (e.g. a bare-resume left
-// cwd at HOME even though the process IS inside the wt-<id> mux), 3 = resolved a
-// worktree but it has no live mux session. The extension used to collapse both
-// (and every other error) into a single misleading "not under a mux session"
-// message; surfacing the host's own error text keeps the reason honest.
-function runHandoffCutover(cwd, seed, sessionId) {
-  const argv = ["handoff-cutover", "--seed", seed];
-  // The extension runs inside the OLD pane; $TMUX_PANE pins it precisely so the
-  // retire step targets the right pane even after the cutover moves the active
-  // pane to the successor. Falls back to the session's active pane in the CLI.
-  const ownPane = process.env.TMUX_PANE || process.env.PSMUX_PANE || "";
-  if (ownPane) argv.push("--old-pane", ownPane);
-  // #4098: pass the resumed session id so the host verb can resolve the worktree
-  // authoritatively when cwd is HOME (bare resume). Without it, the verb only
-  // has cwd -- which is HOME under bare resume -- and fails to identify the
-  // wt-<id> the session is already inside.
-  if (sessionId) argv.push("--session-id", sessionId);
-  try {
-    const out = runCli("agent-worktrees", argv, {
-      cwd,
-      timeout: 20000,
-    });
-    const result = JSON.parse(out);
-    return result?.ok ? result : { ok: false, reason: "error", error: null };
-  } catch (e) {
-    // execFileSync/execSync throw on a non-zero exit; the host still wrote its
-    // JSON error envelope to stdout, and the exit code names the cause.
-    const status = typeof e?.status === "number" ? e.status : null;
-    let error = null;
-    try {
-      const stdout = (e?.stdout || "").toString();
-      const parsed = stdout ? JSON.parse(stdout) : null;
-      error = parsed?.error || null;
-    } catch {
-      /* stdout was not JSON (e.g. agent-worktrees not found) */
-    }
-    const reason =
-      status === 2 ? "no-worktree" : status === 3 ? "no-mux" : "error";
-    return { ok: false, reason, error };
-  }
-}
 
 // Best-effort, user-visible progress line to the (successor) Copilot session.
 // The handoff must never block or fail on logging, so swallow everything.
@@ -540,8 +523,12 @@ function bindConsumedHandoff(cwd, token, metadata, sid) {
 // Store a handoff as a proposed, handoff-labeled agent-dispatch task pinned to
 // the current worktree; payload = metadata + handoff markdown. Returns the task
 // id, or null if anything fails (the caller then falls back to a worktree file).
-function dispatchHandoff(promptText, sid, cwd, title) {
-  const metadata = makeHandoffMetadata({ sid, cwd, title, storage: "agent-dispatch" });
+function dispatchHandoff(
+  promptText, sid, cwd, title, nativeContinuation = null,
+) {
+  const metadata = makeHandoffMetadata({
+    sid, cwd, title, storage: "agent-dispatch", nativeContinuation,
+  });
   const dir = metadata.stateDir ? join(metadata.stateDir, "handoff") : null;
   if (!dir) return null;
   const tmp = join(dir, `${metadata.id}-payload-${process.pid}.md`);
@@ -663,6 +650,16 @@ function retireAfterConsume(cwd, metadata, sid, handoffToken) {
     retireResult: null,
     concluded: false,
   };
+  if (metadata?.predecessor?.transport === "herdr") {
+    result.retireResult = retireHerdrPredecessorAfterConsume({
+      consumed: true,
+      metadata,
+      successorSessionId: sid,
+    });
+    result.retired = Boolean(result.retireResult?.retired);
+    return result;
+  }
+  if (isHerdrPane()) return result;
   result.concluded = bindConsumedHandoff(cwd, handoffToken, metadata, sid);
   if (!result.concluded && metadata?.sessionId) {
     // Compatibility with a handoff written before the numbered ledger existed.
@@ -924,6 +921,7 @@ function formatConsumeResult(result, { deferComplete = false } = {}) {
     retireResult
       ? `**Predecessor retire:** ${retireResult.method || "unknown"} ` +
         `(pane gone: ${Boolean(retireResult.gone)}` +
+        (retireResult.status ? `; status ${retireResult.status}` : "") +
         (retireResult.copilot
           ? `; old Copilot: reaped ${retireResult.copilot.reaped || 0}, ` +
             `survivors ${retireResult.copilot.survivors || 0}`
@@ -1086,11 +1084,120 @@ function formatHandoffMarkdown(handoffData, scope) {
   return lines.join("\n");
 }
 
+function hasActiveAutopilotObjective(content) {
+  if (typeof content !== "string" || !content.trim()) return false;
+  try {
+    return JSON.parse(content)?.current?.status === "active";
+  } catch {
+    return false;
+  }
+}
+
+function objectiveRestored(expected, actual, targetMode) {
+  if (!expected) return actual === null;
+  if (targetMode === "autopilot") return actual === expected;
+  try {
+    const expectedCurrent = JSON.parse(expected)?.current;
+    const actualCurrent = JSON.parse(actual)?.current;
+    return (
+      expectedCurrent?.objective === actualCurrent?.objective
+      && expectedCurrent?.status === actualCurrent?.status
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function captureNativeContinuation() {
+  try {
+    const [mode, objective, permissions, pending] = await Promise.all([
+      session.rpc.mode.get(),
+      session.rpc.workspaces.readAutopilotObjective(),
+      session.rpc.permissions.getMode(),
+      session.rpc.permissions.pendingRequests(),
+    ]);
+    if (!Array.isArray(pending?.items)) {
+      throw new Error("Copilot returned an invalid pending-permissions response.");
+    }
+    if (pending.items.length > 0) {
+      return {
+        value: null,
+        error:
+          `${pending.items.length} permission confirmation request(s) are still ` +
+          "pending. Resolve them in this session before handing off.",
+      };
+    }
+    return {
+      value: {
+        version: 1,
+        mode,
+        permissionMode: permissions.mode,
+        autopilotObjective: objective.content,
+      },
+      error: null,
+    };
+  } catch (error) {
+    return {
+      value: null,
+      error: error?.message || String(error),
+    };
+  }
+}
+
+async function restoreNativeContinuation(metadata) {
+  const native = metadata?.nativeContinuation;
+  if (!native || native.version !== 1) {
+    return { restored: false, mode: null, permissionMode: null };
+  }
+  const permissionMode = native.permissionMode;
+  if (!["manual", "assisted", "allow-all"].includes(permissionMode)) {
+    throw new Error(`unsupported inherited permission mode: ${permissionMode}`);
+  }
+  const permissionResult = await session.rpc.permissions.setMode({
+    mode: permissionMode,
+  });
+  if (!permissionResult.success || permissionResult.mode !== permissionMode) {
+    throw new Error(
+      `could not restore permission mode ${permissionMode}; runtime reported ` +
+      `${permissionResult.mode || "unknown"}`,
+    );
+  }
+
+  const objective = native.autopilotObjective;
+  if (typeof objective === "string" && objective.trim()) {
+    await session.rpc.workspaces.writeAutopilotObjective({ content: objective });
+  } else {
+    await session.rpc.workspaces.deleteAutopilotObjective();
+  }
+
+  const targetMode =
+    native.mode === "autopilot" && !hasActiveAutopilotObjective(objective)
+      ? "interactive"
+      : native.mode;
+  if (!["interactive", "plan", "autopilot"].includes(targetMode)) {
+    throw new Error(`unsupported inherited session mode: ${targetMode}`);
+  }
+  await session.rpc.mode.set({ mode: targetMode });
+  const [restoredMode, restoredObjective] = await Promise.all([
+    session.rpc.mode.get(),
+    session.rpc.workspaces.readAutopilotObjective(),
+  ]);
+  if (
+    restoredMode !== targetMode
+    || !objectiveRestored(
+      objective || null,
+      restoredObjective.content,
+      targetMode,
+    )
+  ) {
+    throw new Error("native goal or execution mode did not persist after restore");
+  }
+  return { restored: true, mode: targetMode, permissionMode };
+}
+
 // --- Extension ---
 
 const session = await joinSession({
-  onPermissionRequest: approveAll,
-
   tools: [
     {
       name: "generate_handoff_prompt",
@@ -1163,12 +1270,14 @@ const session = await joinSession({
             "   create a live handoff merely to report that fact; finish instead.",
             "2. Call save_handoff_prompt with the composed markdown as `prompt_text`",
             "   (and an optional short `title`). It stores the handoff — as an",
-            "   agent-dispatch task when a coordinator is reachable, else a",
-            "   one-time worktree-state file — and returns the short paste prompt",
+            "   checkout-scoped machine-local file in Herdr; otherwise as an",
+            "   agent-dispatch task when a coordinator and worktree are reachable,",
+            "   with a machine-local file fallback — and returns the short paste prompt",
             "   plus a HANDOFF_SEED for live cutover.",
-            "3. Under mux, call continue_handoff with the exact HANDOFF_SEED.",
-            "   The successor consumes the stored handoff and retires this",
-            "   predecessor. Without mux, reply with ONLY the short paste prompt.",
+            "3. In a Herdr or mux pane, call continue_handoff with the exact",
+            "   HANDOFF_SEED. Herdr creates a sibling and retains this predecessor;",
+            "   mux retires it only after successor pickup. Without either host,",
+            "   reply with ONLY the short paste prompt.",
             "Do NOT paste the handoff contents, commit anything, or claim the",
             "handoff auto-loads on restart (it does not).",
           ].join("\n"),
@@ -1180,11 +1289,14 @@ const session = await joinSession({
       name: "save_handoff_prompt",
       description:
         "Store the composed handoff markdown and return what short prompt to reply " +
-        "with. When an agent-dispatch coordinator is reachable, the handoff is " +
-        "stored as a *proposed, handoff-labeled task* pinned to this worktree " +
+        "with. In Herdr, the handoff is stored as a checkout-scoped one-time " +
+        "machine-local file. Otherwise, when an agent-dispatch coordinator is " +
+        "reachable, it is stored as a *proposed, handoff-labeled task* pinned to this worktree " +
         "(payload = the markdown, no session file) and resumed next session via " +
-        "/resume-handoff; otherwise it falls back to a one-time file in this " +
-        "worktree's agent-worktrees state directory outside the repo checkout. " +
+        "/resume-handoff; otherwise it falls back to a one-time machine-local " +
+        "file outside the repo checkout. An active Herdr pane uses " +
+        "context-handoff's checkout-scoped state and does not require " +
+        "agent-worktrees. " +
         "Call this after composing the handoff from " +
         "generate_handoff_prompt data. Pass the markdown as `prompt_text` (the " +
         "`prompt` alias is also accepted); an optional short `title` labels the " +
@@ -1231,15 +1343,31 @@ const session = await joinSession({
           );
         }
 
-        const cwd = state.cwd || process.cwd();
+        const cwdResult = currentHandoffCwd();
+        if (!cwdResult.cwd) {
+          return (
+            "Cannot save handoff: the current Herdr pane working directory " +
+            `could not be resolved. Nothing was written. [host: ${cwdResult.error}]`
+          );
+        }
+        const cwd = cwdResult.cwd;
         const title = (args?.title ?? "").toString().trim();
+        const native = await captureNativeContinuation();
+        if (!native.value) {
+          return (
+            "Cannot save handoff: native session state could not be captured " +
+            `without losing a confirmation or execution authority. Nothing was written. ` +
+            `[native: ${native.error}]`
+          );
+        }
         // Front-load the seed with the specific action so the successor
         // session's title-inference (biased toward the START of the prompt)
         // derives a meaningful title from the topic rather than the generic
         // handoff boilerplate that follows it.
         const lead = leadFrom(title);
 
-        // Store the handoff (agent-dispatch task preferred, else worktree file)
+        // Herdr stores locally without agent-worktrees. Other hosts prefer an
+        // agent-dispatch task and fall back to the same one-time file format.
         // and derive both the short reply prompt (the baton paste-seed) and the
         // cutover seed. Storage is single-responsibility here; a live cutover is
         // a SEPARATE, explicit continue_handoff call the agent makes afterward,
@@ -1248,8 +1376,10 @@ const session = await joinSession({
         let cutoverSeed = null;   // deferred cutover seed (== HANDOFF_SEED)
         let storedMsg = null;     // the instruction to reply with
 
-        if (agentDispatchAvailable()) {
-          const stored = dispatchHandoff(text, sid, cwd, title);
+        if (!isHerdrPane() && agentDispatchAvailable()) {
+          const stored = dispatchHandoff(
+            text, sid, cwd, title, native.value,
+          );
           const taskId = stored?.id;
           if (taskId) {
             // Two seeds, two completion models (see the context-handoff skill):
@@ -1268,18 +1398,17 @@ const session = await joinSession({
             // Each LEADS with the specific action (`lead`) so the successor
             // session's title-inference resolves to the topic, not the generic
             // "Agent Dispatch Task Handoff" boilerplate.
-            seed =
-              `${lead}. You are resuming a handoff (agent-dispatch task ` +
-              `${taskId}); continue the prior session's work IN PLACE -- do not ` +
-              `restart or create a new worktree. Load your full brief by ` +
-              `running: agent-dispatch consume ${taskId} . ` +
-              `${CONTINUATION_DIRECTIVE}`;
+            seed = buildCutoverSeed("task", taskId, lead, {
+              retry: false,
+              requiresNativeRestore: true,
+            });
             cutoverSeed = buildCutoverSeed("task", taskId, lead, {
               oldPane: stored?.metadata?.oldPane,
               worktree: stored?.metadata?.worktree,
               worktreeDir: stored?.metadata?.worktreeDir,
               sessionId: sid,
               muxSession: stored?.metadata?.muxSession,
+              requiresNativeRestore: true,
             });
             // Mirror the handoff into the worktree record (record-first recovery).
             noteHandoffInRecord(cwd, sid, taskId, title);
@@ -1288,8 +1417,8 @@ const session = await joinSession({
               `'handoff', pinned to this worktree). No file handoff was written.\n\n` +
               `PRIMARY PATH -- live cutover (no copy/paste): call continue_handoff ` +
               `with \`seed\` = the HANDOFF_SEED below to spin up the successor in ` +
-              `place and hand off automatically. Only if that reports it is not ` +
-              `under a mux session (graceful fallback) do you reply to the user ` +
+              `place and hand off automatically. Only if that reports no live ` +
+              `pane host (graceful fallback) do you reply to the user ` +
               `with ONLY this short paste prompt (they resume via /resume-handoff ` +
               `or by pasting into /clear):\n` +
               `  ${seed}\n` +
@@ -1302,11 +1431,13 @@ const session = await joinSession({
         }
 
         if (!seed) {
-          const fileStored = saveFileHandoff(text, sid, cwd, title);
+          const fileStored = saveFileHandoff(
+            text, sid, cwd, title, native.value,
+          );
           if (!fileStored?.path) {
             return (
-              "Cannot save handoff: no agent-dispatch coordinator was reachable " +
-              "and the file fallback resolver failed. Nothing was written. " +
+              "Cannot save handoff: the machine-local file resolver failed. " +
+              "Nothing was written. " +
               (fileStored?.error || "No safe machine-local state directory resolved.")
             );
           }
@@ -1319,10 +1450,13 @@ const session = await joinSession({
           });
           // Mirror the handoff into the worktree record (record-first recovery).
           noteHandoffInRecord(cwd, sid, fileStored.id, title);
+          const fileReason = isHerdrPane()
+            ? "because Herdr live handoff uses context-handoff's own checkout-scoped baton"
+            : "because no reachable agent-dispatch coordinator was available";
           storedMsg = (
             `Handoff saved to ${fileStored.path}\n\n` +
-            `(Stored as a worktree-scoped handoff file outside the repo checkout ` +
-            `because no reachable agent-dispatch coordinator was available.) ` +
+            `(Stored as a checkout-scoped handoff file outside the repo checkout ` +
+            `${fileReason}.) ` +
             `Reply to the user with ONLY this short paste prompt if live cutover ` +
             `is unavailable:\n` +
             `  ${seed}\n` +
@@ -1335,12 +1469,16 @@ const session = await joinSession({
         // (the PRIMARY handoff path): call continue_handoff with `seed` set to
         // exactly this string. For a task-backed handoff it is the *deferred*
         // cutover seed (the successor completes explicitly at the goal).
+        state.pendingCutover = {
+          seed: cutoverSeed,
+          permissionMode: native.value.permissionMode,
+        };
         return (
           `${storedMsg}\n\n` +
           `HANDOFF_SEED: ${cutoverSeed}\n` +
           `(Live cutover is the PRIMARY path: call continue_handoff with \`seed\` ` +
           `set to exactly the HANDOFF_SEED string above. Only fall back to the ` +
-          `short paste prompt if continue_handoff reports no mux session.)`
+          `short paste prompt if continue_handoff reports no live pane host.)`
         );
       },
     },
@@ -1350,8 +1488,8 @@ const session = await joinSession({
         "Consume a stored context handoff exactly once. For agent-dispatch " +
         "handoffs, pass task_id; for file-backed handoffs, pass handoff_id " +
         "(or path). The tool loads the handoff, marks file-backed handoffs " +
-        "consumed so they do not replay, and retires the recorded predecessor " +
-        "pane after the successor is alive.",
+        "consumed so they do not replay, and retires the identity-matched " +
+        "recorded predecessor only after successful consumption.",
       skipPermission: true,
       parameters: {
         type: "object",
@@ -1378,7 +1516,14 @@ const session = await joinSession({
       },
       handler: async (args, invocation) => {
         ensureState(invocation);
-        const cwd = state.cwd || process.cwd();
+        const cwdResult = currentHandoffCwd();
+        if (!cwdResult.cwd) {
+          return (
+            "Cannot consume handoff: the current Herdr pane working directory " +
+            `could not be resolved. [host: ${cwdResult.error}]`
+          );
+        }
+        const cwd = cwdResult.cwd;
         const sid = state.sessionId || invocation?.sessionId || null;
         const taskId = (args?.task_id ?? "").toString().trim();
         const handoffId = (args?.handoff_id ?? "").toString().trim();
@@ -1387,13 +1532,36 @@ const session = await joinSession({
 
         let result;
         if (taskId) {
-          result = consumeDispatchHandoffTask(cwd, taskId, sid, deferComplete);
+          result = consumeDispatchHandoffTask(
+            cwd, taskId, sid, deferComplete, { deferRetire: true },
+          );
         } else if (handoffId || path) {
-          result = consumeFileHandoff(cwd, sid, handoffId, path || null);
+          result = consumeFileHandoff(
+            cwd, sid, handoffId, path || null, { deferRetire: true },
+          );
         } else {
           return (
             "Cannot consume handoff: pass task_id for an agent-dispatch handoff " +
             "or handoff_id/path for a file-backed handoff."
+          );
+        }
+
+        if (result?.ok) {
+          try {
+            result.nativeContinuation = await restoreNativeContinuation(
+              result.metadata,
+            );
+          } catch (error) {
+            return {
+              textResultForLlm:
+                "The handoff baton was consumed, but native goal, mode, or " +
+                "permission restoration failed. The predecessor was NOT retired. " +
+                `Stop and report this blocker: ${error?.message || String(error)}`,
+              resultType: "error",
+            };
+          }
+          result.retire = retireAfterConsume(
+            cwd, result.metadata, sid, result.id,
           );
         }
 
@@ -1409,12 +1577,13 @@ const session = await joinSession({
         "Live-cutover the CURRENT session to a seeded successor. Call this AFTER " +
         "save_handoff_prompt (the explicit 'kick the flow' step of a live " +
         "handoff): pass `seed` = the exact HANDOFF_SEED string save_handoff_prompt " +
-        "returned. It spawns a successor Copilot in a new window of this " +
-        "worktree's mux session, seeds it with that prompt (copilot -i), cuts the " +
-        "operator over to it; the successor retires THIS predecessor only after " +
-        "it consumes the stored handoff. Requires running " +
-        "under a mux session; if not (or the cutover fails) it does nothing " +
-        "destructive and says so -- the handoff is still safely stored.",
+        "returned. In an active Herdr pane it calls the installed copilot-pane " +
+        "launcher with a task file to create one seeded sibling; the successor " +
+        "stops the identity-matched predecessor after consuming the baton. " +
+        "Otherwise it uses the existing " +
+        "worktree mux cutover, where successor pickup retires the predecessor. " +
+        "If launch fails, it does nothing destructive and the handoff remains " +
+        "safely stored.",
       skipPermission: true,
       parameters: {
         type: "object",
@@ -1437,15 +1606,34 @@ const session = await joinSession({
             "save_handoff_prompt first to store the handoff and get the seed.)"
           );
         }
-        const cwd = state.cwd || process.cwd();
+        const cwdResult = currentHandoffCwd();
+        if (!cwdResult.cwd) {
+          return (
+            "Cannot continue handoff: the current Herdr pane working directory " +
+            `could not be resolved. Nothing was done. [host: ${cwdResult.error}]`
+          );
+        }
+        const cwd = cwdResult.cwd;
         const sid = state.sessionId || invocation?.sessionId || null;
-        const result = runHandoffCutover(cwd, seed, sid);
+        const permissionMode =
+          state.pendingCutover?.seed === seed
+            ? state.pendingCutover.permissionMode
+            : null;
+        const result = runHandoffCutover(cwd, seed, sid, { permissionMode });
         if (!result || !result.ok) {
           const reason = result?.reason || "error";
           const tail =
             " Nothing destructive was done. The handoff is safely stored -- " +
             "resume it the normal way (paste the reply prompt into '/clear', or " +
             "run /resume-handoff in a fresh session in this worktree).";
+          if (result?.host === "herdr") {
+            return (
+              "Live cutover is unavailable: copilot-pane could not launch the " +
+              "seeded sibling from this Herdr pane." +
+              tail +
+              (result?.error ? ` [host: ${result.error}]` : "")
+            );
+          }
           if (reason === "no-worktree") {
             // The common bare-resume case: the process IS inside the wt-<id>
             // mux, but Copilot was launched with its cwd at HOME (e.g. a "Bare
@@ -1476,6 +1664,19 @@ const session = await joinSession({
             (result?.error ? ` [host: ${result.error}]` : "")
           );
         }
+        if (result.host === "herdr") {
+          if (result.startup_pending) {
+            return herdrStartupPendingMessage(result.new_pane);
+          }
+          return (
+            `Live cutover initiated through Herdr. A successor Copilot was ` +
+            `created in sibling pane ${result.new_pane || "?"} and its first ` +
+            `prompt was submitted to consume the saved handoff. The predecessor ` +
+            `pane remains the recovery point until that successful consumption, ` +
+            `then the successor stops its exact recorded pane. Do NOT start new ` +
+            `work here; simply end your turn.`
+          );
+        }
         return (
           `Live cutover initiated. A successor Copilot was spawned in a new window ` +
           `of this worktree's mux session (pane ${result.new_pane || "?"}) and ` +
@@ -1498,16 +1699,24 @@ const session = await joinSession({
         "'empty' because Copilot never received a submitted first prompt, so no " +
         "sessionStart fired, no changeover was recorded, and the predecessor is " +
         "still live (closing the empty window drops you back here). This tool " +
-        "recovers this worktree's stored handoff (agent-dispatch task, else " +
-        "worktree file), rebuilds the exact same cutover seed, and spawns a fresh " +
-        "seeded successor in the mux. Run it from the predecessor (the pane you " +
+        "recovers this checkout's stored handoff (agent-dispatch task, else " +
+        "machine-local file), rebuilds the exact same cutover seed, and spawns a " +
+        "fresh seeded successor through the active Herdr or mux host. Run it from " +
+        "the predecessor (the pane you " +
         "land on after closing the empty window). Takes no arguments.",
       skipPermission: true,
       parameters: { type: "object", properties: {} },
       handler: async (args, invocation) => {
         void args;
         ensureState(invocation);
-        const cwd = state.cwd || process.cwd();
+        const cwdResult = currentHandoffCwd();
+        if (!cwdResult.cwd) {
+          return (
+            "Cannot retry the cutover: the current Herdr pane working directory " +
+            `could not be resolved. Nothing was done. [host: ${cwdResult.error}]`
+          );
+        }
+        const cwd = cwdResult.cwd;
         const sid = state.sessionId || invocation?.sessionId || null;
 
         // Recover the saved handoff (task preferred, else file) and rebuild the
@@ -1515,8 +1724,11 @@ const session = await joinSession({
         let kind = null;
         let id = null;
         let filePath = null;
+        let permissionMode = null;
         let lead = leadFrom("");
-        const wtDir = agentWorktreesGet("worktree-dir", cwd, sid);
+        const wtDir = isHerdrPane()
+          ? null
+          : agentWorktreesGet("worktree-dir", cwd, sid);
         const worktree = wtDir ? basename(wtDir) : null;
         if (worktree) {
           const task = findHandoffTask(cwd, worktree);
@@ -1524,6 +1736,11 @@ const session = await joinSession({
             kind = "task";
             id = task.id;
             lead = leadFrom(task.title || task.name || "");
+            const decoded = decodeHandoffPayload(
+              readTaskPayloadRaw(cwd, task.id),
+            );
+            permissionMode =
+              decoded.metadata?.nativeContinuation?.permissionMode || null;
           }
         }
         if (!id) {
@@ -1533,13 +1750,15 @@ const session = await joinSession({
             id = file.record.id;
             filePath = file.path;
             lead = leadFrom(file.record.title || "");
+            permissionMode =
+              file.record.nativeContinuation?.permissionMode || null;
           }
         }
         if (!id) {
           return (
             "Cannot retry the cutover: no saved handoff was found for this " +
-            "worktree (no proposed agent-dispatch 'handoff' task pinned here, and " +
-            "no unconsumed worktree-state handoff file). If you have not saved " +
+            "checkout (no pending handoff task or unconsumed machine-local file). " +
+            "If you have not saved " +
             "one yet, run save_handoff_prompt first -- there is nothing to " +
             "re-attempt."
           );
@@ -1554,16 +1773,27 @@ const session = await joinSession({
                 worktreeDir: wtDir,
                 sessionId: sid,
                 muxSession: currentMuxSession(),
+                requiresNativeRestore: Boolean(permissionMode),
               }
             : { path: filePath },
         );
-        const result = runHandoffCutover(cwd, seed, sid);
+        const result = runHandoffCutover(
+          cwd, seed, sid, { permissionMode },
+        );
         if (!result || !result.ok) {
           const reason = result?.reason || "error";
           const tail =
             " Nothing destructive was done; the saved handoff is untouched. " +
             "Resume it the normal way (/resume-handoff in a fresh session in this " +
             "worktree, or paste the reply prompt into /clear).";
+          if (result?.host === "herdr") {
+            return (
+              "Cannot retry the cutover: copilot-pane could not launch a fresh " +
+              "seeded sibling from this Herdr pane." +
+              tail +
+              (result?.error ? ` [host: ${result.error}]` : "")
+            );
+          }
           if (reason === "no-worktree") {
             return (
               "Cannot retry the cutover: could not determine which worktree this " +
@@ -1590,6 +1820,19 @@ const session = await joinSession({
         }
         const src =
           kind === "task" ? `agent-dispatch task ${id}` : `handoff file ${id}`;
+        if (result.host === "herdr") {
+          if (result.startup_pending) {
+            return herdrStartupPendingMessage(result.new_pane);
+          }
+          return (
+            `Cutover re-attempted through Herdr from the saved handoff (${src}). ` +
+            `A fresh successor Copilot was created in sibling pane ` +
+            `${result.new_pane || "?"} and its first prompt was submitted. This ` +
+            `predecessor remains the recovery point until successful consumption, ` +
+            `then the successor stops its exact recorded pane. Do NOT start new ` +
+            `work here; end your turn.`
+          );
+        }
         return (
           `Cutover re-attempted from the saved handoff (${src}). A fresh ` +
           `successor Copilot was spawned in a new window of this worktree's mux ` +
@@ -1609,8 +1852,8 @@ const session = await joinSession({
       name: "handoff-continue",
       description:
         "Live-cutover handoff: generate a handoff for THIS session, spawn a " +
-        "seeded successor Copilot in a new mux window, cut the operator over to " +
-        "it; the successor retires the predecessor when it consumes the handoff.",
+        "seeded successor Copilot through the active Herdr or mux pane host, and " +
+        "preserve the predecessor until the selected host's safe lifecycle point.",
       handler: async (ctx) => {
         void ctx;
         await session.send({
@@ -1624,11 +1867,11 @@ const session = await joinSession({
             "`prompt_text` and a short specific `title` -- it stores the handoff " +
             "and returns a HANDOFF_SEED line; (4) call continue_handoff with " +
             "`seed` set to EXACTLY that HANDOFF_SEED string -- it spawns the " +
-            "seeded successor Copilot in a new window of this worktree's mux " +
-            "session and cuts the operator over. After continue_handoff returns " +
+            "seeded successor Copilot through the active Herdr or worktree mux " +
+            "host. After continue_handoff returns " +
             "its confirmation, DO NOT start new work -- just end your turn; this " +
-            "session remains as a recovery point until the successor consumes " +
-            "the handoff and retires it.",
+            "session remains as a recovery point until successful pickup, when the " +
+            "successor retires its exact identity-matched predecessor pane.",
           displayPrompt: "Live-cutover handoff (/handoff-continue)",
         });
       },
@@ -1636,15 +1879,23 @@ const session = await joinSession({
     {
       name: "resume-handoff",
       description:
-        "Dig up this worktree's pending handoff and inject its continuation " +
+        "Dig up this checkout's pending handoff and inject its continuation " +
         "prompt into THIS session (foreground). Consumes the agent-dispatch " +
-        "handoff task if present, else the newest matching worktree handoff file.",
+        "handoff task if present, else the newest matching machine-local file.",
       handler: async (ctx) => {
-        const cwd = state.cwd || process.cwd();
+        const cwdResult = currentHandoffCwd();
+        if (!cwdResult.cwd) {
+          await session.log(
+            `[Context Handoff] Cannot resume: ${cwdResult.error}`,
+            { level: "error" },
+          );
+          return;
+        }
+        const cwd = cwdResult.cwd;
         const sid = state.sessionId || ctx?.sessionId || "unknown";
 
         // Prefer an agent-dispatch handoff task pinned to this worktree.
-        if (agentDispatchAvailable()) {
+        if (!isHerdrPane() && agentDispatchAvailable()) {
           // Binding-first (#4098): pass the real session id (not the "unknown"
           // sentinel) so a bare-resumed session (cwd=HOME) still resolves its
           // worktree from the session binding.
@@ -1697,7 +1948,7 @@ const session = await joinSession({
           }
         }
 
-        // Fallback: the newest worktree-state handoff file for this worktree.
+        // Fallback: the newest checkout-scoped machine-local handoff file.
         const file = findHandoffFile(cwd, sid);
         if (file) {
           const consumed = consumeFileHandoff(
@@ -1839,20 +2090,20 @@ session.on("session.idle", () => {
   // The nudge JUST hands the agent to the context-handoff skill -- it does NOT
   // prescribe individual tool calls (generate_handoff_prompt/save_handoff_prompt/
   // continue_handoff) or a "write a file" outcome. The skill owns the sequencing;
-  // under a mux session that means the autonomous live cutover (spin up a
+  // under Herdr or mux that means the autonomous live cutover (spin up a
   // successor Copilot in place, end the turn), not a paste prompt.
   const msg = level === "hard"
     ? `[Context Handoff -- automated] Context utilization is ${usage.utilization} ` +
       `(${usage.tokens}). ` +
       `The configured hard threshold was reached; auto-compaction still triggers ` +
       `at ~80%. Invoke the context-handoff skill now to ` +
-      `hand off before context is lost -- under a mux session it cuts over to a ` +
+      `hand off before context is lost -- under Herdr or mux it cuts over to a ` +
       `fresh successor Copilot in place, automatically (no copy/paste); otherwise ` +
       `it stores the handoff and hands you a short resume prompt.`
     : `[Context Handoff -- automated] Context utilization is ${usage.utilization} ` +
       `(${usage.tokens}). ` +
       `The configured soft threshold was reached. Invoke the context-handoff skill ` +
-      `at the next clean boundary -- under a mux session it cuts over to a fresh ` +
+      `at the next clean boundary -- under Herdr or mux it cuts over to a fresh ` +
       `successor Copilot in place.`;
   session.send(msg).catch((e) =>
     session.log(`[Context Handoff] nudge send failed: ${e.message}`, { level: "warning" })
