@@ -33,17 +33,18 @@ as the boundary of the objective**.
 
 ## The core rule
 
-Context-handoff is **process-manager agnostic**.
+Context-handoff stores the brief and preserves native `/goal` continuity.
+After an authorized save, call `continue_handoff` with the exact returned
+`HANDOFF_SEED`; `/handoff-continue` requests this live path. End the source turn
+so final usage can settle before launch. Herdr or agent-worktrees creates the
+fixed successor; the extension restores and admits it before identity-checked
+retirement. Save alone does not launch.
 
-- It tracks context pressure.
-- It teaches the continuation rules.
-- It stores the baton.
-- It can signal that a pickup is requested.
-
-It does **not** spawn a successor, inspect mux state, retire panes, or perform
-cutover choreography. If a worktree manager, agent-bridge, or another control
-system wants to act on the pending handoff, it can. Otherwise a human can use
-the short seed manually.
+Requires Node.js and the tested Copilot CLI 1.0.84-3 native API. Do not use a
+plain text pickup to bypass native restoration. Running goals continue once
+with their exact remaining soft cap; paused, exhausted, completed, and no-goal
+handoffs submit no automatic business message. Hidden stopped GoalPanel is
+native behavior, not grounds to enable autopilot or grant credits.
 
 For a worktree-level cutover mismatch between the head-session ledger and a
 control plane's current sweep target, use the dedicated
@@ -162,7 +163,8 @@ more work left to do:
    the **Self-audit before declaring completion** step above first.
 4. **Call `save_handoff_prompt`.** This safely stores the baton and returns the
    short handoff seed.
-5. **Call `trigger_handoff` immediately.**
+5. **Call `trigger_handoff` immediately** -- or, when the baton carries a native
+   goal, **`continue_handoff` with the saved seed** (it launches the successor).
 
 Do **not** ask the user for confirmation first on this path. Running low on
 context while work remains is sufficient justification by itself.
@@ -187,7 +189,9 @@ listing a set of follow-up ideas or questions:
    when the branch itself didn't move; `trigger_handoff` otherwise reuses
    the pre-sync brief and silently omits that outcome. Then **call
    `trigger_handoff`.** Do not sync or mutate local history before the user
-   has agreed -- a decline must leave the worktree untouched.
+   has agreed -- a decline must leave the worktree untouched. For a baton
+   carrying a native goal, call `continue_handoff` with the saved seed instead of
+   `trigger_handoff`.
 
 Only this turn-end follow-up path is skippable via **autopilot** or prior
 explicit pre-authorization.
@@ -265,7 +269,8 @@ blockers, decisions, in-flight work, and required confirmations.
 
 ## `trigger_handoff`
 
-`trigger_handoff` is the explicit "arm pickup" step.
+`trigger_handoff` retains the older signal-only pickup path. New native-aware
+records (including no-goal saves) are directed to `continue_handoff`.
 
 - For a **context-pressure-driven** handoff with work still left to do, call it
   immediately after `save_handoff_prompt`.
@@ -329,6 +334,18 @@ under `manual-only`. Do not assume live cutover happens unless you have
 confirmed `mode: auto` is set.
 
 ## Resume flow
+
+An explicitly launched successor restores the native snapshot by normal cold
+resume, writes `context-handoff.md` through the public workspace API, and
+consumes its assigned task/file without a model admission turn. Preserve the
+source model, effort, context tier, agent, home and permissions. Herdr rejects
+unsupported manual/assisted launch modes before creating a pane.
+
+Use `retry_handoff_cutover` for the existing request, not a second save/spawn.
+Unknown launches or sends with no reconcilable public receipt preserve the
+source; never blindly replay. A queued send is not complete until its exact
+native user event exists. Identical goal text does not authorize overwriting a
+new user goal. Ordinary already-admitted deliveries never recreate goals.
 
 `/consume-handoff` is the canonical resume surface.
 

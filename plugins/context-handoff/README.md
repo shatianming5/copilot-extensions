@@ -2,12 +2,12 @@
 
 Context window monitoring and session handoff for GitHub Copilot CLI.
 
-This plugin is intentionally **process-manager agnostic**. It tracks context
-pressure, teaches the rules of engagement for continuation, stores durable
-handoff batons, and can **signal that a handoff pickup is requested**. It does
-**not** spawn successor sessions, inspect mux state, retire panes, or perform
-any other cutover choreography itself. Those actions belong to external control
-planes such as a worktree manager, agent-bridge, or a human operator.
+This plugin tracks context pressure, stores durable handoff briefs, and
+preserves native `/goal` execution across an explicitly requested live handoff.
+`continue_handoff` delegates process launch to Herdr or agent-worktrees and
+admits the successor before allowing identity-checked predecessor retirement.
+The legacy `trigger_handoff` signal-only route remains available for older
+text-only records.
 
 This plugin ships four cooperating payload pieces:
 
@@ -43,6 +43,79 @@ It does **not** own:
 If a control plane is present, it can watch the pending handoff state this
 plugin leaves behind and perform the actual cutover. If not, the plugin still
 returns a short handoff seed a human can use manually.
+
+**Fork exception -- native goal continuity.** A baton that carries a native
+goal (Copilot/Grok `/goal`) is launched by this plugin itself through
+`continue_handoff`, because the successor must start with the frozen objective
+before any control plane could seed it; see the next section.
+
+## Native goal continuity
+
+Requires Node.js and Copilot CLI **1.0.84-3** (the tested native API version).
+The extension uses the public SDK plus the published
+`session.autopilotObjective.getState` RPC, never patched CLI internals.
+
+1. Save the brief and call `continue_handoff` with its exact `HANDOFF_SEED`.
+   `/handoff-continue` requests both operations. Save alone does not launch.
+2. The source stops automatic execution, finishes the current turn, and freezes
+   final native usage at `session.idle`.
+3. A fixed, named successor starts **without `-i` or a model admission turn**.
+   Public workspace APIs carry the native-generated opaque objective snapshot;
+   normal exit and cold resume hydrate the native objective registry.
+4. The brief becomes `context-handoff.md` in the successor's session workspace.
+   Shared task/file consumption, model/agent/permission checks, and mux
+   bind/link/head acknowledgement precede activation.
+5. A running objective gets at most one business continuation. A queued send ID
+   alone is not admission: its exact public `user.message` must be observed
+   before predecessor retirement. Herdr retirement verifies the recorded
+   pane, terminal, and session identity.
+
+| Source intent | Successor behavior |
+|---|---|
+| Running, finite remaining budget | Resume with exactly `max(0, cap - exact native usage)` remaining |
+| Running, unlimited | Remain unlimited; an internal native ID may change |
+| Paused or exhausted | Remain stopped; no automatic business message |
+| Completed | Remain completed; never reopen automatically |
+| No native goal | Preserve the profile and brief without creating a goal or sending a business message |
+
+Credit limits are native **soft caps**, not hard billing limits. Preserve
+native decimal/nano-AIU accounting; zero never means unlimited. Stopped goals
+may retain the original positive cap and spent amount, including overshoot.
+Running goals display the real native GoalPanel. Native interactive/paused/
+completed modes intentionally hide it; do not add credits or enable autopilot
+just to display a panel.
+
+The runtime preserves the source model, reasoning effort, context tier, agent,
+`COPILOT_HOME`, and permission mode. The current Herdr launcher supports only
+`allow-all`; manual/assisted sources are rejected **before pane creation**, not
+silently widened. First use in an empty profile can require native extension
+trust confirmation for the plugin's existing capabilities.
+
+Linux Herdr/file-backed two-CLI handoffs, repeat handoffs, and native retry/
+conflict boundaries have real-runtime coverage. Task/mux ownership and psmux
+spaced-argument transport have regression fixtures; this is not a claim of
+real Windows acceptance.
+
+### Recovery
+
+- Retain the source checkpoint and fixed successor identity on failure.
+  `retry_handoff_cutover` reuses the existing saved request; do not save a new
+  baton while an existing launch is unresolved.
+- Interrupted first trust resumes the already-created empty receiver UUID.
+  A prepared receiver resumes instead of provisioning a second session.
+- Receiver preparation waits for the source's host-launch receipt before
+  writing its own checkpoint. Startup/trust can finish while this event-driven
+  wait is pending. An unknown host launch requires inspection of that receiver,
+  not another spawn.
+- A known queued send waits for its exact native event without resending.
+  A lost acknowledgement reconciles the unique continuation from public events;
+  an unknown outcome with no matching event stops and preserves the source.
+- Only an owned activation with an unchanged event watermark and no business
+  submission can be reactivated after an unlimited cold resume. Its prior
+  internal ID is recorded. Identical goal text alone never proves ownership.
+  A user's replacement objective is a conflict, not permission to overwrite it.
+- Ordinary admitted deliveries never rebuild the goal or replay the message.
+  The CLI fallback shares the restoration gate and cannot bypass hydration.
 
 ## Why the monitor is an extension
 
@@ -87,7 +160,8 @@ exact session folder. The checked-in static pointer instructs the agent to read
 that file if present. The hook itself emits only `{}`.
 
 A loaded extension exposes `generate_handoff_prompt`, `save_handoff_prompt`,
-`consume_handoff`, and `trigger_handoff`, plus `/handoff-continue` and
+`consume_handoff`, `continue_handoff`, `retry_handoff_cutover`, and
+`trigger_handoff`, plus `/handoff-continue` and
 `/resume-handoff`; `/extensions` lists it with source **plugin**. It
 intentionally does **not** emit a user-visible "Session started" breadcrumb.
 
@@ -145,10 +219,12 @@ boundary, writes the relay delta, and hands the next slice to the successor.
 The effort remains the durable source of truth; the handoff carries only the
 immediate baton.
 
-## `trigger_handoff`: the signal-only contract
+## `trigger_handoff`: legacy signal-only contract
 
-`trigger_handoff` is the plugin's one "arm the continuation" tool. It never
-performs process management.
+New extension saves include a native-presence checkpoint (including explicit
+absence). `trigger_handoff` directs these records to `continue_handoff` so that
+a text pickup cannot bypass native restoration. For older text-only records,
+the signal-only contract below applies.
 
 - For **context-pressure-driven** handoffs with remaining work, call it
   immediately after `save_handoff_prompt`.
@@ -218,6 +294,7 @@ selection:
 
 | Coordinator availability | Storage |
 |---|---|
+| Active Herdr pane | checkout-scoped one-time file, independent of agent-worktrees |
 | `agent-dispatch` reachable | proposed, handoff-labeled task pinned to the current worktree |
 | no `agent-dispatch` | one-time JSON file under the machine-local worktree state directory |
 
@@ -228,7 +305,9 @@ locator.
 
 ## Resuming
 
-A handoff is **never** auto-loaded.
+A saved handoff is **never** auto-loaded merely by opening another session.
+An explicitly launched native successor deterministically consumes its assigned
+brief during bootstrap, without an initial model prompt.
 
 - `/consume-handoff` is the canonical slash command. It prefers a pending
   worktree-pinned agent-dispatch handoff task and otherwise falls back to the

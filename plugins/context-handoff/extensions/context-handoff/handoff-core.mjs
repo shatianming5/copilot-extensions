@@ -34,6 +34,11 @@ import {
 import { supersededHandoffIds } from "./handoff-tasks.mjs";
 import { AGENT_WORKTREES_QUERY_TIMEOUT_MS } from "./cli-timeouts.mjs";
 import { DEFAULT_HANDOFF_MODE, automaticHandoffEnabled } from "./mode.mjs";
+import { nativeConsumeError } from "./native-goal.mjs";
+import {
+  isHerdrPane, herdrStateDir, resolveHerdrCwd,
+  captureHerdrPredecessor, retireHerdrPredecessor,
+} from "./herdr.mjs";
 
 export const HANDOFF_META_PREFIX = "<!-- context-handoff:";
 export const HANDOFF_META_SUFFIX = "-->";
@@ -1484,10 +1489,13 @@ export function collectCliHandoffFacts(cwd, sid) {
 }
 
 export function makeHandoffMetadata(
-  { sid, cwd, title, storage, taskId = null },
+  { sid, cwd, title, storage, taskId = null, nativeGoalCheckpoint = null, nativeGoalState = null },
   get = agentWorktreesGet,
 ) {
-  const { wtDir, worktree, stateDir } = worktreeInfo(cwd, sid, get);
+  const resolvedCwd = resolveHerdrCwd(cwd, runCli);
+  const { wtDir, worktree, stateDir } = isHerdrPane()
+    ? { wtDir: resolvedCwd, worktree: null, stateDir: herdrStateDir(resolvedCwd) }
+    : worktreeInfo(cwd, sid, get);
   const id = `handoff-${safePathSegment(sid)}`;
   return {
     kind: "context-handoff",
@@ -1496,12 +1504,15 @@ export function makeHandoffMetadata(
     storage,
     taskId,
     sessionId: sid,
-    cwd,
+    cwd: resolvedCwd,
     title: title || "",
     worktree,
     worktreeDir: wtDir,
     stateDir,
     createdAt: new Date().toISOString(),
+    ...(nativeGoalCheckpoint ? { nativeGoalCheckpoint } : {}),
+    ...(nativeGoalState ? { nativeGoalState } : {}),
+    ...(isHerdrPane() ? { predecessor: captureHerdrPredecessor(sid, runCli) } : {}),
   };
 }
 
@@ -1532,6 +1543,7 @@ export function decodeHandoffPayload(raw) {
 }
 
 export function handoffDirFor(cwd, sid, get = agentWorktreesGet) {
+  if (isHerdrPane()) return join(herdrStateDir(resolveHerdrCwd(cwd, runCli)), "handoff");
   const stateDir = get("worktree-state-dir", cwd, sid);
   return stateDir ? join(stateDir, "handoff") : null;
 }
@@ -1769,8 +1781,8 @@ export function writeJsonAtomic(path, value) {
 }
 
 // --- file-backed store ----------------------------------------------------
-export function saveFileHandoff(promptText, sid, cwd, title) {
-  const metadata = makeHandoffMetadata({ sid, cwd, title, storage: "file" });
+export function saveFileHandoff(promptText, sid, cwd, title, nativeGoalCheckpoint = null, nativeGoalState = null) {
+  const metadata = makeHandoffMetadata({ sid, cwd, title, storage: "file", nativeGoalCheckpoint, nativeGoalState });
   const dir = metadata.stateDir ? join(metadata.stateDir, "handoff") : null;
   if (!dir) {
     const resolution = agentWorktreesGetResult(
@@ -1980,6 +1992,8 @@ export function consumeFileHandoffOnce(
     if (!current) {
       return { ok: false, message: "File-backed handoff disappeared before consumption." };
     }
+    const nativeError = nativeHandoffConsumeError(current.record, sid, current.record.id);
+    if (nativeError) return { ok: false, id: current.record.id, message: nativeError };
     if (current.record.consumed) {
       if (sid && current.record.consumedBySession === sid) {
         return {
@@ -2140,8 +2154,8 @@ export function handoffDedupKey(sid, promptText) {
   return `handoff-${sid}-${contentHash}`;
 }
 
-export function dispatchHandoff(promptText, sid, cwd, title) {
-  const metadata = makeHandoffMetadata({ sid, cwd, title, storage: "agent-dispatch" });
+export function dispatchHandoff(promptText, sid, cwd, title, nativeGoalCheckpoint = null, nativeGoalState = null) {
+  const metadata = makeHandoffMetadata({ sid, cwd, title, storage: "agent-dispatch", nativeGoalCheckpoint, nativeGoalState });
   const dir = metadata.stateDir ? join(metadata.stateDir, "handoff") : null;
   if (!dir) return null;
   const tmp = join(dir, `${metadata.id}-payload-${process.pid}.md`);
@@ -2179,7 +2193,7 @@ export function dispatchHandoff(promptText, sid, cwd, title) {
   }
 }
 
-function describeCliError(error) {
+export function describeCliError(error) {
   return (
     error?.stderr
     || error?.stdout
@@ -2206,7 +2220,7 @@ function cliJson(bin, argv, cwd, timeout = 15000, execute = runCli) {
 
 function sessionStateDirFor(sessionId) {
   const safe = safePathSegment(sessionId);
-  return join(homedir(), ".copilot", "session-state", safe);
+  return join(process.env.COPILOT_HOME || join(homedir(), ".copilot"), "session-state", safe);
 }
 
 export function sessionStateHandoffPath(sessionId) {
@@ -2224,10 +2238,11 @@ export function readSessionStateHandoff(sessionId) {
 }
 
 export function writeSessionStateHandoff(
-  { sid, promptText, stored, seed },
+  { sid, promptText, stored, seed, nativeGoal },
 ) {
   if (!sid) return { ok: false, path: null, error: "session id is unavailable" };
   const path = sessionStateHandoffPath(sid);
+  const previous = readSessionStateHandoff(sid)?.record;
   const record = {
     kind: "context-handoff-session-request",
     version: 1,
@@ -2241,11 +2256,14 @@ export function writeSessionStateHandoff(
     stateDir: stored.metadata?.stateDir || null,
     title: stored.metadata?.title || "",
     seed,
+    predecessor: stored.metadata?.predecessor || null,
     promptText,
     consumed: false,
     consumedAt: null,
     consumedBySession: null,
     createdAt: new Date().toISOString(),
+    ...(nativeGoal ? { nativeGoal } : previous?.handoffId === stored.id && previous.nativeGoal
+      ? { nativeGoal: previous.nativeGoal } : {}),
   };
   try {
     mkdirSync(dirname(path), { recursive: true });
@@ -2264,10 +2282,14 @@ export function writeSessionStateHandoff(
 
 export function markSessionStateHandoffConsumed(
   predecessorSessionId,
-  { consumedBySession = null, handoffId = null, aborted = false, abortReason = null } = {},
+  {
+    consumedBySession = null, handoffId = null, aborted = false, abortReason = null,
+    metadata = null,
+  } = {},
 ) {
   if (!predecessorSessionId) return null;
-  const found = readSessionStateHandoff(predecessorSessionId);
+  const found = readNativeHandoffCheckpoint(metadata, handoffId)
+    || readSessionStateHandoff(predecessorSessionId);
   if (!found?.record) return null;
   const current = found.record;
   if (handoffId && current.handoffId && current.handoffId !== handoffId) {
@@ -2275,13 +2297,37 @@ export function markSessionStateHandoffConsumed(
   }
   const consumed = {
     ...current,
-    consumed: true,
+    consumed: current.nativeGoal?.intent === "running"
+      ? Boolean(current.nativeGoal.continuationMessageId) : true,
     consumedAt: current.consumedAt || new Date().toISOString(),
     consumedBySession: consumedBySession || current.consumedBySession || null,
     ...(aborted ? { aborted: true, abortReason: abortReason || current.abortReason || null } : {}),
+    ...(current.nativeGoal ? {
+      nativeGoal: { ...current.nativeGoal, consumedBySession },
+    } : {}),
   };
   writeJsonAtomic(found.path, consumed);
   return consumed;
+}
+
+export function readNativeHandoffCheckpoint(metadata, handoffId) {
+  if (!metadata?.nativeGoalCheckpoint) return null;
+  const record = JSON.parse(readFileSync(metadata.nativeGoalCheckpoint, "utf-8"));
+  if (record.kind !== "context-handoff-session-request"
+    || record.sessionId !== metadata.sessionId || record.handoffId !== handoffId
+    || !record.nativeGoal) {
+    throw new Error("Native handoff checkpoint does not match this baton; source is preserved.");
+  }
+  return { path: metadata.nativeGoalCheckpoint, record };
+}
+
+export function nativeHandoffConsumeError(metadata, sid, handoffId) {
+  try {
+    const checkpoint = readNativeHandoffCheckpoint(metadata, handoffId);
+    return checkpoint ? nativeConsumeError({ nativeGoal: checkpoint.record.nativeGoal }, sid) : null;
+  } catch (error) {
+    return `Cannot read native handoff checkpoint: ${error.message}`;
+  }
 }
 
 function deliveryCheckpointPath(metadata, token) {
@@ -2558,6 +2604,8 @@ export function consumeDispatchHandoffTask(
   } = {},
 ) {
   const before = decodeHandoffPayload(readPayload(cwd, taskId));
+  const nativeError = nativeHandoffConsumeError(before.metadata, sid, taskId);
+  if (nativeError) return { ok: false, id: taskId, message: nativeError };
   const prepared = prepareTaskDeliveryCheckpoint(
     cwd, taskId, sid, before, stateDirResolver,
   );
@@ -2604,7 +2652,7 @@ export function consumeDispatchHandoffTask(
   const predecessorSessionId = decoded.metadata?.sessionId || checkpoint.predecessorSession || null;
   markSessionStateHandoffConsumed(
     predecessorSessionId,
-    { consumedBySession: sid, handoffId: taskId },
+    { consumedBySession: sid, handoffId: taskId, metadata: decoded.metadata },
   );
   safePromoteHead(
     promoteHead,
@@ -2642,9 +2690,23 @@ export function consumeFileHandoff(
   const predecessorSessionId = record.sessionId || null;
   markSessionStateHandoffConsumed(
     predecessorSessionId,
-    { consumedBySession: sid, handoffId: record.id },
+    { consumedBySession: sid, handoffId: record.id, metadata: record },
   );
   safePromoteHead(promoteHead, cwd, record.worktree || null, predecessorSessionId, sid);
+  let retire = null;
+  if (record.predecessor?.transport === "herdr" && !record.nativeGoalCheckpoint) {
+    const source = readSessionStateHandoff(record.sessionId);
+    if (source?.record?.retired) {
+      retire = source.record.retired;
+    } else {
+      try {
+        retire = retireHerdrPredecessor(record, sid, runCli);
+        if (source) writeJsonAtomic(source.path, { ...source.record, retired: retire });
+      } catch (error) {
+        retire = { retired: false, manualCleanup: error.message };
+      }
+    }
+  }
   return {
     ok: true,
     id: record.id,
@@ -2654,6 +2716,7 @@ export function consumeFileHandoff(
     resumedDelivery: consumed.resumedDelivery,
     predecessorSession: predecessorSessionId,
     worktree: record.worktree || null,
+    ...(retire ? { retire } : {}),
   };
 }
 
@@ -2696,6 +2759,12 @@ export function formatConsumeResult(
         : "")
     );
   }
+  if (result.metadata?.nativeGoalCheckpoint) {
+    const checkpoint = readNativeHandoffCheckpoint(result.metadata, result.id);
+    if (checkpoint.record.nativeGoal.admissionComplete) {
+      return "This native handoff is already admitted in this session. Do not replay the payload or submit another continuation.";
+    }
+  }
   return [
     "## Handoff Consumed",
     "",
@@ -2708,13 +2777,17 @@ export function formatConsumeResult(
       ? `**Completion:** when the handoff goal is reached, run \`agent-dispatch complete ${result.id}\`.`
       : null,
     "",
-    CONTINUATION_DIRECTIVE,
+    result.metadata?.nativeGoalCheckpoint
+      ? "Native handoff admission is pending. End this turn without business work; the native adapter owns context delivery and continuation."
+      : CONTINUATION_DIRECTIVE,
     "",
     HANDOFF_MECHANISM_AWARENESS,
     "",
     "---",
     "",
-    result.payload || "(The handoff payload was empty.)",
+    result.metadata?.nativeGoalCheckpoint
+      ? "The brief will be available in context-handoff.md after deterministic admission."
+      : result.payload || "(The handoff payload was empty.)",
   ].filter(Boolean).join("\n");
 }
 
@@ -3141,7 +3214,10 @@ export function pickupSignals(cwd, sid, stored, sessionStatePath, execute = runC
 // extension's save_handoff_prompt store selection. Returns:
 //   { storage: "agent-dispatch"|"file", id, taskId?, path?, metadata }
 // On failure returns a storage:null result with the resolver/write diagnostic.
-export function storeHandoff({ promptText, sid, cwd, title, preferTask = true }) {
+export function storeHandoff({
+  promptText, sid, cwd, title, preferTask = true,
+  nativeGoalCheckpoint = null, nativeGoalState = null,
+}) {
   // Deliberately does NOT touch the worktree's own record: `storeHandoff`
   // backs BOTH `save_handoff_prompt` (documented as the "safe,
   // non-committal" step that must never arm pickup) and `trigger_handoff`
@@ -3156,8 +3232,9 @@ export function storeHandoff({ promptText, sid, cwd, title, preferTask = true })
   // gets tracked at all), but the monitor's own spawn-eligibility gate
   // requires `live_cutover: true`, which is only ever passed when `mode:
   // auto` (or an explicit `force`) is in effect.
-  if (preferTask && agentDispatchAvailable()) {
-    const task = dispatchHandoff(promptText, sid, cwd, title);
+  // A Herdr pane stores a file baton beside its own state (herdr.mjs).
+  if (preferTask && !isHerdrPane() && agentDispatchAvailable()) {
+    const task = dispatchHandoff(promptText, sid, cwd, title, nativeGoalCheckpoint, nativeGoalState);
     if (task) {
       return {
         storage: "agent-dispatch",
@@ -3167,7 +3244,7 @@ export function storeHandoff({ promptText, sid, cwd, title, preferTask = true })
       };
     }
   }
-  const file = saveFileHandoff(promptText, sid, cwd, title);
+  const file = saveFileHandoff(promptText, sid, cwd, title, nativeGoalCheckpoint, nativeGoalState);
   if (!file?.path) {
     return {
       storage: null,
