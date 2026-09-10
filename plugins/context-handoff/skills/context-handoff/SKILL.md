@@ -273,7 +273,7 @@ When the user says "resume from handoff", "pick up from last session", or
 similar **without pasting an exact handoff id/prompt**, do not begin with a
 global agent-dispatch query or cross-session search. Let `/resume-handoff`
 resolve the current checkout's machine-local file first. Outside Herdr, the
-agent-worktrees state remains the authoritative first stop:
+worktree-local state remains the authoritative first stop:
 
 1. Resolve the local state directory with
    `<agent-worktrees catalog argv[0]> get worktree-state-dir`. If the session resumed with a CWD
