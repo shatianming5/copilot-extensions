@@ -123,6 +123,21 @@ the user explicitly requested an archival continuation prompt.
 
 ## How to Generate
 
+**Native goals:** use the in-session tools, not the SDK-free fallback. Native
+handoff supports allow-all permission mode only; manual/assisted requests must
+stop before source pause or pane creation. End the source turn after cutover is
+armed so its usage can settle. The assigned empty receiver stores the opaque
+snapshot, exits and cold-resumes with the exact profile before consumption.
+Paused/exhausted/completed goals must not start business work automatically.
+Never copy old history, force a permission/profile setting, or treat a file
+write as restored native state. Legacy `nativeContinuation` / `nativeState`
+batons require a fresh save from the preserved source.
+
+For a native launch failure, retain the same checkpoint/receiver/token.
+Structured pre-creation failures can be explicitly retried; a retained pane or
+unknown launch outcome must not create another receiver. The successful native
+consumer owns single continuation admission and identity-checked retirement.
+
 A handoff has three parts: the **stored handoff** (the full continuation
 context), an optional **live cutover** that spins up the successor *in place*,
 and a **short paste prompt** for environments where cutover is not available.

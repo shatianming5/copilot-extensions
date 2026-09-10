@@ -11,6 +11,8 @@ folds into the same idempotent tracking.register_session the hook uses.
 from __future__ import annotations
 
 import argparse
+import json
+import subprocess
 from pathlib import Path
 
 from agent_worktrees import __main__ as m
@@ -49,6 +51,34 @@ def _neutralize(monkeypatch, captured: dict) -> None:
 
 
 class TestBindSession:
+    def test_native_consumer_accepts_real_token_bound_head_receipt(
+        self, tmp_tracking_dir: Path, monkeypatch_config, monkeypatch
+    ):
+        from agent_worktrees import tracking
+
+        _save_record(tmp_tracking_dir, "wt-native", "/tmp/src/wt-native")
+        captured: dict = {}
+        _neutralize(monkeypatch, captured)
+        assert m.cmd_bind_session(_args(worktree_dir="/tmp/src/wt-native", session_id="source")) == 0
+        record = load_record(tmp_tracking_dir / "wt-native.yaml")
+        tracking.open_handoff(record, "source", "owned-token")
+        captured.clear()
+        assert m.cmd_bind_session(_args(
+            worktree_dir="/tmp/src/wt-native", session_id="target", handoff_token="owned-token",
+        )) == 0
+        record = load_record(tmp_tracking_dir / "wt-native.yaml")
+        assert record.handoffs[-1].successor == "target"
+        assert record.resolved_head_session == "target"
+        native = Path(__file__).resolve().parents[2] / "context-handoff/extensions/context-handoff/native-runtime.mjs"
+        subprocess.run([
+            "node", "--input-type=module", "-e",
+            f"import {{ bindNativeSuccessor }} from {json.dumps(native.as_uri())};"
+            "const receipt = process.argv[1];"
+            "bindNativeSuccessor({worktree:'wt-native', worktreeDir:'/tmp/src/wt-native',"
+            "handoffId:'owned-token',nativeGoal:{launchTransport:'mux'}}, 'target', () => receipt);",
+            json.dumps(captured),
+        ], check=True, capture_output=True, text=True)
+
     def test_binds_from_worktree_dir(
         self, tmp_tracking_dir: Path, monkeypatch_config, monkeypatch
     ):

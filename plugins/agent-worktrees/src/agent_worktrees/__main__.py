@@ -1859,6 +1859,26 @@ def cmd_handoff_cutover(args: argparse.Namespace) -> int:
 
     raw_id = getattr(args, "worktree_id", None)
     session_id = getattr(args, "session_id", None)
+    native_checkpoint = getattr(args, "native_handoff", None)
+    native_launcher = getattr(args, "native_launcher", None)
+    if native_checkpoint or native_launcher:
+        if not native_checkpoint or not native_launcher:
+            return _json_error("Native handoff requires both checkpoint and launcher.")
+        try:
+            native_record = json.loads(Path(native_checkpoint).read_text(encoding="utf-8"))
+            native_goal = native_record["nativeGoal"]
+            native_successor = native_goal["successorSessionId"]
+            if native_goal.get("permissionMode") != "allow-all":
+                raise ValueError(
+                    f"Native handoff cannot preserve {native_goal.get('permissionMode')}; "
+                    "no pane was created."
+                )
+            if native_record["sessionId"] != session_id:
+                raise ValueError("Native checkpoint source does not match the cutover owner.")
+            if native_goal["phase"] != "frozen":
+                raise ValueError("Native successor is already being prepared; do not replay.")
+        except (OSError, ValueError, KeyError) as exc:
+            return _json_error(str(exc))
     config = None
     if raw_id:
         wt_id = _resolve_worktree_id(raw_id)
@@ -1990,6 +2010,12 @@ def cmd_handoff_cutover(args: argparse.Namespace) -> int:
         or (None if anchor_mode else sessions.mux_active_pane(wt_id))
     )
 
+    if native_checkpoint:
+        launch_cmd = [
+            "node", native_launcher, "--checkpoint", native_checkpoint,
+            "--cli", launch_cmd[0], "--", *launch_cmd[1:],
+            "--session-id", native_successor,
+        ]
     if getattr(args, "dry_run", False):
         dry_result = {
             "ok": True, "dry_run": True,
@@ -2009,10 +2035,17 @@ def cmd_handoff_cutover(args: argparse.Namespace) -> int:
         work_dir,
         launch_cmd,
         env,
-        initial_prompt=seed,
+        initial_prompt=None if native_checkpoint else seed,
         session_name=mux_session,
     )
     if not result.get("ok"):
+        if native_checkpoint:
+            _json_output({
+                **result, "ok": False, "old_pane": old_pane,
+                "session": mux_session or sessions.mux_session_name(wt_id),
+                "native_handoff": native_checkpoint,
+            })
+            return 4
         return _json_error(
             f"failed to open successor window: {result.get('error')}",
             exit_code=4,
@@ -2040,6 +2073,7 @@ def cmd_handoff_cutover(args: argparse.Namespace) -> int:
         "seeded": bool(result.get("prompt_received")),
         "seed_ready": bool(result.get("prompt_received")),
         "seed_method": "interactive-argv",
+        **({"native_handoff": native_checkpoint, "startup_pending": True} if native_checkpoint else {}),
     }
     if selection.assignment is not None:
         response["profile_assignment"] = profile_assignment.metadata(
@@ -17083,6 +17117,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", default=None,
                    help="Seed prompt for the successor's first interactive "
                         "turn (copilot -i). Required in spawn mode.")
+    p.add_argument("--native-handoff", default=None, help="Frozen native-goal handoff checkpoint.")
+    p.add_argument("--native-launcher", default=None, help="Payload-local native preparation/resume runner.")
+    p.add_argument("--handoff-token", default=None, help="Saved handoff token (binding remains receiver-owned).")
     p.add_argument("--worktree-id", dest="worktree_id", default=None,
                    help="Target worktree (default: infer from cwd)")
     p.add_argument("--session-id", dest="session_id", default=None,

@@ -130,6 +130,10 @@ as warnings; they do not block the session.
 
 ## Live cutover keeps a recovery predecessor
 
+Native-goal handoffs use the cold-resume sequence below rather than submitting
+the seed as a business prompt. The existing seed transport in this section
+continues to serve plain handoffs without a native objective.
+
 A live cutover (`continue_handoff`) selects the pane host already carrying the
 current session. In Herdr it writes the successor seed to a short-lived,
 owner-readable task file and invokes `~/.local/bin/copilot-pane launch --role
@@ -188,7 +192,7 @@ baton: an active effort is the source of truth and completion gate, so the
 successor selects its next authorized Plan or Validation Plan item and drives
 toward `Done` rather than finalizing after a handoff task, phase, or pull request.
 
-**Failed-successor recovery (`retry_handoff_cutover`).** The native `-i`
+**Plain failed-successor recovery (`retry_handoff_cutover`).** The native `-i`
 transport is receipt-checked by the pane wrapper; a rejected flag or immediately
 exiting successor is reaped without retiring the predecessor. Because the
 handoff is already stored, `retry_handoff_cutover` re-attempts the cutover **from
@@ -213,6 +217,63 @@ This split follows the repo-wide
 [`primitives below, orchestration above`](../../docs/patterns/README.md)
 invariant: agent-worktrees provides the lower-level session/worktree mechanisms,
 while context-handoff composes the handoff policy above them.
+
+### Native goal restoration and recovery
+
+A native objective is not restored merely by writing its JSON file. The old
+`nativeContinuation` implementation wrote persistence and compared that file;
+it did not prove that the live native registry had hydrated the goal. This
+version replaces that path with a `nativeGoal` stage ledger:
+
+1. Save the brief and reserve one successor UUID. On explicit cutover, capture
+   the exact model, effort, context tier, custom agent and permission profile,
+   pause the source, then freeze its opaque objective snapshot at session idle
+   after usage settles.
+2. Launch an empty **named** receiver with that profile. Store the opaque
+   snapshot through the workspace API and exit normally. No old history or
+   business prompt is copied into preparation.
+3. Cold-resume the same UUID. Read the live native objective projection and
+   confirm identity, lifecycle and exact nano-AIU usage before consuming the
+   task/file baton.
+4. Bind a mux successor to the existing fork's exact handoff token and head.
+   For a running goal, reactivate only its remaining budget and admit one
+   continuation message. Paused, exhausted and completed goals remain stopped.
+   Native reactivation may allocate a new internal ID without creating a
+   second logical transfer or message.
+5. Retire the identity-matched predecessor only after admission. Herdr reuses
+   the existing terminal/session identity checks. Mux uses this fork's explicit
+   `bind-session` and `handoff-cutover --retire-pane` contract; no upstream
+   signal-only monitor, reviewer-loop or state-root framework is required.
+
+Native handoff currently supports **allow-all only** on both hosts. Manual and
+assisted native requests are rejected before source pause or receiver creation,
+including the direct mux CLI and preparation/resume runner. The extension never
+changes the permission mode to make admission succeed. Herdr's separately
+managed `copilot-pane` must support `--native-handoff` and `--native-launcher`.
+The existing agent-worktrees/agent-dispatch commands must resolve from the
+session's normal command environment; no installer or resolution policy changes
+are part of this feature.
+
+Custom-agent selection can arrive after extension startup. Bootstrap subscribes
+before reading the agent, waits without blocking extension initialization, and
+then asserts the exact profile. Default-agent launches do not wait for a custom
+selection event. A genuine mismatch stops admission without forcing a profile.
+
+Recovery reuses the same checkpoint, receiver and token. Structured mux exit
+1/2/3 receipts prove a pre-creation rejection and permit an explicit retry.
+Exit 4 with a retained `new_pane` is persisted even though the CLI exited
+nonzero; it is not permission to spawn again. A missing receipt, malformed
+response or exit-4 result without a pane stays unresolved. Unknown Herdr launch
+outcomes also remain unresolved. Inspect the existing receiver rather than
+blindly replaying it. A lost task-consume acknowledgement similarly stops for
+inspection instead of consuming again.
+
+Legacy `nativeContinuation` / `nativeState` batons are explicitly rejected
+before consumption. Save a fresh native baton from the preserved source;
+copying an old file is not evidence of native hydration. The SDK-free fallback
+cannot perform native migration and refuses these batons. Plain handoffs,
+ordinary paste/resume, effort/status records and unrelated fork behavior remain
+on their existing paths.
 
 ## Standalone and degraded modes
 

@@ -20,12 +20,13 @@ import {
   writeFileSync, readFileSync, existsSync, mkdirSync, renameSync, unlinkSync,
   openSync, closeSync, statSync,
 } from "node:fs";
-import { join, basename, parse, relative, resolve } from "node:path";
+import { join, basename, dirname, parse, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { execSync, execFileSync } from "node:child_process";
 import { leadFrom, buildCutoverSeed } from "./cutover-seed.mjs";
 import { supersededHandoffIds } from "./handoff-tasks.mjs";
 import { AGENT_WORKTREES_QUERY_TIMEOUT_MS } from "./cli-timeouts.mjs";
+import { nativeConsumeError } from "./native-goal.mjs";
 
 export const HANDOFF_META_PREFIX = "<!-- context-handoff:";
 export const HANDOFF_META_SUFFIX = "-->";
@@ -404,7 +405,7 @@ export function worktreeInfo(
 
 export function makeHandoffMetadata({
   sid, cwd, title, storage, taskId = null, predecessor = null,
-  nativeContinuation = null,
+  nativeContinuation = null, nativeGoalCheckpoint = null,
 }) {
   const { wtDir, worktree, stateDir } = worktreeInfo(cwd, sid);
   const id = `handoff-${safePathSegment(sid)}`;
@@ -423,6 +424,7 @@ export function makeHandoffMetadata({
     muxSession: currentMuxSession(),
     predecessor,
     nativeContinuation,
+    ...(nativeGoalCheckpoint ? { nativeGoalCheckpoint } : {}),
     stateDir,
     createdAt: new Date().toISOString(),
   };
@@ -473,7 +475,7 @@ export function writeJsonAtomic(path, value) {
 
 // --- file-backed store ----------------------------------------------------
 export function saveFileHandoff(
-  promptText, sid, cwd, title, nativeContinuation = null,
+  promptText, sid, cwd, title, nativeContinuation = null, nativeGoalCheckpoint = null,
 ) {
   const identity = resolveHerdrPredecessorIdentity(sid);
   if (identity.error) return { error: identity.error };
@@ -484,6 +486,7 @@ export function saveFileHandoff(
     storage: "file",
     predecessor: identity.predecessor,
     nativeContinuation,
+    nativeGoalCheckpoint,
   });
   const dir = handoffDirFor(cwd, sid);
   if (!dir) {
@@ -659,6 +662,8 @@ export function consumeFileHandoffOnce(
     if (!current) {
       return { ok: false, message: "File-backed handoff disappeared before consumption." };
     }
+    const nativeError = nativeHandoffConsumeError(current.record, sid, current.record.id);
+    if (nativeError) return { ok: false, message: nativeError };
     if (current.record.consumed) {
       if (sid && current.record.consumedBySession === sid) {
         return {
@@ -712,10 +717,10 @@ export function abandonSupersededHandoffs(cwd, worktree, keepId) {
 }
 
 export function dispatchHandoff(
-  promptText, sid, cwd, title, nativeContinuation = null,
+  promptText, sid, cwd, title, nativeContinuation = null, nativeGoalCheckpoint = null,
 ) {
   const metadata = makeHandoffMetadata({
-    sid, cwd, title, storage: "agent-dispatch", nativeContinuation,
+    sid, cwd, title, storage: "agent-dispatch", nativeContinuation, nativeGoalCheckpoint,
   });
   const dir = metadata.stateDir ? join(metadata.stateDir, "handoff") : null;
   if (!dir) return null;
@@ -800,6 +805,7 @@ export function runHerdrHandoffCutover(
     now = Date.now,
     launcherPath = join(home, ".local", "bin", "copilot-pane"),
     permissionMode = null,
+    native = null,
   } = {},
 ) {
   const cwdResult = resolveHandoffCwd(cwd, { execute, env, home });
@@ -838,6 +844,9 @@ export function runHerdrHandoffCutover(
     if (permissionMode) {
       launcherArgs.push("--permission-mode", permissionMode);
     }
+    if (native) {
+      launcherArgs.push("--native-handoff", native.checkpoint, "--native-launcher", native.launcher);
+    }
     const output = execute(
       launcherPath,
       launcherArgs,
@@ -845,6 +854,7 @@ export function runHerdrHandoffCutover(
     );
     const launched = parseHerdrLaunchOutput(output);
     if (!launched.pane || !launched.sessionId) {
+      if (native) throw new Error("copilot-pane receiver identity is unresolved; do not launch another.");
       return {
         ok: false,
         host: "herdr",
@@ -862,6 +872,7 @@ export function runHerdrHandoffCutover(
       predecessor_retirement: "after-consume",
     };
   } catch (error) {
+    if (native) throw error;
     const detail = commandErrorDetail(error);
     return {
       ok: false,
@@ -923,6 +934,7 @@ export function runHandoffCutover(
 // On failure returns a storage:null result with the resolver/write diagnostic.
 export function storeHandoff({
   promptText, sid, cwd, title, preferTask = true, nativeContinuation = null,
+  nativeGoalCheckpoint = null,
 }) {
   const cwdResult = resolveHandoffCwd(cwd);
   if (!cwdResult.cwd) {
@@ -936,7 +948,7 @@ export function storeHandoff({
   cwd = cwdResult.cwd;
   if (preferTask && !isHerdrPane() && agentDispatchAvailable()) {
     const task = dispatchHandoff(
-      promptText, sid, cwd, title, nativeContinuation,
+      promptText, sid, cwd, title, nativeContinuation, nativeGoalCheckpoint,
     );
     if (task) {
       noteHandoffInRecord(cwd, sid, task.id, title);
@@ -944,7 +956,7 @@ export function storeHandoff({
     }
   }
   const file = saveFileHandoff(
-    promptText, sid, cwd, title, nativeContinuation,
+    promptText, sid, cwd, title, nativeContinuation, nativeGoalCheckpoint,
   );
   if (!file?.path) {
     return { storage: null, id: null, metadata: null, error: file?.error || "unknown file-store failure" };
@@ -968,7 +980,7 @@ export function buildSeedForStored(stored, { retry = true } = {}) {
     sessionId: md.sessionId || null,
     path: stored.path || null,
     muxSession: md.muxSession || null,
-    requiresNativeRestore: Boolean(md.nativeContinuation),
+    requiresNativeRestore: Boolean(md.nativeContinuation || md.nativeGoalCheckpoint),
   });
 }
 
@@ -999,4 +1011,108 @@ export function saveAndCutover({
     });
   }
   return result;
+}
+
+export function sessionStateHandoffPath(sessionId) {
+  return join(process.env.COPILOT_HOME || join(homedir(), ".copilot"),
+    "session-state", safePathSegment(sessionId), "handoff-request.json");
+}
+
+export function readSessionStateHandoff(sessionId) {
+  const path = sessionStateHandoffPath(sessionId);
+  if (!existsSync(path)) return null;
+  return { path, record: JSON.parse(readFileSync(path, "utf8")) };
+}
+
+export function writeSessionStateHandoff({ sid, promptText, stored, seed, nativeGoal }) {
+  if (!sid) return { ok: false, error: "session id is unavailable" };
+  const path = sessionStateHandoffPath(sid);
+  const previous = readSessionStateHandoff(sid)?.record;
+  const record = {
+    kind: "context-handoff-session-request", version: 1, sessionId: sid,
+    storage: stored.storage, handoffId: stored.id, taskId: stored.taskId || null,
+    handoffPath: stored.path || null, worktree: stored.metadata?.worktree || null,
+    worktreeDir: stored.metadata?.worktreeDir || null, stateDir: stored.metadata?.stateDir || null,
+    title: stored.metadata?.title || "", seed, promptText,
+    predecessor: stored.metadata?.predecessor || null,
+    consumed: false, consumedAt: null, consumedBySession: null,
+    createdAt: new Date().toISOString(),
+    ...(nativeGoal ? { nativeGoal } : previous?.handoffId === stored.id && previous.nativeGoal
+      ? { nativeGoal: previous.nativeGoal } : {}),
+  };
+  mkdirSync(dirname(path), { recursive: true });
+  writeJsonAtomic(path, record);
+  return { ok: true, path, record };
+}
+
+export function readNativeHandoffCheckpoint(metadata, handoffId) {
+  if (!metadata?.nativeGoalCheckpoint) return null;
+  const record = JSON.parse(readFileSync(metadata.nativeGoalCheckpoint, "utf8"));
+  if (record.kind !== "context-handoff-session-request"
+    || record.sessionId !== metadata.sessionId || record.handoffId !== handoffId
+    || !record.nativeGoal) {
+    throw new Error("Native handoff checkpoint does not match this baton; source is preserved.");
+  }
+  return { path: metadata.nativeGoalCheckpoint, record };
+}
+
+export function nativeHandoffConsumeError(metadata, sid, handoffId) {
+  if (metadata?.nativeContinuation || metadata?.nativeState) {
+    return "Legacy native handoff cannot prove registry hydration. Save a new baton from the source; predecessor preserved.";
+  }
+  try {
+    const checkpoint = readNativeHandoffCheckpoint(metadata, handoffId);
+    return checkpoint ? nativeConsumeError({ nativeGoal: checkpoint.record.nativeGoal }, sid) : null;
+  } catch (error) {
+    return `Cannot read native handoff checkpoint: ${error.message}`;
+  }
+}
+
+function markNativeHandoffConsumed(metadata, sid, handoffId) {
+  const found = readNativeHandoffCheckpoint(metadata, handoffId);
+  if (!found) return;
+  const current = found.record;
+  writeJsonAtomic(found.path, {
+    ...current,
+    consumed: current.nativeGoal.intent !== "running"
+      || Boolean(current.nativeGoal.continuationMessageId),
+    consumedAt: current.consumedAt || new Date().toISOString(),
+    consumedBySession: sid,
+    nativeGoal: { ...current.nativeGoal, consumedBySession: sid },
+  });
+}
+
+// Native admission uses the same one-time file lock as the plain CLI. Retirement
+// belongs to native-runtime after hydration, binding and continuation admission.
+export function consumeFileHandoff(cwd, sid, handoffId, explicitPath = null) {
+  const result = consumeFileHandoffOnce(cwd, sid, handoffId, explicitPath);
+  if (!result.ok) return result;
+  markNativeHandoffConsumed(result.record, sid, result.record.id);
+  return {
+    ok: true, id: result.record.id, path: result.path,
+    metadata: result.record, payload: result.record.promptText,
+  };
+}
+
+export function consumeDispatchHandoffTask(cwd, taskId, sid, deferComplete = true) {
+  const before = decodeHandoffPayload(runCli("agent-dispatch", ["payload", taskId, "--raw"], { cwd }));
+  const error = nativeHandoffConsumeError(before.metadata, sid, taskId);
+  if (error) return { ok: false, message: error };
+  const checkpoint = readNativeHandoffCheckpoint(before.metadata, taskId);
+  // The native ledger acknowledges consumption before activation, so a cold
+  // resume need not claim the same task or submit a second continuation.
+  if (checkpoint?.record.nativeGoal.consumedBySession !== sid) {
+    if (checkpoint?.record.nativeGoal.taskConsumeRequested) {
+      return { ok: false, message: "Native task consumption outcome is unresolved; inspect the existing task before retrying." };
+    }
+    if (checkpoint) {
+      writeJsonAtomic(checkpoint.path, {
+        ...checkpoint.record,
+        nativeGoal: { ...checkpoint.record.nativeGoal, taskConsumeRequested: true },
+      });
+    }
+    runCli("agent-dispatch", ["consume", taskId, ...(deferComplete ? ["--defer-complete"] : [])], { cwd });
+    markNativeHandoffConsumed(before.metadata, sid, taskId);
+  }
+  return { ok: true, id: taskId, metadata: before.metadata, payload: before.text };
 }

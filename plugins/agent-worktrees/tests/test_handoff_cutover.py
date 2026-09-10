@@ -868,7 +868,8 @@ class TestCmdHandoffCutover:
         out = json.loads(capfd.readouterr().out)
         assert out["old_pane"] == "%bound"
 
-    def test_spawn_success_opens_window(self, monkeypatch, capfd, tmp_path):
+    @pytest.mark.parametrize("native_outcome", [None, "success", "retained"])
+    def test_spawn_success_opens_window(self, monkeypatch, capfd, tmp_path, native_outcome):
         monkeypatch.setattr(m, "_infer_worktree_id_from_cwd", lambda: "wtZ")
         monkeypatch.setattr(sessions, "has_mux_session", lambda w: True)
         monkeypatch.setattr(sessions, "mux_active_pane", lambda w: "%2")
@@ -894,19 +895,39 @@ class TestCmdHandoffCutover:
             captured["env"] = env
             captured["kwargs"] = k
             return {
-                "ok": True,
+                "ok": native_outcome != "retained",
                 "new_pane": "%5",
                 "prompt_received": True,
                 "error": None,
             }
 
         monkeypatch.setattr(sessions, "mux_new_window", _fake_new_window)
-        rc = m.cmd_handoff_cutover(_ns(seed="resume the multi word work", old_pane="%2"))
-        assert rc == 0
+        native_args = {}
+        if native_outcome:
+            checkpoint = tmp_path / "native checkpoint.json"
+            checkpoint.write_text(json.dumps({
+                "sessionId": "owned-source",
+                "nativeGoal": {
+                    "successorSessionId": "owned-target", "phase": "frozen",
+                    "permissionMode": "allow-all",
+                },
+            }))
+            native_args = dict(native_handoff=str(checkpoint), native_launcher="/owned/native-launch.mjs",
+                               session_id="owned-source")
+        rc = m.cmd_handoff_cutover(_ns(seed="resume the multi word work", old_pane="%2", **native_args))
+        assert rc == (4 if native_outcome == "retained" else 0)
         out = json.loads(capfd.readouterr().out)
-        assert out["ok"] is True
+        assert out["ok"] is (native_outcome != "retained")
         assert out["old_pane"] == "%2"
         assert out["new_pane"] == "%5"
+        if native_outcome:
+            assert out["native_handoff"] == str(checkpoint)
+            assert captured["cmd"] == [
+                "node", "/owned/native-launch.mjs", "--checkpoint", str(checkpoint),
+                "--cli", "copilot", "--", "--session-id", "owned-target",
+            ]
+            assert captured["kwargs"]["initial_prompt"] is None
+            return
         assert out["seed_len"] == len("resume the multi word work")
         assert out["seeded"] is True
         # The launch cmd carries NO seed arg; the wrapper receives base64 through
@@ -916,3 +937,22 @@ class TestCmdHandoffCutover:
             "resume the multi word work"
         )
         assert out["seed_method"] == "interactive-argv"
+
+    @pytest.mark.parametrize("permission_mode", ["manual", "assisted"])
+    def test_native_permissions_rejected_before_launch_planning(self, monkeypatch, capfd, tmp_path, permission_mode):
+        checkpoint = tmp_path / "native.json"
+        checkpoint.write_text(json.dumps({
+            "sessionId": "owned-source",
+            "nativeGoal": {
+                "successorSessionId": "owned-target", "phase": "frozen",
+                "permissionMode": permission_mode,
+            },
+        }))
+        monkeypatch.setattr(m.cfg, "load_config", lambda: pytest.fail("must reject before planning"))
+        monkeypatch.setattr(sessions, "mux_new_window", lambda *a, **k: pytest.fail("must not spawn"))
+        rc = m.cmd_handoff_cutover(_ns(
+            seed="owned seed", session_id="owned-source",
+            native_handoff=str(checkpoint), native_launcher="/owned/native-launch.mjs",
+        ))
+        assert rc == 1
+        assert f"cannot preserve {permission_mode}" in json.loads(capfd.readouterr().out)["error"]

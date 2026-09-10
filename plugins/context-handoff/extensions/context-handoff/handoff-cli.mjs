@@ -39,7 +39,7 @@ import { join } from "node:path";
 import {
   storeHandoff, buildSeedForStored, runHandoffCutover,
   consumeFileHandoffOnce, decodeHandoffPayload, readFileHandoff,
-  safePathSegment,
+  safePathSegment, readSessionStateHandoff,
 } from "./handoff-core.mjs";
 
 function parseArgs(argv) {
@@ -91,7 +91,8 @@ function nativeObjectiveExists(sid) {
 
 function fileHandoffHasNativeContinuation(cwd, sid, handoffId, path) {
   const found = readFileHandoff(cwd, sid, handoffId, path || null);
-  return Boolean(found?.record?.nativeContinuation);
+  return Boolean(found?.record?.nativeContinuation || found?.record?.nativeState
+    || found?.record?.nativeGoalCheckpoint);
 }
 
 const HELP = `handoff-cli -- invoke a context handoff from the CLI (extension-free fallback).
@@ -174,6 +175,10 @@ function cmdContinue(args) {
   }
   const cwd = args.cwd || process.cwd();
   const sid = resolveSid(args);
+  const request = sid ? readSessionStateHandoff(sid)?.record : null;
+  if (nativeObjectiveExists(sid) || request?.nativeGoal || request?.nativeState || request?.nativeContinuation) {
+    throw new Error("Native handoff must be continued by the in-session extension. Nothing was launched.");
+  }
   const match = String(seed).match(/(\{"path":.+?\})/);
   if (match) {
     try {
