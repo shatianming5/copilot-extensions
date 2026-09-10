@@ -76,6 +76,33 @@ test("native Herdr adapter passes launcher contract and preserves unknown outcom
   }
 });
 
+test("managed plain Herdr launches retain the native adapter's unknown-outcome semantics", () => {
+  const home = mkdtempSync(join(tmpdir(), "plain-herdr-"));
+  try {
+    const source = readFileSync(new URL("../extensions/context-handoff/herdr.mjs", import.meta.url), "utf8")
+      .replace(/^import[\s\S]*?from "[^"]+";\n/gm, "")
+      .replace(/^export \{.*\};\n/gm, "").replaceAll("export ", "");
+    const context = vm.createContext({
+      process: { env: { COPILOT_AGENT_SESSION_ID: "owned-source" } },
+      runHerdrHandoffCutover: (cwd, seed, sid, options) => runHerdrHandoffCutover(cwd, seed, sid, {
+        ...options, home, env: { HERDR_ENV: "1", HERDR_PANE_ID: "owned-source" },
+      }),
+    });
+    vm.runInContext(`${source}\nglobalThis.launch = launchHerdrSuccessor;`, context);
+    for (const outcome of ["malformed", "transport-error"]) {
+      const execute = bin => {
+        if (bin.endsWith("/herdr")) return JSON.stringify({ result: { pane: { cwd: home } } });
+        if (outcome === "transport-error") throw new Error("Owned launcher connection lost");
+        return "";
+      };
+      assert.throws(() => context.launch(home, "owned seed", execute, "allow-all"),
+        outcome === "transport-error" ? /connection lost/ : /unresolved/);
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("fork mux retirement checks exact bind/head after admission, never a candidate", () => {
   const source = readFileSync(new URL("../extensions/context-handoff/native-runtime.mjs", import.meta.url), "utf8")
     .replace(/^import[\s\S]*?from "[^"]+";\n/gm, "").replaceAll("export ", "");

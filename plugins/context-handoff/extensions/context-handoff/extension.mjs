@@ -1438,6 +1438,13 @@ const session = await joinSession({
       },
       handler: async (args, invocation) => {
         ensureState(invocation);
+        await nativeStartup;
+        if (nativeStartupError) {
+          return {
+            resultType: "error",
+            textResultForLlm: `Native restoration failed: ${nativeStartupError.message}. Predecessor preserved.`,
+          };
+        }
         const cwdResult = currentHandoffCwd();
         if (!cwdResult.cwd) {
           return (
@@ -1761,6 +1768,8 @@ const session = await joinSession({
         "prompt into THIS session (foreground). Consumes the agent-dispatch " +
         "handoff task if present, else the newest matching machine-local file.",
       handler: async (ctx) => {
+        await nativeStartup;
+        if (nativeStartupError) throw nativeStartupError;
         const cwdResult = currentHandoffCwd();
         if (!cwdResult.cwd) {
           await session.log(

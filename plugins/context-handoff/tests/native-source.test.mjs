@@ -17,13 +17,20 @@ const source = readFileSync(new URL(
   .replaceAll("export ", "").replace("import.meta.url", '"file:///owned/native-source.mjs"');
 
 function fixture({ status = 0, output = '{"ok":true,"new_pane":"%5"}',
-  permissionMode = "allow-all", herdr = false, onExit = () => {} } = {}) {
+  permissionMode = "allow-all", herdr = false, plain = false, onExit = () => {} } = {}) {
   let record = {
     sessionId: "source", handoffId: "token", seed: "owned seed",
     nativeGoal: {
       phase: "frozen", sourceObjectiveId: null, successorSessionId: "target",
       cwd: process.cwd(), permissionMode,
     },
+  };
+  if (plain) record = {
+    ...record, nativeGoal: null, permissionMode, cwd: process.cwd(), promptText: "Owned plain brief",
+  };
+  const pending = {
+    seed: record.seed, promptText: "Owned plain brief",
+    stored: { id: "token", storage: "file", path: "baton", metadata: {} },
   };
   const calls = [];
   const pauses = [];
@@ -43,6 +50,10 @@ function fixture({ status = 0, output = '{"ok":true,"new_pane":"%5"}',
     resolveSystemCliDescriptor: () => ({ path: process.execPath }),
     readSessionStateHandoff: () => ({ path: "owned-checkpoint", record }),
     writeJsonAtomic: (_path, value) => { record = structuredClone(value); },
+    writeSessionStateHandoff: () => ({
+      ok: true, path: "owned-checkpoint", record: { ...record, launchRequested: false },
+    }),
+    resolveHerdrCwd: cwd => cwd,
     readNativeGoal: async () => ({ state: null }),
     isHerdrPane: () => herdr,
     launchHerdrSuccessor: () => assert.fail("No Herdr launch expected"),
@@ -59,10 +70,29 @@ function fixture({ status = 0, output = '{"ok":true,"new_pane":"%5"}',
     model: { getCurrent: async () => ({ modelId: "owned-model" }) },
     agent: { getCurrent: async () => ({ agent: null }) },
   } };
+  if (plain) {
+    Object.assign(context, {
+      session, state: { sessionId: "source", pendingHandoff: pending },
+      nativeStartup: Promise.resolve(), nativeStartupError: null, nativeCutoverPath: null,
+      ensureState: () => {}, currentHandoffCwd: () => ({ cwd: process.cwd() }),
+    });
+    const extension = readFileSync(new URL(
+      "../extensions/context-handoff/extension.mjs", import.meta.url,
+    ), "utf8");
+    for (const [name, key] of [["continue_handoff", "publicContinue"], ["retry_handoff_cutover", "publicRetry"]]) {
+      const start = extension.indexOf("handler: async", extension.indexOf(`name: "${name}"`));
+      const end = extension.indexOf("\n      },\n    },", start);
+      assert.ok(start >= 0 && end > start);
+      vm.runInContext(`globalThis.${key} = (${extension.slice(start + "handler: ".length, end)}\n});`, context);
+    }
+  }
   return {
     record: () => record, calls, pauses,
     request: () => context.request(session, record.seed),
     launch: () => context.launch(session, "owned-checkpoint"),
+    continue: () => context.publicContinue({ seed: record.seed }, {}),
+    retry: () => context.publicRetry({}, {}),
+    setExit: (nextStatus, nextOutput) => { status = nextStatus; output = nextOutput; },
   };
 }
 
@@ -144,4 +174,46 @@ test("allow-all native requests still pause, launch once and reuse the receipt",
   assert.equal((await f.launch()).new_pane, "%5");
   assert.equal((await f.request()).launch.new_pane, "%5");
   assert.equal(f.calls.length, 1);
+});
+
+test("plain public continue and retry recover a real rc3 pre-creation CLI exit", async () => {
+  const f = fixture({ plain: true, status: 3, output: '{"ok":false,"error":"no mux session"}' });
+  await f.continue();
+  await assert.rejects(f.launch(), /no mux session/);
+  assert.equal(f.record().launchRequested, false);
+  await f.retry();
+  f.setExit(0, '{"ok":true,"new_pane":"%5"}');
+  await f.launch();
+  await f.retry();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.record().launch.new_pane, "%5");
+});
+
+test("plain retained rc4 publishes receiver updates and never respawns on retry", async () => {
+  const receipt = { ok: false, new_pane: "%5", error: "receiver pending" };
+  const f = fixture({
+    plain: true, status: 4, output: JSON.stringify(receipt),
+    onExit: record => { record.receiverObservation = "keep concurrent receiver update"; },
+  });
+  await f.continue();
+  assert.deepEqual(await f.launch(), receipt);
+  assert.deepEqual(f.record().launch, receipt);
+  assert.equal(f.record().receiverObservation, "keep concurrent receiver update");
+  await f.retry();
+  await f.launch();
+  assert.equal(f.calls.length, 1);
+});
+
+test("plain malformed and unknown nonzero CLI outcomes stay unresolved", async () => {
+  for (const [status, output] of [
+    [3, "not JSON"], [4, '{"ok":false,"error":"unknown pane creation"}'],
+    [4, "{}"], [7, '{"ok":false,"error":"unknown stage"}'],
+  ]) {
+    const f = fixture({ plain: true, status, output });
+    await f.continue();
+    await assert.rejects(f.launch());
+    assert.equal(f.record().launchRequested, true);
+    await assert.rejects(f.retry(), /unresolved/);
+    assert.equal(f.calls.length, 1);
+  }
 });

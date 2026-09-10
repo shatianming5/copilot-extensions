@@ -17,7 +17,7 @@ export function launchHerdrSuccessor(cwd, seed, execute, permissionMode, native 
     throw new Error(`Herdr cannot preserve ${permissionMode}; no pane was created.`);
   }
   return runHerdrHandoffCutover(cwd, seed, process.env.COPILOT_AGENT_SESSION_ID, {
-    execute, permissionMode, native,
+    execute, permissionMode, native, throwLaunchErrors: true,
   });
 }
 

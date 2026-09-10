@@ -806,6 +806,7 @@ export function runHerdrHandoffCutover(
     launcherPath = join(home, ".local", "bin", "copilot-pane"),
     permissionMode = null,
     native = null,
+    throwLaunchErrors = Boolean(native),
   } = {},
 ) {
   const cwdResult = resolveHandoffCwd(cwd, { execute, env, home });
@@ -854,7 +855,7 @@ export function runHerdrHandoffCutover(
     );
     const launched = parseHerdrLaunchOutput(output);
     if (!launched.pane || !launched.sessionId) {
-      if (native) throw new Error("copilot-pane receiver identity is unresolved; do not launch another.");
+      if (throwLaunchErrors) throw new Error("copilot-pane receiver identity is unresolved; do not launch another.");
       return {
         ok: false,
         host: "herdr",
@@ -872,7 +873,7 @@ export function runHerdrHandoffCutover(
       predecessor_retirement: "after-consume",
     };
   } catch (error) {
-    if (native) throw error;
+    if (throwLaunchErrors) throw error;
     const detail = commandErrorDetail(error);
     return {
       ok: false,

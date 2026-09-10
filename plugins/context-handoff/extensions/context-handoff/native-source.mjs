@@ -176,42 +176,34 @@ export async function freezeAndLaunchNative(session, path) {
   if (receipt.launchRequested) throw new Error("Existing receiver launch is unresolved; do not replay.");
   let record = await freezeNativeSource(session, path);
   let goal = record.nativeGoal;
-  if (!goal) {
-    writeJsonAtomic(path, { ...record, launchRequested: true });
-    const launch = isHerdrPane()
-      ? launchHerdrSuccessor(record.cwd, record.seed, runCli, record.permissionMode)
-      : JSON.parse(runCli("agent-worktrees", [
-        "handoff-cutover", "--seed", record.seed, "--session-id", session.sessionId,
-        "--handoff-token", record.handoffId,
-        "--permission-mode", record.permissionMode,
-        ...(record.worktree ? ["--worktree-id", record.worktree] : []),
-      ], { cwd: record.cwd, timeout: 180000 }));
-    if (!launch.ok) throw new Error(`Handoff launch failed: ${launch.error || launch.reason}`);
-    const current = readSessionStateHandoff(session.sessionId).record;
-    writeJsonAtomic(path, { ...current, launch });
-    return launch;
+  if (goal) {
+    goal = {
+      ...goal, launchRequested: true,
+      launchTransport: isHerdrPane() ? "herdr" : "mux",
+    };
+    record = { ...record, nativeGoal: goal };
+  } else {
+    record = { ...record, launchRequested: true };
   }
-  goal = {
-    ...goal, launchRequested: true,
-    launchTransport: isHerdrPane() ? "herdr" : "mux",
-  };
-  record = { ...record, nativeGoal: goal };
   writeJsonAtomic(path, record);
+  const cwd = goal ? goal.cwd : record.cwd;
+  const permissionMode = goal ? goal.permissionMode : record.permissionMode;
   let launch;
   let exitStatus = 0;
   if (isHerdrPane()) {
-    launch = launchHerdrSuccessor(goal.cwd, record.seed, runCli, goal.permissionMode, {
-      checkpoint: path, launcher: NATIVE_LAUNCHER,
-    });
+    launch = launchHerdrSuccessor(cwd, record.seed, runCli, permissionMode,
+      goal ? { checkpoint: path, launcher: NATIVE_LAUNCHER } : null);
   } else {
     let stdout;
     try {
       stdout = runCli("agent-worktrees", [
         "handoff-cutover", "--seed", record.seed,
         "--session-id", session.sessionId, "--handoff-token", record.handoffId,
-        "--native-handoff", path, "--native-launcher", NATIVE_LAUNCHER,
+        ...(goal
+          ? ["--native-handoff", path, "--native-launcher", NATIVE_LAUNCHER]
+          : ["--permission-mode", permissionMode]),
         ...(record.worktree ? ["--worktree-id", record.worktree] : []),
-      ], { cwd: goal.cwd, timeout: 180000 });
+      ], { cwd, timeout: 180000 });
     } catch (error) {
       // execFileSync throws even when the mux command returned its structured
       // receipt. Transport errors with no exit status remain unresolved.
@@ -225,13 +217,18 @@ export async function freezeAndLaunchNative(session, path) {
     // CLI statuses 1/2/3 are pre-spawn rejections. Status 4 can include a mux
     // timeout: a missing pane ID there does not prove that no pane exists.
     if (launch.ok === false && (isHerdrPane() || [1, 2, 3].includes(exitStatus))) {
-      writeJsonAtomic(path, { ...record, nativeGoal: { ...goal, launchRequested: false } });
+      const current = readSessionStateHandoff(session.sessionId).record;
+      writeJsonAtomic(path, goal
+        ? { ...current, nativeGoal: { ...current.nativeGoal, launchRequested: false } }
+        : { ...current, launchRequested: false });
     }
-    throw new Error(`Native handoff launch failed: ${launch.error || launch.reason}`);
+    throw new Error(`${goal ? "Native handoff" : "Handoff"} launch failed: ${launch.error || launch.reason}`);
   }
   // The successor can hydrate while the launch command is returning; merge
   // into its current receipt instead of overwriting it with the frozen copy.
   const current = readSessionStateHandoff(session.sessionId).record;
-  writeJsonAtomic(path, { ...current, nativeGoal: { ...current.nativeGoal, launch } });
+  writeJsonAtomic(path, goal
+    ? { ...current, nativeGoal: { ...current.nativeGoal, launch } }
+    : { ...current, launch });
   return launch;
 }

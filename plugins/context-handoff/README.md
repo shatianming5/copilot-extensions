@@ -194,12 +194,14 @@ toward `Done` rather than finalizing after a handoff task, phase, or pull reques
 
 **Plain failed-successor recovery (`retry_handoff_cutover`).** The native `-i`
 transport is receipt-checked by the pane wrapper; a rejected flag or immediately
-exiting successor is reaped without retiring the predecessor. Because the
-handoff is already stored, `retry_handoff_cutover` re-attempts the cutover **from
-that saved handoff without regenerating it**: it recovers the checkout's pending
-task/file, rebuilds the *identical* cutover seed (via the same `buildCutoverSeed`
-used by `save_handoff_prompt`), and spawns a fresh seeded successor. Run it from
-the predecessor.
+exiting successor is reaped without retiring the predecessor. Plain public
+continue/retry now arms the saved baton for launch at source idle. It shares
+native handoff's receipt classification: a structured mux exit 1/2/3 without a
+pane permits an explicit retry using the same seed; a retained receiver receipt
+is reused without respawning. Unknown/malformed outcomes and exit 4 without a
+pane remain unresolved, not automatically retryable. Receiver-written checkpoint
+fields are retained when the source publishes a receipt. Run explicit retry
+from the preserved predecessor; do not regenerate the baton.
 
 **Extension-load race (self-healing seed).** A live cutover seeds the
 successor's **first turn**, which can run before the context-handoff extension
@@ -258,6 +260,12 @@ Custom-agent selection can arrive after extension startup. Bootstrap subscribes
 before reading the agent, waits without blocking extension initialization, and
 then asserts the exact profile. Default-agent launches do not wait for a custom
 selection event. A genuine mismatch stops admission without forcing a profile.
+Public `consume_handoff` (task, file or path) and `/resume-handoff` wait for this
+same bootstrap promise before reading or consuming a baton. A hydration
+acknowledgement alone is not permission to race bootstrap's pending workspace
+RPC or submit another continuation. Bootstrap uses the core consumer directly,
+without waiting on its own promise; idle/user-message reconciliation starts
+only after bootstrap publishes the receiver path.
 
 Recovery reuses the same checkpoint, receiver and token. Structured mux exit
 1/2/3 receipts prove a pre-creation rejection and permit an explicit retry.
@@ -271,9 +279,9 @@ inspection instead of consuming again.
 Legacy `nativeContinuation` / `nativeState` batons are explicitly rejected
 before consumption. Save a fresh native baton from the preserved source;
 copying an old file is not evidence of native hydration. The SDK-free fallback
-cannot perform native migration and refuses these batons. Plain handoffs,
-ordinary paste/resume, effort/status records and unrelated fork behavior remain
-on their existing paths.
+cannot perform native migration and refuses these batons. Ordinary paste/resume,
+effort/status records and unrelated fork behavior remain on their existing paths;
+plain live cutover uses the idle scheduling and receipt recovery described above.
 
 ## Standalone and degraded modes
 
