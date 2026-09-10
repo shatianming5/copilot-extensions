@@ -41,7 +41,7 @@ import {
 import { execSync, execFileSync } from "node:child_process";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
-import { joinSession } from "@github/copilot-sdk/extension";
+import { pathToFileURL } from "node:url";
 import {
   CONTINUATION_DIRECTIVE,
   leadFrom,
@@ -59,7 +59,27 @@ import {
   retireHerdrPredecessorAfterConsume,
   runHandoffCutover,
   herdrStartupPendingMessage,
+  storeHandoff,
+  buildSeedForStored,
+  nativeHandoffConsumeError,
+  consumeFileHandoff as consumeNativeFile,
+  consumeDispatchHandoffTask as consumeNativeTask,
+  readSessionStateHandoff,
 } from "./handoff-core.mjs";
+import { runNativeBridge, readNativeGoal } from "./native-transport.mjs";
+import { bootstrapNativeHandoff, continueNativeAfterAdmission, nativeCheckpoint } from "./native-runtime.mjs";
+import { saveNativeBaton, requestNativeCutover, requestPlainCutover, freezeAndLaunchNative, recoverPendingHandoff } from "./native-source.mjs";
+
+if (process.env.CONTEXT_HANDOFF_NATIVE_WORKER !== "1") {
+  process.exit(await runNativeBridge(import.meta.url));
+}
+const sdkPath = process.env.COPILOT_SDK_PATH;
+if (!sdkPath) throw new Error("Native handoff requires the CLI-provided public SDK path.");
+const { joinSession } = await import(pathToFileURL(join(sdkPath, "extension.js")).href);
+let nativeStartup;
+let nativeStartupError = null;
+let nativeCutoverPath = null;
+let nativeReceiptPath = null;
 
 // --- State ---
 const handoffConfig = loadContextHandoffConfig(process.cwd());
@@ -75,7 +95,7 @@ const state = {
   hardLogShown: false,            // session.log shown to user
   handoffGenerated: false,
   firstUserPrompt: null,          // first user message (for topic bias)
-  pendingCutover: null,           // { seed, permissionMode } from the last save
+  pendingHandoff: null,
   // Context window tracking (from session.usage_info events)
   currentTokens: 0,
   tokenLimit: 0,
@@ -710,6 +730,11 @@ function consumeDispatchHandoffTask(
   cwd, taskId, sid, deferComplete = false, { deferRetire = false } = {},
 ) {
   const before = decodeHandoffPayload(readTaskPayloadRaw(cwd, taskId));
+  const nativeError = nativeHandoffConsumeError(before.metadata, sid, taskId);
+  if (nativeError) return { ok: false, message: nativeError };
+  if (before.metadata?.nativeGoalCheckpoint) {
+    return consumeNativeTask(cwd, taskId, sid, deferComplete);
+  }
   try {
     const consumed = runAgentDispatchConsume(cwd, taskId, deferComplete);
     const decoded = decodeHandoffPayload(consumed);
@@ -744,6 +769,11 @@ function consumeFileHandoff(
   const found = readFileHandoff(cwd, sid, handoffId, explicitPath);
   if (!found) {
     return { ok: false, message: "File-backed handoff was not found." };
+  }
+  const nativeError = nativeHandoffConsumeError(found.record, sid, found.record.id);
+  if (nativeError) return { ok: false, message: nativeError };
+  if (found.record.nativeGoalCheckpoint) {
+    return consumeNativeFile(cwd, sid, handoffId, explicitPath);
   }
   const { path } = found;
   const lockPath = `${path}.consume.lock`;
@@ -1084,117 +1114,6 @@ function formatHandoffMarkdown(handoffData, scope) {
   return lines.join("\n");
 }
 
-function hasActiveAutopilotObjective(content) {
-  if (typeof content !== "string" || !content.trim()) return false;
-  try {
-    return JSON.parse(content)?.current?.status === "active";
-  } catch {
-    return false;
-  }
-}
-
-function objectiveRestored(expected, actual, targetMode) {
-  if (!expected) return actual === null;
-  if (targetMode === "autopilot") return actual === expected;
-  try {
-    const expectedCurrent = JSON.parse(expected)?.current;
-    const actualCurrent = JSON.parse(actual)?.current;
-    return (
-      expectedCurrent?.objective === actualCurrent?.objective
-      && expectedCurrent?.status === actualCurrent?.status
-    );
-  } catch {
-    return false;
-  }
-}
-
-async function captureNativeContinuation() {
-  try {
-    const [mode, objective, permissions, pending] = await Promise.all([
-      session.rpc.mode.get(),
-      session.rpc.workspaces.readAutopilotObjective(),
-      session.rpc.permissions.getMode(),
-      session.rpc.permissions.pendingRequests(),
-    ]);
-    if (!Array.isArray(pending?.items)) {
-      throw new Error("Copilot returned an invalid pending-permissions response.");
-    }
-    if (pending.items.length > 0) {
-      return {
-        value: null,
-        error:
-          `${pending.items.length} permission confirmation request(s) are still ` +
-          "pending. Resolve them in this session before handing off.",
-      };
-    }
-    return {
-      value: {
-        version: 1,
-        mode,
-        permissionMode: permissions.mode,
-        autopilotObjective: objective.content,
-      },
-      error: null,
-    };
-  } catch (error) {
-    return {
-      value: null,
-      error: error?.message || String(error),
-    };
-  }
-}
-
-async function restoreNativeContinuation(metadata) {
-  const native = metadata?.nativeContinuation;
-  if (!native || native.version !== 1) {
-    return { restored: false, mode: null, permissionMode: null };
-  }
-  const permissionMode = native.permissionMode;
-  if (!["manual", "assisted", "allow-all"].includes(permissionMode)) {
-    throw new Error(`unsupported inherited permission mode: ${permissionMode}`);
-  }
-  const permissionResult = await session.rpc.permissions.setMode({
-    mode: permissionMode,
-  });
-  if (!permissionResult.success || permissionResult.mode !== permissionMode) {
-    throw new Error(
-      `could not restore permission mode ${permissionMode}; runtime reported ` +
-      `${permissionResult.mode || "unknown"}`,
-    );
-  }
-
-  const objective = native.autopilotObjective;
-  if (typeof objective === "string" && objective.trim()) {
-    await session.rpc.workspaces.writeAutopilotObjective({ content: objective });
-  } else {
-    await session.rpc.workspaces.deleteAutopilotObjective();
-  }
-
-  const targetMode =
-    native.mode === "autopilot" && !hasActiveAutopilotObjective(objective)
-      ? "interactive"
-      : native.mode;
-  if (!["interactive", "plan", "autopilot"].includes(targetMode)) {
-    throw new Error(`unsupported inherited session mode: ${targetMode}`);
-  }
-  await session.rpc.mode.set({ mode: targetMode });
-  const [restoredMode, restoredObjective] = await Promise.all([
-    session.rpc.mode.get(),
-    session.rpc.workspaces.readAutopilotObjective(),
-  ]);
-  if (
-    restoredMode !== targetMode
-    || !objectiveRestored(
-      objective || null,
-      restoredObjective.content,
-      targetMode,
-    )
-  ) {
-    throw new Error("native goal or execution mode did not persist after restore");
-  }
-  return { restored: true, mode: targetMode, permissionMode };
-}
-
 // --- Extension ---
 
 const session = await joinSession({
@@ -1352,12 +1271,27 @@ const session = await joinSession({
         }
         const cwd = cwdResult.cwd;
         const title = (args?.title ?? "").toString().trim();
-        const native = await captureNativeContinuation();
-        if (!native.value) {
+        await nativeStartup;
+        if (nativeStartupError) throw nativeStartupError;
+        const pendingPermissions = await session.rpc.permissions.pendingRequests();
+        if (pendingPermissions.items.length) {
+          throw new Error("Resolve pending permission confirmations before handing off.");
+        }
+        const native = (await readNativeGoal(sid)).state;
+        const stored = native
+          ? await saveNativeBaton(session, { promptText: text, title, cwd })
+          : storeHandoff({ promptText: text, title, cwd, sid });
+        if (!stored.storage) throw new Error(stored.error);
+        state.pendingHandoff = {
+          stored, seed: buildSeedForStored(stored), token: stored.id, promptText: text,
+          nativeGoalCheckpoint: stored.metadata.nativeGoalCheckpoint || null,
+        };
+        if (native) {
           return (
-            "Cannot save handoff: native session state could not be captured " +
-            `without losing a confirmation or execution authority. Nothing was written. ` +
-            `[native: ${native.error}]`
+            `Native handoff stored (${stored.storage}: ${stored.id}).\n` +
+            "Use its assigned empty receiver and cold resume; do not paste into another session.\n" +
+            `HANDOFF_SEED: ${state.pendingHandoff.seed}\n` +
+            "Call continue_handoff with this exact seed, then end the source turn."
           );
         }
         // Front-load the seed with the specific action so the successor
@@ -1376,10 +1310,7 @@ const session = await joinSession({
         let cutoverSeed = null;   // deferred cutover seed (== HANDOFF_SEED)
         let storedMsg = null;     // the instruction to reply with
 
-        if (!isHerdrPane() && agentDispatchAvailable()) {
-          const stored = dispatchHandoff(
-            text, sid, cwd, title, native.value,
-          );
+        if (stored.storage === "agent-dispatch") {
           const taskId = stored?.id;
           if (taskId) {
             // Two seeds, two completion models (see the context-handoff skill):
@@ -1400,7 +1331,7 @@ const session = await joinSession({
             // "Agent Dispatch Task Handoff" boilerplate.
             seed = buildCutoverSeed("task", taskId, lead, {
               retry: false,
-              requiresNativeRestore: true,
+              requiresNativeRestore: Boolean(native),
             });
             cutoverSeed = buildCutoverSeed("task", taskId, lead, {
               oldPane: stored?.metadata?.oldPane,
@@ -1408,10 +1339,8 @@ const session = await joinSession({
               worktreeDir: stored?.metadata?.worktreeDir,
               sessionId: sid,
               muxSession: stored?.metadata?.muxSession,
-              requiresNativeRestore: true,
+              requiresNativeRestore: Boolean(native),
             });
-            // Mirror the handoff into the worktree record (record-first recovery).
-            noteHandoffInRecord(cwd, sid, taskId, title);
             storedMsg = (
               `Handoff stored as agent-dispatch task ${taskId} (proposed, label ` +
               `'handoff', pinned to this worktree). No file handoff was written.\n\n` +
@@ -1431,9 +1360,7 @@ const session = await joinSession({
         }
 
         if (!seed) {
-          const fileStored = saveFileHandoff(
-            text, sid, cwd, title, native.value,
-          );
+          const fileStored = stored;
           if (!fileStored?.path) {
             return (
               "Cannot save handoff: the machine-local file resolver failed. " +
@@ -1448,8 +1375,6 @@ const session = await joinSession({
           cutoverSeed = buildCutoverSeed("file", fileStored.id, lead, {
             path: fileStored.path,
           });
-          // Mirror the handoff into the worktree record (record-first recovery).
-          noteHandoffInRecord(cwd, sid, fileStored.id, title);
           const fileReason = isHerdrPane()
             ? "because Herdr live handoff uses context-handoff's own checkout-scoped baton"
             : "because no reachable agent-dispatch coordinator was available";
@@ -1469,10 +1394,7 @@ const session = await joinSession({
         // (the PRIMARY handoff path): call continue_handoff with `seed` set to
         // exactly this string. For a task-backed handoff it is the *deferred*
         // cutover seed (the successor completes explicitly at the goal).
-        state.pendingCutover = {
-          seed: cutoverSeed,
-          permissionMode: native.value.permissionMode,
-        };
+        cutoverSeed = state.pendingHandoff.seed;
         return (
           `${storedMsg}\n\n` +
           `HANDOFF_SEED: ${cutoverSeed}\n` +
@@ -1516,6 +1438,13 @@ const session = await joinSession({
       },
       handler: async (args, invocation) => {
         ensureState(invocation);
+        await nativeStartup;
+        if (nativeStartupError) {
+          return {
+            resultType: "error",
+            textResultForLlm: `Native restoration failed: ${nativeStartupError.message}. Predecessor preserved.`,
+          };
+        }
         const cwdResult = currentHandoffCwd();
         if (!cwdResult.cwd) {
           return (
@@ -1546,20 +1475,11 @@ const session = await joinSession({
           );
         }
 
+        if (result?.ok && result.metadata?.nativeGoalCheckpoint) {
+          await continueNativeAfterAdmission(session, result.metadata.nativeGoalCheckpoint);
+          return "Native baton consumed; the native runtime owns continuation admission and predecessor retirement.";
+        }
         if (result?.ok) {
-          try {
-            result.nativeContinuation = await restoreNativeContinuation(
-              result.metadata,
-            );
-          } catch (error) {
-            return {
-              textResultForLlm:
-                "The handoff baton was consumed, but native goal, mode, or " +
-                "permission restoration failed. The predecessor was NOT retired. " +
-                `Stop and report this blocker: ${error?.message || String(error)}`,
-              resultType: "error",
-            };
-          }
           result.retire = retireAfterConsume(
             cwd, result.metadata, sid, result.id,
           );
@@ -1615,79 +1535,22 @@ const session = await joinSession({
         }
         const cwd = cwdResult.cwd;
         const sid = state.sessionId || invocation?.sessionId || null;
-        const permissionMode =
-          state.pendingCutover?.seed === seed
-            ? state.pendingCutover.permissionMode
-            : null;
-        const result = runHandoffCutover(cwd, seed, sid, { permissionMode });
-        if (!result || !result.ok) {
-          const reason = result?.reason || "error";
-          const tail =
-            " Nothing destructive was done. The handoff is safely stored -- " +
-            "resume it the normal way (paste the reply prompt into '/clear', or " +
-            "run /resume-handoff in a fresh session in this worktree).";
-          if (result?.host === "herdr") {
-            return (
-              "Live cutover is unavailable: copilot-pane could not launch the " +
-              "seeded sibling from this Herdr pane." +
-              tail +
-              (result?.error ? ` [host: ${result.error}]` : "")
-            );
-          }
-          if (reason === "no-worktree") {
-            // The common bare-resume case: the process IS inside the wt-<id>
-            // mux, but Copilot was launched with its cwd at HOME (e.g. a "Bare
-            // resume", or the #1416 HOME-cwd binding), so the host verb could
-            // not resolve WHICH worktree from cwd -- not a genuine "no mux".
-            return (
-              "Live cutover is unavailable: could not determine which worktree " +
-              "this session belongs to from its working directory (it looks like " +
-              "a bare/HOME-cwd resume). The session may well be inside a mux, but " +
-              "the cutover needs the worktree checkout as its cwd. `cd` into this " +
-              "worktree's directory and try the handoff again, or resume it the " +
-              "normal way." +
-              tail +
-              (result?.error ? ` [host: ${result.error}]` : "")
-            );
-          }
-          if (reason === "no-mux") {
-            return (
-              "Live cutover is unavailable: this session is not running under a " +
-              "mux session (no live wt-<id> session to cut into)." +
-              tail +
-              (result?.error ? ` [host: ${result.error}]` : "")
-            );
-          }
-          return (
-            "Live cutover is unavailable: the cutover verb failed." +
-            tail +
-            (result?.error ? ` [host: ${result.error}]` : "")
-          );
+        await nativeStartup;
+        if (nativeStartupError) throw nativeStartupError;
+        const pending = state.pendingHandoff || recoverPendingHandoff(sid);
+        if (pending?.nativeGoalCheckpoint) {
+          const requested = await requestNativeCutover(session, seed);
+          nativeCutoverPath = requested.pending ? requested.path : null;
+          return requested.pending
+            ? "Native cutover armed. End this turn; freeze and launch run after source usage settles."
+            : `Existing native receiver retained: ${JSON.stringify(requested.launch)}. Do not create another.`;
         }
-        if (result.host === "herdr") {
-          if (result.startup_pending) {
-            return herdrStartupPendingMessage(result.new_pane);
-          }
-          return (
-            `Live cutover initiated through Herdr. A successor Copilot was ` +
-            `created in sibling pane ${result.new_pane || "?"} and its first ` +
-            `prompt was submitted to consume the saved handoff. The predecessor ` +
-            `pane remains the recovery point until that successful consumption, ` +
-            `then the successor stops its exact recorded pane. Do NOT start new ` +
-            `work here; simply end your turn.`
-          );
-        }
-        return (
-          `Live cutover initiated. A successor Copilot was spawned in a new window ` +
-          `of this worktree's mux session (pane ${result.new_pane || "?"}) and ` +
-          `seeded to consume the handoff; the operator has been cut over to it. ` +
-          `The predecessor pane will remain available unless and until the ` +
-          `successor consumes the handoff and retires it. Do NOT start new work ` +
-          `here; simply end your turn. (If the successor window comes up EMPTY -- ` +
-          `no session created because its first prompt was never submitted -- ` +
-          `call retry_handoff_cutover from here to re-attempt from the same saved ` +
-          `handoff, without regenerating it.)`
-        );
+        if (pending?.seed !== seed) throw new Error("Recover the saved baton before requesting cutover.");
+        const requested = await requestPlainCutover(session, pending, cwd);
+        nativeCutoverPath = requested.pending ? requested.path : null;
+        return requested.pending
+          ? "Cutover armed. End this turn; the source launches the saved receiver at idle."
+          : `Existing receiver retained: ${JSON.stringify(requested.launch)}.`;
       },
     },
     {
@@ -1719,6 +1582,24 @@ const session = await joinSession({
         const cwd = cwdResult.cwd;
         const sid = state.sessionId || invocation?.sessionId || null;
 
+        await nativeStartup;
+        if (nativeStartupError) throw nativeStartupError;
+        const pending = recoverPendingHandoff(sid);
+        if (pending?.nativeGoalCheckpoint) {
+          const requested = await requestNativeCutover(session, pending.seed);
+          nativeCutoverPath = requested.pending ? requested.path : null;
+          return requested.pending
+            ? "Native cutover re-armed at idle using the same receiver identity."
+            : `Existing native receiver retained: ${JSON.stringify(requested.launch)}. Do not create another.`;
+        }
+        if (pending) {
+          const requested = await requestPlainCutover(session, pending, cwd);
+          nativeCutoverPath = requested.pending ? requested.path : null;
+          return requested.pending
+            ? "Saved cutover re-armed at idle."
+            : `Existing receiver retained: ${JSON.stringify(requested.launch)}. Do not create another.`;
+        }
+
         // Recover the saved handoff (task preferred, else file) and rebuild the
         // EXACT cutover seed via the shared builder -- no regeneration.
         let kind = null;
@@ -1739,6 +1620,8 @@ const session = await joinSession({
             const decoded = decodeHandoffPayload(
               readTaskPayloadRaw(cwd, task.id),
             );
+            const error = nativeHandoffConsumeError(decoded.metadata, sid, task.id);
+            if (error) throw new Error(error);
             permissionMode =
               decoded.metadata?.nativeContinuation?.permissionMode || null;
           }
@@ -1746,6 +1629,8 @@ const session = await joinSession({
         if (!id) {
           const file = findHandoffFile(cwd, sid);
           if (file?.record?.id) {
+            const error = nativeHandoffConsumeError(file.record, sid, file.record.id);
+            if (error) throw new Error(error);
             kind = "file";
             id = file.record.id;
             filePath = file.path;
@@ -1883,6 +1768,8 @@ const session = await joinSession({
         "prompt into THIS session (foreground). Consumes the agent-dispatch " +
         "handoff task if present, else the newest matching machine-local file.",
       handler: async (ctx) => {
+        await nativeStartup;
+        if (nativeStartupError) throw nativeStartupError;
         const cwdResult = currentHandoffCwd();
         if (!cwdResult.cwd) {
           await session.log(
@@ -1915,6 +1802,10 @@ const session = await joinSession({
                     "and load it. Nothing was injected or retired.",
                   { level: "warning" },
                 );
+                return;
+              }
+              if (consumed.metadata?.nativeGoalCheckpoint) {
+                await continueNativeAfterAdmission(session, consumed.metadata.nativeGoalCheckpoint);
                 return;
               }
               try {
@@ -1961,6 +1852,10 @@ const session = await joinSession({
             );
             return;
           }
+          if (consumed.metadata?.nativeGoalCheckpoint) {
+            await continueNativeAfterAdmission(session, consumed.metadata.nativeGoalCheckpoint);
+            return;
+          }
           await session.send({
             prompt: buildResumePrompt(consumed.payload, `file ${file.path}`),
             displayPrompt: `Resuming handoff ${consumed.id || basename(file.path)}`,
@@ -1997,6 +1892,19 @@ const session = await joinSession({
 state.sessionId = session.sessionId ?? state.sessionId ?? null;
 state.cwd = state.cwd || process.cwd();
 state.turnCount = 0;
+// Native UI agent selection happens after extension initialization returns.
+nativeStartup = bootstrapNativeHandoff(session).then(result => {
+  nativeReceiptPath = result?.preparing ? null : result?.path || null;
+  const pending = recoverPendingHandoff(session.sessionId);
+  state.pendingHandoff ||= pending;
+  const request = readSessionStateHandoff(session.sessionId)?.record;
+  if (request?.nativeGoal?.cutoverRequested && !request.nativeGoal.launchRequested) {
+    nativeCutoverPath = pending.nativeGoalCheckpoint;
+  }
+}).catch(error => {
+  nativeStartupError = error;
+  session.log(`[Context Handoff] Native restoration failed: ${error.message}. Predecessor preserved.`, { level: "error" });
+});
 if (handoffConfig.warning) {
   session.log(`[Context Handoff] ${handoffConfig.warning}`, { level: "warning" });
 }
@@ -2081,8 +1989,38 @@ session.on("tool.execution_complete", (event) => {
 // on compaction). session.send() inside an idle handler does not loop: the
 // queue is cleared before sending and the guard flags prevent re-queueing.
 let pendingNudge = null;  // null | "soft" | "hard"
+let nativeIdleInFlight = false;
+
+function reconcileNativeContinuation() {
+  if (!nativeReceiptPath || nativeIdleInFlight || nativeStartupError) return;
+  const goal = nativeCheckpoint(nativeReceiptPath, session.sessionId).nativeGoal;
+  if (goal.consumedBySession !== session.sessionId || goal.retired) return;
+  nativeIdleInFlight = true;
+  continueNativeAfterAdmission(session, nativeReceiptPath).catch(error => {
+    session.log(`[Context Handoff] ${error.message}; predecessor preserved.`, { level: "error" });
+  }).finally(() => { nativeIdleInFlight = false; });
+}
+
+session.on("user.message", reconcileNativeContinuation);
 
 session.on("session.idle", () => {
+  if (nativeIdleInFlight || nativeStartupError) return;
+  if (nativeCutoverPath) {
+    const path = nativeCutoverPath;
+    nativeCutoverPath = null;
+    pendingNudge = null;
+    nativeIdleInFlight = true;
+    freezeAndLaunchNative(session, path).then(launch => {
+      session.log(`[Context Handoff] Successor launch receipt: ${JSON.stringify(launch)}. Keep this source paused.`, { level: "info" });
+    }).catch(error => {
+      session.log(`[Context Handoff] ${error.message}. Source remains paused and preserved.`, { level: "error" });
+    }).finally(() => { nativeIdleInFlight = false; });
+    return;
+  }
+  if (nativeReceiptPath) {
+    reconcileNativeContinuation();
+    return;
+  }
   if (!pendingNudge) return;
   const level = pendingNudge;
   pendingNudge = null;
