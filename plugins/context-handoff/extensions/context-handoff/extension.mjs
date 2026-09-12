@@ -59,7 +59,7 @@ import { contextPressure, formatContextUsage } from "./thresholds.mjs";
 import { runNativeBridge, readNativeGoal } from "./native-transport.mjs";
 import { bootstrapNativeHandoff, continueNativeAfterAdmission, nativeCheckpoint, recordNativeReceiverFailure } from "./native-runtime.mjs";
 import { saveNativeBaton, requestNativeCutover, requestPlainCutover, freezeAndLaunchNative, recoverPendingHandoff } from "./native-source.mjs";
-import { observerSchema } from "./native-observation.mjs";
+import { observerSchema, ObservationHandoffError } from "./native-observation.mjs";
 
 if (process.env.CONTEXT_HANDOFF_NATIVE_WORKER !== "1") {
   process.exit(await runNativeBridge(import.meta.url));
@@ -464,9 +464,15 @@ const session = await joinSession({
         if (state.pendingHandoff?.seed && state.pendingHandoff.seed !== args.seed) {
           throw new Error("Use the exact current saved handoff seed; no receiver was created.");
         }
-        const requested = state.pendingHandoff?.nativeGoalCheckpoint
-          ? await requestNativeCutover(session, args.seed, args.observers)
-          : await requestPlainCutover(session, state.pendingHandoff, state.cwd || process.cwd());
+        let requested;
+        try {
+          requested = state.pendingHandoff?.nativeGoalCheckpoint
+            ? await requestNativeCutover(session, args.seed, args.observers)
+            : await requestPlainCutover(session, state.pendingHandoff, state.cwd || process.cwd());
+        } catch (error) {
+          if (!(error instanceof ObservationHandoffError)) throw error;
+          return { resultType: "rejected", textResultForLlm: error.message };
+        }
         if (requested.launch) return `Successor already launched: ${JSON.stringify(requested.launch)}. Do not replay.`;
         nativeCutoverPath = requested.path;
         return "Native handoff requested. Source automatic execution is paused. End this turn; final native usage will be frozen at session.idle before the successor is launched.";
@@ -496,9 +502,15 @@ const session = await joinSession({
         if (!state.pendingHandoff?.seed) {
           throw new Error("No in-session saved handoff seed is available; recover the existing baton instead of creating another receiver.");
         }
-        const requested = state.pendingHandoff.nativeGoalCheckpoint
-          ? await requestNativeCutover(session, state.pendingHandoff.seed)
-          : await requestPlainCutover(session, state.pendingHandoff, state.cwd || process.cwd());
+        let requested;
+        try {
+          requested = state.pendingHandoff.nativeGoalCheckpoint
+            ? await requestNativeCutover(session, state.pendingHandoff.seed)
+            : await requestPlainCutover(session, state.pendingHandoff, state.cwd || process.cwd());
+        } catch (error) {
+          if (!(error instanceof ObservationHandoffError)) throw error;
+          return { resultType: "rejected", textResultForLlm: error.message };
+        }
         if (requested.launch) return `Existing successor: ${JSON.stringify(requested.launch)}. Do not launch another.`;
         nativeCutoverPath = requested.path;
         return "Existing native handoff will resume at this turn's idle boundary.";

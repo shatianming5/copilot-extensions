@@ -5,7 +5,8 @@ import { once } from "node:events";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { observationBrief, prepareObservationHandoff } from "../extensions/context-handoff/native-observation.mjs";
+import vm from "node:vm";
+import { observationBrief, prepareObservationHandoff, ObservationHandoffError } from "../extensions/context-handoff/native-observation.mjs";
 
 const jobCode = `
 const fs = require("node:fs");
@@ -26,6 +27,29 @@ function check() {
 }
 process.send("ready");
 check();`;
+
+for (const tool of ["continue_handoff", "retry_handoff_cutover"]) {
+  test(`${tool} returns the actual observer rejection through the public tool boundary`, async () => {
+    const extension = readFileSync(new URL("../extensions/context-handoff/extension.mjs", import.meta.url), "utf8");
+    const start = extension.indexOf("handler: async", extension.indexOf(`name: "${tool}"`));
+    const end = extension.indexOf("\n      },\n    },", start);
+    const message = "Attached shells prevent native session.idle; exact observer is still attached.";
+    let failure = new ObservationHandoffError(message);
+    const context = vm.createContext({
+      ObservationHandoffError, process: { env: {} }, session: { sessionId: "source" },
+      state: { pendingHandoff: { seed: "fixed-seed", nativeGoalCheckpoint: "fixed-checkpoint" } },
+      nativeCutoverPath: null,
+      requestNativeCutover: async () => { throw failure; },
+    });
+    vm.runInContext(`globalThis.invoke = (${extension.slice(start + "handler: ".length, end)}\n});`, context);
+    const result = await context.invoke({ seed: "fixed-seed" });
+    assert.equal(result.resultType, "rejected");
+    assert.equal(result.textResultForLlm, message);
+    assert.equal(context.nativeCutoverPath, null);
+    failure = new Error("unrelated native failure");
+    await assert.rejects(context.invoke({ seed: "fixed-seed" }), /unrelated native failure/);
+  });
+}
 
 async function child(t, code, args = []) {
   const process = spawn(globalThis.process.execPath, ["-e", code, ...args], {

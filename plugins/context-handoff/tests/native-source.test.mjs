@@ -86,22 +86,23 @@ test("managed registry preparation precedes the first receiver launch and prepar
     },
   });
 
-  test("actual cutover refuses attached work before pause, arming or launch", async () => {
-    const f = fixture({ tasks: [
-      { type: "shell", attachmentMode: "attached", status: "running", id: "original-work" },
-    ] });
-    const before = structuredClone(f.record());
-    await assert.rejects(f.request(), /Undeclared attached shells: original-work/);
-    assert.deepEqual(f.record(), before);
-    assert.deepEqual(f.pauses, []);
-    assert.deepEqual(f.calls, []);
-  });
   await f.launch();
   assert.deepEqual(order, ["registry-prepared", "receiver-created"]);
   const failed = fixture({ lifecycle: () => { throw new Error("registry prepare failed"); } });
   await assert.rejects(failed.launch(), /registry prepare failed/);
   assert.equal(failed.calls.length, 0);
   assert.equal(failed.record().nativeGoal.launchRequested, undefined);
+});
+
+test("actual cutover refuses attached work before pause, arming or launch", async () => {
+  const f = fixture({ tasks: [
+    { type: "shell", attachmentMode: "attached", status: "running", id: "original-work" },
+  ] });
+  const before = structuredClone(f.record());
+  await assert.rejects(f.request(), /Undeclared attached shells: original-work/);
+  assert.deepEqual(f.record(), before);
+  assert.deepEqual(f.pauses, []);
+  assert.deepEqual(f.calls, []);
 });
 
 test("rc4 retained receiver publishes the receipt and retry never spawns again", async () => {

@@ -1,5 +1,7 @@
 import { writeJsonAtomic } from "./handoff-core.mjs";
 
+export class ObservationHandoffError extends Error {}
+
 export const observerSchema = {
   type: "array",
   description: "Only explicitly owned, source-private read-only observers of independently running jobs. Record the original job and durable terminal source before stopping an observer; never stop the job.",
@@ -30,26 +32,26 @@ const active = task => task.type === "shell" && task.attachmentMode === "attache
 export async function prepareObservationHandoff(session, path, record, observers) {
   const { tasks } = await session.rpc.tasks.list();
   if (observers !== undefined) {
-    if (!Array.isArray(observers)) throw new Error("observers must be an array.");
+    if (!Array.isArray(observers)) throw new ObservationHandoffError("observers must be an array.");
     if (record.observations) {
       const saved = record.observations.map(item => ({ shell_id: item.observer.id, job: item.job }));
       if (JSON.stringify(saved) !== JSON.stringify(observers)) {
-        throw new Error("Observer handoff already saved; preserve the same job/observer metadata on retry.");
+        throw new ObservationHandoffError("Observer handoff already saved; preserve the same job/observer metadata on retry.");
       }
     } else if (observers.length) {
       const seen = new Set();
       const observations = observers.map(({ shell_id, job }) => {
-        if (!shell_id || seen.has(shell_id)) throw new Error("Observer shell IDs must be present and unique.");
+        if (!shell_id || seen.has(shell_id)) throw new ObservationHandoffError("Observer shell IDs must be present and unique.");
         seen.add(shell_id);
         for (const key of observerSchema.items.properties.job.required) {
           if (typeof job?.[key] !== "string" || !job[key].trim()) {
-            throw new Error(`Observer ${shell_id} requires job.${key}. Nothing was parked.`);
+            throw new ObservationHandoffError(`Observer ${shell_id} requires job.${key}. Nothing was parked.`);
           }
         }
         const task = tasks.find(item => item.id === shell_id);
         if (!task || task.type !== "shell" || task.attachmentMode !== "attached"
           || !Number.isInteger(task.pid)) {
-          throw new Error(`Observer ${shell_id} is not an identifiable attached shell in this source session.`);
+          throw new ObservationHandoffError(`Observer ${shell_id} is not an identifiable attached shell in this source session.`);
         }
         return {
           source_session_id: session.sessionId, job,
@@ -61,11 +63,11 @@ export async function prepareObservationHandoff(session, path, record, observers
     }
   }
   for (const item of record.observations || []) {
-    if (item.source_session_id !== session.sessionId) throw new Error("Observer belongs to a different source session.");
+    if (item.source_session_id !== session.sessionId) throw new ObservationHandoffError("Observer belongs to a different source session.");
     const task = tasks.find(candidate => candidate.id === item.observer.id);
     if (task && (task.pid !== item.observer.pid || task.command !== item.observer.command
       || task.startedAt !== item.observer.started_at)) {
-      throw new Error(`Observer ${item.observer.id} identity changed; do not stop the replacement.`);
+      throw new ObservationHandoffError(`Observer ${item.observer.id} identity changed; do not stop the replacement.`);
     }
   }
   const pending = tasks.filter(active);
@@ -73,7 +75,7 @@ export async function prepareObservationHandoff(session, path, record, observers
     const declared = new Set((record.observations || []).map(item => item.observer.id));
     const owned = pending.filter(task => declared.has(task.id)).map(task => task.id);
     const other = pending.filter(task => !declared.has(task.id)).map(task => task.id);
-    throw new Error([
+    throw new ObservationHandoffError([
       "Attached shells prevent native session.idle; cutover was not armed.",
       ...(owned.length ? [
         `Job/observer metadata is durable. Verify these are separate read-only observers, then use stop_bash for ONLY their exact source shell IDs: ${owned.join(", ")}.`,
