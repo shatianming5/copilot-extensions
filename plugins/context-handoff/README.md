@@ -140,6 +140,12 @@ an automatic observation or business turn. See the skill for preparation.
 
 ## Managed worker continuity
 
+An ordinary session may register its frontend with the paired lifecycle module
+without restoring a handoff. If registration fails, startup and tool errors
+identify that registration failure and the unavailable managed-launch capability.
+Only startup with a native checkpoint reports a restoration failure and a
+preserved predecessor; the underlying failure remains visible in both cases.
+
 The optional lifecycle bridge preserves an external managed-worker registry;
 it does not add a scheduler, a second registry, or a new goal/admission turn.
 Only sources with a managed session reference use the bridge. Unmanaged

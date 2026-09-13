@@ -42,7 +42,6 @@ import {
   collectAdvisoryGitFacts,
   consumeDispatchHandoffTask,
   consumeFileHandoff,
-  describeCliError,
   findHandoffFile,
   findHandoffTask,
   findTaskDeliveryCheckpoint,
@@ -57,7 +56,7 @@ import {
 import { loadContextHandoffConfig } from "./config.mjs";
 import { contextPressure, formatContextUsage } from "./thresholds.mjs";
 import { runNativeBridge, readNativeGoal } from "./native-transport.mjs";
-import { bootstrapNativeHandoff, continueNativeAfterAdmission, nativeCheckpoint, recordNativeReceiverFailure } from "./native-runtime.mjs";
+import { bootstrapNativeHandoff, continueNativeAfterAdmission, nativeCheckpoint, recordNativeReceiverFailure, describeNativeStartupError } from "./native-runtime.mjs";
 import { saveNativeBaton, requestNativeCutover, requestPlainCutover, freezeAndLaunchNative, recoverPendingHandoff } from "./native-source.mjs";
 import { observerSchema, ObservationHandoffError } from "./native-observation.mjs";
 
@@ -560,7 +559,7 @@ const session = await joinSession({
 
         await nativeStartup;
         if (nativeStartupError) {
-          return { resultType: "error", textResultForLlm: `Native restoration failed: ${nativeStartupError.message}. Predecessor preserved.` };
+          return { resultType: "error", textResultForLlm: describeNativeStartupError(nativeStartupError, process.env.CONTEXT_HANDOFF_NATIVE_CHECKPOINT) };
         }
 
         let result;
@@ -906,7 +905,7 @@ nativeStartup = bootstrapNativeHandoff(session).then(result => {
   nativeStartupError = error;
   const path = process.env.CONTEXT_HANDOFF_NATIVE_CHECKPOINT;
   if (path) recordNativeReceiverFailure(path, session.sessionId, error);
-  session.log(`[Context Handoff] Native restoration failed: ${describeCliError(error)}. Predecessor preserved.`, { level: "error" });
+  session.log(`[Context Handoff] ${describeNativeStartupError(error, path)}`, { level: "error" });
 });
 if (handoffConfig.warning) {
   session.log(`[Context Handoff] ${handoffConfig.warning}`, { level: "warning" });

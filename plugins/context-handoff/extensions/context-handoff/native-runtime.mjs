@@ -1,12 +1,19 @@
 import { readFileSync, watch } from "node:fs";
 import { dirname } from "node:path";
 import {
-  writeJsonAtomic, runCli, consumeFileHandoff, consumeDispatchHandoffTask,
+  writeJsonAtomic, runCli, consumeFileHandoff, consumeDispatchHandoffTask, describeCliError,
 } from "./handoff-core.mjs";
 import { prepareNativeGoal, acknowledgeNativeGoal, activateNativeGoal } from "./native-goal.mjs";
 import { readNativeGoal } from "./native-transport.mjs";
 import { observationBrief } from "./native-observation.mjs";
 import { retireHerdrPredecessor, workerLifecycle, advertiseWorkerLifecycle } from "./herdr.mjs";
+
+export function describeNativeStartupError(error, checkpointPath) {
+  const detail = describeCliError(error);
+  return checkpointPath
+    ? `Native restoration failed: ${detail}. Predecessor preserved.`
+    : `Worker lifecycle registration failed: ${detail}. Managed worker launch is unavailable; no handoff restoration was attempted.`;
+}
 
 export function nativeCheckpoint(path, sessionId) {
   const record = JSON.parse(readFileSync(path, "utf8"));
