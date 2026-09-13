@@ -24,7 +24,6 @@ export function advertiseWorkerLifecycle(sessionId, execute) {
   if (!isHerdrPane()) return;
   const home = process.env.COPILOT_HOME || join(homedir(), ".copilot");
   if (!existsSync(join(home, "worker-lifecycle", "installation.json"))) return;
-  if (existsSync(join(home, "session-state", sessionId, "files", "worker-lifecycle.json"))) return;
   execute(join(homedir(), ".local", "bin", "copilot-pane"), [
     "lifecycle", "--config-home", home, "native-ready", "--session", sessionId,
     "--plugin-path", fileURLToPath(new URL("../..", import.meta.url)),

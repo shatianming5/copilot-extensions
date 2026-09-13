@@ -1,12 +1,38 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import vm from "node:vm";
 import { observationBrief } from "../extensions/context-handoff/native-observation.mjs";
 import { runNativeSuccessor } from "../extensions/context-handoff/native-launch.mjs";
-import { retireHerdrPredecessor } from "../extensions/context-handoff/herdr.mjs";
+import { retireHerdrPredecessor, advertiseWorkerLifecycle } from "../extensions/context-handoff/herdr.mjs";
+
+test("paired reload refreshes an already managed frontend registration", t => {
+  const root = mkdtempSync(join(tmpdir(), "native-registration-"));
+  const keys = ["COPILOT_HOME", "HERDR_ENV", "HERDR_PANE_ID"];
+  const before = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  t.after(() => {
+    for (const key of keys) {
+      if (before[key] === undefined) delete process.env[key];
+      else process.env[key] = before[key];
+    }
+    rmSync(root, { recursive: true, force: true });
+  });
+  Object.assign(process.env, { COPILOT_HOME: root, HERDR_ENV: "1", HERDR_PANE_ID: "owned-pane" });
+  mkdirSync(join(root, "worker-lifecycle"));
+  writeFileSync(join(root, "worker-lifecycle", "installation.json"), "{}");
+  const files = join(root, "session-state", "owned-session", "files");
+  mkdirSync(files, { recursive: true });
+  writeFileSync(join(files, "worker-lifecycle.json"), "{}");
+  let calls = 0;
+  advertiseWorkerLifecycle("owned-session", (_command, args) => {
+    calls++;
+    assert.ok(args.includes("native-ready"));
+    assert.equal(args[args.indexOf("--session") + 1], "owned-session");
+  });
+  assert.equal(calls, 1);
+});
 
 const runtime = readFileSync(new URL(
   "../extensions/context-handoff/native-runtime.mjs", import.meta.url,

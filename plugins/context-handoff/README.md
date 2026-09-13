@@ -145,6 +145,9 @@ without restoring a handoff. If registration fails, startup and tool errors
 identify that registration failure and the unavailable managed-launch capability.
 Only startup with a native checkpoint reports a restoration failure and a
 preserved predecessor; the underlying failure remains visible in both cases.
+Reload also refreshes frontend registration for an already managed session.
+An existing logical binding is not proof that its current extension/process
+registration has survived a paired update.
 
 The optional lifecycle bridge preserves an external managed-worker registry;
 it does not add a scheduler, a second registry, or a new goal/admission turn.
