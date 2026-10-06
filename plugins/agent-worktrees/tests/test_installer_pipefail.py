@@ -25,6 +25,7 @@ tests carry no Windows-vs-POSIX path-translation assumptions either.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -35,7 +36,26 @@ _INSTALL_SH = (
     Path(__file__).resolve().parents[1] / "scripts" / "install.sh"
 )
 
-_BASH = shutil.which("bash")
+# A bare shutil.which("bash") can resolve to a Windows App Execution Alias
+# stub or the classic `C:\Windows\System32\bash.exe` WSL launcher (both
+# invoke an actual WSL distro rather than running this script in the
+# environment under test). Prefer the real Git Bash location when present;
+# otherwise filter both known WSL-launcher locations out of PATH before
+# falling back to shutil.which, so this never silently selects one.
+_GIT_BASH = Path(r"C:\Program Files\Git\bin\bash.exe")
+def _resolve_bash() -> str | None:
+    if _GIT_BASH.is_file():
+        return str(_GIT_BASH)
+    path = os.environ.get("PATH")
+    if not path:
+        return None
+    filtered = os.pathsep.join(
+        part for part in path.split(os.pathsep)
+        if "windowsapps" not in part.lower()
+        and part.rstrip("\\").lower() != r"c:\windows\system32"
+    )
+    return shutil.which("bash", path=filtered)
+_BASH = _resolve_bash()
 
 
 def _bash_honors_pipefail() -> bool:
@@ -58,6 +78,12 @@ def _bash_honors_pipefail() -> bool:
         r = subprocess.run([_BASH, "-c", probe], capture_output=True,
                            text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
+        return False
+    bash_path = Path(_BASH)
+    if (
+        bash_path.name.lower() == "bash.exe"
+        and bash_path.parent.name.lower() == "system32"
+    ):
         return False
     return r.returncode != 0 and "REACHED" not in r.stdout
 
@@ -110,7 +136,10 @@ def test_install_sh_guards_value_greps():
     (``default_branch`` is no longer grep-extracted -- the projects.yaml write
     moved to the Python `register-project-entry` subcommand -- so only the
     ``anchor:`` REPO_DIR detection remains.)"""
-    text = _INSTALL_SH.read_text()
+    # Explicit UTF-8: this is a POSIX shell script, and relying on the
+    # platform default text encoding (cp1252 on Windows) raises
+    # UnicodeDecodeError on any non-ASCII byte the script happens to contain.
+    text = _INSTALL_SH.read_text(encoding="utf-8")
     for key in ("anchor:",):
         line = next(
             ln for ln in text.splitlines()

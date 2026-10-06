@@ -60,7 +60,7 @@ def test_nudge_at_call_threshold_then_cooldown(tmp_path):
     fired = [i for i, o in enumerate(outs) if o]
     # Fires on the 3rd call (index 2), resets, needs another full window -> 6th (index 5).
     assert fired == [2, 5]
-    assert "status --summary" in outs[2]
+    assert "status --activity" in outs[2]
     assert "--title" in outs[2]  # summary_and_title scope
 
 
@@ -114,6 +114,16 @@ def test_kill_switch(tmp_path):
     for off in ("off", "0", "false", "no"):
         env = {"AGENT_WORKTREES_NUDGE": off, "AGENT_WORKTREES_NUDGE_CALLS": "1"}
         assert nudge.decide(_payload(cwd), env=env, home=home, now=1000.0) is None
+
+
+def test_expired_deadline_does_not_commit_sidecar(tmp_path):
+    home, cwd = _make_home(tmp_path)
+    env = {"AGENT_WORKTREES_NUDGE_CALLS": "1"}
+    assert nudge.decide(
+        _payload(cwd), env=env, home=home, deadline=0
+    ) is None
+    sidecar = home / ".agent-worktrees" / "nudge-state" / f"{_WID}.json"
+    assert not sidecar.exists()
 
 
 @pytest.mark.parametrize("scope_key", ["summary", "title"])

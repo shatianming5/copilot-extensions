@@ -41,7 +41,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from agent_procutil import detached_kwargs, windowless_python
+from agent_procutil import detached_kwargs, windowless_python, windowless_python_env
 
 from agent_logger.sync.lock import sync_lock
 
@@ -94,16 +94,16 @@ def _detach_kwargs() -> dict:
     return {**detached_kwargs(), "close_fds": True}
 
 
-def spawn_detached_sync(cfg, *, prune: bool = False) -> int:
+def spawn_detached_sync(cfg, *, prune: bool = False, full: bool = False) -> int:
     """Stage the package and launch a detached child that runs one sync pass.
 
     Returns quickly (0) after spawning. Dedupes against an in-flight sync via a
     non-blocking probe of the push lock. The launched child runs
-    ``agent_logger.sync.engine run [--prune]`` from the staged copy with a
-    neutral cwd; it removes its staging dir on exit.
+    ``agent_logger.sync.engine run [--prune] [--full]`` from the staged copy
+    with a neutral cwd; it removes its staging dir on exit.
     """
     # A sync already running? Skip staging entirely (rapid session-end dedupe).
-    lock_file = cfg.home / "session-sync.lock"
+    lock_file = cfg.home / cfg.sync_lock_name
     with sync_lock(lock_file, wait=False) as acquired:
         if not acquired:
             return 0
@@ -128,12 +128,16 @@ def spawn_detached_sync(cfg, *, prune: bool = False) -> int:
     else:
         env.pop(STAGED_ENV, None)
 
-    cmd = [windowless_python(sys.executable), "-m", "agent_logger.sync.engine", "run"]
+    python = sys.executable
+    cmd = [windowless_python(python), "-m", "agent_logger.sync.engine", "run"]
     if prune:
         cmd.append("--prune")
+    if full:
+        cmd.append("--full")
+    env.update(windowless_python_env(python))
 
     try:
-        subprocess.Popen(  # noqa: S603 - fixed argv, detached background sync
+        subprocess.Popen(
             cmd,
             cwd=cwd,
             env=env,

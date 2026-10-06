@@ -12,24 +12,30 @@ import pytest
 
 PLUGIN = Path(__file__).resolve().parents[1]
 MANIFEST = PLUGIN / "plugin.json"
-HOOKS = PLUGIN / "hooks.json"
 POWERSHELL_PRODUCER = PLUGIN / "scripts" / "emit-guidance.ps1"
 BASH_PRODUCER = PLUGIN / "scripts" / "emit-guidance.sh"
-
-
-def _hook_input() -> str:
-    return json.dumps({
-        "sessionId": "context-handoff-hook-test",
-        "cwd": str(PLUGIN),
-        "source": "test",
-        "timestamp": 1,
-    })
 
 
 def _powershell() -> str | None:
     if os.name == "nt":
         return shutil.which("pwsh") or shutil.which("powershell.exe")
     return shutil.which("pwsh")
+
+
+def _bash() -> str | None:
+    executable = shutil.which("bash")
+    if not executable:
+        return None
+    try:
+        result = subprocess.run(
+            [executable, "-lc", "exit 0"],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return executable if result.returncode == 0 else None
 
 
 def _run(
@@ -54,7 +60,10 @@ def _run_bash(
     *args: str,
     plugin_root: Path | None = PLUGIN,
 ) -> subprocess.CompletedProcess[str]:
-    return _run(["bash", str(BASH_PRODUCER), *args], plugin_root=plugin_root)
+    bash = _bash()
+    if not bash:
+        pytest.skip("a conformant Bash is unavailable")
+    return _run([bash, str(BASH_PRODUCER), *args], plugin_root=plugin_root)
 
 
 def _run_powershell(
@@ -69,6 +78,15 @@ def _run_powershell(
     )
 
 
+def _run_native(
+    *args: str,
+    plugin_root: Path | None = PLUGIN,
+) -> subprocess.CompletedProcess[str]:
+    if os.name == "nt":
+        return _run_powershell(*args, plugin_root=plugin_root)
+    return _run_bash(*args, plugin_root=plugin_root)
+
+
 def _context(result: subprocess.CompletedProcess[str]) -> str:
     payload = json.loads(result.stdout)
     assert set(payload) == {"additionalContext"}
@@ -80,28 +98,17 @@ def _catalog(context: str) -> dict[str, object]:
     return json.loads(raw)
 
 
-def _hook_entry() -> dict[str, object]:
-    manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
-    hook_path = (PLUGIN / manifest["hooks"]).resolve()
-    assert hook_path.is_relative_to(PLUGIN.resolve())
-    assert hook_path == HOOKS.resolve()
-    hooks = json.loads(hook_path.read_text(encoding="utf-8"))
-    return hooks["hooks"]["sessionStart"][0]
-
-
-def test_manifest_registers_cross_platform_session_start_hook() -> None:
+def test_manifest_registers_output_free_session_writer() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     assert manifest["hooks"] == "hooks.json"
-    entry = _hook_entry()
-    assert entry["type"] == "command"
-    assert entry["timeoutSec"] == 30
-    for shell in ("powershell", "bash"):
-        command = str(entry[shell])
-        assert "COPILOT_PLUGIN_ROOT" in command
-        assert "PLUGIN_ROOT" in command
-        assert "CLAUDE_PLUGIN_ROOT" in command
-        assert "invoke-context-contributor." in command
-        assert "emit-guidance." in command
+    declaration = json.loads(
+        (PLUGIN / "session-context.json").read_text(encoding="utf-8")
+    )
+    assert declaration["contributors"] == []
+    assert declaration["sessionStart"] == {
+        "sideEffects": "restart-safe-idempotent",
+        "context": "none",
+    }
 
 
 def test_bash_emits_owned_bounded_continuity_guidance() -> None:
@@ -110,22 +117,36 @@ def test_bash_emits_owned_bounded_continuity_guidance() -> None:
     assert context.startswith(f"[owner: context-handoff@{version}]\n")
     assert "When you own the active objective, it can span multiple agent sessions" in context
     assert "do not narrow investigation, planning, implementation" in context
-    assert "begin execution immediately, subject to any required safety" in context
+    assert "compose and store the baton safely" in context
+    assert "sync the worktree first if pressure-driven, then compose and store" in context
+    assert "trigger_handoff" in context
+    assert "do not ask first" in context
+    assert "ending the turn with proposed follow-ups" in context
+    assert "always stores/seeds; never performs process management" in context
+    assert "Live signaling needs" in context
+    assert "mode: auto" in context
+    assert "manual-only" in context
     assert "Consuming or producing a handoff is setup or progress, never completion" in context
-    assert "transfer it through the available handoff path" in context
-    assert "Bounded delegates remain within their assigned scope" in context
-    assert "a session superseded by cutover stops work" in context
+    assert "one slice of the larger effort" in context
     assert "The session owning the objective stops only" in context
     assert "Use the `context-handoff` skill" in context
+    # Fresh-session awareness (Goal 2/3): a session did not need to begin
+    # from a handoff to learn the mechanism exists -- delivered here (static,
+    # naturally idempotent session-start guidance) rather than a runtime
+    # session.send() nudge from the extension (which is reimported on every
+    # reconnect/refork and so cannot track "sent once" safely).
+    assert "whether or not this session began from a handoff" in context
+    assert "available from turn one" in context
     kernel = context.split("\n\n## agent-worktrees session command catalog", 1)[0]
     assert len(kernel.encode("utf-8")) < 2048
     assert len(context.encode("utf-8")) < 3072
 
 
 def test_bash_preserves_adjacent_agent_worktrees_command_catalog() -> None:
-    context = _context(_run_bash())
+    context = _context(_run_native())
+    filename = "agent-worktrees.ps1" if os.name == "nt" else "agent-worktrees"
     command = (
-        PLUGIN.parent / "agent-worktrees" / "bin" / "payload" / "agent-worktrees"
+        PLUGIN.parent / "agent-worktrees" / "bin" / "payload" / filename
     ).resolve()
     assert "## agent-worktrees session command catalog" in context
     catalog = _catalog(context)
@@ -135,7 +156,7 @@ def test_bash_preserves_adjacent_agent_worktrees_command_catalog() -> None:
 
 
 def test_bash_own_only_mode_excludes_adjacent_catalog() -> None:
-    context = _context(_run_bash("--own-only"))
+    context = _context(_run_native("--own-only"))
     assert context.startswith("[owner: context-handoff@")
     assert "agent-worktrees session command catalog" not in context
     assert len(context.encode("utf-8")) < 2048
@@ -148,9 +169,12 @@ def test_aggregate_mode_is_owned_compact_and_cross_platform() -> None:
     context = _context(_run_bash("--aggregate"))
     assert context.startswith("[owner: context-handoff@")
     assert "handoff is progress, never completion" in context
-    assert "predecessor stops competing" in context
+    assert "trigger_handoff" in context
+    assert "Near token pressure" in context
+    assert "Turn-end follow-ups ask before" in context
+    assert "one slice" in context
     assert "Use the `context-handoff` skill" in context
-    assert len(context.encode("utf-8")) <= 448
+    assert len(context.encode("utf-8")) <= 700
 
     if _powershell():
         assert _context(_run_powershell("--aggregate")) == context
@@ -172,18 +196,22 @@ def test_bash_reports_incomplete_adjacent_payload_as_unavailable(
     command.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     command.chmod(0o755)
 
-    catalog = _catalog(_context(_run_bash(plugin_root=payload)))
+    catalog = _catalog(_context(_run_native(plugin_root=payload)))
     assert catalog["commands"][0]["availability"] == "unavailable"
 
 
 def test_bash_standalone_payload_emits_only_own_guidance(tmp_path: Path) -> None:
     payload = tmp_path / "context-handoff"
     shutil.copytree(PLUGIN, payload)
-    context = _context(_run_bash(plugin_root=payload))
+    context = _context(_run_native(plugin_root=payload))
     assert context.startswith("[owner: context-handoff@")
     assert "agent-worktrees session command catalog" not in context
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows path limits cannot construct the oversized catalog fixture",
+)
 def test_oversized_adjacent_catalog_falls_back_to_own_guidance(
     tmp_path: Path,
 ) -> None:
@@ -209,64 +237,19 @@ def test_oversized_adjacent_catalog_falls_back_to_own_guidance(
     (scripts_dir / "install.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     (scripts_dir / "install.ps1").write_text("exit 0\n", encoding="utf-8")
 
-    bash_context = _context(_run_bash(plugin_root=payload))
-    assert bash_context.startswith("[owner: context-handoff@")
-    assert "agent-worktrees session command catalog" not in bash_context
-    assert len(bash_context.encode("utf-8")) < 2048
+    native_context = _context(_run_native(plugin_root=payload))
+    assert native_context.startswith("[owner: context-handoff@")
+    assert "agent-worktrees session command catalog" not in native_context
+    assert len(native_context.encode("utf-8")) < 2048
 
-    if _powershell():
-        assert _context(_run_powershell(plugin_root=payload)) == bash_context
+    if os.name != "nt" and _powershell():
+        assert _context(_run_powershell(plugin_root=payload)) == native_context
 
 
 def test_bash_falls_back_to_script_location() -> None:
-    assert _context(_run_bash(plugin_root=None)).startswith("[owner: context-handoff@")
-
-
-def test_hook_commands_use_plugin_root() -> None:
-    entry = _hook_entry()
-    environment = os.environ.copy()
-    environment["COPILOT_PLUGIN_ROOT"] = str(PLUGIN)
-
-    result = subprocess.run(
-        ["bash", "-c", str(entry["bash"])],
-        input=_hook_input(),
-        check=True,
-        capture_output=True,
-        text=True,
-        env=environment,
+    assert _context(_run_native(plugin_root=None)).startswith(
+        "[owner: context-handoff@"
     )
-    assert _context(result) == _context(_run_bash("--aggregate"))
-
-    powershell = _powershell()
-    if powershell:
-        result = subprocess.run(
-            [powershell, "-NoProfile", "-Command", str(entry["powershell"])],
-            input=_hook_input(),
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        assert _context(result) == _context(_run_powershell("--aggregate"))
-
-
-def test_hook_commands_accept_compatibility_root_aliases() -> None:
-    entry = _hook_entry()
-    for alias in ("PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
-        environment = os.environ.copy()
-        for name in ("COPILOT_PLUGIN_ROOT", "PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
-            environment.pop(name, None)
-        environment[alias] = str(PLUGIN)
-
-        result = subprocess.run(
-            ["bash", "-c", str(entry["bash"])],
-            input=_hook_input(),
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        assert _context(result).startswith("[owner: context-handoff@")
 
 
 @pytest.mark.skipif(_powershell() is None, reason="PowerShell is not installed")
@@ -301,6 +284,6 @@ def test_producers_fail_open_for_incomplete_payload(
         manifest["version"] = "0.1"
         (payload / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
 
-    assert _run_bash(plugin_root=payload).stdout == "{}"
-    if _powershell():
+    assert _run_native(plugin_root=payload).stdout == "{}"
+    if os.name != "nt" and _powershell():
         assert _run_powershell(plugin_root=payload).stdout == "{}"

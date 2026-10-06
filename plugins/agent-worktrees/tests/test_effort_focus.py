@@ -8,8 +8,11 @@ from pathlib import Path
 import pytest
 
 from agent_worktrees import __main__ as m
+from agent_worktrees import output
 from agent_worktrees import effort_focus as ef
+from agent_worktrees import session_metadata_cli
 from agent_worktrees import tracking
+from agent_worktrees import worktree_identity
 
 
 def _effort(
@@ -105,7 +108,7 @@ def cli_env(tmp_path, tmp_tracking_dir, monkeypatch_config, monkeypatch):
     tracking.save_record(record, tmp_tracking_dir / f"{record.worktree_id}.yaml")
     monkeypatch.setattr(m.cfg, "load_config", lambda: object())
     monkeypatch.setattr(m, "_infer_worktree_id", lambda _wid, _config=None: record.worktree_id)
-    monkeypatch.setattr(m, "_resolve_worktree_id", lambda wid: wid)
+    monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda wid: wid)
     monkeypatch.setattr(ef, "repository_root", lambda _path: repo)
     return repo, record, tmp_tracking_dir
 
@@ -154,7 +157,12 @@ def test_binding_rejects_symlink_escape(tmp_path):
     (repo / "efforts" / "active").mkdir(parents=True)
     outside.mkdir()
     (outside / "README.md").write_text("outside", encoding="utf-8")
-    (repo / "efforts" / "active" / "linked").symlink_to(outside, target_is_directory=True)
+    try:
+        (repo / "efforts" / "active" / "linked").symlink_to(
+            outside, target_is_directory=True
+        )
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
 
     with pytest.raises(ef.EffortFocusError, match="link or reparse"):
         ef.resolve_effort_path(repo, "efforts/active/linked/README.md")
@@ -186,6 +194,24 @@ def test_validate_binding_requires_declared_participant_and_slice(tmp_path):
     substring_slice = ef.make_active_effort(relative, "Driver", "Phase 2")
     with pytest.raises(ef.EffortFocusError, match="slice"):
         ef.validate_binding(repo, substring_slice)
+
+
+def test_participant_cell_with_multiple_backtick_tokens_matches_plain_text(tmp_path):
+    """A Participants cell may wrap several identifiers separately in backticks
+    (e.g. "`repo` worktree `id`") rather than wrapping the whole cell once --
+    every backtick is markdown code-span syntax here, not content, so matching
+    must strip all of them, not just a leading/trailing pair."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    relative = _effort(
+        repo, participant="`some-repo` worktree `host-win-20260101-000000-aaaa`"
+    )
+    valid = ef.make_active_effort(
+        relative,
+        "some-repo worktree host-win-20260101-000000-aaaa",
+        "Phase 2 - Bind active effort",
+    )
+    assert ef.validate_binding(repo, valid).active
 
 
 def test_binding_requires_canonical_active_effort_prefix(tmp_path):
@@ -303,6 +329,107 @@ def test_closed_or_stale_effort_is_not_oriented(tmp_path):
     assert ef.orientation(repo, ref) == ""
 
 
+def test_lint_effort_reports_nothing_for_a_clean_readme(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    relative = _effort(repo)
+    assert ef.lint_effort(repo, relative) == []
+    # participant/slice checks are opt-in and pass when declared
+    assert ef.lint_effort(
+        repo, relative, participant="Driver", slice_name="Phase 2 - Bind active effort",
+    ) == []
+
+
+def test_lint_effort_names_the_missing_bullet_marker_specifically(tmp_path):
+    """The exact near-miss copilot-extensions#2631 reports: a bare
+    "**Slug:** ..." bold line renders identically to the bulleted form in
+    Markdown, but only the bulleted form parses -- lint must name that
+    specific fix, not a generic "is required"."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    relative = _effort(repo)
+    path = repo / Path(*relative.split("/"))
+    text = path.read_text(encoding="utf-8").replace(
+        "- **Slug:** `durable-loop`", "**Slug:** `durable-loop`",
+    )
+    path.write_text(text, encoding="utf-8")
+
+    findings = ef.lint_effort(repo, relative)
+    assert len(findings) == 1
+    assert findings[0]["field"] == "slug"
+    assert "not a bulleted list item" in findings[0]["message"]
+    assert "`- **Slug:** ...`" in findings[0]["message"]
+
+
+def test_lint_effort_reports_every_finding_in_one_pass(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    relative = _effort(repo)
+    path = repo / Path(*relative.split("/"))
+    text = path.read_text(encoding="utf-8")
+    # Strip the Slug header entirely, and the Validation Plan heading, in
+    # one shot -- both should be reported together, not one at a time.
+    text = text.replace("- **Slug:** `durable-loop`\n", "")
+    text = text.replace("## Validation Plan", "## Not Validation Plan")
+    path.write_text(text, encoding="utf-8")
+
+    findings = ef.lint_effort(repo, relative)
+    fields = {f["field"] for f in findings}
+    assert fields == {"slug", "validation_plan"}
+
+
+def test_lint_effort_flags_unrecognized_status(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    relative = _effort(repo, status="Dnoe")
+    findings = ef.lint_effort(repo, relative)
+    assert any(f["field"] == "status" and "not recognized" in f["message"] for f in findings)
+
+
+def test_lint_effort_checks_participant_and_slice_only_when_given(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    relative = _effort(repo)
+    # Clean without participant/slice checks.
+    assert ef.lint_effort(repo, relative) == []
+    findings = ef.lint_effort(repo, relative, participant="Nobody", slice_name="Nowhere")
+    fields = {f["field"] for f in findings}
+    assert fields == {"participant", "slice"}
+
+
+def test_lint_effort_reports_a_single_finding_for_an_unreadable_path(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    findings = ef.lint_effort(repo, "efforts/active/missing/README.md")
+    # The exact EffortFocusError text differs by platform (the POSIX
+    # no-follow-handle path vs. the Windows fallback path), so only assert
+    # the shape: a single "path" finding naming an unreadable README.
+    assert findings == [{"field": "path", "message": findings[0]["message"]}]
+    assert findings[0]["message"]
+
+
+def test_cmd_effort_focus_lint_cli(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    relative = _effort(repo)
+    args = _args("lint", path=relative, repo_root=str(repo))
+    rc = session_metadata_cli.cmd_effort_focus(args)
+    assert rc == 0
+    assert f"{relative}: OK" in capsys.readouterr().out
+
+
+def test_cmd_effort_focus_lint_cli_json_reports_findings(tmp_path, capfd):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    relative = _effort(repo, status="Dnoe")
+    args = _args("lint", path=relative, repo_root=str(repo), json=True)
+    rc = session_metadata_cli.cmd_effort_focus(args)
+    assert rc == 1
+    payload = capfd.readouterr().out
+    assert '"ok": false' in payload
+    assert '"field": "status"' in payload
+
+
 def test_bind_show_and_transfer_release(cli_env, capsys, monkeypatch):
     repo, record, tracking_dir = cli_env
     relative = _effort(repo)
@@ -320,7 +447,7 @@ def test_bind_show_and_transfer_release(cli_env, capsys, monkeypatch):
 
     capsys.readouterr()
     shown = {}
-    monkeypatch.setattr(m, "_json_output", lambda payload: shown.update(payload))
+    monkeypatch.setattr(output, "_json_output", lambda payload: shown.update(payload))
     assert m.cmd_effort_focus(_args("show", json=True)) == 0
     assert shown["active_effort"]["active"] is True
     assert shown["follow_up"] is True
@@ -332,6 +459,60 @@ def test_bind_show_and_transfer_release(cli_env, capsys, monkeypatch):
     assert released.active_effort is None
     assert released.follow_up is False
     assert released.summary == "Transferred effort durable-loop to issue #42"
+
+
+def test_bind_show_resolves_effort_against_paired_knowledge_worktree(
+    tmp_path, tmp_tracking_dir, monkeypatch_config, monkeypatch
+):
+    """A stateless harness worktree's ``effort-focus bind``/``show`` must
+    resolve the effort README against the paired knowledge worktree, not the
+    harness's own checkout (#300)."""
+
+    harness_repo = tmp_path / "harness"
+    harness_repo.mkdir()
+    knowledge_repo = tmp_path / "knowledge"
+    knowledge_repo.mkdir()
+    relative = _effort(knowledge_repo)
+
+    record = _record(harness_repo)
+    tracking.save_record(record, tmp_tracking_dir / f"{record.worktree_id}.yaml")
+
+    class _StatelessRepoConfig:
+        stateless = True
+        requires_external_state_root = True
+
+    class _FakeConfig:
+        default_repo = _StatelessRepoConfig()
+
+    fake_config = _FakeConfig()
+    monkeypatch.setattr(m.cfg, "load_config", lambda: fake_config)
+    monkeypatch.setattr(m, "_infer_worktree_id", lambda _wid, _config=None: record.worktree_id)
+    monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda wid: wid)
+    monkeypatch.setattr(ef, "repository_root", lambda _path: harness_repo)
+
+    sibling = m.state_root_mod.PairCheckout(
+        role="knowledge",
+        path=str(knowledge_repo),
+        repo="knowledge-repo",
+        worktree_id="wt-knowledge",
+    )
+    current = m.state_root_mod.PairCheckout(
+        role="harness", path=str(harness_repo), repo="example", worktree_id=record.worktree_id
+    )
+    pair = m.state_root_mod.StatePair(
+        paired=True, pair_id="pair-1", current=current, sibling=sibling
+    )
+    monkeypatch.setattr(m.state_root_mod, "resolve_pair", lambda _config, cwd=None: pair)
+
+    assert m.cmd_effort_focus(_args(
+        "bind",
+        path=relative,
+        participant="Driver",
+        effort_slice="Phase 2 - Bind active effort",
+    )) == 0
+    loaded = tracking.load_record(tmp_tracking_dir / f"{record.worktree_id}.yaml")
+    assert loaded.active_effort is not None
+    assert loaded.follow_up is True
 
 
 def test_release_requires_done_or_named_transfer(cli_env):
@@ -575,7 +756,7 @@ def test_transfer_and_show_work_when_checkout_is_unavailable(
         ),
     )
     shown = {}
-    monkeypatch.setattr(m, "_json_output", lambda payload: shown.update(payload))
+    monkeypatch.setattr(output, "_json_output", lambda payload: shown.update(payload))
 
     assert m.cmd_effort_focus(_args("show", json=True)) == 0
     assert shown["active_effort"]["state"] == "stale"
@@ -644,7 +825,7 @@ def test_history_digest_includes_bounded_effort_pointer(
         relative, "Driver", "Phase 2 - Bind active effort"
     )
     tracking.save_record(record, tracking_dir / f"{record.worktree_id}.yaml")
-    monkeypatch.setattr(m, "_resolve_worktree_for_read", lambda *_args: record.worktree_id)
+    monkeypatch.setattr(session_metadata_cli, "_resolve_worktree_for_read", lambda *_args: record.worktree_id)
 
     assert m.cmd_history_digest(
         argparse.Namespace(worktree_id=None, worktree_dir=None, session_id=None, limit=8)

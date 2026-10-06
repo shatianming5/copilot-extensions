@@ -65,12 +65,50 @@ class SourceSpec:
     auth_account: str | None = None
     trust_domain: str | None = None
     repo_path: str | None = None
+    ref: str | None = None
 
 
 def _type_from_name(name: str) -> str:
     """Infer a connector type from a source name prefix (``git:``/``github:``/…)."""
     head = name.split(":", 1)[0].strip().lower()
     return head or "git"
+
+
+def _resolve_explicit_source_spec(
+    source: str, by_name: dict[str, "SourceSpec"]
+) -> "SourceSpec":
+    """Resolve one explicitly-named ``--source``/``{"source": ...}`` request.
+
+    Prefers the matching configured spec so its repo/auth resolve correctly.
+    ``git:<name>:commits`` and ``github:<owner>/<repo>:issues``/``:pulls`` are
+    never themselves configured sources -- each is a BYPRODUCT its connector's
+    ``discover()`` emits alongside its sibling content (files+commits in one
+    git crawl; issues+pulls in one GitHub issues-API crawl), using whatever
+    identity its *base* source resolves. A bare synthesized spec for one of
+    these has no repo/repo_path/auth_account, so it used to either silently
+    fall back to ``GitRepoConnector``'s cwd/env default (virtually always the
+    wrong repo, surfacing only as an opaque ``git ls-files`` exit-128) or, for
+    ``github:``, get constructed with the SUFFIX STILL IN THE NAME --
+    ``GitHubConnector._parse_source`` naively splits on the first ``/``, so
+    ``github:owner/repo:issues`` parses as repo ``"repo:issues"``, producing a
+    malformed API URL and a 404 on every request (confirmed identically across
+    all of ``:issues``/``:pulls`` for every configured github source).
+
+    Resolve the request against its BASE source's spec instead (returned
+    as-is, so the connector is constructed with the correct bare name and
+    inherits the base's real repo/repo_path/auth_account/ref) -- a full
+    reindex of the base naturally refreshes all of its byproducts together,
+    same as requesting the base name directly. Any other unresolvable name
+    synthesizes a bare spec, which ``_connector_kwargs`` now raises loudly on
+    (see its docstring) rather than silently defaulting.
+    """
+    spec = by_name.get(source)
+    if spec is None:
+        for suffix in (":commits", ":issues", ":pulls"):
+            if source.endswith(suffix):
+                spec = by_name.get(source[: -len(suffix)])
+                break
+    return spec or SourceSpec(name=source, type=_type_from_name(source))
 
 
 def configured_source_specs() -> list[SourceSpec]:
@@ -103,6 +141,7 @@ def configured_source_specs() -> list[SourceSpec]:
                 auth_account=(auth or {}).get("account") if isinstance(auth, dict) else None,
                 trust_domain=entry.get("trust_domain"),
                 repo_path=entry.get("_repo_path"),
+                ref=entry.get("ref"),
             )
         )
     if specs:
@@ -160,15 +199,41 @@ def _connector_kwargs(spec: SourceSpec) -> dict[str, object]:
     #1350). The bare default ``git`` source (no repo/repo_path) resolves to no
     kwargs, letting ``GitRepoConnector`` fall back to its cwd/env default."""
     if spec.type == "git":
+        kwargs: dict[str, object] = {}
         path = _resolve_repo_path(spec)
         if path:
-            return {"repo_path": path}
-        if spec.repo or spec.repo_path:
+            kwargs["repo_path"] = path
+        elif spec.name != "git":
+            # Any OTHER explicitly-named git source (including one synthesized
+            # for a name that doesn't match a configured spec) that still can't
+            # resolve a checkout path must fail loudly here -- never silently
+            # fall through to GitRepoConnector's cwd/env default, which is
+            # virtually always the WRONG repo (or no repo at all) for a named
+            # request and previously surfaced only as an opaque `git ls-files`
+            # exit-128 deep in a subprocess traceback (see the ``:commits``
+            # case this guards against, just below).
             raise RuntimeError(
                 f"git source {spec.name!r}: could not resolve a checkout path "
                 f"(repo={spec.repo!r}) via the agent-worktrees registry"
             )
-        return {}  # bare default 'git' — connector uses cwd / AGENT_INDEX_GIT_REPO
+        if spec.ref:
+            kwargs["ref"] = spec.ref
+        if spec.auth_account:
+            # Authenticate the fetch step so the checkout is actively pulled
+            # forward as the remote's tracked branch moves, rather than
+            # depending on whichever account happens to be ambient-active in
+            # the system's `gh`-backed git credential helper (which may not be
+            # the account THIS repo needs -- e.g. an EMU org repo vs. a
+            # personal one). Unlike the github: (issues/PRs) connector, a
+            # resolution failure here is non-fatal: GitRepoConnector's own
+            # fetch already falls back gracefully to stale-but-canonical
+            # remote-tracking state or the local HEAD (see its module
+            # docstring), so proceed unauthenticated rather than failing the
+            # whole source.
+            token = _resolve_gh_token(spec.auth_account)
+            if token:
+                kwargs["token"] = token
+        return kwargs
     if spec.type == "github":
         if not spec.auth_account:
             return {}  # anonymous (low rate limit) — the connector warns
@@ -256,14 +321,13 @@ def run_reindex(
         # An explicit --source names one source: prefer its configured spec so
         # its repo/auth still resolve; otherwise synthesize a bare spec.
         by_name = {s.name: s for s in configured_source_specs()}
-        sources_to_index = [
-            by_name.get(source) or SourceSpec(name=source, type=_type_from_name(source))
-        ]
+        sources_to_index = [_resolve_explicit_source_spec(source, by_name)]
 
     total_chunks = 0
     total_deleted = 0
     total_files_crawled = 0
     failed_sources: list[dict[str, str]] = []
+    sources_purged: list[str] = []
     start = time.monotonic()
 
     try:
@@ -331,6 +395,35 @@ def run_reindex(
                     profile.model_id, exc_info=True,
                 )
 
+    # Purge sources removed from the CURRENT corpus config (a harness's own
+    # checked-in defaults, a knowledge-repo overlay, or a personal/machine
+    # override) -- distinct from `gc_stale_sources`'s abandoned-naming-scheme
+    # cleanup below, and unlike it, cheap and safe on EVERY reindex (not just
+    # `--full`). Runs only when `source` names the whole configured set (an
+    # explicit single `--source` invocation doesn't see the full set, so it
+    # would otherwise purge every OTHER configured source). This is what lets
+    # a config change -- e.g. removing a source from `.agent-index/config.yaml`
+    # -- take effect on the very next routine reindex tick, with no full
+    # reindex and no service restart required.
+    if source is None and os.environ.get("AGENT_INDEX_REINDEX_GC", "1") != "0":
+        try:
+            from agent_index.indexing.gc import gc_unconfigured_sources
+
+            configured_names = frozenset(spec.name for spec in sources_to_index)
+            gc_summary = gc_unconfigured_sources(
+                multi_store, path_index, state, configured_names=configured_names,
+            )
+            purged = gc_summary["purged"]
+            if purged:
+                print("\nPurging sources removed from config...")
+                for src, cnt in sorted(purged.items()):
+                    print(f"  purged {src}: {cnt} chunks")
+                total_deleted += gc_summary["chunks_deleted"]
+                sources_purged = sorted(purged)
+        except Exception:
+            logger.warning("Unconfigured-source GC failed", exc_info=True)
+            print("  WARNING: unconfigured-source GC failed (see logs)")
+
     if full:
         state.last_full_reindex = time.time()
 
@@ -385,6 +478,8 @@ def run_reindex(
     }
     if failed_sources:
         result["sources_failed"] = failed_sources
+    if sources_purged:
+        result["sources_purged"] = sources_purged
 
     # Refresh the similarity-cluster artifact from the just-updated vectors.
     # Reuses stored embeddings (no re-embedding), so it runs post-index in the
@@ -808,9 +903,27 @@ def _embed_and_store_batch(
                 )
                 raise
             except Exception:
-                logger.warning(
-                    "Failed to embed batch with model '%s'", model_id,
+                # ANY other embed/upsert failure must ALSO fail loud, for the
+                # exact same #775 reason the EngineUnavailableError branch
+                # above already covers: upsert_content() ran earlier in this
+                # loop iteration and already persisted this batch's chunks, so
+                # silently continuing here leaves them stored WITHOUT their
+                # vector -- permanently invisible to semantic search, with the
+                # task still reporting a clean "complete". This previously
+                # only logged a warning and moved on, which is exactly how a
+                # real host accumulated chunks across MULTIPLE sources with
+                # silently-missing vectors once the embedding engine started
+                # returning HTTP 500s (httpx.HTTPStatusError, NOT
+                # EngineUnavailableError, which only covers connection-level
+                # unreachability -- a since-fixed transformers version-pin
+                # typo, copilot-extensions#114) while every affected reindex
+                # task still reported success.
+                logger.error(
+                    "Failed to embed batch with model '%s'; failing the "
+                    "source so %d chunks are retried, not silently stored "
+                    "without vectors", model_id, len(model_chunks),
                     exc_info=True,
                 )
+                raise
 
     return total

@@ -84,6 +84,29 @@ degradation without global identity mutation.
   failures, and target/account mismatches.
 - [ ] Document migration from ambient selection and a reversible rollback path.
 
+### Phase 5 - Reconcile deferred backlog
+
+- [ ] Accept account-scoping candidates only through
+  [`migration-intake`](../migration-intake/README.md)'s deduplication and
+  ownership gate.
+- [ ] Revalidate accepted technical scope against the current identity/scoped-
+  execution contract; return obsolete or unsafe candidates for explicit
+  disposition.
+- [ ] Place each accepted public tracker item in exactly one existing phase,
+  extending this plan before implementation when necessary.
+- [ ] PR-guidance overlays and relationship metadata: support review-guidance
+  overlays and cross-PR relationship metadata once live caller-identity and
+  network resolution (Phase 1-2 of this plan) exist to attribute them
+  correctly.
+- [ ] Keep examples synthetic and repository-neutral.
+
+### Bug sweep — linked open bugs (2026-09-24)
+
+_Correlated via a facility-driven sweep of open `bug`-labeled issues against active efforts (VEI + direct review). Not yet triaged into a numbered phase — listed here as upcoming work for whoever picks this effort back up._
+
+- [ ] **#545** agent-worktrees: <project> --version mis-routes to the bare Picker seam instead of the CLI
+  - `<project> --version` mis-routing is exactly this effort's `project-addressed-not-cwd-bound` scope.
+
 ## Validation Plan
 
 - [ ] Parallel child processes targeting repositories with different bindings

@@ -9,10 +9,13 @@ used (the resolve_token None case).
 from __future__ import annotations
 
 import json
+import os
+from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse
 from urllib.parse import quote
 
-from ..pr_contract import Comment, CommentThread, PRSnapshot, Review, ThreadsResult
-from .base import ProviderError, PRScope, PullResult, run_cli
+from ..pr_contract import Comment, CommentThread, PRDiff, PRSnapshot, Review, ReviewNudgeResult, ThreadsResult
+from .base import ProviderError, PRScope, PullResult, reject_copilot_mention, run_cli
 
 
 # HTTP statuses worth retrying (network / 5xx / 429 / 408); 4xx (auth / not-found
@@ -41,15 +44,69 @@ def _gh_detail_is_transient(detail: str) -> bool:
     )
 
 
+#: GitHub's ``repos/{owner}/{repo}`` payload carries a ``permissions`` object
+#: of booleans for the *authenticated* identity -- the acting token/CLI-login,
+#: never a config value. Highest-to-lowest so one true bit wins.
+_GH_PERMISSION_PRIORITY = ("admin", "maintain", "push", "triage", "pull")
+#: GitHub's boolean key -> the provider-neutral token ``actor_merge_authority``
+#: understands (``push`` is GitHub's name for write access).
+_GH_PERMISSION_TOKEN = {
+    "admin": "admin", "maintain": "maintain", "push": "write",
+    "triage": "triage", "pull": "read",
+}
+
+
+def _github_viewer_permission(permissions: object) -> str:
+    """Normalize ``repos/{owner}/{repo}.permissions`` to a merge-authority token.
+
+    Returns ``""`` when the payload is missing/malformed or every bit is false
+    (an authenticated call always has at least ``pull`` true for a repo it can
+    see, so all-false means the field wasn't populated -- report unknown, not a
+    confident "none"). A bit must be the actual boolean ``True`` -- a malformed
+    payload with e.g. ``"push": "false"`` (a truthy string) must never
+    normalize to write access.
+    """
+    if not isinstance(permissions, dict):
+        return ""
+    for bit in _GH_PERMISSION_PRIORITY:
+        if permissions.get(bit) is True:
+            return _GH_PERMISSION_TOKEN[bit]
+    return ""
+
+
 class GitHubProvider:
     """Open + query pull requests on GitHub via the ``gh`` CLI."""
 
     name = "github"
 
-    def _env(self, token: str | None) -> dict[str, str]:
-        return {"GH_TOKEN": token} if token else {}
+    def authority_endpoint(self, api_base: str = "") -> str:
+        configured = (api_base or "").strip()
+        if configured:
+            parsed = urlparse(
+                configured if "://" in configured else f"//{configured}"
+            )
+            if parsed.hostname:
+                endpoint = parsed.hostname.lower()
+                if parsed.port is not None:
+                    endpoint = f"{endpoint}:{parsed.port}"
+                return endpoint
+        return (os.environ.get("GH_HOST") or "github.com").strip().lower()
+
+    def _env(self, token: str | None, *, host: str = "") -> dict[str, str]:
+        env: dict[str, str] = {}
+        if token:
+            env["GH_TOKEN"] = token
+        if host:
+            # `gh pr merge`/`gh pr merge --auto` have no `--hostname` flag (unlike
+            # `gh api`) -- GH_HOST is the only way to pin them to a non-default
+            # host, matching authority_endpoint(api_base) so a merge never runs
+            # against a different host than the one viewer_permission verified.
+            env["GH_HOST"] = host
+        return env
 
     def create_pull(self, scope: PRScope, *, token: str | None = None) -> PullResult:
+        reject_copilot_mention(scope.title, what="PR title")
+        reject_copilot_mention(scope.body, what="PR description")
         args = [
             "gh", "pr", "create",
             "--repo", scope.repo,
@@ -81,13 +138,14 @@ class GitHubProvider:
     def get_pull(
         self, repo: str, number: int, *, api_base: str = "", token: str | None = None
     ) -> PullResult:
+        host = self.authority_endpoint(api_base)
         proc = run_cli(
             [
                 "gh", "pr", "view", str(number),
                 "--repo", repo,
-                "--json", "url,number,state",
+                "--json", "url,number,state,headRefOid",
             ],
-            env=self._env(token),
+            env=self._env(token, host=host),
         )
         if proc.returncode != 0:
             raise ProviderError(
@@ -102,7 +160,84 @@ class GitHubProvider:
             number=int(data.get("number", number)),
             state=state,
             merged=(state == "merged"),
+            # Same single lightweight call already returns the head commit
+            # (#4699) -- reading it here costs nothing extra, unlike the
+            # far heavier observe_head/get_snapshot calls (reviews, checks,
+            # statuses) a historical-PR boundary lookup has no need for.
+            # `headRefOid` is nullable (e.g. a deleted head ref) -- `or ""`
+            # normalizes an explicit JSON null, not just a missing key, so
+            # a stringified "None" never masquerades as a real head SHA.
+            head_sha=str(data.get("headRefOid") or ""),
         )
+
+    def observe_head(
+        self, repo: str, number: int, *, api_base: str = "", token: str | None = None
+    ) -> PullResult:
+        """Read the exact head and GitHub's HTTP ``Date`` in one response."""
+        host = self.authority_endpoint(api_base)
+        proc = run_cli(
+            [
+                "gh", "api", "--hostname", host, "--include",
+                f"/repos/{repo}/pulls/{number}",
+            ],
+            env=self._env(token),
+        )
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or proc.stdout.strip()
+            raise ProviderError(f"gh PR #{number} observation failed: {detail}")
+        marker = "\n{"
+        body_at = proc.stdout.find(marker)
+        if body_at < 0:
+            raise ProviderError(f"gh PR #{number} observation was malformed.")
+        headers = proc.stdout[:body_at]
+        body = proc.stdout[body_at + 1:]
+        date_header = ""
+        for line in headers.splitlines():
+            name, sep, value = line.partition(":")
+            if sep and name.strip().lower() == "date":
+                date_header = value.strip()
+        try:
+            data = json.loads(body)
+            observed_at = parsedate_to_datetime(date_header).isoformat()
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ProviderError(
+                f"gh PR #{number} observation lacked valid server evidence."
+            ) from exc
+        return PullResult(
+            number=int(data.get("number", number)),
+            head_sha=str((data.get("head") or {}).get("sha", "")),
+            observed_at=observed_at,
+        )
+
+    def publish_source_marker(
+        self,
+        repo: str,
+        number: int,
+        marker: str,
+        *,
+        api_base: str = "",
+        token: str | None = None,
+    ) -> str:
+        reject_copilot_mention(marker)
+        proc = run_cli(
+            [
+                "gh",
+                "pr",
+                "comment",
+                str(number),
+                "--repo",
+                repo,
+                "--body",
+                marker,
+            ],
+            env=self._env(token),
+        )
+        if proc.returncode != 0:
+            return (
+                f"gh pr comment #{number} failed for {repo}: "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        return ""
 
     def remove_label(
         self, repo: str, number: int, label: str, *, api_base: str = "",
@@ -151,22 +286,23 @@ class GitHubProvider:
         self, repo: str, number: int, *, api_base: str = "", token: str | None = None
     ) -> PRSnapshot:
         """Fetch the full review/mergeability/lifecycle snapshot for pr-watch.
-
-        Mirrors the gitea provider over GitHub's REST API (whose ``pulls`` shape
-        is near-identical): one read of the PR object (state, merged, mergeable,
-        head sha, base ref, author, title, draft, labels) plus the paginated
-        reviews list -- the REST ``/pulls/{n}/reviews`` endpoint, so each review
-        carries the **numeric** ``id`` the watch cursor keys off (``gh pr view``
-        only exposes GraphQL node ids). ``checks_state`` folds together GitHub's
-        two independent signals -- legacy commit *statuses* and Actions
-        *check-runs* -- into the provider-neutral vocabulary.
-
-        ``api_base`` is unused (GitHub Enterprise hosts are addressed via ``gh``'s
-        own ``GH_HOST`` config, not a per-call base), kept for signature parity.
+        Mirrors the gitea provider over GitHub's REST API (near-identical
+        ``pulls`` shape): one read of the PR object plus the paginated
+        reviews list -- REST ``/pulls/{n}/reviews``, so each review carries
+        the **numeric** ``id`` the watch cursor keys off (``gh pr view`` only
+        exposes GraphQL node ids). ``checks_state`` folds GitHub's two
+        independent signals (legacy commit statuses + Actions check-runs)
+        into the provider-neutral vocabulary. ``api_base`` may identify a
+        GitHub Enterprise host; otherwise ambient ``GH_HOST``/``github.com``
+        is resolved once and passed explicitly to every read.
         """
-        _ = api_base
+        host = self.authority_endpoint(api_base)
         proc = run_cli(
-            ["gh", "api", f"/repos/{repo}/pulls/{number}"], env=self._env(token),
+            [
+                "gh", "api", "--hostname", host,
+                f"/repos/{repo}/pulls/{number}",
+            ],
+            env=self._env(token),
         )
         if proc.returncode != 0:
             detail = (proc.stderr.strip() or proc.stdout.strip())
@@ -200,17 +336,19 @@ class GitHubProvider:
             merged=bool(pr.get("merged", False)),
             head_sha=head_sha,
             base_ref=str((pr.get("base") or {}).get("ref", "")),
-            reviews=self._all_review_objs(repo, number, token),
+            updated_at=str(pr.get("updated_at", "") or ""),
+            reviews=self._all_review_objs(repo, number, token, host=host),
             author=str((pr.get("user") or {}).get("login", "")),
             mergeable=mergeable_raw if isinstance(mergeable_raw, bool) else None,
-            checks_state=self._combined_checks_state(repo, head_sha, token),
+            checks_state=self._combined_checks_state(repo, head_sha, token, host=host),
             labels=labels,
             title=str(pr.get("title", "")),
             draft=bool(pr.get("draft", False)),
         )
 
     def _all_review_objs(
-        self, repo: str, number: int, token: str | None
+        self, repo: str, number: int, token: str | None, *,
+        host: str = "github.com",
     ) -> tuple[Review, ...]:
         """Fetch every review as ``pr_contract.Review``s, paging the endpoint.
 
@@ -227,7 +365,7 @@ class GitHubProvider:
         while True:
             proc = run_cli(
                 [
-                    "gh", "api",
+                    "gh", "api", "--hostname", host,
                     f"/repos/{repo}/pulls/{number}/reviews"
                     f"?per_page={page_size}&page={page}",
                 ],
@@ -264,7 +402,8 @@ class GitHubProvider:
         return tuple(reviews)
 
     def _combined_checks_state(
-        self, repo: str, sha: str, token: str | None
+        self, repo: str, sha: str, token: str | None, *,
+        host: str = "github.com",
     ) -> str:
         """Provider-neutral CI rollup for ``sha`` over BOTH GitHub check systems.
 
@@ -285,7 +424,10 @@ class GitHubProvider:
 
         # 1. Legacy combined commit status.
         proc = run_cli(
-            ["gh", "api", f"/repos/{repo}/commits/{sha}/status"],
+            [
+                "gh", "api", "--hostname", host,
+                f"/repos/{repo}/commits/{sha}/status",
+            ],
             env=self._env(token),
         )
         if proc.returncode == 0:
@@ -305,7 +447,10 @@ class GitHubProvider:
 
         # 2. Actions check-runs.
         cproc = run_cli(
-            ["gh", "api", f"/repos/{repo}/commits/{sha}/check-runs"],
+            [
+                "gh", "api", "--hostname", host,
+                f"/repos/{repo}/commits/{sha}/check-runs",
+            ],
             env=self._env(token),
         )
         if cproc.returncode == 0:
@@ -357,6 +502,49 @@ class GitHubProvider:
             "(pr-merge --all is gitea-only today)."
         )
 
+    def find_pull_by_head(
+        self, repo: str, head: str, *, api_base: str = "", token: str | None = None
+    ) -> PullResult | None:
+        """Resolve a PR by its head branch via ``gh pr list --head`` (all states).
+
+        fleet-flows Phase 2 (#2146): heals a tracked record whose active PR has
+        no ``number``. ``gh pr list --head`` scopes to branches in ``repo``
+        itself -- correct here, since every branch this facility opens a PR
+        from lives in the same repo (no cross-fork PRs). Returns ``None`` when
+        no PR (of any state) has that head.
+        """
+        proc = run_cli(
+            [
+                "gh", "pr", "list",
+                "--repo", repo,
+                "--head", head,
+                "--state", "all",
+                "--json", "number,url,state,headRefOid,baseRefName",
+            ],
+            env=self._env(token, host=self.authority_endpoint(api_base)),
+        )
+        if proc.returncode != 0:
+            raise ProviderError(
+                f"gh pr list --head {head} failed for {repo}: "
+                f"{proc.stderr.strip()}"
+            )
+        try:
+            rows = json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            raise ProviderError(f"gh pr list returned non-JSON: {exc}") from exc
+        if not isinstance(rows, list) or not rows:
+            return None
+        data = rows[0]
+        state = str(data.get("state", "open")).lower() or "open"
+        return PullResult(
+            url=str(data.get("url", "")),
+            number=int(data.get("number")),
+            state=state,
+            merged=(state == "merged"),
+            head_sha=str(data.get("headRefOid", "")),
+            base_ref=str(data.get("baseRefName", "")),
+        )
+
     def request_auto_complete(
         self, repo: str, number: int, *, api_base: str = "", token: str | None = None,
         automerge_label: str = "", squash: bool = True,
@@ -369,20 +557,22 @@ class GitHubProvider:
         watches (via ``gh pr edit --add-label``); the squash / delete-source /
         bypass options do not apply.
         """
-        _ = (api_base, squash, delete_source_branch, bypass_policy, bypass_reason)
+        _ = (squash, delete_source_branch, bypass_policy, bypass_reason)
         if not automerge_label:
             return "github: no automerge_label bound to signal merge consent."
+        host = self.authority_endpoint(api_base)
         proc = run_cli(
             [
-                "gh", "pr", "edit", str(number),
-                "--repo", repo,
-                "--add-label", automerge_label,
+                "gh", "api", "--hostname", host,
+                "--method", "POST",
+                f"repos/{repo}/issues/{number}/labels",
+                "-f", f"labels[]={automerge_label}",
             ],
             env=self._env(token),
         )
         if proc.returncode != 0:
             return (
-                f"gh pr edit --add-label failed for {repo}#{number}: "
+                f"gh api label apply failed for {repo}#{number}: "
                 f"{proc.stderr.strip() or proc.stdout.strip()}"
             )
         return ""
@@ -390,21 +580,49 @@ class GitHubProvider:
     def merge_pull(
         self, repo: str, number: int, *, squash: bool = True, admin: bool = False,
         api_base: str = "", token: str | None = None,
+        delete_source_branch: bool = True, expected_head_sha: str = "",
     ) -> str:
         """Directly merge PR ``number`` via ``gh pr merge``.
 
         The ``pr-merge <#> --now`` submitter-direct primitive. ``--squash`` keeps
         the non-interactive merge method explicit; ``--admin`` is used only when
-        the configured review is non-blocking. The source branch is deliberately
-        **not** deleted, so ``finalize`` can affirm the merge.
+        the configured review is non-blocking. ``delete_source_branch`` (default
+        ``True``, matching :meth:`request_auto_complete`'s own default) passes
+        ``--delete-branch`` so the head branch is cleaned up on merge -- safe
+        because ``finalize``/``pr-complete`` verify a merged PR against the
+        tracked record's own ``pr.head_sha`` (fetched into the local object
+        database when the worktree pushed it), never by requiring the live
+        remote branch to still exist; a missing branch at finalize time is an
+        explicitly tested, ordinary precondition pass, not a special case this
+        caller needs to avoid creating. A repo whose own
+        ``delete_branch_on_merge`` setting is already on would delete the
+        branch regardless of this flag -- it is set explicitly here so every
+        repo this plugin merges into behaves the same way, not only ones that
+        happen to have that setting enabled. Targets
+        ``authority_endpoint(api_base)`` (via ``GH_HOST``) so the merge always
+        runs against the same host ``pr-merge --now``'s live permission gate
+        just verified -- never a different ambient host.
+
+        ``expected_head_sha``, when given, is passed as GitHub's own
+        ``--match-head-commit``: the merge endpoint itself refuses (rather than
+        silently merging) if its view of the PR's head doesn't match. This is
+        the authoritative safety net for a confirmed real-world failure mode
+        (ThomasMichon/copilot-extensions#4949): the PR object's reported head
+        can stay stale for minutes after a push on a cross-fork PR even though
+        the underlying branch ref is already correct, and nothing else in this
+        call reads the real ref.
         """
-        _ = api_base
+        host = self.authority_endpoint(api_base)
         args = ["gh", "pr", "merge", str(number), "--repo", repo]
         if squash:
             args.append("--squash")
         if admin:
             args.append("--admin")
-        proc = run_cli(args, env=self._env(token))
+        if delete_source_branch:
+            args.append("--delete-branch")
+        if expected_head_sha:
+            args += ["--match-head-commit", expected_head_sha]
+        proc = run_cli(args, env=self._env(token, host=host))
         if proc.returncode != 0:
             return (
                 f"gh pr merge failed for {repo}#{number}: "
@@ -412,28 +630,210 @@ class GitHubProvider:
             )
         return ""
 
+    def close_pull(
+        self, repo: str, number: int, *, api_base: str = "", token: str | None = None,
+        comment: str = "",
+    ) -> str:
+        """Close PR ``number`` without merging via ``gh pr close``.
+
+        The ``pr-abandon --confirm`` primitive. ``comment``, when given, is
+        posted first via ``gh pr comment`` (best-effort: a comment failure
+        is folded into the returned message as a warning suffix, but the
+        close itself still proceeds and its own success/failure is what the
+        return value reports -- a caller must not treat a comment-post
+        failure alone as reason to skip closing an already-confirmed
+        abandon). Rejects a ``comment`` containing a genuine ``@copilot``
+        mention via :func:`reject_copilot_mention`, same as every other
+        agent-authored-text path.
+        """
+        host = self.authority_endpoint(api_base)
+        warning = ""
+        if comment:
+            reject_copilot_mention(comment, what="pr-abandon comment")
+            comment_proc = run_cli(
+                ["gh", "pr", "comment", str(number), "--repo", repo, "--body", comment],
+                env=self._env(token, host=host),
+            )
+            if comment_proc.returncode != 0:
+                warning = (
+                    " (comment post failed: "
+                    f"{(comment_proc.stderr.strip() or comment_proc.stdout.strip())})"
+                )
+        proc = run_cli(
+            ["gh", "pr", "close", str(number), "--repo", repo],
+            env=self._env(token, host=host),
+        )
+        if proc.returncode != 0:
+            return (
+                f"gh pr close failed for {repo}#{number}: "
+                f"{proc.stderr.strip() or proc.stdout.strip()}" + warning
+            )
+        return warning.strip()
+
     def enable_auto_merge(
         self, repo: str, number: int, *, squash: bool = True,
         api_base: str = "", token: str | None = None,
+        delete_source_branch: bool = True, expected_head_sha: str = "",
     ) -> str:
         """Arm GitHub native auto-merge: ``gh pr merge <n> --squash --auto`` (#225).
 
         No ``--admin``: auto-merge waits on required checks rather than bypassing
-        them. The source branch is left in place so ``finalize`` can affirm the
-        eventual merge. Returns "" once auto-merge is armed (the PR is NOT yet
-        merged), or an error string so the caller falls back to a direct merge.
+        them. ``delete_source_branch`` (default ``True``) passes
+        ``--delete-branch`` so the head branch is cleaned up once the eventual
+        merge lands -- see :meth:`merge_pull`'s docstring for why this is safe
+        against ``finalize``/``pr-complete``. Returns "" once auto-merge is armed
+        (the PR is NOT yet merged), or an error string so the caller falls back
+        to an immediate :meth:`merge_pull`.
+
+        ``expected_head_sha``, when given, is passed as ``--match-head-commit``
+        -- auto-merge can complete immediately rather than only arming when
+        requirements are already satisfied, so this path needs the same
+        stale-head protection as :meth:`merge_pull`.
         """
-        _ = api_base
+        host = self.authority_endpoint(api_base)
         args = ["gh", "pr", "merge", str(number), "--repo", repo, "--auto"]
         if squash:
             args.append("--squash")
-        proc = run_cli(args, env=self._env(token))
+        if delete_source_branch:
+            args.append("--delete-branch")
+        if expected_head_sha:
+            args += ["--match-head-commit", expected_head_sha]
+        proc = run_cli(args, env=self._env(token, host=host))
         if proc.returncode != 0:
             return (
                 f"gh pr merge --auto failed for {repo}#{number}: "
                 f"{proc.stderr.strip() or proc.stdout.strip()}"
             )
         return ""
+
+    #: Maps a repo's abstract ``pr.reviewer`` token to the concrete GitHub
+    #: reviewer login ``requested_reviewers`` understands. Only ``"copilot"``
+    #: is mapped today; an unmapped token falls to ``_unsupported_review_request``.
+    _REVIEWER_BOT_LOGINS = {
+        "copilot": "copilot-pull-request-reviewer[bot]",
+    }
+
+    def request_review(
+        self, repo: str, number: int, *, reviewer: str = "", api_base: str = "",
+        token: str | None = None,
+    ) -> ReviewNudgeResult:
+        """Ask GitHub's Copilot code-review bot to (re-)review PR ``number``
+        via ``POST .../requested_reviewers`` -- works for both the initial
+        request and a re-request once Copilot has already reviewed, though
+        the latter is asynchronous and not reliably observable from the API
+        response alone (a 2xx means GitHub accepted the request, not that a
+        fresh verdict will land). Carries no comment body (never risks an
+        ``@copilot`` mention -- see ``reject_copilot_mention``).
+        """
+        token_key = (reviewer or "").strip().lower()
+        bot_login = self._REVIEWER_BOT_LOGINS.get(token_key, "")
+        if not bot_login:
+            from .base import _unsupported_review_request
+            return _unsupported_review_request(self.name, reviewer)
+
+        host = self.authority_endpoint(api_base)
+        proc = run_cli(
+            [
+                "gh", "api", "--hostname", host, "-X", "POST",
+                f"repos/{repo}/pulls/{number}/requested_reviewers",
+                "-f", f"reviewers[]={bot_login}",
+            ],
+            env=self._env(token, host=host),
+        )
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or proc.stdout.strip()
+            return ReviewNudgeResult(
+                supported=True, requested=False, reviewer=bot_login,
+                error=f"gh api requested_reviewers failed for {repo}#{number}: {detail}",
+            )
+        return ReviewNudgeResult(
+            supported=True, requested=True, reviewer=bot_login,
+            detail=(
+                f"Requested a review from {bot_login}. GitHub processes this "
+                "asynchronously (observed latency: minutes) -- poll pr-status "
+                "or pr-watch afterward rather than assuming an immediate verdict."
+            ),
+        )
+
+    def pull_review_gate(
+        self, repo: str, number: int, *, api_base: str = "", token: str | None = None,
+    ) -> tuple[bool, bool | None]:
+        """Live GitHub-rulesets review gate for a PR: ``(review_required, bypassable)``.
+
+        Native ``enable_auto_merge`` arms successfully even when a required
+        review is what's actually blocking the merge -- GitHub queues it
+        indefinitely rather than refusing (#3296 follow-up).
+
+        Reads ``gh pr view --json mergeStateStatus,reviewDecision,baseRefName``,
+        then -- only when ``reviewDecision`` is ``REVIEW_REQUIRED`` -- the
+        branch **rulesets** API for whether the acting identity can bypass
+        it (``current_user_can_bypass``). Classic branch protection has no
+        per-actor bypass signal, so ``bypassable`` is ``None`` (unknown, not
+        "no") when rulesets don't apply -- callers must treat ``None`` as
+        "do not attempt a bypass", never as an affirmative yes.
+
+        Returns ``(False, None)`` when no review is required (or the read
+        itself fails) -- the ordinary auto-merge path is correct there.
+        """
+        host = self.authority_endpoint(api_base)
+        proc = run_cli(
+            ["gh", "pr", "view", str(number), "--repo", repo,
+             "--json", "reviewDecision,baseRefName"],
+            env=self._env(token, host=host),
+        )
+        if proc.returncode != 0:
+            return False, None
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return False, None
+        if data.get("reviewDecision") != "REVIEW_REQUIRED":
+            return False, None
+
+        base_ref = (data.get("baseRefName") or "").strip()
+        if not base_ref:
+            return True, None
+        rproc = run_cli(
+            ["gh", "api", "--hostname", host,
+             f"repos/{repo}/rules/branches/{quote(base_ref, safe='')}"],
+            env=self._env(token),
+        )
+        if rproc.returncode != 0:
+            return True, None
+        try:
+            rules = json.loads(rproc.stdout)
+        except json.JSONDecodeError:
+            return True, None
+        if not isinstance(rules, list):
+            return True, None
+        ruleset_ids = {
+            r.get("ruleset_id") for r in rules
+            if isinstance(r, dict)
+            and r.get("type") == "pull_request"
+            and r.get("ruleset_id")
+        }
+        if not ruleset_ids:
+            return True, None
+
+        for ruleset_id in ruleset_ids:
+            sproc = run_cli(
+                ["gh", "api", "--hostname", host,
+                 f"repos/{repo}/rulesets/{ruleset_id}"],
+                env=self._env(token),
+            )
+            if sproc.returncode != 0:
+                continue
+            try:
+                ruleset = json.loads(sproc.stdout)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(ruleset, dict):
+                continue
+            if ruleset.get("current_user_can_bypass") in (
+                "always", "pull_requests_only",
+            ):
+                return True, True
+        return True, False
 
     def get_repo_policy(
         self, repo: str, *, default_branch: str = "", api_base: str = "",
@@ -442,15 +842,22 @@ class GitHubProvider:
         """Read GitHub repo settings + branch protection into a ``RepoPolicy``.
 
         Two reads: ``gh api repos/<repo>`` (merge methods, native auto-merge,
-        delete-branch-on-merge) and, best-effort, the default branch's protection
-        (required approving reviews, required status checks). Never raises: a
-        failed settings read yields ``RepoPolicy(supported=False, error=...)``;
-        an unreadable/absent protection leaves those fields ``None``.
+        delete-branch-on-merge) and, best-effort, the default branch's
+        protection (required approving reviews, required status checks,
+        ``dismiss_stale_reviews`` -- copilot-extensions#2060). Both target
+        ``authority_endpoint(api_base)`` rather than gh's ambient default
+        host -- required for ``viewer_permission`` to describe the acting
+        identity's access on *this* repo's real host. Never raises: a failed
+        settings read yields ``RepoPolicy(supported=False, error=...)``; an
+        unreadable protection response leaves those fields ``None`` (a
+        confirmed-absent protection reports ``dismiss_stale_reviews=False``).
         """
         from ..pr_contract import RepoPolicy
 
+        host = self.authority_endpoint(api_base)
         proc = run_cli(
-            ["gh", "api", f"repos/{repo}"], env=self._env(token),
+            ["gh", "api", "--hostname", host, f"repos/{repo}"],
+            env=self._env(token),
         )
         if proc.returncode != 0:
             return RepoPolicy(
@@ -467,11 +874,14 @@ class GitHubProvider:
             v = data.get(key)
             return bool(v) if isinstance(v, bool) else None
 
+        viewer_permission = _github_viewer_permission(data.get("permissions"))
+
         req_reviews: int | None = None
         req_checks: bool | None = None
+        dismiss_stale_reviews: bool | None = None
         if default_branch:
             pproc = run_cli(
-                ["gh", "api",
+                ["gh", "api", "--hostname", host,
                  f"repos/{repo}/branches/{default_branch}/protection"],
                 env=self._env(token),
             )
@@ -485,11 +895,19 @@ class GitHubProvider:
                     if isinstance(rpr, dict):
                         cnt = rpr.get("required_approving_review_count")
                         req_reviews = int(cnt) if isinstance(cnt, int) else 0
+                        dsr = rpr.get("dismiss_stale_reviews")
+                        if isinstance(dsr, bool):
+                            dismiss_stale_reviews = dsr
+                    elif rpr is None:
+                        # Protection exists but required-review protection is
+                        # disabled -> no review rule to dismiss anything.
+                        req_reviews, dismiss_stale_reviews = 0, False
                     rsc = prot.get("required_status_checks")
                     req_checks = bool(rsc)
             elif "Not Found" in (pproc.stderr + pproc.stdout):
                 # No protection configured on the default branch -> nothing gates.
                 req_reviews, req_checks = 0, False
+                dismiss_stale_reviews = False
 
         return RepoPolicy(
             supported=True,
@@ -500,6 +918,8 @@ class GitHubProvider:
             delete_branch_on_merge=_b("delete_branch_on_merge"),
             required_approving_reviews=req_reviews,
             has_required_status_checks=req_checks,
+            dismiss_stale_reviews=dismiss_stale_reviews,
+            viewer_permission=viewer_permission,
         )
 
     def head_contained_in_base(
@@ -509,6 +929,57 @@ class GitHubProvider:
         """Not implemented: the zombie-PR containment probe is Gitea-only today."""
         _ = (repo, base, head_sha, api_base, token)
         return None
+
+    def resolve_fork_owner(
+        self, *, api_base: str = "", token: str | None = None,
+    ) -> str | None:
+        """Read-only ``gh api user`` half of :meth:`ensure_fork`; ``api_base``
+        pins the host like every other call (:meth:`authority_endpoint`)."""
+        host = self.authority_endpoint(api_base)
+        who = run_cli(
+            ["gh", "api", "--hostname", host, "user", "--jq", ".login"],
+            env=self._env(token),
+        )
+        if who.returncode != 0:
+            return None
+        return who.stdout.strip() or None
+
+    def ensure_fork(
+        self, repo: str, *, api_base: str = "", token: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Create (or read, if it already exists) the caller's fork via
+        ``POST /repos/<repo>/forks``. Owner from :meth:`resolve_fork_owner`;
+        ``api_base`` resolved once so both calls hit the SAME host."""
+        owner = self.resolve_fork_owner(api_base=api_base, token=token)
+        if not owner:
+            return None
+        host = self.authority_endpoint(api_base)
+        proc = run_cli(
+            ["gh", "api", "--hostname", host, "-X", "POST", f"repos/{repo}/forks"],
+            env=self._env(token),
+        )
+        if proc.returncode != 0:
+            return None
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        clone_url = data.get("clone_url") or data.get("ssh_url") or ""
+        if not isinstance(clone_url, str) or not clone_url:
+            return None
+        # The GET and this POST are separate calls; a concurrent ambient
+        # account switch between them can create the fork under a
+        # DIFFERENT login. Trust the POST response's own owner.login and
+        # fail closed on any mismatch/missing value.
+        resp_owner = data.get("owner")
+        resp_login = resp_owner.get("login") if isinstance(resp_owner, dict) else None
+        if not isinstance(resp_login, str) or not resp_login:
+            return None
+        if resp_login.casefold() != owner.casefold():
+            return None
+        return (resp_login, clone_url)
 
     _THREADS_QUERY = (
         "query($owner:String!,$name:String!,$number:Int!){"
@@ -594,12 +1065,9 @@ class GitHubProvider:
         self, repo: str, number: int, *, api_base: str = "", token: str | None = None,
         thread_ids: tuple[int, ...] = (),
     ) -> str:
-        """Resolve all active review threads via GraphQL.
-
-        GitHub thread ids are opaque node ids, so ``thread_ids`` (display
-        indices) cannot target individually; this resolves every currently
-        unresolved thread (the "addressed all feedback" case).
-        """
+        """Resolve all active review threads via GraphQL. GitHub thread ids
+        are opaque node ids, so ``thread_ids`` can't target individually;
+        this resolves every currently unresolved thread instead."""
         _ = (api_base, thread_ids)
         owner, name = self._split_owner_name(repo)
         data, err = self._graphql(
@@ -619,3 +1087,68 @@ class GitHubProvider:
             if merr:
                 errors.append(merr)
         return "; ".join(errors)
+
+    def get_diff(
+        self, repo: str, number: int, *, api_base: str = "", token: str | None = None
+    ) -> PRDiff:
+        """Return the PR's current unified diff via ``gh pr diff``."""
+        _ = api_base
+        proc = run_cli(
+            ["gh", "pr", "diff", str(number), "--repo", repo], env=self._env(token),
+        )
+        if proc.returncode != 0:
+            return PRDiff(
+                supported=True,
+                error=f"gh pr diff #{number} failed for {repo}: "
+                      f"{proc.stderr.strip() or proc.stdout.strip()}",
+            )
+        return PRDiff(diff=proc.stdout)
+
+    def post_comment(
+        self, repo: str, number: int, body: str, *, api_base: str = "",
+        token: str | None = None,
+    ) -> str:
+        """Post a general PR comment via ``gh pr comment``."""
+        _ = api_base
+        reject_copilot_mention(body)
+        proc = run_cli(
+            ["gh", "pr", "comment", str(number), "--repo", repo, "--body", body],
+            env=self._env(token),
+        )
+        if proc.returncode != 0:
+            return (
+                f"gh pr comment #{number} failed for {repo}: "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        return ""
+
+    _REVIEW_EVENT_FLAGS = {
+        "APPROVED": "--approve",
+        "CHANGES_REQUESTED": "--request-changes",
+        "COMMENTED": "--comment",
+    }
+
+    def submit_review(
+        self, repo: str, number: int, *, event: str, body: str = "",
+        api_base: str = "", token: str | None = None,
+    ) -> str:
+        """Publish a review verdict via ``gh pr review``."""
+        _ = api_base
+        flag = self._REVIEW_EVENT_FLAGS.get(event.upper())
+        if flag is None:
+            return (
+                f"gh: unknown review event {event!r} (expected one of "
+                f"{tuple(self._REVIEW_EVENT_FLAGS)})."
+            )
+        if body:
+            reject_copilot_mention(body, what="review")
+        args = ["gh", "pr", "review", str(number), "--repo", repo, flag]
+        if body:
+            args += ["--body", body]
+        proc = run_cli(args, env=self._env(token))
+        if proc.returncode != 0:
+            return (
+                f"gh pr review #{number} failed for {repo}: "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        return ""

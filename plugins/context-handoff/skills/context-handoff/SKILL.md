@@ -2,13 +2,13 @@
 name: context-handoff
 description: >
   Context handoff — generate continuation prompts for seamless session
-  transitions, and resume from handoffs left by previous sessions.
-  Use this skill when preparing to hand off work to a new session or
-  when resuming from a prior session's handoff.
-  Trigger phrases include:
+  transitions, store them safely, and resume from handoffs left by prior
+  sessions. Use this skill when preparing to hand off work to a new session or
+  when resuming from a prior session's handoff. Trigger phrases include:
   - 'handoff'
   - '/handoff'
   - '/handoff-continue'
+  - '/consume-handoff'
   - '/resume-handoff'
   - 'resume handoff'
   - 'resume from handoff'
@@ -16,8 +16,6 @@ description: >
   - 'consume handoff'
   - 'continuation prompt'
   - 'hand off and continue'
-  - 'live cutover'
-  - 'continue automatically'
   - 'next session'
   - 'context is getting large'
   - 'pick up where we left off'
@@ -29,324 +27,554 @@ description: >
 
 # Context Handoff
 
-Use the exact `argv[0]` from the agent-worktrees session command catalog for
-worktree-state and cutover operations executed in the current session. Replace
-`<agent-worktrees catalog argv[0]>` with the raw path and quote it at the shell
-call site on POSIX; in PowerShell use
-`& "<agent-worktrees catalog argv[0]>" <args>`. Generated successor
-first-action commands remain literal global
-wrappers because they run before the successor receives session catalog
-context.
-
 Generate structured continuation prompts so a new Copilot CLI session can
-seamlessly resume work from the current session.
+resume work from the current one **without treating the current context window
+as the boundary of the objective**.
 
-## How This Differs From Related Skills
+## The core rule
 
-| Skill | Question | Scope | Primary Source |
-|-------|----------|-------|----------------|
-| **context-handoff** (this) | "What did last session queue up?" | Per-worktree | Dedicated handoff system |
-| **recap** | "What did I last do?" | System-wide | Permanent Record logs |
-| **backlog** | "What's next for ___?" | Per-service/tool | Gitea → plans → ROADMAP |
+Context-handoff stores the brief and preserves native `/goal` continuity.
+After an authorized save, call `continue_handoff` with the exact returned
+`HANDOFF_SEED`; `/handoff-continue` requests this live path. End the source turn
+so final usage can settle before launch. Herdr or agent-worktrees creates the
+fixed successor; the extension restores and admits it before identity-checked
+retirement. Save alone does not launch.
 
-Handoff is a relay baton — it carries structured state from one session
-to the next on the same worktree. Recap is a rearview mirror. Backlog
-is a task list.
+Requires Node.js and the tested Copilot CLI 1.0.84-3 native API. Do not use a
+plain text pickup to bypass native restoration. Running goals continue once
+with their exact remaining soft cap; paused, exhausted, completed, and no-goal
+handoffs submit no automatic business message. Hidden stopped GoalPanel is
+native behavior, not grounds to enable autopilot or grant credits.
 
-## Continuity Contract
+For a worktree-level cutover mismatch between the head-session ledger and a
+control plane's current sweep target, use the dedicated
+`diagnosing-handoff-cutover` skill.
+
+## Every session knows this exists
+
+This is not a mechanism a session opts into only once it feels context
+pressure or the user says a trigger phrase. Every session receives the
+static, hookless session-start guidance
+(`instructions/context-handoff/session-guidance.instructions.md`, written by
+this plugin's `sessionStart` hook -- see `scripts/emit-guidance.*`), which
+states plainly -- whether or not it began
+from a handoff -- that the mechanism exists and that context pressure is
+never a reason to rush, truncate diligence, or leave work unfinished. Treat
+that awareness as standing permission to work as thoroughly as a task
+deserves: you can always hand off instead of cutting corners.
+
+## Continuity contract
 
 A handoff transfers **active responsibility for the original objective**. It is
-not a request to confirm that the predecessor's latest phase finished, and it is
-not a session-closing recap. Consuming the baton starts the successor's relay
-leg.
+not a recap and it is not proof that the predecessor's latest phase completed
+the work.
 
-- When the worktree has a valid open `active_effort` binding, that effort owns
-  the objective and completion gate. The handoff is only a compact relay delta:
-  effort pointer, bound participant/slice, immediate next slice, material
-  blockers/decisions, and required confirmations.
-- A handoff task, session, phase, commit, or pull request never replaces the
-  active effort as the source of truth.
-- The successfully bound successor is the rightful head of the relay. Once
-  cutover starts, the predecessor may preserve the baton or help diagnose a
-  failed pickup, but must not continue making competing worktree changes.
-  Confirm the role with `<agent-worktrees catalog argv[0]> session-role --json`
-  when that capability is available; a superseded session assists the head.
 - Re-read the **Original Request**, **Continuing Objective**, ordered
-  **Successor Work Roster**, and their cited effort/issue/source of truth.
-- Keep driving every actionable next phase the original request permits, as far
-  as the current context and available work allow. Do not wait for another user
-  prompt merely because one phase, PR, or checklist slice completed.
+  **Successor Work Roster**, and any cited effort or issue.
+- Keep driving every actionable next phase the original request already allows.
+  Do not wait for another user prompt merely because one phase, PR, or checklist
+  slice finished.
 - Consuming the handoff is setup, not completion. Begin substantive work after
   pickup. If the inherited plan is incomplete, finish the planning needed to
   act and then execute it, subject to any required safety, review, approval, or
-  confirmation gate; do not stop at a plan unless the user explicitly requested
-  planning only.
-- A single session may consume one handoff, implement and land many additional
-  slices or phases, and produce another handoff when context pressure returns.
-  Session boundaries do not define effort boundaries.
-- Stop only when the parent objective's completion gate is met, an explicit user
-  scope boundary or required safety confirmation stops progress, or a real
-  blocker needs input. A handoff never waives those boundaries or confirmations.
-- If context pressure returns before the parent objective is done, preserve the
-  same objective and the newly remaining roster in the next handoff. Complete
-  the current deferred handoff task only after that successor baton is durably
-  stored, or after the parent objective itself is complete.
+  confirmation gate.
+- If context pressure returns before the parent objective is done, hand off
+  again with the same parent objective and the newly remaining roster.
+- A handoff with no actionable successor work is usually malformed. If the
+  original objective is genuinely complete, finish instead of creating a baton
+  merely to announce closure.
 
-A handoff with no actionable successor work is usually malformed. If the
-original objective is genuinely complete, finish the session and worktree
-lifecycle instead of spawning a successor merely to announce completion, unless
-the user explicitly requested an archival continuation prompt.
+## When to generate
 
----
-
-## When to Generate a Handoff
-
-- The context-handoff extension monitors `session.usage_info` events for
-  **exact token counts** and, on the next idle, sends you an **agent-facing
-  nudge that tells you to invoke this skill** when context utilization crosses
-  a threshold:
-  - **55% of the window by default** — hand off at the next clean boundary
-  - **70% of the window by default** — hand off now; compaction remains at ~80%
-  An owning repository may override these percentages in
-  `.context-handoff/config.yaml`.
-  The nudge deliberately **does not prescribe individual tool calls** or a
-  "write a file" outcome — it hands you to this skill, which owns the
-  sequencing. When you receive it **under Herdr or a mux session**, the correct response
-  is the **autonomous live cutover** described below (store the handoff, spin up
-  the successor Copilot in place, end your turn) — *not* a paste prompt back to
-  the operator. The nudge fires once per threshold and resets after compaction.
+- The extension nudges you when exact context utilization crosses the configured
+  thresholds.
 - The user explicitly asks for a handoff or continuation prompt.
-- You sense the conversation is getting complex (even if token usage
-  hasn't hit thresholds yet — they reset after compaction).
+- You reach a natural stopping point and want to preserve a baton before the
+  conversation gets tighter. This is a reason to *hand off*, never a reason to
+  simply end the turn with outstanding work unhandled -- see **Ending a turn
+  with outstanding work** below.
 
----
+## Ending a turn with outstanding work
 
-## How to Generate
+If the assigned effort or task still has outstanding work, the final action
+before ending a turn is always to save and trigger a handoff -- never to stop
+and leave the remaining work implicit. "This is a suitable stopping point,"
+"this session has run long," and "it's getting late" are not, by themselves,
+reasons to end a turn short of that. Legitimate reasons to stop short of
+driving further are a genuine crossroads (a design decision only the operator
+can make), an error that needs diagnosis before continuing, a design
+contradiction, or a step that requires confirmation before a potentially
+destructive action. Even then, the correct close is still to save and trigger
+a handoff naming the blocker -- not a silent stop.
 
-**Native goals:** use the in-session tools, not the SDK-free fallback. Native
-handoff supports allow-all permission mode only; manual/assisted requests must
-stop before source pause or pane creation. End the source turn after cutover is
-armed so its usage can settle. The assigned empty receiver stores the opaque
-snapshot, exits and cold-resumes with the exact profile before consumption.
-Paused/exhausted/completed goals must not start business work automatically.
-Never copy old history, force a permission/profile setting, or treat a file
-write as restored native state. Legacy `nativeContinuation` / `nativeState`
-batons require a fresh save from the preserved source.
+## Self-audit before declaring completion
 
-For a native launch failure, retain the same checkpoint/receiver/token.
-Structured pre-creation failures can be explicitly retried; a retained pane or
-unknown launch outcome must not create another receiver. The successful native
-consumer owns single continuation admission and identity-checked retirement.
+A brief that says "Continuing Objective: None outstanding" or ships an empty
+**Successor Work Roster** is a claim, not a default -- and it is easy to get
+wrong even when every explicit ask genuinely was completed. Over the course of
+a session you routinely say things in passing that are themselves open items:
+"that closes the specific gap; the broader idea is still open for a future
+pass," "I didn't chase that down," "left as a follow-up," "not fully verified,"
+"deferred." None of those require a fresh user ask to exist -- they are
+self-flagged threads you already noticed, and a brief that omits them is
+**more misleading than a terse one**, because a successor has no way to know
+what it doesn't know.
 
-A handoff has three parts: the **stored handoff** (the full continuation
-context), an optional **live cutover** that spins up the successor *in place*,
-and a **short paste prompt** for environments where cutover is not available.
+Before composing the **Continuing Objective** / **Successor Work Roster** /
+**Completion Gates** sections (either trigger path below):
 
-**Live cutover is the default under Herdr or mux.** A Herdr session invokes the
-installed `copilot-pane launch --task-file` helper exactly once to create a
-seeded sibling and keeps the predecessor as the recovery pane. A mux-backed
-session spawns the successor in the same `wt-<id>` session; the successor
-retires the predecessor only after it consumes the stored handoff. Neither path
-self-retires the predecessor on idle.
+1. Re-scan your own turns in this conversation -- not just the final one --
+   for open-ended language: "still open," "future pass," "not yet," "didn't
+   verify," "follow-up," "left as-is," "deferred," "out of scope for this,"
+   or similar.
+2. **Classify each hit against what happened afterward, not just the hit
+   itself.** An earlier "didn't verify" or "still open" may have been
+   resolved by a later turn in the same session -- check the turns that
+   follow the hit before deciding it's still open. Carry forward only the
+   hits that remain genuinely unresolved at the point the brief is composed.
+3. For each hit that remains open, fold it into the brief's own carrier for
+   open work -- the **Successor Work Roster** for the standalone shape, or
+   the **Next Slice** for the effort-backed shape (which has no Successor
+   Work Roster; route the hit there, or into the active effort itself when
+   it doesn't belong to this handoff leg specifically) -- or state explicitly
+   in the brief that it was deliberately scoped out and why. Never let it
+   silently disappear because the primary ask happened to be done, and never
+   drop it for lack of a Successor Work Roster in the shape you're using.
+4. Only write "None outstanding" once this scan has actually happened, not
+   because nothing came immediately to mind.
 
-### Storage and cutover matrix
+This is a self-check, not a formal tool -- do it by re-reading, not by
+assuming the last turn's framing already covers everything you said earlier.
 
-| Stored baton | Live pane host | Behavior |
-|---|---|---|
-| machine-local file | Herdr | context-handoff resolves the current pane cwd through Herdr, stores the one-time JSON file in checkout-scoped state under `~/.copilot/context-handoff/`, passes the seed through a short-lived task file to `copilot-pane`, creates one sibling, and keeps the predecessor. agent-worktrees is not probed or required. |
-| agent-dispatch task | mux | When a coordinator and worktree are reachable outside Herdr, `continue_handoff` uses the existing worktree cutover. The successor consumes the task and retires the recorded mux predecessor after pickup. |
-| machine-local file | mux | If no task can be created, `continue_handoff` uses the existing worktree cutover with the file baton. The successor consumes it and retires the recorded mux predecessor after pickup. |
-| task or file | none | Reply with the short paste prompt telling the next session how to consume the exact stored baton. |
+## Two triggers, two gates
 
-### Steps (default = live cutover)
+### Attached observers: prepare before cutover
 
-1. **Inspect active effort focus when agent-worktrees is available.** From the
-   intended worktree, run `<agent-worktrees catalog argv[0]> effort-focus show
-   --json` (or add the known `--worktree-id` when the session cwd is elsewhere).
-   Select the compact effort-backed template only when
-   `active_effort.active` is `true`. A missing command, unavailable worktree,
-   stale/closed binding, or no binding selects the full standalone template;
-   optional enrichment never blocks handoff.
-2. **Reconcile durable effort state at a clean boundary.** Before an
-   effort-backed handoff, update landed Plan/Validation markers and the Journal.
-   Include failed approaches and non-obvious gotchas in the Journal when they
-   will matter after this relay. If context pressure or in-flight work prevents
-   that, list every not-yet-durable fact explicitly in Immediate Session Delta.
-3. **Call `generate_handoff_prompt`**. It returns structured facts: session ID,
-   cwd, branch, files modified, git status, turn count, and key tool invocations.
-4. **Compose the handoff markdown** using the selected template. For an active
-   effort, link its repository-relative README and include only the next slice
-   plus the immediate session delta; do not duplicate its request, plan, or
-   journal. Otherwise preserve the full parent objective and ordered successor
-   roster. Both modes keep separate handoff and worktree completion gates.
-5. **Call `save_handoff_prompt`** with that markdown as **`prompt_text`** (plus
-   an optional short `title`). It stores the handoff and returns both the paste
-   prompt and a `HANDOFF_SEED:` line.
-6. **If under Herdr or mux, call `continue_handoff`** with `seed` exactly equal
-   to the `HANDOFF_SEED` string. Then end your turn. Do not start new work in
-   the predecessor.
-7. **If cutover cannot run**, reply with only the short paste prompt returned by
-   `save_handoff_prompt`.
+Native `session.idle` includes attached shells, not just the agent turn.
+For a source-private read-only observer of an independently running job,
+call `continue_handoff` with the exact seed and `observers` entries:
+`{shell_id, job: {host, id, identity, artifact_path, terminal_path, reattach}}`.
+`identity` is the original scheduler ID or PID/start identity; preserve
+authorization and remaining budget in the brief. The job must write durable
+terminal status independently of the observer.
 
-> **Two completion models.** A task-backed paste resume uses
-> `agent-dispatch consume <id>` and completes the baton on pickup. <!-- marketplace-isolation: allow handoff-seed-startup -->
-> A task-backed
-> live cutover uses `consume_handoff` with `defer_complete: true`; the successor
-> later runs `agent-dispatch complete <id>` only when it reaches the handoff <!-- marketplace-isolation: allow handoff-seed-startup -->
-> completion gate. Finishing the predecessor's latest phase is not sufficient
-> when the continuing objective still has actionable work.
+The tool saves the job and runtime observer metadata, then rejects an active
+attached shell without arming cutover or stopping any process. Verify the
+declared observer is separate and read-only; use `stop_bash` for ONLY that
+source shell ID, never the original job or its launcher. Retry the SAME saved
+request using `retry_handoff_cutover`; do not save/spawn again. Undeclared
+attached work must finish or be explicitly identified, never blindly killed.
 
-### Fallback when the extension's tools are unavailable — the CLI
+The admitted successor reads the restored observation records and checks
+durable terminal status FIRST, including a result written during the
+observation gap. Validate terminal artifacts or attach a NEW event-driven
+observer to the SAME job, recording its new session/shell/PID identity.
+Historical source shell IDs are not restored observers. Do not automatically
+execute metadata, restart work, enable autopilot, create a goal or add budget.
+Stopped/no-goal handoffs still send no automatic business message.
 
-The tools above are provided by the context-handoff **extension**. When the
-extension does not resolve or fails to load, they are simply absent — most
-notably in a **Bare-resumed session**, where *no* extensions load at all
-(`extensions list` shows nothing). The plugin's **payload files are still on
-disk**, so an agent can drive the same store + live-cutover directly through a
-standalone Node CLI — no extension runtime required:
+### 1. Context-pressure-driven handoff: trigger directly
+
+When context pressure is the reason for handing off and the objective still has
+more work left to do:
+
+1. **Sync the worktree first** -- see "Sync before triggering" below. Do this
+   before collecting facts so the composed brief reflects the synced state
+   (and, if the sync conflicts, the brief can say so).
+2. **Call `generate_handoff_prompt`.**
+3. **Compose the markdown brief** using the effort-backed shape when a valid
+   open active effort exists, otherwise the full standalone shape. Note the
+   sync outcome (synced cleanly / conflict left unresolved) if relevant. Run
+   the **Self-audit before declaring completion** step above first.
+4. **Call `save_handoff_prompt`.** This safely stores the baton and returns the
+   short handoff seed.
+5. **Call `trigger_handoff` immediately** -- or, when the baton carries a native
+   goal, **`continue_handoff` with the saved seed** (it launches the successor).
+
+Do **not** ask the user for confirmation first on this path. Running low on
+context while work remains is sufficient justification by itself.
+
+### 2. Turn-end / follow-ups handoff: compose, save, ask
+
+When you have completed the requested work and would otherwise end the turn by
+listing a set of follow-up ideas or questions:
+
+1. **Call `generate_handoff_prompt`.**
+2. **Compose the markdown brief**, running the **Self-audit before declaring
+   completion** step above first -- this is exactly the path where "all
+   requested work is complete" is tempting to write without checking it.
+3. **Call `save_handoff_prompt`.**
+4. **Replace the usual follow-up list** with one short, low-friction offer to
+   continue via handoff.
+5. **Only once the user says yes:** sync the worktree (see "Sync before
+   triggering" below), then **always re-run `generate_handoff_prompt` and
+   `save_handoff_prompt`** -- even if the sync looked like a no-op -- so the
+   stored baton reflects the post-sync state. A WIP commit, a failed sync
+   attempt, or a conflict left unresolved all matter to the successor even
+   when the branch itself didn't move; `trigger_handoff` otherwise reuses
+   the pre-sync brief and silently omits that outcome. Then **call
+   `trigger_handoff`.** Do not sync or mutate local history before the user
+   has agreed -- a decline must leave the worktree untouched. For a baton
+   carrying a native goal, call `continue_handoff` with the saved seed instead of
+   `trigger_handoff`.
+
+Only this turn-end follow-up path is skippable via **autopilot** or prior
+explicit pre-authorization.
+
+## Sync before triggering: give the successor the latest code
+
+The successor inherits the **same on-disk worktree** the predecessor is
+sitting in -- not a fresh checkout. If that worktree's branch is behind the
+repo's default branch, the successor starts on stale plugin code and stale
+instructions, including any bugs already fixed upstream since this session
+began (a live example: a plugin-load reliability fix that shipped mid-session
+would only reach the successor if the worktree's tip actually contains it).
+A predecessor that hands off without syncing silently hands the same bug to
+its own successor.
+
+When the worktree is a git checkout with a remote default branch:
+
+1. **Inspect the tree before committing anything.** Never blanket-commit
+   (`git add -A` / `git commit -a`) -- stage and commit only the paths you
+   recognize as your own reviewed, intentional changes this session, the same
+   discipline the `worktree` skill's cleanup-details reference requires
+   before any commit. If anything in the tree looks unfamiliar, untracked,
+   or possibly sensitive (credentials, secrets, unrelated edits), or you are
+   otherwise unsure it is safe to commit, **skip this sync entirely** and
+   note in the brief that the worktree may be behind the default branch and
+   was left as-is -- never guess.
+2. **Sync using the shared, lock-aware entry point** -- `handoff-cli.mjs
+   sync-worktree` (resolve `$CH`/`$ch` exactly as the "CLI fallback" section
+   below does), not a bare `agent-worktrees git sync` <!-- marketplace-isolation: allow cross-plugin-diagnostic-mention --> or raw `git rebase`.
+   This is the SAME helper the fully-automated force-tier path uses
+   internally (`attemptWorktreeSync`): it takes a per-worktree lock so a
+   concurrent force-tier sync on this same worktree can't race a
+   skill-guided one, checks for an in-progress rebase before touching
+   anything (a paused rebase can report a clean tree, and the sync
+   helper's own failure path aborts any failed rebase -- never one this
+   session should cancel), and runs entirely under a sanitized Git
+   environment. Run:
+   ```bash
+   node "$CH" sync-worktree --json --cwd "$PWD"
+   ```
+   (`$ch`/PowerShell equivalent; exits nonzero for every non-`"synced":
+   true` outcome -- that is expected and NOT itself a reason to stop; read
+   the JSON `reason` and continue). A `"synced": true` result means the
+   sync completed cleanly; anything else (`"attempted": false` for a
+   skipped rebase/lock/dirty-tree case, or `"attempted": true, "synced":
+   false` for a real failure) carries a `"reason"` string -- note it in the
+   brief rather than blocking on it, same as step 3 below.
+3. Either way, if the sync did not complete cleanly (conflict, abort, or
+   step 1 skipped it), do **not** block the handoff on resolving it there --
+   note the conflict/skip and the branch's un-synced state plainly in the
+   handoff brief instead, so the successor knows to resolve it as its first
+   action rather than silently inheriting stale or partially-merged code
+   without realizing it.
+
+This is a lightweight, mechanical step, not a reason to delay a
+context-pressure-driven handoff that needs to trigger immediately -- skip
+straight to noting the un-synced state in the brief if there is any doubt
+about whether it is safe to rebase right now (e.g. genuinely conflicting
+in-flight work you cannot lose).
+
+## Efforts + handoffs
+
+When both capabilities are present, use them to let one session own one slice
+of a larger effort:
+
+- the **effort** remains the durable source of truth and completion gate,
+- the **handoff** carries only the immediate relay delta,
+- one session should stride forward confidently, reach a clean boundary, and
+  hand the next slice forward rather than trying to finish the entire effort in
+  one context window.
+
+For an effort-backed baton, link the repository-relative effort README and avoid
+duplicating its request, plan, or journal. Carry only the next slice, immediate
+blockers, decisions, in-flight work, and required confirmations.
+
+## `trigger_handoff`
+
+`trigger_handoff` retains the older signal-only pickup path. New native-aware
+records (including no-goal saves) are directed to `continue_handoff`.
+
+- For a **context-pressure-driven** handoff with work still left to do, call it
+  immediately after `save_handoff_prompt`.
+- For a **turn-end / follow-ups** handoff, call it only after the user says yes,
+  unless autopilot or prior authorization already covers that path.
+
+It may either:
+
+- reuse the current session's most recently saved baton, or
+- accept fresh `prompt_text` / `prompt` and store it in the same call.
+
+Its contract is:
+
+1. drop the full markdown in the current session's session-state folder,
+2. **always:** durably store it (reusing the existing agent-dispatch task
+   path when available, otherwise a worktree-state file),
+3. **always, in every mode including `off`:** note it in the worktree's own
+   record via `agent-worktrees note-handoff` <!-- marketplace-isolation: allow agent-worktrees-management --> (this creates a
+   `pending_handoffs` entry -- lineage/tracking state, so a
+   manually-consuming successor can still be promoted to the worktree's
+   head via `link-succession` regardless of mode). `trigger_handoff` is a
+   manual entry point the session/operator explicitly invoked, so `mode:
+   off` never refuses it -- `off` only disables automatic/unprompted
+   behavior (see "Mode gate" below),
+4. **only when `.context-handoff/config.yaml`'s `mode` is `auto`** (the
+   default is `manual-only` -- see "Mode gate" below): pass
+   `--live-cutover` on that same `note-handoff` call -- agent-worktrees'
+   resident monitor requires this exact flag on the entry (never merely
+   its existence) before it will discover and claim it on its own --
+   refresh worktree-visible PENDING-HANDOFF state when `agent-worktrees` is
+   available, and best-effort ping `agent-bridge` if present,
+5. wait up to 30 seconds for the cutover itself to start -- not for the
+   successor to fully finish cold-starting and consume the handoff (a real
+   Copilot cold-start routinely takes 40-90+ seconds, and isn't worth
+   blocking on) -- **skipped entirely under `manual-only`**, since nothing
+   will spawn automatically,
+6. check for any pickup signal, including the earlier, cheaper "spawn
+   acknowledged" marker,
+7. print manual instructions only if nothing at all happened; print a
+   distinct "already under way" note when a spawn is merely in flight, or a
+   distinct "automatic cutover is disabled" note under `manual-only`,
+8. always end with the short handoff prompt/seed.
+
+## Mode gate
+
+`.context-handoff/config.yaml`'s `mode` controls only automatic/unprompted
+behavior; manual entry points (`generate_handoff_prompt`, `save_handoff_
+prompt`, `trigger_handoff`, `consume_handoff`, and their slash-command
+wrappers) work identically in **every** mode, including `off`. Defaults to
+`manual-only`: soft/hard context-pressure warnings and nudges fire under this
+default (any mode other than `off`), and so does step 3 above (the
+worktree-record note itself -- this is what lets head-tracking march forward
+even under `manual-only`, and under `off`). The force-tier auto-trigger and
+step 4 above (arming `--live-cutover`: the worktree-visible pending-handoff
+state and the agent-bridge ping) remain opt-in, requiring `mode: auto` in
+that file (repo-level) or `~/.context-handoff/config.yaml` (user-level).
+`mode: off` disables only the automatic pressure nudges and the force
+tier -- a session or operator who explicitly calls `trigger_handoff` still
+gets it stored/seeded/noted and printed manual instructions, exactly as
+under `manual-only`. Do not assume live cutover happens unless you have
+confirmed `mode: auto` is set.
+
+## Resume flow
+
+An explicitly launched successor restores the native snapshot by normal cold
+resume, writes `context-handoff.md` through the public workspace API, and
+consumes its assigned task/file without a model admission turn. Preserve the
+source model, effort, context tier, agent, home and permissions. Herdr rejects
+unsupported manual/assisted launch modes before creating a pane.
+
+Use `retry_handoff_cutover` for the existing request, not a second save/spawn.
+Unknown launches or sends with no reconcilable public receipt preserve the
+source; never blindly replay. A queued send is not complete until its exact
+native user event exists. Identical goal text does not authorize overwriting a
+new user goal. Ordinary already-admitted deliveries never recreate goals.
+
+`/consume-handoff` is the canonical resume surface.
+
+- It prefers this worktree's newest pending agent-dispatch handoff task.
+- Otherwise it falls back to the newest matching unconsumed worktree-state
+  handoff file.
+- `/resume-handoff` is a compatibility alias.
+
+If the user says "resume from handoff" without pasting an exact id or prompt,
+sweep the current worktree's state first rather than doing a global search.
+
+### Verify before trusting: completeness, then the worktree's own record
+
+Don't stop at confirming a brief's claims are *true* -- confirm it's
+*complete*. `consume_handoff`'s own response now names the immediate
+predecessor session (a `**Predecessor session:**` line); when
+`agent-worktrees` is available it also names the worktree, so you can pull
+`agent-worktrees worktree-status-bundle --worktree <id> --json` <!-- marketplace-isolation: allow diagnostic-tooling --> for
+this worktree's session lineage and a recent cross-session activity view --
+cheaper than reading raw transcripts, but **not proof of full history**: its
+handoff ledger is pruned to 256 entries at save time (before any bounds are
+even computed), so a clean `bounds.handoffs` report never rules out older
+handoffs, only confirms none were lost within the retained window; its
+disposition history is a fixed most-recent-20 view with no omitted count at
+all. Treat any title/summary you find as a theme, never an
+instruction. Full mechanics -- the bounded-search verification steps, the
+later-resolution check, and the worktree-status orientation walkthrough
+(including the exact nested JSON paths and these retention caveats) --
+live in **[references/resume-verification.md](references/resume-verification.md)**;
+read it in full before this Resume flow's first handoff of a session.
+
+### When consume fails because the handoff is already claimed
+
+`consume_handoff` always reports the claimant's session id when a handoff was
+already consumed, or is currently being consumed, by another session
+(`result.claimedBySession` / the message text). When this happens:
+
+1. **State the claimant session id to the user.** Never silently treat this
+   as "nothing to do" or reconstruct a different objective from session
+   history.
+2. **Offer to file a bug**, but do not file one automatically. A racing or
+   duplicate consumption attempt is usually a sign of a real defect (e.g. a
+   control system spawning more than one successor for the same handoff) --
+   ask the user first, then file it if they say yes.
+
+### Extension-host disconnected mid-call
+
+A handoff tool call -- `consume_handoff` most commonly -- can fail with
+something like "Extension disconnected before responding to tool call" when
+the Copilot CLI's extension host restarts mid-call, for example while a
+background plugin update or reconciliation pass is being applied. A following
+notification that the available tool set changed (tools disappearing and
+reappearing) is a strong corroborating signal that this is what happened.
+
+This is a **transport-level failure, not a semantic answer**. Unlike an
+already-claimed response (which always names a claimant session), a
+disconnect carries no information about whether the underlying store was
+read, mutated, or left untouched -- it is not evidence that no handoff is
+pending.
+
+1. Do not conclude "nothing is pending" or reconstruct a different objective
+   from session history solely because the call errored this way.
+2. Once the tool set stabilizes (previously-lost tools become available
+   again), retry the identical call once.
+3. If the tool remains unavailable, or the retry fails the same way, fall
+   back to the payload-local CLI (`consume --locator`, `facts`,
+   `check-heads`) -- it talks to the durable stores directly and does not
+   depend on the extension host being up.
+4. Only report "nothing pending" once that CLI-backed retry also finds none.
+
+### Diagnosing a stuck cutover (predecessor not confirmed retired)
+
+`trigger_handoff` is one stage (6 of 13) in a wider cutover lifecycle traced
+across this plugin and `agent-worktrees`' resident status monitor -- see
+[context-handoff's README § Handoff-lifecycle observability](../../README.md#handoff-lifecycle-observability)
+for the full stage model and stores. For a predecessor whose retirement was
+never confirmed after its successor was spawned, first run the safe retry when
+you are still inside the superseded predecessor session:
 
 ```bash
-CH="$HOME/.copilot/installed-plugins/copilot-extensions/context-handoff/extensions/context-handoff/handoff-cli.mjs"
-
-# Store the handoff AND start the live cutover (the save_handoff_prompt +
-# continue_handoff equivalent). Compose the markdown yourself (the extension's
-# in-memory session facts are unavailable out-of-band) and pass it in:
-node "$CH" cutover --title "<topic>" --prompt-file <handoff.md>
-
-# Store only + print the paste prompt (no cutover):
-node "$CH" save --title "<topic>" --prompt-file <handoff.md>
-# Trigger a cutover for an existing seed:   node "$CH" continue --seed "<HANDOFF_SEED>"
-# Consume a file-backed handoff:            node "$CH" consume --handoff-id <id>
+node "$CH" retry-cutover --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
 ```
 
-It reuses the SDK-free `handoff-core.mjs` (same store format + Herdr-first,
-mux-preserving cutover trigger <!-- marketplace-isolation: allow handoff-core-management -->
-and the issue-#853 bash-first seed), so a handoff it stores is
-byte-compatible with `consume_handoff` / `/resume-handoff`. Session id defaults
-to `$COPILOT_AGENT_SESSION_ID`; pass `--session-id` / `--cwd` when running from
-outside the worktree. `--no-task` forces the file store.
+That path refocuses an already-live successor instead of spawning a duplicate.
+If no live successor exists, it falls back to a fresh spawn attempt. If the
+problem is specifically an unretired predecessor after a spawn is recorded (a
+successor associated as a candidate *or* already linked, plus a recorded spawn
+event -- not only a fully confirmed cutover), then run
+`agent-worktrees handoffs-check --worktree-id <id>` <!-- marketplace-isolation: allow diagnostic-tooling --> (or `--all`, `--execute`
+to actually retire what it finds) before assuming manual intervention is
+needed -- the read-only report does not itself confirm the pane is still
+alive, only `--execute`'s live check does -- and do not manually kill a
+predecessor pane yourself. It does **not** diagnose "acknowledged but
+nothing appeared" (no successor was ever
+recorded) -- that case has no dedicated diagnostic yet.
 
-If even `node` is unavailable, compose the handoff manually and follow the same
-storage rules: a task when a coordinator and worktree are resolvable, otherwise a
-one-time machine-local file outside the checkout. Do not write handoffs into the
-repo.
+## CLI fallback
 
----
+When the extension is absent, invoke the payload-local CLI by exact verified
+plugin-root-relative path:
 
-## Live-Cutover Handoff — the primary path (hand off *and continue* in place)
+```bash
+CH_ROOT="${COPILOT_PLUGIN_ROOT:-}"
+if [ ! -f "$CH_ROOT/plugin.json" ]; then
+  CH_ROOT="$HOME/.copilot/installed-plugins/copilot-extensions/context-handoff"
+  provenance="$(node -e 'const fs=require("fs"),m=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); console.log(`${m.name||""}|${m.repository||""}`)' "$CH_ROOT/plugin.json" 2>/dev/null)"
+  [ "$provenance" = "context-handoff|https://github.com/ThomasMichon/copilot-extensions" ] ||
+    { echo "canonical context-handoff@copilot-extensions payload not found" >&2; exit 1; }
+fi
+CH="$CH_ROOT/extensions/context-handoff/handoff-cli.mjs"
+[ -f "$CH" ] || { echo "context-handoff payload-local CLI not found" >&2; exit 1; }
 
-`save_handoff_prompt` stores the baton. `continue_handoff` selects the current
-pane host. Under Herdr it writes the seed to a short-lived task file, invokes
-`~/.local/bin/copilot-pane launch --task-file`, and leaves the predecessor pane
-available. Under mux it opens a successor window; the successor's first action
-loads the brief, marks file-backed handoffs spent, records the predecessor as
-handed off, and retires the old pane through
-`agent-worktrees handoff-cutover --retire-pane`. <!-- marketplace-isolation: allow handoff-core-management -->
+node "$CH" facts --json --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" check-heads --json --cwd "$PWD"
+node "$CH" retry-cutover --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" save --title "<topic>" --prompt-file "<handoff.md>" \
+  --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" trigger --title "<topic>" --prompt-file "<handoff.md>" \
+  --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" trigger --handoff-token "<HANDOFF_TOKEN>" \
+  --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" consume --locator "task:<task-id>" \
+  --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" consume --locator "file:<handoff-id>" \
+  --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" list-sessions --json --cwd "$PWD"
+node "$CH" get-previous-session --json --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" abort --locator "task:<task-id>" --reason "<why>" --cwd "$PWD"
+```
 
-The safety rule is: **the predecessor never self-retires on idle.** Retirement
-is successor-consume-driven. In Herdr the successor verifies the baton-recorded
-pane/session identity and stops only that exact predecessor through
-`copilot-pane stop`.
+PowerShell:
 
----
+```powershell
+$chRoot = $env:COPILOT_PLUGIN_ROOT
+if (-not (Test-Path -LiteralPath "$chRoot\plugin.json")) {
+  $chRoot = Join-Path $HOME '.copilot\installed-plugins\copilot-extensions\context-handoff'
+  try { $manifest = Get-Content -Raw "$chRoot\plugin.json" | ConvertFrom-Json } catch { $manifest = $null }
+  if ($manifest.name -ne 'context-handoff' -or
+      $manifest.repository -ne 'https://github.com/ThomasMichon/copilot-extensions') {
+    throw 'canonical context-handoff@copilot-extensions payload not found'
+  }
+}
+$ch = Join-Path $chRoot 'extensions\context-handoff\handoff-cli.mjs'
+if (-not (Test-Path -LiteralPath $ch -PathType Leaf)) { throw 'context-handoff payload-local CLI not found' }
+node $ch facts --json --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch check-heads --json --cwd $PWD
+node $ch retry-cutover --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch save --title '<topic>' --prompt-file '<handoff.md>' --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch trigger --title '<topic>' --prompt-file '<handoff.md>' --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch trigger --handoff-token '<HANDOFF_TOKEN>' --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch consume --locator 'task:<task-id>' --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch consume --locator 'file:<handoff-id>' --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch list-sessions --json --cwd $PWD
+node $ch get-previous-session --json --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch abort --locator 'task:<task-id>' --reason '<why>' --cwd $PWD
+```
 
-## Resuming From a Handoff
+## Last-resort fallback: write the file yourself
 
-A handoff is **not** auto-loaded. How you resume depends on which form the
-previous session produced:
+The tool-backed path (`save_handoff_prompt` / `trigger_handoff` /
+`consume_handoff`) and the payload-local CLI fallback above both assume
+*something* still works -- the extension host, `node`, or a reachable store.
+When even that assumption is unsafe (the extension is disconnected, the CLI
+fails the same way, or storage reports "no safe task or file store was
+available"), the **most durable** continuation path needs none of it: an
+ordinary file write, plus a short prompt a human pastes into a fresh session
+after `/clear`. This always works because it depends on nothing but the
+agent's normal ability to write a file and print text.
 
-1. **agent-dispatch form** (coordinator available). The paste prompt contains
-   the complete `agent-dispatch consume <id>` command. <!-- marketplace-isolation: allow handoff-seed-startup -->
-   `/resume-handoff` can also
-   find and consume this worktree's newest proposed handoff task and inject the
-   continuation prompt.
-2. **File form** (no pinned task). The paste prompt tells the next session to
-   call the extension's `consume_handoff` tool with the handoff id. The tool
-   reads the machine-local JSON file, marks it consumed, and injects the stored
-   continuation. Re-running it on a consumed file returns a stop notice instead
-   of replaying the brief. In Herdr this file lives in checkout-scoped
-   context-handoff state and does not require agent-worktrees.
+1. Compose the same markdown brief the Template section describes.
+2. Write it with an ordinary file write -- no MCP tool call, no extension, no
+   `node` -- to a stable path under the current session's own state folder:
+   the same `~/.copilot/session-state/<session-id>/` directory the extension
+   itself already uses (for example
+   `~/.copilot/session-state/<session-id>/files/handoff-<slug>.md`). Create the
+   `files/` directory first if it does not already exist -- it is not
+   guaranteed to be pre-created. This directory persists independent of the
+   extension, the payload-local CLI, and any store selection.
+3. State the exact absolute path to the user.
+4. Give the user a short prompt to paste into a new session after `/clear`,
+   naming that exact path and instructing the next session to read it and
+   resume the objective it describes -- not merely recap it. For example:
 
-### Natural-language resume requests: sweep this worktree's state first
+   ```text
+   /clear
+   Read <absolute-path-to-file> and resume the objective it describes.
+   ```
 
-When the user says "resume from handoff", "pick up from last session", or
-similar **without pasting an exact handoff id/prompt**, do not begin with a
-global agent-dispatch query or cross-session search. Let `/resume-handoff`
-resolve the current checkout's machine-local file first. Outside Herdr, the
-worktree-local state remains the authoritative first stop:
+5. This path has no automatic pickup, no claim tracking, and no
+   supersession -- it is a manual handoff between two humans/agents. Prefer
+   the tool-backed and CLI-backed paths above whenever either is reachable;
+   reserve this one for when both have failed.
 
-1. Resolve the local state directory with
-   `<agent-worktrees catalog argv[0]> get worktree-state-dir`. If the session resumed with a CWD
-   outside its worktree, retry with the current session id:
-   `<agent-worktrees catalog argv[0]> get worktree-state-dir --session-id <session-id>`.
-   From an adopted anchor this resolves the stable machine-local `@anchor`
-   namespace, so a restarted session can perform the same state-first sweep
-   without enumerating global Copilot session history.
-2. Sweep `<worktree-state-dir>/handoff/*.json`, newest first. Select only a
-   valid `kind: "context-handoff"` record for this worktree whose `consumed`
-   value is not `true`. Call `consume_handoff` with its exact `path`; do not
-   merely read or replay `promptText`, because the tool owns one-time
-   consumption and predecessor retirement.
-3. If no unconsumed file exists, read the worktree-local pointer history with
-   `<agent-worktrees catalog argv[0]> status --history --json --limit 20` (pass
-   `--worktree-id <id>` when CWD cannot resolve it). Walk newest-first for a
-   `kind: "handoff"` entry. If it names `handoff task <id>`, call
-   `consume_handoff` with that exact `task_id`.
-4. Only when local state has neither a file baton nor an exact task pointer,
-   query agent-dispatch for `proposed`, `handoff`-labeled tasks. Filter the
-   result to `target_worktree == <current-worktree-id>` before choosing the
-   newest task; never consume a task selected only by repo, title, or global
-   recency.
-5. Only after the complete worktree-local and worktree-filtered sweep finds
-   nothing, fall back to `session_store_sql` for recent-session recovery. That
-   fallback summarizes prior work; it is not a handoff consumption path.
+## Template
 
-If the user supplied an exact handoff id/path or the extension already injected
-the handoff, skip discovery and consume/continue that exact baton.
-
-### `/resume-handoff` — an injected slash command (extension-provided)
-
-When the operator runs `/resume-handoff` in the target worktree, the extension:
-
-1. Prefers this worktree's newest `proposed`, `handoff`-labeled agent-dispatch
-   task and consumes it.
-2. Otherwise finds the newest unconsumed checkout-scoped handoff file and consumes
-   it with the same one-time semantics as `consume_handoff`.
-3. Injects the continuation prompt into the foreground session, or logs that no
-   pending handoff was found.
-
-So your job on resume is: **read the injected handoff and keep going.** Do not
-re-claim or re-complete a baton that `/resume-handoff` already consumed. Apply
-the Continuity Contract above: the completed items are history; the continuing
-objective and successor work roster are the authorization to keep driving.
-For an effort-backed baton, load the cited effort README first. Use session
-ramp-up only when the Immediate Session Delta is missing or insufficient, and
-recover only the predecessor's immediate activity rather than reconstructing
-the durable objective from transcript history.
-
-### If the user says "pick up from last session" with no pasted prompt
-
-The previous session's handoff was not pasted in. Perform the state-first sweep
-above. If nothing is pending after its local-state, exact-pointer, and
-worktree-filtered task checks, fall back to `session_store_sql` to identify the
-most recent session for this repo/worktree and summarize what was worked on.
-
----
-
-## Handoff Template
-
-Compose the appropriate shape and pass it to `save_handoff_prompt` as `prompt_text`
-(it becomes the agent-dispatch **task payload**, or the prompt content inside
-the one-time machine-local handoff file). Full template:
-[`references/handoff-template.md`](references/handoff-template.md). Its sections:
+Compose the appropriate shape and pass it to `save_handoff_prompt` as
+`prompt_text`. Use exactly one of:
 
 ```markdown
-Choose exactly one:
-
 ## Effort-Backed Session Continuation
 ### Active Effort
 ### Next Slice
 ### Immediate Session Delta
+### Outstanding Background Flows & External State
 ### Completion Gates
 ### Re-Handoff Instructions
 
@@ -356,71 +584,69 @@ Choose exactly one:
 ### Direction & Motivation
 ### Progress
 ### Successor Work Roster
+### Outstanding Background Flows & External State
 ### Completion Gates
 ### Re-Handoff Instructions
 ### Gotchas
 ```
 
----
-
 ## Rules
 
-- **Effort-backed handoffs are compact by construction.** The effort README
-  already carries durable direction, plan, validation, and journal. Link it and
-  carry only the next slice plus immediate blockers, decisions, in-flight work,
-  and required confirmations.
-- **Standalone handoff content can be as long as needed** because it is read on
-  demand. Capture the complete parent objective, direction, progress, and
-  successor roster when no valid effort owns them.
-- **The inline REPLY prompt must be short — one or two sentences.** It is
-  addressed to the **next agent** and is whichever form `save_handoff_prompt`
-  returned: either the agent-dispatch resume seed with the full
-  `agent-dispatch consume <id>` command, <!-- marketplace-isolation: allow handoff-seed-startup -->
-  or the file-backed seed instructing
-  the next agent to call `consume_handoff` with the handoff id. It is
-  copy-pasted verbatim into `/clear` (or `/new`); keep it scannable and do
-  **not** repeat the handoff contents.
-- **Lead with the original topic.** The "Original Request" must reference the
-  session's founding purpose, not just recent activity.
-- **Preserve the parent objective.** A phase-complete milestone belongs under
-  Progress. It must not replace the broader objective or become the handoff
-  title when more of the original request remains.
-- **Open forward, not backward.** The Successor Work Roster must contain the
-  immediate next action and every already-known later slice the successor can
-  pursue without another user decision. Do not write "no action remains" while
-  the cited effort, issue, or original request still exposes actionable work.
-- **Separate completion gates.** State both when the current deferred handoff
-  task may be completed and when the parent objective/worktree is actually
-  complete. For an active effort, responsibility remains open until it is
-  `Done`, every Plan and Validation Plan checkbox is resolved, deferred/blocked
-  work uses the checked form `Deferred to \`<tracked objective>\`: ...` or
-  `Blocked; transferred to \`<tracked objective>\`: ...`, required pull requests
-  are merged, and the effort is archived. A landed phase, consumed baton, or
-  merged PR is not by itself completion.
-- **Plan the next relay.** Re-Handoff Instructions must tell a context-limited
-  successor to carry the same parent objective and remaining roster into another
-  handoff rather than stopping for operator intervention.
-- **Be specific.** "Fix the auth bug" is useless. "JWT refresh in
-  `src/auth/token.ts:142` has a race — mutex added but error handler uses old
-  non-awaited path" is useful. Include file paths, what failed, and the why.
-- **Never claim auto-pickup.** A handoff is never loaded automatically on
-  restart. Do not imply Copilot will resume on its own — the user resumes it
-  (`/resume-handoff`, or paste the reply prompt).
-- **One home, not two.** A handoff lives in **one** place — a checkout-scoped
-  machine-local file in Herdr, otherwise an agent-dispatch task when a
-  coordinator and worktree are available, else a machine-local file outside the
-  repo checkout. Don't write a file *and* a task. Show the reply prompt to the
-  user; don't hide it in a tool call.
-
----
-
-## Integration Notes
-
-- **Storage is mode-dependent.** `save_handoff_prompt` prefers an agent-dispatch
-  task outside Herdr (payload = metadata plus the markdown, no file handoff) and
-  falls back to a one-time JSON file outside the checkout. In Herdr,
-  context-handoff selects that checkout-scoped file directly without probing
-  agent-worktrees; other modes use the worktree state directory reported by
-  agent-worktrees. Pass the markdown as the
-  **`prompt_text`** argument (the `prompt` alias is also accepted) plus an
-  optional short **`title`**.
+- Every session has this mechanism available from turn one, whether or not it
+  began from a handoff -- the extension delivers a one-time awareness message
+  on the first turn so this is never gated behind a pressure threshold or an
+  explicit trigger phrase. Context pressure is never a reason to truncate
+  diligence; it is only a reason to hand off.
+- The seed is a **locator**, not the handoff. Never inline the full markdown in
+  it.
+- **Relay the seed verbatim.** When `trigger_handoff` prints the final
+  handoff seed prompt, give it to the user exactly as printed -- do not
+  paraphrase, summarize, reformat, or invent your own wording for it. The
+  tool's own response says this explicitly; follow it literally.
+- The stored brief may be long. Preserve fidelity there; optimize the seed and
+  the pickup exchange instead.
+- Keep the original topic and parent objective visible.
+- Separate the handoff leg's completion gate from the broader objective's
+  completion gate.
+- Never claim auto-pickup. A handoff is not loaded automatically on restart.
+- **"None outstanding" is a checked claim, not a default.** Run the
+  **Self-audit before declaring completion** step before writing an empty
+  Successor Work Roster or Continuing Objective; on the resume side, spot-check
+  the brief against the predecessor's own transcript and the worktree's own
+  status/lineage per **Verify before trusting: completeness, then the
+  worktree's own record** before reporting "nothing queued" to the user.
+- Never end a turn with outstanding work and no handoff. "Suitable stopping
+  point," "session ran long," and "getting late" do not excuse it; only a
+  genuine crossroads, an error, a design contradiction, or a confirmation-gated
+  destructive step does -- and even those close with a handoff naming the
+  blocker, not a silent stop.
+- Never silently drop outstanding background flows (watches, polls,
+  `manage_schedule` entries, long-running commands) or external state this
+  session owns (open PRs, held claims/leases, peer-agent coordination). Always
+  carry each forward in the handoff's **Outstanding Background Flows &
+  External State** section as either resumable (state how) or an explicit
+  open item -- write "none" only when genuinely none exist.
+- **Scope this to the worktree's full outbound claim graph, not just this
+  turn's own actions.** Sessions progress a worktree forward and never look
+  back -- a successor inherits everything the worktree (and everything it
+  spawned, recursively, across every prior session) still has open, not only
+  what the immediately-preceding session itself did. Before writing "none" or
+  scoping an item out as "not this handoff's," verify with the tool, not
+  memory (exact `argv[0]` per the `agent-worktrees:tracing-claimant-graphs`
+  skill's convention):
+  1. `<agent-worktrees catalog argv[0]> claims show --json` lists this
+     worktree's own outbound claims (child worktrees, sessions, PRs).
+  2. **Recurse explicitly**: for every outbound `worktree` claim, run
+     `claims show --json` again from *that* child project/worktree, repeating
+     down every level a prior session spawned -- not just one hop. A
+     repo-wide `claims find pr --repo <owner/repo> --live` sweep is a useful
+     shortcut but no substitute: `--live` only confirms the PR's remote
+     state, never that the claiming worktree/session is alive.
+  3. For each open PR/claim found, apply that skill's own two-hop recipe --
+     `claims <id> --json` for the `owner_ref`, then `claimant-liveness
+     "<owner_ref>" --json` -- before concluding. A claim tracing to a
+     currently-live worktree/session is fine to name and leave (don't adopt
+     another live session's PR); one whose owner reports `alive: false`, or
+     that has no owner at all (e.g. an anchor-repo session with no worktree
+     to hold it), is this worktree's own unresolved obligation -- name it
+     explicitly, never drop it as "someone else's."

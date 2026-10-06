@@ -8,6 +8,7 @@ import types
 import pytest
 
 from agent_worktrees import config as cfg
+from agent_worktrees import output
 from agent_worktrees import list_cache as lc
 
 
@@ -152,7 +153,7 @@ def test_cmd_list_json_coalesces_scans(_cache_home, monkeypatch):
     monkeypatch.setattr(sessions, "scan_sessions_fast", _scan)
 
     outputs = []
-    monkeypatch.setattr(m, "_json_output", lambda payload: outputs.append(payload))
+    monkeypatch.setattr(output, "_json_output", lambda payload: outputs.append(payload))
 
     def _ns(fresh=False):
         return types.SimpleNamespace(
@@ -167,6 +168,79 @@ def test_cmd_list_json_coalesces_scans(_cache_home, monkeypatch):
     assert outputs[0] == outputs[1]  # identical payload
     m.cmd_list(_ns(fresh=True))  # --fresh -> re-scan
     assert scans["n"] == 2
+
+
+def test_cmd_list_json_reuses_config_for_controller_rows(_cache_home, monkeypatch):
+    """Controller findings used to reload config once per serialized row."""
+    from agent_worktrees import __main__ as m
+    from agent_worktrees import delegate_cli, sessions, tracking
+
+    records = [
+        tracking.WorktreeRecord(
+            worktree_id=f"wt-{idx}",
+            branch=f"worktree/wt-{idx}",
+            worktree_path=f"/w/{idx}",
+            repo="r",
+            machine="host",
+            platform="windows",
+            started_at="",
+            last_resumed_at="",
+            resume_count=0,
+            title=f"t{idx}",
+            status="active",
+            completed_at=None,
+            controllers=[
+                tracking.ControllerRelation(
+                    kind="session",
+                    source="explicit",
+                    relation_revision=1,
+                    created_at="",
+                    state="ended",
+                )
+            ],
+            controller_revision=1,
+        )
+        for idx in range(20)
+    ]
+    monkeypatch.setattr(cfg, "tracking_dir", lambda: _cache_home / "trk")
+    monkeypatch.setattr(cfg, "detect_platform", lambda: "windows")
+    monkeypatch.setattr(cfg, "project_name", lambda: "testproj")
+    monkeypatch.setattr(tracking, "list_records", lambda *a, **k: records)
+    monkeypatch.setattr(
+        sessions, "scan_sessions_fast", lambda rows: sessions.SessionContext())
+    monkeypatch.setattr(delegate_cli, "annotate_delegate_graph", lambda rows: None)
+
+    loads = {"n": 0}
+
+    def _load_config_once(*args, **kwargs):
+        loads["n"] += 1
+        return types.SimpleNamespace(machine="host")
+
+    monkeypatch.setattr(cfg, "_load_config_uncached", _load_config_once)
+    outputs = []
+    monkeypatch.setattr(output, "_json_output", outputs.append)
+
+    m.cmd_list(
+        types.SimpleNamespace(
+            json=True,
+            stream=False,
+            cache_only=False,
+            mux_details=False,
+            classify=False,
+            all=True,
+            tracking_status="all",
+            include_other_platforms=False,
+            profile_assignment_history=False,
+            fresh=True,
+            worktree_id=None,
+            codename=None,
+            refresh=False,
+            glance=False,
+        )
+    )
+
+    assert loads["n"] == 1
+    assert len(outputs[0]["worktrees"]) == len(records)
 
 
 def test_filter_list_worktree_accepts_exact_and_unique_suffix():
@@ -201,7 +275,7 @@ def test_list_error_respects_plain_and_json_modes(monkeypatch):
     errors = []
     envelopes = []
     monkeypatch.setattr(m.output, "err", errors.append)
-    monkeypatch.setattr(m, "_json_error", lambda message: envelopes.append(message) or 1)
+    monkeypatch.setattr(output, "_json_error", lambda message: envelopes.append(message) or 1)
 
     assert m._list_error(
         types.SimpleNamespace(json=False, stream=False), "plain") == 1
@@ -265,6 +339,59 @@ def test_resident_warm_populates_exact_demanded_shapes(_cache_home, monkeypatch)
             "worktrees": [{"id": "record"}]}
 
 
+def test_resident_warm_reuses_config_for_controller_rows(_cache_home, monkeypatch):
+    from agent_worktrees import __main__ as m
+    from agent_worktrees import delegate_cli, sessions, tracking
+
+    records = [
+        tracking.WorktreeRecord(
+            worktree_id=f"wt-{idx}",
+            branch=f"worktree/wt-{idx}",
+            worktree_path=f"/w/{idx}",
+            repo="r",
+            machine="host",
+            platform="windows",
+            started_at="",
+            last_resumed_at="",
+            resume_count=0,
+            title=f"t{idx}",
+            status="active",
+            completed_at=None,
+            controllers=[
+                tracking.ControllerRelation(
+                    kind="session",
+                    source="explicit",
+                    relation_revision=1,
+                    created_at="",
+                    state="ended",
+                )
+            ],
+            controller_revision=1,
+        )
+        for idx in range(12)
+    ]
+    monkeypatch.setattr(cfg, "project_name", lambda: "testproj")
+    monkeypatch.setattr(m, "_list_records_for_args", lambda args: records)
+    monkeypatch.setattr(
+        sessions, "scan_sessions_fast", lambda rows: sessions.SessionContext())
+    monkeypatch.setattr(delegate_cli, "annotate_delegate_graph", lambda rows: None)
+
+    loads = {"n": 0}
+
+    def _load_config_once(*args, **kwargs):
+        loads["n"] += 1
+        return types.SimpleNamespace(machine="host")
+
+    monkeypatch.setattr(cfg, "_load_config_uncached", _load_config_once)
+    args = _args(classify=False, mux_details=False, all=True)
+    key = lc.cache_key(args, project="testproj", tracking_status="all")
+    lc.note_demand(key, args, project="testproj", tracking_status="all", now=1000.0)
+    monkeypatch.setattr(lc.time, "time", lambda: 1001.0)
+
+    assert m._warm_list_cache_for_active_project(interval=15) == 1
+    assert loads["n"] == 1
+
+
 def test_resident_warm_respects_disabled_cache(_cache_home, monkeypatch):
     from agent_worktrees import __main__ as m
 
@@ -294,3 +421,26 @@ def test_recent_demand_projects_reports_all_active_projects(_cache_home):
         "b", args, project="p2", tracking_status="all")
 
     assert lc.recent_demand_projects() == {"p1", "p2"}
+
+
+def test_one_off_scope_reuses_an_active_resident_session():
+    """A nested one-off scope must not mask a monitor's TTL-bounded session."""
+    from agent_worktrees import config_cache
+
+    resident = config_cache.ConfigCacheSession(ttl=60)
+    calls = {"n": 0}
+
+    def load():
+        calls["n"] += 1
+        return calls["n"]
+
+    with resident.scope():
+        with config_cache.cached_load_config_scope() as inner:
+            assert inner is resident
+            config_cache.memoize_in_scope(load)
+    with resident.scope():
+        with config_cache.cached_load_config_scope():
+            assert config_cache.memoize_in_scope(load) == 1
+    assert calls["n"] == 1
+    with config_cache.cached_load_config_scope() as standalone:
+        assert standalone is not resident

@@ -325,6 +325,18 @@ def test_missing_status_core_emits_empty(tmp_path: Path) -> None:
         assert _run(hook, repo, tools).stdout == b"{}"
 
 
+def test_aggregate_mode_skips_expensive_status_capability_probe(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    tools = _tool_path(tmp_path / "bin", status_core=False)
+    for hook in _hooks():
+        context = json.loads(
+            _run(hook, repo, tools, "--aggregate").stdout
+        )["additionalContext"]
+        assert context.startswith(f"[owner: agent-dispatch@{VERSION}]\n")
+
+
 @pytest.mark.parametrize(
     "payload",
     ["", "{", "[]", '{"source":"copilot-cli"}', '{"cwd":"relative"}'],
@@ -513,14 +525,16 @@ def test_hook_registration_is_separate_from_bootstrap_contract() -> None:
     assert "COPILOT_PLUGIN_ROOT" in entries[0]["powershell"]
     assert "else printf '{}'" in entries[0]["bash"]
     assert "else { [Console]::Out.Write('{}') }" in entries[0]["powershell"]
-    assert "focus-guidance" not in entries[0]["bash"]
-    assert "focus-guidance" not in entries[0]["powershell"]
-    assert "focus-guidance" in entries[1]["bash"]
-    assert "focus-guidance" in entries[1]["powershell"]
-    assert "COPILOT_PLUGIN_ROOT" in entries[1]["bash"]
-    assert "COPILOT_PLUGIN_ROOT" in entries[1]["powershell"]
-    assert "emit-command-catalog" in entries[2]["bash"]
-    assert "emit-command-catalog" in entries[2]["powershell"]
+    assert "register-bridge-provider" in entries[1]["bash"]
+    assert "register-bridge-provider" in entries[1]["powershell"]
+    assert "write-session-guidance" in entries[2]["bash"]
+    assert "write-session-guidance" in entries[2]["powershell"]
+    assert "COPILOT_PLUGIN_ROOT" in entries[2]["bash"]
+    assert "COPILOT_PLUGIN_ROOT" in entries[2]["powershell"]
+    assert "else printf '{}'" in entries[2]["bash"]
+    assert "else { [Console]::Out.Write('{}') }" in entries[2]["powershell"]
+    assert "focus-guidance" not in json.dumps(entries)
+    assert "emit-command-catalog" not in json.dumps(entries)
     for bootstrap in (
         PLUGIN / "scripts" / "bootstrap-check.sh",
         PLUGIN / "scripts" / "bootstrap-check.ps1",

@@ -14,6 +14,7 @@ from agent_bridge.transport import (
     AgentProcess,
     SpawnTarget,
     _agent_worktrees_python,
+    _agent_worktrees_root,
     _build_remote_cmd,
     _extract_json_object,
     _looks_unprovisioned_project,
@@ -22,6 +23,7 @@ from agent_bridge.transport import (
     _resolve_worktree,
     _resolve_worktree_remote,
     _wrap_batch_for_windows,
+    resolve_local_launch,
     spawn,
     spawn_local,
     spawn_raw,
@@ -335,8 +337,13 @@ class TestSpawnSsh:
         assert "&& exec " not in remote_cmd
 
     @pytest.mark.asyncio
-    async def test_ssh_project_resolve_failure_falls_back_to_new(self, mock_manager):
-        """If remote resolve fails, launch falls back with a verified cwd."""
+    async def test_ssh_project_resolve_failure_fails_closed(self, mock_manager):
+        """If remote resolve fails, the whole connect attempt fails closed.
+
+        A direct launch in an unmanaged, bare-home cwd is never an acceptable
+        substitute: it just fails a second time with an unrelated-looking
+        error, hiding the real stage-6 cause.
+        """
         target = SpawnTarget(
             type="ssh", host="server-a", user="deploy", project="my-project",
         )
@@ -345,23 +352,18 @@ class TestSpawnSsh:
         failed.exit_code = 1
         failed.stdout = ""
         failed.stderr = "resolve blew up"
-        home = MagicMock()
-        home.timed_out = False
-        home.exit_code = 0
-        home.stdout = "/home/deploy\n"
-        home.stderr = ""
-        mock_manager.exec_command = AsyncMock(side_effect=[failed, home])
+        mock_manager.exec_command = AsyncMock(return_value=failed)
 
         with patch("agent_bridge.transport.get_default_manager", return_value=mock_manager):
-            await spawn_ssh(target)
+            with pytest.raises(ConnectError) as ei:
+                await spawn_ssh(target)
 
-        # No id bound; launch uses the legacy direct --new path.
+        assert ei.value.stage == ConnectStage.WORKTREE
+        assert ei.value.retryable is False
+        assert "resolve blew up" in str(ei.value)
+        # No id bound; the direct launch was never attempted.
         assert target.worktree_id is None
-        assert target.cwd == "/home/deploy"
-        assert mock_manager.exec_command.call_count == 2
-        remote_cmd = mock_manager.open_stdio_channel.call_args[0][1]
-        assert "--new" in remote_cmd
-        assert "--worktree-id" not in remote_cmd
+        mock_manager.open_stdio_channel.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_ssh_unprovisioned_project_fails_loud(self, mock_manager):
@@ -421,11 +423,14 @@ class TestSpawnSsh:
         mock_manager.open_stdio_channel.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_ssh_generic_resolve_failure_still_degrades(self, mock_manager):
-        """A *generic* resolve failure (not command-not-found) still degrades.
+    async def test_ssh_generic_resolve_failure_fails_closed(self, mock_manager):
+        """A *generic* resolve failure (not command-not-found) also fails closed.
 
-        Guards that the #757 fail-loud path is narrow: only an unprovisioned
-        project short-circuits; other resolve failures keep the legacy fallback.
+        Every resolve failure fails the connect attempt -- not only an
+        unprovisioned project. A direct launch in an unmanaged (bare-home) cwd
+        is never an acceptable substitute: it just fails a second time with an
+        unrelated-looking error (an immediate "Connection closed", or an ACP
+        handshake timeout), hiding the real stage-6 cause.
         """
         target = SpawnTarget(
             type="ssh", host="server-a", user="deploy", project="my-project",
@@ -436,19 +441,103 @@ class TestSpawnSsh:
         failed.exit_code = 1
         failed.stdout = ""
         failed.stderr = "fatal: some internal resolve error"
-        home = MagicMock()
-        home.timed_out = False
-        home.exit_code = 0
-        home.stdout = "/home/deploy\n"
-        home.stderr = ""
-        mock_manager.exec_command = AsyncMock(side_effect=[failed, home])
+        mock_manager.exec_command = AsyncMock(return_value=failed)
 
         with patch("agent_bridge.transport.get_default_manager", return_value=mock_manager):
-            await spawn_ssh(target)
+            with pytest.raises(ConnectError) as ei:
+                await spawn_ssh(target)
 
-        # Degraded as before: launched with the verified fallback cwd.
-        assert target.cwd == "/home/deploy"
-        mock_manager.open_stdio_channel.assert_called_once()
+        assert ei.value.stage == ConnectStage.WORKTREE
+        assert ei.value.retryable is False
+        assert "some internal resolve error" in str(ei.value)
+        # Crucially: NO degrade -- the direct launch was never attempted.
+        mock_manager.open_stdio_channel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ssh_resolve_success_without_work_dir_fails_closed(self, mock_manager):
+        """A resolve that succeeds but omits work_dir also fails closed.
+
+        Even when the remote resolve command itself reports success, an
+        incomplete plan (missing ``work_dir``) must not silently proceed to a
+        bare, unmanaged launch.
+        """
+        target = SpawnTarget(
+            type="ssh", host="server-a", user="deploy", project="my-project",
+            ssh_shell="bash",
+        )
+        ok = MagicMock()
+        ok.timed_out = False
+        ok.exit_code = 0
+        ok.stdout = '{"launch": {"worktree_id": "server-a-new-1"}}'
+        ok.stderr = ""
+        mock_manager.exec_command = AsyncMock(return_value=ok)
+
+        with patch("agent_bridge.transport.get_default_manager", return_value=mock_manager):
+            with pytest.raises(ConnectError) as ei:
+                await spawn_ssh(target)
+
+        assert ei.value.stage == ConnectStage.WORKTREE
+        assert "incomplete plan" in str(ei.value)
+        mock_manager.open_stdio_channel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ssh_resolve_success_without_worktree_id_fails_closed(self, mock_manager):
+        """A resolve that succeeds but omits worktree_id also fails closed.
+
+        An incomplete plan missing ``worktree_id`` must not silently launch
+        with ``--new`` (creating a second worktree) using whatever ``cwd`` the
+        target happened to already carry.
+        """
+        target = SpawnTarget(
+            type="ssh", host="server-a", user="deploy", project="my-project",
+            ssh_shell="bash",
+        )
+        ok = MagicMock()
+        ok.timed_out = False
+        ok.exit_code = 0
+        ok.stdout = '{"launch": {"work_dir": "/home/deploy/src.worktrees/wt-1"}}'
+        ok.stderr = ""
+        mock_manager.exec_command = AsyncMock(return_value=ok)
+
+        with patch("agent_bridge.transport.get_default_manager", return_value=mock_manager):
+            with pytest.raises(ConnectError) as ei:
+                await spawn_ssh(target)
+
+        assert ei.value.stage == ConnectStage.WORKTREE
+        assert "incomplete plan" in str(ei.value)
+        mock_manager.open_stdio_channel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ssh_incomplete_plan_fails_closed_despite_preexisting_cwd(
+        self, mock_manager,
+    ):
+        """A pre-populated ``cwd`` (e.g. a static agent-config ``cwd:``) must
+        never substitute for an incomplete resolve plan.
+
+        ``SpawnTarget.cwd`` can be pre-populated from agent config
+        (``explicit_cwd`` stays false in that case) -- an incomplete plan
+        missing ``worktree_id`` must still fail closed instead of silently
+        launching from that unrelated, possibly stale cwd with ``--new``
+        (which would also create a second, orphaned worktree).
+        """
+        target = SpawnTarget(
+            type="ssh", host="server-a", user="deploy", project="my-project",
+            cwd="/home/deploy/some/other/preconfigured/path", ssh_shell="bash",
+        )
+        ok = MagicMock()
+        ok.timed_out = False
+        ok.exit_code = 0
+        ok.stdout = "{}"
+        ok.stderr = ""
+        mock_manager.exec_command = AsyncMock(return_value=ok)
+
+        with patch("agent_bridge.transport.get_default_manager", return_value=mock_manager):
+            with pytest.raises(ConnectError) as ei:
+                await spawn_ssh(target)
+
+        assert ei.value.stage == ConnectStage.WORKTREE
+        assert "incomplete plan" in str(ei.value)
+        mock_manager.open_stdio_channel.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_ssh_project_with_existing_worktree_id_skips_resolve(self, mock_manager):
@@ -1106,6 +1195,96 @@ class TestSpawnRaw:
         with pytest.raises(ValueError, match="spawn_command"):
             await spawn_raw(target)
 
+    @pytest.mark.asyncio
+    async def test_spawn_raw_sets_copilot_args_env_for_container_target(self):
+        """A container-backed target's copilot_args (e.g. a charter overlay,
+        ``--agent <charter>``) must reach the launched ``agent-containers
+        exec`` invocation via the ``AGENT_CONTAINERS_EXEC_COPILOT_ARGS`` env
+        var, never trailing argv -- unlike the local/SSH spawn paths, which
+        append copilot_args directly onto the launched ``copilot`` command,
+        a container target's spawn_command is itself a wrapper binstub that
+        can be a Windows ``.cmd`` shim routed through ``cmd.exe``, which
+        reparses argv metacharacters but passes the environment through
+        untouched."""
+        target = SpawnTarget(
+            type="command",
+            spawn_command=["agent-containers", "exec", "--stdio", "myfleet-1"],
+            copilot_args=["--agent", "some-charter"],
+            container={"name": "myfleet-1"},
+        )
+        with patch("agent_bridge.transport.asyncio") as mock_asyncio, \
+             patch("agent_bridge.transport._wrap_batch_for_windows") as mock_wrap, \
+             patch("agent_bridge.transport._creation_flags", return_value=0):
+            mock_proc = MagicMock()
+            mock_asyncio.create_subprocess_exec = AsyncMock(return_value=mock_proc)
+            mock_asyncio.subprocess = asyncio.subprocess
+            mock_wrap.side_effect = lambda cmd, env: cmd
+
+            await spawn_raw(target)
+
+            call_args = mock_asyncio.create_subprocess_exec.call_args
+            assert call_args[0] == ("agent-containers", "exec", "--stdio", "myfleet-1")
+            assert json.loads(
+                call_args[1]["env"]["AGENT_CONTAINERS_EXEC_COPILOT_ARGS"]
+            ) == ["--agent", "some-charter"]
+
+    @pytest.mark.asyncio
+    async def test_spawn_raw_sets_copilot_args_env_for_restricted_container_target(
+        self,
+    ):
+        """A restricted-fleet container target carries no ``target.container``
+        metadata at all (``ContainerResolver.resolve_spec`` deliberately omits
+        it for restricted fleets) -- it is identified only via
+        ``venue.provider`` instead, so that must also trigger the env-var
+        forwarding, not just ``target.container is not None``."""
+        target = SpawnTarget(
+            type="command",
+            spawn_command=["agent-containers", "exec", "--stdio", "myfleet-1"],
+            copilot_args=["--agent", "some-charter"],
+            venue={"provider": "agent-containers", "kind": "container"},
+        )
+        with patch("agent_bridge.transport.asyncio") as mock_asyncio, \
+             patch("agent_bridge.transport._wrap_batch_for_windows") as mock_wrap, \
+             patch("agent_bridge.transport._creation_flags", return_value=0):
+            mock_proc = MagicMock()
+            mock_asyncio.create_subprocess_exec = AsyncMock(return_value=mock_proc)
+            mock_asyncio.subprocess = asyncio.subprocess
+            mock_wrap.side_effect = lambda cmd, env: cmd
+
+            await spawn_raw(target)
+
+            call_args = mock_asyncio.create_subprocess_exec.call_args
+            assert json.loads(
+                call_args[1]["env"]["AGENT_CONTAINERS_EXEC_COPILOT_ARGS"]
+            ) == ["--agent", "some-charter"]
+
+    @pytest.mark.asyncio
+    async def test_spawn_raw_does_not_set_copilot_args_env_for_non_container_command(
+        self,
+    ):
+        """A codespace (or other non-agent-containers) command target's own
+        spawn wrapper is not assumed to understand this env var -- it is only
+        set for a target carrying agent-containers transport metadata, never
+        generically for every command target."""
+        target = SpawnTarget(
+            type="command",
+            spawn_command=["agent-codespaces", "ssh", "--stdio", "my-cs"],
+            copilot_args=["--agent", "some-charter"],
+        )
+        with patch("agent_bridge.transport.asyncio") as mock_asyncio, \
+             patch("agent_bridge.transport._wrap_batch_for_windows") as mock_wrap, \
+             patch("agent_bridge.transport._creation_flags", return_value=0):
+            mock_proc = MagicMock()
+            mock_asyncio.create_subprocess_exec = AsyncMock(return_value=mock_proc)
+            mock_asyncio.subprocess = asyncio.subprocess
+            mock_wrap.side_effect = lambda cmd, env: cmd
+
+            await spawn_raw(target)
+
+            call_args = mock_asyncio.create_subprocess_exec.call_args
+            assert call_args[0] == ("agent-codespaces", "ssh", "--stdio", "my-cs")
+            assert "AGENT_CONTAINERS_EXEC_COPILOT_ARGS" not in call_args[1]["env"]
+
 
 class TestSpawnDispatchCommand:
     """Tests for spawn() dispatching to spawn_raw for command targets."""
@@ -1146,6 +1325,30 @@ class TestLocalResolveBridgeFallback:
         p.returncode = returncode
         p.communicate = AsyncMock(return_value=(stdout, stderr))
         return p
+
+    @pytest.mark.asyncio
+    async def test_explicit_cwd_bypasses_project_worktree_resolution(self):
+        target = SpawnTarget(
+            type="local",
+            cwd="/tmp/wt-review",
+            project="test-chamber",
+            worktree_id="wt-review",
+            explicit_cwd=True,
+            copilot_path="/usr/bin/copilot",
+        )
+
+        with patch(
+            "agent_bridge.transport._resolve_worktree",
+            new=AsyncMock(
+                side_effect=AssertionError(
+                    "explicit target directory must not create another checkout"
+                )
+            ),
+        ):
+            args, cwd, _env = await resolve_local_launch(target)
+
+        assert args == ["/usr/bin/copilot", "--acp", "--stdio", "--no-auto-update"]
+        assert cwd == "/tmp/wt-review"
 
     @pytest.mark.asyncio
     async def test_local_new_sends_bridge(self):
@@ -1284,6 +1487,20 @@ class TestAgentWorktreesPython:
     """_agent_worktrees_python resolves the junction-free current-version marker
     (the retired .venv junction must not be traversed -- #581/#1085/#1106)."""
 
+    @pytest.fixture(autouse=True)
+    def _clear_ambient_agent_rt_root_override(self, monkeypatch):
+        """``_agent_worktrees_python`` honors ``AGENT_RT_ROOT`` as a resolution
+        override with priority over the default ``~/.agent-worktrees`` (see
+        ``test_honors_agent_rt_root_override`` below) -- any host that
+        genuinely has this set ambiently (the facility's own convention: every
+        plugin's ``resolve-runtime.ps1``/``resolve-runtime.sh`` honors the
+        same override) bypasses every other test's ``os.path.expanduser``
+        monkeypatch entirely, silently resolving the REAL ambient
+        ``AGENT_RT_ROOT`` instead of the test's isolated ``tmp_path``. Clear it
+        by default so these tests are deterministic regardless of the host's
+        own environment; the one test that needs it sets its own override."""
+        monkeypatch.delenv("AGENT_RT_ROOT", raising=False)
+
     def _make_slot(self, root, ver):
         import os
         import sys
@@ -1334,6 +1551,37 @@ class TestAgentWorktreesPython:
         got = _agent_worktrees_python()
         assert got == want
         assert ".venv" not in got
+
+    def test_honors_agent_rt_root_override(self, tmp_path, monkeypatch):
+        """The standard cross-plugin resolution override every plugin's own
+        resolve-runtime.ps1/.sh honors -- a non-default agent-worktrees
+        install location must resolve consistently here too, not only via
+        the hardcoded ~/.agent-worktrees default."""
+        import os
+        import sys
+        custom_root = tmp_path / "custom-agent-worktrees-root"
+        rel = ("Scripts", "python.exe") if sys.platform == "win32" else ("bin", "python")
+        want = os.path.join(str(custom_root), "versions", "1.5.3-dev467", *rel)
+        os.makedirs(os.path.dirname(want), exist_ok=True)
+        open(want, "w").close()
+        os.makedirs(str(custom_root), exist_ok=True)
+        with open(os.path.join(str(custom_root), "current-version"), "w") as fh:
+            fh.write("1.5.3-dev467\n")
+        # A default-location slot must be ignored while the override is set.
+        self._make_slot(tmp_path, "1.5.3-dev999")
+        monkeypatch.setattr(os.path, "expanduser", lambda p: str(tmp_path) if p == "~" else p)
+        monkeypatch.setenv("AGENT_RT_ROOT", str(custom_root))
+        assert _agent_worktrees_python() == want
+
+    def test_agent_worktrees_root_honors_override(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_RT_ROOT", str(tmp_path / "custom"))
+        assert _agent_worktrees_root() == str(tmp_path / "custom")
+
+    def test_agent_worktrees_root_defaults_to_home(self, tmp_path, monkeypatch):
+        import os
+        monkeypatch.delenv("AGENT_RT_ROOT", raising=False)
+        monkeypatch.setattr(os.path, "expanduser", lambda p: str(tmp_path) if p == "~" else p)
+        assert _agent_worktrees_root() == os.path.join(str(tmp_path), ".agent-worktrees")
 
 
 class TestLocalResolvePassesProject:
@@ -1453,3 +1701,58 @@ class TestReresolveStaleInterpreter:
 
     def test_empty_args(self):
         assert _reresolve_stale_interpreter([]) == []
+
+
+class TestAgentProcessKillGracefulWindows:
+    """AgentProcess.kill() delegates the Windows tree-kill to the shared
+    procgroup.terminate_windows_tree (graceful stdin-close before a forceful
+    taskkill -- see #4031); POSIX is unaffected."""
+
+    def _target(self) -> SpawnTarget:
+        return SpawnTarget(type="ssh", cwd=".", host="myhost")
+
+    def _fake_proc(self, pid: int = 4242) -> MagicMock:
+        proc = MagicMock()
+        proc.pid = pid
+        proc.returncode = None
+        return proc
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_windows_helper_on_win32(self):
+        proc = self._fake_proc()
+        proc.wait = AsyncMock(return_value=0)
+        agent_proc = AgentProcess(proc, self._target())
+
+        with patch("agent_bridge.transport.sys") as mock_sys, \
+             patch("agent_bridge.transport.terminate_windows_tree", AsyncMock()) as mock_win:
+            mock_sys.platform = "win32"
+            await agent_proc.kill()
+
+        mock_win.assert_awaited_once_with(proc)
+
+    @pytest.mark.asyncio
+    async def test_posix_unchanged(self):
+        proc = self._fake_proc()
+        proc.wait = AsyncMock(return_value=0)
+        agent_proc = AgentProcess(proc, self._target())
+
+        with patch("agent_bridge.transport.sys") as mock_sys, \
+             patch("agent_bridge.transport.safe_killpg", return_value=True) as mock_killpg, \
+             patch("agent_bridge.transport.terminate_windows_tree", AsyncMock()) as mock_win:
+            mock_sys.platform = "linux"
+            await agent_proc.kill()
+
+        mock_killpg.assert_called_once()
+        mock_win.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_already_dead(self):
+        proc = self._fake_proc()
+        proc.returncode = 0
+        agent_proc = AgentProcess(proc, self._target())
+
+        with patch("agent_bridge.transport.terminate_windows_tree", AsyncMock()) as mock_win:
+            await agent_proc.kill()
+
+        mock_win.assert_not_awaited()
+

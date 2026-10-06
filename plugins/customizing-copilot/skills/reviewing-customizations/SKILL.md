@@ -18,6 +18,10 @@ description: >
   - 'check my AGENTS.md'
   - 'review my hooks'
   - 'review my sub-agents'
+  - 'migrate session guidance'
+  - 'remove context injection'
+  - 'conform all plugins'
+  - 'conform plugin guidance'
 ---
 
 # Reviewing Customizations
@@ -36,7 +40,8 @@ Gather the harness's customization surfaces:
 - **Skills** — every `SKILL.md` under `.github/skills/` (and any plugin skills
   the harness authors).
 - **Sub-agents** — every `.agent.md` under `.github/agents/` and
-  `.claude/agents/`, plus agents shipped by the plugins enabled for this repo.
+  `.claude/agents/`, explicitly declared repository-owned agent roots, plus
+  agents shipped by the plugins enabled for this repo.
 - **Instructions** — root `AGENTS.md` and any nested `AGENTS.md` / custom
   instruction files.
 - **Hooks** — `.github/hooks/*.json` (or `hooks.json`).
@@ -60,28 +65,297 @@ design:
 python3 <skill-dir>/scripts/scan-customizations.py <repo-root> [--json] [--strict]
 ```
 
+Repositories that own agent definitions outside the standard directories name
+each directory explicitly:
+
+```bash
+python3 <skill-dir>/scripts/scan-customizations.py <repo-root> \
+  --owned-agent-root services/example/agents
+```
+
+`--owned-agent-root` is repeatable, repository-relative, non-recursive, and
+limited to immediate `*.agent.md` children. Those agents receive the same
+blocking ownership checks as `.github/agents`; absolute paths, traversal,
+missing directories, and symlink escapes are rejected. The same roots join
+`--context-budget` metadata accounting.
+
 It reports (BLOCKING vs WARNING) on: **skill frontmatter** (`name` +
 `description`), **name/folder match**, **trigger collisions** across skills,
 **anti-recursion** (a Task-capable agent without an agent-specific
-anti-self-delegation line), **MCP readiness** (an MCP-owning agent without a
+anti-self-delegation line), **agent manifest declaration** (a plugin shipping
+`agents/*.agent.md` whose manifest does not declare a truthy top-level
+`agents` field -- explicit is more robust than the runtime's implicit
+`plugin_root/agents` default), **MCP readiness** (an MCP-owning agent without a
 `## MCP Readiness` section), **agent-mcp fallback** (an agent-mcp-backed agent
 without an equivalent materialized CLI fallback), **MCP plugin recovery** (a
 plugin-packaged MCP agent without a discoverable troubleshooting skill, or
 without an explicit dependency/prerequisite section in the plugin README),
 **inline secrets** in config files, **raw IPs** in ssh/scp/rsync commands, and,
 with `--from-settings`,
-**session-start context composition**, including missing or ambiguous aggregate
-ownership.
+**session-start context composition**, including ambiguous stacks with more than
+one possible non-empty output.
 `--strict` exits non-zero on any BLOCKING finding, so it drops into a hook or CI
 gate. It is a **heuristic aid, not a proof** — it deliberately under-flags rather
 than cry wolf; feed its findings into the design critique, don't treat a clean
 scan as a full review.
 
+The ordinary scan also validates checked-in static instruction projections and
+`.github/copilot/context-projections.json` offline. With `--from-settings`, it
+uses the same enabled-plugin payload resolution as the rest of the scan to
+compare each explicit `instruction-projections.json` declaration with the
+checked-in result. Findings cover missing or stale projections, malformed
+declarations/markers/locks, duplicate ids or destinations, conflicting
+ownership, safely detectable `applyTo` overlap, orphaned lock/file entries,
+legacy marked `AGENTS.md` regions, 4 KiB per-file and 12 KiB aggregate budgets,
+and dynamic/session-specific content that cannot be checked in safely.
+
+### Static fail-safe projection sync
+
+Until the supported Copilot CLI version floor proves native composition of every
+plugin-owned `sessionStart` `additionalContext` value, checked-in projections
+plus exact-session guidance files are the reliable ambient-policy path. A plugin
+declares a bounded, data-only pointer or fallback template and, when guidance is
+dynamic, uses an output-free `sessionStart` hook to write the exact session's
+file. Synchronize enabled declarations with the companion manager:
+
+```bash
+python3 <skill-dir>/scripts/manage-instruction-projections.py sync <repo-root>
+python3 <skill-dir>/scripts/manage-instruction-projections.py scan <repo-root>
+python3 <skill-dir>/scripts/manage-instruction-projections.py \
+  scan <repo-root> --from-settings --json
+```
+
+`sync` reads committed repository settings independently of interactive folder
+trust, then reads only the explicit declaration and canonical template from
+each enabled payload (personal activation does not change a shared checked-in
+projection). Malformed settings and unavailable enabled payloads block the
+operation. It creates or updates only the declared
+`.github/instructions/<plugin>/` destination, writes deterministic UTF-8/LF
+bytes with machine-readable provenance, and commits all changed projections and
+the deterministic lock as one serialized, compare-before-replace,
+rollback-protected transaction. It refuses
+unmarked files, malformed or missing ownership, different owners, local body
+edits, nonportable or case-conflicting destinations, path escape, and
+symlink/reparse indirection. It never deletes repository-owned files; orphaned
+projections and old managed regions are review findings for a human or ordinary
+repository change to remove.
+
+### `projection-reflect`: automating the sync (deterministic worker policy)
+
+`sync`/`scan` above are the mechanism; a scheduled, non-agentic worker that
+runs them unattended for a consumer repo needs an additional **policy** layer
+before it may fold a run's diff into an auto-mergeable PR --
+`scripts/projection_reflect.py` provides exactly that layer (pure functions,
+no rendering/writing/pushing of its own):
+
+- **The "did anything happen" trigger is `changed or lock_updated`, never
+  `changed` alone** (`has_actionable_change`) -- `sync` can report an empty
+  `changed` list with a lock-only update, and a no-op sync can still pair
+  with a `scan` that finds something.
+- **Deterministic, fail-closed finding classification** (`classify_findings`):
+  only `projection-missing` and `projection-source-update` are plain drift
+  `sync` already resolved. Every other check name -- including one not yet
+  invented -- is conflict-routed by default; a newly added
+  `instruction_projections.py` check must be reviewed and explicitly
+  allowlisted here before a worker may silently fold it into a bypass.
+- **Trusted-source allowlist** (`marketplace_of` + `bypass_decision`), keyed
+  off a lock entry's own `plugin@marketplace` identity -- `sync`'s
+  `discover_enabled_sources` resolves every repository-enabled marketplace,
+  including third-party ones this repo did not author, so byte-exact
+  reproducibility alone is never sufficient to bypass review.
+
+A worker composes these with `sync_repository`/`scan_repository`'s own
+`Result.findings` and the lock's changed entries to get a single
+`BypassDecision`; `eligible=False` names every violated conjunct (not just
+the first). See `projection_reflect.py`'s own module docstring for the
+immutable upstream-commit pinning conjunct (`pinned_commits`, additive and
+optional). `scan_plugin_sources.resolve_pinned_commits()` is a real,
+honestly-partial resolver for it: it re-probes each `is_local_checkout`
+source's commit **fresh at call time** (never trusting the informational-
+only `PluginSource.commit` field captured at discovery, which can precede
+a `refresh` that advances the checkout) via `git rev-parse HEAD` inside
+that source's own payload root -- a plain installed-plugins payload copy
+(the common case for an externally-installed marketplace plugin, and
+never marked `is_local_checkout`) has no local git history to read, and is
+simply absent from the resulting map rather than guessed at (see its own
+docstring, and issue #3132 for that remaining half). See
+`efforts/2026/10/02 ambient-guidance-navigability`'s Journal for status on
+the
+externally-installed-source resolver described just above -- the only
+remaining piece; the scheduler wrapper (`projection_sync_worker.py`) and
+the setup skill (`setting-up-instruction-sync-worker`) are both already
+implemented. A conflict a worker cannot bypass routes to
+`agent_dispatch.conflict_dispatch`'s generalized dispatch primitive, naming
+the
+[`projection-reconciler` agent template](references/projection-reconciler-agent-template.md)
+-- report-only on a hand-edited managed projection, re-derive-fresh on an
+ordinary git-level conflict, never a self-merge.
+
+### `projection_sync_worker.py`: the one-shot deterministic sync tool
+
+Composing `sync`, `scan`, and `projection_reflect`'s policy by hand every
+run risks exactly the failure mode this effort exists to close: a worker
+that discovers more work on a second pass and needs a follow-up PR to
+finish resolving a single upstream change. `scripts/projection_sync_worker.py`
+wraps that whole recipe into **one function, one call, one outcome** per
+run:
+
+```bash
+python3 <skill-dir>/scripts/projection_sync_worker.py <repo-root> --json
+```
+
+`run_sync_pass()` acquires `instruction_projections`'s per-repository sync
+lock once (`repository_sync_lock()`), then runs `sync_repository_locked()`
+(the only mutation -- it writes/locks whatever it can safely resolve,
+assuming the caller already holds the lock) then `scan_repository()`
+(which validates the result and reports everything it could not resolve)
+exactly once, keeping the same lock held across both calls and the
+before/after lock-entry reads -- so a concurrent worker's own sync can
+never interleave and get misattributed to this pass's outcome (plain
+`sync_repository()`/`scan_repository()` remain available for a caller that
+only needs one operation standalone, without this atomicity guarantee).
+It returns a `SyncOutcome` whose `needs_pr` / `bypass_eligible` /
+`needs_conflict_dispatch` properties are already the complete decision --
+a caller branches on that outcome directly; it never needs to re-invoke this
+tool to discover more work from the same run, so a scheduler wired to it
+opens at most one PR per invocation. `needs_conflict_dispatch` is true only
+for a real conflict-classified finding (a hand-edit, a failed sync); an
+untrusted-marketplace source or a missing/malformed immutable pin refuses
+the bypass but opens a normal review-only PR instead, since there is
+nothing there for a reconciler to act on. It performs no git or PR/dispatch
+operations of its own (that remains the calling scheduler's job, per-adopting-
+repo and out of this repo's own scope -- see Phase 5); refreshing installed
+plugin payloads is similarly the caller's job, via an optional `refresh`
+callback run once before the pass (never retried mid-pass).
+
+### Worktree-scoped local cache -- the consent-free, permissionless read path
+
+`sync`/`scan`/`run_sync_pass()` above mutate the checked-in projection and
+its lock -- privileged, PR-gated, consent-gated by design (see Phase 5).
+`instruction_projections.render_local_cache(repo_root, discover_sources)` is
+a deliberately **un**privileged sibling: it renders each enabled source's
+*current* projection into a gitignored `<sourceId>.local.instructions.md`
+file next to its checked-in destination
+(`local_sibling_destination()` computes the path) -- no consent check, no
+mutation of any checked-in file, lock, or git history. It *does* hold its
+own dedicated lock (`_local_cache_lock`, separate from `sync`'s own) so
+concurrent callers for the same repository can't interleave their
+render/write/cleanup passes -- distinct from the checked-in sync's lock in
+purpose and lifetime. A caller must handle contention: a locked-out call
+returns a blocking `projection-local-cache-lock` finding and refreshes
+nothing at all, rather than assuming every call updates the cache: retry
+later, or treat it as a benign no-op if this call was only ever a
+best-effort refresh. `discover_sources` is a callable, resolved only after
+the lock is acquired -- never a precomputed list -- so no call can act on a
+source set a more recent call has already superseded. See
+`docs/patterns/worktree-scoped-dynamic-guidance.md`: any session, regardless
+of push rights or scheduled-worker opt-in, can always see a fresh render of
+what's currently installed without a privileged sync. Call it
+unconditionally -- worktree create/resume, `sessionStart`, or any read path --
+since a failure on one source never blocks another and nothing it does
+mutates a checked-in file or git history.
+
+The CLI (`main()`/`__main__`) is the actual consent-gated scheduled-worker
+surface: it calls `projection_reflect_consent.load_consent()` first and
+refuses to run at all -- no mutation, no trust decision made -- without this
+repo's own live, committed opt-in, deriving its trusted-source allowlist
+from that consent object rather than any command-line flag. There is
+deliberately no `--installed-root`-style override on this CLI: letting the
+bypass-eligible path source projections from a caller-chosen payload root,
+rather than the repo's own settings-resolved, consent-trusted sources,
+would let a substituted, unverified payload tree ride the same auto-merge
+surface a real trusted source gets. `run_sync_pass()` itself stays a
+general-purpose library function that takes `trusted_marketplaces`
+explicitly from any caller (including a test or an already-consent-resolved
+scheduler); the consent gate lives at the CLI boundary, not inside the pure
+composition.
+
+The committed consent file's `requireImmutablePin` (default `false` when
+absent) gates whether the CLI enforces the pin conjunct at all: most
+adopters sync externally-installed marketplace plugins, which
+`resolve_pinned_commits()` cannot pin -- enforcing it unconditionally would
+silently disable the bypass path entirely for that common case. A repo
+opts in explicitly only once it understands today's tradeoff (only
+self-hosted/directory-marketplace sources can ever be pinned). When
+enabled, the CLI passes `resolve_pinned_commits` to `run_sync_pass()` as
+`resolve_pins` (a callback), never a precomputed map: `run_sync_pass` calls
+it after `refresh` and inside its own held lock, immediately before the
+locked sync -- resolving pins any earlier would leave a window where a
+refresh or a concurrent update changes a payload after its commit was
+captured, letting a stale-but-well-formed SHA pass the pin conjunct even
+though it no longer describes what that pass actually renders.
+`resolve_pinned_commits()` itself pins only a clean checkout:
+`_plugin_commit()` rejects any modified, untracked, or ignored file inside
+the payload (forcing full untracked enumeration regardless of a
+`status.showUntrackedFiles` config), re-reads `HEAD` before and after that
+check and requires them to agree, and runs every git subprocess with
+`GIT_*` environment variables stripped so an inherited `GIT_DIR`/
+`GIT_WORK_TREE` override can never redirect the probe at an unrelated
+repository.
+
+### Troubleshooting-category coverage registry
+
+A plugin may additionally ship a `troubleshooting-index.json` at its payload
+root, declaring the "what do I do when X happens" failure-mode categories it
+claims to own an ambient answer for (e.g. `agent-worktrees` claiming
+`claims-ledger`, `resource-obligations`):
+
+```json
+{
+  "schema": "copilot-extensions.troubleshooting-index",
+  "version": 1,
+  "categories": [
+    {
+      "id": "claims-ledger",
+      "summary": "Inspect or release an outbound claim on another worktree.",
+      "pointer": "`claims` command / `tracing-claimant-graphs` skill",
+      "markers": ["claims-ledger", "tracing-claimant-graphs"]
+    }
+  ]
+}
+```
+
+This registry is opt-in, independent of `instruction-projections.json`, and
+targets exactly the gap the
+`efforts/2026/10/02 ambient-guidance-navigability` audit found: skills are
+pull-only, so a category with no ambient pointer is undiscoverable to an
+agent that doesn't already know the skill exists. The suite's guard test
+(`plugins/customizing-copilot/tests/test_troubleshooting_index.py`, backed by
+`scripts/troubleshooting_index.py`) fails closed the moment a plugin declares
+a category with no matching `markers` string present in any of that plugin's
+own static instruction-projection templates -- a category claimed but not
+actually indexed anywhere ambient. See
+[`docs/patterns/agents-md-vs-instructions-split.md`](../../../../docs/patterns/agents-md-vs-instructions-split.md)'s
+fourth audit question for when a category belongs in this registry.
+
+### Session guidance conformance
+
+For a complete migration rather than a point-in-time scan, follow
+[`references/session-guidance-conformance.md`](references/session-guidance-conformance.md).
+It has two modes:
+
+- **adopting repository** -- update payloads, disable the retired authority at
+  repository precedence, remove its config, synchronize every enabled
+  projection, scan the settings-derived roster, and run blind launch probes;
+- **plugin suite** -- classify every marketplace plugin, migrate dynamic
+  guidance to exact-session writers, preserve static-only/output-free hooks,
+  remove retired machinery, and enforce the complete roster mechanically.
+
+The runbook also owns the later native-host transition gate. It never treats a
+custom cross-plugin aggregator as a migration option.
+
+The manager exits nonzero for every blocking conflict. Its `--json` result is a
+stable versioned object for automation. A plugin remains independently usable
+without this manager: its hook and skills do not import a sibling plugin. The
+manager is the suite's reference consumer of the optional inert projection
+contract.
+
 Add `--context-budget` for a reproducible, counts-only inventory:
 
 ```bash
 python3 <skill-dir>/scripts/scan-customizations.py <repo-root> \
-  --from-settings --context-budget
+  --from-settings --context-budget \
+  --owned-agent-root services/example/agents
 ```
 
 It counts Unicode characters, UTF-8 bytes, words, and estimated tokens using the
@@ -90,12 +364,36 @@ instructions, nested/conditional `AGENTS.md`, standard personal Copilot
 instructions, `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` payloads, enabled skill/agent
 frontmatter metadata upper bounds, `additionalContext`-capable command-hook
 registrations, prompt-hook registrations, and other hook registrations. Dynamic
-payload size remains unknown; prompt-hook payloads are reported separately and
-are not counted as `additionalContext`.
+payload size remains unknown by default; prompt-hook payloads are reported
+separately and are not counted as `additionalContext`.
 JSON output includes a stable `context_budget` object.
 
+Add `--capture-dynamic` to also measure the real session-scoped
+`instructions/**/*.instructions.md` files each plugin's `sessionStart` command
+hook writes (see `docs/patterns/session-scoped-dynamic-guidance.md`), turning
+the "unknown" additionalContext row into real byte/token counts:
+
+```bash
+python3 <skill-dir>/scripts/scan-customizations.py <repo-root> \
+  --from-settings --context-budget --capture-dynamic
+```
+
+This runs only **plugin-owned** `sessionStart` command hooks (never
+repository- or user-level hook files), once each, with a synthetic session
+payload and a disposable sandbox `HOME`/`USERPROFILE` -- every facility
+session-guidance writer resolves its session-state root via `Path.home()`,
+so the override fully redirects the write; the real
+`~/.copilot/session-state` tree is never touched, and the sandbox is removed
+afterward. A hook that fails or times out is named in a per-plugin `errors`
+list rather than silently reported as zero. Because it executes already-
+installed, already-trusted plugin code (the same hooks a normal session runs
+on every launch), this is a materially different -- and lower-risk --
+operation than running arbitrary untrusted marketplace hooks; it is still
+opt-in given it executes code at all.
+
 The report prints paths and counts only. It never dumps instruction contents or
-hook commands, and it **never executes hooks merely to measure them**. The token
+hook commands, and it **never executes hooks merely to measure them unless
+`--capture-dynamic` is given**. The token
 estimate is a comparison heuristic, not a tokenizer result; metadata is an upper
 bound, and dynamic context remains unknown until runtime. The budget excludes
 runtime MCP tool schemas unless an authoritative runtime measurement is
@@ -119,6 +417,14 @@ set and brings each into scope:
 python3 <skill-dir>/scripts/scan-customizations.py <repo-root> --from-settings
 ```
 
+> **`agent-worktrees-repo` marketplace sources.** If any `extraKnownMarketplaces`
+> entry declares `{"source": "agent-worktrees-repo", "repo": "<name>"}`, add
+> `--agent-worktrees-path "<agent-worktrees catalog argv[0]>"` to either
+> `scan-customizations.py --from-settings` or `manage-instruction-projections.py
+> sync` (no flag needed) / `manage-instruction-projections.py scan
+> --from-settings` -- all share the same resolver, and ambient `PATH` could
+> otherwise select a different marketplace/cell's install.
+
 - An **in-repo `directory` marketplace** plugin (e.g. `./.ai`) is *owned* — it
   gets the full frontmatter / name-folder / trigger checks, closing the gap
   where a repo's own `.ai` skills were invisible to the scan.
@@ -141,47 +447,29 @@ python3 <skill-dir>/scripts/scan-customizations.py <repo-root> --from-settings
 The same loaded-set pass inventories each active command `sessionStart` plugin
 without executing hooks. It reports plugin identities and these roles only:
 
-- **aggregate authority** — the exact `context-injection@copilot-extensions`
-  plugin selected by repository adoption;
-- **complete declared contributor** — `plugin.json` points through
-  `sessionContext` to a version-1 `session-context.json` whose contributors are
-  explicitly pure and whose direct context behavior is `authority-aware`;
-- **complete declared side-effect-only** — the declaration is complete and has
-  `sideEffects: restart-safe-idempotent`, `context: none`, and no contributors;
-  and
-- **legacy direct or unknown** — no complete declaration proves the hook's
-  context behavior.
+- **complete declared output-capable** — a complete declaration says the hook
+  may emit context;
+- **proven output-free** — a complete `context: none` declaration or a
+  suite-standard exact-session writer/bootstrap/registration shape proves the
+  hook does not emit model context; and
+- **legacy direct or unknown** — no complete declaration proves the hook
+  output-free.
 
-The scanner accepts aggregate authority only when the plugin-owned
-`.context-injection/config.yaml` names the exact enabled
-`context-injection@copilot-extensions` authority and its engine contract is
-compatible. Host settings only enable the plugin. Missing, malformed,
-unknown-shaped, or ambiguous adoption remains BLOCKING. In an adopted stack,
-every enabled session-start plugin must be complete-declared; unclassified hooks,
-incomplete side-effect-only declarations, and contributors without
-authority-aware direct behavior are BLOCKING. An external plugin whose payload
-cannot be inspected remains a warning because the scanner cannot establish
-whether it emits context. After proof, every producer and the authority emits
-the same cached aggregate bytes. The authority may run before, after, or
-concurrently with producers. Their host-level `timeoutSec` must be at
-least the engine's 25-second rendezvous deadline, with 30 seconds recommended
-for wrapper overhead.
+Stacks containing only side-effect-only exact-session writers, bootstrap hooks,
+registrations, and other output-free work are valid without a composition
+authority. One possible non-empty output is also valid. More than one possible
+non-empty result is BLOCKING unless the runtime version floor has a separately
+proven merge contract for that event and field. An unavailable external payload
+is a warning by itself, but joins collision detection when another possible
+output is present. Reports never include hook commands, contributor argv, or
+emitted context.
 
-For this marketplace's owned stack, the repository guard is stricter: every
-declared contributor must have exactly one 30-second engine-v5 wrapper hook,
-the Bash and PowerShell wrapper copies must remain byte-identical to the
-authority copy, and no legacy direct hook may still invoke the contributor.
-Mixed plugins must prove their direct state mutations use context-free modes;
-the aggregate authority must never invoke those mutations.
-
-More than one possible non-empty result is BLOCKING unless the runtime defines
-merge semantics for that event/field or one attributable owner composes the
-outputs. The version-1 declaration makes
-contributors inspectable; it does not prove host execution order. Reports never
-include hook commands, contributor argv, or emitted context. The full execution
-and output-composition contract, including the open start-hook runtime work, is
-in `authoring-skills`'
-[`references/session-context-aggregation.md`](../authoring-skills/references/session-context-aggregation.md).
+The version-1 `sessionContext` declaration remains useful as static proof that a
+side-effect hook returns only `{}`. Existing output-capable declarations are
+treated conservatively as possible non-empty output; they do not establish
+execution order or composition. The current contract and the future native-host
+composition seam are in `authoring-skills`'
+[`references/hook-output-composition.md`](../authoring-skills/references/hook-output-composition.md).
 
 Collision owners are tagged with their origin (`skill [marketplace/plugin]`).
 (The older `--include-installed` / `--include-plugins DIR` still work — they add
@@ -247,7 +535,7 @@ Cross-check each artifact against the skill that governs its format:
 | Sub-agents | **`defining-subagents`** | `.agent.md` frontmatter, bounded direct-execution contract, Task-capability, per-agent MCP ownership, anti-recursion pattern |
 | MCP servers | **`registering-mcp-servers`** | registration scope (per-agent vs project vs global), config shape, env substitution, no inline secrets |
 | Plugin registration | **`installing-plugins`** | repo `settings.json` (`extraKnownMarketplaces` + `enabledPlugins`), payload-vs-runtime, no "just in case" plugins |
-| Instructions | this skill + `authoring-skills` | `AGENTS.md` is a lean map with repository-owned invariants/fail-safes; plugin ambient policy uses config-backed injection; skills hold detailed procedures; headless/cloud fallback coverage remains |
+| Instructions | this skill + `authoring-skills` | `AGENTS.md` is a lean map with repository-owned invariants/fail-safes; plugin ambient policy uses config-backed injection; declared static projections are locked, provenance-marked, bounded, and free of dynamic state; skills hold detailed procedures |
 
 ## Output and follow-through
 

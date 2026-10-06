@@ -56,12 +56,22 @@ DIGEST_SESSION_SUFFIX_CHARS = 6
 DIGEST_OMITTED = "- ... older entries omitted ..."
 
 #: The disposition fields a history entry snapshots / can mark as changed.
-_FIELDS = ("summary", "title", "follow_up")
+_FIELDS = ("summary", "title", "activity", "follow_up", "paused")
 
 
-def history_path(worktree_id: str) -> Path:
-    """Path to a worktree's disposition-history sidecar (not created)."""
-    return cfg.tracking_dir() / f"{worktree_id}.history.jsonl"
+def history_path(worktree_id: str, *, tracking_path: Path | None = None) -> Path:
+    """Path to a worktree's disposition-history sidecar (not created).
+
+    ``tracking_path`` scopes the read/write to an explicit project's
+    tracking directory instead of the ambient active project
+    (``cfg.tracking_dir()``) -- required for any caller with no active
+    project set (e.g. a cross-project daemon resolving an explicit
+    ``project`` argument, per the agent-worktrees-external-status-
+    accelerator effort's own contract), and safer for any caller that
+    already knows which project it means rather than trusting whichever
+    project happens to be ambiently active.
+    """
+    return (tracking_path or cfg.tracking_dir()) / f"{worktree_id}.history.jsonl"
 
 
 def append(
@@ -72,14 +82,24 @@ def append(
     title: str | None,
     follow_up: bool,
     changed: list[str],
+    activity: str = "",
+    paused: bool = False,
     kind: str = "status",
     session_id: str | None = None,
+    tracking_path: Path | None = None,
 ) -> None:
     """Append one history entry for *worktree_id*. Best-effort (never raises).
     Trims oldest entries past :data:`MAX_ENTRIES`.
 
     ``changed`` names the fields THIS write touched (a subset of :data:`_FIELDS`);
     the snapshot carries the resulting values so each line is self-contained.
+    ``activity`` is the agent-asserted CURRENT sub-task (distinct from
+    ``summary``'s broader recap and ``title``'s rare headline -- see
+    ``tracking.set_disposition``'s own docstring for the cadence contract);
+    omitted from the line when empty, same as every other neutral-default
+    field below. ``paused`` is a purely informational "intentionally idle
+    for now" overlay (never fed to any gate, unlike ``follow_up``); omitted
+    from the line when ``False``.
 
     ``kind`` classifies the entry -- ``"status"`` (a disposition write; the
     default so every existing caller is unchanged), ``"bind"`` (a session
@@ -92,6 +112,10 @@ def append(
     Both are omitted from the line when at their neutral default (``status`` /
     ``None``) so legacy readers and byte-comparisons of status-only histories are
     unaffected.
+
+    ``tracking_path`` is forwarded to :func:`history_path` unchanged -- see that
+    function's own docstring for why an explicit path is safer than the ambient
+    ``cfg.tracking_dir()`` default for a cross-project-capable caller.
     """
     try:
         entry: dict[str, Any] = {
@@ -101,11 +125,15 @@ def append(
             "summary": summary,
             "follow_up": bool(follow_up),
         }
+        if activity:
+            entry["activity"] = activity
+        if paused:
+            entry["paused"] = True
         if kind and kind != "status":
             entry["kind"] = kind
         if session_id:
             entry["session"] = session_id
-        path = history_path(worktree_id)
+        path = history_path(worktree_id, tracking_path=tracking_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         lines: list[str] = []
         if path.exists():
@@ -125,10 +153,13 @@ def append(
         pass
 
 
-def read(worktree_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+def read(
+    worktree_id: str, *, limit: int | None = None, tracking_path: Path | None = None
+) -> list[dict[str, Any]]:
     """Return a worktree's disposition history oldest-first. Malformed lines are
-    skipped. ``limit`` keeps only the most recent N entries. Never raises."""
-    path = history_path(worktree_id)
+    skipped. ``limit`` keeps only the most recent N entries. Never raises.
+    ``tracking_path`` -- see :func:`history_path`."""
+    path = history_path(worktree_id, tracking_path=tracking_path)
     entries: list[dict[str, Any]] = []
     try:
         if not path.exists():
@@ -155,7 +186,7 @@ def remove(worktree_id: str) -> None:
     raises) -- called wherever the tracking ``<id>.yaml`` is unlinked."""
     try:
         history_path(worktree_id).unlink(missing_ok=True)
-    except OSError:
+    except Exception:
         pass
 
 
@@ -216,13 +247,17 @@ def digest(
             sess = _digest_session_suffix(e.get("session"))
             sess_tag = f" {sess}" if sess else ""
             flag = " !" if e.get("follow_up") else ""
+            # Same convention as `flag` above: the snapshot's CURRENT
+            # `paused` value, renders independent of which fields this
+            # particular entry's own write touched.
+            pause_mark = " \u23f8" if e.get("paused") else ""
             title = e.get("title")
             summary = _digest_label(e.get("summary"))
             label = summary or (title or "")
             if kind != "status" and not label:
                 label = f"({kind})"
             label = _digest_label(label)
-            line = f"- {at} [{kind}{sess_tag}]{flag} {label}".rstrip()
+            line = f"- {at} [{kind}{sess_tag}]{flag}{pause_mark} {label}".rstrip()
             rendered.append(line)
 
         selected: list[str] = []

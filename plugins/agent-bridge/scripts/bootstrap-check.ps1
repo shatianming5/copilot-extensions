@@ -1,3 +1,24 @@
+# --- bootstrap-killswitch guard (vendored; see libs/bootstrap-killswitch/README.md) ---
+# One shared, repo-wide switch (not per-plugin) that pauses EVERY adopting
+# plugin's reconcile-on-session-start at once, for when an operator/agent is
+# hand-diagnosing a venv/install and a background reconcile must not race it.
+# Legacy/default installation ONLY: a namespaced marketplace cell
+# (COPILOT_EXTENSIONS_CONTEXT set) reconciles through its own cell-scoped
+# mechanism, never this global state file -- crossing that installation-cell
+# boundary would let one marketplace's switch pause an unrelated,
+# independently-owned cell's reconcile (visions/plugin-services/
+# installation-cells). This guard is therefore a deliberate no-op under a
+# cell context, same as this hook's own existing cell-context exit below.
+if (-not $env:COPILOT_EXTENSIONS_CONTEXT) {
+  $_bksGuardDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+  $_bksGuard = Join-Path $_bksGuardDir "bootstrap-killswitch-guard.ps1"
+  if (Test-Path -LiteralPath $_bksGuard) {
+    & $_bksGuard check
+    if ($LASTEXITCODE -eq 0) { [Console]::Out.Write('{}'); exit 0 }
+  }
+}
+# --- end bootstrap-killswitch guard ---
+
 <#
     agent-bridge session-start runtime reconcile (reference implementation).
 
@@ -18,12 +39,36 @@
     ~/.<name>/reconcile-status.json and redirects the installer's output to
     ~/.<name>/reconcile.log (stdout) / reconcile.err.log (stderr). Check those to
     see whether the last auto-reconcile succeeded.
+
+    OPT-IN GATE (removed -- agent-bridge-unified-zdd-cutover Phase 0): a
+    version-drift reconcile used to require a checked-in, PER-PLUGIN
+    ``<project>/.copilot-extensions/config.yaml`` opt-in line
+    (a per-project opt-in flag) because the background
+    spawn could race a live daemon/session. Now that agent-bridge's own
+    update path is always-ZDD (spawn passive -> health-gate -> flip ->
+    drain -> retire, safe to run unattended), that justification is gone.
+    The single-flight/stale-reap guard below (not the opt-in) is what keeps
+    a shared/active-dev machine from stacking background installers.
+    Staleness stays observable via `agent-bridge service status`, which
+    reports days-since-last-reconcile (see _print_reconcile_status in
+    service_process_cli.py).
 #>
 $ErrorActionPreference = 'SilentlyContinue'
+$script:SessionStartJsonEmitted = $false
+function Write-SessionStartJson {
+    if (-not $script:SessionStartJsonEmitted) {
+        [Console]::Out.Write('{}')
+        $script:SessionStartJsonEmitted = $true
+    }
+}
+function Exit-SessionStart {
+    Write-SessionStartJson
+    exit 0
+}
 $PluginDir = Split-Path -Parent $PSScriptRoot
 try {
     $name = (Get-Content (Join-Path $PluginDir 'plugin.json') -Raw | ConvertFrom-Json).name
-    if (-not $name) { exit 0 }
+    if (-not $name) { Exit-SessionStart }
     $InstallDir = Join-Path $env:USERPROFILE ".$name"
     $Manifest = Join-Path $InstallDir 'deploy-manifest.json'
     if (-not (Test-Path $Manifest)) {
@@ -42,7 +87,7 @@ try {
             $exe = if ($pw) { $pw.Source } else { 'powershell.exe' }
             & $exe -NoProfile -ExecutionPolicy Bypass -File $stampInst stamp *> $null
         }
-        exit 0
+        Exit-SessionStart
     }
     $deployed = "" + (Get-Content $Manifest -Raw | ConvertFrom-Json).source.version
     $current = $deployed
@@ -85,13 +130,14 @@ try {
     # version -> nothing to reconcile. (When a legacy fallback set the flag,
     # $curVer is $null and we fall back to the version-string check alone, as
     # before.)
-    if ($runtimeHealthy -and $deployed -eq $current -and (-not $curVer -or $curVer -eq $deployed)) { exit 0 }
+    if ($runtimeHealthy -and $deployed -eq $current -and (-not $curVer -or $curVer -eq $deployed)) { Exit-SessionStart }
+
     $init = Join-Path $PluginDir 'scripts\init.ps1'
     if (Test-Path $init) {
         $reInner = "& `"$init`""
     } else {
         $inst = Join-Path $PluginDir 'scripts\install.ps1'
-        if (-not (Test-Path $inst)) { exit 0 }
+        if (-not (Test-Path $inst)) { Exit-SessionStart }
         $reInner = "& `"$inst`" install -NonInteractive"
     }
     $pw = Get-Command pwsh -ErrorAction SilentlyContinue
@@ -130,13 +176,13 @@ try {
                     $dto = if ($atVal -is [DateTime]) { [DateTimeOffset]$atVal } else { [DateTimeOffset]::Parse([string]$atVal) }
                     $ageMin = ([DateTimeOffset]::UtcNow - $dto).TotalMinutes
                 } catch { }
-                if ($ageMin -lt $staleMinutes) { exit 0 }         # in flight -- don't stack
+                if ($ageMin -lt $staleMinutes) { Exit-SessionStart }         # in flight -- don't stack
                 Stop-Process -Id $prevPid -Force -ErrorAction SilentlyContinue  # wedged -- reap
             }
         }
     } catch { }
 
-    Write-Host "[$name] runtime $deployed -> $current; reconciling in background (log: $InstallDir\reconcile.log)..." -ForegroundColor DarkGray
+    [Console]::Error.WriteLine("[$name] runtime $deployed -> $current; reconciling in background (log: $InstallDir\reconcile.log)...")
 
     # The background reconcile is HEADLESS and non-blocking. Two guards keep the
     # installer from ever waiting on input:
@@ -157,11 +203,45 @@ try {
     # self-redirects all streams to reconcile.log via `*>`. The command is
     # base64-encoded to avoid arg-quoting under conhost; children (uv/python
     # building the venv) inherit the headless console and stay hidden too.
-    $reCmd = "& { $reInner } *> `"$reconcileLog`""
+    $now = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    # Observability (#167 + agent-bridge-unified-zdd-cutover Phase 0 review):
+    # the initial status write below (right after Start-Process) records the
+    # ATTEMPT so the single-flight/staleness check above always sees it; this
+    # tail, appended to the SAME headless pwsh that runs the reconcile itself,
+    # overwrites that same file with completion info once it actually exits --
+    # otherwise "Last auto-reconcile" would report a launch timestamp even for
+    # a reconcile that failed or is still wedged, making staleness look
+    # falsely healthy. Re-reads launched_pid back from the status file rather
+    # than re-deriving it, since only the PARENT knows conhost's PID (this
+    # child can't reference $proc.Id -- it hasn't been created yet at the
+    # point this string is built).
+    $compTail = @'
+$__rc = if ($?) { 0 } else { 1 }
+$__completedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+$__prevPid = 0
+try {
+    $__prevJson = Get-Content '__STATUSFILE__' -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
+    if ($__prevJson) { [void][int]::TryParse("" + $__prevJson.launched_pid, [ref]$__prevPid) }
+} catch { }
+$__status = [ordered]@{
+    at           = '__NOW__'
+    from         = '__DEPLOYED__'
+    to           = '__CURRENT__'
+    launched_pid = $__prevPid
+    log          = '__RECONCILELOG__'
+    completed_at = $__completedAt
+    exit_code    = $__rc
+    success      = ($__rc -eq 0)
+} | ConvertTo-Json -Compress
+$__utf8 = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText('__STATUSFILE__', $__status, $__utf8)
+'@
+    $compTail = $compTail.Replace('__STATUSFILE__', $statusFile).Replace('__NOW__', $now).`
+        Replace('__DEPLOYED__', $deployed).Replace('__CURRENT__', $current).Replace('__RECONCILELOG__', $reconcileLog)
+    $reCmd = "& { $reInner } *> `"$reconcileLog`"`n$compTail"
     $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($reCmd))
     $proc = Start-Process -FilePath 'conhost.exe' -PassThru -WindowStyle Hidden `
         -ArgumentList @('--headless', "`"$exe`"", '-NoProfile', '-ExecutionPolicy', 'Bypass', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', $enc)
-    $now = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     $launchedPid = if ($proc) { $proc.Id } else { 0 }
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $status = [ordered]@{
@@ -173,4 +253,4 @@ try {
     } | ConvertTo-Json -Compress
     [System.IO.File]::WriteAllText($statusFile, $status, $utf8NoBom)
 } catch { }
-exit 0
+Exit-SessionStart

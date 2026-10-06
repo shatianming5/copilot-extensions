@@ -16,6 +16,10 @@ sync:
   repo_allowlist_fail_closed: false
   repo_denylist: []             # exclude matching repos
   harness_repos: []             # origin.json derivation for downstream routing
+  require_repo_opt_in: false    # additional gate: matched repo (or its bound
+                                 # knowledge repo) must commit
+                                 # .copilot-extensions/agent-logger/config.yaml
+                                 # with `sync: {opt_in: true}` -- see SKILL.md
   # Cold-session compaction (opt-in). Archive very old, inactive sessions into
   # a compressed store to reclaim space. Run by `session-sync compact` (local)
   # and `session-sync compact-hub` (the OneDrive/local hub backlog); with
@@ -27,6 +31,17 @@ sync:
     min_age_days: 30            # only sessions at least this old
     require_untracked_worktree: true  # skip sessions of picker-tracked worktrees
     archive_root: null          # null => <home>/archived-sessions (out of ~/.copilot)
+  # Incremental sync via a local, stat-only change signature db. On by
+  # default -- disables only with `enabled: false` (then every run always
+  # pushes everything, as before this existed). See SKILL.md's "Change
+  # tracking" section for the `--delete-excluded` tradeoff and the doctor
+  # (`run --full`) realignment workflow.
+  change_tracking:
+    enabled: true
+    full_sync_interval_hours: 24  # periodic full/segmented reconciliation
+    batch_size: 100              # sessions per push call during a full pass
+    db_path: null                # null => <home>/sync-state.db
+
   notify:
     url: null                   # optional post-push HTTP POST; {machine} expands
     bearer_token_file: null
@@ -57,7 +72,7 @@ sync:
     # Ingest -- push to a processing service's rsync-daemon sink.
     ingest:
       url: rsync://hub.example.com/sessions       # or host::module/path
-      password_file: ~/.agent-logger/rsync.pass   # optional
+      password_file: ~/.agent-logger/rsync.pass   # optional # marketplace-isolation: allow doc-example
       notify_url: https://hub.example.com/api/notify?machine={machine}  # optional
 
 # Optional global fallback for repos with no repo-local .agent-logger.yaml.

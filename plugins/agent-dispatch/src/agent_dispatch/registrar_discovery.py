@@ -7,9 +7,10 @@ layer** that finds and reads declaration *documents*:
 * a cache-populate-style **pointer registry** -- a system, service, or repo records
   a lightweight *pointer* to a directory of declarations in its own footprint, and
   the supervisor aggregates every pointer (vision: *declarative-discovered-registrar*);
-* the **in-repo ``.agent-dispatch/registrar/``** convention -- a repo carries its
-  supervised work with its code, so it lights up on repo-sync and winds down when the
-  repo (or declaration) is gone;
+* the **in-repo** convention -- a repo carries its supervised work with its
+  code under ``.copilot-extensions/agent-dispatch/registrar/`` (with legacy
+  ``.agent-dispatch/registrar/`` fallback), so it lights up on repo-sync and
+  winds down when the repo (or declaration) is gone;
 * the **aggregation** that reads every pointed location into the declared profile set
   the singleton supervisor reconciles.
 
@@ -29,19 +30,28 @@ import tempfile
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from dropin_registry import Finding, ScanAuthority, WarningTracker
 from plugin_activation import ActivationReport
 
+from . import repo_config
+from .install_paths import install_dir as dispatch_install_dir
 from .registrar import ProfileDeclaration, RegistrarError, load_declaration
+from .registrar_lane_aliases import (  # noqa: F401 -- re-exported for existing call sites/tests
+    ENFORCE_REGISTERED_REPOS_ENV,
+    _derive_git_remote_alias,
+    agent_backed_enforcement_enabled,
+    known_lane_aliases,
+)
 
 if TYPE_CHECKING:
     from .registrar_registry import CombinedRegistrarReport, RegistrarCandidate
 
-#: The in-repo convention: a repo declares its supervised work here, discovered on
-#: sync. Relative to the repo root.
-INREPO_SUBDIR = ".agent-dispatch/registrar"
+#: The in-repo convention: a repo declares its supervised work here, discovered
+#: on sync. Relative to the repo root.
+INREPO_SUBDIR = str(repo_config.CANONICAL_REPO_CONFIG_DIR / "registrar")
+LEGACY_INREPO_SUBDIR = str(repo_config.LEGACY_REPO_CONFIG_DIR / "registrar")
 
 #: Declaration document suffixes, in precedence order (YAML-primary, JSON accepted).
 _DECL_SUFFIXES = (".yaml", ".yml", ".json")
@@ -69,7 +79,7 @@ def registrar_dir() -> Path:
     override = os.environ.get(REGISTRAR_DIR_ENV)
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".agent-dispatch" / "registrar"
+    return dispatch_install_dir() / "registrar"
 
 
 def pointers_file(base: Path | None = None) -> Path:
@@ -85,21 +95,35 @@ class Pointer:
     plain ``dir`` pointer from a ``repo`` pointer (whose ``location`` is a repo root
     and whose declarations live under :data:`INREPO_SUBDIR`). ``owner`` is provenance
     stamped onto every declaration read through this pointer.
+
+    ``aliases`` are canonical lane identities (``identity.canonicalize_remote``
+    shape, e.g. ``host/owner/name``) this ``repo``-kind pointer is agent-backed
+    for -- the actual, trustworthy repo identity. ``name`` is a free-form label
+    (the registrar CLI accepts any name; it is not derived from or validated
+    against the repo's real remote), so it must never itself be treated as a
+    repo identity -- see :func:`agent_dispatch.queue_agent_backed_repo.
+    AgentBackedRepoMixin._require_agent_backed_repo`, which matches a task's
+    lane against this set, never against pointer ``name``\\ s.
     """
 
     name: str
     location: str
     kind: str = "dir"
     owner: str | None = None
+    aliases: tuple[str, ...] = ()
 
     def resolved_location(self) -> Path:
         """The directory to scan for declaration documents.
 
-        For a ``repo`` pointer that is the repo root's ``.agent-dispatch/registrar``;
-        for a ``dir`` pointer it is the location itself.
+        For a ``repo`` pointer that is the repo root's canonical
+        ``.copilot-extensions/agent-dispatch/registrar`` directory with legacy
+        ``.agent-dispatch/registrar`` fallback; for a ``dir`` pointer it is the
+        location itself.
         """
         base = Path(self.location).expanduser()
-        return base / INREPO_SUBDIR if self.kind == "repo" else base
+        if self.kind == "repo":
+            return repo_config.selected_repo_surface_dir(base, "registrar")
+        return base
 
     def effective_owner(self) -> str:
         """Provenance token for declarations read here (explicit owner, else derived)."""
@@ -108,10 +132,16 @@ class Pointer:
         stem = Path(self.location).expanduser().name or self.name
         return f"repo:{stem}" if self.kind == "repo" else f"pointer:{self.name}"
 
-    def to_dict(self) -> dict[str, str]:
-        d: dict[str, str] = {"name": self.name, "location": self.location, "kind": self.kind}
+    def to_dict(self) -> dict[str, str | list[str]]:
+        d: dict[str, str | list[str]] = {
+            "name": self.name,
+            "location": self.location,
+            "kind": self.kind,
+        }
         if self.owner:
             d["owner"] = self.owner
+        if self.aliases:
+            d["aliases"] = list(self.aliases)
         return d
 
     @classmethod
@@ -130,15 +160,41 @@ class Pointer:
         owner = data.get("owner")
         if owner is not None and not isinstance(owner, str):
             raise RegistrarError(f"pointer.owner: expected a string, got {owner!r}")
-        return cls(name=name, location=location, kind=kind, owner=owner or None)
+        raw_aliases = data.get("aliases", [])
+        if not isinstance(raw_aliases, list) or not all(
+            isinstance(a, str) and a for a in raw_aliases
+        ):
+            raise RegistrarError("pointer.aliases: expected a list of non-empty strings")
+        return cls(
+            name=name,
+            location=location,
+            kind=kind,
+            owner=owner or None,
+            aliases=tuple(raw_aliases),
+        )
+
 
 
 def repo_pointer(
     repo_root: str | Path, *, name: str | None = None, owner: str | None = None
 ) -> Pointer:
-    """Build the in-repo pointer for ``repo_root`` (its ``.agent-dispatch/registrar``)."""
+    """Build the in-repo pointer for ``repo_root``.
+
+    Auto-derives a canonical lane alias from ``repo_root``'s own ``origin``
+    remote when one is resolvable (best-effort; empty otherwise -- callers
+    needing the agent-backed-repo check to recognize this pointer under a
+    *different* host alias than its own remote must add it explicitly via
+    :func:`add_pointer`'s ``aliases``).
+    """
     root = Path(repo_root).expanduser()
-    return Pointer(name=name or root.name, location=str(root), kind="repo", owner=owner)
+    derived = _derive_git_remote_alias(root)
+    return Pointer(
+        name=name or root.name,
+        location=str(root),
+        kind="repo",
+        owner=owner,
+        aliases=(derived,) if derived else (),
+    )
 
 
 # -- pointer-registry persistence (the thin index) ---------------------------
@@ -198,25 +254,78 @@ def save_pointers(pointers: Iterable[Pointer], base: Path | None = None) -> Path
     return path
 
 
+_UNSET: Any = object()
+
+
 def add_pointer(
     name: str,
     location: str | Path,
     *,
     kind: str = "dir",
-    owner: str | None = None,
+    owner: str | Any | None = _UNSET,
+    aliases: Iterable[str] | None = None,
     base: Path | None = None,
 ) -> Pointer:
     """Add (or replace) a pointer by ``name`` and persist. Returns the stored pointer.
 
     Idempotent: re-adding the same ``name`` with the same target is a no-op; re-adding
     with a *different* target replaces it (the pointer index has one entry per name).
+
+    ``aliases`` are canonical lane identities (see :class:`Pointer`) this
+    ``repo``-kind pointer is agent-backed for. Pass them explicitly whenever a
+    lane is known under a host alias that doesn't match ``location``'s own git
+    remote (e.g. a reverse-proxy alias or a bare ``owner/name`` form alongside
+    the real origin remote). Passing ``aliases=None`` (the default) **preserves
+    an existing pointer's own aliases** rather than re-deriving and silently
+    discarding them, *provided* ``location`` and ``kind`` are unchanged from
+    the current record -- an explicit ``aliases`` argument always replaces
+    them, and any change of ``location``/``kind`` always re-derives/resets
+    them (preserving a prior target's aliases across a genuine retarget would
+    leave an old repo lane wrongly authorized). For a brand-new ``kind="repo"``
+    pointer, or an existing one being retargeted, with no ``aliases`` given,
+    one is auto-derived from ``location``'s own ``origin`` remote on a
+    best-effort basis (never fatal if that fails -- the pointer is just not
+    recognized as backing any lane until an alias is added).
+
+    ``owner`` follows the identical same-target-preservation rule: omitting it
+    entirely (the default) preserves the current record's ``owner`` when
+    ``location``/``kind`` are unchanged -- re-registering to only add an
+    alias must never silently clear an existing declared owner. Pass
+    ``owner=None`` explicitly to clear it, or any string to set/replace it.
     """
     if not name or not all(c.isalnum() or c in "-_" for c in name):
         raise RegistrarError(f"pointer name {name!r}: use only letters, digits, '-' and '_'")
-    pointer = Pointer(name=name, location=str(Path(location).expanduser()), kind=kind, owner=owner)
-    Pointer.from_dict(pointer.to_dict())  # validate kind/shape via the loader
+    resolved_location = str(Path(location).expanduser())
     existing = load_pointers(base)
     current = next((p for p in existing if p.name == name), None)
+    retargeted = current is not None and (
+        current.location != resolved_location or current.kind != kind
+    )
+    if owner is _UNSET:
+        resolved_owner = current.owner if (current is not None and not retargeted) else None
+    else:
+        resolved_owner = owner
+    if aliases is not None:
+        from .identity import canonicalize_remote
+
+        normalized_aliases: list[str] = []
+        for alias in aliases:
+            canonical = canonicalize_remote(alias)
+            if not canonical:
+                raise RegistrarError(f"pointer alias {alias!r} is not a valid canonical lane")
+            normalized_aliases.append(canonical)
+        alias_tuple = tuple(dict.fromkeys(normalized_aliases))  # de-dup, keep order
+    elif current is not None and not retargeted:
+        alias_tuple = current.aliases  # same target -- preserve, never silently discard
+    elif kind == "repo":
+        derived = _derive_git_remote_alias(Path(resolved_location))
+        alias_tuple = (derived,) if derived else ()
+    else:
+        alias_tuple = ()
+    pointer = Pointer(
+        name=name, location=resolved_location, kind=kind, owner=resolved_owner, aliases=alias_tuple
+    )
+    Pointer.from_dict(pointer.to_dict())  # validate kind/shape via the loader
     if current == pointer:
         return pointer  # truly idempotent: identical entry, don't rewrite the file
     others = [p for p in existing if p.name != name]
@@ -279,10 +388,77 @@ def _resolve_declaration_paths(
     return replace(declaration, spec=spec)
 
 
+def _field_defining_hop_is_cross_repo(
+    field: str,
+    ref: object,
+    *,
+    base_dir: Path,
+    repo_root: Path,
+    _chain: tuple[str, ...] = (),
+) -> bool:
+    """Walk an ``extends:`` chain to find the *nearest* hop that actually
+    defines ``field`` in its own raw ``forge`` mapping, and report whether
+    that hop lives outside ``repo_root`` -- never merely whether *some*
+    hop somewhere in the chain is cross-repo. For a chain such as ``leaf
+    (repo A) -> mid (repo A, defines forge.command) -> base (repo B)``,
+    `mid`'s own same-repo definition is what the leaf actually inherits;
+    `base`'s unrelated repo never enters into it, so this must stop at
+    `mid` rather than keep walking to `base`. Returns ``False`` (not
+    cross-repo) once a same-repo hop defines the field, or once the
+    field is never defined anywhere in the chain at all (a missing-field
+    error, if any, is `validate_script_forge_config`'s own to raise).
+
+    Mirrors ``registrar_recipes._resolve_extends_tracking_cwd_origin``'s
+    own chain-walking shape (ref resolution, cycle/depth guards via
+    ``_chain``) but only to answer this one per-field provenance question
+    -- it never resolves placeholders or merges fields, so it carries
+    none of that function's own substitution/merge logic or risk.
+    """
+    if not isinstance(ref, str) or not ref:
+        return False  # malformed; let resolve_extends raise its own clear error later
+    from .registrar_recipes import _MAX_CHAIN_DEPTH, _ref_identity, resolve_recipe_ref
+
+    identity, ref_path = _ref_identity(ref, base_dir=base_dir)
+    if identity in _chain or len(_chain) >= _MAX_CHAIN_DEPTH:
+        # A cyclic/too-deep chain is `resolve_extends`'s own error to
+        # raise later -- don't manufacture a different one here.
+        return False
+    # `ref_path is None` only for a `global:` recipe (no on-disk file) --
+    # always outside this repo, by definition.
+    hop_is_cross_repo = ref_path is None or not (
+        ref_path == repo_root or repo_root in ref_path.parents
+    )
+    template = resolve_recipe_ref(ref, base_dir=base_dir)
+    if not isinstance(template, Mapping):
+        return False
+    hop_forge = template.get("forge")
+    hop_forge = hop_forge if isinstance(hop_forge, Mapping) else {}
+    if field in hop_forge:
+        return hop_is_cross_repo
+    if "extends" not in template:
+        return False
+    next_base_dir = ref_path.parent if ref_path is not None else base_dir
+    return _field_defining_hop_is_cross_repo(
+        field,
+        template.get("extends"),
+        base_dir=next_base_dir,
+        repo_root=repo_root,
+        _chain=(*_chain, identity),
+    )
+
+
 def read_declaration_file_set(
     path: str | Path,
+    *,
+    allow_plugin_companion: bool = False,
+    repo_root: str | Path | None = None,
 ) -> tuple[ProfileDeclaration, ...]:
-    """Read one document and expand it into one or more runtime declarations."""
+    """Read one document and expand it into one or more runtime declarations.
+
+    ``repo_root``, when known, is the repository this declaration file
+    belongs to -- threaded through a repository-issue-loop's expansion so its
+    named ``worker_identity`` resolves relative to that repo.
+    """
     p = Path(path).expanduser()
     if p.suffix not in _DECL_SUFFIXES:
         raise RegistrarError(
@@ -298,21 +474,89 @@ def read_declaration_file_set(
             f"{p}: declaration could not be read: {exc}"
         ) from exc
     data = dict(_decode(text, p.suffix, where=str(p)))
+    extends_present = "extends" in data
+    leaf_forge = data.get("forge")
+    leaf_forge = leaf_forge if isinstance(leaf_forge, Mapping) else {}
+    # Only meaningful when `extends_present`: a field *absent* from the
+    # leaf file's own raw `forge` mapping but present after merging below
+    # must have come from a base this file `extends:` -- possibly a
+    # different repository entirely. Threaded through so
+    # `expand_repository_issue_loop` can refuse a relative inherited
+    # `forge.command`/`forge.cwd` instead of silently resolving it against
+    # this (wrong) leaf repo root -- see "Resolve inherited script paths
+    # relative to their declaring repository". Checked **per field**,
+    # following each field's own nearest-defining hop (not just whether
+    # *some* hop anywhere in the chain is cross-repo): a chain such as
+    # `leaf (repo A) -> mid (repo A, defines forge.command) -> base (repo
+    # B)` must NOT reject `forge.command`, since the hop that actually
+    # supplies it is same-repo -- `base`'s unrelated repo never enters
+    # into that field at all.
+    this_repo_root = (
+        Path(repo_root).expanduser() if repo_root is not None else p.parent
+    )
+    inherited_script_fields = set()
+    if extends_present:
+        try:
+            this_repo_root = this_repo_root.resolve()
+            for field in ("command", "cwd"):
+                if field in leaf_forge:
+                    continue
+                if _field_defining_hop_is_cross_repo(
+                    field,
+                    data.get("extends"),
+                    base_dir=this_repo_root,
+                    repo_root=this_repo_root,
+                ):
+                    inherited_script_fields.add(field)
+        except (OSError, RuntimeError, ValueError, RegistrarError):
+            # Can't prove every hop shares this repo root -- treat every
+            # field the leaf doesn't declare itself as cross-repo (the
+            # safer default) rather than silently assuming same-repo.
+            inherited_script_fields = {
+                field for field in ("command", "cwd") if field not in leaf_forge
+            }
+    inherited_script_fields = frozenset(inherited_script_fields)
+    if "extends" in data:
+        from .registrar_recipes import resolve_extends
+
+        base_dir = Path(repo_root).expanduser() if repo_root is not None else p.parent
+        data = resolve_extends(data, base_dir=base_dir)
     if data.get("kind") == "reviewer-loop":
         from .reviewer_loops import expand_reviewer_loop
 
         declarations = expand_reviewer_loop(data)
+    elif data.get("kind") == "repository-issue-loop":
+        from .repository_issue_loops import expand_repository_issue_loop
+
+        declarations = expand_repository_issue_loop(
+            data, repo_root=repo_root, inherited_script_fields=inherited_script_fields
+        )
+    elif data.get("kind") == "effort-driver-loop":
+        from .effort_driver_loops import expand_effort_driver_loop
+
+        declarations = expand_effort_driver_loop(data, repo_root=repo_root)
     else:
-        declarations = (load_declaration(data),)
+        declarations = (
+            load_declaration(
+                data, allow_plugin_companion=allow_plugin_companion
+            ),
+        )
     return tuple(
         _resolve_declaration_paths(declaration, p.parent)
         for declaration in declarations
     )
 
 
-def read_declaration_file(path: str | Path) -> ProfileDeclaration:
+def read_declaration_file(
+    path: str | Path,
+    *,
+    allow_plugin_companion: bool = False,
+    repo_root: str | Path | None = None,
+) -> ProfileDeclaration:
     """Read a document that represents exactly one runtime declaration."""
-    declarations = read_declaration_file_set(path)
+    declarations = read_declaration_file_set(
+        path, allow_plugin_companion=allow_plugin_companion, repo_root=repo_root
+    )
     if len(declarations) != 1:
         raise RegistrarError(
             f"{path}: expands to {len(declarations)} declarations; "
@@ -367,19 +611,49 @@ def _iter_declaration_files(location: Path) -> list[Path]:
     return accepted
 
 
-def read_location(location: str | Path, *, owner: str | None = None) -> list[ProfileDeclaration]:
+def read_location(
+    location: str | Path,
+    *,
+    owner: str | None = None,
+    repo_root: str | Path | None = None,
+) -> list[ProfileDeclaration]:
     """Read every declaration document directly under ``location``.
 
     Each declaration is stamped with ``owner`` provenance (when it does not carry its
     own). Missing/empty directories yield an empty list -- a pointer to a not-yet-synced
-    repo is simply quiet, not an error.
+    repo is simply quiet, not an error. ``repo_root``, when known, is the repository
+    these declarations belong to -- threaded through so a repository-issue-loop's
+    named ``worker_identity`` resolves a repo-local override relative to that repo.
     """
     loc = Path(location).expanduser()
     out: list[ProfileDeclaration] = []
     for f in _iter_declaration_files(loc):
-        for decl in read_declaration_file_set(f):
+        for decl in read_declaration_file_set(f, repo_root=repo_root):
             out.append(decl.with_owner(owner) if owner else decl)
     return out
+
+
+def read_repo_location_layers(
+    repo_root: str | Path, *, owner: str | None = None
+) -> list[ProfileDeclaration]:
+    """Read the effective declaration set for one repo root.
+
+    Base declarations come from the canonical repo surface with legacy fallback.
+    An explicit marketplace overlay directory may then replace or add
+    declarations by logical name.
+    """
+    merged: dict[str, ProfileDeclaration] = {}
+    for location in repo_config.layered_repo_surface_dirs(repo_root, "registrar"):
+        layer: dict[str, ProfileDeclaration] = {}
+        for declaration in read_location(location, owner=owner, repo_root=repo_root):
+            if declaration.name in layer:
+                raise RegistrarError(
+                    f"duplicate profile name {declaration.name!r}: declared more than once "
+                    f"under {location} -- names must be unique within one repo layer"
+                )
+            layer[declaration.name] = declaration
+        merged.update(layer)
+    return [merged[name] for name in sorted(merged)]
 
 
 def discover_trusted(
@@ -401,7 +675,20 @@ def discover_trusted(
     by_name: dict[str, tuple[str, ProfileDeclaration]] = {}
     for pointer in pts:
         owner = pointer.effective_owner()
-        for decl in read_location(pointer.resolved_location(), owner=owner):
+        if pointer.kind == "repo":
+            declarations = read_repo_location_layers(pointer.location, owner=owner)
+        else:
+            location = pointer.resolved_location()
+            # A supported dir pointer may point directly at an in-repo
+            # registrar surface (e.g. `<repo>/.copilot-extensions/
+            # agent-dispatch/registrar`); derive that repo's root the same
+            # way the direct CLI declaration-read path does, so a
+            # repository-issue-loop declared there still resolves a
+            # repo-local worker_identity against the right repo rather than
+            # this process's own cwd or the generic built-in.
+            repo_root = repo_config.repo_root_from_surface_path(location, "registrar")
+            declarations = read_location(location, owner=owner, repo_root=repo_root)
+        for decl in declarations:
             if decl.name in by_name:
                 prior_owner = by_name[decl.name][0]
                 raise RegistrarError(
@@ -425,13 +712,16 @@ def discover(
 
 
 def discover_repo(repo_root: str | Path, *, owner: str | None = None) -> list[ProfileDeclaration]:
-    """Convenience: read a single repo's in-repo ``.agent-dispatch/registrar`` declarations.
+    """Convenience: read a single repo's in-repo declarations.
 
     The repo-sync discovery unit -- given a synced repo root, read what it declares
     without touching the persisted pointer registry.
     """
-    pointer = repo_pointer(repo_root, owner=owner)
-    return discover([pointer])
+    root = Path(repo_root).expanduser()
+    return read_repo_location_layers(
+        root,
+        owner=owner or f"repo:{root.name}",
+    )
 
 
 # -- Legacy env-profile back-compat bridge (Phase 4 migration) ----------------
@@ -454,7 +744,7 @@ def install_dir() -> Path:
     override = os.environ.get(INSTALL_DIR_ENV)
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".agent-dispatch"
+    return dispatch_install_dir()
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:

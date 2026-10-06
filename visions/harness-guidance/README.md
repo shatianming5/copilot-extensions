@@ -3,8 +3,8 @@
 - **Subject:** Ambient guidance across repositories, plugins, skills, and operator policy
 - **Scope:** leaf
 - **Status:** Active
-- **Last revised:** 2026-08-31
-- **Reality docs:** `docs/patterns/context-injection.md`, `docs/harness-runbook.md`
+- **Last revised:** 2026-10-02
+- **Reality docs:** `docs/patterns/session-scoped-dynamic-guidance.md`, `docs/patterns/worktree-scoped-dynamic-guidance.md`, `docs/harness-runbook.md`
 
 ## Purpose & Intent
 
@@ -27,12 +27,46 @@ portable, attributable, and intentionally budgeted.
   completion, while bounded delegates isolate independent evidence gathering,
   domain-tool interaction, explicitly disjoint implementation, and independent
   review roles.
+- **Role/model routing policy** classifies delegated work by purpose, risk,
+  execution surface, and demonstrated capability, then selects from an
+  evidence-backed mapping of acceptable models rather than treating every
+  worker as interchangeable.
+- **Budget posture** combines finite allowance, consumption, reset horizon,
+  recent pace, and projection into a sourced, freshness-bearing input that can
+  refine model-routing recommendations without becoming model eligibility.
+- **Budget adapters** obtain partial or complete posture from provider APIs,
+  manual/static configuration, or explicitly configured external readers behind
+  one portable contract. Each adapter remains attributable and reports
+  unavailable or stale data honestly.
+- **Routing evidence** links model-purpose eligibility to reviewed outcomes,
+  including retries, discarded work, coordinator repair, and downstream
+  findings, so a cheap call is not mistaken for a cheap accepted result.
 - **Operator policy** is personal ambient guidance that can follow an agent
   across target repositories. A plugin may explicitly delegate narrow
   configuration keys to a repository, but safety, publication, attribution,
   and sanitization policy remains with the operator/plugin owner.
 - **Context accounting** makes each loaded guidance source visible as a
   contributor to a shared budget.
+- **Grounding guides** hold detailed behavioral control and reference material
+  that remains overarching but does not need to occupy every model request.
+- **Aggregate document structure** gives independently owned contributions a
+  coherent, navigable shape without transferring their authorship to the
+  composition authority.
+- **A harness's private state/knowledge home** is a term this guidance keeps
+  consistent, naming the concept [agent-fabric](../agent-fabric/README.md)
+  already owns as the durable coordination identity a stateless harness must
+  bind before it creates or adopts claims (see also
+  `docs/patterns/state-root-coordination.md`). `harness-knowledge` owns the
+  setup/configurator front door for that binding; `agent-worktrees` owns the
+  live binding/pairing/routing and state-root resolution underneath it. None
+  of that concept is GitHub Codespaces' `dotfiles` mechanism — a narrower,
+  specific auto-clone-and-run-on-container-create convention with its own
+  semantics. A consuming harness may happen to name its own bound repo
+  `dotfiles`; shared guidance, skills, and PR/issue titles should name the
+  generic concept ("private state home", "knowledge repo") instead of
+  borrowing that narrower term, so the next harness author isn't misled into
+  assuming Codespaces dotfiles
+  semantics apply here.
 
 ## Features
 
@@ -47,12 +81,18 @@ detailed procedures should live in skills.
 
 Plugin-owned ambient policy should reach every applicable session as a concise
 kernel containing only what must remain active, with detailed mechanics
-available on demand. When the host cannot compose independent hook outputs,
-one attributable authority should compute the kernel and every proven producer
-should return the same bytes, so host result selection cannot discard guidance.
-When repeating the complete aggregate through every hook would exceed a host
-budget, those identical bytes should instead be a compact critical kernel plus
-an exact session-scoped pointer to the full attributable context.
+available on demand. **`sessionStart` `additionalContext` composition across
+multiple hooks is empirically unreliable** — observed sessions deliver no
+contributor's output at all, not merely a last-writer-wins loss. Guidance a
+harness genuinely depends on should therefore reach the agent through a
+checked-in static pointer instruction plus a hook-written session-scoped file
+the agent is directed to read (see
+`docs/patterns/session-scoped-dynamic-guidance.md`), not through
+`additionalContext` aggregation alone. When the host natively composes every
+independent hook output and that behavior is proven at the supported version
+floor, direct plugin-owned `additionalContext` should become the preferred
+perfectly dynamic path. Until then, the checked-in pointer plus exact-session
+guidance file remains authoritative.
 
 ### portable-operator-policy
 
@@ -73,6 +113,29 @@ not durably represented in reconstructed history, a bounded model-facing prompt
 recovery channel should re-establish an exact, attributable context pointer
 without duplicating the full aggregate on every turn.
 
+### progressive-context-disclosure
+
+Always-loaded guidance should contain only the critical policy, constraints,
+orientation, and decision cues an agent needs before it can safely choose what
+to inspect. Detailed overarching behavior and grounding material should remain
+available through attributable on-demand references rather than being eagerly
+loaded into every session.
+
+### navigable-on-demand-grounding
+
+Deferred guidance should remain easy for an agent to discover and apply. Each
+reference should make its owner, subject, applicability, and expected use clear
+enough that the agent reads the right guide when needed and does not explore
+irrelevant material by default.
+
+### coherent-attributable-assembly
+
+When several plugins contribute ambient guidance, the assembled context should
+form a deterministic, legible hierarchy of critical constraints, orientation,
+capability grounding, and deferred references. Composition should preserve
+source attribution and owner boundaries rather than rewriting independent
+policy into an unattributed central voice.
+
 ### coordinator-first-task-routing
 
 Harnesses should provide model-neutral guidance that helps a coordinating agent
@@ -90,6 +153,51 @@ result shape suitable for integration.
 Domain-specific service catalogs and verbose tool payloads should remain with
 the delegate that owns that domain; compact shared research and orchestration
 signals may remain with the coordinator.
+
+### evidence-calibrated-model-routing
+
+Harnesses should help a coordinator choose the least-expensive available model
+that has demonstrated the capability, tools, context, and reliability required
+for the delegated role. Model choice should follow task classification and the
+direct-versus-delegate decision rather than becoming a reason to fragment
+cohesive work.
+
+### budget-aware-model-routing
+
+Harnesses should refine otherwise-eligible model choices against a finite,
+current budget posture. A coordinator should be able to distinguish sustainable
+pace from projected exhaustion or unused balance before committing to a model
+class, while preserving operator choice and every product gate.
+
+### adapter-based-budget-posture
+
+Allowance, consumption, reset horizon, and recent usage may come from different
+authorities. Harnesses should compose provider, manual, and external readings
+through a portable contract that carries source, capture time, freshness,
+availability, and explicit errors rather than assuming one universal billing
+surface.
+
+### concise-current-budget-guidance
+
+The current posture should reach an applicable decision-maker as a concise,
+attributable cue and through equivalent machine-readable status. Detailed
+history and accounting remain external; the harness carries only enough current
+state to make the next routing decision responsibly.
+
+### purpose-to-model-grounding
+
+Current model eligibility should be supplied through attributable, configurable
+grounding that distinguishes demonstrated choices from candidates, holds, and
+known failures. The portable strategy should remain stable while repositories
+and operators can update the models that satisfy it as providers, costs,
+capabilities, and execution surfaces change.
+
+### guarded-real-work-evidence
+
+Model-routing evidence should come from bounded real work whose authority grows
+through explicit stages: read-only investigation, reviewed documentation,
+contained implementation, and ordinary publication gates. Trial workers should
+be isolated from credentials and authority their assigned role does not need.
 
 ## Behaviors
 
@@ -114,7 +222,67 @@ should remain discoverable from the concise ambient kernel.
 Critical safety and publication constraints should retain a minimal static
 fallback when a launch path cannot load the richer plugin-owned guidance.
 Plugin setup should own any compatibility/fallback prose through a stable,
-idempotently reconciled marker or dedicated rule file.
+idempotently reconciled marker or dedicated rule file. For worktree-scoped
+projected instruction content specifically, the lifecycle-hook-rendered,
+gitignored local cache is the **primary** delivery path -- it reflects the
+currently installed payload, not a sync-lagged approximation of it. The
+checked-in, scheduled-sync-worker-maintained copy is strictly the
+**fallback**: the floor a session falls back to only when no pre-session
+hook could render anything fresher (a fully hookless/headless/sandboxed
+launch) or hasn't yet had the chance to (a pre-sync gap on an otherwise
+hook-capable path). A fallback a stale leftover local artifact can
+silently outrank is not actually safe, so precedence between the two must
+be decided by stable content provenance (e.g. a declared version), never
+by the local artifact's mere existence or render recency.
+
+### ambient-delivery-fails-open
+
+Ambient delivery plumbing should fail open and never block session startup when
+a contributor is inapplicable, unavailable, or malformed. That delivery
+failure must remain attributable and diagnosable rather than being mistaken for
+successful policy application. Fail-closed behavior belongs at authorization,
+trust, and model-eligibility boundaries, not in the mechanism that lets an
+otherwise-usable session start. A session-scoped dynamic guidance file that has
+not yet been written (or whose owning hook could not run, e.g. an untrusted
+repository-level hook path) is an explicit no-op for the reader, never a
+blocker.
+
+### bounded-source-modules
+
+A source module's line count is itself a harness-guidance concern, not only a
+style preference: an oversized module costs every agent that must ingest it
+before working nearby, and a module that has grown past a single cohesive
+responsibility is harder to test and reason about in isolation. This repo
+enforces a per-file cap with a shrink-only grandfathered ceiling for
+pre-existing offenders (`tools/check-module-size.py`) so growth never goes
+unnoticed, without demanding an immediate rewrite of every legacy file.
+
+Enforcement must attribute growth to whichever change actually caused it, never
+to an uninvolved bystander: a PR is checked only against the files its own
+diff touches, so it is never blocked by another, already-merged PR's growth in
+a file it never opened. The one exception is a diff that edits the ceiling
+data itself: because that changes the invariant for the whole tree, not just
+whichever files its own diff otherwise names, it is always checked in full,
+never scoped — attribution-by-diff is a narrowing convenience for ordinary
+changes, not a way to let a ceiling edit go unverified against the modules it
+governs. Organic, cumulative drift that no single small PR
+caused — several individually-reasonable contributions summing past a
+ceiling over time — is a distinct failure mode from a single PR dumping an
+oversized module into the tree; it is swept up and remediated by a dedicated,
+purpose-built process (a scheduled watchdog dispatching a decomposition
+agent), not left as diffuse, second-order pressure on whichever future PR
+happens to touch the file next.
+
+## Non-Goals / Boundaries
+
+### no-custom-cross-plugin-aggregation-authority
+
+The harness must not depend on a custom plugin that discovers other plugins,
+invokes their context producers, coordinates a session rendezvous, caches or
+spills their aggregate, or becomes the shared authority for their guidance.
+Cross-plugin dynamic composition belongs to the native host. Compatibility
+paths may preserve reliable plugin-owned files and static fail-safes, but must
+not recreate a second composition runtime beside the host.
 
 ### recovery-revalidates-authority
 
@@ -122,6 +290,32 @@ Context recovery should never replay a previously valid aggregate solely
 because session-local state exists. It should revalidate repository trust,
 scope, authority, and contributor identity at the current boundary, then either
 recover the matching context or fail closed with bounded guidance.
+
+### critical-before-comprehensive
+
+Context authors should prefer a short, stable kernel that enables safe first
+decisions over a comprehensive procedure dump. Deferral must never hide a rule
+the agent needs in order to know that a guide exists or that an action is unsafe.
+
+### references-carry-applicability
+
+An on-demand reference should state when it matters, not merely where it lives.
+The agent should be able to distinguish mandatory grounding for the current
+task from optional background and unrelated capability documentation.
+
+### composition-preserves-owner-boundaries
+
+A composition authority may order, group, label, and budget contributed
+material, but should not silently paraphrase, merge, or resolve disagreements
+between independently owned policies. Conflicts remain attributable and
+diagnosable.
+
+### deferral-is-evidence-calibrated
+
+Decisions about kernel size, reference form, emphasis, and hierarchy should be
+validated against observed agent behavior. Context reduction is successful only
+when first-turn correctness and task-appropriate grounding are retained without
+causing routine unnecessary exploration.
 
 ### transparent-cost
 
@@ -148,6 +342,67 @@ Independent review should preserve distinct required roles without becoming an
 unbounded loop. An unchanged artifact should not receive repeated same-role
 review unless a concrete defect or materially changed evidence justifies it.
 
+### routing-policy-before-delegation
+
+A Task-capable decision-maker should receive the compact model-routing policy
+before its first delegation decision. A worker that cannot delegate should
+receive its bounded assignment rather than paying the context cost of the
+complete routing catalog.
+
+### least-expensive-demonstrated-choice
+
+Selection should prefer the least-expensive available choice that has
+demonstrated the required task capability and execution-surface support. An
+unavailable preferred model may fall through to another demonstrated choice;
+an unproven candidate runs only as an explicit trial and never becomes a silent
+default.
+
+### budget-refines-but-never-qualifies
+
+Budget posture may reorder or discourage choices that are already eligible, but
+it cannot make an unproven, held, failed, or unavailable model eligible. When no
+qualified choice fits the desired budget posture, the result is an explicit
+escalation or no-fit decision rather than a fabricated cheap option.
+
+### unavailable-is-not-zero
+
+Missing, stale, unauthorized, contradictory, or adapter-failed budget data is a
+visible state. It must never be converted into zero consumption, full remaining
+allowance, or another optimistic success-shaped default.
+
+### one-posture-many-surfaces
+
+Injected guidance, CLI status, dashboards, and routing consumers should derive
+from the same resolved budget posture. A presenter may reshape the result for
+its audience, but it should not independently recalculate or reinterpret the
+underlying balance and freshness.
+
+### accepted-outcome-economics
+
+Model-routing decisions should be evaluated against accepted work products, not
+isolated call prices. Retries, abandoned output, coordinator repair, review
+findings, and attributable follow-up work remain visible so apparent savings
+cannot be created by moving cost or failure outside the selected worker's call.
+
+### independent-promotion
+
+The agents and pairs being evaluated should not validate themselves. Promotion
+into ordinary routing should derive from durable trial evidence and a separate
+reviewed decision with explicit uncertainty and applicability boundaries.
+
+### product-gates-outrank-routing
+
+Routing optimization must not lower the correctness, safety, review, or
+publication requirements of the work being routed. A cheaper pair that fails
+the product's ordinary acceptance gate is not an optimization.
+
+### configuration-is-inert-data
+
+Repository, plugin, and operator configuration used to compose guidance or
+resolve model eligibility should be parsed and validated as inert declarative
+data. A harness must not source or execute configuration merely to discover
+policy, availability, or routing choices.
+
 ## Non-Goals / Boundaries
 
 - This vision does not prescribe one configuration schema or hook script.
@@ -155,9 +410,25 @@ review unless a concrete defect or materially changed evidence justifies it.
 - It does not delegate final synthesis, goal ownership, or completion judgment.
 - It does not prescribe one model, task API, agent runtime, or orchestration
   transport.
+- It does not prescribe one billing provider, allowance, reset policy, account
+  type, or organization-specific usage service.
+- It does not become a longitudinal billing ledger, cost-attribution warehouse,
+  or financial dashboard.
+- It does not treat the cheapest available model as qualified merely because it
+  can be launched.
+- It does not let a model, coordinator, worker, or pair promote itself into the
+  accepted routing policy.
+- It does not replace product review, safety, deployment, or publication gates
+  with a routing score.
 - It does not authorize recursive self-delegation or overlapping edit ownership.
 - It does not move repository-specific identity or invariants into plugins.
 - It does not make skills an always-on policy channel.
+- It does not require detailed overarching guidance to be recast as a skill
+  merely because it is loaded on demand.
+- It does not assume that a particular Markdown or path representation is
+  reliably followed or ignored without behavioral evidence.
+- It does not authorize a composition authority to rewrite plugin-owned policy
+  into one synthesized voice.
 - It does not require executing dynamic guidance producers to estimate their
   contribution.
 
@@ -165,4 +436,4 @@ review unless a concrete defect or materially changed evidence justifies it.
 
 - Parent vision: none
 - Child visions: none (leaf)
-- Reality docs: `docs/patterns/context-injection.md`, `docs/harness-runbook.md`
+- Reality docs: `docs/patterns/session-scoped-dynamic-guidance.md`, `docs/patterns/worktree-scoped-dynamic-guidance.md`, `docs/harness-runbook.md`

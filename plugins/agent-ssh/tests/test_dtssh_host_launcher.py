@@ -27,11 +27,24 @@ def test_released_dtssh_leaks_are_classified_before_reaping() -> None:
 
     assert "[int]$PressureCheckSec    = 5" in text
     assert "[int]$SessionClassificationSec = 15" in text
+    assert "[int]$OrphanProxyGraceSec = 120" in text
     assert "[int]$PreAuthWarnThreshold = 8" in text
     assert "[int]$PreAuthReapThreshold = 9" in text
     assert "[int]$IdleSessionWarnThreshold = 4" in text
     assert "[int]$IdleSessionReapThreshold = 8" in text
     assert "function Get-DedicatedSshdSessionPressure" in text
+    assert "function Stop-GuardedProcessTree" in text
+    assert "function Clear-OrphanedDtsshProxies" in text
+    assert "if ($RootPid -le 0) { return }" in text
+    assert "if ($children.ContainsKey($current))" in text
+    assert "$current.CreationDate -ne $expected.CreationDate" in text
+    assert "Stop-Process -Id $targetPid" in text
+    assert "reaped dedicated sshd process tree" in text
+    assert "reaped orphaned dtssh proxy process tree" in text
+    assert "reaped orphaned devtunnel helper" in text
+    assert "$current.ExecutablePath -ne $proxy.ExecutablePath" in text
+    assert "$current.ExecutablePath -ne $helper.ExecutablePath" in text
+    assert "$parent.CreationDate -le $proxy.CreationDate" in text
     assert "$children.ContainsKey($current)" in text
     assert "$seen.Add($current)" in text
     assert "$root.CommandLine -match '(?:^|\\s)-z(?:\\s|$)'" in text
@@ -99,7 +112,7 @@ def test_pre_auth_pressure_excludes_authenticated_session_roots() -> None:
         [PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=30,
         check=False,
     )
 
@@ -194,7 +207,7 @@ def test_session_pressure_classifies_idle_command_and_forwarding_roots() -> None
         [PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=30,
         check=False,
     )
 

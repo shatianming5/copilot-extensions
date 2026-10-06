@@ -76,7 +76,7 @@ The tracking state (seen in `list` / the picker) and its status-bar block:
 | `unused` | `UNUSED` (grey) | Clean; no commits **and** no conversation since the fork point |
 | `convo` | `CONVO` (teal) | Clean; no commits, but the session held conversation turns (`💬N`) |
 | `pushed` | — | Changes pushed to the default branch, awaiting finalization |
-| `completed` | `FINAL` (green) | All content landed on the default branch; safe to clean |
+| `completed` | `FINAL` (green) or `MERGED` (orange) | All content landed on the default branch -- see below for which label shows |
 | `finalized` | — | Landed and the worktree removed |
 | `gone` | — | Worktree directory missing |
 | `orphan` | `ORPHAN` (magenta) | No merge base with upstream |
@@ -84,6 +84,93 @@ The tracking state (seen in `list` / the picker) and its status-bar block:
 `unused` vs `convo` is why cleanup never auto-purges a commit-less worktree: it
 may hold planning or conversation. See
 [cli-reference.md § status-segment](cli-reference.md) for the bar detail.
+
+#### `FINAL` vs `MERGED` -- the closure descriptor split
+
+A `completed` worktree (its content is fully on the default branch) does not
+always render as `FINAL`. The canonical closure descriptor
+(`prune.assemble_closure_descriptor`, worktree-finality-and-obligations Phase
+5) splits it into two distinct labels, shared by the status bar, `list --json
+--classify`'s additive `closure` field, and the Picker/Worktree Manager table:
+
+- **`FINAL`** (green) -- a `completed` worktree that is genuinely, currently
+  *proven* safe to clean: the evidence came from a **refreshed** (fetched)
+  classification, it has **zero held claims**, **zero open follow-ups**, and
+  no other blocker (e.g. `rec.status == "finalizing"`).
+- **`MERGED`** (orange) -- `completed`, but not (yet) provably settled. Any of
+  the following forces `MERGED` instead of `FINAL`: no tracking record at all
+  (there is no evidence to prove `FINAL` with), a fetch-free/cached poll (the
+  default `status-interval` tick never fetches), a requested `--fetch` that
+  itself failed, one or more held claims, or one or more open follow-ups. A
+  `MERGED` block may carry a compact `C<N>`/`F<N>` marker suffix for held
+  claims / open follow-ups, plus an `XM<N>` marker (see below) when some of
+  those held claims are purely cross-machine.
+
+A cached or fetch-free descriptor **never** reports `FINAL`, even when the
+underlying facts would otherwise qualify -- proving a worktree safe to clean
+always requires a fresh fetch immediately before acting. Pass `--fetch` to
+`agent-worktrees status-segment` (or trigger a picker refresh) to let a
+genuinely clean, claim-free, follow-up-free worktree earn `FINAL`.
+
+##### Decomposed sub-state facts (Phase 9)
+
+Internally, `prune.assemble_closure_descriptor` (schema `version: 2`)
+decomposes the descriptor into five named, independently freshness-tracked
+`facts` rather than one all-or-nothing `evidence_mode`/`evidence_complete`
+pair: `checkpoint_activity`, `upstream_containment`, `local_dirtiness`,
+`open_claims`, and `pending_handoff`. Each carries its own `confirmed` flag.
+`checkpoint_activity`, `local_dirtiness`, and `pending_handoff` are always
+locally computed (`pending_handoff` reads `rec.pending_handoffs` --
+agent-worktrees' own already-tracked opened-but-unlinked session
+handoffs), so always `confirmed` and purely informational (never gate
+`FINAL`); `upstream_containment` and `open_claims` require fresh evidence
+(a fetch, a provider PR lookup) to be `confirmed`, and `FINAL` requires
+BOTH to be independently confirmed. This is additive plumbing: the
+`FINAL`/`MERGED` label rules above are unchanged; the Picker does not yet
+render each fact's own freshness marker (still a separate, unstarted
+slice) the way `list --json` and this status segment already do (see
+below).
+
+##### Per-fact freshness markers (Phase 9)
+
+`compact` additionally carries an `U*`/`OC*` marker whenever
+`upstream_containment`/`open_claims` (respectively) is unconfirmed --
+independent of each other and of the `C<N>`/`F<N>` held-claim/follow-up
+markers above, and independent of the base label (a `DIRTY`/`WIP`/etc.
+worktree can carry either marker too, not just `MERGED`). This is the
+general marker convention the Plan calls for: an unconfirmed fact is marked
+**in place**, never spawning a separate whole state. `FINAL` never carries
+either marker (both facts are confirmed by construction whenever `final` is
+true). The mux/PSMux status segment (below) renders `compact` directly, so
+it picks up both markers automatically; the Picker does not yet consume
+`compact` (still a separate, unstarted slice -- see the 2026-09-15 Journal
+entry on Picker label parity).
+
+##### Cross-machine held claims (worktree-claims-transitive-finalization, Phase 4)
+
+An outbound `worktree`-kind claim whose ref names a **different** machine
+targets a worktree hosted remotely -- it isn't a LOCAL blocker, since this
+worktree holds the claim but the claimed resource lives elsewhere. This
+proves only that the target is remote, nothing about its state: a
+cross-machine claim may target a genuinely busy remote worktree, not an
+idle/settled one, and nothing today actually sweeps/settles this kind of
+claim either way (`sweep.py`'s `gone_of`/`safe_of` both spare an
+unjudgeable cross-machine ref, and `worktree` isn't in
+`sweep._LEASEABLE_KINDS`). This bucket names WHERE the target lives, not
+that the claim needs no further look or clears itself. When **every** held
+claim on a worktree is one of these, `cleanup_disposition` reports the
+`held-claims-cross-machine` bucket instead of the generic `held-claims` --
+same safety posture (still not cleanable, still `blocked`), but a distinct
+reason ("claim(s) on a worktree hosted remotely") so an operator isn't left
+thinking an otherwise-clean worktree is blocked on something local. A
+single same-machine or non-`worktree`-kind claim in the mix keeps the
+generic bucket -- never collapsed into the cross-machine reading when
+something might genuinely need local attention. The sub-count rides the
+`open_claims` fact as `cross_machine_held` and renders its own `XM<N>`
+`compact` marker (alongside the ordinary `C<N>`) -- both additive: the
+wire-safe `held-claims` blocker code and `DESCRIPTOR_VERSION` are
+unchanged, so an older consumer degrades
+gracefully to the generic reading.
 
 ### The status core — an orthogonal disposition layer
 
@@ -191,6 +278,55 @@ branch, and pushes. `finalize` verifies the content actually landed before
 removing the worktree/branch — and defers the prune while a session is still
 live. Never hand-run `git merge`/`push`/`worktree remove`.
 
+### Pausing a worktree instead of finalizing (a runbook, not a subcommand)
+
+`finalize` is all-or-nothing on its resource-obligation-settlement gate: any
+unsettled outbound claim either blocks it outright, or `--abandon
+--handoff-to <recipient>` re-homes the *entire* unsettled set elsewhere.
+Neither fits "sync and tidy everything that's actually done, but leave this
+one claim open on purpose" — e.g. a deliberate pending `context-handoff` task
+meant to resume in this exact worktree, or any other genuinely-still-open
+piece of work. There is no dedicated `pause` subcommand for this — compose
+the existing primitives instead:
+
+```bash
+agent-worktrees git sync                       # pull the branch forward onto the latest default branch
+agent-worktrees claims sweep --apply            # auto-settle whatever the never-wedge sweep can PROVE is resolved
+agent-worktrees claims                          # see what's still genuinely open
+# settle/release anything you've independently confirmed is safe:
+agent-worktrees claims settle <ref> [--released]
+# mark the worktree as intentionally idle, with a note on what's left:
+agent-worktrees status --paused --summary "<why it's paused / what's still open>"
+```
+
+1. **Sync first.** `git sync` rebases the branch forward (never force-pushes,
+   never prunes) so the worktree builds on the latest default branch before
+   you report anything.
+2. **Auto-settle only what's provably safe.** `claims sweep --apply` is the
+   repo's own never-wedge reclaim sweep — it flips a claim to `released`
+   (a provably-merged hand-back) or `abandoned` (every other case where its
+   holder is provably gone *and* its resource is provably safe, e.g. an
+   off-box CodeSpace). It never guesses. Settle anything else you've
+   independently verified via `claims settle <ref>` / `claims release <ref>`.
+3. **Report what remains — don't force it.** `claims` (no args) prints the
+   full outbound ledger. Whatever is left open after the sweep is exactly
+   what the operator needs to see; do not release, abandon, or force a
+   disposition on a claim you can't prove is already safe.
+4. **Mark the worktree `--paused`.** This never affects `finalize`'s
+   obligation gate or `cleanup`'s prune eligibility, but it lets a human (or
+   Picker) immediately see "this worktree has work left open on purpose, not
+   abandoned" -- a scannable glyph in the Picker title and the
+   `status`/`list` JSON payload (the plain-table view is unmarked, same as
+   any other JSON-only field), and it does stamp `status_note_at` like any
+   other disposition write. Pair it with `--summary` naming what's still
+   open and why. Clear it later with `agent-worktrees status --unpaused`
+   once the worktree is active again (or genuinely done — run `finalize`
+   instead).
+
+Settling a specific claim, then re-running `finalize`, is how a paused
+worktree eventually becomes finalizable — `pause` itself never settles
+anything `claims sweep` couldn't already prove safe.
+
 ### 3b. PR mode — the `pr-*` command family
 
 When the repo is PR-gated, sign-off becomes **create-pr → review → merge →
@@ -209,9 +345,14 @@ branch. Three profiles decide which verbs apply:
   CI-gated auto-merge when the provider supports it and otherwise performs the
   configured merge.
 
-The verbs are self-describing — `pr-status` prints the active `flow:` and
-`pr-merge` refuses (naming the reason + next step) where it doesn't apply.
-Believe them; never hand-merge past a verb that says it doesn't apply.
+The base config has a pure, offline **configured profile** (`get pr-profile`).
+Networked actor-specific verbs resolve an **effective actor profile** from that
+base + live provider permission + a matching GitHub `pr.roles` override.
+`pr-status` prints the effective `flow:` and its configured source;
+`pr-status --no-live` remains configured-only. `pr-merge` uses the same
+resolver before deciding whether `--now` applies, and `pr-watch wait` uses the
+same effective review posture. Believe those live surfaces; never hand-merge
+past a verb that says it doesn't apply.
 
 | Verb | Role in the loop |
 |------|------------------|
@@ -283,7 +424,11 @@ deleted only when its content is verified on the default branch.
 
 **Finalized is not terminal.** Until it is pruned, a finalized worktree still
 appears in the picker and can be resumed to carry follow-up work — open a fresh
-PR for the new change. If a PR-mode worktree was already torn down (the `detach`
+PR for the new change. It can also still journal a fresh outbound resource
+claim (`claims add`) or take part in a claim handoff: `finalized` only stamps
+"no obligations as of this validation," not "frozen." (Only the in-flight
+`finalizing` RMW window and a genuinely broken `orphaned` record refuse new
+claims.) If a PR-mode worktree was already torn down (the `detach`
 disposition), recover it via
 [`references/pr-workflow.md` § Recovering a PR after teardown](../skills/worktree/references/pr-workflow.md).
 When in doubt, just `create` a fresh worktree and continue there.
@@ -319,7 +464,7 @@ residue, and each **spares anything in use**:
 | `gc` | tracked reap (the cleanup verdict) **+ leaked system/bridge worktrees + on-disk orphan dirs + git prune** | see the managed-reap invariant below |
 | `reap-sessions` | leaked `wt-<id>` mux sessions whose worktree is finalized/gone/untracked **and** idle past grace | **attached, active, or recently-busy** sessions |
 | `reap-shells` | orphaned launcher shells (pwsh/python scaffolding stranded by a force-closed terminal) | anything with a live descendant; reports-only unless `--yes` |
-| `remove-system <id>` | one **system worktree** by id (the manual escape hatch) | — (explicit, targeted) |
+| `remove-system <id>` | one **system worktree** by id (the manual escape hatch) | dirty working tree, unmerged/unpushed branch content, branch drift or a detached HEAD, an unclassifiable git state, a live PR (open/creating/unpopulated), a live outbound resource claim, or (for a resource this worktree itself is, via `owner_ref`) a live/unconfirmed inbound claimant -- refused by default; an unadvertised `--force` overrides |
 
 ### System worktrees (`sys-*`, `[system]`/`[delegate]`)
 
@@ -332,8 +477,19 @@ finalizes without tearing its worktree down, they **leak**, and because their
 tracking status stays `active` (never marked complete) `gc`'s managed sweep
 records them as `not-final-or-unused` and keeps them — so they can accumulate.
 Clear a *provably dead* one with **`remove-system <id>`** (verify it isn't a live
-session first); the durable fix is for the owning service to `remove-system` on
-task completion.
+session first) -- it also independently guards against discarding real content:
+it refuses (by default) a worktree with uncommitted changes, unmerged/unpushed
+branch content (squash-merge-aware), checkout branch drift or a detached HEAD,
+an unclassifiable git state (a zombie checkout with no `.git`, an
+orphaned/unrelated-history checkout, or a timed-out probe), a live PR record, a
+live outbound resource claim, or -- when this worktree is itself another
+worktree's outbound resource (`owner_ref`) -- a live or liveness-unconfirmed
+inbound claimant (unless this resource has itself finished: `finalized` status,
+or its branch content is already merged upstream), naming the blocker so the
+caller can resolve it; an unadvertised `--force` exists for a caller that has
+already confirmed discarding is correct. The durable fix is for the owning
+service to `remove-system` on task
+completion.
 
 ### The managed-reap invariant — what `gc` will never touch
 

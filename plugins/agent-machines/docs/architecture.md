@@ -40,26 +40,47 @@ Discovery is implemented in `src\agent_machines\discover.py`:
    Canonical registration may resolve through an explicit platform path or the
    registry's declared source root; filesystem discovery without a registry
    entry is not accepted.
-4. Each repo contributes `*.yaml` / `*.yml` files from
-   `.agent-machines/all/` plus `.agent-machines/machines/<machine>/`; package
-   gates then apply as an additional filter.
+4. Each repo contributes `*.yaml` / `*.yml` files from the canonical
+   `.copilot-extensions/agent-machines/all/` plus
+   `.copilot-extensions/agent-machines/machines/<machine>/`; package gates
+   then apply as an additional filter.
+5. `user_scoped_packages()` additionally, always, scans the home-relative
+   `user_package_root()` (`~/.agent-machines/config/`, same `all/`/
+   `machines/<machine>/` shape) and folds any matching packages into the
+   result as a synthetic `DiscoveredRepo` named `USER_SCOPE_NAME` (`"user"`).
+   This source requires no registry, adoption, or repository at all -- it is
+   the standalone fallback for a machine with no bound knowledge/control repo,
+   and is scanned unconditionally (not only when the registries are absent),
+   so a repo-adopted machine can still layer a purely local, unversioned
+   override on top.
 
-If the registries are missing or unreadable, discovery returns an empty set; the
-CLI still runs. `repo_enables_agent_machines()` annotates whether the repo has an
+If the registries are missing or unreadable, discovery still additionally
+scans the user-scoped source (step 5), so it need not return an empty set even
+with `agent-worktrees` entirely absent; the CLI still runs either way.
+`repo_enables_agent_machines()` annotates whether the repo has an
 enabled `agent-machines` plugin, but `discover()` does not require enablement
-unless called with `require_enable=True`.
+unless called with `require_enable=True`; the user-scoped source is always
+reported `enabled=True` since it has no per-repo plugin-activation concept of
+its own.
 
-Machine-directory and package-gate matching are case-insensitive. Files in
-`all/` and the matching machine directory are independent complete packages and
-must carry unique package names; the engine does not cross-file merge them.
-Partial overrides stay in the existing package-local `per-machine` block.
-Module gates and `per-machine` overlay keys are exact string matches today.
-The machine directory key is the raw `platform.node()` host name (Windows
-`%COMPUTERNAME%`), not an alias from an external topology file.
+Machine-directory and gate matching are case-insensitive. Files in `all/` and
+the matching machine directory are independent complete packages and must carry
+unique package names; the engine does not cross-file merge them. Partial
+overrides stay in the existing package-local `per-machine` block.
 
-The legacy `.github/machine-state/` directory is read only when the canonical
-`.agent-machines/` root is absent. This makes migration atomic per repo and
-prevents duplicate settings, resources, or module executions.
+The machine directory key is the canonical key from a matching adopted
+repository `machines.yaml` entry. The raw `platform.node()` host name (Windows
+`%COMPUTERNAME%`) resolves through the entry key, `hostname`, `alias`, and
+`display_name`; that accepted identity set applies to package, module, resource,
+overlay, and directory gates. Ambiguous matches fail before package loading.
+When no topology matches, the raw host remains the standalone identity.
+
+The canonical repo root is `.copilot-extensions/agent-machines/`. Legacy
+`.agent-machines/` and `.github/machine-state/` are read only when that newer
+root is absent. This makes migration atomic per repo and prevents duplicate
+settings, resources, or module executions. A marketplace-specific overlay may
+live under
+`.copilot-extensions/agent-machines/marketplaces/<marketplace-id>/`.
 
 `src\agent_machines\layout.py` owns layout diagnosis and migration.
 `agent-machines doctor` inspects canonical and legacy locations without
@@ -71,18 +92,34 @@ fails. It never guesses machine scoping from package gates.
 
 ## Requirement-package schema
 
-`src\agent_machines\manifest.py` writes schema version `2` packages and retains
-read compatibility for legacy version `1`. Required keys are:
+`src\agent_machines\manifest.py` implements schema version `4` and retains read
+compatibility for versions `1`, `2`, and `3`. Required keys are:
 
-- `schema_version: 2`
+- `schema_version: 1|2|3|4`
 - `package: <name>`
 
-Optional keys include `gate`, `aliases`, `manage`, `per-machine` /
+Optional keys include `authority`, `gate`, `aliases`, `manage`, `per-machine` /
 `per_machine`, `bootstrap-floor` / `bootstrap_floor`, `exclude`, `modules`, and
 `resources`. `per-machine.<machine>` is deep-merged onto `manage`; a `null` leaf
 unsets a key. Machine overlay keys resolve case-insensitively, matching package
 gate semantics; keys are normalized once at load time for constant-time lookup,
 and case-duplicate or surrounding-whitespace keys are rejected as ambiguous.
+
+Schema version 4 is the fail-closed boundary for authority metadata. Authority
+is an integer from `-1000` through `1000`, defaults to `0` at package level,
+and may be overridden by a manage spec, resource, or module. Any authority field
+under an older schema is rejected so an older runtime cannot silently ignore
+the selection contract. Per-machine overlays remain manage-only: they may
+override or remove a manage-spec authority, but do not introduce per-machine
+package authority, resources, or modules.
+
+Authority is rejected on `ensure-absent`,
+`copilot.settings.plugin-tombstones`,
+`copilot.settings.plugin-activation`, and any manage payload containing
+`enabledPlugins` or `extraKnownMarketplaces`. Package authority is inherited,
+so it is also rejected when the package contains one of those sensitive specs.
+This keeps plugin tombstones, activation, marketplace bootstrap, and removal
+protections outside authority arbitration.
 
 Schema version 2 is the fail-closed capability boundary for
 `enabledPlugins.<plugin>: false` tombstones. A v1 package cannot rely on that
@@ -113,10 +150,14 @@ The accepted dispositions are:
 `src\agent_machines\reconcile.py` owns the restore flow:
 
 1. Resolve each package for the target machine.
-2. Compute a drift key from the full resolved package union, including source
-   provenance, surfaces, resources, and modules.
+2. Compute `drift_key` from normalized effective operations (ordered floors,
+   authority-resolved enforce values, explicit removals, resources, and
+   modules) and `provenance_hash` from the full resolved package union,
+   including package authority.
 3. Apply Copilot surfaces first.
-4. Apply declarative resources second (packages/files; see below).
+4. Apply declarative resources second (packages/files/registry/features/power
+   settings/self-update/fleet-update opt-ins and Scheduled Task reconciliation;
+   see below).
 5. Run repo-local modules third.
 
 `plan`, `validate`, and `restore` default to the adopted project containing CWD
@@ -135,7 +176,7 @@ The implemented surfaces live in `src\agent_machines\surfaces\`:
 
 | Logical key | File | Behavior |
 | --- | --- | --- |
-| `copilot.settings` | `~/.copilot/settings.json` | `ensure-present` floors first, then `enforce`; only declared keys are touched. `enabledPlugins.<plugin>: false` tombstones one plugin without replacing the map. |
+| `copilot.settings` | `~/.copilot/settings.json` | `ensure-present` floors first, then `enforce`; enforce contributions use ascending effective authority and a source/package/manage-key tiebreak, while ensure-present remains an authority-neutral union floor with stable source ordering. Only declared keys are touched. `enabledPlugins.<plugin>: false` tombstones one plugin without replacing the map. |
 | `copilot.permissions` | `~/.copilot/permissions-config.json` | Adds declared `tool_approvals` to existing concrete locations resolved from location classes. |
 | `copilot.trustedFolders` | `~/.copilot/config.json` | Adds concrete trusted folders while preserving other config keys. |
 
@@ -143,6 +184,24 @@ Writes are dry-run-safe and create backups under `~/.agent-machines/backups/`
 before mutation. Location classes are resolved by
 `src\agent_machines\locations.py`; `$WORKTREES` applies to worktrees that exist at
 restore time.
+
+**`model`/`effortLevel`/`contextTier` get a second, independent guarantee at
+launch time, not just at restore time.** Copilot CLI has been observed to
+ignore these persisted `copilot.settings` values alone at startup (honoring
+only an explicit CLI flag or a mid-session `/model` change) — this is also
+the behavior a policy that forces the launch default to `Auto` would exploit.
+`agent-worktrees` closes that gap on its side: it unconditionally re-expresses
+whatever is currently persisted in `~/.copilot/settings.json` as explicit
+`--model`/`--reasoning-effort`/`--context` CLI flags on every non-ACP
+worktree create/resume/recovery launch (see
+`plugins/agent-worktrees/docs/config-reference.md` § "Persisted model/effort/
+context preference at launch"). Declaring these three keys in your own
+`copilot.settings` package here is what feeds that downstream mechanism the
+right values — restoring this surface and relying on `agent-worktrees`'
+launch-time reinforcement are two halves of one guarantee, not two
+alternatives. ACP sessions are a tracked exception (Copilot ignores these
+flags in ACP mode); `agent-bridge` carries model/effort through its own ACP
+configuration path there instead.
 
 ## Repo-local modules
 
@@ -154,6 +213,90 @@ Module failures are reported in the result but do not prevent later modules from
 running.
 
 The public plugin does not ship OS-mutating modules. Those stay repo-local.
+Module authority is reporting-only and uses the explicit
+`authority_mode: opaque-additive`: all applicable modules remain additive,
+including same-named modules from different packages.
+
+## Machine-local Playwright CLI provisioning
+
+`src\agent_machines\playwright_cli.py` owns a focused,
+source-neutral user-home provisioner. The directly callable
+`agent-machines provision-playwright-cli` subcommand is also available through
+the plugin's existing payload command, so a requirement package can use an
+`invocation` module without introducing a second PATH command.
+
+The provisioner resolves `node` and `npm`, then accepts npm's JavaScript CLI
+entry point only from a standard package layout physically contained by the
+resolved Node installation prefix. This trust rule intentionally does not
+require npm itself to live under the user home: npm is part of the detected
+runtime prerequisite, while the state it manages is separately constrained to
+the selected user prefix. The common POSIX npm command symlink is accepted only
+when it resolves to that trusted layout; a symlinked or reparse-point package
+root is rejected. All npm operations execute as a direct Node argv; no shell or
+batch shim is involved.
+
+The provisioner queries `npm prefix -g`, normalizes the result, and accepts it
+only when it is contained by the requested user home. Otherwise it selects
+`~/AppData/Roaming/npm` on Windows or `~/.local` on POSIX/WSL without mutating
+npm's global configuration, then resolves and revalidates that fallback against
+the resolved home. Every subsequent npm operation uses that same explicit
+prefix: registry latest lookup, installed package query, install, and
+global-root discovery. Dry-run therefore performs a required network read;
+inability to obtain registry `latest` is a failure.
+
+A missing package or an installed version different from registry `latest`
+plans or applies the prefix-scoped `@latest` install. Apply re-queries the
+installed package and requires an exact match to the version observed before
+mutation. The expected installed command may be reported from the selected
+prefix when it resolves within the prefix and home, but command shims are
+informational only and never executed.
+
+The npm-reported package root must remain within both the selected prefix and
+user home. It locates the canonical Playwright JavaScript entry point at
+`@playwright/cli/playwright-cli.js` and the bundled skill at
+`@playwright/cli/skills/playwright-cli`; both are resolved and validated within
+that package tree. Before planning or applying registration, every existing
+component beneath the resolved home in `~/.agents`, the target skill path,
+`~/.playwright`, and the config path is inspected without traversing links;
+symlinks, junctions, and other reparse points fail both dry-run and apply.
+Skill traversal applies the same rule to every directory and file, and the
+bundled tree must remain contained by the validated Playwright package, npm
+root, selected prefix, and home. The skill must contain a non-empty `SKILL.md`.
+Health compares the complete regular-file tree against
+`~/.agents/skills/playwright-cli` by relative path and SHA-256 content, so
+missing, extra, empty, unreadable, or byte-different files are stale. Stale
+Hashing is incremental and bounded by file count, total bytes, and the shared
+provision deadline. Stale state and every package update run
+`node <playwright-cli.js> install --skills agents`, then require complete tree
+equality. The CLI-created `~/.playwright/cli.config.json` remains reported
+workspace state, but browser profiles, credentials, navigation, and product
+policy are not owned here.
+
+Default and explicit `--dry-run` modes are read-only. `--apply` verifies the
+package, JavaScript entry point, and skill postconditions; a nonzero command or
+missing postcondition is a failed result with bounded stdout/stderr evidence.
+Each command runs in its own process group/tree. A timeout terminates the
+group/tree, waits through the bounded cleanup path, preserves partial output,
+and reports exit code `124`, including cleanup errors without replacing the
+original timeout. The complete provision operation has a 1500-second deadline;
+individual commands are capped at 600 seconds with a reserved cleanup margin,
+while the module runner remains capped at 1800 seconds. On Windows a gated
+launcher is assigned to a kill-on-close Job Object before it can spawn Node, so
+root exit cannot orphan descendants; POSIX retains a new process group and
+verifies it is empty after normal or abnormal root exit, escalating from
+termination to forced cleanup within bounded waits. Any exact-PID Windows
+fallback is bounded and evidence-bearing. The stable JSON
+result is schema version 1 and reports
+prerequisites, observed prefix/root/package/CLI/skill/config state, planned or
+attempted actions, command evidence, and the literal failure.
+Unexpected subprocess I/O failures terminate the same contained tree and return
+structured exit code `126` evidence.
+
+Requirement invocations use the established exact platform keys `windows`,
+`linux`, and `wsl`. The payload shim starts from the package repository because
+that is the generic module-runner contract, but Playwright workspace
+initialization itself always receives the user home as `cwd`; no repository
+content is registered or mutated.
 
 ## Declarative resources
 
@@ -211,12 +354,25 @@ guide.
 - if any package manages marketplaces, omitting the bootstrap-critical
   `copilot-extensions` marketplace is an error.
 
-For `resources:`, cross-package collisions on the same identity are reported
-(delegated to `resources.detect_conflicts`): incompatible `present`/`absent`
-states, disagreeing version pins, and conflicting `enforce` file content or
-formats are errors; enforce-over-ensure-present precedence and differing
-ensure-present content are advisories. Compatible declarations merge
-deterministically (pins OR together; the deterministic pick is stable across
-package order).
+For `resources:`, authority is applied at each existing semantic conflict
+field rather than filtering whole declarations. Only highest-authority
+participants decide package state/version, file format/content/block
+state/content, registry state/value/type, feature state, and power AC/DC.
+Equal-highest disagreement retains the field's existing error or advisory.
+Compatible safety fields still merge from every declaration (`pin` OR and
+case-folded `process_guard.names` union), and whole-file versus managed-block
+ownership plus managed-block marker disagreement remain hard errors regardless
+of authority.
+
+For `copilot.settings*`, conflicting same-shape enforced scalar/collection
+leaves use the same highest-authority rule. A valid lower-authority disagreement
+emits an informational `authority-supersession` finding; equal-highest value
+disagreement retains the existing error. Incompatible settings shapes remain
+errors at every authority because declaration ordering cannot safely reconstruct
+the effective tree. Disposition classes do not arbitrate against each other: an
+`ensure-present` declaration cannot defeat `enforce` because it has more
+authority.
 
 The validator reads only manifests, not live `~/.copilot/` state.
+Both CLI and library restore paths run it before any surface, resource, or
+module mutation; direct callers receive `RestoreValidationError` on errors.

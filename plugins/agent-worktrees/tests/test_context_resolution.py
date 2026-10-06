@@ -9,6 +9,7 @@ never trusted for identity when the directory is authoritative.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import types
 from pathlib import Path
@@ -16,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from agent_worktrees import __main__ as m
+from agent_worktrees import worktree_identity
 from agent_worktrees import config as cfg
 from agent_worktrees import git_ops
 from agent_worktrees import installer as inst
@@ -148,6 +150,26 @@ def test_resolve_from_anchor_cwd(adopted_repo, monkeypatch):
     assert assumed is None  # assumed CWD stays the real CWD
 
 
+def test_resolve_from_bare_anchor_cwd(adopted_repo, monkeypatch):
+    """A ``core.bare=true`` anchor (agent-worktrees' own pattern once worktrees
+    are attached) must still resolve from its own directory.
+
+    ``git rev-parse --show-toplevel`` always fails in a bare repo ("this
+    operation must be run in a work tree"), even when that directory IS the
+    registered project anchor -- reproduced live resuming a worktree whose
+    anchor had been converted to bare. ``_git_toplevel``/``_resolve_active_project``
+    must recognize this case via ``--is-bare-repository``/``--git-dir``
+    instead of reporting "not inside an adopted repo".
+    """
+    anchor, _wt_root, _wt_path, _wt_id, _conf = adopted_repo
+    _git("config", "core.bare", "true", cwd=anchor)
+    monkeypatch.chdir(anchor)
+    assert m._git_toplevel(anchor) == anchor.resolve()
+    project, assumed = m._resolve_active_project(None)
+    assert project == "myproj"
+    assert assumed is None
+
+
 def test_resolve_from_worktree_cwd(adopted_repo, monkeypatch):
     _anchor, _wt_root, wt_path, _wt_id, _conf = adopted_repo
     monkeypatch.chdir(wt_path)
@@ -245,8 +267,33 @@ def test_worktree_id_resolves_under_foreign_worktree_root(adopted_repo, monkeypa
     monkeypatch.setattr(cfg, "load_config", lambda *a, **k: bad_conf)
     monkeypatch.chdir(wt_path)
     # Legacy root scan would fail (cwd not under foreign root); git identity wins.
-    assert m._infer_worktree_id_from_worktree_root(bad_conf, Path(wt_path)) is None
+    assert worktree_identity._infer_worktree_id_from_worktree_root(
+        bad_conf, Path(wt_path)
+    ) is None
     assert m._infer_worktree_id(None, bad_conf) == wt_id
+
+
+def test_worktree_id_auto_adopts_untracked_linked_worktree(adopted_repo, active_myproj, monkeypatch):
+    """A linked worktree that `git worktree add`-ed directly -- never through
+    `agent-worktrees create` -- must still resolve AND get a tracking record
+    written on first use, not just report git's raw identity. This is what lets
+    a worktree created by an external host (a GitHub-App/coding-agent session,
+    a hand-run git command, any environment without our sessionStart hook)
+    still bind PR ownership on a *later* `create-pr`/`pr-status`/`finalize` call
+    from a machine that DOES have agent-worktrees, instead of staying
+    permanently "detached" from tracking."""
+    _anchor, _wt_root, wt_path, wt_id, conf = adopted_repo
+    tdir = Path(cfg.tracking_dir())
+    yaml_path = tdir / f"{wt_id}.yaml"
+    assert yaml_path.exists()  # fixture pre-seeds it
+    yaml_path.unlink()  # simulate: never registered via agent-worktrees create
+
+    monkeypatch.chdir(wt_path)
+    assert not yaml_path.exists()
+    assert m._infer_worktree_id(None, conf) == wt_id
+    # The call must have created a real tracking record, not merely returned
+    # git's raw id without persisting anything.
+    assert yaml_path.exists()
 
 
 def test_project_override_yields_no_worktree_id_at_anchor(adopted_repo, monkeypatch):
@@ -358,6 +405,26 @@ def test_get_worktree_dir_is_current_worktree(adopted_repo, active_myproj, monke
     assert Path(out).resolve() == wt_path.resolve()
 
 
+def test_get_worktree_dir_uses_actual_foreign_worktree_path(
+    adopted_repo, active_myproj, tmp_path, monkeypatch, capsys
+):
+    """A host-created linked worktree must not be projected under worktree_root."""
+    anchor, wt_root, _wt_path, _wt_id, _conf = adopted_repo
+    foreign = tmp_path / "copilot-worktrees" / "app-session"
+    foreign.parent.mkdir()
+    git_ops.git(
+        "worktree", "add", str(foreign), "-b", "app-session", "master",
+        cwd=str(anchor),
+    )
+    monkeypatch.chdir(foreign)
+
+    rc = m.cmd_get(types.SimpleNamespace(key="worktree-dir"))
+
+    assert rc == 0
+    assert Path(capsys.readouterr().out.strip()).resolve() == foreign.resolve()
+    assert not (wt_root / "app-session").exists()
+
+
 def test_get_worktree_dir_empty_at_anchor(adopted_repo, active_myproj, monkeypatch, capsys):
     """At the anchor (not inside a worktree) `get worktree-dir` is empty."""
     anchor, _wt_root, _wt_path, _wt_id, _conf = adopted_repo
@@ -366,6 +433,61 @@ def test_get_worktree_dir_empty_at_anchor(adopted_repo, active_myproj, monkeypat
     out = capsys.readouterr().out.strip()
     assert rc == 0
     assert out == ""
+
+
+def test_get_worktree_id_is_current_worktree(adopted_repo, active_myproj, monkeypatch, capsys):
+    """`get worktree-id` from inside a worktree yields THAT worktree's id --
+    resolvable by the setup launcher (Stage 3, copilot_invoked) without a
+    session/worktree-id argument."""
+    _anchor, _wt_root, wt_path, wt_id, _conf = adopted_repo
+    monkeypatch.chdir(wt_path)
+    rc = m.cmd_get(types.SimpleNamespace(key="worktree-id"))
+    out = capsys.readouterr().out.strip()
+    assert rc == 0
+    assert out == wt_id
+
+
+def test_get_worktree_id_empty_at_anchor(adopted_repo, active_myproj, monkeypatch, capsys):
+    """At the anchor (not inside a worktree) `get worktree-id` is empty."""
+    anchor, _wt_root, _wt_path, _wt_id, _conf = adopted_repo
+    monkeypatch.chdir(anchor)
+    rc = m.cmd_get(types.SimpleNamespace(key="worktree-id"))
+    out = capsys.readouterr().out.strip()
+    assert rc == 0
+    assert out == ""
+
+
+def test_get_session_scope_id_is_worktree_id_inside_a_worktree(
+    adopted_repo, active_myproj, monkeypatch, capsys,
+):
+    """Inside a worktree, `session-scope-id` is exactly the worktree id --
+    the CLI-mode registration extension threads this straight through as
+    `worktree_id`, so it must be identical to what `get worktree-id` itself
+    reports for the ordinary (non-anchor) case."""
+    _anchor, _wt_root, wt_path, wt_id, _conf = adopted_repo
+    monkeypatch.chdir(wt_path)
+    rc = m.cmd_get(types.SimpleNamespace(key="session-scope-id"))
+    out = capsys.readouterr().out.strip()
+    assert rc == 0
+    assert out == wt_id
+
+
+def test_get_session_scope_id_is_anchor_repo_name_at_anchor(
+    adopted_repo, active_myproj, monkeypatch, capsys,
+):
+    """At the anchor, `session-scope-id` is `anchor-<repo_name>` -- unlike
+    `worktree-id` (deliberately left empty there, an unrelated documented
+    contract), this is the new identity `agent-worktrees embody/copilot
+    --anchor` and the CLI-mode registration extension actually need: without
+    it, an anchor-mode session's self-registration reports a null
+    worktree_id and agent-bridge's CLI-mode reservation can never correlate
+    it (agent-bridge-cli-mode-sessions Phase 4 follow-up)."""
+    anchor, _wt_root, _wt_path, _wt_id, _conf = adopted_repo
+    monkeypatch.chdir(anchor)
+    rc = m.cmd_get(types.SimpleNamespace(key="session-scope-id"))
+    out = capsys.readouterr().out.strip()
+    assert rc == 0
+    assert out == "anchor-myproj"
 
 
 def test_get_worktree_state_dir_uses_machine_local_anchor_scope(
@@ -543,3 +665,126 @@ def test_get_keys_lists_swapped_keys(adopted_repo, capsys):
     assert rc == 0
     assert "worktree-dir" in out
     assert "worktrees-root" in out
+
+
+def test_get_non_pr_key_skips_control_plane_related_pr(
+    adopted_repo, active_myproj, monkeypatch, capsys,
+):
+    """Regression (copilot-extensions#2660): ``_control_plane_related_pr_map``
+    is a 13-subprocess, ~218-file-read walk over every installed plugin, and
+    it is only ever consulted for the ``pr-*`` keys' values -- every other
+    ``get`` key must skip it (``include_control_plane_related_pr=False``)
+    rather than pay that cost on every single invocation regardless of the
+    key actually requested."""
+    _anchor, _wt_root, wt_path, _wt_id, conf = adopted_repo
+    monkeypatch.chdir(wt_path)
+    calls: list[bool] = []
+
+    def spy_load_config(*a, include_control_plane_related_pr=True, **k):
+        calls.append(include_control_plane_related_pr)
+        return conf
+
+    monkeypatch.setattr(cfg, "load_config", spy_load_config)
+
+    rc = m.cmd_get(types.SimpleNamespace(key="worktree-dir"))
+    assert rc == 0
+    assert calls == [False]
+
+
+def test_get_pr_key_still_includes_control_plane_related_pr(
+    adopted_repo, active_myproj, monkeypatch, capsys,
+):
+    """The four ``pr-*`` keys DO need the control-plane PR-graft overlay, so
+    they must keep requesting it."""
+    _anchor, _wt_root, wt_path, _wt_id, conf = adopted_repo
+    monkeypatch.chdir(wt_path)
+    calls: list[bool] = []
+
+    def spy_load_config(*a, include_control_plane_related_pr=True, **k):
+        calls.append(include_control_plane_related_pr)
+        return conf
+
+    monkeypatch.setattr(cfg, "load_config", spy_load_config)
+
+    for key in ("pr-enabled", "pr-required", "pr-provider", "pr-profile"):
+        calls.clear()
+        rc = m.cmd_get(types.SimpleNamespace(key=key))
+        assert rc == 0
+        assert calls == [True], key
+
+
+def test_picker_paths_json_reports_install_and_plugin_roots(
+    monkeypatch,
+    capsys,
+    tmp_path,
+):
+    install_dir = tmp_path / ".agent-worktrees"
+    home = tmp_path / "home"
+    monkeypatch.setattr(cfg, "install_dir", lambda: install_dir)
+    monkeypatch.setattr(cfg, "_home", lambda: home)
+
+    rc = m.cmd_picker_paths(types.SimpleNamespace(json=True))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload == {
+        "version": 1,
+        "install_dir": str(install_dir),
+        "installed_plugins_dir": str(home / ".copilot" / "installed-plugins"),
+    }
+
+
+def test_picker_bootstrap_json_reports_runner_decisions(
+    adopted_repo,
+    active_myproj,
+    monkeypatch,
+    capfd,
+):
+    anchor, _wt_root, _wt_path, _wt_id, _conf = adopted_repo
+    monkeypatch.setattr(m, "_resolve_active_project", lambda project: (project, anchor))
+    monkeypatch.setattr(m, "_cwd_is_inside_project", lambda candidate: False)
+    monkeypatch.setattr(m, "_in_ssh_session", lambda: True)
+
+    rc = m.cmd_picker_bootstrap(types.SimpleNamespace(json=True))
+
+    payload = json.loads(capfd.readouterr().out)
+    assert rc == 0
+    assert payload == {
+        "version": 1,
+        "project": "myproj",
+        "should_switch_cwd": True,
+        "cwd": str(anchor.resolve()),
+        "default_live": False,
+    }
+
+
+def test_repair_stale_anchor_json_reports_targeted_status(
+    adopted_repo,
+    active_myproj,
+    monkeypatch,
+    capfd,
+):
+    _anchor, _wt_root, _wt_path, _wt_id, conf = adopted_repo
+    states = iter((False, True))
+
+    def _present(_config):
+        return next(states)
+
+    monkeypatch.setattr("agent_worktrees.update_runtime._self_entry_present", _present)
+    monkeypatch.setattr(
+        "agent_worktrees.update_runtime._heal_stale_anchor_if_self_missing",
+        lambda config: config,
+    )
+    monkeypatch.setattr(cfg, "load_config", lambda *a, **k: conf)
+
+    rc = m.cmd_repair_stale_anchor(types.SimpleNamespace(json=True))
+
+    payload = json.loads(capfd.readouterr().out)
+    assert rc == 0
+    assert payload == {
+        "version": 1,
+        "project": "myproj",
+        "status": "repaired",
+        "self_present_before": False,
+        "self_present_after": True,
+    }

@@ -38,7 +38,7 @@ import uuid
 from collections.abc import Callable, Sequence
 
 from . import embody
-from .procutil import no_window_kwargs
+from .procutil import run_ssh_command
 
 log = logging.getLogger("agent-dispatch.fleet")
 
@@ -94,14 +94,7 @@ def _host_has_command(host: str, command: str, *, timeout: float = 8.0) -> bool:
         _ssh_alias(host), f"command -v {command}",
     ]
     try:
-        result = subprocess.run(  # noqa: S603 -- fixed argv, exe via shutil.which
-            cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            **no_window_kwargs(),
-        )
+        result = run_ssh_command(cmd, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return False
     return result.returncode == 0
@@ -140,6 +133,7 @@ class FleetSpawner:
         driver: str = embody.DEFAULT_DRIVER,
         headless: bool = False,
         agent: str = embody.DEFAULT_HEADLESS_AGENT,
+        charter: str | None = None,
         all_repos: bool = False,
         verify_timeout: int = 0,
         liveness: LivenessFn | None = None,
@@ -155,6 +149,16 @@ class FleetSpawner:
         self.driver = driver
         self.headless = bool(headless)
         self.agent = agent
+        self.charter = charter
+        if self.charter and not self.headless:
+            # agent-worktrees embody has no charter-binding flag; the CLI-embody
+            # fleet worker (spawn_fleet_embodied_worker) has no charter parameter
+            # at all. Fail fast at construction rather than silently launching
+            # every task on the bare venue with the requested charter dropped.
+            raise embody.EmbodyUnavailable(
+                "FleetSpawner: --charter is only supported for a headless fleet "
+                "lane (agent-worktrees embody has no charter-binding flag)"
+            )
         self.all_repos = bool(all_repos)
         self.verify_timeout = verify_timeout
         default_liveness = host_can_bridge if self.headless else host_can_embody
@@ -246,6 +250,7 @@ class FleetSpawner:
                     owner=owner,
                     worker_id=owner,
                     agent=self.agent,
+                    charter=self.charter,
                     repo=None if self.all_repos else task.get("repo"),
                     all_repos=self.all_repos,
                 )

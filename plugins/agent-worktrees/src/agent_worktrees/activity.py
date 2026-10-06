@@ -15,36 +15,108 @@ the full picture across processes.
 
 Events are intentionally high-level:
 
+  boot_trace                always-on payload-launch timing from the shell
+                            launcher / resolver path
   worktree_created          a new worktree + branch was created
   worktree_resumed          an existing worktree was resumed via the picker
   launcher_started          the session launcher began a launch flow (carries
                             launch_id + the setup-log path)
   session_started           a Copilot session registered against a worktree
   session_ended             a Copilot session deregistered
+  ahp_session_bound         an AHP session was created or verified for a worktree
+  ahp_session_disposed      the bound AHP session was explicitly disposed
   copilot_exited            the Copilot process exited (launcher)
   pane_exited               the wrapped pane command exited (pane wrapper) --
                             the only mark carrying the mux pane's real exit_code
   mux_attached              a tmux/psmux session was attached/joined (launcher);
                             fresh creation carries its attempt count
+  mux_session_assigned      the programmatic cutover path's mux pane creation
+                            succeeded (mux_new_session/mux_new_window) --
+                            stage 2's other emitter, alongside mux_attached
+  copilot_invoked           the Copilot binary was actually exec'd (the true
+                            final resolution point in the setup launcher)
+  copilot_invocation_attempted
+                            launch-command's wrapper handed off to a
+                            config-driven launch template or legacy
+                            tools/setup/setup.{sh,ps1} -- a coarser mark for
+                            paths that never reach default-setup's own
+                            precise copilot_invoked emitter
   mux_failed                the requested tmux/psmux launch failed closed;
                             creation exhaustion carries attempt count and
                             recoverable=true when the worktree was preserved
   mux_detached              the attach returned -- user detached or session ended
+  status_reported           the first status-report (disposition) write in a
+                            session -- marks "Copilot did something here"
   changes_pushed            worktree content was pushed to the default branch
   worktree_finalized        finalize completed (content on upstream)
   finalize_skipped_removal  finalize left the worktree/branch/session in place
                             (running inside it, or a live session was detected)
   worktree_reaped           cleanup removed a worktree's dir/branch/session
-  handoff_cutover_spawn     live handoff spawned a successor pane
+  handoff_cutover_claim     monitor atomically claimed a pending handoff token
+  pane_create_started       programmatic pane/session creation intent was
+                            recorded before the mux subprocess was invoked
+  handoff_successor_spawn_started
+                            successor pane spawn is starting -- emitted before
+                            success/failure is known, so a killed spawn still
+                            leaves a trace
+  handoff_cutover_spawn     live handoff spawned a successor pane (terminal
+                            success for the spawn started above)
+  handoff_successor_spawn_failed
+                            the successor pane spawn (started above) failed
   handoff_predecessor_retire
                             a consumed handoff retired the predecessor pane
   handoff_retire_guard      a retire request was left in place by a safety guard
+  claim_added               ``claims add`` journaled a new outbound resource
+                            claim (or reopened a finalized worktree via one)
+  claim_released            ``claims release`` released or removed a claim
+  claim_annotated           ``claims annotate`` updated an existing claim's note
+  claim_settled             ``claims settle`` set a claim's terminal
+                            disposition (released/at-rest)
+  claim_abandoned           ``claims sweep --apply`` flipped an abandoned,
+                            provably-gone obligation to at-rest
+  claim_at_rest_reconciled  ``claims reconcile-at-rest --apply`` released a
+                            lingering at-rest claim
+  claim_reclaimed           ``claims cleanup --apply`` reclaimed a re-homed
+                            (orphaned) obligation
+  claim_handoff_offered     ``claims handoff offer`` created or re-affirmed a
+                            same-machine claim-bundle offer
+  claim_handoff_accepted    ``claims handoff accept`` transferred a bundle's
+                            ownership to the consumer worktree
+  claim_handoff_declined    ``claims handoff decline`` marked a bundle declined
+  claim_handoff_cancelled   ``claims handoff cancel`` marked a bundle cancelled
+  follow_up_added           ``follow-ups add`` journaled a new open follow-up
+                            (or reopened a finalized worktree via one)
+  follow_up_resolved        ``follow-ups resolve`` marked a follow-up done
+  follow_up_dismissed       ``follow-ups dismiss`` marked a follow-up as not
+                            requiring action
+
+Unlike the handoff-cutover stages above, the claim/follow-up-ledger events
+(``claim_*``, ``follow_up_*``) deliberately do NOT feed ``handoff_trace``'s
+unrotated per-worktree store. A claim or follow-up's *current* disposition
+already lives durably in its owning ``WorktreeRecord`` YAML -- the gap this
+instrumentation closes is *history* (an audit trail of who mutated what and
+when), not *truth* (which the YAML already guarantees survives past this
+log's 7-day rolling window). See
+efforts/2026/08/28 worktree-finality-and-obligations/README.md Phase 7 and
+ThomasMichon/copilot-extensions#3113 for the full rationale.
 
 Every record carries ``worktree_id`` and (where known) ``session_id`` and
 ``launch_id``. ``launch_id`` is a short correlation token minted once at
 launcher entry and threaded through the whole flow (launcher -> mux env ->
 session hooks -> post-exit), so ``agent-worktrees activity --launch-id <id>``
 returns one launch flow deterministically rather than by timestamp guesswork.
+
+Events recognized in ``HANDOFF_STAGE_MAP`` (see below) additionally carry
+``stage`` (1-13, the ordinal position in the handoff cutover lifecycle) and
+``stage_name`` (its canonical name), stamped automatically by ``log_event`` --
+see efforts/active/handoff-cutover-lifecycle-journal/README.md Phase 1 for the
+full 13-stage model this lays the foundation for. This is purely additive:
+no existing event name is renamed, so existing readers (health.py's
+``find_orphaned_handoffs``, the status monitor's pending-handoff scan) are
+unaffected. Every stage-mapped event is also, best-effort, appended to
+``handoff_trace``'s durable per-project/per-worktree trace store (Phase 3),
+since this rolling log's retention window is too short to "re-trace a
+handoff at any time".
 
 Logging must never break the worktree lifecycle: every public function
 swallows its own exceptions.
@@ -53,13 +125,19 @@ swallows its own exceptions.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
+import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import config as cfg
+from . import handoff_trace
+from .worktree_identity import _infer_worktree_id_from_cwd
 
 # Rolling retention window. Lines older than this are dropped on prune.
 RETENTION_DAYS = 7
@@ -69,7 +147,94 @@ RETENTION_DAYS = 7
 # triggers rarely (hundreds of sessions).
 _PRUNE_SIZE_BYTES = 512 * 1024
 
+# Minimum time between prune *dispatches*, independent of how many
+# log_event() calls land on this path in between. Under heavy automated
+# usage (many sub-agents/launches per minute) the file can stay above
+# _PRUNE_SIZE_BYTES almost continuously, so without this debounce every
+# single log_event() call would spawn its own background prune worker.
+_PRUNE_DEBOUNCE_SECONDS = 3600
+
 _HOSTNAME = socket.gethostname()
+
+log = logging.getLogger("agent-worktrees")
+
+# Process-local count of log_event() calls that failed to write a record.
+# log_event() must never raise into its caller, so a dropped event is
+# otherwise invisible; this counter (plus the paired log.debug() call) makes
+# a swallowed failure detectable rather than merely theorized. Reset each
+# process start -- it is a liveness signal for the current run, not a
+# persisted metric.
+_log_event_failures = 0
+
+
+def log_event_failure_count() -> int:
+    """Number of ``log_event()`` calls in this process that failed to write.
+
+    ``log_event`` always swallows its own exceptions (a diagnostic log must
+    never break the operation it observes), so this counter -- incremented
+    alongside a ``log.debug`` call on every such failure -- is how a caller or
+    test can detect "an event was silently dropped" instead of only being
+    able to theorize it from a gap in the trace.
+    """
+    return _log_event_failures
+
+
+# Handoff cutover lifecycle stage vocabulary (the 13-stage model from
+# efforts/active/handoff-cutover-lifecycle-journal/README.md Phase 1). Maps
+# each existing wire event name that corresponds to a stage onto that stage's
+# (ordinal, canonical_name). Layered on top of existing event names -- never
+# renames or replaces them, so existing consumers (health.py, the status
+# monitor's pending-handoff scan) keep working unmodified. New stages with no
+# pre-existing event (5, 7-as-a-distinct-signal, etc.) are added here as their
+# dedicated emitters land in later phases; until then they simply have no
+# entry and are omitted from a rendered trace rather than guessed at.
+HANDOFF_STAGE_MAP: dict[str, tuple[int, str]] = {
+    "worktree_created": (1, "worktree_created"),
+    "mux_attached": (2, "mux_session_assigned"),
+    "mux_session_assigned": (2, "mux_session_assigned"),
+    "copilot_invoked": (3, "copilot_invoked"),
+    "copilot_invocation_attempted": (3, "copilot_invoked"),
+    "session_started": (4, "session_start_bound"),
+    "status_reported": (5, "status_reported"),
+    "handoff_requested": (6, "handoff_triggered"),
+    "handoff_cutover_claim": (7, "handoff_host_acknowledged"),
+    "handoff_host_acknowledged": (7, "handoff_host_acknowledged"),
+    "handoff_cutover_spawn": (8, "handoff_successor_spawn_started"),
+    "handoff_successor_spawn_started": (8, "handoff_successor_spawn_started"),
+    "handoff_successor_spawn_failed": (8, "handoff_successor_spawn_started"),
+    "handoff_successor_session_start_bound": (
+        9,
+        "handoff_successor_session_start_bound",
+    ),
+    "handoff_successor_claimed": (10, "handoff_successor_claimed"),
+    "handoff_predecessor_retire": (
+        11,
+        "handoff_pickup_confirmed_predecessor_closing",
+    ),
+    "handoff_pickup_confirmed_predecessor_closing": (
+        11,
+        "handoff_pickup_confirmed_predecessor_closing",
+    ),
+    "session_ended": (12, "session_end_bound"),
+    "session_end_bound": (12, "session_end_bound"),
+    "handoff_complete": (13, "handoff_complete"),
+}
+
+
+# Events whose stage-map entry is only valid for a specific field value --
+# e.g. handoff_cutover_claim fires for outcome="acquired" (the real
+# acknowledgement), but also for "already-claimed" and "error" (a duplicate or
+# failed claim attempt), which must NOT be stamped as a Stage 7 success or the
+# audit trace would show a false acknowledgement for every collision.
+# handoff_predecessor_retire similarly fires for outcome="identity-mismatch"
+# (a safety guard skipped the pane) and outcome="left-running" (the pane/
+# process survived retirement), neither of which is a confirmed Stage 11
+# pickup/closure -- only outcome="gone" (retire_pane confirmed gone AND
+# process reaping clean) is.
+_HANDOFF_STAGE_GATE: dict[str, tuple[str, object]] = {
+    "handoff_cutover_claim": ("outcome", "acquired"),
+    "handoff_predecessor_retire": ("outcome", "gone"),
+}
 
 
 def log_path() -> Path:
@@ -84,9 +249,18 @@ def log_event(
     session_id: str | None = None,
     launch_id: str | None = None,
     source: str = "python",
+    handoff_token: str | None = None,
+    predecessor_session_id: str | None = None,
+    successor_session_id: str | None = None,
+    project: str | None = None,
     **fields: object,
 ) -> None:
     """Append a single high-level lifecycle event. Never raises.
+
+    Delivery is best-effort: a write failure (disk full, permissions, ...) is
+    swallowed and never propagates to the caller, but it is not swallowed
+    *invisibly* -- see ``log_event_failure_count()`` and the paired
+    ``log.debug`` call in the except clause below.
 
     Args:
         event: One of the documented event names (see module docstring).
@@ -96,8 +270,16 @@ def log_event(
             launcher entry and threaded through the flow so every record of one
             launch shares it (``agent-worktrees activity --launch-id``).
         source: Originating component ("python" or "launcher").
+        project: Explicit project name for the durable per-project trace store
+            (below) -- overrides the ambient ``cfg.active_project()`` default,
+            required for any caller (e.g. a resident daemon serving more than
+            one project) whose own ambient project may not match this event's
+            actual worktree.
         **fields: Extra context (branch, reason, exit_code, ...). ``None``
-            values are dropped.
+            values are dropped. ``stage``/``stage_name`` are reserved: a
+            caller-supplied value is dropped in favor of the canonical
+            ``HANDOFF_STAGE_MAP`` stamp so the schema can't be corrupted by an
+            arbitrary ``--field stage=...`` from the CLI.
     """
     try:
         path = log_path()
@@ -115,24 +297,203 @@ def log_event(
         for key, value in fields.items():
             if value is not None:
                 record[key] = value
+        stage_info = HANDOFF_STAGE_MAP.get(event)
+        normalized_handoff_token = (
+            str(handoff_token).strip() if handoff_token not in (None, "") else ""
+        ) or (
+            str(fields.get("handoff_id") or "").strip()
+        ) or None
+        if stage_info is not None:
+            stage_num, _stage_name = stage_info
+            if predecessor_session_id is None and session_id and stage_num in {6, 7, 8, 11, 13}:
+                predecessor_session_id = session_id
+            if successor_session_id is None and session_id and stage_num in {9, 10}:
+                successor_session_id = session_id
+            record["handoff_token"] = normalized_handoff_token
+            record["predecessor_session_id"] = predecessor_session_id
+            record["successor_session_id"] = successor_session_id
+        elif (
+            normalized_handoff_token is not None
+            or predecessor_session_id is not None
+            or successor_session_id is not None
+        ):
+            record["handoff_token"] = normalized_handoff_token
+            record["predecessor_session_id"] = predecessor_session_id
+            record["successor_session_id"] = successor_session_id
+        if stage_info is not None:
+            gate = _HANDOFF_STAGE_GATE.get(event)
+            gated_out = gate is not None and record.get(gate[0]) != gate[1]
+            if gated_out:
+                record.pop("stage", None)
+                record.pop("stage_name", None)
+            else:
+                # Stamped last so no caller-supplied field (including a
+                # same-named one from **fields) can override the canonical
+                # value.
+                record["stage"], record["stage_name"] = stage_info
+        # An unmapped/custom event's own stage/stage_name fields (if any)
+        # are left exactly as the caller supplied them -- only a *mapped*
+        # event's stamp is reserved/gated.
         line = json.dumps(record, ensure_ascii=True)
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(line + "\n")
         _maybe_prune(path)
-    except Exception:
+        if stage_info is not None and "stage" in record and worktree_id:
+            # Also land stage-mapped events in the durable, unrotated
+            # per-project trace store (Phase 3) so a handoff's full history
+            # survives past activity.jsonl's rolling retention window.
+            # Best-effort and project-scoped: a caller with no resolved
+            # active project (a rare ambient context) still gets the
+            # activity.jsonl record above, just not this durable copy.
+            handoff_trace.append_event(project or cfg.active_project(), worktree_id, record)
+    except Exception as exc:
         # A diagnostic log must never interfere with the operation it
-        # observes -- fail silently.
-        pass
+        # observes -- delivery stays best-effort and this never raises into
+        # the caller. But "fail silently" must not mean "fail invisibly": bump
+        # a process-local counter and emit a debug-level log line so a missing
+        # event is itself detectable (via log_event_failure_count() or a
+        # DEBUG-level log stream) rather than only inferable from a gap in
+        # the trace.
+        global _log_event_failures
+        _log_event_failures += 1
+        log.debug("activity log_event(%r) failed to write: %s", event, exc)
 
 
 def _maybe_prune(path: Path) -> None:
-    """Prune lines older than the retention window if the file is large."""
+    """Dispatch a background prune if the file has grown large.
+
+    The rewrite is never run inline on this path. ``log_event()`` is called
+    from everywhere -- including a picker action mid-interaction (selecting
+    an item, opening a sub-menu) -- so a synchronous multi-second rewrite of
+    a large log here would freeze the caller *between keypresses*. Instead
+    this claims the current debounce window's marker (see
+    :func:`_claim_prune_marker`) and hands the actual rewrite to a detached
+    ``activity-prune-worker`` subprocess (see
+    :func:`_dispatch_background_prune`), so the foreground caller never
+    waits on it.
+    """
     try:
         if path.stat().st_size < _PRUNE_SIZE_BYTES:
             return
     except OSError:
         return
-    _prune(path, RETENTION_DAYS)
+    if not _claim_prune_marker(path):
+        return
+    _dispatch_background_prune(path)
+
+
+def _prune_marker_path(path: Path, *, now: float | None = None) -> Path:
+    """The debounce marker for *path*'s current ``_PRUNE_DEBOUNCE_SECONDS``
+    window, named by its bucket number so each window gets its own file."""
+    return path.with_name(f"{path.name}.prune-marker.{_prune_marker_bucket(now=now)}")
+
+
+def _prune_marker_bucket(*, now: float | None = None) -> int:
+    return int((time.time() if now is None else now) // _PRUNE_DEBOUNCE_SECONDS)
+
+
+def _claim_prune_marker(path: Path) -> bool:
+    """Atomically claim *this debounce window's* dispatch slot for *path*.
+
+    Returns ``True`` only for the one caller that wins the claim, so a burst
+    of concurrent ``log_event()`` calls -- across many processes, all seeing
+    the log large at the same time -- dispatches at most one background
+    prune for this window, not one per caller.
+
+    Each window gets its own marker file (``_prune_marker_path``), claimed
+    with an exclusive create (``O_CREAT | O_EXCL``). Unlike a single shared
+    marker refreshed in place, there is no separate "renew a stale marker"
+    step -- and therefore no window where multiple processes can all
+    believe they renewed the same claim.
+    """
+    bucket = _prune_marker_bucket()
+    marker = path.with_name(f"{path.name}.prune-marker.{bucket}")
+    try:
+        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except OSError:
+        return False
+    _cleanup_old_prune_markers(path, current_bucket=bucket)
+    return True
+
+
+# How many whole debounce windows a marker must be behind the current one
+# before cleanup may delete it. 1 (not 0) is deliberate: a caller that read
+# the clock right at the tail of bucket N-1 and was then descheduled before
+# its (otherwise instantaneous) O_CREAT|O_EXCL claim can still be holding
+# that bucket's claim-in-flight when a different caller's cleanup pass, now
+# in bucket N, runs -- deleting bucket N-1 at that point would let the
+# descheduled caller's claim succeed a second time once it resumes,
+# dispatching a duplicate worker. Only ever cleaning bucket <= N-2 means
+# that race now requires a caller to be descheduled for over a FULL
+# extra debounce window (~_PRUNE_DEBOUNCE_SECONDS) between reading the
+# clock and completing one `os.open()` call -- not eliminated in theory,
+# but not a realistic scheduling delay either, and proportionate to a
+# diagnostic log's own debounce (same best-effort posture as the rest of
+# this module).
+_PRUNE_MARKER_CLEANUP_GRACE_WINDOWS = 1
+
+
+def _cleanup_old_prune_markers(path: Path, *, current_bucket: int) -> None:
+    prefix = f"{path.name}.prune-marker."
+    cutoff = current_bucket - _PRUNE_MARKER_CLEANUP_GRACE_WINDOWS
+    try:
+        for sibling in path.parent.glob(f"{prefix}*"):
+            suffix = sibling.name[len(prefix):]
+            try:
+                sibling_bucket = int(suffix)
+            except ValueError:
+                continue  # not one of ours (or malformed) -- leave it alone
+            if sibling_bucket < cutoff:
+                try:
+                    sibling.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def _dispatch_background_prune(path: Path) -> None:
+    """Fire-and-forget a detached worker that prunes *path*. Never blocks,
+    never raises into the caller.
+
+    The ``Popen`` handle is retained and reaped on a daemon thread (not
+    discarded) even though the child is otherwise fully detached
+    (``start_new_session``/``DETACHED_PROCESS``): on POSIX, detaching a
+    session does not reap the child -- a caller that never waits on it
+    leaves an exited worker as a zombie until this process starts another
+    subprocess or exits. A long-lived caller (the picker, a resident
+    daemon) could accumulate one zombie per dispatch over its lifetime.
+    ``Thread(target=proc.wait)`` performs that blocking wait off the
+    caller's own thread, so dispatch itself still returns immediately.
+    """
+    try:
+        from agent_procutil import (
+            detached_kwargs,
+            windowless_python,
+            windowless_python_env,
+        )
+
+        python = windowless_python(sys.executable)
+        env = {**os.environ, **windowless_python_env(sys.executable)}
+        proc = subprocess.Popen(
+            [
+                python, "-I", "-m", "agent_worktrees", "activity-prune-worker",
+                str(path), str(RETENTION_DAYS),
+            ],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, env=env,
+            # Never the caller's cwd: this detached worker may outlive the
+            # repo/worktree checkout log_event() happened to be called from
+            # (service-lifecycle-supervision's "nothing pins the plugin
+            # payload" rule) -- it works entirely off the absolute `path`
+            # argument, so its cwd is irrelevant to its job; root it at HOME.
+            cwd=os.path.expanduser("~"),
+            **detached_kwargs(breakaway=True),
+        )
+        threading.Thread(target=proc.wait, daemon=True).start()
+    except Exception:
+        log.debug("activity: failed to dispatch background prune for %s", path, exc_info=True)
 
 
 def _prune(path: Path, retention_days: int) -> int:
@@ -141,6 +502,16 @@ def _prune(path: Path, retention_days: int) -> int:
     Returns the number of lines kept. Best-effort: a concurrent append
     during the rewrite could be lost, which is acceptable for a
     diagnostic log. Unparseable lines are kept.
+
+    Adjacent debounce windows are deliberately allowed to each dispatch
+    their own worker (see ``_claim_prune_marker``'s grace window), so two
+    ``_prune()`` calls against the same *path* can genuinely run
+    concurrently. The rewrite's temp file is therefore named per-process
+    (``.tmp.<pid>``), never a fixed shared name -- two processes writing and
+    replacing through the same temp path could otherwise interleave and
+    corrupt the result, or race each other's ``replace()``. Both workers
+    still converge on a valid (if redundant) prune of the same file; they
+    simply never share a write target while doing it.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
     kept: list[str] = []
@@ -156,7 +527,7 @@ def _prune(path: Path, retention_days: int) -> int:
     except OSError:
         return 0
 
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     try:
         tmp.write_text(
             ("\n".join(kept) + "\n") if kept else "", encoding="utf-8"
@@ -293,6 +664,55 @@ def render_events(events: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def add_parsers(sub) -> None:
+    """Register the activity / activity-log / activity-prune-worker verbs."""
+    sp = sub.add_parser(
+        "activity",
+        help="View the worktree/session lifecycle activity log",
+    )
+    sp.add_argument(
+        "--since",
+        default=None,
+        help="Only show events newer than this (e.g. 2d, 12h, "
+        "30m, or an ISO date). Default: all retained.",
+    )
+    sp.add_argument("--worktree-id", default=None, help="Filter to a single worktree id")
+    sp.add_argument(
+        "--launch-id",
+        dest="launch_id",
+        default=None,
+        help="Filter to a single launch flow (correlation id)",
+    )
+    sp.add_argument("--event", default=None, help="Filter to a single event type")
+    sp.add_argument("--lines", type=int, default=None, help="Show only the most recent N events")
+    sp.add_argument(
+        "--json", action="store_true", help="Emit one JSON object per line instead of a table"
+    )
+
+    sp = sub.add_parser(
+        "activity-log",
+        help="Append one lifecycle event to the activity log (internal)",
+    )
+    sp.add_argument("event", help="Event name")
+    sp.add_argument("--worktree-id", default=None, help="Worktree ID (default: resolved from cwd)")
+    sp.add_argument("--session-id", default=None)
+    sp.add_argument(
+        "--launch-id", dest="launch_id", default=None, help="Launch-flow correlation id"
+    )
+    sp.add_argument("--source", default="launcher")
+    sp.add_argument(
+        "--field", action="append", default=[], help="Extra context as key=value (repeatable)"
+    )
+
+    # internal; dispatched detached by _maybe_prune, never run interactively
+    sp = sub.add_parser(
+        "activity-prune-worker",
+        help="Prune a large activity log in the background (internal)",
+    )
+    sp.add_argument("path", help="Path to the activity.jsonl log to prune")
+    sp.add_argument("retention_days", help="Retention window in days")
+
+
 def cmd_activity(args) -> int:
     """``agent-worktrees activity`` -- view the lifecycle log."""
     since = None
@@ -317,14 +737,49 @@ def cmd_activity(args) -> int:
     return 0
 
 
+def cmd_activity_prune_worker(args) -> int:
+    """``agent-worktrees activity-prune-worker`` -- internal, hidden.
+
+    Performs the actual synchronous rewrite dropped out of ``log_event()``'s
+    own call path (see ``_maybe_prune``/``_dispatch_background_prune``).
+    Only ever invoked as a detached, windowless background child -- never
+    run this directly from an interactive flow.
+    """
+    path = Path(getattr(args, "path"))
+    try:
+        retention_days = int(getattr(args, "retention_days"))
+    except (TypeError, ValueError):
+        retention_days = RETENTION_DAYS
+    _prune(path, retention_days)
+    return 0
+
+
 def cmd_activity_log(args) -> int:
     """``agent-worktrees activity-log`` -- append one event (launcher hook).
 
     Extra context is passed as repeatable ``--field key=value`` args.
+
+    ``--worktree-id`` defaults to the explicit CLI value; when omitted, it is
+    auto-resolved from the current working directory the same way most other
+    subcommands do (:func:`worktree_identity._infer_worktree_id_from_cwd`).
+    A caller that cannot be resolved either way fails loudly (non-zero exit
+    + stderr) rather than silently appending a `worktree_id: null` entry --
+    such an entry is invisible to `agent-worktrees activity --worktree-id
+    <id>` (it only surfaces when querying with no worktree filter at all),
+    defeating the log's main use as a per-worktree durable trace
+    (copilot-extensions#2631).
     """
     event = getattr(args, "event", None)
     if not event:
         print("Usage: activity-log EVENT [--worktree-id ID] ...", file=sys.stderr)
+        return 1
+    worktree_id = getattr(args, "worktree_id", None) or _infer_worktree_id_from_cwd()
+    if not worktree_id:
+        print(
+            "activity-log: could not determine worktree ID from --worktree-id "
+            "or the current directory; pass --worktree-id explicitly.",
+            file=sys.stderr,
+        )
         return 1
     fields: dict[str, object] = {}
     for item in getattr(args, "field", None) or []:
@@ -335,7 +790,7 @@ def cmd_activity_log(args) -> int:
                 fields[key] = value
     log_event(
         event,
-        worktree_id=getattr(args, "worktree_id", None),
+        worktree_id=worktree_id,
         session_id=getattr(args, "session_id", None),
         launch_id=getattr(args, "launch_id", None),
         source=getattr(args, "source", None) or "launcher",

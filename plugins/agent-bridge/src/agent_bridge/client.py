@@ -3,23 +3,22 @@
 Used by CLI commands to talk to a running agent-bridge service.
 Uses only stdlib (urllib) to avoid adding runtime dependencies.
 """
-
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
 import yaml
 
+from .client_cli_mode import CliModeClientMixin
+from .client_worktree_restart import WorktreeRestartMixin
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-
 DEFAULT_RESTART_GRACE = 30.0
 DEFAULT_SESSION_SETTLE_GRACE = 5.0
 
@@ -27,7 +26,7 @@ DEFAULT_SESSION_SETTLE_GRACE = 5.0
 class BridgeClientError(Exception):
     """Raised when the API returns an error."""
 
-    def __init__(self, status: int, detail: str) -> None:
+    def __init__(self, status: int, detail: Any) -> None:
         self.status = status
         self.detail = detail
         super().__init__(f"HTTP {status}: {detail}")
@@ -42,7 +41,109 @@ class BridgeConnectionError(Exception):
     """
 
 
-class BridgeClient:
+class SseStream(Iterator[dict[str, Any]]):
+    """Closable incremental SSE parser used by long-lived subscriptions."""
+
+    def __init__(self, response: Any) -> None:
+        self._response = response
+        self._lines = iter(response)
+        self._event_type = ""
+        self._event_id = ""
+        self._data_lines: list[str] = []
+        self.headers = getattr(response, "headers", {})
+
+    def __iter__(self) -> SseStream:
+        return self
+
+    def __enter__(self) -> SseStream:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: object,
+        _exc: object,
+        _traceback: object,
+    ) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            self._close_safely()
+
+    def __del__(self) -> None:
+        self._close_safely()
+
+    def _close_safely(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
+
+    def _close_on_exhaustion(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __next__(self) -> dict[str, Any]:
+        while True:
+            try:
+                raw_line = next(self._lines)
+            except StopIteration:
+                self._close_on_exhaustion()
+                raise
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+
+            if line.startswith(":"):
+                body = line[1:].strip()
+                if body.startswith("tool_progress"):
+                    raw = body[len("tool_progress"):].strip()
+                    try:
+                        data = json.loads(raw) if raw else {}
+                    except json.JSONDecodeError:
+                        data = {}
+                    return {
+                        "id": "",
+                        "event": "tool_progress",
+                        "data": data,
+                    }
+                return {"id": "", "event": "_heartbeat", "data": {}}
+            if line.startswith("id: "):
+                self._event_id = line[4:]
+            elif line.startswith("event: "):
+                self._event_type = line[7:]
+            elif line.startswith("data: "):
+                self._data_lines.append(line[6:])
+            elif line == "":
+                if not self._data_lines:
+                    self._event_type = ""
+                    self._event_id = ""
+                    continue
+                raw_data = "\n".join(self._data_lines)
+                try:
+                    parsed = json.loads(raw_data)
+                except json.JSONDecodeError:
+                    parsed = {"raw": raw_data}
+                event = {
+                    "id": self._event_id,
+                    "event": self._event_type or parsed.get("event", ""),
+                    "data": parsed.get("data", parsed),
+                }
+                if "timestamp" in parsed:
+                    event["timestamp"] = parsed["timestamp"]
+                if "continuity_id" in parsed:
+                    event["continuity_id"] = parsed["continuity_id"]
+                self._event_type = ""
+                self._event_id = ""
+                self._data_lines = []
+                return event
+
+    def close(self) -> None:
+        response, self._response = self._response, None
+        if response is not None:
+            response.close()
+
+
+class BridgeClient(CliModeClientMixin, WorktreeRestartMixin):
     """Sync HTTP client for the agent-bridge REST API."""
 
     def __init__(
@@ -96,21 +197,16 @@ class BridgeClient:
 
     @classmethod
     def from_config(cls) -> BridgeClient:
-        """Build a client from ~/.agent-bridge/ config and auth files.
+        """Build a client from the active agent-bridge config and auth files.
 
         Fails clearly if the auth token is missing (unlike the server
         path which auto-generates one).
         """
-        import os
-
+        from .config import config_dir
         from .models import default_port
 
-        config_dir = Path(
-            os.environ.get("AGENT_BRIDGE_CONFIG_DIR", "~/.agent-bridge")
-        ).expanduser()
-
         # Load config
-        cfg_path = config_dir / "config.yaml"
+        cfg_path = config_dir() / "config.yaml"
         port = default_port()
         bind = "127.0.0.1"
         if cfg_path.exists():
@@ -130,44 +226,38 @@ class BridgeClient:
         elif bind == "::":
             bind = "::1"
 
-        # The static config port is the *fallback*. Prefer the routing table
-        # (active.json) so a zero-downtime redeploy that flipped to a new port
-        # transparently reroutes this client -- without it the CLI would dial a
-        # retired daemon mid-cutover. The table is consulted unless explicitly
-        # overridden; absence falls back to the config port (backward compatible).
         base_url = f"http://{bind}:{port}"
         explicit = os.environ.get("AGENT_BRIDGE_BASE_URL")
-        # A live re-resolver follows a dynamic-port cutover on a connection
-        # rejection. Enabled only on the routing-table discovery path --
-        # an explicit URL or a disabled routing table pins the endpoint, so
-        # re-resolution stays off there (the operator dialed a specific daemon).
         reresolve: "Callable[[], str | None] | None" = None
         if explicit:
-            # Highest priority: the deploy orchestrator dials a *specific*
-            # daemon (old or passive) by URL, bypassing the table entirely.
             base_url = explicit.rstrip("/")
         elif os.environ.get("AGENT_BRIDGE_NO_ROUTING_TABLE") not in ("1", "true"):
             def _reresolve_from_table() -> str | None:
-                """The current listener-verified active endpoint, or None.
-
-                ``verify_listener=True`` skips an advertised-but-dead port
-                (healing active->previous), so a stale entry pointing at a
-                retired daemon is never handed back as 'live'."""
+                """Current listener-verified active endpoint, including forwards."""
                 try:
+                    from .routing_state import forwarded_route_base_url
                     from zdd.routing import read_active_endpoint
 
-                    ep = read_active_endpoint(config_dir, verify_listener=True)
+                    forwarded = forwarded_route_base_url(config_dir())
+                    if forwarded is not None:
+                        return forwarded
+                    ep = read_active_endpoint(config_dir(), verify_listener=True)
                 except Exception:
                     return None
                 return ep.base_url if ep is not None else None
 
             reresolve = _reresolve_from_table
             try:
+                from .routing_state import forwarded_route_base_url
                 from zdd.routing import read_active_endpoint
 
-                ep = read_active_endpoint(config_dir)
-                if ep is not None:
-                    base_url = ep.base_url
+                forwarded = forwarded_route_base_url(config_dir())
+                if forwarded is not None:
+                    base_url = forwarded
+                else:
+                    ep = read_active_endpoint(config_dir())
+                    if ep is not None:
+                        base_url = ep.base_url
             except Exception:
                 # The routing table is an optimization, never a hard dependency.
                 pass
@@ -187,7 +277,7 @@ class BridgeClient:
             timeout = 120
 
         # Load auth token -- fail if missing
-        auth_path = config_dir / "auth.yaml"
+        auth_path = config_dir() / "auth.yaml"
         if not auth_path.exists():
             print(
                 "[FAIL] Auth token not found at %s\n"
@@ -219,7 +309,7 @@ class BridgeClient:
         path: str,
         body: dict[str, Any] | None = None,
         *,
-        params: dict[str, str] | None = None,
+        params: dict[str, Any] | list[tuple[str, Any]] | None = None,
         request_timeout: float | None = None,
     ) -> dict[str, Any] | None:
         """Make an authenticated HTTP request. Returns parsed JSON or None for 204."""
@@ -228,8 +318,14 @@ class BridgeClient:
         def _build_request() -> urllib.request.Request:
             url = f"{self._base}{path}"
             if params:
+                pairs = (
+                    list(params.items())
+                    if isinstance(params, dict)
+                    else params
+                )
                 qs = urllib.parse.urlencode(
-                    {k: v for k, v in params.items() if v is not None}
+                    [(key, value) for key, value in pairs if value is not None],
+                    doseq=True,
                 )
                 if qs:
                     url = f"{url}?{qs}"
@@ -244,6 +340,7 @@ class BridgeClient:
             nonlocal req
             if self._reresolve is None:
                 return False
+            self._daemon_proto = None
             new_base = self._reresolve()
             if not new_base or new_base.rstrip("/") == self._base:
                 return False
@@ -259,6 +356,8 @@ class BridgeClient:
         session_deadline: float | None = None
         session_replacement_used = False
         readiness_deadline: float | None = None
+        drain_deadline: float | None = None
+        drain_replacement_used = False
         backoff = 0.25
         while True:
             try:
@@ -275,12 +374,36 @@ class BridgeClient:
                     detail = json.loads(exc.read().decode()).get("detail", str(exc))
                 except Exception:
                     detail = str(exc)
-                if exc.code == 503 and "initializing" in str(detail).lower():
+                detail_text = str(detail).lower()
+                if exc.code == 503 and any(w in detail_text for w in ("initializing", "merging")):
                     if readiness_deadline is None:
                         readiness_deadline = (
                             _time.monotonic() + self._connect_grace
                         )
                     if _time.monotonic() + backoff < readiness_deadline:
+                        _time.sleep(backoff)
+                        backoff = min(backoff * 2, 1.0)
+                        continue
+                # A graceful-cutover drain gate answers new-session/new-turn
+                # requests with 503 "draining" from the *retiring* daemon
+                # while it waits for its successor to take over -- this is a
+                # normal, bounded, self-resolving condition (typically well
+                # under a second), not a genuine failure. Follow the routing
+                # table to the new daemon (mirroring the 404 session-settle
+                # case below) and retry within the same bounded grace window
+                # instead of raising a hard error mid-drain (#3179: an
+                # unhandled BridgeClientError here previously escaped as a raw
+                # traceback from CLI commands like `create` that do not wrap
+                # every internal call in their own try/except).
+                if exc.code == 503 and "draining" in detail_text:
+                    if drain_deadline is None:
+                        drain_deadline = _time.monotonic() + self._connect_grace
+                        backoff = 0.25
+                    if not drain_replacement_used:
+                        if _follow_active_endpoint():
+                            drain_replacement_used = True
+                            continue
+                    if _time.monotonic() + backoff < drain_deadline:
                         _time.sleep(backoff)
                         backoff = min(backoff * 2, 1.0)
                         continue
@@ -304,7 +427,19 @@ class BridgeClient:
                         backoff = min(backoff * 2, 1.0)
                         continue
                 raise BridgeClientError(exc.code, detail) from exc
-            except urllib.error.URLError:
+            except (urllib.error.URLError, ConnectionResetError) as exc:
+                reset = (
+                    isinstance(exc, ConnectionResetError)
+                    or (
+                        isinstance(exc, urllib.error.URLError)
+                        and isinstance(exc.reason, ConnectionResetError)
+                    )
+                )
+                if reset and method not in ("GET", "HEAD"):
+                    raise BridgeConnectionError(
+                        f"Connection to agent-bridge at {self._base} reset "
+                        f"during non-idempotent {method}; request was not retried"
+                    ) from exc
                 if self._outage_deadline is None:
                     self._outage_deadline = (
                         _time.monotonic() + self._connect_grace
@@ -338,8 +473,8 @@ class BridgeClient:
                     backoff = min(backoff * 2, 1.0)
                     continue
                 raise BridgeConnectionError(
-                    f"Cannot connect to agent-bridge at {self._base}"
-                )
+                    f"Cannot connect to agent-bridge at {self._base}: {exc}"
+                ) from exc
 
     def refresh_endpoint(self) -> bool:
         """Re-resolve the daemon endpoint from the routing table.
@@ -353,6 +488,7 @@ class BridgeClient:
         True when the base actually changed. Safe/no-op when the client was built
         without a re-resolver.
         """
+        self._daemon_proto = None
         if self._reresolve is None:
             return False
         new_base = self._reresolve()
@@ -362,8 +498,12 @@ class BridgeClient:
         return True
 
     def _stream_sse(
-        self, path: str, *, params: dict[str, str] | None = None
-    ) -> Iterator[dict[str, Any]]:
+        self,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> SseStream:
         """Stream SSE events from an endpoint. Yields parsed event dicts.
 
         Raises ``BridgeConnectionError`` if the service is unreachable so the
@@ -377,9 +517,12 @@ class BridgeClient:
             if qs:
                 url = f"{url}?{qs}"
 
-        req = urllib.request.Request(url)
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(url, data=data)
         req.add_header("Authorization", f"Bearer {self._token}")
         req.add_header("Accept", "text/event-stream")
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
 
         try:
             resp = urllib.request.urlopen(req, timeout=120)
@@ -396,56 +539,7 @@ class BridgeClient:
             ) from exc
 
         self._mark_connected()
-        try:
-            event_type = ""
-            event_id = ""
-            data_lines: list[str] = []
-
-            for raw_line in resp:
-                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-
-                if line.startswith(":"):
-                    # SSE comment. ``: tool_progress <json>`` carries quiet-
-                    # period liveness (the in-flight tool call the remote is
-                    # blocked on); any other comment is a bare heartbeat. Both
-                    # are cursor-neutral (no id) -- they let the streaming
-                    # engine show progress and check for turn completion during
-                    # silence, without touching the durable event stream.
-                    body = line[1:].strip()
-                    if body.startswith("tool_progress"):
-                        raw = body[len("tool_progress"):].strip()
-                        try:
-                            data = json.loads(raw) if raw else {}
-                        except json.JSONDecodeError:
-                            data = {}
-                        yield {"id": "", "event": "tool_progress", "data": data}
-                    else:
-                        yield {"id": "", "event": "_heartbeat", "data": {}}
-                    continue
-                elif line.startswith("id: "):
-                    event_id = line[4:]
-                elif line.startswith("event: "):
-                    event_type = line[7:]
-                elif line.startswith("data: "):
-                    data_lines.append(line[6:])
-                elif line == "":
-                    # End of event block
-                    if data_lines:
-                        raw_data = "\n".join(data_lines)
-                        try:
-                            parsed = json.loads(raw_data)
-                        except json.JSONDecodeError:
-                            parsed = {"raw": raw_data}
-                        yield {
-                            "id": event_id,
-                            "event": event_type or parsed.get("event", ""),
-                            "data": parsed.get("data", parsed),
-                        }
-                    event_type = ""
-                    event_id = ""
-                    data_lines = []
-        finally:
-            resp.close()
+        return SseStream(resp)
 
     # -- API methods ---------------------------------------------------------
 
@@ -525,19 +619,39 @@ class BridgeClient:
         agents, _errors = self.list_agents_with_diagnostics()
         return agents
 
-    def list_agents_with_diagnostics(
-        self,
-    ) -> tuple[list[dict[str, Any]], list[str]]:
+    def list_agents_with_diagnostics(self) -> tuple[list[dict[str, Any]], list[str]]:
         """GET /api/v1/agents, including invalid-topology diagnostics."""
-        resp = self._request("GET", "/api/v1/agents")
-        if not resp:
-            return [], []
-        errors = [str(e) for e in resp.get("topology_errors", [])]
-        return resp.get("agents", []), errors
+        agents, errors, _incomplete, _known = self.list_agents_with_incomplete()
+        return agents, errors
 
-    def get_agent(self, name: str) -> dict[str, Any]:
+    def list_agents_with_incomplete(
+        self, *, force_refresh: bool = False, require_complete: bool = False,
+    ) -> tuple[list[dict[str, Any]], list[str], list[str], bool]:
+        """GET /api/v1/agents incl. topology errors, namespaces incomplete
+        this call, and whether the response carries the key at all (an
+        older daemon omits it, since key *presence* is the capability
+        signal, no protocol negotiation needed)."""
+        from .client_agents import agent_roster_params
+        params = agent_roster_params(self, force_refresh, require_complete)
+        resp = self._request("GET", "/api/v1/agents", params=params or None)
+        if not resp:
+            return [], [], [], False
+        capability_known = "incomplete_namespaces" in resp
+        errors = [str(e) for e in resp.get("topology_errors", [])]
+        incomplete = (
+            [str(p) for p in resp.get("incomplete_namespaces", [])]
+            if capability_known else []
+        )
+        return resp.get("agents", []), errors, incomplete, capability_known
+
+    def get_agent(
+        self, name: str, *, include_unaddressable: bool = False
+    ) -> dict[str, Any]:
         """GET /api/v1/agents/{name}"""
-        return self._request("GET", f"/api/v1/agents/{name}") or {}
+        path = f"/api/v1/agents/{name}"
+        if include_unaddressable:
+            path += "?include_unaddressable=true"
+        return self._request("GET", path) or {}
 
     def list_machines(self) -> list[dict[str, Any]]:
         """GET /api/v1/machines"""
@@ -635,9 +749,24 @@ class BridgeClient:
                 return {}
             raise
 
+    def resolve_live_result_target(self, handle: str) -> dict[str, Any]:
+        """Resolve a represented live or wedged target for result inspection."""
+        self._require_represented_result_snapshots()
+        try:
+            return self._request(
+                "GET",
+                "/api/v1/live-sessions/result-target",
+                params={"handle": handle},
+            ) or {}
+        except BridgeClientError as exc:
+            if exc.status == 404:
+                return {}
+            raise
+
     def send_live_message(
         self, session_id: str, *, sender: str, body: str,
         reply_to: str | None = None, kind: str = "prompt",
+        delivery: str = "steer",
         wait: bool = False, wait_timeout: float | None = None,
         idempotency_key: str | None = None,
         expected_session_id: str | None = None,
@@ -656,6 +785,8 @@ class BridgeClient:
             payload["reply_to"] = reply_to
         if kind and kind != "prompt":
             payload["kind"] = kind
+        if delivery and delivery != "steer":
+            payload["delivery"] = delivery
         if idempotency_key:
             payload["idempotency_key"] = idempotency_key
         if expected_session_id:
@@ -735,6 +866,98 @@ class BridgeClient:
             params={"ref": ref},
         ) or {}
 
+    def _require_attention_waits(self) -> None:
+        from .protocol import ATTENTION_WAIT_PROTOCOL_VERSION
+
+        if not self.daemon_supports(ATTENTION_WAIT_PROTOCOL_VERSION):
+            version, _minimum = self.daemon_protocol()
+            raise BridgeClientError(
+                426,
+                "attention waits require agent-bridge HTTP protocol "
+                f"v{ATTENTION_WAIT_PROTOCOL_VERSION}; the daemon advertises "
+                f"v{version}. Update the agent-bridge plugin + runtime.",
+            )
+
+    def wait_for_attention(
+        self,
+        session_ref: str,
+        *,
+        reasons: list[str],
+        position: str | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> dict[str, Any]:
+        """Return one cursor-neutral bounded attention wait result."""
+        self._require_attention_waits()
+        params: list[tuple[str, Any]] = [
+            ("reason", reason) for reason in reasons
+        ]
+        params.append(("timeout_seconds", timeout_seconds))
+        if position:
+            params.append(("position", position))
+        return self._request(
+            "GET",
+            f"/api/v1/sessions/{session_ref}/attention",
+            params=params,
+            request_timeout=max(self._timeout, timeout_seconds + 5.0),
+        ) or {}
+
+    def answer_permission(
+        self, session_id: str, request_id: str, option_id: str
+    ) -> dict[str, Any]:
+        """Resolve one correlated permission request."""
+        self._require_attention_waits()
+        return self._request(
+            "POST",
+            f"/api/v1/sessions/{session_id}/permission",
+            body={"request_id": request_id, "option_id": option_id},
+        ) or {}
+
+    def _require_represented_result_snapshots(self) -> None:
+        from .protocol import REPRESENTED_RESULT_SNAPSHOT_PROTOCOL_VERSION
+
+        if not self.daemon_supports(REPRESENTED_RESULT_SNAPSHOT_PROTOCOL_VERSION):
+            version, _minimum = self.daemon_protocol()
+            raise BridgeClientError(
+                426,
+                "represented result snapshots require agent-bridge HTTP "
+                f"protocol v{REPRESENTED_RESULT_SNAPSHOT_PROTOCOL_VERSION}; "
+                f"the daemon advertises v{version}. Update the agent-bridge "
+                "plugin + runtime.",
+            )
+
+    def get_live_result_snapshot(
+        self,
+        session_ref: str,
+        *,
+        position: str | None = None,
+        max_items: int | None = None,
+        max_text_chars: int | None = None,
+    ) -> dict[str, Any]:
+        """GET /api/v1/live-sessions/{ref}/result after a capability gate."""
+        self._require_represented_result_snapshots()
+        params: dict[str, Any] = {}
+        if position:
+            params["position"] = position
+        if max_items is not None:
+            params["max_items"] = max_items
+        if max_text_chars is not None:
+            params["max_text_chars"] = max_text_chars
+        return self._request(
+            "GET", f"/api/v1/live-sessions/{session_ref}/result",
+            params=params or None,
+        ) or {}
+
+    def expand_live_result_ref(
+        self, session_ref: str, ref: str
+    ) -> dict[str, Any]:
+        """GET represented result detail for one process-lifetime reference."""
+        self._require_represented_result_snapshots()
+        return self._request(
+            "GET",
+            f"/api/v1/live-sessions/{session_ref}/result/detail",
+            params={"ref": ref},
+        ) or {}
+
     def answer_ask_user(
         self,
         session_id: str,
@@ -764,6 +987,7 @@ class BridgeClient:
         self,
         *,
         agent: str | None = None,
+        charter: str | None = None,
         target_dir: str | None = None,
         caller_id: str | None = None,
         sender_repo: str | None = None,
@@ -771,21 +995,23 @@ class BridgeClient:
         force_new: bool = False,
         parity_fault: str | None = None,
         worktree_id: str | None = None,
-        reclaim: bool = False,
         env: dict[str, str] | None = None,
         model: str | None = None,
         effort: str | None = None,
+        copilot_args: list[str] | None = None,
         request_timeout: float | None = None,
     ) -> dict[str, Any]:
         """POST /api/v1/sessions
 
-        ``worktree_id`` targets an *existing* worktree (a session roll). When it
-        is set, the server enforces the session-lifecycle head guard: a create
+        ``worktree_id`` targets an *existing* worktree (a session roll). When
+        set, the server enforces the session-lifecycle head guard: a create
         into a worktree whose ground-layer head is active or whose numbered
         handoff is pending is refused (409 ``worktree_head_active`` /
-        ``worktree_head_pending``) unless ``reclaim=true`` -- the
-        break-glass take-over (sibling of ``resume_worktree(reclaim=...)``).
+        ``worktree_head_pending``) with no break-glass of its own (Phase 3)
+        -- ``resume_worktree(reclaim=True)`` resumes-or-creates it instead.
 
+        ``charter`` binds a ``.github/agents/<charter>.agent.md`` overlay via
+        ``copilot_args`` (``--agent <charter>``), independent of ``agent``.
         ``env`` sets per-session environment overrides merged onto the resolved
         agent's declared env and applied to the spawned Copilot CLI -- e.g. BYOK
         provider selection (``COPILOT_PROVIDER_BASE_URL`` / ``COPILOT_MODEL``).
@@ -793,6 +1019,8 @@ class BridgeClient:
         body: dict[str, Any] = {}
         if agent:
             body["agent"] = agent
+        if args := (["--agent", charter, *(copilot_args or [])] if charter else copilot_args):
+            body["copilot_args"] = args
         if target_dir:
             body["target_dir"] = target_dir
         if caller_id:
@@ -818,8 +1046,6 @@ class BridgeClient:
             body["parity_fault"] = parity_fault
         if worktree_id:
             body["worktree_id"] = worktree_id
-        if reclaim:
-            body["reclaim"] = True
         if env:
             body["env"] = env
         if model:
@@ -980,14 +1206,40 @@ class BridgeClient:
             or {}
         )
 
-    def end_session(self, session_id: str, *, force: bool = False) -> None:
+    def end_session(
+        self,
+        session_id: str,
+        *,
+        force: bool = False,
+        if_idle: bool = False,
+    ) -> None:
         """DELETE /api/v1/sessions/{id}
 
         ``force`` maps to the route's ``?force=true`` — tear down even with
         active background sub-agent tasks (they are killed). See #191.
+        ``if_idle`` maps to ``?if_idle=true`` and atomically refuses teardown
+        unless the session is idle or stopped with no queued prompts. It
+        requires a daemon that advertises the conditional-idle-end protocol.
         """
-        params = {"force": "true"} if force else None
-        self._request("DELETE", f"/api/v1/sessions/{session_id}", params=params)
+        if if_idle:
+            from .protocol import CONDITIONAL_IDLE_END_PROTOCOL_VERSION
+
+            if not self.daemon_supports(CONDITIONAL_IDLE_END_PROTOCOL_VERSION):
+                raise BridgeClientError(
+                    426,
+                    "Conditional idle end requires agent-bridge HTTP protocol "
+                    f"{CONDITIONAL_IDLE_END_PROTOCOL_VERSION} or newer.",
+                )
+        params: dict[str, str] = {}
+        if force:
+            params["force"] = "true"
+        if if_idle:
+            params["if_idle"] = "true"
+        self._request(
+            "DELETE",
+            f"/api/v1/sessions/{session_id}",
+            params=params or None,
+        )
 
     def handoff_session(
         self, session_id: str, *, reason: str | None = None, seed: bool = True
@@ -1021,6 +1273,35 @@ class BridgeClient:
             "POST",
             f"/api/v1/worktrees/{worktree_id}/handoff",
             params=params or None,
+        ) or {}
+
+    def handoff_request(
+        self,
+        worktree_id: str,
+        *,
+        session_id: str,
+        seed_text: str,
+        handoff_token: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /api/v1/worktrees/{id}/handoff-request -- external control-plane
+        ping for a worktree's current session.
+
+        The caller already composed the successor's exact opening turn
+        (``seed_text``) and identifies the session it believes currently owns
+        the worktree. This supplements, but does not replace, agent-bridge's
+        internal ACP auto-handoff path. Returns the successor's SessionInfo on
+        success.
+        """
+        body: dict[str, Any] = {
+            "session_id": session_id,
+            "seed_text": seed_text,
+        }
+        if handoff_token:
+            body["handoff_token"] = handoff_token
+        return self._request(
+            "POST",
+            f"/api/v1/worktrees/{worktree_id}/handoff-request",
+            body=body,
         ) or {}
 
     def gc(self) -> dict[str, Any]:
@@ -1079,7 +1360,10 @@ class BridgeClient:
         *,
         after: int | None = None,
         caller_id: str | None = None,
-    ) -> Iterator[dict[str, Any]]:
+        controlled: bool = False,
+        continuity_id: str | None = None,
+        transient: bool = False,
+    ) -> SseStream:
         """GET /api/v1/sessions/{id}/events (SSE stream).
 
         ``after=None`` + ``caller_id`` resumes from the caller's last-acked
@@ -1091,6 +1375,12 @@ class BridgeClient:
             params["after"] = str(after)
         if caller_id:
             params["caller_id"] = caller_id
+        if controlled:
+            params["controlled"] = "true"
+        if continuity_id is not None:
+            params["continuity_id"] = continuity_id
+        if transient:
+            params["transient"] = "true"
         return self._stream_sse(
             f"/api/v1/sessions/{session_id}/events",
             params=params or None,
@@ -1122,7 +1412,12 @@ class BridgeClient:
         return resp or {"last_acked_id": 0, "head_id": 0}
 
     def ack_cursor(
-        self, session_id: str, last_id: int, *, caller_id: str | None = None
+        self,
+        session_id: str,
+        last_id: int,
+        *,
+        caller_id: str | None = None,
+        continuity_id: str | None = None,
     ) -> int:
         """POST /api/v1/sessions/{id}/cursor -- confirm delivery up to last_id.
 
@@ -1131,10 +1426,258 @@ class BridgeClient:
         body: dict[str, Any] = {"last_id": last_id}
         if caller_id:
             body["caller_id"] = caller_id
+        if continuity_id is not None:
+            body["continuity_id"] = continuity_id
         resp = self._request(
             "POST", f"/api/v1/sessions/{session_id}/cursor", body
         )
         return resp.get("last_acked_id", last_id) if resp else last_id
+
+    @staticmethod
+    def _remote_path(host: str, suffix: str) -> str:
+        return (
+            "/api/v1/remote/"
+            + urllib.parse.quote(host, safe="")
+            + suffix
+        )
+
+    def _require_remote_operations(self) -> None:
+        from .protocol import REMOTE_OPERATIONS_PROTOCOL_VERSION
+
+        if not self.daemon_supports(REMOTE_OPERATIONS_PROTOCOL_VERSION):
+            version, _minimum = self.daemon_protocol()
+            raise BridgeClientError(
+                426,
+                "remote Bridge operations require agent-bridge HTTP protocol "
+                f"v{REMOTE_OPERATIONS_PROTOCOL_VERSION}; the daemon advertises "
+                f"v{version}. Update the agent-bridge plugin + runtime.",
+            )
+
+    def _require_remote_commands(self) -> None:
+        from .protocol import REMOTE_COMMANDS_PROTOCOL_VERSION
+
+        if not self.daemon_supports(REMOTE_COMMANDS_PROTOCOL_VERSION):
+            version, _minimum = self.daemon_protocol()
+            raise BridgeClientError(
+                426,
+                "remote Bridge commands require agent-bridge HTTP protocol "
+                f"v{REMOTE_COMMANDS_PROTOCOL_VERSION}; the daemon advertises "
+                f"v{version}. Update the agent-bridge plugin + runtime.",
+            )
+
+    def get_remote_session_status(
+        self, host: str, session_id: str, *, caller_id: str
+    ) -> dict[str, Any]:
+        """Read exact session status through the local carrier owner."""
+        self._require_remote_operations()
+        return self._request(
+            "GET",
+            self._remote_path(
+                host,
+                "/sessions/"
+                + urllib.parse.quote(session_id, safe="")
+                + "/status",
+            ),
+            params={"caller_id": caller_id},
+        ) or {}
+
+    def resolve_remote_live_session(
+        self, host: str, target: str
+    ) -> dict[str, Any]:
+        """Resolve an exact session or worktree handle on a hosting Bridge."""
+        self._require_remote_operations()
+        return self._request(
+            "GET",
+            self._remote_path(
+                host,
+                "/live-sessions/"
+                + urllib.parse.quote(target, safe=""),
+            ),
+        ) or {}
+
+    def create_remote_session(
+        self,
+        host: str,
+        *,
+        agent: str,
+        prompt: str,
+        caller_id: str,
+        timeout: float = 120.0,
+    ) -> dict[str, Any]:
+        """Create and seed a new hosting-Bridge session through the carrier."""
+        self._require_remote_commands()
+        return self._request(
+            "POST",
+            self._remote_path(host, "/sessions"),
+            {
+                "agent": agent,
+                "prompt": prompt,
+                "caller_id": caller_id,
+                "timeout": timeout,
+            },
+            request_timeout=timeout + 15.0,
+        ) or {}
+
+    def stop_remote_session(
+        self,
+        host: str,
+        session_id: str,
+        *,
+        force: bool = False,
+        reap_host: bool = False,
+        timeout: float = 20.0,
+    ) -> None:
+        """Stop a hosting-Bridge session through the shared carrier."""
+        self._require_remote_commands()
+        self._request(
+            "POST",
+            self._remote_path(
+                host,
+                "/sessions/"
+                + urllib.parse.quote(session_id, safe="")
+                + "/stop",
+            ),
+            {
+                "force": force,
+                "reap_host": reap_host,
+                "timeout": timeout,
+            },
+            request_timeout=timeout + 15.0,
+        )
+
+    def end_remote_session(
+        self,
+        host: str,
+        session_id: str,
+        *,
+        force: bool = False,
+        if_idle: bool = False,
+        timeout: float = 20.0,
+    ) -> None:
+        """End a hosting-Bridge session through the shared carrier."""
+        self._require_remote_commands()
+        self._request(
+            "POST",
+            self._remote_path(
+                host,
+                "/sessions/"
+                + urllib.parse.quote(session_id, safe="")
+                + "/end",
+            ),
+            {
+                "force": force,
+                "if_idle": if_idle,
+                "timeout": timeout,
+            },
+            request_timeout=timeout + 15.0,
+        )
+
+    def send_remote_live_message(
+        self,
+        host: str,
+        target: str,
+        *,
+        sender: str,
+        message: str,
+        kind: str = "prompt",
+        delivery: str = "steer",
+        expected_session_id: str | None = None,
+        idempotency_key: str | None = None,
+        timeout: float = 20.0,
+    ) -> dict[str, Any]:
+        """Deliver to a represented remote session through the carrier."""
+        self._require_remote_commands()
+        return self._request(
+            "POST",
+            self._remote_path(
+                host,
+                "/live-sessions/"
+                + urllib.parse.quote(target, safe="")
+                + "/messages",
+            ),
+            {
+                "sender": sender,
+                "message": message,
+                "kind": kind,
+                "delivery": delivery,
+                "expected_session_id": expected_session_id,
+                "idempotency_key": idempotency_key,
+                "timeout": timeout,
+            },
+            request_timeout=timeout + 15.0,
+        ) or {}
+
+    def stream_remote_events(
+        self,
+        host: str,
+        session_id: str,
+        *,
+        caller_id: str,
+        after: int | None = None,
+        continuity_id: str | None = None,
+    ) -> SseStream:
+        """Stream exact hosting-Bridge events through the shared carrier."""
+        self._require_remote_operations()
+        params = {"caller_id": caller_id}
+        if after is not None:
+            params["after"] = str(after)
+        if continuity_id is not None:
+            params["continuity_id"] = continuity_id
+        return self._stream_sse(
+            self._remote_path(
+                host,
+                "/sessions/"
+                + urllib.parse.quote(session_id, safe="")
+                + "/events",
+            ),
+            params=params,
+        )
+
+    def stream_remote_event_multiplex(
+        self, subscriptions: list[dict[str, Any]]
+    ) -> SseStream:
+        """Stream several exact remote sessions over one local SSE connection."""
+        from .protocol import REMOTE_EVENT_MULTIPLEX_PROTOCOL_VERSION
+
+        if not self.daemon_supports(REMOTE_EVENT_MULTIPLEX_PROTOCOL_VERSION):
+            version, _minimum = self.daemon_protocol()
+            raise BridgeClientError(
+                426,
+                "remote event multiplexing requires agent-bridge HTTP protocol "
+                f"v{REMOTE_EVENT_MULTIPLEX_PROTOCOL_VERSION}; the daemon "
+                f"advertises v{version}. Update the agent-bridge plugin + runtime.",
+            )
+        return self._stream_sse(
+            "/api/v1/remote/events",
+            body={"subscriptions": subscriptions},
+        )
+
+    def ack_remote_cursor(
+        self,
+        host: str,
+        session_id: str,
+        last_id: int,
+        *,
+        caller_id: str,
+        continuity_id: str | None,
+    ) -> int:
+        """Acknowledge a remote event only after local delivery is accepted."""
+        self._require_remote_operations()
+        response = self._request(
+            "POST",
+            self._remote_path(
+                host,
+                "/sessions/"
+                + urllib.parse.quote(session_id, safe="")
+                + "/cursor",
+            ),
+            body={
+                "caller_id": caller_id,
+                "last_id": last_id,
+                "continuity_id": continuity_id,
+            },
+        )
+        return response.get("last_acked_id", last_id) if response else last_id
 
     def read_range(
         self, session_id: str, *, start: int = 0, end: int | None = None

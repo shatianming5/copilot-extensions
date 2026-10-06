@@ -9,6 +9,7 @@ from conftest import make_session_dir
 from agent_worktrees import config as cfg
 from agent_worktrees import installer
 from agent_worktrees import session_catalog
+from agent_worktrees import session_projection
 from agent_worktrees import sessions
 from agent_worktrees import tracking
 
@@ -244,6 +245,300 @@ def test_mux_catalog_refreshes_hint_and_monitor_registry(
     assert reconciler.has_live_worktree_mux is True
 
 
+def test_dark_worktree_with_no_live_process_stops_fsmonitor(
+    tmp_path, monkeypatch
+):
+    """A worktree observed mux-dark right now, with no live Copilot process,
+    gets its fsmonitor daemon reaped -- level-triggered, so it also covers a
+    worktree that was ALREADY dark before this reconciler ever started
+    watching it (the common case for a long-finalized worktree whose daemon
+    `git` quietly restarted from an unrelated later command; #2270)."""
+    rec = _record("wt-mux", str(tmp_path / "wt-mux"), sessions_list=[])
+    tracking_dir, _state_dir = _wire(tmp_path, monkeypatch, [rec])
+    monkeypatch.setattr(sessions, "worktree_has_live_session", lambda record: False)
+    stopped: list[str] = []
+    monkeypatch.setattr(
+        tracking, "stop_fsmonitor_daemon", lambda path: stopped.append(path))
+
+    reconciler = session_catalog.ResidentSessionReconciler(
+        record_budget=8, session_budget=8)
+    reconciler.observe_mux(set())  # no live wt-* mux sessions this tick
+
+    reconciler.step()
+
+    assert stopped == [rec.worktree_path]
+
+
+def test_dark_worktree_with_live_process_does_not_stop_fsmonitor(
+    tmp_path, monkeypatch
+):
+    """A bare/bound Copilot process still holding the worktree's session lock
+    vetoes the reap even though mux itself is dark."""
+    rec = _record("wt-mux", str(tmp_path / "wt-mux"), sessions_list=[])
+    tracking_dir, _state_dir = _wire(tmp_path, monkeypatch, [rec])
+    monkeypatch.setattr(sessions, "worktree_has_live_session", lambda record: True)
+    stopped: list[str] = []
+    monkeypatch.setattr(
+        tracking, "stop_fsmonitor_daemon", lambda path: stopped.append(path))
+
+    reconciler = session_catalog.ResidentSessionReconciler(
+        record_budget=8, session_budget=8)
+    reconciler.observe_mux(set())
+
+    reconciler.step()
+
+    assert stopped == []
+
+
+def test_finalized_worktree_still_gets_reaped(tmp_path, monkeypatch):
+    """A finalized record is exactly the case the level-triggered check exists
+    for: its directory is deliberately kept, so a daemon can (and does, in
+    practice) come back after finalization from an unrelated incidental git
+    command. The active-only bookkeeping (heads/projections/mux registration)
+    must still be skipped for it."""
+    rec = _record("wt-done", str(tmp_path / "wt-done"), sessions_list=[])
+    rec.status = "finalized"
+    tracking_dir, _state_dir = _wire(tmp_path, monkeypatch, [rec])
+    monkeypatch.setattr(sessions, "worktree_has_live_session", lambda record: False)
+    stopped: list[str] = []
+    monkeypatch.setattr(
+        tracking, "stop_fsmonitor_daemon", lambda path: stopped.append(path))
+
+    reconciler = session_catalog.ResidentSessionReconciler(
+        record_budget=8, session_budget=8)
+    reconciler.observe_mux(set())
+
+    report = reconciler.step()
+
+    assert stopped == [rec.worktree_path]
+    assert report["records"] == 0  # active-only bookkeeping correctly skipped
+
+
+def test_fsmonitor_reap_is_cooldown_throttled(tmp_path, monkeypatch):
+    """A persistently-dark record costs one reap attempt per cooldown window,
+    not one per tick -- otherwise a stale worktree left forever would spawn
+    `git fsmonitor--daemon stop` on every ~15s resident-monitor tick."""
+    rec = _record("wt-mux", str(tmp_path / "wt-mux"), sessions_list=[])
+    _wire(tmp_path, monkeypatch, [rec])
+    monkeypatch.setattr(sessions, "worktree_has_live_session", lambda record: False)
+    stopped: list[str] = []
+    monkeypatch.setattr(
+        tracking, "stop_fsmonitor_daemon", lambda path: stopped.append(path))
+    now = {"value": 1000.0}
+    monkeypatch.setattr(
+        session_catalog.time, "monotonic", lambda: now["value"])
+
+    reconciler = session_catalog.ResidentSessionReconciler(
+        record_budget=8, session_budget=8)
+    reconciler.observe_mux(set())
+
+    reconciler.step()
+    now["value"] += 1.0  # well within the cooldown window
+    reconciler.step()
+
+    assert stopped == [rec.worktree_path]  # only the first tick reaped
+
+    now["value"] += session_catalog._FSMONITOR_REAP_COOLDOWN_S + 1.0
+    reconciler.observe_mux(set())  # refresh the mux snapshot's freshness window
+    reconciler.step()
+
+    assert stopped == [rec.worktree_path, rec.worktree_path]  # cooldown elapsed
+
+
+# --- repo-scoped freshness sweep (worktree-finality-and-obligations Phase 9) -
+
+def _fake_git_result(returncode: int):
+    class _Result:
+        pass
+    r = _Result()
+    r.returncode = returncode
+    return r
+
+
+def test_repo_freshness_sweep_fetches_and_records_when_stale(
+    tmp_path, monkeypatch
+):
+    from agent_worktrees import git_ops
+
+    wt_dir = tmp_path / "wt-a"
+    wt_dir.mkdir()
+    rec = _record("wt-a", str(wt_dir), sessions_list=[])
+    rec.repo = "owner/repo"
+    _wire(tmp_path, monkeypatch, [rec])
+    monkeypatch.setattr(sessions, "worktree_has_live_session", lambda record: False)
+    monkeypatch.setattr(tracking, "is_repo_fetch_fresh", lambda repo: False)
+    fetch_calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        git_ops, "git",
+        lambda *args, **kw: (
+            fetch_calls.append((args, kw.get("cwd"))) or _fake_git_result(0)
+        ),
+    )
+    recorded: list[str] = []
+    monkeypatch.setattr(
+        tracking, "record_repo_fetch_confirmed", lambda repo: recorded.append(repo))
+
+    reconciler = session_catalog.ResidentSessionReconciler(
+        record_budget=8, session_budget=8)
+    reconciler.step()
+
+    assert len(fetch_calls) == 1
+    assert fetch_calls[0][1] == str(wt_dir)
+    assert recorded == ["owner/repo"]
+
+
+def test_repo_freshness_sweep_skips_when_already_fresh(tmp_path, monkeypatch):
+    from agent_worktrees import git_ops
+
+    wt_dir = tmp_path / "wt-a"
+    wt_dir.mkdir()
+    rec = _record("wt-a", str(wt_dir), sessions_list=[])
+    rec.repo = "owner/repo"
+    _wire(tmp_path, monkeypatch, [rec])
+    monkeypatch.setattr(sessions, "worktree_has_live_session", lambda record: False)
+    monkeypatch.setattr(tracking, "is_repo_fetch_fresh", lambda repo: True)
+    fetch_calls: list = []
+    monkeypatch.setattr(
+        git_ops, "git", lambda *a, **kw: fetch_calls.append(1) or _fake_git_result(0))
+
+    reconciler = session_catalog.ResidentSessionReconciler(
+        record_budget=8, session_budget=8)
+    reconciler.step()
+
+    assert fetch_calls == []
+
+
+def test_repo_freshness_sweep_does_not_record_on_fetch_failure(
+    tmp_path, monkeypatch
+):
+    from agent_worktrees import git_ops
+
+    wt_dir = tmp_path / "wt-a"
+    wt_dir.mkdir()
+    rec = _record("wt-a", str(wt_dir), sessions_list=[])
+    rec.repo = "owner/repo"
+    _wire(tmp_path, monkeypatch, [rec])
+    monkeypatch.setattr(sessions, "worktree_has_live_session", lambda record: False)
+    monkeypatch.setattr(tracking, "is_repo_fetch_fresh", lambda repo: False)
+    monkeypatch.setattr(git_ops, "git", lambda *a, **kw: _fake_git_result(1))
+    recorded: list[str] = []
+    monkeypatch.setattr(
+        tracking, "record_repo_fetch_confirmed", lambda repo: recorded.append(repo))
+
+    reconciler = session_catalog.ResidentSessionReconciler(
+        record_budget=8, session_budget=8)
+    reconciler.step()
+
+    assert recorded == []
+
+
+def test_repo_freshness_sweep_skips_missing_directory(tmp_path, monkeypatch):
+    from agent_worktrees import git_ops
+
+    rec = _record("wt-a", str(tmp_path / "does-not-exist"), sessions_list=[])
+    rec.repo = "owner/repo"
+    _wire(tmp_path, monkeypatch, [rec])
+    monkeypatch.setattr(sessions, "worktree_has_live_session", lambda record: False)
+    monkeypatch.setattr(tracking, "is_repo_fetch_fresh", lambda repo: False)
+    fetch_calls: list = []
+    monkeypatch.setattr(
+        git_ops, "git", lambda *a, **kw: fetch_calls.append(1) or _fake_git_result(0))
+
+    reconciler = session_catalog.ResidentSessionReconciler(
+        record_budget=8, session_budget=8)
+    reconciler.step()
+
+    assert fetch_calls == []
+
+
+def test_repo_freshness_sweep_runs_without_any_mux_observation(
+    tmp_path, monkeypatch
+):
+    """Unlike the fsmonitor reap, the repo-freshness sweep is NOT mux-gated:
+    it must still fetch even when `observe_mux` was never called this
+    session (mux unavailable/not yet observed)."""
+    from agent_worktrees import git_ops
+
+    wt_dir = tmp_path / "wt-a"
+    wt_dir.mkdir()
+    rec = _record("wt-a", str(wt_dir), sessions_list=[])
+    rec.repo = "owner/repo"
+    _wire(tmp_path, monkeypatch, [rec])
+    monkeypatch.setattr(sessions, "worktree_has_live_session", lambda record: False)
+    monkeypatch.setattr(tracking, "is_repo_fetch_fresh", lambda repo: False)
+    fetch_calls: list = []
+    monkeypatch.setattr(
+        git_ops, "git", lambda *a, **kw: fetch_calls.append(1) or _fake_git_result(0))
+    recorded: list[str] = []
+    monkeypatch.setattr(
+        tracking, "record_repo_fetch_confirmed", lambda repo: recorded.append(repo))
+
+    reconciler = session_catalog.ResidentSessionReconciler(
+        record_budget=8, session_budget=8)
+    # NOTE: no reconciler.observe_mux(...) call at all.
+    reconciler.step()
+
+    assert recorded == ["owner/repo"]
+
+
+def test_repo_freshness_sweep_is_per_repo_not_per_worktree(tmp_path, monkeypatch):
+    """Two worktrees of the SAME repo cost one fetch per cooldown window
+    total, not one per worktree."""
+    from agent_worktrees import git_ops
+
+    wt_a = tmp_path / "wt-a"
+    wt_b = tmp_path / "wt-b"
+    wt_a.mkdir()
+    wt_b.mkdir()
+    rec_a = _record("wt-a", str(wt_a), sessions_list=[])
+    rec_a.repo = "owner/repo"
+    rec_b = _record("wt-b", str(wt_b), sessions_list=[])
+    rec_b.repo = "owner/repo"
+    _wire(tmp_path, monkeypatch, [rec_a, rec_b])
+    monkeypatch.setattr(sessions, "worktree_has_live_session", lambda record: False)
+    monkeypatch.setattr(tracking, "is_repo_fetch_fresh", lambda repo: False)
+    fetch_calls: list = []
+    monkeypatch.setattr(
+        git_ops, "git", lambda *a, **kw: fetch_calls.append(1) or _fake_git_result(0))
+
+    reconciler = session_catalog.ResidentSessionReconciler(
+        record_budget=8, session_budget=8)
+    reconciler.step()
+
+    assert len(fetch_calls) == 1
+
+
+def test_repo_freshness_sweep_is_cooldown_throttled(tmp_path, monkeypatch):
+    from agent_worktrees import git_ops
+
+    wt_dir = tmp_path / "wt-a"
+    wt_dir.mkdir()
+    rec = _record("wt-a", str(wt_dir), sessions_list=[])
+    rec.repo = "owner/repo"
+    _wire(tmp_path, monkeypatch, [rec])
+    monkeypatch.setattr(sessions, "worktree_has_live_session", lambda record: False)
+    monkeypatch.setattr(tracking, "is_repo_fetch_fresh", lambda repo: False)
+    fetch_calls: list = []
+    monkeypatch.setattr(
+        git_ops, "git", lambda *a, **kw: fetch_calls.append(1) or _fake_git_result(0))
+    now = {"value": 1000.0}
+    monkeypatch.setattr(
+        session_catalog.time, "monotonic", lambda: now["value"])
+
+    reconciler = session_catalog.ResidentSessionReconciler(
+        record_budget=8, session_budget=8)
+    reconciler.step()
+    now["value"] += 1.0  # well within the cooldown window
+    reconciler.step()
+
+    assert len(fetch_calls) == 1  # only the first tick fetched
+
+    now["value"] += session_catalog._REPO_FRESHNESS_SWEEP_COOLDOWN_S + 1.0
+    reconciler.step()
+
+    assert len(fetch_calls) == 2  # cooldown elapsed
+
+
 def test_stale_mux_observation_is_not_restamped(tmp_path, monkeypatch):
     rec = _record("wt-mux", str(tmp_path / "wt-mux"), sessions_list=[])
     tracking_dir, _state_dir = _wire(tmp_path, monkeypatch, [rec])
@@ -306,3 +601,100 @@ def test_record_cursor_counts_non_yaml_entries_toward_budget(
     reconciler.step()
 
     assert reconciler._record_iter is not None
+
+
+def test_dark_record_repairs_projection_with_fixed_budget(
+    tmp_path, monkeypatch
+):
+    rec = _record(
+        "wt-a",
+        str(tmp_path / "wt-a"),
+        sessions_list=[
+            tracking.SessionEntry("session-a", "2026-06-01T10:00:00"),
+            tracking.SessionEntry("session-b", "2026-06-02T10:00:00"),
+        ],
+        head="session-b",
+    )
+    _tracking_dir, state_dir = _wire(tmp_path, monkeypatch, [rec])
+    for session_id in ("session-a", "session-b"):
+        make_session_dir(state_dir, session_id, rec.worktree_path)
+    monkeypatch.setattr(sessions, "worktree_has_live_session", lambda record: False)
+
+    reconciler = session_catalog.ResidentSessionReconciler(
+        record_budget=8,
+        session_budget=1,
+        projection_budget=1,
+    )
+    reconciler.observe_mux(set())
+    first = reconciler.step()
+    second = reconciler.step()
+
+    assert first["projection_checked"] == 1
+    assert second["projection_checked"] == 1
+    assert first["projection_written"] + second["projection_written"] == 2
+    for session_id in ("session-a", "session-b"):
+        projection = session_projection.read(session_id)
+        assert projection is not None
+        assert projection["relations"][0]["worktree_id"] == "wt-a"
+    assert reconciler.step()["projection_checked"] == 0
+
+
+def test_live_record_projection_repair_is_report_only(
+    tmp_path, monkeypatch
+):
+    rec = _record(
+        "wt-a",
+        str(tmp_path / "wt-a"),
+        sessions_list=[
+            tracking.SessionEntry("session-a", "2026-06-01T10:00:00"),
+        ],
+        head="session-a",
+    )
+    _tracking_dir, state_dir = _wire(tmp_path, monkeypatch, [rec])
+    make_session_dir(state_dir, "session-a", rec.worktree_path)
+    monkeypatch.setattr(sessions, "worktree_has_live_session", lambda record: True)
+
+    reconciler = session_catalog.ResidentSessionReconciler(
+        record_budget=8,
+        session_budget=1,
+        projection_budget=1,
+    )
+    reconciler.observe_mux(set())
+    report = reconciler.step()
+
+    assert report["projection_live_conflicts"] == 1
+    assert session_projection.read("session-a") is None
+
+
+def test_ref_only_controller_does_not_suppress_later_projection() -> None:
+    rec = _record("wt-a", "/tmp/wt-a", sessions_list=[])
+    rec.controllers = [
+        tracking.ControllerRelation(
+            kind="worktree",
+            source="explicit",
+            relation_revision=1,
+            created_at="2026-06-01T10:00:00",
+            controller_ref="host/test/parent",
+        ),
+        tracking.ControllerRelation(
+            kind="session",
+            source="explicit",
+            relation_revision=2,
+            created_at="2026-06-02T10:00:00",
+            controller_session_id="session-b",
+        ),
+    ]
+    rec.controller_revision = 2
+    reconciler = session_catalog.ResidentSessionReconciler(
+        projection_budget=4
+    )
+
+    reconciler._queue_projection_repairs(
+        "project-a",
+        Path("wt-a.yaml"),
+        rec,
+    )
+
+    assert ("project-a", "session-b", "controller") in (
+        reconciler._projection_queue
+    )

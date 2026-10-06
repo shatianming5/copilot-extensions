@@ -56,6 +56,17 @@ class BridgeSession:
     def decorator_count(self) -> int:
         return len(self._pipeline.decorators) if self._pipeline is not None else 0
 
+    @property
+    def has_pending(self) -> bool:
+        """True while at least one client message is mid-dispatch.
+
+        The authoritative liveness signal for an idle self-reap (#3876): a
+        bridge must never be reaped while a request is still awaiting its
+        upstream response, however long that takes, even past an otherwise
+        elapsed idle window.
+        """
+        return bool(self._tasks)
+
     async def start(self) -> None:
         """Build the injector + transport + upstream client + pipeline, connect."""
         injector = build_injector(self.cfg)
@@ -66,7 +77,19 @@ class BridgeSession:
         self._client.on_unsolicited(self._write)
         ctx = BridgeContext(new_id=self._client.new_id, emit_to_client=self._write)
         self._pipeline = Pipeline(build_decorators(self.cfg, ctx), self._client.request)
-        await self._transport.start()
+        # Bound the upstream spawn/connect the same way OneShotSession does
+        # (see the downstream tracker): an unbounded ``transport.start()`` here
+        # doesn't wedge a shared lock the way a WarmPool entry-open would, but
+        # it still leaves one caller (the ``agent-mcp bridge`` stdio process,
+        # or one ``serve`` attach connection) hanging forever with no
+        # diagnostic, holding an fd/subprocess slot open indefinitely.
+        try:
+            await asyncio.wait_for(self._transport.start(), timeout=self.cfg.timeout)
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            raise RuntimeError(
+                f"upstream transport did not start within {self.cfg.timeout}s"
+            ) from exc
+
 
     async def _dispatch(self, msg: dict) -> None:
         assert self._pipeline is not None

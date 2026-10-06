@@ -27,18 +27,21 @@ resource.)
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import ParseResult, urlparse
 
 from agent_procutil import no_window_flags
 
 from . import config as cfg
 from . import repos as repos_mod
 from . import sweep as sweep_mod
-from . import tracking
+from . import tracking, tracking_claims
 
 log = logging.getLogger(__name__)
 
@@ -69,20 +72,56 @@ def _creationflags() -> int:
     return no_window_flags()
 
 
-def _run_codespaces(args: list[str], *, timeout: float = 300.0):
-    """Run ``agent-codespaces <args>``; return the process, or None if unrunnable."""
-    binstub = shutil.which("agent-codespaces")
-    if not binstub:
+def _run_codespaces(args: list[tuple[str, bool]], *, timeout: float = 660.0):
+    """Run agent-codespaces via the identity-verified ``codespace:``
+    claim-provider registry (claim-provider-pattern effort); return the
+    process, or None if unrunnable. Resolves the provider's own
+    payload-local binstub -- never an ambient ``PATH`` lookup -- closing the
+    tier-3 -> tier-8 upward call this effort exists to fix. Degrades
+    identically to the prior ``shutil.which`` behavior when no provider is
+    registered (e.g. agent-codespaces not installed): returns None.
+
+    ``args`` is an ordered ``(token, trusted)`` sequence -- ``trusted=True``
+    for a static/literal subcommand name or flag this module itself wrote
+    (e.g. ``"claim-reclaim"``, ``"--apply"``), ``trusted=False`` for a
+    persisted value (a CodeSpace name). Passed straight through to
+    ``claim_providers.build_provider_argv``, which validates every
+    ``trusted=False`` token before it ever reaches a possibly-cmd.exe-wrapped
+    argv (see that helper's own docstring for why a leading-dash heuristic
+    would be unsafe here).
+
+    Default timeout (660s, matching
+    ``claim_providers._RECLAIM_CALLBACK_TIMEOUT_SECONDS``) budgets for
+    ``agent-codespaces claim-reclaim``'s own internal chain: pre-delete
+    session recovery (boot up to 180s, THEN pull up to 300s, THEN the
+    session-sync-push subprocess up to 60s) THEN the delete subprocess
+    itself (a further 60s timeout) -- every phase must complete in FULL
+    sequence within this call's own timeout, not just the first, with
+    margin left over.
+    """
+    from . import claim_providers
+
+    providers, _findings = claim_providers.discover_claim_providers()
+    provider = providers.get("codespace")
+    if provider is None:
         return None
-    try:
-        return subprocess.run(
-            [binstub, *args],
-            capture_output=True, text=True, timeout=timeout,
-            creationflags=_creationflags(),
-        )
-    except Exception as exc:  # binstub vanished / exec error
-        log.debug("agent-codespaces %s failed to run: %s", args[:2], exc)
+    full_argv = claim_providers.build_provider_argv_for_manifest(
+        provider,
+        *args,
+        kind="reclaim",
+    )
+    if full_argv is None:
         return None
+    proc = claim_providers._run_provider_process(
+        provider,
+        callback_args=tuple(token for token, _trusted in args),
+        legacy_command=full_argv,
+        timeout=timeout,
+    )
+    if proc is None:
+        log.debug("agent-codespaces %s failed to run", [t for t, _ in args][:2])
+        return None
+    return proc
 
 
 def _run_worktrees(args: list[str], *, cwd: str | None = None,
@@ -93,7 +132,7 @@ def _run_worktrees(args: list[str], *, cwd: str | None = None,
     cross-project reclaim runs the binstub with ``cwd`` set to the child's repo
     anchor.
     """
-    binstub = shutil.which("agent-worktrees")
+    binstub = shutil.which("agent-worktrees")  # marketplace-isolation: allow legacy-compatibility
     if not binstub:
         return None
     try:
@@ -107,41 +146,47 @@ def _run_worktrees(args: list[str], *, cwd: str | None = None,
         return None
 
 
-def _looks_gone(output: str) -> bool:
-    """Heuristic: does a failed delete mean the CodeSpace is already gone?
-
-    ``agent-codespaces delete`` on a non-existent box exits non-zero with an
-    HTTP 404 / Not Found from ``gh`` -- the resource is *already* reclaimed, so
-    the obligation is discharged. Any other failure is a genuine failure.
-    """
-    low = output.lower()
-    return "404" in low or "not found" in low or "could not resolve" in low
-
-
 def reclaim_codespace(name: str, *, apply: bool) -> ReclaimResult:
-    """Reclaim an orphaned CodeSpace by deleting it (best-effort, idempotent).
+    """Reclaim an orphaned CodeSpace via the provider's own ``claim-reclaim``
+    callback (best-effort, idempotent).
 
-    In dry-run (``apply=False``) reports the intent without acting. On apply,
-    shells ``agent-codespaces delete <name> --force`` (keeps the graceful
-    pre-delete Copilot-session recovery, skips the interactive prompt). Exit 0
-    -> reclaimed; a 404/not-found -> already gone -> reclaimed (idempotent); any
-    other outcome -> failed (entry retained).
+    In dry-run (``apply=False``) reports the intent without acting. On
+    apply, invokes ``agent-codespaces claim-reclaim <name> --apply`` --
+    NOT the legacy human-facing ``delete ... --force`` shape this used to
+    shell directly, which bypassed the callback's own lease guard and
+    pre-delete session-recovery gate (claim-provider-pattern effort review
+    finding: "Invoke claim-reclaim instead of the legacy delete command").
+    Parses the callback's small JSON envelope (``{"reclaimed": bool,
+    "detail": str}``, matching ``agent_worktrees.claim_providers``'
+    ``resolve_claim_reclaim`` contract) rather than grepping free-text
+    stdout for a 404/not-found heuristic -- the callback already resolves
+    idempotent-already-gone itself and reports it as ``reclaimed: true``.
     """
     if not name:
         return ReclaimResult("failed", "orphan entry has no CodeSpace name")
     if not apply:
         return ReclaimResult("reclaimed", f"would delete CodeSpace {name}")
-    proc = _run_codespaces(["delete", name, "--force"])
+    proc = _run_codespaces([("claim-reclaim", True), (name, False), ("--apply", True)])
     if proc is None:
         return ReclaimResult("failed", "agent-codespaces binstub unavailable")
-    if proc.returncode == 0:
-        return ReclaimResult("reclaimed", f"deleted CodeSpace {name}")
-    combined = f"{proc.stdout}\n{proc.stderr}"
-    if _looks_gone(combined):
-        return ReclaimResult("reclaimed", f"CodeSpace {name} already gone (404)")
-    tail = (proc.stderr or proc.stdout or "").strip().splitlines()
-    detail = tail[-1] if tail else f"delete exited {proc.returncode}"
-    return ReclaimResult("failed", f"delete failed: {detail}")
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        detail = tail[-1] if tail else f"claim-reclaim exited {proc.returncode}"
+        return ReclaimResult("failed", f"claim-reclaim failed: {detail}")
+    try:
+        data = json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        return ReclaimResult(
+            "failed", f"claim-reclaim returned invalid JSON: {proc.stdout.strip()!r}"
+        )
+    if not isinstance(data, dict) or not isinstance(data.get("reclaimed"), bool):
+        return ReclaimResult(
+            "failed", f"claim-reclaim returned an unexpected shape: {proc.stdout.strip()!r}"
+        )
+    detail = data.get("detail") or (
+        f"reclaimed CodeSpace {name}" if data["reclaimed"] else f"could not reclaim CodeSpace {name}"
+    )
+    return ReclaimResult("reclaimed" if data["reclaimed"] else "failed", detail)
 
 
 def reclaim_worktree(
@@ -216,11 +261,251 @@ def reclaim_worktree(
     return ReclaimResult("failed", f"finalize refused: {detail}")
 
 
+def _parse_provider_url(value: str) -> ParseResult | None:
+    try:
+        parsed = urlparse(value if "://" in value else f"//{value}")
+    except ValueError:
+        return None
+    if not parsed.hostname or parsed.username or parsed.password:
+        return None
+    return parsed
+
+
+def _same_provider_origin(
+    left: ParseResult, right: ParseResult, *, require_scheme: bool = True,
+) -> bool:
+    try:
+        left_port = left.port
+        if left_port is None:
+            left_port = {"http": 80, "https": 443}.get(
+                (left.scheme or "https").lower()
+            )
+        right_port = right.port
+        if right_port is None:
+            right_port = {"http": 80, "https": 443}.get(
+                (right.scheme or "https").lower()
+            )
+    except ValueError:
+        return False
+    return (
+        bool(left.hostname and right.hostname)
+        and left.hostname.casefold() == right.hostname.casefold()
+        and left_port == right_port
+        and (
+            not require_scheme
+            or (left.scheme or "https").casefold()
+            == (right.scheme or "https").casefold()
+        )
+    )
+
+
+def _pr_claim_target(
+    ref: str, prcfg: cfg.PRConfig,
+) -> tuple[str, str, int, str] | None:
+    """Resolve a stored PR claim into provider, repo, number, and API base."""
+    # Reached only via reclaim_pr's dispatch table, keyed exclusively on
+    # kind="pr" -- restrict to that exact kind, not the broader
+    # PR_LIKE_KINDS, so a mismatched bug/issue-kind canonical ref can never
+    # be silently accepted as a PR target here.
+    ref = tracking_claims.decanonicalize_ref(
+        ref, expected_kinds=frozenset({"pr"}),
+    )
+    configured_provider = (getattr(prcfg, "provider", "") or "").strip().lower()
+    api_base = (getattr(prcfg, "api_base", "") or "").strip()
+    short = re.fullmatch(
+        r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)", (ref or "").strip(),
+    )
+    if short:
+        # The authority-less `owner/repo#N` shorthand is GitHub-only (see
+        # sweep.py's _GH_PR_SHORT grammar comment) -- Gitea and Azure DevOps
+        # claims always carry a full authority-bearing URL. Recognizing the
+        # shorthand for those providers would let a legacy slug/number be
+        # re-queried against a different service if the configured provider
+        # ever changes, deleting an unrelated obligation.
+        if configured_provider != "github":
+            return None
+        # The shorthand carries NO authority of its own, so it is only safe
+        # to resolve against the CURRENT configured authority when that
+        # authority is unambiguously the implicit default public
+        # github.com -- i.e. no api_base configured AND no ambient GH_HOST
+        # override. A shorthand claim created under that default, then
+        # later re-queried after GH_HOST is pointed at a different (e.g.
+        # Enterprise) host, would otherwise confirm an unrelated PR there
+        # and silently remove the original obligation. Require a full,
+        # authority-bearing URL instead whenever any non-default authority
+        # is configured.
+        from .providers.github import GitHubProvider
+
+        if GitHubProvider().authority_endpoint(api_base) != "github.com":
+            return None
+        return configured_provider, short.group(1), int(short.group(2)), api_base
+
+    try:
+        parsed = urlparse((ref or "").strip())
+        parsed_host = parsed.hostname
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed_host:
+        return None
+    if parsed.username or parsed.password:
+        return None
+    # Preserve the port: a bare ``parsed.hostname`` drops it, so an ambient
+    # ``GH_HOST=host:port`` authority would pass validation here but then
+    # have its port silently dropped before being handed to get_pull() as
+    # ``api_base`` below.
+    host = parsed_host.lower()
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    parts = [part for part in parsed.path.split("/") if part]
+
+    if configured_provider == "github":
+        from .providers.github import GitHubProvider
+
+        # Honor the provider's own ambient authority (GH_HOST) rather than
+        # hardcoding the public host -- otherwise every valid full-URL claim
+        # on a GitHub Enterprise host configured through GH_HOST would be
+        # rejected as "unconfigured".
+        expected_host = GitHubProvider().authority_endpoint(api_base)
+        if host == expected_host or (len(parts) >= 4 and parts[-2] == "pull"):
+            # Require the EXACT canonical ``owner/repo/pull/N`` shape (four
+            # segments, no query/fragment) regardless of whether
+            # ``api_base`` is configured -- an URL carrying extra leading
+            # segments (e.g. ``.../unrelated/owner/repo/pull/42``) is
+            # rejected rather than silently stripped down to its trailing
+            # four segments, which would extract the wrong repo identity.
+            if (
+                len(parts) != 4
+                or parts[-2] != "pull"
+                or not parts[-1].isdigit()
+                or parsed.scheme != "https"
+                or parsed.query
+                or parsed.fragment
+            ):
+                return None
+            if not api_base and parsed.netloc.casefold() != expected_host:
+                return None
+            repo_parts = parts[-4:-2]
+            if len(repo_parts) != 2:
+                return None
+            if api_base:
+                configured = _parse_provider_url(api_base)
+                if not configured or not _same_provider_origin(
+                    parsed, configured, require_scheme=False,
+                ):
+                    return None
+            elif host != expected_host:
+                return None
+            api_base = api_base or host
+            return "github", "/".join(repo_parts), int(parts[-1]), api_base
+
+    if configured_provider == "azure-devops" and (
+        host == "dev.azure.com" or host.endswith(".visualstudio.com")
+    ):
+        if parsed.query or parsed.fragment:
+            return None
+        # Require the EXACT canonical shape -- ``<org>/<project>/_git/<repo>
+        # /pullrequest/<N>`` on ``dev.azure.com`` (6 segments), or
+        # ``<project>/_git/<repo>/pullrequest/<N>`` on a classic
+        # ``*.visualstudio.com`` org host (5 segments). A URL carrying an
+        # extra/noncanonical segment anywhere in the path (e.g. injected
+        # between the org and project) is rejected outright rather than
+        # located by searching for "pullrequest"/"_git" anywhere in the
+        # path, which would still happen to extract a project/repo/number
+        # from a malformed URL as though it were the genuine canonical one.
+        expected_len = 6 if host == "dev.azure.com" else 5
+        if (
+            len(parts) != expected_len
+            or parts[-2] != "pullrequest"
+            or parts[-4] != "_git"
+            or not parts[-1].isdigit()
+        ):
+            return None
+        number, name, project = parts[-1], parts[-3], parts[-5]
+        if host == "dev.azure.com":
+            url_org = parts[0]
+            configured = _parse_provider_url(api_base)
+            if not configured or not _same_provider_origin(parsed, configured):
+                return None
+            configured_org = next(
+                (part for part in configured.path.split("/") if part), "",
+            )
+            if configured_org.casefold() != url_org.casefold():
+                return None
+        else:
+            configured = _parse_provider_url(api_base)
+            if not configured or not _same_provider_origin(parsed, configured):
+                return None
+        return "azure-devops", f"{project}/{name}", int(number), api_base
+
+    if configured_provider == "gitea":
+        if parsed.query or parsed.fragment:
+            return None
+        configured = _parse_provider_url(api_base)
+        if not configured or not _same_provider_origin(parsed, configured):
+            return None
+        # A path-hosted Gitea instance's `api_base` includes its own root
+        # path (e.g. ".../gitea"); same-origin alone doesn't rule out a
+        # claim URL under a DIFFERENT root on that same host (a different
+        # app entirely). Require the claim URL's path to actually be under
+        # the configured root before stripping it and extracting the repo.
+        base_parts = [part for part in configured.path.split("/") if part]
+        if base_parts and parts[:len(base_parts)] != base_parts:
+            return None
+        remaining = parts[len(base_parts):]
+        # Require the EXACT canonical ``owner/project/pulls/N`` shape --
+        # exactly four remaining segments after the configured root is
+        # stripped. Any extra/noncanonical segment ahead of that trailing
+        # four is rejected rather than silently stripped off.
+        if (
+            len(remaining) != 4
+            or remaining[-2] != "pulls"
+            or not remaining[-1].isdigit()
+        ):
+            return None
+        repo_parts = remaining[-4:-2]
+        if len(repo_parts) != 2:
+            return None
+        return "gitea", "/".join(repo_parts), int(remaining[-1]), api_base
+    return None
+
+
+def reclaim_pr(
+    ref: str, config: cfg.Config, *, apply: bool,
+) -> ReclaimResult:
+    """Release an orphaned PR claim only after the provider confirms it merged."""
+    prcfg = getattr(getattr(config, "default_repo", None), "pr", None)
+    if prcfg is None:
+        return ReclaimResult("failed", "PR provider configuration is unavailable")
+    target = _pr_claim_target(ref, prcfg)
+    if target is None:
+        return ReclaimResult("failed", "PR reference cannot be resolved safely")
+    provider_name, repo, number, api_base = target
+    try:
+        from . import providers
+
+        provider = providers.get_provider(provider_name)
+        token = providers.account_token_for_slug(repo, prcfg)
+        pull = provider.get_pull(
+            repo, number, api_base=api_base, token=token,
+        )
+    except Exception as exc:
+        return ReclaimResult("failed", f"PR provider lookup failed: {exc}")
+    merged = bool(getattr(pull, "merged", False)) or (
+        (getattr(pull, "state", "") or "").strip().lower() == "merged"
+    )
+    if not merged:
+        return ReclaimResult("skipped", "PR is not confirmed merged")
+    action = "would release" if not apply else "released"
+    return ReclaimResult("reclaimed", f"{action} confirmed merged PR {ref}")
+
+
 #: Kinds this consumer knows how to dispose of. Others are surfaced as
 #: ``unsupported`` (entry retained) until a reclaimer is wired.
 _RECLAIMERS = {
     "codespace": lambda ref, apply, config: reclaim_codespace(ref, apply=apply),
     "worktree": lambda ref, apply, config: reclaim_worktree(
+        ref, config, apply=apply),
+    "pr": lambda ref, apply, config: reclaim_pr(
         ref, config, apply=apply),
 }
 

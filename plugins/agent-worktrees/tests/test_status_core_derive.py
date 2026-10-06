@@ -7,7 +7,7 @@ without the optional TUI dep installed.
 
 from __future__ import annotations
 
-from agent_worktrees.picker_tui import derive
+from agent_worktrees.picker_support import derive
 
 
 def _raw(**kw):
@@ -40,6 +40,34 @@ class TestDispositionGlyph:
         # The glyph never leaks into ``state`` (bucket()/prune key off it).
         n = derive.norm(_raw(follow_up=True, summary="x"), "anomalous-potato", "win")
         assert n["state"] == "FINAL"
+
+
+class TestPausedGlyph:
+    """`paused` is purely informational -- a title glyph + a field, never fed
+    into bucket()/the prune verdict (unlike `follow_up`)."""
+
+    def test_paused_gets_glyph_and_field(self):
+        n = derive.norm(_raw(paused=True, title="Nudge subsystem"),
+                        "anomalous-potato", "win")
+        assert n["title"].startswith("\u23f8 ")  # ⏸ prefix
+        assert n["paused"] is True
+
+    def test_unpaused_has_no_glyph(self):
+        n = derive.norm(_raw(title="Done"), "anomalous-potato", "win")
+        assert not n["title"].startswith("\u23f8")
+        assert n["paused"] is False
+
+    def test_paused_state_stays_pure_for_bucketing(self):
+        n = derive.norm(_raw(paused=True), "anomalous-potato", "win")
+        assert n["state"] == "FINAL"
+
+    def test_paused_and_follow_up_glyphs_compose(self):
+        n = derive.norm(
+            _raw(follow_up=True, paused=True, summary="x"), "anomalous-potato", "win",
+        )
+        assert n["title"].startswith("\u23f8 \u271a ")  # ⏸ outside ✚
+        assert n["follow_up"] is True
+        assert n["paused"] is True
 
 
 class TestPairMarker:
@@ -179,6 +207,11 @@ class TestFastPassActive:
         n = derive.norm(self._raw_active(session_bound_live=True), "m", "e")
         assert n["state"] == "ACTIVE"
 
+    def test_execution_leg_live_marks_active_without_mux(self):
+        n = derive.norm(self._raw_active(execution_leg_live=True), "m", "e")
+        assert n["state"] == "ACTIVE"
+        assert n["sessionless"] is False
+
     def test_bridge_live_marks_active_without_git(self):
         # #4272 bridge-lock: no mux, no lock, no bound hint -- only a live
         # bridge.lock (a bridge-owned bare session) marks the worktree ACTIVE.
@@ -232,3 +265,27 @@ class TestFollowUpBucket:
     def test_fallback_unflagged_finalized_is_clean(self):
         assert derive._bucket_from_raw(
             {"id": "x", "status": "finalized"}) == "clean"
+
+
+class TestHeldClaimsBucket:
+    """The ``held-claims``/``held-claims-cross-machine`` cleanup buckets
+    emitted by ``prune.cleanup_disposition`` must each have their own
+    disposition-chip entry (a held-claims-blocked worktree must never render
+    with no chip at all) -- the cross-machine variant needs its own reason
+    naming the claim's target as remote, distinct from the generic one.
+    """
+
+    def test_held_claims_bucket_has_a_review_chip(self):
+        assert derive.BUCKET_DISPO["held-claims"] == "REVIEW"
+        assert "held-claims" in derive.BUCKET_REASON
+
+    def test_cross_machine_bucket_has_its_own_reason(self):
+        assert derive.BUCKET_DISPO["held-claims-cross-machine"] == "REVIEW"
+        assert derive.BUCKET_REASON["held-claims-cross-machine"] != (
+            derive.BUCKET_REASON["held-claims"])
+
+    def test_authoritative_cross_machine_bucket_passthrough(self):
+        n = derive.norm(
+            _raw(cleanup_bucket="held-claims-cross-machine"),
+            "anomalous-potato", "win")
+        assert n["cleanup_bucket"] == "held-claims-cross-machine"

@@ -150,13 +150,62 @@ files in this repo.**
    repo template is missing, run `efforts-setup`; that template is scaffolded
    from this skill's `assets/TEMPLATE.md`.
 4. **Fill the header + Guiding Intent + Request** — capture the operator's ask
-   **verbatim**; don't paraphrase the premise away.
+   **verbatim**; don't paraphrase the premise away. Then **validate the
+   capture** before moving on (see *Validate the capture* below) — this
+   requirement applies here and at every later rewrite.
 5. **Catalog participants.** If the work spans machines/CodeSpaces/containers,
    fill the `## Participants` section (binding + how each is reached, per the
    addendum).
 6. **Track it.** If the work warrants tracking, open an umbrella issue and
    cross-link it in the header.
 7. **Commit** the effort file on the working branch.
+
+## Validate the capture, then demarcate enhancements
+
+Every write to an effort's `README.md` that captures or updates operator
+intent — at creation, and at any later point where new operator guidance
+lands (a follow-up round, a resumed session, a direction change) — carries an
+explicit obligation: **before treating the write as done, re-read it back
+against the operator's actual words and confirm nothing was paraphrased away,
+softened, or silently added.** A captured effort that quietly drifts from
+what the operator actually said is worse than no capture at all, because it
+reads as authoritative.
+
+- **Validate against the source, within reason.** Compare the README's
+  Request/Guiding Intent/Plan against the operator's literal input for the
+  round just captured. Flag it back to the operator, in the same turn, when
+  you: omitted a stated constraint, softened a firm decision into an open
+  question, or added scope the operator didn't ask for.
+- **Demarcate agent-recommended enhancements.** Anything in the Plan,
+  Validation Plan, or Context that originated from the agent's own analysis
+  rather than the operator's stated request must be visibly marked as such —
+  an inline `_(agent-recommended)_` tag, or a dedicated subsection — so a
+  later reader (the operator, a reviewer, a resuming agent) can tell "the
+  operator asked for this" from "the agent proposed this and it was
+  accepted." Don't let recommended and requested content blend into one
+  undifferentiated list.
+- **Accumulate, then summarize.** A short back-and-forth (a clarifying
+  question, one follow-up round) can be captured verbatim inline in
+  **Request**, appended in sequence. Once operator input spans several rounds
+  or the verbatim text would dominate the README, stop accumulating inline:
+  write a **gist** in Request/Context (the settled premise, in your own
+  words, clearly labeled as a summary) and move the full back-and-forth to a
+  sidecar file.
+- **The sidecar: `<effort-folder>/inception-transcript.md`.** When the
+  verbatim record no longer belongs inline, create this file holding the full
+  operator-agent exchange that produced the effort (or a later major
+  direction change), and link it from the README's Request/Context section
+  (e.g. "Full inception exchange: `inception-transcript.md`"). This keeps the
+  README a navigable map — its own stated purpose — without losing the
+  authoritative record of what was actually said.
+- **Redaction is the one safety exception to verbatim capture** when the
+  repo is public/externally-shareable and the operator's own words name a
+  real private/internal identifier — never drop or soften the surrounding
+  *intent* to work around it, only the private specifics it doesn't depend
+  on. See *Keep internal specifics out of a public-facing effort*
+  (`references/efforts.md`) for the full technique, including why a name
+  swap alone is sometimes not enough and why the public README never links
+  to a private sidecar.
 
 ## Plan an effort
 
@@ -210,15 +259,9 @@ gate before executing:
 
 **The operator may waive their *own* review — but the agent's review-gate is
 non-optional when automated review is available.** Always route the plan through
-it before starting the project. Three reasons this matters:
-
-- **Reviewed plan** — execution proceeds from a plan something checked, not a
-  first draft.
-- **Cross-agent visibility** — a committed, merged effort is visible to *other*
-  agents, who can dedupe against it or co-work on it instead of starting parallel
-  work.
-- **Crash recovery** — if the driving agent dies, the committed effort is a
-  recovery point; work resumes from the file.
+it before starting the project: it guarantees a reviewed plan, cross-agent
+visibility (others can dedupe/co-work instead of starting parallel work), and a
+crash-recovery point if the driving agent dies.
 
 **Graceful degradation:** if the repo has no automated PR review (or isn't
 PR-gated at all), the gate collapses to "commit the plan, then execute" — there
@@ -234,7 +277,10 @@ The README is the shared contract — keep it **ahead of the conversation**. But
   need pushing anyway**. Routine checkbox ticks can ride along with the next
   substantive change.
 - **Annotate as you go:** mark Plan items complete, adjust pending designs,
-  re-prioritize on feedback, and journal decisions/blockers/dispatches.
+  re-prioritize on feedback, and journal decisions/blockers/dispatches. A
+  feedback round that changes the Request/Plan is itself a rewrite —
+  re-apply *Validate the capture, then demarcate enhancements* above before
+  moving on.
 - **By code-complete**, the README reflects the coding-done state and, at most,
   names the *next* effort that carries the work forward (deploy / smoke-test /
   delegation) — it does not try to own that next stretch.
@@ -242,7 +288,74 @@ The README is the shared contract — keep it **ahead of the conversation**. But
   commit is itself opening is a catch-22; record a PR only once it has merged.
   Remark open issues the effort spawned or still blocks on.
 
-### Cross-repo efforts — where the effort folder lives
+## Keep internal specifics out of a public-facing effort
+
+When the effort's own repo is public/externally-shareable, its Journal,
+Context, Request, and any linked sub-doc can't carry the same concrete detail
+a private knowledge repo's effort would — a real private/internal repo or
+system name, a private cross-organization issue reference, or a blow-by-blow
+internal-investigation narrative is exactly the kind of content that leaks,
+even inside an effort folder that otherwise looks like ordinary engineering
+notes. This is not a rule against cross-repo references in general — a
+fully-qualified reference to a genuinely *public* repo remains expected
+traceability. See *Keep internal specifics out of a public-facing effort* in
+`references/efforts.md` for the full technique (abstract the specifics
+rather than omitting the lesson, route the un-abstracted record to a private
+knowledge repo without linking to it from the public side, and apply the
+same bar everywhere, not just Journal entries).
+
+## Drive to completion, relentlessly
+
+A durably-journaled effort is what makes relentless driving safe: because the
+README and its Journal — not the conversation or a single session's memory —
+already carry the plan, the decisions, and what happened, the head session can
+keep selecting and executing the next Plan item across phases, PRs, and
+session boundaries **without waiting to be re-prompted for each step**. This
+is the `continue-until-closed` behavior the `efforts` vision commits to: the
+rightful head keeps driving until the effort's own completion gate is
+satisfied, not until one relay leg, PR, or checklist item happens to finish.
+
+In particular, **opening or pushing a reviewable change is not a stopping
+point** — it's mid-flight. Once a PR (or equivalent reviewable gate) exists,
+stay on it: watch for the verdict, and act on it immediately — once the
+target repo's own documented verdict/merge gate is satisfied (read that
+repo's own CONTRIBUTING-equivalent doc for what "satisfied" actually means
+there; many repos' automated reviewers never render a literal `Approve` on
+certain PRs — e.g. a repo owner's own self-merge PRs — and define a
+different passing shape instead, such as a clean non-blocking review with no
+Medium/High finding left open), merge; otherwise address requested changes
+and re-push, or resolve a conflict — through to merge, then continue with
+the effort's next Plan item. Do not assume "wait for Approve" as a universal
+rule, and do not trust a generic tooling field (e.g. a raw `eligible`/
+`reason` pair) over that repo's own documented verdict-shape when the two
+disagree (`agent-worktrees`'s own `pr-workflow.md` reference, "Default
+conduct: drive every PR you open through to merge," covers this in more
+detail, including a precedent (`ThomasMichon/copilot-extensions#3638`)
+where exactly this confusion stalled *merging* an already-converged PR for
+roughly 90 minutes past the point the target repo's own docs already called
+done — a separate problem from why that PR's review took 25 rounds to
+converge in the first place, which was carried-over review findings not
+clearing after being fixed, not this verdict/bypass confusion).
+Journal the outcome as you go so the next slice starts from a durable record,
+not from memory of what "should" happen next.
+
+**Stop short of driving further only for a genuine blocker:**
+
+- an **error** that needs diagnosis before it's safe to continue;
+- a **design crossroads** — a decision only the operator can make;
+- a **safety rail** — a destructive action, or anything else, that requires
+  explicit confirmation before proceeding;
+- a **handoff boundary** where automatic cutover to a successor session isn't
+  available (see the `context-handoff` skill, when present) — hand off
+  explicitly, naming the blocker and the next actionable step, rather than
+  stopping silently.
+
+None of these are satisfied by "this is a suitable stopping point," "the
+session has run long," or a completed phase/PR/handoff/session in isolation —
+those are exactly the false stops the effort's own completion gate exists to
+catch.
+
+## Cross-repo efforts — where the effort folder lives
 
 When an effort touches **another** repo, placement follows validated target
 capability, not directory presence, repository names, or private assumptions.
@@ -266,40 +379,25 @@ target all mean **host-owned orchestration**. Do not execute target code, source
 target files, or fetch individual remote files to manufacture a capability
 answer.
 
-After that check, choose among the placement models below (see
-[`references/efforts.md`](references/efforts.md) § Cross-repo placement for the
-fuller rationale).
+After that check, choose among the placement models below. **Host-owned
+orchestration is the default** — capability permits a target to own one
+canonical target-local effort, it does not silently move ownership out of the
+host. Full description of each model, and the several-hosts-one-target rule:
+[`references/efforts.md`](references/efforts.md) § Cross-repo placement.
 
-**Host-owned orchestration is the default.** A compatible target may own one
-canonical target-local effort when the stretch is predominantly about that
-target and placing the plan with its work and reviewers is an explicit,
-deliberate choice. Capability permits that placement; it does not silently move
-ownership out of the host.
+- **Local / tracking-only (default)** — the folder stays in *this* repo and
+  tracks work landing elsewhere.
+- **Build directly in the target repo** — only when the exact probe proves
+  adoption *and* the stretch is genuinely about that repo; author it there,
+  through that repo's own flow, keeping only a one-way reference back in the
+  host.
+- **Hybrid (split public/private)** — a canonical public/generalized effort
+  plus a private one that links to and elaborates it, never the reverse.
 
-- **Local / tracking-only (default).** The effort folder lives in *this*
-  (control) repo and coordinates work that lands elsewhere — the folder tracks,
-  the real changes happen in the target. Use when the work spans several targets,
-  or the target repo hasn't adopted `efforts/`.
-- **Build directly in the target repo.** If the **target repo has adopted
-  `efforts/`** according to the exact probe and the stretch is genuinely *about
-  that repo*, **prefer to author** one canonical target-owned effort **there**,
-  through *that repo's* flow — its grouping, tracker, review gate, and addendum —
-  instead of here. The host keeps only its own orchestration context and a
-  one-way reference to the target effort; the target effort does not point back
-  into host-private state.
-- **Hybrid (split public/private).** Keep a **generalized** effort in a
-  **public / portable** repo *and* a **fuller, downstream-private** effort in the
-  control repo that **links to it**. The **public effort is canonical** — it is
-  what other agents cite and what the plan is reviewed as; the private effort
-  *elaborates* it with deployment-specific context (private names, hosts, downstream
-  wiring) and links back. Keep the public artifact **generic** — no
-  downstream-private names — per the repo's public-artifact rule.
-
-When several hosts collaborate on one compatible target, the first host creates
-or claims the target-local effort through the target's normal coordination
-flow; later hosts discover and reference that same effort. Each host retains
-only its own orchestration context. Never create drifting peer copies, reciprocal
-ownership links, or a second target-local effort for the same scope.
+Never create drifting peer copies, reciprocal ownership links, or a second
+target-local effort for the same scope: the first host to collaborate on a
+compatible target claims it through that target's normal coordination flow,
+and later hosts discover and reference that same effort.
 
 **One ordering rule holds across all three: propose before you do.** Reviewers
 can't meaningfully comment on external work that's already committed, so:
@@ -360,7 +458,21 @@ change that realizes it.
 - ❌ New planning docs outside `efforts/` for fresh planning work → start an
   effort.
 - ❌ Paraphrasing the premise instead of capturing the **Request** verbatim.
+- ❌ Writing or updating an effort README from operator input without
+  validating the capture against the operator's actual words before moving
+  on — silently dropping a constraint, softening a decision into an open
+  question, or adding unrequested scope.
+- ❌ Letting agent-recommended Plan/Validation Plan/Context items blend in,
+  undemarcated, with operator-requested ones.
+- ❌ Letting a multi-round verbatim Request balloon inline instead of
+  summarizing the gist and moving the full exchange to
+  `inception-transcript.md`.
 - ❌ Letting the conversation, not the README, hold effort state.
+- ❌ Journaling a real **private/internal** repo or system name, a private
+  cross-org reference, or unabstracted incident narrative into a
+  public-facing effort — abstract the specifics or route the precise record
+  to a private knowledge repo instead. (A fully-qualified reference to a
+  genuinely *public* repo remains expected traceability, not a leak.)
 - ❌ Clearing `follow_up` manually while an open effort remains bound, or
   dropping the binding without verified completion or a named transfer.
 - ❌ Cross-repo issues linking this repo's effort paths.
@@ -383,3 +495,6 @@ change that realizes it.
 - ❌ Letting the README balloon with every phase's full detail inline — extract
   large phases/slices to linked sibling sub-docs (`<effort-folder>/<phase>.md`) and keep the
   Plan a map, so a resuming agent loads only the phase it is working.
+- ❌ Stopping after opening or pushing a reviewable change and waiting to be
+  re-prompted — stay on it through review, consent, and merge before moving on
+  or ending the turn.

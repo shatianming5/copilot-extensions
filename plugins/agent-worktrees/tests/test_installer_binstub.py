@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import platform
 import shlex
+import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -20,10 +22,90 @@ def _project_binstub(lb: Path, project: str) -> str:
     return (lb / name).read_text()
 
 
+def test_binstub_lock_is_reentrant_per_thread():
+    """A duplicate acquisition of the same lock key in the same thread must
+    not re-touch the OS-level lock (Windows msvcrt.locking is not reentrant
+    and raises ``OSError(EDEADLK, "Resource deadlock avoided")`` on a
+    duplicate acquisition -- see copilot-extensions issue tracking the
+    reconcile-binstubs crash)."""
+    with inst._binstub_lock("__registries__"):
+        with inst._binstub_lock("__registries__"):
+            pass
+    # Also exercise the exact pairing used by project_binstub_registration:
+    # a project literally named "__registries__" would otherwise deadlock
+    # acquiring its own lock twice.
+    with inst._binstub_lock("__registries__"), inst._binstub_lock("__registries__"):
+        pass
+
+
+def test_binstub_lock_releases_after_reentrant_use(tmp_path: Path, monkeypatch):
+    """After the outermost ``with`` exits, the lock is fully released so a
+    fresh acquisition (e.g. a subsequent CLI invocation) still works."""
+    with inst._binstub_lock("demoproj"):
+        with inst._binstub_lock("demoproj"):
+            pass
+    # Re-acquiring after full release must succeed without blocking/raising.
+    with inst._binstub_lock("demoproj"):
+        pass
+
+
+def test_binstub_lock_serializes_peer_threads():
+    """A second thread contending for the same key must block on the
+    in-process RLock -- not race straight into the OS-level lock, which
+    would hit the process-wide EDEADLK the reentrancy fix closes."""
+    order: list[str] = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with inst._binstub_lock("peerkey"):
+            order.append("holder-acquired")
+            started.set()
+            release.wait(timeout=5)
+        order.append("holder-released")
+
+    def contender():
+        assert started.wait(timeout=5)
+        with inst._binstub_lock("peerkey"):
+            order.append("contender-acquired")
+
+    t1 = threading.Thread(target=holder)
+    t2 = threading.Thread(target=contender)
+    t1.start()
+    assert started.wait(timeout=5)
+    t2.start()
+    time.sleep(0.1)  # contender must still be blocked behind the holder
+    assert order == ["holder-acquired"]
+    release.set()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+    assert order == ["holder-acquired", "holder-released", "contender-acquired"]
+
+
+def test_platform_installers_honor_structured_runtime_root():
+    posix = (PLUGIN / "scripts" / "install.sh").read_text(encoding="utf-8")
+    powershell = (PLUGIN / "scripts" / "install.ps1").read_text(encoding="utf-8")
+
+    assert "--install-dir" in posix
+    assert "CONTEXTUAL_INSTALL=true" in posix
+    assert "does not match validated installation context" in posix
+    assert "structured installation context does not support action" in posix
+    assert "__aw_child" in posix
+    assert "__aw_watcher" in posix
+    assert 'ok "Context runtime updated at $INSTALL_DIR"' in posix
+
+    assert "[string]$InstallDir" in powershell
+    assert "$ContextualInstall = [bool]$env:COPILOT_EXTENSIONS_CONTEXT" in powershell
+    assert "-InstallDir does not match validated installation context." in powershell
+    assert "Structured installation context does not support action" in powershell
+    assert "$contextChild.WaitForExit" in powershell
+    assert "taskkill.exe /PID $contextChild.Id /T /F" in powershell
+    assert 'Write-ServiceOk "Context runtime updated at $InstallDir"' in powershell
+
+
 def test_project_binstub_uses_project_flag(monkeypatch, tmp_path: Path):
     """A project binstub names its project via ``--project`` (context otherwise
-    resolves from CWD, git-like). It must NOT set an ambient WORKTREE_PROJECT on
-    the primary path, nor scrub WORKTREE_ID (identity now comes purely from CWD)."""
+    resolves from CWD, git-like). It must not set ambient identity variables."""
     lb = tmp_path / "bin"
     monkeypatch.setattr(inst, "local_bin", lambda: lb)
 
@@ -35,14 +117,16 @@ def test_project_binstub_uses_project_flag(monkeypatch, tmp_path: Path):
     # No longer scrubs the inherited worktree id -- it is simply ignored.
     assert "WORKTREE_ID" not in content
     assert "APERTURE_WORKTREE_ID" not in content
-    # WORKTREE_PROJECT survives ONLY in the recovery (venv-missing) branch,
-    # never on the primary CLI path.
+    assert "WORKTREE_PROJECT" not in content
+    assert "agent-worktrees project binstub" in content
     if platform.system() == "Windows":
         assert "bin\\payload\\agent-worktrees.cmd" in content
         assert "--project demoproj" in content
+        assert "launch-session.cmd" not in content
     else:
         assert "bin/payload/agent-worktrees" in content
         assert "--project demoproj" in content
+        assert "launch-session.sh" not in content
         assert ".local/bin/agent-worktrees" not in content
 
 
@@ -113,6 +197,11 @@ def test_windows_binstubs_avoid_unsigned_trampoline(monkeypatch, tmp_path: Path)
     for name in ("demoproj.cmd", "demoproj.ps1"):
         content = (lb / name).read_text()
         assert "bin\\payload\\agent-worktrees" in content
+        assert "AGENT_WORKTREES_LAUNCH_ID" in content
+        assert "picker-launches.jsonl" not in content
+        assert "binstub_start" not in content
+        assert "timestamp_local" not in content
+        assert "launch-session" not in content
         assert "--project" in content
         assert "agent-worktrees.exe" not in content
 
@@ -210,6 +299,34 @@ def test_deploy_binstubs_writes_ps1_on_windows(monkeypatch, tmp_path: Path):
     assert "--project 'demoproj'" in content
 
 
+def test_posix_binstub_has_no_pre_context_trace(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(inst, "local_bin", lambda: tmp_path / "bin")
+
+    specs = inst._project_binstub_specs("demoproj", repo_dir=PLUGIN)
+
+    assert len(specs) == 1
+    content = specs[0][1]
+    assert "picker-launches.jsonl" not in content
+    assert "$RANDOM-$(date +%s)" in content
+    assert "binstub_start" not in content
+    assert "if [[ $# -eq 0 ]]" not in content
+    assert "bin/payload/agent-worktrees" in content.replace("\\", "/")
+    assert "%N" not in content
+
+
+def test_wsl_binstub_routes_through_tool_binstub_not_retired_launcher():
+    """The Windows->WSL project binstub must route through the modern,
+    self-provisioning `agent-worktrees` tool binstub (~/.local/bin/agent-worktrees),
+    never the phase-3b-retired shared `~/.agent-worktrees/bin/launch-session.sh`
+    (deleted in worktree-manager-control-plane/phase-3b-mux-relocation.md and
+    never deployed there since -- copilot-extensions#3433's sibling defect)."""
+    install_ps1 = (PLUGIN / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    assert ".agent-worktrees/bin/launch-session.sh" not in install_ps1
+    assert '$HOME/.local/bin/agent-worktrees"' in install_ps1
+    assert "agent-worktrees is not installed in WSL." in install_ps1
+
+
 def _reg(monkeypatch, names: list[str]) -> None:
     monkeypatch.setattr(
         inst, "read_projects_registry",
@@ -227,7 +344,7 @@ def test_reconcile_adds_registered_and_removes_stale(monkeypatch, tmp_path: Path
 
     # Pre-seed a stale receipt-owned stub for a project no longer registered.
     inst._deploy_project_binstub("staleproj")
-    # And a foreign stub from another tool (no WORKTREE_PROJECT / --project marker).
+    # And a foreign stub from another tool (no project-addressed payload marker).
     foreign = lb / ("othertool.cmd" if platform.system() == "Windows" else "othertool")
     foreign.write_text("@echo off\r\necho not ours\r\n", newline="")
 
@@ -243,6 +360,119 @@ def test_reconcile_adds_registered_and_removes_stale(monkeypatch, tmp_path: Path
     assert foreign.exists()
     assert "keepproj" in result["registered"]
     assert any("staleproj" in r for r in result["removed"])
+
+
+def test_reconcile_migrates_matching_legacy_unreceipted_stub(
+    monkeypatch, tmp_path: Path
+):
+    lb = tmp_path / "bin"
+    root = tmp_path / "runtime"
+    lb.mkdir()
+    monkeypatch.setattr(inst, "local_bin", lambda: lb)
+    monkeypatch.setattr(inst, "install_dir", lambda: root)
+    _reg(monkeypatch, ["demo"])
+    specs = inst._project_binstub_specs("demo")
+    if platform.system() == "Windows":
+        for target, _content in specs:
+            legacy = (
+                '@echo off\r\nset "WORKTREE_PROJECT=demo"\r\n'
+                'call "%USERPROFILE%\\.agent-worktrees\\bin\\launch-session.cmd"\r\n'
+                '"C:\\payload\\bin\\payload\\agent-worktrees.cmd" '
+                '--project demo %*\r\n'
+                if target.suffix.lower() == ".cmd"
+                else "$env:WORKTREE_PROJECT = 'demo'\n"
+                "& \"$HOME\\.agent-worktrees\\bin\\launch-session.ps1\"\n"
+                "& 'C:\\payload\\bin\\payload\\agent-worktrees.ps1' "
+                "--project demo @args\n"
+            )
+            target.write_text(legacy, encoding="utf-8", newline="")
+    else:
+        target = specs[0][0]
+        target.write_text(
+            '#!/usr/bin/env bash\nWORKTREE_PROJECT=demo\n'
+            '"$HOME/.agent-worktrees/bin/launch-session.sh"\n'
+            'exec /payload/bin/payload/agent-worktrees --project demo "$@"\n',
+            encoding="utf-8",
+        )
+
+    result = inst.reconcile_binstubs()
+
+    assert result["migrated"] == ["demo"]
+    assert inst._read_receipt("demo") is not None
+    for target, _content in specs:
+        deployed = target.read_text(encoding="utf-8")
+        assert "agent-worktrees project binstub" in deployed
+        assert "WORKTREE_PROJECT" not in deployed
+
+
+def test_reconcile_preserves_legacy_stub_for_different_project(
+    monkeypatch, tmp_path: Path
+):
+    lb = tmp_path / "bin"
+    root = tmp_path / "runtime"
+    lb.mkdir()
+    monkeypatch.setattr(inst, "local_bin", lambda: lb)
+    monkeypatch.setattr(inst, "install_dir", lambda: root)
+    _reg(monkeypatch, ["demo"])
+    target = inst._project_binstub_specs("demo")[0][0]
+    target.write_text(
+        'WORKTREE_PROJECT=another-project\n.agent-worktrees\n',
+        encoding="utf-8",
+    )
+
+    result = inst.reconcile_binstubs()
+
+    assert result["migrated"] == []
+    assert result["preserved"] == ["demo"]
+    assert target.read_text(encoding="utf-8").startswith(
+        "WORKTREE_PROJECT=another-project"
+    )
+    assert inst._read_receipt("demo") is None
+
+
+def test_reconcile_preserves_unreceipted_explicit_project_wrapper(
+    monkeypatch, tmp_path: Path
+):
+    lb = tmp_path / "bin"
+    root = tmp_path / "runtime"
+    lb.mkdir()
+    monkeypatch.setattr(inst, "local_bin", lambda: lb)
+    monkeypatch.setattr(inst, "install_dir", lambda: root)
+    _reg(monkeypatch, ["demo"])
+    target = inst._project_binstub_specs("demo")[0][0]
+    wrapper = "python -m agent_worktrees --project demo status\n"
+    target.write_text(wrapper, encoding="utf-8")
+
+    result = inst.reconcile_binstubs()
+
+    assert result["migrated"] == []
+    assert result["preserved"] == ["demo"]
+    assert target.read_text(encoding="utf-8") == wrapper
+    assert inst._read_receipt("demo") is None
+
+
+def test_reconcile_preserves_custom_ambient_project_wrapper(
+    monkeypatch, tmp_path: Path
+):
+    lb = tmp_path / "bin"
+    root = tmp_path / "runtime"
+    lb.mkdir()
+    monkeypatch.setattr(inst, "local_bin", lambda: lb)
+    monkeypatch.setattr(inst, "install_dir", lambda: root)
+    _reg(monkeypatch, ["demo"])
+    target = inst._project_binstub_specs("demo")[0][0]
+    wrapper = (
+        "WORKTREE_PROJECT=demo\n"
+        'exec "$HOME/.agent-worktrees/bin/launch-session.sh"\n'
+    )
+    target.write_text(wrapper, encoding="utf-8")
+
+    result = inst.reconcile_binstubs()
+
+    assert result["migrated"] == []
+    assert result["preserved"] == ["demo"]
+    assert target.read_text(encoding="utf-8") == wrapper
+    assert inst._read_receipt("demo") is None
 
 
 def test_reconcile_never_touches_reserved_global_name(monkeypatch, tmp_path: Path):
@@ -392,6 +622,15 @@ def test_project_binstub_requires_transfer_for_exact_legacy_signature(
     assert inst._read_receipt("demo") is not None
     content = target.read_text(encoding="utf-8").replace("\\", "/")
     assert "bin/payload/agent-worktrees" in content
+
+
+def test_legacy_environment_binstub_remains_detectable_for_migration():
+    content = (
+        "#!/usr/bin/env bash\n"
+        "export WORKTREE_PROJECT=demo\n"
+        "exec \"$HOME/.agent-worktrees/bin/launch-session.sh\"\n"
+    )
+    assert inst._is_project_binstub(content)
 
 
 def test_registration_preflight_rejects_transfer_before_registry_mutation(
@@ -607,10 +846,81 @@ def test_payload_shims_propagate_ownership_root() -> None:
     powershell = (
         PLUGIN / "bin" / "payload" / "agent-worktrees.ps1"
     ).read_text(encoding="utf-8")
+    inner_posix = (
+        PLUGIN / "scripts" / "invoke-payload-runtime.sh"
+    ).read_text(encoding="utf-8")
+    inner_powershell = (
+        PLUGIN / "scripts" / "invoke-payload-runtime.ps1"
+    ).read_text(encoding="utf-8")
     assert 'export AGENT_WORKTREES_PAYLOAD_ROOT="$_payload_root"' in posix
     assert "$env:AGENT_WORKTREES_PAYLOAD_ROOT = $_payloadRoot" in powershell
-    assert "[Environment]::GetEnvironmentVariable" in powershell
-    assert "Remove-Item Env:AGENT_WORKTREES_PAYLOAD_ROOT" in powershell
+    assert "scripts/invoke-payload-runtime.sh" in posix
+    assert "scripts\\invoke-payload-runtime.ps1" in powershell
+    # The outer shim only forwards `shim-start`'s timestamp via env var and
+    # never itself writes the durable JSONL record (it cannot know which
+    # runtime root -- legacy or an active namespaced context -- is genuinely
+    # active); the inner, installation-context-aware dispatcher is the one
+    # that actually resolves the root and performs the durable write
+    # (Copilot review, PR #3310 round 3).
+    assert "COPILOT_EXTENSIONS_BOOT_TRACE_SHIM_START_MS" in posix
+    assert "COPILOT_EXTENSIONS_BOOT_TRACE_SHIM_START_MS" in powershell
+    assert 'logs/activity.jsonl' in inner_posix
+    assert "logs\\activity.jsonl" in inner_powershell
+    assert '\\"event\\":\\"boot_trace\\"' in inner_posix
+    assert '"event":"boot_trace"' in inner_powershell
+    dispatcher = (
+        PLUGIN / "scripts" / "invoke-payload-runtime.ps1"
+    ).read_text(encoding="utf-8")
+    assert "[Environment]::GetEnvironmentVariable" in dispatcher
+
+
+def test_project_binstubs_never_launch_through_legacy_runtime(
+    monkeypatch, tmp_path
+):
+    payload = tmp_path / "payload"
+    (payload / "plugin.json").parent.mkdir(parents=True)
+    (payload / "plugin.json").write_text(
+        '{"name":"agent-worktrees","version":"1.0.0"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_WORKTREES_PAYLOAD_ROOT", str(payload))
+    monkeypatch.setattr(inst, "local_bin", lambda: tmp_path / "bin")
+
+    for _path, content in inst._project_binstub_specs("example"):
+        normalized = content.replace("\\", "/")
+        assert ".agent-worktrees/bin/launch-session" not in normalized
+        assert "bin/payload/agent-worktrees" in normalized
+
+
+def test_native_installers_generate_payload_pinned_project_binstubs() -> None:
+    plugin = Path(__file__).resolve().parents[1]
+    posix = (plugin / "scripts" / "install.sh").read_text(encoding="utf-8")
+    powershell = (plugin / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    posix_binstub = posix.split("deploy_binstub() {", 1)[1].split(
+        "deploy_global_config() {", 1
+    )[0]
+    powershell_binstub = powershell.split("function Deploy-Binstub {", 1)[1].split(
+        "function Deploy-GlobalBinstub {", 1
+    )[0]
+
+    assert "bin/payload/agent-worktrees" in posix_binstub
+    assert ".agent-worktrees/bin/launch-session" not in posix_binstub
+    assert "_root=" not in posix_binstub
+    assert "bin\\payload\\agent-worktrees" in powershell_binstub
+    assert ".agent-worktrees\\bin\\launch-session" not in powershell_binstub
+    assert "resolve-runtime.ps1" not in powershell_binstub
+
+
+def test_hook_deployment_includes_registry_root_helper() -> None:
+    posix = (PLUGIN / "scripts" / "install.sh").read_text(encoding="utf-8")
+    powershell = (PLUGIN / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    python = (
+        PLUGIN / "src" / "agent_worktrees" / "installer.py"
+    ).read_text(encoding="utf-8")
+
+    assert "anchor_write_guard.py pr_supersede_guard.py registry_root.py" in posix
+    assert "'anchor_write_guard.py', 'pr_supersede_guard.py', 'registry_root.py'" in powershell
+    assert '"anchor_write_guard.py", "pr_supersede_guard.py", "registry_root.py"' in python
 
 
 def test_project_binstub_rejects_invalid_command_name(

@@ -18,11 +18,15 @@ from agent_bridge.client import BridgeClientError
 
 
 class _FakeClient:
-    def __init__(self, *, session_resume=None, worktree_resume=None):
+    def __init__(self, *, session_resume=None, worktree_resume=None, agents=None):
         self._session_resume = session_resume
         self._worktree_resume = worktree_resume
+        self._agents = list(agents or [])
         self.session_calls: list[str] = []
         self.worktree_calls: list[tuple[str, bool]] = []
+
+    def list_agents(self):
+        return list(self._agents)
 
     def resume_session(self, session_id, *, request_timeout=None):
         self.session_calls.append(session_id)
@@ -38,13 +42,18 @@ class _FakeClient:
         request_timeout=None,
     ):
         self.worktree_calls.append((worktree_id, reclaim))
-        if isinstance(self._worktree_resume, Exception):
-            raise self._worktree_resume
-        return self._worktree_resume
+        result = (
+            self._worktree_resume(worktree_id, reclaim=reclaim)
+            if callable(self._worktree_resume)
+            else self._worktree_resume
+        )
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
-def _args(target, *, force=False):
-    return argparse.Namespace(session_id=target, force=force)
+def _args(target, *, force=False, json=False):
+    return argparse.Namespace(session_id=target, force=force, json=json)
 
 
 def _patch_client(monkeypatch, client):
@@ -125,3 +134,87 @@ def test_unknown_target_reports_neither(monkeypatch, capsys):
     assert "neither a bridge-owned session nor a recognized worktree" in (
         capsys.readouterr().err
     )
+
+
+def test_singleton_repo_target_falls_back_to_anchor_key(monkeypatch, capsys):
+    client = _FakeClient(
+        session_resume=BridgeClientError(404, "not found"),
+        worktree_resume=lambda worktree_id, reclaim=False: (
+            BridgeClientError(404, "No session found")
+            if worktree_id != "llama.cpp@anchor"
+            else {"status": "idle", "session_id": "owned-anchor-1"}
+        ),
+        agents=[{"name": "llama.cpp@Atlas-Core", "project": "llama.cpp"}],
+    )
+    _patch_client(monkeypatch, client)
+    monkeypatch.setattr(
+        "agent_bridge.resume_handoff_cli.find_singleton_repo",
+        lambda target: (
+            type("Repo", (), {"name": "llama.cpp", "path": "/repo/llama.cpp"})()
+            if target == "llama.cpp"
+            else None
+        ),
+    )
+
+    m._cmd_resume(_args("llama.cpp@Atlas-Core"))
+
+    assert client.worktree_calls == [
+        ("llama.cpp@Atlas-Core", False),
+        ("llama.cpp@anchor", False),
+    ]
+    assert "Repo llama.cpp loaded as owned session owned-anchor-1" in (
+        capsys.readouterr().out
+    )
+
+
+class TestResumeJsonOutput:
+    """#6744 Phase 3: --json is the sole headless take-over primitive now
+    that `create --reclaim` is gone -- a caller (agent-dispatch) needs the
+    session id back machine-readably, not scraped from a human summary line.
+    """
+
+    def test_force_take_over_emits_json_session_id(self, monkeypatch, capsys):
+        client = _FakeClient(
+            worktree_resume={"status": "idle", "session_id": "owned-9"},
+        )
+        _patch_client(monkeypatch, client)
+
+        m._cmd_resume(_args("wt-6b68", force=True, json=True))
+
+        import json as _json
+
+        out = _json.loads(capsys.readouterr().out)
+        assert out == {
+            "session_id": "owned-9", "status": "idle",
+            "verb": "took over", "worktree_id": "wt-6b68",
+        }
+
+    def test_live_holder_refusal_emits_json_error(self, monkeypatch, capsys):
+        client = _FakeClient(
+            session_resume=BridgeClientError(404, "not found"),
+            worktree_resume=BridgeClientError(
+                409, {"reason": "live_cli_holds_worktree", "session_id": "live-7"}
+            ),
+        )
+        _patch_client(monkeypatch, client)
+
+        with pytest.raises(SystemExit) as ei:
+            m._cmd_resume(_args("wt-6b68", json=True))
+        assert ei.value.code == 1
+
+        import json as _json
+
+        out = _json.loads(capsys.readouterr().out)
+        assert out["reason"] == "live_cli_holds_worktree"
+        assert out["session_id"] == "live-7"
+
+    def test_resumed_owned_session_emits_json(self, monkeypatch, capsys):
+        client = _FakeClient(session_resume={"status": "idle"})
+        _patch_client(monkeypatch, client)
+
+        m._cmd_resume(_args("sess-1", json=True))
+
+        import json as _json
+
+        out = _json.loads(capsys.readouterr().out)
+        assert out == {"session_id": "sess-1", "status": "idle", "verb": "resumed"}

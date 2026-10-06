@@ -5,7 +5,10 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import types
+from pathlib import Path
 
+import pytest
 from agent_containers import container_shims
 
 
@@ -35,11 +38,7 @@ def test_relay_client_serves_github_from_launch_token(tmp_path):
     )
 
     assert result.returncode == 0
-    fields = dict(
-        line.split("=", 1)
-        for line in result.stdout.splitlines()
-        if "=" in line
-    )
+    fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
     assert fields["username"] == "x-access-token"
     assert fields["password"] == token
 
@@ -57,3 +56,253 @@ def test_deploy_includes_git_credential_helper_by_default(monkeypatch):
     assert container_shims.RELAY_CLIENT_PATH in written
     assert container_shims.AZURE_HELPER_PATH in written
     assert container_shims.ADO_HELPER_PATH in written
+
+
+def test_ensure_agent_worktrees_is_noop_when_already_ready(monkeypatch):
+    monkeypatch.setattr(container_shims, "_agent_worktrees_ready", lambda *a, **k: True)
+    monkeypatch.setattr(
+        container_shims, "_agent_worktrees_payload_ready", lambda *a, **k: True
+    )
+    monkeypatch.setattr(container_shims, "_container_home", lambda *a, **k: "/home/vscode")
+    monkeypatch.setattr(
+        container_shims,
+        "_agent_worktrees_payload_paths",
+        lambda home: ("/home/vscode/.agent-worktrees/payload-src", "/payload-root"),
+    )
+    monkeypatch.setattr(
+        container_shims,
+        "_deploy_agent_worktrees_wrapper",
+        lambda container, payload_root=None: None,
+    )
+
+    container_shims.ensure_agent_worktrees("repo-1", user="vscode")
+
+
+def test_agent_worktrees_ready_requires_the_launch_script_too(monkeypatch):
+    # A live-confirmed bug: `agent-worktrees --version` succeeding is NOT
+    # sufficient -- the lean `install.sh provision` mode deploys only the CLI,
+    # never `scripts/launch-command.sh`, which `embody`'s own detached-launch
+    # command names directly. Without it every detached launch failed with an
+    # opaque not-ready-timeout (the launch command itself never ran).
+    exec_calls: list[str] = []
+    exists_checks: list[str] = []
+
+    monkeypatch.setattr(
+        container_shims,
+        "_docker_exec",
+        lambda container, command, *, user, env=None, timeout=30.0: (
+            exec_calls.append(command)
+            or types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        ),
+    )
+
+    def fake_exists(container, path, *, user="0", timeout=30.0):
+        exists_checks.append(path)
+        return "launch-command.sh" in path
+
+    monkeypatch.setattr(container_shims, "_docker_exists", fake_exists)
+
+    assert container_shims._agent_worktrees_ready(
+        "repo-1", user="vscode", home="/home/vscode",
+    ) is True
+    assert any("--version" in c for c in exec_calls)
+    assert "/home/vscode/.agent-worktrees/scripts/launch-command.sh" in exists_checks
+
+
+def test_agent_worktrees_ready_false_when_launch_script_missing():
+    exists_calls: list[str] = []
+
+    class _Container:
+        pass
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            container_shims,
+            "_docker_exec",
+            lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+        mp.setattr(
+            container_shims,
+            "_docker_exists",
+            lambda *a, **k: exists_calls.append(a) or False,
+        )
+        ready = container_shims._agent_worktrees_ready(
+            "repo-1", user="vscode", home="/home/vscode",
+        )
+    assert ready is False
+    assert exists_calls  # the launch-script check actually ran
+
+
+def test_ensure_agent_worktrees_persists_local_payload_and_external_uv_sources(
+    monkeypatch, tmp_path
+):
+    repo_root = tmp_path / "repo"
+    payload_root = repo_root / "plugins" / "agent-worktrees"
+    libs_root = repo_root / "libs"
+    (payload_root / "scripts").mkdir(parents=True)
+    (payload_root / "scripts" / "install.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    (payload_root / "pyproject.toml").write_text(
+        """
+[project]
+name = "agent-worktrees"
+
+[tool.uv.sources]
+agent-lazy-cli-dispatch = { path = "../../libs/lazy-cli-dispatch", editable = true }
+agent-procutil = { path = "libs/agent-procutil" }
+""".strip(),
+        encoding="utf-8",
+    )
+    (payload_root / "libs" / "agent-procutil").mkdir(parents=True)
+    (libs_root / "lazy-cli-dispatch" / "src").mkdir(parents=True)
+
+    ready = iter([False, True])
+    exec_calls: list[tuple[str, str]] = []
+    cp_calls: list[tuple[Path, str]] = []
+    wrappers: list[tuple[str, str | None]] = []
+
+    monkeypatch.setattr(container_shims, "_agent_worktrees_payload_root", lambda: payload_root)
+    monkeypatch.setattr(container_shims, "_agent_worktrees_ready", lambda *a, **k: next(ready))
+    monkeypatch.setattr(container_shims, "_container_home", lambda *a, **k: "/home/vscode")
+    monkeypatch.setattr(container_shims, "_docker_exists", lambda *a, **k: False)
+    monkeypatch.setattr(container_shims, "_host_uv_index", lambda: "https://feed/simple/")
+    monkeypatch.setattr(
+        container_shims,
+        "_docker_exec",
+        lambda container, command, *, user, env=None, timeout=30.0: (
+            exec_calls.append((user, command))
+            or types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        ),
+    )
+    monkeypatch.setattr(
+        container_shims,
+        "_docker_cp",
+        lambda source, container, target_dir, *, timeout=120.0: cp_calls.append(
+            (source, target_dir)
+        ),
+    )
+    monkeypatch.setattr(
+        container_shims,
+        "_deploy_agent_worktrees_wrapper",
+        lambda container, payload_root=None: wrappers.append((container, payload_root)),
+    )
+
+    container_shims.ensure_agent_worktrees("repo-1", user="vscode")
+
+    assert wrappers == [
+        ("repo-1", "/home/vscode/.agent-worktrees/payload-src/plugins/agent-worktrees")
+    ]
+    payload_targets = {source: target_dir for source, target_dir in cp_calls}
+    assert payload_targets[payload_root] == "/home/vscode/.agent-worktrees/payload-src/plugins"
+    assert payload_targets[libs_root] == "/home/vscode/.agent-worktrees/payload-src"
+    install = next(
+        command for user, command in exec_calls if "bash scripts/install.sh install" in command
+    )
+    assert "cd '/home/vscode/.agent-worktrees/payload-src/plugins/agent-worktrees'" in install
+    assert "--install-dir '/home/vscode/.agent-worktrees'" in install
+    assert any(
+        command.startswith("rm -rf '/home/vscode/.agent-worktrees/payload-src'")
+        for _, command in exec_calls
+    )
+    assert any(".payload-sync-complete" in command for _, command in exec_calls)
+
+
+def test_ensure_agent_worktrees_surfaces_install_failures(monkeypatch):
+    exec_calls = []
+
+    monkeypatch.setattr(
+        container_shims,
+        "_agent_worktrees_payload_root",
+        lambda: Path("/host/plugins/agent-worktrees"),
+    )
+    monkeypatch.setattr(
+        container_shims,
+        "_agent_worktrees_copy_sources",
+        lambda payload_root: (Path("/host"), [Path("/host/plugins/agent-worktrees")]),
+    )
+    monkeypatch.setattr(container_shims, "_agent_worktrees_ready", lambda *a, **k: False)
+    monkeypatch.setattr(container_shims, "_container_home", lambda *a, **k: "/home/vscode")
+    monkeypatch.setattr(container_shims, "_docker_exists", lambda *a, **k: False)
+    monkeypatch.setattr(container_shims, "_docker_cp", lambda *a, **k: None)
+    monkeypatch.setattr(container_shims, "_deploy_agent_worktrees_wrapper", lambda *a, **k: None)
+
+    monkeypatch.setattr(container_shims, "_host_uv_index", lambda: "https://feed/simple/")
+
+    def fake_exec(container, command, *, user, env=None, timeout=30.0):
+        exec_calls.append(command)
+        if "bash scripts/install.sh install" in command:
+            return types.SimpleNamespace(returncode=23, stdout="", stderr="network down")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(container_shims, "_docker_exec", fake_exec)
+
+    with pytest.raises(RuntimeError, match="could not install agent-worktrees"):
+        container_shims.ensure_agent_worktrees("repo-1", user="vscode")
+
+    assert any(
+        command.startswith("rm -rf '/home/vscode/.agent-worktrees/payload-src'")
+        for command in exec_calls
+    )
+
+
+def test_ensure_agent_worktrees_repairs_old_ready_install_without_reinstall(monkeypatch):
+    ready = iter([True, True])
+    exec_calls: list[str] = []
+    wrappers: list[tuple[str, str | None]] = []
+
+    monkeypatch.setattr(container_shims, "_agent_worktrees_ready", lambda *a, **k: next(ready))
+    monkeypatch.setattr(container_shims, "_agent_worktrees_payload_ready", lambda *a, **k: False)
+    monkeypatch.setattr(container_shims, "_container_home", lambda *a, **k: "/home/vscode")
+    monkeypatch.setattr(container_shims, "_docker_exists", lambda *a, **k: True)
+    monkeypatch.setattr(
+        container_shims,
+        "_agent_worktrees_payload_paths",
+        lambda home: ("/home/vscode/.agent-worktrees/payload-src", "/payload-root"),
+    )
+    monkeypatch.setattr(
+        container_shims,
+        "_sync_agent_worktrees_payload",
+        lambda *a, **k: "/payload-root",
+    )
+    monkeypatch.setattr(
+        container_shims,
+        "_deploy_agent_worktrees_wrapper",
+        lambda container, payload_root=None: wrappers.append((container, payload_root)),
+    )
+    monkeypatch.setattr(
+        container_shims,
+        "_docker_exec",
+        lambda container, command, *, user, env=None, timeout=30.0: (
+            exec_calls.append(command)
+            or types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        ),
+    )
+
+    container_shims.ensure_agent_worktrees("repo-1", user="vscode")
+
+    assert wrappers == [("repo-1", "/payload-root")]
+    assert not any("bash scripts/install.sh install" in command for command in exec_calls)
+
+
+def test_ensure_agent_worktrees_workspace_registered_runs_idempotent_register(monkeypatch):
+    calls: list[tuple[str, str, str]] = []
+
+    def fake_exec(container, command, *, user, env=None, timeout=30.0):
+        calls.append((container, user, command))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(container_shims, "_docker_exec", fake_exec)
+
+    container_shims.ensure_agent_worktrees_workspace_registered(
+        "repo-1",
+        user="vscode",
+        workspace_folder="/workspaces/example-web",
+    )
+
+    assert calls == [
+        (
+            "repo-1",
+            "vscode",
+            "set -euo pipefail; cd '/workspaces/example-web'; "
+            "'/usr/local/bin/agent-worktrees' register 'example-web' --repo-dir '/workspaces/example-web'",
+        )
+    ]

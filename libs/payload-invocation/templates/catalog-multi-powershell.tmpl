@@ -4,13 +4,7 @@
 $ErrorActionPreference = 'SilentlyContinue'
 
 $selfRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$contextRoot = if ($env:COPILOT_PLUGIN_ROOT) { $env:COPILOT_PLUGIN_ROOT } else { $selfRoot }
-try { $contextRoot = (Resolve-Path $contextRoot).Path } catch { Write-Output '{}'; exit 0 }
-if (-not [StringComparer]::OrdinalIgnoreCase.Equals($contextRoot, $selfRoot)) {
-    Write-Output '{}'
-    exit 0
-}
-
+@@CATALOG_GATE_POWERSHELL@@
 $installerPath = Join-Path $selfRoot 'scripts\@@INSTALLER@@.ps1'
 $specs = '@@CATALOG_SPECS_JSON_PS@@' | ConvertFrom-Json
 $commands = @(
@@ -42,7 +36,7 @@ $context = @(
     '## @@PLUGIN@@ session command catalog'
     ''
     'Select the command by `id` and invoke its exact `argv`. Do not search `PATH` or substitute a same-named command from another payload.'
-    ''
+@@WINDOWS_CATALOG_NOTE_PS@@    ''
     "${fence}json"
     $catalogJson
     $fence

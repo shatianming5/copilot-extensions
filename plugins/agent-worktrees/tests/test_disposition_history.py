@@ -48,7 +48,39 @@ def test_append_and_read_roundtrip(_tracking_dir):
     p = _tracking_dir / "wt-a.history.jsonl"
     assert p.is_file()
     assert len(p.read_text("utf-8").splitlines()) == 2
-    json.loads(p.read_text("utf-8").splitlines()[0])  # valid JSON per line
+
+
+def test_read_accepts_an_explicit_tracking_path_over_the_ambient_project(
+    tmp_path, monkeypatch
+):
+    """agent-worktrees-external-status-accelerator effort, Copilot review
+    finding: a cross-project daemon/CLI caller has no active project set,
+    so `read()` must be able to scope to an explicit tracking directory
+    instead of `cfg.tracking_dir()`'s ambient one."""
+    explicit_dir = tmp_path / "other-project" / "worktrees"
+    explicit_dir.mkdir(parents=True)
+    ambient_dir = tmp_path / "ambient" / "worktrees"
+    ambient_dir.mkdir(parents=True)
+    monkeypatch.setattr(cfg, "tracking_dir", lambda: ambient_dir)
+
+    dh.append(
+        "wt-x", at="2026-01-01T00:00:01", summary="explicit", title=None,
+        follow_up=False, changed=["summary"],
+        # `append` itself is not part of this fix's scope (still ambient-
+        # project-only); write directly to the explicit dir's own path.
+    )
+    # The line above wrote to the AMBIENT dir (append's own current
+    # contract); now write the real explicit-dir entry directly to prove
+    # `read(tracking_path=...)` reads from there, not the ambient one.
+    (explicit_dir / "wt-x.history.jsonl").write_text(
+        json.dumps({"summary": "from-explicit-dir"}) + "\n", encoding="utf-8"
+    )
+
+    result = dh.read("wt-x", tracking_path=explicit_dir)
+    assert [e["summary"] for e in result] == ["from-explicit-dir"]
+
+    ambient_result = dh.read("wt-x")  # no tracking_path -> ambient, unchanged
+    assert [e["summary"] for e in ambient_result] == ["explicit"]
 
 
 def test_read_limit_returns_most_recent(_tracking_dir):
@@ -89,6 +121,18 @@ def test_remove_deletes_sidecar(_tracking_dir):
     dh.remove("wt-e")  # idempotent, no raise
 
 
+def test_remove_is_fail_open_without_project_context(monkeypatch):
+    monkeypatch.setattr(
+        cfg,
+        "tracking_dir",
+        lambda: (_ for _ in ()).throw(
+            ValueError("No active project could be resolved")
+        ),
+    )
+
+    dh.remove("wt-e")
+
+
 # --- set_disposition integration --------------------------------------------
 
 def test_set_disposition_appends_history(_tracking_dir):
@@ -115,6 +159,28 @@ def test_set_disposition_history_entry_matches_record_state(_tracking_dir):
     assert entry["summary"] == rec.summary
     assert entry["title"] == rec.title
     assert entry["follow_up"] == rec.follow_up
+
+
+def test_set_disposition_activity_has_its_own_freshness_stamp(_tracking_dir):
+    """#3307 worktrees-pivot-ux-overhaul follow-up: ``activity`` is applied
+    independently of summary/title/follow_up, stamps its own ``activity_at``
+    (distinct from the shared ``status_note_at``), and is recorded in the
+    history entry only when it was the field actually written."""
+    rec = _rec()
+    set_disposition(rec, activity="running the retry-budget tests")
+    assert rec.activity == "running the retry-budget tests"
+    assert rec.activity_at == rec.status_note_at
+    hist = dh.read(rec.worktree_id)
+    assert hist[-1]["changed"] == ["activity"]
+    assert hist[-1]["activity"] == "running the retry-budget tests"
+
+    # A later summary-only write leaves activity (and its stamp) untouched,
+    # and the entry omits "activity" from `changed` for that write.
+    prior_activity_at = rec.activity_at
+    set_disposition(rec, summary="folded the retry-budget work in")
+    assert rec.activity == "running the retry-budget tests"
+    assert rec.activity_at == prior_activity_at
+    assert dh.read(rec.worktree_id)[-1]["changed"] == ["summary"]
 
 
 # --- session-tag + kind + recovery digest (Phase 2) -----------------------
@@ -156,6 +222,20 @@ def test_digest_renders_recent_entries(_tracking_dir):
     assert "[status" in out and "[bind" in out
     # session tail is surfaced
     assert "123456" in out and "987654" in out
+
+
+def test_digest_disambiguates_pausing_from_unpausing(_tracking_dir):
+    """A `paused` entry in `changed` alone cannot tell set from clear -- the
+    digest must render the resulting value, not just the field name."""
+    dh.append("wt-pause", at="2026-01-01T00:00:01", summary="pausing on purpose",
+              title=None, follow_up=False, changed=["paused"], paused=True)
+    dh.append("wt-pause", at="2026-01-01T00:00:02", summary="back at it",
+              title=None, follow_up=False, changed=["paused"], paused=False)
+    lines = dh.digest("wt-pause").splitlines()
+    paused_line = next(line for line in lines if "pausing on purpose" in line)
+    unpaused_line = next(line for line in lines if "back at it" in line)
+    assert "\u23f8" in paused_line
+    assert "\u23f8" not in unpaused_line
 
 
 def test_digest_honors_limit(_tracking_dir):

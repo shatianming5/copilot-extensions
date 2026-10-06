@@ -1,16 +1,18 @@
 # Architecture Overview
 
-How the 21 copilot-extensions plugins fit together — install topology,
-runtimes, ports, and the credential relay. **Eleven ship a runtime** (currently
-a `uv`-built venv under legacy `~/.agent-*`, deployed by the plugin's own
-installer) plus generated payload-local agent commands and session command
-glossaries; compatibility management wrappers remain in `~/.local/bin` during
-the installation-cell migration. **Ten are payload-only** — `efforts` (skills), `visions`
+How the 24 copilot-extensions plugins fit together — install topology,
+runtimes, ports, and the credential relay. **Thirteen ship a runtime** (currently
+a `uv`-built venv under a plugin-owned root such as `~/.agent-*` or
+`~/.budget-guidance`, deployed by the plugin's own installer) plus generated
+payload-local agent commands and session command glossaries; compatibility
+management wrappers remain in `~/.local/bin` during the installation-cell
+migration. **Eleven are payload-only** — `efforts` (skills), `visions`
 (skills), `context-handoff` (hook + session extension + skill), `customizing-copilot`
-(skills), `copilot-extensions-harness` (skills + contribution-boundary hook),
+(skills), `copilot-extensions-harness` (skills + static instruction projections),
 `wsl-setup` (skills), and
-`harness-knowledge` (skills), `ai-attribution` (hook + skill), and
-`delegation-guidance` (hook + skill), and `context-injection` (aggregation hook)
+`harness-knowledge` (skills), `ai-attribution` (hook + skill),
+`delegation-guidance` (hook + skill), `agent-conduct-guidance`
+(instruction projection + skill), and `agent-remote-driver` (SDK extension)
 deploy entirely from the marketplace
 payload with no installer. For per-plugin internals, follow the links in each
 section.
@@ -22,6 +24,7 @@ section.
 | Plugin | Kind | Legacy runtime home | Global command surface (legacy wrapper / project binstubs) | Lifecycle |
 |--------|------|--------------|---------|-----------|
 | [agent-worktrees](../plugins/agent-worktrees/) | Session plugin (skills + `sessionStart` hook) | `~/.agent-worktrees/` | `~/.local/bin/agent-worktrees` + per-project binstubs | Per session (launched by binstub); runtime auto-updates on session start |
+| [agent-pull-requests](../plugins/agent-pull-requests/) | Cross-repo PR CLI | `~/.agent-pull-requests/` | `~/.local/bin/agent-pull-requests` | On-demand CLI; current runtime-backed slice shells through `agent-worktrees repos gh <owner/repo> -- ...` for GitHub account/token resolution and does not require a local checkout |
 | [agent-bridge](../plugins/agent-bridge/) | Persistent HTTP service | `~/.agent-bridge/` | `~/.local/bin/agent-bridge` | Always-on daemon (Windows scheduled task / Linux systemd user unit) |
 | [agent-codespaces](../plugins/agent-codespaces/) | CLI + credential relay | `~/.agent-codespaces/` | `~/.local/bin/agent-codespaces` | On-demand CLI; self-registers a `codespace:` namespace **provider** (+ credential relay) with the agent-bridge daemon via a `~/.agent-bridge/providers.d/` manifest — the daemon drives its binstub over a process boundary |
 | [agent-containers](../plugins/agent-containers/) | CLI + `container:` provider | `~/.agent-containers/` | `~/.local/bin/agent-containers` | On-demand CLI; self-registers a `container:` namespace **provider** with the agent-bridge daemon via a `~/.agent-bridge/providers.d/` manifest (process-boundary binstub invocation) |
@@ -29,9 +32,10 @@ section.
 | [agent-ssh](../plugins/agent-ssh/) | SSH profile emitter + verifier | `~/.agent-ssh/` | `~/.local/bin/agent-ssh` | On-demand CLI; owns the transport-provider contract for SSH profile modules |
 | [agent-logger](../plugins/agent-logger/) | Session-logging CLI + writer agent + local/rescue sync sources | `~/.agent-logger/` | `~/.local/bin/agent-logger` | On-demand CLI + a scheduled `session-sync` (Windows task / Linux systemd timer) |
 | [agent-dispatch](../plugins/agent-dispatch/) | Task-queue engine + per-host coordinator + CLI/MCP | `~/.agent-dispatch/` | `~/.local/bin/agent-dispatch` | On-demand CLI + optional always-on coordinator and label-gated embody supervisor(s) (Windows tasks / Linux systemd units) |
-| [agent-index](../plugins/agent-index/) | Indexing/search service shell | `~/.agent-index/` | `~/.local/bin/agent-index` | Phase 1 always-on service shell (Windows task / Linux systemd user unit); indexing engine arrives in later slices |
+| [agent-index](../plugins/agent-index/) | Lightweight retrieval CLI + managed host companion | `~/.agent-index/` (client and durable data); dispatch-owned host generations | `~/.local/bin/agent-index` | Explicit configured host service supervised and provisioned only by running agent-dispatch; independent warm engine unchanged |
 | [agent-machines](../plugins/agent-machines/) | Machine-state reconciler CLI | `~/.agent-machines/` | `~/.local/bin/agent-machines` | On-demand CLI (no daemon); reconciled at session launch on its gated machines |
 | [agent-vault](../plugins/agent-vault/) | Local secret store: CLI + vault service | `~/.agent-vault/` | `~/.local/bin/agent-vault` | On-demand CLI + a persistent vault daemon (Windows scheduled task / Linux systemd user unit); ships a `vault-askpass` SUDO_ASKPASS helper |
+| [budget-guidance](../plugins/budget-guidance/) | Current budget-posture CLI | `~/.budget-guidance/` | `~/.local/bin/budget-guidance` | On-demand CLI; static configuration is offline and default-off |
 
 ### Payload-only plugins (no installer, no runtime)
 
@@ -40,13 +44,14 @@ section.
 | [efforts](../plugins/efforts/) | Planning skills (`planning-efforts`, `efforts-setup`) | Marketplace payload (skills + assets) | Loaded on demand when a skill matches; no runtime to install |
 | [visions](../plugins/visions/) | North-star skills (`envisioning`, `visions-setup`) | Marketplace payload (skills + assets) | Loaded on demand when a skill matches; no runtime to install |
 | [context-handoff](../plugins/context-handoff/) | Ambient continuity hook + session **extension** + `/handoff` skill | Marketplace payload (hook, scripts, extension, and skill) | Hook injects a concise owner-marked continuity kernel; extension is auto-discovered from the enabled plugin's `extensions/` dir; no copy to `~/.copilot/extensions/`, no deploy manifest |
-| [customizing-copilot](../plugins/customizing-copilot/) | Customization skills (authoring skills, sub-agents, MCP servers, plugins, harnesses, review) | Marketplace payload (skills) | Loaded on demand when a CLI-customization prompt matches; no runtime to install |
-| [copilot-extensions-harness](../plugins/copilot-extensions-harness/) | Operator-harness skills, `clean-room-judge` evaluator agent, and ambient contribution-boundary pointer | Marketplace payload (skills + agent + `sessionStart` hook) | Hook emits a concise guide pointer at session start; detailed skills/agent load on demand; no runtime to install |
+| [customizing-copilot](../plugins/customizing-copilot/) | Customization and CLI-diagnostics skills (authoring skills, sub-agents, MCP servers, plugins, harnesses, review, startup hangs, module decomposition, agent hoisting, instruction-sync automation) | Marketplace payload (skills) | Loaded on demand when a CLI customization or startup-diagnostics prompt matches; no runtime to install |
+| [copilot-extensions-harness](../plugins/copilot-extensions-harness/) | Operator-harness skills, `clean-room-judge` evaluator agent, and two ambient static instruction projections (contribution-boundary, cross-repo-debug-tracking) | Marketplace payload (skills + agent + static instruction projections) | No `sessionStart` hook; both projections are checked-in static fallbacks synced by `customizing-copilot:reviewing-customizations`; detailed skills/agent load on demand; no runtime to install |
 | [wsl-setup](../plugins/wsl-setup/) | WSL2 setup / troubleshooting skills | Marketplace payload (skills) | Loaded on demand when a WSL-setup prompt matches; no runtime to install |
 | [harness-knowledge](../plugins/harness-knowledge/) | Stateless-harness → knowledge-repo binding skill (`binding-knowledge`) | Marketplace payload (skill + configurator script) | Loaded on demand when a harness-setup prompt matches; no runtime to install |
 | [ai-attribution](../plugins/ai-attribution/) | Ambient publication-policy hook + publication/setup skills | Marketplace payload (hooks + dependency-free scripts + skills/docs/examples) | The hook emits a concise payload-cwd-gated policy kernel at session start; setup reconciles the static fallback; detailed publication workflow loads on demand; no runtime to install |
-| [delegation-guidance](../plugins/delegation-guidance/) | Ambient coordinator-first routing hook + `delegating-work` skill | Marketplace payload (hook + scripts + skill) | The hook emits a concise owner-marked kernel at session start; detailed routing loads on demand; no runtime to install |
-| [context-injection](../plugins/context-injection/) | Compatibility session-context aggregator | Marketplace payload (hook + scripts + contributor schema) | On affected hosts, verifies one exact source-qualified marketplace authority, trust, compatible engine, complete declarations, and aggregate admission before emitting; otherwise every authority-aware producer preserves its standalone path |
+| [delegation-guidance](../plugins/delegation-guidance/) | **Deprecated** — no-op pointer at `agent-conduct-guidance` | Marketplace payload (README pointer only) | Ships no skills or instruction projections; kept installable so the name keeps resolving for existing adopters |
+| [agent-conduct-guidance](../plugins/agent-conduct-guidance/) | Consolidated ambient conduct-guidance modules (headless-process-spawn instruction projection + `spawning-headless-processes` skill; coordinator-first delegation instruction projection + `delegating-work` skill, migrated from `delegation-guidance`; scratch-space hygiene instruction projection + `using-scratch-space` skill) | Marketplace payload (static instruction projections + skills) | No `sessionStart` hook; each module's projection is a checked-in static fallback; detailed per-module skills load on demand; no runtime to install |
+| [agent-remote-driver](../plugins/agent-remote-driver/) | User-global SDK extension — baseline session drivability (attach/send/steer/abort) over a loopback HTTP surface, independent of agent-bridge | Marketplace payload (extension only) | Extension is auto-discovered from the enabled plugin's `extensions/` dir, same mechanism as `context-handoff`'s; no daemon, no runtime to install; not yet default-enabled (`cli-default-bridging` effort, pre-validation) |
 
 Every runtime plugin is itself a **Python package** — its `src/` package plus
 any vendored `libs/` — installed by its own `scripts/install.*` / `scripts/init.*`
@@ -58,16 +63,31 @@ payload-local agent shims move with the payload itself. The repo uses
 — not `uvx`, `uv tool install`, or `pipx`. The full payload-vs-runtime contract
 lives in [install-contract.md](install-contract.md).
 
+Agent Index's optional host `[store]` footprint is the narrow
+[managed companion](patterns/managed-companion-runtime.md) exception: its own
+installer provisions only the lightweight base/client package. The running
+dispatch supervisor consumes an attributed declaration to build and select
+immutable host generations; plugin commands and session hooks cannot install
+or launch that host. Namespaced host integration is not yet supported.
+
 Every runtime `agent-*` plugin also carries `payload-invocation.json`, generated
 POSIX/PowerShell/CMD shims under its payload `bin/` or manifest `outputDir`, and
-an `emit-command-catalog` pure contributor. Its authority-aware `sessionStart`
-wrapper emits the catalog directly before aggregate-authority proof and `{}` after
-proof; the selected `context-injection` authority then emits the deterministic
-aggregate. Agent-facing skills resolve logical commands through that
-attributable session glossary rather than ambient `PATH`.
+an `emit-command-catalog` pure contributor. `agent-worktrees` is the first
+[`session-scoped-dynamic-guidance`](patterns/session-scoped-dynamic-guidance.md)
+exemplar: its payload-local `sessionStart` hook writes the attributable command
+catalog and current binding to the exact session's instruction folder, while
+its existing authority-aware contributor remains a best-effort supplementary
+channel. Agent-facing skills resolve logical commands through that attributable
+session glossary rather than ambient `PATH`.
 `~/.local/bin/agent-*` remains a legacy management compatibility surface while
 runtime roots are still unqualified; repo/project binstubs remain the intended
 machine-global command surface.
+
+Agent Machines' Windows shim delegates to its plugin-owned payload runtime
+dispatcher. That dispatcher owns first-use installer output and result
+forwarding; the resolved-runtime path invokes the command directly. Its
+[Windows provisioning diagnostics contract](install-contract.md#agent-machines-windows-first-use-diagnostics)
+describes stream handling, encoding, and process/cleanup responsibilities.
 
 The repository now also carries the non-operative
 `libs/installer-readiness/` foundation for a later out-of-plugin configurator.
@@ -100,7 +120,7 @@ flowchart TB
       AV["agent-vault/<br/>scripts • src"]
       AI["agent-index/<br/>scripts • src"]
       AK["agent-machines/<br/>scripts • src"]
-      PO["efforts/ • visions/ • context-handoff/ • customizing-copilot/ • copilot-extensions-harness/ • wsl-setup/ • harness-knowledge/ • ai-attribution/ • delegation-guidance/ • context-injection/<br/>(payload-only: skills / hooks / extension)"]
+      PO["efforts/ • visions/ • context-handoff/ • customizing-copilot/ • copilot-extensions-harness/ • wsl-setup/ • harness-knowledge/ • ai-attribution/ • delegation-guidance/ (deprecated) • agent-conduct-guidance/ • agent-remote-driver/<br/>(payload-only: skills / hooks / extension)"]
     end
     subgraph RT["Local runtimes"]
       RW["~/.agent-worktrees/<br/>versions/ • current-version • bin"]
@@ -156,8 +176,10 @@ flowchart TB
 
 > The `PO` node — `efforts`, `visions`, `context-handoff`, `customizing-copilot`,
 > `copilot-extensions-harness`, `wsl-setup`, `harness-knowledge`, and
-> `ai-attribution`, `delegation-guidance`, and `context-injection` — deploy entirely from the
-> marketplace payload — no installer, no `~/.agent-*` runtime, no binstub.
+> `ai-attribution`, `delegation-guidance`, `agent-conduct-guidance`, and
+> `agent-remote-driver` —
+> deploy entirely from the marketplace payload — no installer, no
+> `~/.agent-*` runtime, no binstub.
 
 ### Agent-facing invocation and command glossaries
 
@@ -172,12 +194,15 @@ sibling's payload or runtime path. The sibling owns and emits its mapping. A
 missing or ambiguous mapping is unavailable, not a reason to fall back to
 `PATH`.
 
-The complete marketplace-owned startup stack is declared rather than inferred:
-15 contributing plugins publish 21 pure contributors, and
-`context-injection` is the sole aggregate authority. Four contributors are
-context-only; eleven plugins keep restart-safe idempotent side effects direct
-while publishing only their read-only context through the authority-aware
-wrapper. The authority never reruns those direct side effects.
+The marketplace-owned startup stack is declared rather than inferred. Plugin
+hooks retain ownership of their own side effects and guidance, and no custom
+cross-plugin authority coordinates, caches, spills, or reruns those
+contributions. Guidance that must reach the agent uses the
+[session-scoped dynamic guidance](patterns/session-scoped-dynamic-guidance.md)
+pattern: a checked-in pointer directs the agent to the exact session's
+file. Native host-composed `additionalContext` may become the preferred
+dynamic convergence path only after behavior is proven at the supported
+version floor.
 
 On current Copilot CLI hosts, a successful `sessionStart` `additionalContext`
 result is not written into the durable local timeline as part of the persisted
@@ -205,6 +230,46 @@ snapshot would stale immediately. In particular, agent-bridge emits its command
 mapping rather than a worktree/session catalog; its CLI discovers the live
 service endpoint and topology when invoked.
 
+### Context handoff composition
+
+`context-handoff` is payload-only, but its integrated lifecycle composes two
+optional sibling capabilities without absorbing their responsibilities:
+
+- `agent-worktrees` remains the authority for session/worktree identity,
+  process ancestry, mux ownership, candidate association, succession, head
+  movement, title updates, and identity-bound process retirement.
+- `agent-dispatch` is an optional durable handoff store. A managed worktree and
+  reachable coordinator produce a pinned task; otherwise a resolvable managed
+  worktree or adopted anchor uses a one-time file in machine-local worktree
+  state.
+- An active effort is optional objective context. It selects a compact
+  effort-backed relay, but neither an effort nor a knowledge repository is a
+  handoff storage or lifecycle dependency.
+
+The full continuation is persisted before launch. The successor receives only
+a bounded, single-line locator: task summary, `/consume-handoff`
+recommendation, and one short opaque task/file recovery locator. Executable
+source and shell commands never enter the seed. Copilot creates no successor
+session until that initial prompt is submitted, so startup records only a
+candidate association. Explicit consumption checkpoints the baton and
+acknowledges the successor before succession/head movement, title update, and
+verified predecessor retirement.
+
+Extension and extension-free flows share the same SDK-free core. Cross-plugin
+calls never use ambient `PATH` to select the sibling payload or its Python
+runtime: they resolve the owning sibling payload inside the same
+provenance-checked marketplace installation cell. On Windows and POSIX, the
+payload resolver may locate or provision that authoritative runtime, but the
+actual command runs as direct, isolated, UTF-8 Python argv with inherited
+`PYTHONPATH`/`PYTHONHOME` removed. Prompt, title, and payload text therefore
+never become batch source or pass through a shell-to-native argument
+re-serialization boundary.
+
+The complete lifecycle and invocation contract is
+[`patterns/context-handoff-lifecycle.md`](patterns/context-handoff-lifecycle.md).
+Plugin-specific behavior, degraded modes, and evaluation evidence are in the
+[`context-handoff` README](../plugins/context-handoff/README.md).
+
 The complete authoring pattern is
 [runtime-agent-plugin](patterns/runtime-agent-plugin.md). The current roster is
 guarded by `libs/payload-invocation/tests/test_agent_plugin_coverage.py`.
@@ -225,6 +290,53 @@ provider — a malformed or missing manifest is simply skipped with a warning
 version skew. agent-mcp is standalone: no bridge integration or resolver. Its
 agent-facing skills use the payload command glossary; static `mcp-servers`
 startup remains an explicit compatibility boundary during migration.
+
+**Cold-store providers** are a second, sibling provider *kind* (see
+`visions/plugins/agent-bridge` §Concepts/*cold-store providers*), keyed by
+**capability** rather than address namespace: they answer "give me this
+session's content" when the daemon's own live session ledger has nothing for
+a requested ID. A cold-store provider drops its manifest into
+`~/.agent-bridge/cold-store-providers.d/<name>.json` (schema: `capability`,
+`command`, plus the same `plugin`/`plugin_root` attribution fields as a
+namespace provider) and the daemon drives `<command> session-fetch
+<session-id> --json` over the same process-boundary discipline. The verb's
+exit-code contract: `0` = found (stdout is `{"session": {...}, "events":
+[...]}`, with `session.session_id` required and matched against the request),
+`3` = not found (a legitimate miss, never an error), anything else = a
+provider error that is logged and treated as "this provider could not
+answer" — never raised to the caller. `GET /api/v1/sessions/{id}`,
+`GET /api/v1/sessions/{id}/transcript`, and
+`GET /api/v1/worktrees/{id}/sessions/{session_id}/transcript` all fall
+through to a registered `session-fetch` provider once their live answer has
+nothing for the requested session — the bare metadata/transcript routes
+when the live ledger misses (a bare session may have no `worktree_id` at
+all, so there is no owning agent to resolve through in the first place),
+the worktree-scoped transcript route when there is no live owning agent for
+the worktree at all *or* the owning agent's own local session-state has
+nothing for that session (its `session-transcript` verb answers an absent
+session with an empty list, not an error). All three mark the cold-store
+answer `read_only`/`at_rest` in their existing response shape.
+`GET /api/v1/worktrees/{id}/sessions` (the worktree-scoped *listing*) does
+**not** fall through to a cold-store provider yet — the cold-store contract
+is session-ID-keyed (`session-fetch <id>`), not worktree-keyed, so there is
+no provider verb to enumerate a worktree's sessions; adding one is a
+follow-up slice, not a wiring gap in the existing mechanism.
+
+A separate `GET /api/v1/worktrees/{id}/lineage` route shells to
+`<project> worktree-lineage --worktree <id> --json` and forwards its graph
+verbatim: the current head, every session with its predecessor/successor,
+the head-transition history, and the handoff ledger (each entry carries its
+own `state`, so a caller can tell a genuine **fork** — more than one
+simultaneously `pending` handoff — from ordinary resolved/cancelled
+history). This reuses agent-worktrees' own already-bounded, already-tested
+`lineage_surfaces.worktree_lineage` surface rather than re-deriving
+fork/lineage semantics in the bridge from the plain session list (an
+earlier draft of this route tried exactly that, using the unfiltered
+`handoffs` history instead of the `pending`-filtered/`state`-aware view —
+caught by review before merge).
+agent-logger is the reference cold-store provider (see its own plugin docs);
+`agent-bridge doctor` reports findings for both `providers.d` and
+`cold-store-providers.d`.
 
 ## Ports
 
@@ -445,6 +557,40 @@ silently orphans a half-finished CodeSpace, an un-merged cross-repo branch, or a
 bridge session left mid-flight. (Effort: `resource-obligation-settlement`;
 umbrella dotfiles#1081; parent `git-ref-resource-leases`.)
 
+### Coordination readiness — identity before ownership
+
+Before a worktree or provider creates an outbound claim, lease, owner-linked
+child, or externally hosted resource, agent-worktrees resolves the qualified
+owner project's durable coordination identity. `coordination-readiness` emits a
+version-1 JSON result with `ready`, a stable `code`, bounded `state_root`
+metadata, and actionable `error` text. A project that requires external state
+returns `knowledge_binding_required` when no knowledge repository is bound and
+`state_root_resolution_failed` when the bound/owner project cannot be resolved.
+Normal self-hosted projects remain ready.
+
+The check precedes claim-ledger writes, handoff reservations, pending `run`
+claims, child subprocesses, source preparation, Git worktree creation, Git-ref
+lease I/O, and CodeSpace claim/transport work. A lease-origin override cannot
+bypass required binding: new acquisition accepts it only when it identifies the
+bound state repository, whose checkout continues to provide account-scoped Git
+authentication.
+
+The boundary is acquisition-only. Claim/lease inspection and teardown remain
+available, and an existing lease can renew or release through its original
+explicit/carried origin during a later binding outage. agent-codespaces consumes
+the preflight only when an agent-worktrees owner reference participates;
+agent-bridge forwards that reference for Session-Host dispatch. Missing, older,
+malformed, unversioned, or incompatible optional peers preserve standalone
+provider behavior; only a compatible explicit rejection blocks. Direct
+agent-containers fleet admission remains provider-local and independent.
+An embedding lease acquisition reports the versioned rejection on exit `5`;
+agent-codespaces carries a compatible provider rejection as exit `78`, which
+agent-bridge turns into a distinct `codespace_coordination_rejected`
+failed-session event before establishing the Session-Host transport.
+
+The reusable contract is documented in
+[`state-root-bound coordination`](patterns/state-root-coordination.md).
+
 ### Disposition — the lien on each outbound claim
 Every outbound resource in a worktree's claim ledger
 (`agent_worktrees.tracking.ResourceClaim`) carries a **disposition** — the three
@@ -567,6 +713,11 @@ closed; umbrella dotfiles#1081.)*
 
 ## Where to go next
 
+- **Troubleshooting across entities (worktree, session, task, bridge,
+  machine, ...)?** Start with
+  [patterns/entity-relationship-model.md](patterns/entity-relationship-model.md)
+  — the diagnostic playbook mapping each cross-entity question to its current
+  CLI command, before writing an ad-hoc script.
 - [Rollout readiness plan](plans/rollout-readiness.md) · [Fresh dev box validation](plans/fresh-devbox-validation.md)
 - agent-worktrees [architecture](../plugins/agent-worktrees/docs/architecture.md) · [CLI reference](../plugins/agent-worktrees/docs/cli-reference.md)
 - agent-bridge [architecture](../plugins/agent-bridge/docs/architecture.md) · [machine-config](../plugins/agent-bridge/docs/machine-config.md)
@@ -576,6 +727,8 @@ closed; umbrella dotfiles#1081.)*
 - agent-logger [README](../plugins/agent-logger/README.md) · [session-sync-setup skill](../plugins/agent-logger/skills/session-sync-setup/SKILL.md)
 - efforts [README](../plugins/efforts/README.md) · [planning-efforts skill](../plugins/efforts/skills/planning-efforts/SKILL.md)
 - context-handoff [README](../plugins/context-handoff/README.md) · [context-handoff skill](../plugins/context-handoff/skills/context-handoff/SKILL.md)
-- customizing-copilot [README](../plugins/customizing-copilot/README.md) · [authoring-skills](../plugins/customizing-copilot/skills/authoring-skills/SKILL.md) · [defining-subagents](../plugins/customizing-copilot/skills/defining-subagents/SKILL.md) · [registering-mcp-servers](../plugins/customizing-copilot/skills/registering-mcp-servers/SKILL.md) · [installing-plugins](../plugins/customizing-copilot/skills/installing-plugins/SKILL.md)
+- customizing-copilot [README](../plugins/customizing-copilot/README.md) · [authoring-skills](../plugins/customizing-copilot/skills/authoring-skills/SKILL.md) · [defining-subagents](../plugins/customizing-copilot/skills/defining-subagents/SKILL.md) · [registering-mcp-servers](../plugins/customizing-copilot/skills/registering-mcp-servers/SKILL.md) · [installing-plugins](../plugins/customizing-copilot/skills/installing-plugins/SKILL.md) · [building-harnesses](../plugins/customizing-copilot/skills/building-harnesses/SKILL.md) · [reviewing-customizations](../plugins/customizing-copilot/skills/reviewing-customizations/SKILL.md) · [authoring-harness-plugins](../plugins/customizing-copilot/skills/authoring-harness-plugins/SKILL.md) · [diagnosing-copilot-cli-startup](../plugins/customizing-copilot/skills/diagnosing-copilot-cli-startup/SKILL.md) · [hoisting-plugin-agents](../plugins/customizing-copilot/skills/hoisting-plugin-agents/SKILL.md) · [componentizing-modules](../plugins/customizing-copilot/skills/componentizing-modules/SKILL.md) · [setting-up-instruction-sync-worker](../plugins/customizing-copilot/skills/setting-up-instruction-sync-worker/SKILL.md)
 - ai-attribution [README](../plugins/ai-attribution/README.md) · [configuration](../plugins/ai-attribution/docs/configuration.md) · [setup](../plugins/ai-attribution/skills/ai-attribution-setup/SKILL.md) · [publication workflow](../plugins/ai-attribution/skills/ai-attribution/SKILL.md)
-- delegation-guidance [README](../plugins/delegation-guidance/README.md) · [delegating-work skill](../plugins/delegation-guidance/skills/delegating-work/SKILL.md)
+- delegation-guidance [README](../plugins/delegation-guidance/README.md) — deprecated, see agent-conduct-guidance
+- agent-conduct-guidance [README](../plugins/agent-conduct-guidance/README.md) · [spawning-headless-processes skill](../plugins/agent-conduct-guidance/skills/spawning-headless-processes/SKILL.md) · [delegating-work skill](../plugins/agent-conduct-guidance/skills/delegating-work/SKILL.md) · [using-scratch-space skill](../plugins/agent-conduct-guidance/skills/using-scratch-space/SKILL.md)
+- agent-remote-driver [README](../plugins/agent-remote-driver/README.md)

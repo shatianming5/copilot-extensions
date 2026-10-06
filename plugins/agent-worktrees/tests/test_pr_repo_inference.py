@@ -22,6 +22,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent_worktrees import __main__ as m
+from agent_worktrees import pr_cli
+from agent_worktrees import pr_config
+from agent_worktrees import pr_merge_cli
 from agent_worktrees import config as cfg
 from agent_worktrees import git_ops
 
@@ -134,6 +137,43 @@ class TestInferActiveRepoSlug:
         assert m._infer_active_repo_slug(self._config()) is None
 
 
+# _infer_active_github_slug -- GitHub-only variant (#3032 follow-up) ---------
+# --------------------------------------------------------------------------
+class TestInferActiveGithubSlug:
+    def _config(self):
+        cfg_obj = MagicMock()
+        cfg_obj.default_repo = MagicMock()
+        return cfg_obj
+
+    def test_github_remote_resolves(self, monkeypatch):
+        monkeypatch.setattr(
+            m, "_resolve_repo_remote",
+            lambda config, repo: "https://github.com/example-user/example-repo.git")
+        assert (
+            m._infer_active_github_slug(self._config())
+            == "example-user/example-repo"
+        )
+
+    def test_ado_remote_is_none(self, monkeypatch):
+        # The reported bug: a provider-generic slug like "Developer/example-repo"
+        # must never reach GitHub account resolution, which would treat
+        # "Developer" as a bogus GitHub owner.
+        monkeypatch.setattr(
+            m, "_resolve_repo_remote",
+            lambda config, repo: "https://your-org.visualstudio.com/Developer/_git/example-repo")
+        assert m._infer_active_github_slug(self._config()) is None
+
+    def test_none_when_remote_empty(self, monkeypatch):
+        monkeypatch.setattr(m, "_resolve_repo_remote", lambda config, repo: "")
+        assert m._infer_active_github_slug(self._config()) is None
+
+    def test_none_when_resolve_raises(self, monkeypatch):
+        def _boom(config, repo):
+            raise OSError("anchor missing")
+        monkeypatch.setattr(m, "_resolve_repo_remote", _boom)
+        assert m._infer_active_github_slug(self._config()) is None
+
+
 # --------------------------------------------------------------------------
 # Dispatcher wiring
 # --------------------------------------------------------------------------
@@ -153,7 +193,7 @@ class TestPrMergeDispatcherInference:
         def _infer(config):
             calls["n"] += 1
             return None
-        monkeypatch.setattr(m, "_infer_active_repo_slug", _infer)
+        monkeypatch.setattr(pr_merge_cli, "_infer_active_repo_slug", _infer)
 
         rc = m.cmd_pr_merge_dispatch(["2333486"])
         assert rc == 2
@@ -165,9 +205,24 @@ class TestPrMergeDispatcherInference:
 
         def _must_not_call(config):
             raise AssertionError("inference must not run when a slug is explicit")
-        monkeypatch.setattr(m, "_infer_active_repo_slug", _must_not_call)
+        monkeypatch.setattr(pr_merge_cli, "_infer_active_repo_slug", _must_not_call)
+        # The explicit slug must resolve to *some* repo config to reach the
+        # flow-classification point this test actually probes -- stand in
+        # for registry/remote resolution with a trivial same-repo match
+        # (this test is about inference being skipped, not resolution).
+        monkeypatch.setattr(
+            pr_config, "resolve_repo_config_for_slug",
+            lambda config, slug: pr_config.ForeignRepoResolution(
+                config.default_repo, "owner/name", same_as_active=True
+            ),
+        )
         # Halt just past the inference point so we never hit the network.
-        monkeypatch.setattr(m, "_pr_flow_profile",
+        # `cmd_pr_merge_dispatch` resolves flow via
+        # `pr_config.resolve_actor_pr_flow`, which classifies the *configured*
+        # flow through `_profile_for_pr_config` unconditionally and before any
+        # network/provider call (#4480) -- `_pr_flow_profile` is no longer on
+        # this call path, so patching it here no longer halts anything.
+        monkeypatch.setattr(pr_config, "_profile_for_pr_config",
                             lambda repo_cfg: (_ for _ in ()).throw(_Stop()))
 
         with pytest.raises(_Stop):
@@ -184,7 +239,7 @@ class TestPrResearchDispatcherInference:
         def _infer(config):
             calls["n"] += 1
             return None
-        monkeypatch.setattr(m, "_infer_active_repo_slug", _infer)
+        monkeypatch.setattr(pr_cli, "_infer_active_repo_slug", _infer)
 
         rc = m.cmd_pr_research_dispatch([])
         assert rc == 1
@@ -201,7 +256,7 @@ class TestPrWatchDispatcherInference:
         def _infer(config):
             calls["n"] += 1
             return None
-        monkeypatch.setattr(m, "_infer_active_repo_slug", _infer)
+        monkeypatch.setattr(pr_cli, "_infer_active_repo_slug", _infer)
 
         rc = m.cmd_pr_watch_dispatch(["wait", "123"])
         assert rc == 2

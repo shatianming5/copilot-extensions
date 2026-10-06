@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 
 class RegistrationKind:
@@ -36,8 +38,12 @@ class RegistrationKind:
     SCHEDULE = "schedule"
     EMITTER = "emitter"
     EVALUATOR = "evaluator"
+    PLUGIN_COMPANION = "plugin-companion"
 
-    ALL = frozenset({SUPERVISED_LANE, SCHEDULE, EMITTER, EVALUATOR})
+    ALL = frozenset(
+        {SUPERVISED_LANE, SCHEDULE, EMITTER, EVALUATOR, PLUGIN_COMPANION}
+    )
+    DIRECT = frozenset({SUPERVISED_LANE, SCHEDULE, EMITTER, EVALUATOR})
 
 
 class RegistrationStatus:
@@ -57,6 +63,501 @@ class RegistrationStatus:
 
 class RegistrationError(ValueError):
     """Raised when a registration's kind or spec is malformed."""
+
+
+_COMPANION_KEYS = frozenset(
+    {
+        "command",
+        "stop_command",
+        "config_provider",
+        "health_probe",
+        "config_timeout_seconds",
+        "health_timeout_seconds",
+        "startup_timeout_seconds",
+        "stop_timeout_seconds",
+        "managed_runtime",
+    }
+)
+_COMPANION_REQUIRED_KEYS = frozenset({"command"})
+_COMPANION_TIMEOUT_KEYS = frozenset(
+    {
+        "config_timeout_seconds",
+        "health_timeout_seconds",
+        "startup_timeout_seconds",
+        "stop_timeout_seconds",
+    }
+)
+COMPANION_CONFIG_RESULT_VERSION = 1
+COMPANION_HEALTH_RESULT_VERSION = 1
+MANAGED_RUNTIME_SCHEMA_VERSION = 1
+_PORTABLE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+_IMPORT_NAME = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$"
+)
+_MAX_PROJECT_PATH_LENGTH = 1024
+_MAX_PROJECT_COMPONENTS = 32
+_MAX_PROJECT_COMPONENT_LENGTH = 128
+_MAX_IMPORT_LENGTH = 512
+_MAX_IMPORT_COMPONENTS = 16
+_MAX_IMPORT_COMPONENT_LENGTH = 128
+_WINDOWS_RESERVED_STEMS = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
+    | {f"{prefix}{index}" for prefix in ("com", "lpt") for index in "¹²³"}
+)
+
+
+def _validate_plugin_relative_argv(value: object, *, field: str) -> None:
+    if not isinstance(value, list) or not value or not all(
+        isinstance(part, str) and part for part in value
+    ):
+        raise RegistrationError(
+            f"plugin-companion '{field}' must be a non-empty argv list"
+        )
+    executable = value[0].replace("\\", "/")
+    path = PurePosixPath(executable)
+    if path.is_absolute() or re.match(r"^[A-Za-z]:", executable):
+        raise RegistrationError(
+            f"plugin-companion '{field}' executable must be plugin-relative"
+        )
+    if any(part in ("", ".", "..") for part in path.parts):
+        raise RegistrationError(
+            f"plugin-companion '{field}' executable must be a contained relative path"
+        )
+
+
+def _validate_portable_component(value: object, *, field: str) -> None:
+    if (
+        not isinstance(value, str)
+        or value in {".", ".."}
+        or not _PORTABLE_COMPONENT.fullmatch(value)
+        or value.endswith(".")
+        or value.split(".", 1)[0].casefold() in _WINDOWS_RESERVED_STEMS
+    ):
+        raise RegistrationError(
+            f"plugin-companion managed runtime '{field}' must be a portable "
+            "filesystem component"
+        )
+
+
+def _validate_project_path(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise RegistrationError(
+            f"plugin-companion managed runtime '{field}' must be a plugin-relative path"
+        )
+    normalized = value
+    if normalized == ".":
+        return normalized
+    parts = normalized.split("/")
+    path = PurePosixPath(normalized)
+    if (
+        len(normalized) > _MAX_PROJECT_PATH_LENGTH
+        or len(parts) > _MAX_PROJECT_COMPONENTS
+        or any(len(part) > _MAX_PROJECT_COMPONENT_LENGTH for part in parts)
+        or path.is_absolute()
+        or re.match(r"^[A-Za-z]:", normalized)
+        or any(part in ("", ".", "..") for part in parts)
+        or any(
+            part.endswith((".", " "))
+            or any(ord(character) < 32 or character in '<>:"|?*' for character in part)
+            or part.split(".", 1)[0].casefold() in _WINDOWS_RESERVED_STEMS
+            for part in parts
+        )
+    ):
+        raise RegistrationError(
+            f"plugin-companion managed runtime '{field}' must be a contained "
+            "plugin-relative path"
+        )
+    return path.as_posix()
+
+
+def _validate_managed_runtime(value: object) -> None:
+    if not isinstance(value, dict):
+        raise RegistrationError(
+            "plugin-companion 'managed_runtime' must be a JSON object"
+        )
+    allowed = {"schema_version", "runtimes"}
+    if unknown := sorted(set(value) - allowed):
+        raise RegistrationError(
+            "plugin-companion managed runtime has unknown fields: "
+            + ", ".join(unknown)
+        )
+    schema_version = value.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != MANAGED_RUNTIME_SCHEMA_VERSION
+    ):
+        raise RegistrationError(
+            "plugin-companion managed runtime needs schema_version "
+            f"{MANAGED_RUNTIME_SCHEMA_VERSION}"
+        )
+    runtimes = value.get("runtimes")
+    if not isinstance(runtimes, list) or not runtimes or len(runtimes) > 16:
+        raise RegistrationError(
+            "plugin-companion managed runtime 'runtimes' must contain 1 to 16 objects"
+        )
+
+    runtime_names: set[str] = set()
+    python_environments: set[str] = set()
+    runtime_keys = {
+        "name",
+        "version",
+        "profile",
+        "python_env",
+        "projects",
+        "identity_paths",
+        "imports",
+    }
+    required_runtime_keys = {
+        "name",
+        "version",
+        "profile",
+        "python_env",
+        "projects",
+        "imports",
+    }
+    for index, runtime in enumerate(runtimes):
+        prefix = f"runtimes[{index}]"
+        if not isinstance(runtime, dict):
+            raise RegistrationError(
+                f"plugin-companion managed runtime '{prefix}' must be a JSON object"
+            )
+        if unknown := sorted(set(runtime) - runtime_keys):
+            raise RegistrationError(
+                f"plugin-companion managed runtime '{prefix}' has unknown fields: "
+                + ", ".join(unknown)
+            )
+        missing = sorted(required_runtime_keys - set(runtime))
+        if missing:
+            raise RegistrationError(
+                f"plugin-companion managed runtime '{prefix}' is missing required "
+                f"fields: {', '.join(missing)}"
+            )
+        for field in ("name", "version", "profile"):
+            _validate_portable_component(
+                runtime[field], field=f"{prefix}.{field}"
+            )
+        name = runtime["name"]
+        canonical_name = name.casefold()
+        if canonical_name in runtime_names:
+            raise RegistrationError(
+                f"plugin-companion managed runtime has duplicate runtime name: {name}"
+            )
+        runtime_names.add(canonical_name)
+
+        python_env = runtime["python_env"]
+        if (
+            not isinstance(python_env, str)
+            or not _ENVIRONMENT_NAME.fullmatch(python_env)
+        ):
+            raise RegistrationError(
+                f"plugin-companion managed runtime '{prefix}.python_env' must be "
+                "an environment variable name"
+            )
+        canonical_python_env = python_env.casefold()
+        if canonical_python_env in python_environments:
+            raise RegistrationError(
+                "plugin-companion managed runtime has duplicate python environment: "
+                f"{python_env}"
+            )
+        python_environments.add(canonical_python_env)
+
+        projects = runtime["projects"]
+        if not isinstance(projects, list) or not projects or len(projects) > 32:
+            raise RegistrationError(
+                f"plugin-companion managed runtime '{prefix}.projects' must contain "
+                "1 to 32 objects"
+            )
+        project_paths: set[str] = set()
+        for project_index, project in enumerate(projects):
+            project_prefix = f"{prefix}.projects[{project_index}]"
+            if not isinstance(project, dict):
+                raise RegistrationError(
+                    f"plugin-companion managed runtime '{project_prefix}' must be "
+                    "a JSON object"
+                )
+            if unknown := sorted(set(project) - {"path", "extras"}):
+                raise RegistrationError(
+                    f"plugin-companion managed runtime '{project_prefix}' has "
+                    f"unknown fields: {', '.join(unknown)}"
+                )
+            if "path" not in project:
+                raise RegistrationError(
+                    f"plugin-companion managed runtime '{project_prefix}' is "
+                    "missing required field: path"
+                )
+            project_path = _validate_project_path(
+                project["path"], field=f"{project_prefix}.path"
+            )
+            canonical_project_path = project_path.casefold()
+            if canonical_project_path in project_paths:
+                raise RegistrationError(
+                    f"plugin-companion managed runtime '{prefix}' has duplicate "
+                    f"project path: {project_path}"
+                )
+            project_paths.add(canonical_project_path)
+            extras = project.get("extras")
+            if extras is not None and (
+                not isinstance(extras, list)
+                or not extras
+                or len(extras) > 32
+                or not all(
+                    isinstance(extra, str)
+                    and _PORTABLE_COMPONENT.fullmatch(extra)
+                    and not extra.endswith(".")
+                    and extra.split(".", 1)[0].casefold()
+                    not in _WINDOWS_RESERVED_STEMS
+                    for extra in extras
+                )
+                or len({extra.casefold() for extra in extras}) != len(extras)
+            ):
+                raise RegistrationError(
+                    f"plugin-companion managed runtime '{project_prefix}.extras' "
+                    "must contain 1 to 32 unique portable names"
+                )
+        identity_paths = runtime.get("identity_paths")
+        if identity_paths is not None:
+            if (
+                not isinstance(identity_paths, list)
+                or not identity_paths
+                or len(identity_paths) > 64
+            ):
+                raise RegistrationError(
+                    f"plugin-companion managed runtime '{prefix}.identity_paths' "
+                    "must contain 1 to 64 paths"
+                )
+            seen_identity_paths: set[str] = set()
+            for identity_index, identity_path in enumerate(identity_paths):
+                normalized_identity_path = _validate_project_path(
+                    identity_path,
+                    field=f"{prefix}.identity_paths[{identity_index}]",
+                )
+                canonical_identity_path = normalized_identity_path.casefold()
+                if canonical_identity_path in seen_identity_paths:
+                    raise RegistrationError(
+                        f"plugin-companion managed runtime '{prefix}' has duplicate "
+                        f"identity path: {normalized_identity_path}"
+                    )
+                seen_identity_paths.add(canonical_identity_path)
+
+        imports = runtime["imports"]
+        if (
+            not isinstance(imports, list)
+            or not imports
+            or len(imports) > 32
+            or not all(
+                isinstance(import_name, str)
+                and len(import_name) <= _MAX_IMPORT_LENGTH
+                and len(import_name.split(".")) <= _MAX_IMPORT_COMPONENTS
+                and all(
+                    len(component) <= _MAX_IMPORT_COMPONENT_LENGTH
+                    for component in import_name.split(".")
+                )
+                and _IMPORT_NAME.fullmatch(import_name)
+                for import_name in imports
+            )
+            or len({import_name.casefold() for import_name in imports}) != len(imports)
+        ):
+            raise RegistrationError(
+                f"plugin-companion managed runtime '{prefix}.imports' must contain "
+                "1 to 32 unique Python import names"
+            )
+
+
+def _validate_plugin_companion(spec: dict) -> None:
+    unknown = sorted(set(spec) - _COMPANION_KEYS)
+    if unknown:
+        raise RegistrationError(
+            f"plugin-companion spec has unknown fields: {', '.join(unknown)}"
+        )
+    missing = sorted(_COMPANION_REQUIRED_KEYS - set(spec))
+    if missing:
+        raise RegistrationError(
+            f"plugin-companion spec is missing required fields: {', '.join(missing)}"
+        )
+    for field in ("command", "stop_command", "health_probe", "config_provider"):
+        if field in spec:
+            _validate_plugin_relative_argv(spec[field], field=field)
+    for field in _COMPANION_TIMEOUT_KEYS:
+        value = spec.get(field)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+            or value > 3600
+        ):
+            raise RegistrationError(
+                f"plugin-companion '{field}' must be > 0 and <= 3600"
+            )
+    if "managed_runtime" in spec:
+        _validate_managed_runtime(spec["managed_runtime"])
+
+
+def validate_companion_config_result(result: dict) -> None:
+    """Validate the versioned JSON contract emitted by a companion config provider."""
+    if not isinstance(result, dict):
+        raise RegistrationError("companion config result must be a JSON object")
+    allowed = {"schema_version", "active", "arguments", "environment"}
+    if unknown := sorted(set(result) - allowed):
+        raise RegistrationError(
+            f"companion config result has unknown fields: {', '.join(unknown)}"
+        )
+    schema_version = result.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != COMPANION_CONFIG_RESULT_VERSION
+    ):
+        raise RegistrationError(
+            "companion config result needs schema_version "
+            f"{COMPANION_CONFIG_RESULT_VERSION}"
+        )
+    if not isinstance(result.get("active"), bool):
+        raise RegistrationError("companion config result 'active' must be true/false")
+    arguments = result.get("arguments")
+    if arguments is not None and (
+        not isinstance(arguments, list)
+        or not all(isinstance(value, str) and value for value in arguments)
+    ):
+        raise RegistrationError(
+            "companion config result 'arguments' must be a list of non-empty strings"
+        )
+    environment = result.get("environment")
+    if environment is not None and (
+        not isinstance(environment, dict)
+        or not all(
+            isinstance(key, str)
+            and key
+            and isinstance(value, str)
+            for key, value in environment.items()
+        )
+    ):
+        raise RegistrationError(
+            "companion config result 'environment' must map strings to strings"
+        )
+
+
+def validate_companion_health_result(result: dict) -> None:
+    """Validate the versioned JSON contract emitted by a companion health probe."""
+    if not isinstance(result, dict):
+        raise RegistrationError("companion health result must be a JSON object")
+    allowed = {"schema_version", "healthy", "detail"}
+    if unknown := sorted(set(result) - allowed):
+        raise RegistrationError(
+            f"companion health result has unknown fields: {', '.join(unknown)}"
+        )
+    schema_version = result.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != COMPANION_HEALTH_RESULT_VERSION
+    ):
+        raise RegistrationError(
+            "companion health result needs schema_version "
+            f"{COMPANION_HEALTH_RESULT_VERSION}"
+        )
+    if not isinstance(result.get("healthy"), bool):
+        raise RegistrationError("companion health result 'healthy' must be true/false")
+    detail = result.get("detail")
+    if detail is not None and (not isinstance(detail, str) or not detail):
+        raise RegistrationError(
+            "companion health result 'detail' must be a non-empty string"
+        )
+
+
+def _validate_disposable_cli_labels(spec: dict) -> None:
+    values = spec.get("disposable_cli_labels")
+    if values is None:
+        return
+    if not isinstance(values, list) or not values or not all(
+        isinstance(value, str) and value for value in values
+    ):
+        raise RegistrationError(
+            "'disposable_cli_labels' must be a non-empty list of labels"
+        )
+    labels = spec.get("labels") or []
+    if not isinstance(labels, list) or not all(
+        isinstance(value, str) and value for value in labels
+    ):
+        raise RegistrationError(
+            "a disposable CLI policy requires a valid 'labels' list"
+        )
+    watched = set(labels)
+    disposable = set(values)
+    if stray := disposable - watched:
+        raise RegistrationError(
+            f"disposable CLI labels {sorted(stray)} are not watched by this lane"
+        )
+
+    fleet = spec.get("fleet") or {}
+    if not isinstance(fleet, dict):
+        raise RegistrationError("'fleet' must be a JSON object")
+    if fleet.get("pool"):
+        raise RegistrationError(
+            "disposable worker conclusion is supported only for local bodies"
+        )
+    for key, routed in (
+        ("headless_labels", spec.get("headless_labels") or []),
+        ("cli_labels", spec.get("cli_labels") or []),
+    ):
+        if not isinstance(routed, list) or not all(
+            isinstance(value, str) and value for value in routed
+        ):
+            raise RegistrationError(f"'{key}' must be a list of labels")
+
+
+def _validate_idle_nudge_exempt_labels(spec: dict) -> None:
+    values = spec.get("idle_nudge_exempt_labels")
+    if values is None:
+        return
+    if not isinstance(values, list) or not values or not all(
+        isinstance(value, str) and value for value in values
+    ):
+        raise RegistrationError(
+            "'idle_nudge_exempt_labels' must be a non-empty list of labels"
+        )
+    labels = spec.get("labels") or []
+    if not isinstance(labels, list) or not all(
+        isinstance(value, str) and value for value in labels
+    ):
+        raise RegistrationError(
+            "an idle-nudge-exempt policy requires a valid 'labels' list"
+        )
+    watched = set(labels)
+    exempt = set(values)
+    if stray := exempt - watched:
+        raise RegistrationError(
+            f"idle-nudge-exempt labels {sorted(stray)} are not watched by this lane"
+        )
+
+
+def _validate_steering_disallowed_labels(spec: dict) -> None:
+    values = spec.get("steering_disallowed_labels")
+    if values is None:
+        return
+    if not isinstance(values, list) or not values or not all(
+        isinstance(value, str) and value for value in values
+    ):
+        raise RegistrationError(
+            "'steering_disallowed_labels' must be a non-empty list of labels"
+        )
+    labels = spec.get("labels") or []
+    if not isinstance(labels, list) or not all(
+        isinstance(value, str) and value for value in labels
+    ):
+        raise RegistrationError(
+            "a steering-disallowed policy requires a valid 'labels' list"
+        )
+    watched = set(labels)
+    disallowed = set(values)
+    if stray := disallowed - watched:
+        raise RegistrationError(
+            f"steering-disallowed labels {sorted(stray)} are not watched by this lane"
+        )
 
 
 def _schedule_entry(spec: dict, *, strict: bool) -> dict:
@@ -124,6 +625,9 @@ def validate_registration(kind: str, spec: dict) -> None:
                 "supervised-lane registration needs a 'repo' (the lane) or "
                 "'all_repos': true"
             )
+        _validate_disposable_cli_labels(spec)
+        _validate_idle_nudge_exempt_labels(spec)
+        _validate_steering_disallowed_labels(spec)
     elif kind == RegistrationKind.SCHEDULE:
         # A schedule is a self-run emitter: it needs an id (its dedup namespace,
         # 'sched:<id>:<epoch>') and a lane to emit into.
@@ -137,7 +641,11 @@ def validate_registration(kind: str, spec: dict) -> None:
     elif kind == RegistrationKind.EMITTER:
         if not spec:
             raise RegistrationError("emitter registration needs a non-empty spec")
-        if "command" in spec:
+        if (
+            "command" in spec
+            or "repository_issue_loop" in spec
+            or "effort_driver_loop" in spec
+        ):
             from .producers.emitter import EmitterError, validate_spec
 
             try:
@@ -147,6 +655,8 @@ def validate_registration(kind: str, spec: dict) -> None:
     elif kind == RegistrationKind.EVALUATOR:
         if not spec:
             raise RegistrationError("evaluator registration needs a non-empty spec")
+        from .reviewer_loops import EvaluatorError, reviewer_loop_lifecycle_config
+
         eval_spec = spec.get("evaluator_spec")
         if eval_spec is None and not spec.get("evaluator"):
             raise RegistrationError(
@@ -163,12 +673,19 @@ def validate_registration(kind: str, spec: dict) -> None:
                 "'all_repos': true"
             )
         evaluator_ref = spec.get("evaluator_ref")
-        if evaluator_ref is not None and (
-            not isinstance(evaluator_ref, str) or not evaluator_ref
-        ):
+        if not isinstance(evaluator_ref, str) or not evaluator_ref:
             raise RegistrationError(
-                "evaluator 'evaluator_ref' must be a non-empty string"
+                "evaluator registration needs a non-empty 'evaluator_ref'"
             )
+        try:
+            reviewer_loop_lifecycle_config(spec)
+        except EvaluatorError as exc:
+            raise RegistrationError(str(exc)) from exc
+        _validate_disposable_cli_labels(spec)
+        _validate_idle_nudge_exempt_labels(spec)
+        _validate_steering_disallowed_labels(spec)
+    elif kind == RegistrationKind.PLUGIN_COMPANION:
+        _validate_plugin_companion(spec)
 
 
 def _scope_key(kind: str, spec: dict) -> str:

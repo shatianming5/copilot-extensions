@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-vault"
-version = "0.1.0-dev84"
+version = "0.1.21-dev2"
 description = "Local KeePassXC-backed secret store for Copilot CLI agents."
 readme = "README.md"
 license = "MIT"
@@ -19,18 +19,27 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-# Windows-headless process-spawn helpers (module ``agent_procutil``). Vendored
-# per plugin; byte-identical src across copies.
+# `path` escapes this plugin's own root and resolves live to
+# `libs/agent-procutil`, so this `dev`-branch checkout has nothing to keep
+# manually in sync -- only a real `main`-branch release
+# (tools/materialize_main.py) ever gets a real local copy.
 agent-procutil = { path = "libs/agent-procutil" }
 # zero-downtime cutover primitives -- routing table + cutover orchestrator +
-# recovery breadcrumb (module ``zdd``). Vendored per plugin; byte-identical src
-# across copies. Lets a vault version bump drain-and-cut-over instead of a hard
-# restart, so the unlocked master secret survives (#743).
+# recovery breadcrumb (module ``zdd``). This is a `uv`-editable canonical
+# reference (vendor-pointer-generalization effort, Phase 1): `path`
+# escapes this plugin's own root and resolves live to `libs/zdd`, so this
+# `dev`-branch checkout has nothing to keep manually in sync -- only a
+# real `main`-branch release (tools/materialize_main.py) ever gets a real
+# local copy. It still lets a vault version bump drain-and-cut-over
+# instead of a hard restart, so the unlocked master secret survives
+# (#743).
 agent-zdd = { path = "libs/zdd" }
 # single-instance lease + supersession self-retire (module
-# ``single_instance_lease``). Vendored per plugin; byte-identical src across
-# copies. Guards "one active vault per host" and drives the drained predecessor's
-# self-retire during a cutover (#743).
+# ``single_instance_lease``). Guards "one active vault per host" and drives the
+# drained predecessor's self-retire during a cutover (#743). This is a
+# `uv`-editable canonical reference (vendor-pointer-generalization effort,
+# Phase 1): `path` escapes this plugin's own root and resolves live to
+# `libs/single-instance-lease`, so every consumer shares one canonical copy.
 agent-single-instance-lease = { path = "libs/single-instance-lease" }
 
 [project.optional-dependencies]

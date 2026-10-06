@@ -1036,6 +1036,8 @@ def test_anchor_pair_rejects_rebound_knowledge_before_resolving(
     assert "old-private" in result.error
     assert "new-private" in result.error
     assert resolved is False
+    assert result.current is not None
+    assert result.current.kind == "worktree"
 
 
 @pytest.mark.parametrize(
@@ -1179,6 +1181,23 @@ class TestStateRootPairCLI:
         knowledge.mkdir()
         self._pair_records(tracking_dir, harness, knowledge)
         monkeypatch.setattr(tk.cfg, "tracking_dir", lambda: tracking_dir)
+        knowledge_project = tmp_path / "knowledge-project"
+        knowledge_tracking = knowledge_project / "worktrees"
+        knowledge_tracking.mkdir(parents=True)
+        tk.save_record(
+            tk.load_record(tracking_dir / "wt-knowledge.yaml"),
+            knowledge_tracking / "wt-knowledge.yaml",
+        )
+        original_project_dir = tk.cfg.project_dir
+        monkeypatch.setattr(
+            tk.cfg,
+            "project_dir",
+            lambda project=None: (
+                knowledge_project
+                if project == "knowledge"
+                else original_project_dir(project)
+            ),
+        )
         monkeypatch.setattr("agent_worktrees.__main__.os.getcwd", lambda: str(harness))
 
         rc = cmd_state_root_dispatch(["--pair"])
@@ -1200,6 +1219,23 @@ class TestStateRootPairCLI:
         knowledge.mkdir()
         self._pair_records(tracking_dir, harness, knowledge)
         monkeypatch.setattr(tk.cfg, "tracking_dir", lambda: tracking_dir)
+        knowledge_project = tmp_path / "knowledge-project"
+        knowledge_tracking = knowledge_project / "worktrees"
+        knowledge_tracking.mkdir(parents=True)
+        tk.save_record(
+            tk.load_record(tracking_dir / "wt-knowledge.yaml"),
+            knowledge_tracking / "wt-knowledge.yaml",
+        )
+        original_project_dir = tk.cfg.project_dir
+        monkeypatch.setattr(
+            tk.cfg,
+            "project_dir",
+            lambda project=None: (
+                knowledge_project
+                if project == "knowledge"
+                else original_project_dir(project)
+            ),
+        )
         monkeypatch.setattr("agent_worktrees.__main__.os.getcwd", lambda: str(harness))
 
         rc = cmd_state_root_dispatch(["--pair", "--json"])
@@ -1223,6 +1259,181 @@ class TestStateRootPairCLI:
         )
         rc = cmd_state_root_dispatch(["--pair"])
         assert rc == 3
+
+    def test_pair_untracked_anchor_json_includes_state_root_context(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from agent_worktrees import context_cli
+        from agent_worktrees import tracking as tk
+        from agent_worktrees.__main__ import cmd_state_root_dispatch
+
+        tracking_dir = tmp_path / "tracking"
+        tracking_dir.mkdir()
+        harness = tmp_path / "harness"
+        knowledge = tmp_path / "knowledge"
+        harness.mkdir()
+        knowledge.mkdir()
+        config = _config(
+            "harness",
+            stateless=True,
+            knowledge_repo="knowledge",
+            anchor=str(harness),
+        )
+        monkeypatch.setattr(tk.cfg, "tracking_dir", lambda: tracking_dir)
+        monkeypatch.setattr(context_cli.cfg, "load_config", lambda: config)
+        monkeypatch.setattr(sr, "_checkout_path", lambda _name: str(knowledge))
+        monkeypatch.setattr(context_cli.os, "getcwd", lambda: str(harness))
+        monkeypatch.setattr(sr, "_git_toplevel", lambda _cwd: str(harness))
+
+        rc = cmd_state_root_dispatch(["--pair", "--json"])
+        data = json.loads(capsys.readouterr().out)
+
+        assert rc == 3
+        assert data["paired"] is False
+        assert data["error"] == "current directory is not a tracked worktree"
+        assert data["error_code"] == "CURRENT_CHECKOUT_IS_ANCHOR"
+        assert data["checkout"] == {"kind": "anchor", "path": str(harness)}
+        assert data["state_root"] == str(knowledge)
+        assert data["source"] == "knowledge_repo"
+        assert data["repo"] == "knowledge"
+        assert data["bound"] is True
+        assert data["recovery"]["read_only_path"] == str(knowledge)
+        assert "tracked worktree" in data["recovery"]["writable"]
+
+    def test_pair_untracked_anchor_json_keeps_unresolved_binding_distinct(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from agent_worktrees import context_cli
+        from agent_worktrees import tracking as tk
+        from agent_worktrees.__main__ import cmd_state_root_dispatch
+
+        tracking_dir = tmp_path / "tracking"
+        tracking_dir.mkdir()
+        harness = tmp_path / "harness"
+        harness.mkdir()
+        config = _config(
+            "harness",
+            stateless=True,
+            knowledge_repo="missing",
+            anchor=str(harness),
+        )
+        monkeypatch.setattr(tk.cfg, "tracking_dir", lambda: tracking_dir)
+        monkeypatch.setattr(context_cli.cfg, "load_config", lambda: config)
+        monkeypatch.setattr(sr, "_checkout_path", lambda _name: None)
+        monkeypatch.setattr(context_cli.os, "getcwd", lambda: str(harness))
+        monkeypatch.setattr(sr, "_git_toplevel", lambda _cwd: str(harness))
+
+        rc = cmd_state_root_dispatch(["--pair", "--json"])
+        data = json.loads(capsys.readouterr().out)
+
+        assert rc == 3
+        assert data["error"] == "current directory is not a tracked worktree"
+        assert data["error_code"] == "CURRENT_CHECKOUT_IS_ANCHOR"
+        assert data["state_root"] is None
+        assert data["bound"] is False
+        assert data["recovery"]["read_only_path"] is None
+        assert "not a registered repo" in data["state_root_error"]
+
+    def test_pair_untracked_anchor_text_is_actionable(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from agent_worktrees import context_cli
+        from agent_worktrees import tracking as tk
+        from agent_worktrees.__main__ import cmd_state_root_dispatch
+
+        tracking_dir = tmp_path / "tracking"
+        tracking_dir.mkdir()
+        harness = tmp_path / "harness"
+        knowledge = tmp_path / "knowledge"
+        harness.mkdir()
+        knowledge.mkdir()
+        config = _config(
+            "harness",
+            stateless=True,
+            knowledge_repo="knowledge",
+            anchor=str(harness),
+        )
+        monkeypatch.setattr(tk.cfg, "tracking_dir", lambda: tracking_dir)
+        monkeypatch.setattr(context_cli.cfg, "load_config", lambda: config)
+        monkeypatch.setattr(sr, "_checkout_path", lambda _name: str(knowledge))
+        monkeypatch.setattr(context_cli.os, "getcwd", lambda: str(harness))
+        monkeypatch.setattr(sr, "_git_toplevel", lambda _cwd: str(harness))
+
+        rc = cmd_state_root_dispatch(["--pair"])
+        captured = capsys.readouterr()
+
+        assert rc == 3
+        assert captured.err.splitlines()[0] == (
+            "current directory is not a tracked worktree"
+        )
+        assert "registered repository anchor" in captured.err
+        assert f"Read-only state root: {knowledge}" in captured.err
+        assert "from a tracked worktree" in captured.err
+
+    def test_pair_untracked_anchor_survives_failed_git_probe(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from agent_worktrees import context_cli
+        from agent_worktrees import tracking as tk
+        from agent_worktrees.__main__ import cmd_state_root_dispatch
+
+        tracking_dir = tmp_path / "tracking"
+        tracking_dir.mkdir()
+        harness = tmp_path / "harness"
+        knowledge = tmp_path / "knowledge"
+        harness.mkdir()
+        knowledge.mkdir()
+        config = _config(
+            "harness",
+            stateless=True,
+            knowledge_repo="knowledge",
+            anchor=str(harness),
+        )
+        monkeypatch.setattr(tk.cfg, "tracking_dir", lambda: tracking_dir)
+        monkeypatch.setattr(context_cli.cfg, "load_config", lambda: config)
+        monkeypatch.setattr(sr, "_checkout_path", lambda _name: str(knowledge))
+        monkeypatch.setattr(context_cli.os, "getcwd", lambda: str(harness))
+        monkeypatch.setattr(sr, "_git_toplevel", lambda _cwd: None)
+
+        rc = cmd_state_root_dispatch(["--pair", "--json"])
+        data = json.loads(capsys.readouterr().out)
+
+        assert rc == 3
+        assert data["error_code"] == "CURRENT_CHECKOUT_IS_ANCHOR"
+        assert data["checkout"] == {"kind": "anchor", "path": str(harness)}
+        assert data["state_root"] == str(knowledge)
+
+    def test_pair_untracked_context_failure_preserves_original_error(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from agent_worktrees import context_cli
+        from agent_worktrees import tracking as tk
+        from agent_worktrees.__main__ import cmd_state_root_dispatch
+
+        tracking_dir = tmp_path / "tracking"
+        tracking_dir.mkdir()
+        harness = tmp_path / "harness"
+        harness.mkdir()
+        config = _config("harness", anchor=str(harness))
+        monkeypatch.setattr(tk.cfg, "tracking_dir", lambda: tracking_dir)
+        monkeypatch.setattr(context_cli.cfg, "load_config", lambda: config)
+        monkeypatch.setattr(context_cli.os, "getcwd", lambda: str(harness))
+        monkeypatch.setattr(sr, "_git_toplevel", lambda _cwd: str(harness))
+        monkeypatch.setattr(
+            sr,
+            "resolve_state_root",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyError("boom")),
+        )
+
+        rc = cmd_state_root_dispatch(["--pair", "--json"])
+        data = json.loads(capsys.readouterr().out)
+
+        assert rc == 3
+        assert data["paired"] is False
+        assert data["error"] == "current directory is not a tracked worktree"
+        assert "additional state-root context unavailable" in (
+            data["state_root_error"]
+        )
 
     def test_pair_unpaired_worktree_exits_3(self, tmp_path, monkeypatch, capsys):
         from agent_worktrees import tracking as tk

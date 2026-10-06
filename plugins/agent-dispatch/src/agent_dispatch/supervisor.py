@@ -19,7 +19,7 @@ reservation and is skipped, so a slow-but-alive embody can never be
 double-spawned (the exact failure this component exists to prevent).
 
 A reservation is released for a **fresh** spawn only when its task reaches a
-**terminal** state (``completed``/``abandoned`` -> ``reconcile`` settles it) or
+**terminal** state (``submitted``/``abandoned`` -> ``reconcile`` settles it) or
 when an operator explicitly fails it (having confirmed the embody is gone). That
 means **auto-recovery of a genuinely dead-but-non-terminal embody is
 intentionally NOT done here** -- it requires embody-session *liveness detection*
@@ -31,496 +31,130 @@ re-spawn) and surfaced for a human, which is the safe default.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
-import uuid
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path  # noqa: F401 -- re-exported; tests patch Path.stat via this module
 from typing import Any
 
+import httpx
+
+from .bridge_events import BridgeSubscription, SupervisorEventWake
 from .client import DispatchClient, DispatchError
+from .loop_governance import LoopGovernance
 from .queue import SpawnState, Status
+from .spawn_factories import (  # noqa: F401 -- re-exported for existing call sites/tests
+    _FLEET_BODY_PREFIX,
+    _LOCAL_BODY_PREFIX,
+    AttemptConclusionFn,
+    ConclusionFn,
+    FleetActivityFn,
+    FleetColdFn,
+    FleetEndFn,
+    FleetVerdictFn,
+    LivenessFn,
+    LocalAcpSessionFn,
+    LocalBodyActivityFn,
+    LocalBodyTargetDirFn,
+    LocalBodyVerdictFn,
+    LocalColdFn,
+    LocalEndFn,
+    LocalResumeFn,
+    NudgeFn,
+    RedriveFn,
+    ScriptBodyVerdictFn,
+    SpawnFn,
+    SpawnPreparationRetained,
+    VerdictFn,
+    WorktreeDirectoryPresentFn,
+    _default_attempt_conclusion,
+    _default_conclusion,
+    _default_fleet_activity,
+    _default_fleet_cold,
+    _default_fleet_end,
+    _default_fleet_verdict,
+    _default_liveness,
+    _default_local_acp_session,
+    _default_local_body_activity,
+    _default_local_body_target_dir,
+    _default_local_body_verdict,
+    _default_local_cold,
+    _default_local_end,
+    _default_local_resume,
+    _default_nudge,
+    _default_redrive,
+    _default_script_body_verdict,
+    _default_verdict,
+    _default_worktree_directory_present,
+    _cleanup_script_task_file,
+    _machine_from_owner,
+    _parse_fleet_body_handle,
+    _parse_local_body_handle,
+    _parse_script_body_handle,
+    _reservation_made_progress,
+    _target_directory_missing,
+    _tracking,
+    _worktree_from_owner,
+    _worktree_from_reservation,
+    make_embody_spawn,
+    make_headless_spawn,
+    make_label_routed_spawn,
+    make_script_spawn,
+    make_redrive_sender,
+    request_failed_created_spawn_release,
+)
+from .supervisor_conclusion import (  # noqa: F401 -- re-exported for existing call sites/tests
+    _CONCLUSION_COMPLETE,
+    _CONCLUSION_HELD,
+    _CONCLUSION_MAX_ATTEMPTS,
+    _CONCLUSION_PENDING,
+    _CONCLUSION_RETRY_BASE_SECONDS,
+    _TRANSIENT_CONCLUSION_REASONS,
+    _append_conclusion_detail,
+    _bounded_cleanup_failure,
+    _bounded_component_failure,
+    _cleanup_envelope_state,
+    _component_retry_meta,
+    _conclusion_retry_meta,
+    _conclusion_retry_payload,
+    _conclusion_state,
+    _hold_pending_cleanup,
+)
 
 log = logging.getLogger("agent-dispatch.supervisor")
+_GOVERNANCE_BACKOFF_SECONDS = 10.0
 
-#: A spawn function: given a task snapshot, launch a worker and report
-#: ``(ok, handle)`` where ``handle`` carries ``session``/``worktree`` (on
-#: success) or ``error`` (on failure).
-SpawnFn = Callable[[dict], "tuple[bool, dict]"]
-
-#: A liveness probe: ``(worktree, machine) -> session dict`` when the embodied
-#: session is **confirmed alive**, else ``None`` (dead *or* unresolvable).
-LivenessFn = Callable[[str, "str | None"], "dict | None"]
-
-#: A liveness **verdict** resolver: ``(worktree, machine, owner_session_id) ->
-#: 'live' | 'gone' | 'unknown'`` (identity-keyed; ``unknown`` is never treated as
-#: death). Injectable so tests drive verdicts deterministically.
-VerdictFn = Callable[[str, "str | None", "str | None"], str]
-
-#: A nudge sender: ``(worktree, machine, task) -> sent?``. Delivers a non-blocking
-#: steering message to a stalled-but-live embodied session. Injectable for tests.
-NudgeFn = Callable[[str, "str | None", dict], bool]
-
-#: A re-drive sender for a spawned-but-unclaimed embodied worker. The session is
-#: known live, but the task is still queued/unowned, so the supervisor re-sends
-#: the idempotent autopilot seed instead of spawning a duplicate.
-RedriveFn = Callable[[str, "str | None", dict, dict, dict], bool]
-
-#: A turn-state resolver: ``(worktree, machine) -> 'running' | 'idle' | None``.
-#: Reads an embodied worker's coarse turn state (the derived turn boundary the
-#: coordination layer computes from its session events); ``None`` when the worker
-#: has no observable live session. Injectable so tests drive turn boundaries
-#: deterministically.
-TurnStateFn = Callable[[str, "str | None"], "str | None"]
-
-#: Stop a local headless bridge session while preserving it for later resume.
-LocalColdFn = Callable[[str], bool]
-
-#: Stop a remote fleet bridge session while preserving it for later resume.
-FleetColdFn = Callable[[str, str], bool]
-
-_TERMINAL = frozenset({Status.COMPLETED, Status.ABANDONED})
+#: "Provably finished, reconcile() may settle a still-active reservation" --
+#: includes COMPLETED (2026-09-28, rubber-duck review): it is Status.COMPLETED
+#: that is the TRUE completion terminal now (Status.SUBMITTED is only a
+#: worker's unverified claim -- see queue_records.py), but this set had never
+#: been updated when COMPLETED was introduced, so a task reaching COMPLETED
+#: before its next reconcile() pass permanently fenced its exclusive_key --
+#: reconcile() never settled the reservation, and no other sweep covers a
+#: RESERVING/SPAWNED/COLD reservation on a COMPLETED task either. Deliberately
+#: NOT Status.CONCLUDED: this is the set of statuses whose reservations can
+#: be settled by the generic reconcile path.
+_TERMINAL = frozenset({Status.SUBMITTED, Status.COMPLETED, Status.ABANDONED})
 _LEASED = frozenset({Status.CLAIMED, Status.STARTED})
-
-
-def _default_liveness(worktree: str, machine: str | None) -> dict | None:
-    """Resolve an embodied session's liveness via the agent-bridge registry.
-
-    Delegates to :func:`agent_dispatch.tracking.resolve_live_session` (shells the
-    ``agent-bridge`` CLI, cross-machine over SSH when the owner is remote). All
-    failure modes collapse to ``None`` -- so ``None`` means "not confirmed alive",
-    which is why the supervisor only *heartbeats* on a positive result and never
-    treats ``None`` as proof-of-death.
-    """
-    from . import tracking
-
-    return tracking.resolve_live_session(worktree, machine=machine)
-
-
-def _reservation_made_progress(reservation: dict, task: dict) -> bool:
-    """Whether this spawned body durably advanced the task after reservation.
-
-    A headless body commonly ends its one turn after posting a card/progress beat.
-    That is a successful embodiment round, not a failed spawn attempt. Compare the
-    durable activity timestamps to this reservation so stale progress from an
-    earlier body cannot mask a newly crashing replacement.
-    """
-    try:
-        reserved_at = float(reservation.get("reserved_at") or 0)
-    except (TypeError, ValueError):
-        reserved_at = 0.0
-    timestamps: list[object] = []
-    card = task.get("card")
-    if isinstance(card, dict):
-        timestamps.append(card.get("ts"))
-    progress = task.get("latest_progress")
-    if isinstance(progress, str):
-        try:
-            progress = json.loads(progress)
-        except json.JSONDecodeError:
-            progress = None
-    if isinstance(progress, dict):
-        timestamps.append(progress.get("ts"))
-    for value in timestamps:
-        try:
-            if float(value) > reserved_at:
-                return True
-        except (TypeError, ValueError):
-            continue
-    return False
-
-
-def _default_verdict(
-    worktree: str, machine: str | None, owner_session_id: str | None
-) -> str:
-    """Resolve an embodied session's liveness to a **tri-state verdict** via the
-    agent-bridge registry (shells the CLI, cross-machine over SSH). Delegates to
-    :func:`agent_dispatch.tracking.liveness_verdict`; every probe failure collapses
-    to ``unknown`` (never ``gone``), so recovery never fires on ignorance."""
-    from . import tracking
-
-    return tracking.liveness_verdict(
-        worktree, machine=machine, owner_session_id=owner_session_id
-    )
-
-
-def _default_nudge(worktree: str, machine: str | None, task: dict) -> bool:
-    """Deliver a non-blocking nudge to a stalled-but-live embodied session.
-
-    Builds a terse *notify*-kind steering message pointing the worker back at its
-    goal (or at recording a blocker) and shells it via
-    :func:`agent_dispatch.bridge.send_nudge`. Best-effort -- a failed send is not
-    fatal (recovery, not the nudge, handles a genuinely-gone worker)."""
-    from . import bridge
-
-    tid = task.get("id")
-    goal = task.get("goal") or task.get("title") or "your dispatched task"
-    message = (
-        f"[agent-dispatch] You appear stalled on task {tid} -- no progress "
-        f"recorded recently. Goal: {goal}. Continue toward it and record a "
-        f"progress beat (agent-dispatch progress {tid} --phase <p> --summary "
-        f"<line>), or record a blocker (--blocker <why>); if it is already done, "
-        f"complete it; if it is not yours, yield it."
-    )
-    return bridge.send_nudge(worktree, message)
-
-
-def make_redrive_sender(route: str = "") -> RedriveFn:
-    """Build a re-drive sender that uses the same coordinator route as spawn."""
-
-    def redrive(
-        worktree: str,
-        machine: str | None,
-        task: dict,
-        session: dict,
-        reservation: dict,
-    ) -> bool:
-        from . import bridge, embody
-
-        task_id = str(task.get("id") or "")
-        if not task_id:
-            return False
-        worker_id = f"redrive-{uuid.uuid4().hex[:8]}"
-        prompt = embody.autopilot_worker_prompt(
-            task_id, worker_id=worker_id, route=route
-        )
-        session_id = session.get("session_id")
-        expected_session_id = session_id if isinstance(session_id, str) else None
-        return bridge.redrive_embodied_worker(
-            worktree,
-            prompt,
-            machine=machine,
-            expected_session_id=expected_session_id,
-            idempotency_key=f"{reservation.get('key')}:redrive",
-        )
-
-    return redrive
-
-
-def _default_redrive(
-    worktree: str,
-    machine: str | None,
-    task: dict,
-    session: dict,
-    reservation: dict,
-) -> bool:
-    """Re-send the autopilot seed to a live worker that never claimed its task."""
-    return make_redrive_sender()(
-        worktree, machine, task, session, reservation
-    )
-
-
-def _default_turn_state(worktree: str, machine: str | None) -> str | None:
-    """Resolve an embodied worker's coarse **turn state** via the agent-bridge
-    registry (shells the CLI, cross-machine over SSH).
-
-    Reads the ``turn_state`` field of the worktree's live session -- the coarse
-    ``running``/``idle`` boundary the coordination layer *derives from its own
-    session events* (``assistant.turn_end``), so sampling it here reads the same
-    turn signal without agent-dispatch subscribing to a raw event stream or
-    importing agent-bridge. Every failure mode (no CLI/ssh, unreachable bridge,
-    no live session, no turn signal yet) collapses to ``None`` -- so ``None`` means
-    "no observable turn boundary", which the reactive wait treats as *no signal*
-    (falling back to the periodic poll), never as a turn-end.
-    """
-    from . import tracking
-
-    session = tracking.resolve_live_session(worktree, machine=machine)
-    if not session:
-        return None
-    state = session.get("turn_state")
-    return state if isinstance(state, str) and state else None
-
-
-def _worktree_from_owner(owner: str | None) -> str | None:
-    from . import tracking
-
-    return tracking.worktree_from_owner(owner)
-
-
-def _worktree_from_reservation(reservation: dict, owner: str | None = None) -> str | None:
-    """Best-effort worktree handle for a spawn reservation.
-
-    Newer reservations persist ``worktree`` directly. Older rows sometimes only
-    have the mux session handle (``wt-<worktree>``); decode that enough to
-    reconcile and re-drive rather than leaving the worker invisible forever.
-    """
-    worktree = reservation.get("worktree")
-    if isinstance(worktree, str) and worktree:
-        return worktree
-    handle = reservation.get("session_handle")
-    if isinstance(handle, str) and handle.startswith("wt-") and len(handle) > 3:
-        return handle[3:]
-    return _worktree_from_owner(owner)
-
-
-def _machine_from_owner(owner: str | None) -> str | None:
-    from . import tracking
-
-    return tracking.machine_from_owner(owner)
-
-
-#: A **fleet-body** liveness verdict resolver: ``(host, bridge_session_id) ->
-#: 'live' | 'gone' | 'unknown'``. Probes a headless fleet body's agent-bridge
-#: session on its pool host over SSH; ``unknown`` is never treated as death.
-#: Injectable so tests drive verdicts deterministically.
-FleetVerdictFn = Callable[[str, str], str]
-FleetActivityFn = Callable[[str, str], str | None]
-
-#: A **local-body** liveness verdict resolver: ``(bridge_session_id) ->
-#: 'live' | 'gone' | 'unknown'``. Probes a *local* headless body's agent-bridge
-#: session on this host (no SSH); ``unknown`` is never treated as death.
-#: Injectable so tests drive verdicts deterministically.
-LocalBodyVerdictFn = Callable[[str], str]
-
-#: Prefix stamped on the reservation ``session_handle`` of a headless fleet body,
-#: encoding its recovery handle as ``fleet-body:<host>:<bridge-session-id>`` (see
-#: :meth:`agent_dispatch.fleet.FleetSpawner.__call__`).
-_FLEET_BODY_PREFIX = "fleet-body:"
-
-#: Prefix stamped on the reservation ``session_handle`` of a **local** headless
-#: body, encoding its recovery handle as ``local-body:<bridge-session-id>`` (see
-#: :func:`make_headless_spawn`). Unlike a fleet body there is no host component --
-#: the session lives on *this* machine's agent-bridge daemon.
-_LOCAL_BODY_PREFIX = "local-body:"
-
-
-def _parse_fleet_body_handle(session_handle: str | None) -> tuple[str, str] | None:
-    """Decode a ``fleet-body:<host>:<bridge-session-id>`` reservation handle.
-
-    Returns ``(host, bridge_session_id)`` for a headless fleet body whose recovery
-    handle was captured at spawn, else ``None`` (a worktree-backed embody, a
-    fleet body whose session id could not be captured, or any other handle).
-    """
-    if not session_handle or not session_handle.startswith(_FLEET_BODY_PREFIX):
-        return None
-    rest = session_handle[len(_FLEET_BODY_PREFIX):]
-    host, _sep, sid = rest.partition(":")
-    if not host or not sid:
-        return None
-    return host, sid
-
-
-def _default_fleet_verdict(host: str, bridge_session_id: str) -> str:
-    """Resolve a headless fleet body's liveness to a tri-state verdict by probing
-    its agent-bridge session on the pool ``host`` over SSH. Delegates to
-    :func:`agent_dispatch.embody.fleet_body_verdict`; every probe failure collapses
-    to ``unknown`` (never ``gone``), so recovery never fires on ignorance."""
-    from . import embody
-
-    return embody.fleet_body_verdict(host, bridge_session_id)
-
-
-def _default_fleet_activity(host: str, bridge_session_id: str) -> str | None:
-    from . import embody
-
-    return embody.fleet_body_activity(host, bridge_session_id)
-
-
-def _parse_local_body_handle(session_handle: str | None) -> str | None:
-    """Decode a ``local-body:<bridge-session-id>`` reservation handle.
-
-    Returns the local agent-bridge ``session_id`` for a headless body embodied on
-    *this* machine whose recovery handle was captured at spawn, else ``None`` (a
-    worktree-backed embody, a fleet body, a headless body whose session id could
-    not be captured, or any other handle).
-    """
-    if not session_handle or not session_handle.startswith(_LOCAL_BODY_PREFIX):
-        return None
-    sid = session_handle[len(_LOCAL_BODY_PREFIX):]
-    return sid or None
-
-
-def _default_local_body_verdict(bridge_session_id: str) -> str:
-    """Resolve a *local* headless body's liveness to a tri-state verdict by
-    probing its agent-bridge session on this host (no SSH). Delegates to
-    :func:`agent_dispatch.embody.local_body_verdict`; every probe failure collapses
-    to ``unknown`` (never ``gone``), so recovery never fires on ignorance."""
-    from . import embody
-
-    return embody.local_body_verdict(bridge_session_id)
-
-
-def _default_local_cold(bridge_session_id: str) -> bool:
-    from . import bridge
-
-    return bridge.stop_worker(bridge_session_id)
-
-
-def _default_fleet_cold(host: str, bridge_session_id: str) -> bool:
-    from . import embody
-
-    return embody.stop_fleet_body(host, bridge_session_id)
-
-
-def _tracking():
-    """Lazy accessor for the ``tracking`` module (its verdict constants)."""
-    from . import tracking
-
-    return tracking
-
-
-def make_embody_spawn(
-    *,
-    driver: str = "agent-dispatch",
-    verify_timeout: int = 0,
-    route: str = "",
-    all_repos: bool = False,
-) -> SpawnFn:
-    """Build a :data:`SpawnFn` that embodies a worker via ``agent-worktrees``.
-
-    Degrades cleanly: if the ``agent-worktrees`` CLI is absent, the spawn reports
-    failure (the supervisor fails the reservation, leaving the task queued).
-
-    The supervisor runs CWD-neutral (a service whose working directory is its own
-    runtime dir, not any repo), so the spawn **names the target project
-    explicitly** -- derived from the task's lane -- via embody's ``--project``
-    global, rather than relying on git-like CWD discovery (which would fail with
-    "Could not resolve a project for 'embody'"). See the
-    ``project-scoped-invocation`` pattern.
-
-    ``route`` is the coordinator routing intent handed to the worker's
-    ``agent-dispatch`` commands (``""`` for local discovery, ``" --shared"`` for
-    the shared moniker); never a raw ``--url`` (the caller rejects that).
-    """
-    from . import embody
-
-    def spawn(task: dict) -> tuple[bool, dict]:
-        worker_id = f"embody-{uuid.uuid4().hex[:8]}"
-        try:
-            result = embody.spawn_embodied_worker(
-                task["id"],
-                worker_id=worker_id,
-                driver=driver,
-                project=embody.project_for_task(task),
-                route=route,
-                repo=None if all_repos else task.get("repo"),
-                all_repos=all_repos,
-                verify_timeout=verify_timeout,
-            )
-        except embody.EmbodyUnavailable as exc:
-            return False, {"error": str(exc)}
-        if result.returncode != 0:
-            return False, {"error": (result.stderr or "").strip()[:200] or "nonzero exit"}
-        handle = embody.parse_handle(result)
-        return True, handle
-    return spawn
-
-
-def make_headless_spawn(
-    *,
-    agent: str = "task-worker",
-    route: str = "",
-    all_repos: bool = False,
-) -> SpawnFn:
-    """Build a :data:`SpawnFn` that embodies a worker as a **headless
-    agent-bridge ACP** session -- no mux, no CLI-start-prompt.
-
-    This is the embodiment for **self-contained, bounded** tasks that need no
-    human attach: a scheduled/reactive sweep that claims a task, runs it to a
-    deliberate completion, and is torn down. It sidesteps the CLI-start-prompt
-    delivery path entirely (a seeded CLI session can race the input caret and
-    never deliver its seed), so a headless-marked task never deadlocks on that
-    path.
-
-    It reuses the **same autopilot seed** as the CLI backend
-    (:func:`agent_dispatch.embody.autopilot_worker_prompt` -- claim-under-identity,
-    contract-net evaluation, deferred completion), so a headless-embodied task is
-    driven identically to a CLI-embodied one; only the *body* differs. Degrades
-    cleanly: if the ``agent-bridge`` CLI is absent, the spawn reports failure (the
-    supervisor fails the reservation, leaving the task queued).
-
-    A headless body is not a parallel worktree, so no worktree handle is recorded
-    -- the supervisor's worktree-keyed lease heartbeat does not apply to it.
-    Instead it records a ``local-body:<bridge-session-id>`` recovery handle, so a
-    body that ends before completing (crash, or an explicit ``agent-bridge end``
-    after a run cancel) is **liveness-recovered**: the supervisor probes the
-    session locally and, on a confirmed-gone verdict, settles the orphaned
-    ``spawned`` reservation -- freeing the label's concurrency slot instead of
-    starving it. Reconciliation still settles the reservation when the task
-    reaches a terminal state.
-
-    ``route`` is the coordinator routing intent handed to the worker's
-    ``agent-dispatch`` commands (``""`` for local discovery, ``" --shared"`` for
-    the shared moniker); never a raw ``--url`` (the caller rejects that).
-    """
-    from . import bridge, embody
-
-    def spawn(task: dict) -> tuple[bool, dict]:
-        worker_id = f"headless-{uuid.uuid4().hex[:8]}"
-        seed = embody.autopilot_worker_prompt(
-            task["id"],
-            worker_id=worker_id,
-            route=route,
-            repo=None if all_repos else task.get("repo"),
-            all_repos=all_repos,
-        )
-        try:
-            result = bridge.spawn_worker(
-                task["id"],
-                agent=agent,
-                worker_id=worker_id,
-                prompt=seed,
-                wait=False,
-                json_output=True,
-            )
-        except bridge.BridgeUnavailable as exc:
-            return False, {"error": str(exc)}
-        if result.returncode != 0:
-            return False, {"error": (result.stderr or "").strip()[:200] or "nonzero exit"}
-        # Capture the created local agent-bridge session id and encode it as a
-        # `local-body:<sid>` recovery handle so a *gone* body (ended/cancelled)
-        # is liveness-recovered by the supervisor -- freeing its spawn slot --
-        # instead of orphaning its `spawned` reservation forever. When the id
-        # can't be captured, fall back to the opaque worker id (degrade safe:
-        # unprobeable, exactly the pre-fix behavior).
-        sid = embody.parse_fleet_body_session(result)
-        handle = f"{_LOCAL_BODY_PREFIX}{sid}" if sid else worker_id
-        return True, {"session": handle, "worktree": None}
-
-    return spawn
-
-
-def make_label_routed_spawn(
-    default: SpawnFn, *, overrides: Mapping[str, SpawnFn]
-) -> SpawnFn:
-    """Return a :data:`SpawnFn` that routes a task to an **override** backend when
-    any of its labels has one, else to the ``default`` backend.
-
-    This lets a *single* supervisor embody different task classes with different
-    bodies -- e.g. self-contained sweep labels headless (bridge) while
-    interactive/standalone worktree work stays CLI-first (embody) -- without
-    splitting into multiple services. When a task carries several overridden
-    labels, the first match in the task's own label order wins. With no overrides,
-    the ``default`` is returned unwrapped (no behavior change).
-    """
-    if not overrides:
-        return default
-
-    def spawn(task: dict) -> tuple[bool, dict]:
-        for label in task.get("labels") or []:
-            fn = overrides.get(label)
-            if fn is not None:
-                return fn(task)
-        return default(task)
-
-    return spawn
-
+_CONCLUSION_PER_CYCLE = 10
+_COLD_RESUME_RETRY_SECONDS = 300
+_MIN_RESERVING_TIMEOUT_SECONDS = 600
+
+class _ReservationsUnavailable(Exception):
+    """The coordinator couldn't be reached to list reservations."""
 
 class Supervisor:
     """Reserve -> spawn -> record, with terminal-state reconciliation.
 
-    ``max_concurrent`` caps the number of in-flight spawns (``reserving`` +
-    ``spawned`` reservations). ``max_attempts`` bounds failed spawn attempts per
-    task before it is **dead-lettered** (held, no longer auto-retried; 0 disables
-    the bound). ``label_max_attempts`` optionally overrides that bound **per
-    label** (agent type): a task carrying an overridden label uses the override
-    instead of the global ``max_attempts`` (the most-permissive override wins when
-    a task carries several). This decouples unrelated task classes -- e.g.
-    reviving one label's dead-lettered tasks (raise its bound) without also
-    reviving another label's stale tasks. ``repo`` scopes the lane; ``labels`` (if
-    given) restricts spawning to queued tasks carrying at least one of them -- the
-    **opt-in** so a supervisor only embodies work explicitly marked for autopilot.
+    ``max_concurrent`` caps in-flight spawns. ``max_attempts`` bounds failed spawn
+    attempts before a task is **dead-lettered** (held, no longer auto-retried; 0
+    disables the bound). ``label_max_attempts`` optionally overrides that bound
+    per label; the most permissive matching override wins. ``repo`` scopes the
+    lane; ``labels`` restrict spawning to queued tasks carrying at least one of
+    them -- the **opt-in** so a supervisor only embodies work explicitly marked
+    for autopilot.
     """
 
     def __init__(
@@ -538,7 +172,7 @@ class Supervisor:
         publish_activity: bool = False,
         recover: bool = True,
         nudge: bool = True,
-        reactive: bool = True,
+        reactive: bool = False,
         reactive_interval: float = 2.0,
         stall_seconds: float = 600.0,
         liveness_fn: LivenessFn | None = None,
@@ -546,15 +180,31 @@ class Supervisor:
         fleet_verdict_fn: FleetVerdictFn | None = None,
         fleet_activity_fn: FleetActivityFn | None = None,
         local_body_verdict_fn: LocalBodyVerdictFn | None = None,
+        local_body_activity_fn: LocalBodyActivityFn | None = None,
+        local_acp_session_fn: LocalAcpSessionFn | None = None,
+        local_body_target_dir_fn: LocalBodyTargetDirFn | None = None,
+        script_body_verdict_fn: ScriptBodyVerdictFn | None = None,
         local_cold_fn: LocalColdFn | None = None,
+        local_end_fn: LocalEndFn | None = None,
+        local_resume_fn: LocalResumeFn | None = None,
         fleet_cold_fn: FleetColdFn | None = None,
+        fleet_end_fn: FleetEndFn | None = None,
         nudge_fn: NudgeFn | None = None,
+        idle_nudge_fn: Any | None = None,
+        idle_nudge_exempt_labels: Sequence[str] | None = None,
         redrive_fn: RedriveFn | None = None,
-        turn_state_fn: TurnStateFn | None = None,
+        disposable_cli_labels: Sequence[str] | None = None,
+        conclusion_fn: ConclusionFn | None = None,
+        attempt_conclusion_fn: AttemptConclusionFn | None = None,
+        machine: str | None = None,
         capacity_gate: Callable[[dict], bool] | None = None,
+        worktree_directory_present_fn: WorktreeDirectoryPresentFn | None = None,
         evaluator: Any | None = None,
         evaluator_ref: str | None = None,
         evaluate_limit: int = 100,
+        event_wake: SupervisorEventWake | None = None,
+        reserving_timeout: float = _MIN_RESERVING_TIMEOUT_SECONDS,
+        consistency_sweep: bool = True,
     ):
         self.client = client
         self.spawn_fn = spawn_fn
@@ -570,7 +220,22 @@ class Supervisor:
         self.label_max_attempts = {
             str(k): max(0, int(v)) for k, v in (label_max_attempts or {}).items()
         }
-        self.supervisor_id = supervisor_id or f"supervisor-{uuid.uuid4().hex[:8]}"
+        if machine is None:
+            from . import remote_dispatch
+
+            machine = remote_dispatch.local_machine()
+        lane_identity = json.dumps(
+            {
+                "machine": machine,
+                "repo": repo,
+                "labels": sorted(labels or ()),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.supervisor_id = supervisor_id or (
+            "supervisor-" + hashlib.sha256(lane_identity.encode()).hexdigest()[:16]
+        )
         self.heartbeat = heartbeat
         #: Publish exact execution state into coordinator-owned task rows. This
         #: keeps read surfaces pure API queries instead of shelling to bridge.
@@ -586,10 +251,37 @@ class Supervisor:
         self.nudge = nudge
         #: Quiet-but-live window before a nudge. 0 disables nudging.
         self.stall_seconds = max(0.0, float(stall_seconds))
+        #: When True, :meth:`poll_once` calls :meth:`sweep_spawn_consistency`
+        #: every cycle -- the Phase 10 (review-automation-reliability)
+        #: periodic-cadence wiring the sweep's own docstring left as a
+        #: follow-up decision. Read-only and additive (see that method), so
+        #: this is safe to leave enabled by default; off only for a caller
+        #: that wants to invoke the sweep on its own schedule instead.
+        self.consistency_sweep = consistency_sweep
         self.liveness_fn = liveness_fn or _default_liveness
         #: Tri-state verdict resolver used by :meth:`recover_gone`. Injectable so
         #: tests drive ``gone``/``live``/``unknown`` deterministically.
         self.verdict_fn = verdict_fn or _default_verdict
+        #: Local agent-worktrees directory-presence probe, used **only** by
+        #: :meth:`release_requested_bodies`' unleased worktree-only retirement
+        #: branch: when ``verdict_fn`` answers ``unknown`` because the task
+        #: never captured an ``owner_session_id`` AND its reservation never
+        #: recorded a ``session_handle`` either (a RESERVING-stage spawn
+        #: failure that never even reached spawning a body -- a spawned body
+        #: with a recorded handle must resolve through its own liveness path
+        #: instead, never this shortcut), this reservation's own recorded
+        #: worktree -- which agent-dispatch itself created on THIS host
+        #: (gated on a matching ``creating_host``, since a shared
+        #: cross-machine queue's reservation may have been created elsewhere)
+        #: -- can still be confirmed gone by checking the local
+        #: agent-worktrees registry directly, scoped to the reservation's own
+        #: repo project (this daemon is CWD-neutral). Never used to escalate
+        #: general claimed/started task liveness GC, where an owner's
+        #: worktree may have no agent-worktrees record at all. Injectable for
+        #: tests; ``None`` (unresolved probe) never counts as gone.
+        self.worktree_directory_present_fn = (
+            worktree_directory_present_fn or _default_worktree_directory_present
+        )
         #: Tri-state verdict resolver for **headless fleet bodies** (probes the
         #: body's agent-bridge session on its pool host over SSH). Used by
         #: :meth:`recover_gone` (re-embody a confirmed-gone body) and
@@ -602,33 +294,68 @@ class Supervisor:
         #: :meth:`recover_gone` (re-embody/free a confirmed-gone local body) and
         #: :meth:`hold_live_leases` (heartbeat a confirmed-live one). Injectable
         #: for tests; ``unknown`` is never treated as death.
-        self.local_body_verdict_fn = (
-            local_body_verdict_fn or _default_local_body_verdict
-        )
+        self.local_body_verdict_fn = local_body_verdict_fn or _default_local_body_verdict
+        self.local_body_activity_fn = local_body_activity_fn or _default_local_body_activity
+        self.local_acp_session_fn = local_acp_session_fn or _default_local_acp_session
+        self.local_body_target_dir_fn = local_body_target_dir_fn or _default_local_body_target_dir
+        #: Tri-state verdict resolver for a **local deterministic script body**
+        #: (PID + process-start-token fence). Used by :meth:`recover_gone`,
+        #: :meth:`hold_live_leases`, and :meth:`reconcile_reserving`.
+        self.script_body_verdict_fn = script_body_verdict_fn or _default_script_body_verdict
         self.local_cold_fn = local_cold_fn or _default_local_cold
+        self.local_end_fn = local_end_fn or _default_local_end
+        self.local_resume_fn = local_resume_fn or _default_local_resume
         self.fleet_cold_fn = fleet_cold_fn or _default_fleet_cold
+        self.fleet_end_fn = fleet_end_fn or _default_fleet_end
         self._cooled_reservations: set[str] = set()
         self._cold_retry_after: dict[str, float] = {}
+        self._resume_retry_after: dict[str, float] = {}
         #: Nudge sender used by :meth:`nudge_stalled`. Injectable for tests.
         self.nudge_fn = nudge_fn or _default_nudge
+        #: Idle-confirm sender used by :meth:`nudge_idle_headless_tasks`.
+        from .idle_confirm import default_idle_confirm_nudge
+
+        self.idle_nudge_fn = idle_nudge_fn or default_idle_confirm_nudge
+        #: Labels exempt from the generic idle-confirm nudge (see
+        #: :func:`agent_dispatch.idle_confirm.nudge_idle_headless_tasks`): a
+        #: recipe/emitter-driven task type already owns its own resume path
+        #: (an in-process evaluator, or an external one driven entirely
+        #: through this CLI), so an idle STARTED task with no new activity is
+        #: its correct resting state, not an unfinished turn -- nudging it
+        #: anyway can push the worker toward an unsanctioned resolution
+        #: (confirmed live). Default (empty) preserves today's behavior for
+        #: genuinely self-tracked work (#3487).
+        self.idle_nudge_exempt_labels = set(idle_nudge_exempt_labels or ())
         #: Re-drive sender used when a spawned CLI body is alive but still has
         #: not claimed its queued task after a supervisor/bridge restart.
         self.redrive_fn = redrive_fn or _default_redrive
-        #: When True, the inter-cycle wait in :meth:`serve` is **interruptible by a
-        #: turn boundary**: it returns early when an embodied worker settles a turn
-        #: (goes idle), so a completed goal is reconciled and the next task embodied
-        #: promptly instead of only on the poll cadence (*react-to-turn-end*). The
-        #: periodic poll remains the correctness floor; off restores a plain sleep.
+        #: Push acceleration is optional. The former implementation sampled
+        #: Agent Bridge state every two seconds; this path owns one aggregate
+        #: local stream and never changes periodic reconciliation correctness.
         self.reactive = reactive
-        #: Sub-sampling cadence for the reactive wait -- how often
-        #: :meth:`wait_for_turn_end` re-checks embodied workers' turn state within a
-        #: single inter-cycle wait. Clamped to a sane floor so it never busy-loops.
+        #: Retained for declaration/CLI compatibility; never drives polling.
         self.reactive_interval = max(0.25, float(reactive_interval))
-        #: Turn-state resolver used by :meth:`wait_for_turn_end`. Injectable for tests.
-        self.turn_state_fn = turn_state_fn or _default_turn_state
+        #: Explicit label-scoped terminal conclusion policy. Only a terminal
+        #: task carrying one of these labels is handed to the disposable CLI
+        #: conclusion path; arbitrary CLI worktrees remain untouched.
+        self.disposable_cli_labels = set(disposable_cli_labels or ())
+        self.conclusion_fn = conclusion_fn or _default_conclusion
+        self.attempt_conclusion_fn = attempt_conclusion_fn or _default_attempt_conclusion
+        self.machine = machine
+        self._event_caller_id = (
+            "agent-dispatch:" + hashlib.sha256(self.supervisor_id.encode()).hexdigest()[:24]
+        )
+        self.event_wake = event_wake or (SupervisorEventWake() if self.reactive else None)
+        #: Maximum age of this supervisor's own handle-less ``reserving`` row.
+        #: Spawn is synchronous, so reconciliation cannot observe a live local
+        #: allocation from the same process; after restart, a row older than this
+        #: bound has no allocator left that can attach durable identity.
+        self.reserving_timeout = max(0.0, float(reserving_timeout))
         #: task_id -> last nudge ts (in-memory cooldown so a persistently-quiet
         #: live worker is nudged at most once per stall window, not every cycle).
         self._last_nudge: dict[str, float] = {}
+        #: task_id -> last idle-confirm nudge ts (separate from stall nudges).
+        self._last_idle_nudge: dict[str, float] = {}
         #: reservation key -> redrive attempted in this supervisor process. A
         #: restarted supervisor may retry; a healthy worker claims promptly.
         self._redriven_spawn_keys: set[str] = set()
@@ -660,18 +387,58 @@ class Supervisor:
         #: Last compact dead-letter signature emitted by this process. Unchanged
         #: task ids, failed counts, and caps stay quiet across poll cycles.
         self._dead_letter_signature: tuple[tuple[str, int, int], ...] = ()
+        self._governance = LoopGovernance()
+
+    def set_governance_recheck_fn(
+        self,
+        fn: Callable[[str], dict[str, Any]] | None,
+    ) -> None:
+        """Override the loop-governance recheck callback (tests)."""
+        self._governance.set_recheck_fn(fn)
+
+    def _recheck_governance(self, checkpoint: str) -> dict[str, Any] | None:
+        return self._governance.recheck(checkpoint)
 
     # -- helpers -------------------------------------------------------------
 
     def _eligible(self, now: float) -> list[dict]:
-        """Queued, due tasks in the lane matching the label opt-in (oldest first)."""
-        tasks = self.client.list(repo=self.repo, status=Status.QUEUED, limit=200)
+        """Queued, due tasks in the lane matching the label opt-in (oldest first).
+
+        Fetches server-side PER OWN LABEL (when scoped to one or more labels)
+        rather than one broad, unfiltered, newest-first page: ``client.list``
+        truncates at ``limit`` (200) tasks-wide, newest first, across the
+        WHOLE coordinator -- every label/pool sharing it, not just this one.
+        With enough other pools' tasks queued at once (474 system-wide,
+        confirmed live), an older task in THIS lane falls off that shared
+        page and this supervisor never even sees it to attempt a claim --
+        regardless of how much free capacity its own lane has. A durably
+        assigned PR-review task sat `queued` with zero wakes for hours this
+        way while its own 4-slot lane had
+        room. Querying per-label pushes the ``LIMIT`` down to the
+        coordinator's own `label=` filter (an indexed json_each EXISTS
+        clause), so the page this supervisor actually sees is scoped to its
+        own pool before truncation, not after.
+        """
+        if self.labels:
+            seen: dict[str, dict] = {}
+            for label in sorted(self.labels):
+                for t in self.client.list(
+                    repo=self.repo, status=Status.QUEUED, label=label, limit=200
+                ):
+                    seen[t["id"]] = t
+            tasks = list(seen.values())
+        else:
+            # No label restriction (a catch-all pool) -- nothing to scope the
+            # server-side query to; same broad page as before.
+            tasks = self.client.list(repo=self.repo, status=Status.QUEUED, limit=200)
         out: list[dict] = []
         for t in tasks:
             if (t.get("not_before") or 0) > now:
                 continue  # deferred: not due yet
             if t.get("awaiting_steer"):
                 continue  # blocked on the operator; Confirm clears this to wake
+            if t.get("hold_reason"):
+                continue  # operator hold (Phase 1's Pause primitive) blocks re-queue
             if not self._matches_pool(t):
                 continue  # not opted in
             out.append(t)
@@ -681,16 +448,30 @@ class Supervisor:
     def _matches_pool(self, task: dict) -> bool:
         if self.repo is not None and task.get("repo") != self.repo:
             return False
-        if self.labels is not None and not (
-            self.labels & set(task.get("labels") or [])
-        ):
+        if self.labels is not None and not (self.labels & set(task.get("labels") or [])):
             return False
         return True
 
     def _active_reservations(self) -> list[dict]:
-        reservations = self._pool_reservations(
-            state=f"{SpawnState.RESERVING},{SpawnState.SPAWNED}"
-        )
+        try:
+            reservations = self._pool_reservations(
+                state=(f"{SpawnState.RESERVING},{SpawnState.SPAWNED},{SpawnState.RELEASING}"),
+                strict=True,
+            )
+        except _ReservationsUnavailable as exc:
+            # Capacity-critical: unlike every other _pool_reservations caller
+            # (which only skips optional work on an empty result), this count
+            # gates whether we spawn MORE work. Treating "couldn't determine"
+            # as "zero active" would risk spawning past max_concurrent during
+            # an outage. Fail closed instead: report full capacity so this
+            # cycle spawns nothing, and retry next interval.
+            log.warning(
+                "could not determine active reservation count (%s); treating "
+                "capacity as exhausted this cycle rather than risking an "
+                "over-spawn",
+                exc,
+            )
+            return [{}] * self.max_concurrent
         active: list[dict] = []
         for reservation in reservations:
             try:
@@ -698,33 +479,55 @@ class Supervisor:
             except DispatchError:
                 active.append(reservation)
                 continue
-            if (
-                self._matches_pool(task)
-                and self._reservation_has_live_process(reservation, task)
-            ):
+            if self._matches_pool(task) and self._reservation_has_live_process(reservation, task):
                 active.append(reservation)
         return active
+
+    def _list_reservations_safe(self, *, strict: bool = False, **kwargs: Any) -> list[dict]:
+        """List reservations, treating a transport failure as "none found".
+
+        Every caller of this is one sub-check inside a larger per-cycle
+        sweep; an uncaught transport error here previously propagated and
+        aborted the *entire* supervision cycle (copilot-extensions#2857),
+        silently skipping every other sub-check that same pass. Retry next
+        interval instead -- unless ``strict``, in which case a capacity-
+        critical caller (see ``_active_reservations``) needs to know
+        "unknown" is not the same as "genuinely none" and handles it itself.
+        """
+        try:
+            return self.client.list_reservations(**kwargs)
+        except (DispatchError, httpx.TransportError) as exc:
+            log.warning("failed to list reservations (%s): %s", kwargs, exc)
+            if strict:
+                raise _ReservationsUnavailable(str(exc)) from exc
+            return []
 
     def _pool_reservations(
         self,
         *,
         state: str,
+        conclusion_state: str | None = None,
         resume_requested: bool | None = None,
+        strict: bool = False,
     ) -> list[dict]:
         """List reservations filtered server-side to this pool before limit."""
         if not self.labels:
-            return self.client.list_reservations(
+            return self._list_reservations_safe(
+                strict=strict,
                 state=state,
                 repo=self.repo,
+                conclusion_state=conclusion_state,
                 resume_requested=resume_requested,
                 limit=10000,
             )
         by_key: dict[str, dict] = {}
         for label in self.labels:
-            for reservation in self.client.list_reservations(
+            for reservation in self._list_reservations_safe(
+                strict=strict,
                 state=state,
                 repo=self.repo,
                 label=label,
+                conclusion_state=conclusion_state,
                 resume_requested=resume_requested,
                 limit=10000,
             ):
@@ -733,9 +536,123 @@ class Supervisor:
                     by_key[key] = reservation
         return list(by_key.values())
 
-    def _reservation_has_live_process(
-        self, reservation: dict, task: dict
-    ) -> bool:
+    def _spawn_requires_reusable_worktree(self, task: dict) -> bool:
+        selector = getattr(
+            self.spawn_fn,
+            "requires_reusable_worktree_for",
+            None,
+        )
+        if callable(selector):
+            return bool(selector(task))
+        return bool(getattr(self.spawn_fn, "requires_reusable_worktree", False))
+
+    def _spawn_no_pair(self, task: dict) -> bool:
+        selector = getattr(self.spawn_fn, "allocation_no_pair_for", None)
+        if callable(selector):
+            return bool(selector(task))
+        return bool(getattr(self.spawn_fn, "allocation_no_pair", False))
+
+    def _spawn_attribute(self, task: dict, name: str, default: str) -> str:
+        selector = getattr(self.spawn_fn, f"{name}_for", None)
+        if callable(selector):
+            value = selector(task)
+        else:
+            value = getattr(self.spawn_fn, name, default)
+        return value if isinstance(value, str) and value else default
+
+    def _prepare_spawn_task(self, task: dict, reservation: dict) -> dict:
+        """Pre-create or resolve a backend-required worktree before launch."""
+        if not self._spawn_requires_reusable_worktree(task):
+            return task
+        from . import embody
+
+        driver = self._spawn_attribute(task, "allocation_driver", "agent-dispatch")
+        interface = self._spawn_attribute(task, "allocation_interface", "cli")
+        project = self._spawn_attribute(
+            task, "allocation_project", embody.project_for_task(task) or ""
+        )
+        agent = self._spawn_attribute(task, "allocation_agent", "")
+        prepared = embody.prepare_reusable_worktree(
+            task,
+            reservation,
+            project=project or None,
+            interface=interface,
+            driver=driver,
+            supervisor=self.supervisor_id,
+            agent=agent or None,
+            no_pair=self._spawn_no_pair(task),
+        )
+        worktree = str(prepared["worktree"])
+        replaced = bool(prepared.get("replaced"))
+        ownership = str(prepared.get("ownership") or "unknown")
+        if (
+            reservation.get("worktree") != worktree
+            or reservation.get("worktree_ownership") != ownership
+        ):
+            try:
+                self.client.record_spawn_worktree(
+                    reservation["key"],
+                    worktree,
+                    ownership=ownership,
+                    creating_host=self.machine if ownership == "created" else None,
+                    driver=driver,
+                )
+            except DispatchError as exc:
+                if ownership == "created":
+                    raise SpawnPreparationRetained(
+                        f"created worktree {worktree} could not be recorded; "
+                        "reservation retained for repair"
+                    ) from exc
+                raise
+        return {
+            **task,
+            "spawn_worktree": worktree,
+            "spawn_worktree_path": prepared["path"],
+            "spawn_worktree_ownership": ownership,
+            "spawn_session_handle": (None if replaced else reservation.get("session_handle")),
+        }
+
+    def _reservation_has_live_process(self, reservation: dict, task: dict) -> bool:
+        if reservation.get("state") == SpawnState.RELEASING:
+            # Release state retains resource ownership independently of process
+            # capacity. A process slot is released only after exact absence is
+            # proven; unknown or failed probes remain conservatively occupied.
+            fleet = _parse_fleet_body_handle(reservation.get("session_handle"))
+            if fleet is not None:
+                try:
+                    return self.fleet_verdict_fn(*fleet) != _tracking().GONE
+                except Exception:
+                    return True
+            local_sid = _parse_local_body_handle(reservation.get("session_handle"))
+            if local_sid is not None:
+                try:
+                    return self.local_body_verdict_fn(local_sid) != _tracking().GONE
+                except Exception:
+                    return True
+            script_handle = _parse_script_body_handle(reservation.get("session_handle"))
+            if script_handle is not None:
+                _worker_id, pid, start_token, _task_file = script_handle
+                try:
+                    return self.script_body_verdict_fn(pid, start_token) != _tracking().GONE
+                except Exception:
+                    return True
+            worktree = _worktree_from_reservation(
+                reservation,
+                task.get("owner"),
+            )
+            if not worktree:
+                return bool(reservation.get("session_handle"))
+            try:
+                return (
+                    self.verdict_fn(
+                        worktree,
+                        _machine_from_owner(task.get("owner")),
+                        task.get("owner_session_id"),
+                    )
+                    != _tracking().GONE
+                )
+            except Exception:
+                return True
         if task.get("status") != Status.SUSPENDED:
             return True
         key = str(reservation.get("key") or "")
@@ -753,6 +670,13 @@ class Supervisor:
                 return self.local_body_verdict_fn(local_sid) != _tracking().GONE
             except Exception:
                 return True
+        script_handle = _parse_script_body_handle(reservation.get("session_handle"))
+        if script_handle is not None:
+            _worker_id, pid, start_token, _task_file = script_handle
+            try:
+                return self.script_body_verdict_fn(pid, start_token) != _tracking().GONE
+            except Exception:
+                return True
         # CLI suspension hands its process to the hibernation layer.
         return False
 
@@ -762,6 +686,14 @@ class Supervisor:
         The durable spawned reservation remains as the cold-session handle.
         Steering a suspended headless task settles that reservation and queues a
         fresh embodiment, so dormant tasks consume no live-process capacity.
+
+        A task suspended specifically on ``awaiting_steer`` additionally
+        releases its ``exclusive_key`` while cold: nothing is actually using
+        the exclusive resource (e.g. a headed browser) while purely waiting on
+        an operator answer, so a sibling task sharing the same key may claim a
+        fresh reservation and proceed instead of sitting queued behind it.
+        Resuming always reacquires the key (:meth:`Supervisor
+        .release_resumed_cold_tasks`), deferring if a sibling is using it.
         """
         cooled = 0
         attempted = 0
@@ -790,45 +722,106 @@ class Supervisor:
             stopped = False
             try:
                 if fleet is not None:
-                    stopped = (
-                        self.fleet_verdict_fn(*fleet) == _tracking().GONE
-                        or self.fleet_cold_fn(*fleet)
-                    )
+                    stopped = self.fleet_verdict_fn(
+                        *fleet
+                    ) == _tracking().GONE or self.fleet_cold_fn(*fleet)
                 elif local_sid is not None:
-                    stopped = (
-                        self.local_body_verdict_fn(local_sid)
-                        == _tracking().GONE
-                        or self.local_cold_fn(local_sid)
-                    )
+                    stopped = self.local_body_verdict_fn(
+                        local_sid
+                    ) == _tracking().GONE or self.local_cold_fn(local_sid)
             except Exception:
                 log.exception("failed to cool dormant reservation %s", key)
             if stopped:
+                release_exclusive = bool(task.get("awaiting_steer"))
                 try:
-                    self.client.record_cold(key)
+                    self.client.record_cold(key, release_exclusive=release_exclusive)
                 except DispatchError:
-                    log.exception(
-                        "failed to record cold reservation %s", key
-                    )
+                    log.exception("failed to record cold reservation %s", key)
                     self._cold_retry_after[key] = now + 60.0
                     continue
                 self._cooled_reservations.add(key)
                 self._cold_retry_after.pop(key, None)
                 cooled += 1
                 log.info(
-                    "cooled dormant worker for task %s (%s)",
+                    "cooled dormant worker for task %s (%s)%s",
                     task.get("id"),
                     key,
+                    " (released exclusive_key: awaiting_steer)" if release_exclusive else "",
                 )
             else:
                 self._cold_retry_after[key] = now + 60.0
         return cooled
 
-    def release_resumed_cold_tasks(self) -> int:
-        """Release cold reservations only after a durable resume request."""
-        released = 0
-        for res in self._pool_reservations(
-            state=SpawnState.COLD, resume_requested=True
-        ):
+    def nudge_idle_headless_tasks(self, *, now: float | None = None) -> int:
+        """Idle is not done. Ask the worker to confirm, then keep going."""
+        from .idle_confirm import nudge_idle_headless_tasks as _nudge
+
+        return _nudge(self, now=time.time() if now is None else now)
+
+    def suspend_idle_headless_tasks(self) -> int:
+        """Compatibility alias -- idle unfinished workers are nudged, not suspended."""
+        return self.nudge_idle_headless_tasks()
+
+    def bind_headless_owner_sessions(self) -> int:
+        """Attach held local headless tasks to their durable ACP session id.
+
+        ``local_sid`` (from the ``local-body:<sid>`` handle) is agent-
+        bridge's own ephemeral escrow session id, used only to correlate a
+        spawn attempt while creating it -- not durable (agent-bridge prunes
+        its own ``sessions.db`` aggressively). A caller resolving this task's
+        session later needs the bridge-hosted process's real Copilot ACP
+        session id instead. Bind that, not the escrow handle -- skip (retry
+        next sweep) when it isn't known yet.
+        """
+        bound = 0
+        for res in self._pool_reservations(state=SpawnState.SPAWNED):
+            local_sid = _parse_local_body_handle(res.get("session_handle"))
+            if local_sid is None:
+                continue
+            try:
+                task = self.client.get(res["task_id"])
+            except DispatchError:
+                continue
+            if (
+                not self._matches_pool(task)
+                or task.get("status") not in _LEASED
+                or not task.get("owner")
+                or task.get("owner_session_id")
+            ):
+                continue
+            try:
+                acp_session_id = self.local_acp_session_fn(local_sid)
+            except Exception:
+                log.exception(
+                    "failed to resolve ACP session id for bridge session %s",
+                    local_sid,
+                )
+                continue
+            if not acp_session_id:
+                continue  # not yet known -- leave unbound for a later sweep
+            try:
+                self.client.bind_owner_session(
+                    task["id"],
+                    task["owner"],
+                    acp_session_id,
+                    expected_generation=task.get("generation"),
+                )
+                bound += 1
+            except DispatchError:
+                log.exception(
+                    "failed to bind headless owner session for task %s",
+                    task.get("id"),
+                )
+        return bound
+
+    def release_resumed_cold_tasks(self, *, now: float | None = None) -> int:
+        """Resume viable cold bodies or release ones whose worktree vanished."""
+        now = time.time() if now is None else now
+        handled = 0
+        for res in self._pool_reservations(state=SpawnState.COLD, resume_requested=True):
+            key = str(res.get("key") or "")
+            if not key or now < self._resume_retry_after.get(key, 0.0):
+                continue
             try:
                 task = self.client.get(res["task_id"])
             except DispatchError:
@@ -836,21 +829,1115 @@ class Supervisor:
             owner = task.get("owner")
             if task.get("status") != Status.SUSPENDED or not owner:
                 continue
+            local_sid = _parse_local_body_handle(res.get("session_handle"))
+            if local_sid is None:
+                continue
             try:
-                self.client.release(
+                target_dir = self.local_body_target_dir_fn(local_sid)
+            except Exception:
+                log.exception(
+                    "failed to resolve target directory for cold session %s",
+                    local_sid,
+                )
+                target_dir = None
+            target_missing = (
+                _target_directory_missing(target_dir) if target_dir is not None else None
+            )
+            if target_missing is True:
+                try:
+                    self.client.record_spawn_conclusion(
+                        key,
+                        conclusion_state=_CONCLUSION_COMPLETE,
+                        conclusion_detail=json.dumps(
+                            {
+                                "action": "already-removed",
+                                "reason": "recorded-target-directory-missing",
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
+                    self.client.release(
+                        task["id"],
+                        owner,
+                        reason=("recorded worktree is missing; released for fresh re-embodiment"),
+                    )
+                except DispatchError:
+                    self._resume_retry_after[key] = now + _COLD_RESUME_RETRY_SECONDS
+                    log.exception(
+                        "failed to release missing-worktree cold task %s",
+                        task["id"],
+                    )
+                    continue
+                self._cooled_reservations.discard(key)
+                self._cold_retry_after.pop(key, None)
+                self._resume_retry_after.pop(key, None)
+                handled += 1
+                log.warning(
+                    "released suspended task %s after its recorded worktree "
+                    "disappeared (%s); durable task state retained for fresh "
+                    "re-embodiment",
+                    task["id"],
+                    target_dir,
+                )
+                continue
+            prompt = (
+                f"Task {task['id']} has new durable steering. Resume this same "
+                "task and ACP conversation, run `agent-dispatch steer take "
+                f"{task['id']} --all`, and continue from the recorded progress. "
+                "Do not create a replacement task or worktree."
+            )
+            try:
+                self.client.record_spawn(
+                    res["key"],
+                    session_handle=res.get("session_handle"),
+                    worktree=res.get("worktree"),
+                )
+                self._cooled_reservations.discard(str(res["key"]))
+                self._cold_retry_after.pop(str(res["key"]), None)
+                try:
+                    process_resumed = self.local_resume_fn(local_sid, prompt)
+                except Exception:
+                    self._resume_retry_after[key] = now + _COLD_RESUME_RETRY_SECONDS
+                    log.exception(
+                        "failed to resume cold local body %s for task %s",
+                        local_sid,
+                        task.get("id"),
+                    )
+                    continue
+                if not process_resumed:
+                    self._resume_retry_after[key] = now + _COLD_RESUME_RETRY_SECONDS
+                    continue
+                self.client.resume(
                     task["id"],
                     owner,
-                    reason="cold body stopped; released for re-embodiment",
+                    wake=False,
+                    reuse_session=True,
+                    expected_owner_session_id=task.get("owner_session_id"),
+                    expected_generation=task.get("generation"),
                 )
-                released += 1
+                self._resume_retry_after.pop(key, None)
+                handled += 1
                 log.info(
-                    "released resumed cold task %s for re-embodiment",
+                    "resumed cold task %s in existing ACP session %s",
                     task.get("id"),
+                    local_sid,
                 )
+            except DispatchError as exc:
+                self._resume_retry_after[key] = now + _COLD_RESUME_RETRY_SECONDS
+                if "cannot reacquire its exclusive_key" in str(exc):
+                    # Expected, retriable: a sibling reservation is currently
+                    # using the shared exclusive resource (e.g. the one
+                    # headed browser this lane allows). Not an error.
+                    log.info(
+                        "deferring resume of cold task %s: exclusive_key "
+                        "still held by another active reservation",
+                        task.get("id"),
+                    )
+                else:
+                    log.exception(
+                        "failed to finalize cold-task resume for %s",
+                        task.get("id"),
+                    )
+        return handled
+
+    def recover_stranded_cold_reservations(self) -> int:
+        """See :func:`spawn_cold_recovery.recover_stranded_cold_reservations`."""
+        from .spawn_cold_recovery import recover_stranded_cold_reservations as _r
+
+        return _r(self)
+
+    def recover_stranded_releasing_reservations(self, *, now: float | None = None) -> int:
+        """See :func:`spawn_releasing_recovery.recover_stranded_releasing_reservations`."""
+        from .spawn_releasing_recovery import (
+            recover_stranded_releasing_reservations as _r,
+        )
+
+        return _r(self, now=now)
+
+    def reconcile_reserving(self) -> int:
+        """Recover pre-launch reservations after a supervisor interruption.
+
+        A worktree-backed reservation is safe to classify because the reusable
+        worktree id is recorded before launch. Confirmed-live worktrees are
+        promoted to ``spawned`` with their observed session; confirmed-gone
+        worktrees fail for a fresh attempt; unknown state remains reserved.
+        A handle-less reservation remains untouched during its launch window.
+        After that bound, this same stable supervisor identity may fail its own
+        orphaned reservation so the queued task can receive a fresh attempt.
+
+        A worktree-backed reservation whose owner is confirmed LIVE but which
+        never produces an actual session in that worktree is the same class of
+        gap, previously unbounded: the embody/spawn call can silently fail or
+        hang with no session ever launched, and -- unlike the handle-less
+        case above -- this branch had no timeout at all, so it could sit in
+        ``reserving`` indefinitely with no automatic recovery (confirmed in a
+        real deployment: 46+ minutes, only noticed and manually recovered by
+        an operator -- see #3354). It now shares the same ``reserving_timeout``
+        bound: past that age, with no session ever observed, this supervisor
+        fails its own reservation so a fresh attempt can be reserved.
+        """
+        reconciled = 0
+        for res in self._pool_reservations(state=SpawnState.RESERVING):
+            try:
+                task = self.client.get(res["task_id"])
+            except DispatchError:
+                continue
+            if not self._matches_pool(task):
+                continue
+            local_sid = _parse_local_body_handle(res.get("session_handle"))
+            if local_sid is not None:
+                try:
+                    verdict = self.local_body_verdict_fn(local_sid)
+                except Exception:
+                    verdict = _tracking().UNKNOWN
+                if verdict == _tracking().UNKNOWN:
+                    continue
+                if verdict == _tracking().LIVE:
+                    try:
+                        activity = self.local_body_activity_fn(local_sid)
+                    except Exception:
+                        activity = None
+                    if activity == "IDLE" and res.get("worktree"):
+                        try:
+                            self.client.fail_spawn(
+                                res["key"],
+                                detail=("carried local body is idle and ready for safe resume"),
+                            )
+                            reconciled += 1
+                        except DispatchError:
+                            log.exception(
+                                "failed to rearm idle reserving body %s",
+                                res["key"],
+                            )
+                        continue
+                    if activity not in {"ACTIVE", "STALLED"}:
+                        continue
+                    try:
+                        self.client.record_spawn(
+                            res["key"],
+                            session_handle=res.get("session_handle"),
+                            worktree=res.get("worktree"),
+                        )
+                        reconciled += 1
+                    except DispatchError:
+                        log.exception(
+                            "failed to promote live reserving body %s",
+                            res["key"],
+                        )
+                    continue
+                try:
+                    detail = "carried local body confirmed gone while reserving"
+                    if res.get("worktree_ownership") == "created":
+                        self.client.request_spawn_release(
+                            res["key"],
+                            detail=detail,
+                            disposition="failed",
+                        )
+                    else:
+                        self.client.fail_spawn(
+                            res["key"], detail=detail, release_requested=True
+                        )
+                    reconciled += 1
+                except DispatchError:
+                    log.exception("failed to release gone reserving body %s", res["key"])
+                continue
+
+            script_handle = _parse_script_body_handle(res.get("session_handle"))
+            if script_handle is not None:
+                worker_id, pid, start_token, _task_file = script_handle
+                try:
+                    verdict = self.script_body_verdict_fn(pid, start_token)
+                except Exception:
+                    verdict = _tracking().UNKNOWN
+                if verdict == _tracking().UNKNOWN:
+                    continue
+                if verdict == _tracking().LIVE:
+                    try:
+                        self.client.record_spawn(
+                            res["key"],
+                            session_handle=res.get("session_handle"),
+                            worktree=res.get("worktree"),
+                        )
+                        reconciled += 1
+                    except DispatchError:
+                        log.exception(
+                            "failed to promote live reserving script body %s",
+                            res["key"],
+                        )
+                    continue
+                try:
+                    self.client.fail_spawn(
+                        res["key"],
+                        detail=(
+                            "script body confirmed gone while reserving "
+                            f"(worker {worker_id}, pid {pid})"
+                        ),
+                        release_requested=True,
+                    )
+                    reconciled += 1
+                except DispatchError:
+                    log.exception("failed to release gone reserving script body %s", res["key"])
+                continue
+
+            worktree = _worktree_from_reservation(res, task.get("owner"))
+            if not worktree:
+                try:
+                    age = time.time() - float(res.get("reserved_at") or 0)
+                except (TypeError, ValueError):
+                    age = 0.0
+                if (
+                    self.reserving_timeout <= 0
+                    or res.get("reserved_by") != self.supervisor_id
+                    or age < self.reserving_timeout
+                ):
+                    continue
+                try:
+                    self.client.fail_spawn(
+                        res["key"],
+                        detail=(
+                            f"orphaned reserving allocation has no durable handle after {age:.0f}s"
+                        ),
+                    )
+                    reconciled += 1
+                except DispatchError:
+                    log.exception(
+                        "failed to release orphaned reserving allocation %s",
+                        res["key"],
+                    )
+                continue
+            try:
+                verdict = self.verdict_fn(
+                    worktree,
+                    _machine_from_owner(task.get("owner")),
+                    task.get("owner_session_id"),
+                )
+            except Exception:
+                verdict = _tracking().UNKNOWN
+            if verdict == _tracking().UNKNOWN:
+                continue
+            if verdict == _tracking().GONE:
+                try:
+                    detail = "reserved worktree confirmed without a live worker"
+                    if res.get("worktree_ownership") == "created":
+                        self.client.request_spawn_release(
+                            res["key"],
+                            detail=detail,
+                            disposition="failed",
+                        )
+                    else:
+                        self.client.fail_spawn(
+                            res["key"], detail=detail, release_requested=True
+                        )
+                    reconciled += 1
+                except DispatchError:
+                    log.exception(
+                        "failed to release gone reserving worktree %s",
+                        res["key"],
+                    )
+                continue
+            try:
+                session = self.liveness_fn(
+                    worktree,
+                    _machine_from_owner(task.get("owner")),
+                )
+            except Exception:
+                session = None
+            session_id = session.get("session_id") if session else None
+            if not isinstance(session_id, str) or not session_id:
+                try:
+                    age = time.time() - float(res.get("reserved_at") or 0)
+                except (TypeError, ValueError):
+                    age = 0.0
+                if (
+                    self.reserving_timeout <= 0
+                    or res.get("reserved_by") != self.supervisor_id
+                    or age < self.reserving_timeout
+                ):
+                    continue
+                try:
+                    detail = (
+                        "reserved worktree's owner is live, but no session "
+                        f"ever appeared in the worktree after {age:.0f}s"
+                    )
+                    if res.get("worktree_ownership") == "created":
+                        self.client.request_spawn_release(
+                            res["key"],
+                            detail=detail,
+                            disposition="failed",
+                        )
+                    else:
+                        self.client.fail_spawn(res["key"], detail=detail)
+                    reconciled += 1
+                except DispatchError:
+                    log.exception(
+                        "failed to release sessionless reserving worktree %s",
+                        res["key"],
+                    )
+                continue
+            try:
+                self.client.record_spawn(
+                    res["key"],
+                    session_handle=session_id,
+                    worktree=session.get("worktree_id") or worktree,
+                )
+                reconciled += 1
             except DispatchError:
                 log.exception(
-                    "failed to release resumed cold task %s",
-                    task.get("id"),
+                    "failed to promote live reserving worktree %s",
+                    res["key"],
+                )
+        return reconciled
+
+    def sweep_spawn_consistency(self) -> dict[str, int]:
+        """Phase 10's live wiring of
+        :mod:`agent_dispatch.spawn_reservation_machine`'s declared
+        reservation<->bridge consistency relation and single-assignment
+        invariant against this pool's real, current reservation rows.
+
+        Read-only and additive: this never mutates a reservation or a
+        task, and it changes no other reconciliation method's behavior --
+        it only classifies today's real state and logs any detected
+        anomaly, so the declared classification functions are actually
+        exercised against live data rather than only proven sound in
+        isolation. Called every cycle by :meth:`poll_once` when
+        ``consistency_sweep`` is enabled (the default) -- the periodic
+        cadence this docstring previously left as a follow-up decision;
+        it also remains safe to call directly at any time.
+
+        Liveness is resolved only for reservations carrying a local body
+        handle, via the same ``local_body_verdict_fn`` the rest of this
+        module already uses, translated through
+        :func:`spawn_reservation_machine.verdict_to_bridge_state`. A
+        reservation without a local handle, or whose verdict is
+        ``unknown``, is skipped (:attr:`ConsistencyTier.NOT_APPLICABLE`)
+        rather than guessed at.
+
+        Returns a summary dict: ``checked`` (reservations with a
+        resolvable bridge state), ``anomalies`` (count classified as
+        :attr:`ConsistencyTier.ANOMALY`), and
+        ``assignment_violations`` (task/exclusive-key groups with more
+        than one simultaneously ``ACTIVE`` reservation).
+        """
+        from . import spawn_reservation_machine as srm
+
+        active = self._pool_reservations(state=SpawnState.ACTIVE)
+        records = tuple(
+            srm.ReservationRecord(
+                key=str(res.get("key") or ""),
+                task_id=str(res.get("task_id") or ""),
+                state=str(res.get("state") or ""),
+                exclusive_key=res.get("exclusive_key"),
+            )
+            for res in active
+        )
+        violations = srm.violating_assignment_groups(records)
+        if violations:
+            log.warning(
+                "spawn-reservation single-assignment invariant violated for group(s): %s",
+                ", ".join(sorted(violations)),
+            )
+
+        checked = 0
+        anomalies = 0
+        for res in active:
+            local_sid = _parse_local_body_handle(res.get("session_handle"))
+            if local_sid is None:
+                continue
+            try:
+                verdict = self.local_body_verdict_fn(local_sid)
+            except Exception:
+                verdict = _tracking().UNKNOWN
+            bridge_state = srm.verdict_to_bridge_state(verdict)
+            if bridge_state is None:
+                continue
+            checked += 1
+            tier = srm.classify_consistency(
+                res.get("state"),
+                bridge_state,
+                worktree_ownership=res.get("worktree_ownership"),
+            )
+            if tier is srm.ConsistencyTier.ANOMALY:
+                anomalies += 1
+                log.warning(
+                    "spawn-reservation %s: state %r inconsistent with observed bridge state %r",
+                    res.get("key"),
+                    res.get("state"),
+                    bridge_state,
+                )
+        return {
+            "checked": checked,
+            "anomalies": anomalies,
+            "assignment_violations": len(violations),
+        }
+
+    def sweep_task_reservation_consistency(self) -> dict[str, int]:
+        """See :func:`task_reservation_consistency.sweep`."""
+        from .task_reservation_consistency import sweep as _sweep
+
+        return _sweep(self)
+
+    def _conclude_released_attempt(
+        self,
+        reservation: dict,
+        *,
+        session_id: str | None,
+    ) -> tuple[str, dict]:
+        """Conclude only an allocation proven created by this reservation."""
+        worktree = reservation.get("worktree")
+        if not isinstance(worktree, str) or not worktree:
+            return _CONCLUSION_COMPLETE, {
+                "action": "skipped",
+                "reason": "reservation-has-no-worktree",
+            }
+        ownership = reservation.get("worktree_ownership")
+        if ownership in {"targeted", "reused"}:
+            return _CONCLUSION_COMPLETE, {
+                "action": "preserved",
+                "reason": f"{ownership}-worktree",
+            }
+        if ownership != "created":
+            return _CONCLUSION_HELD, {
+                "action": "skipped",
+                "reason": "allocation-ownership-unknown",
+            }
+        creating_host = reservation.get("creating_host")
+        if (
+            not isinstance(creating_host, str)
+            or not creating_host
+            or not self.machine
+            or creating_host.casefold() != self.machine.casefold()
+        ):
+            return _CONCLUSION_HELD, {
+                "action": "skipped",
+                "reason": "foreign-or-unknown-creating-host",
+            }
+        driver = reservation.get("driver")
+        if not isinstance(driver, str) or not driver:
+            return _CONCLUSION_HELD, {
+                "action": "skipped",
+                "reason": "allocation-driver-unknown",
+            }
+        try:
+            outcome = self.attempt_conclusion_fn(
+                worktree,
+                session_id,
+                str(reservation["key"]),
+                driver,
+            )
+        except Exception as exc:
+            log.exception(
+                "attempt conclusion failed for reservation %s",
+                reservation.get("key"),
+            )
+            outcome = {"action": "failed", "reason": str(exc)[:300]}
+        if session_id:
+            outcome = {**outcome, "acp_session_id": session_id}
+        return self._conclusion_state(outcome), outcome
+
+    def _retired_cleanup_plan(
+        self,
+        reservation: dict,
+        *,
+        local_session_id: str | None = None,
+        conclusion_session: str | None = None,
+        target_missing: bool = False,
+        cleanup_kind: str = "attempt",
+    ) -> tuple[str, dict]:
+        prior = self._conclusion_retry_payload(reservation)
+        if target_missing:
+            worktree_cleanup = {
+                "state": _CONCLUSION_COMPLETE,
+                "outcome": {
+                    "action": "already-removed",
+                    "reason": "recorded-target-directory-missing",
+                },
+            }
+        elif reservation.get("conclusion_state") in {
+            _CONCLUSION_COMPLETE,
+            _CONCLUSION_HELD,
+        }:
+            worktree_cleanup = {
+                "state": reservation.get("conclusion_state"),
+                "outcome": prior,
+            }
+        elif reservation.get("worktree_ownership") in {"targeted", "reused"}:
+            worktree_cleanup = {
+                "state": _CONCLUSION_COMPLETE,
+                "outcome": {
+                    "action": "preserved",
+                    "reason": (f"{reservation.get('worktree_ownership')}-worktree"),
+                },
+            }
+        elif reservation.get("worktree"):
+            worktree_cleanup = {"state": _CONCLUSION_PENDING}
+        else:
+            worktree_cleanup = {
+                "state": _CONCLUSION_COMPLETE,
+                "outcome": {
+                    "action": "skipped",
+                    "reason": "reservation-has-no-worktree",
+                },
+            }
+        payload: dict[str, object] = {
+            "action": "pending",
+            "reason": "retired-body-cleanup",
+            "cleanup_kind": cleanup_kind,
+            "worktree_cleanup": worktree_cleanup,
+        }
+        states = [worktree_cleanup["state"]]
+        if local_session_id is not None:
+            payload["session_end"] = {
+                "state": _CONCLUSION_PENDING,
+                "session_id": local_session_id,
+            }
+            states.append(_CONCLUSION_PENDING)
+        if conclusion_session:
+            payload["acp_session_id"] = conclusion_session
+        state = (
+            _CONCLUSION_PENDING
+            if _CONCLUSION_PENDING in states
+            else (_CONCLUSION_HELD if _CONCLUSION_HELD in states else _CONCLUSION_COMPLETE)
+        )
+        return state, payload
+
+    def _retire_release_for_cleanup(
+        self,
+        reservation: dict,
+        *,
+        conclusion_state: str,
+        cleanup_payload: dict,
+    ) -> dict:
+        encoded = json.dumps(
+            cleanup_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        detail = reservation.get("detail") or "spawn release requested"
+        return self.client.retire_spawn(
+            reservation["key"],
+            exact_absence=True,
+            detail=detail,
+            conclusion_state=conclusion_state,
+            conclusion_detail=encoded,
+        )
+
+    # -- pure cleanup-retry / conclusion-classification helpers, extracted to
+    # -- supervisor_conclusion.py and re-exposed here so existing
+    # -- self._foo(...)/Supervisor._foo(...) call sites keep working -------
+    _bounded_cleanup_failure = staticmethod(_bounded_cleanup_failure)
+    _component_retry_meta = staticmethod(_component_retry_meta)
+    _bounded_component_failure = staticmethod(_bounded_component_failure)
+    _hold_pending_cleanup = staticmethod(_hold_pending_cleanup)
+    _cleanup_envelope_state = staticmethod(_cleanup_envelope_state)
+
+    def release_requested_bodies(self, *, now: float | None = None) -> int:
+        """Retire proven-absent bodies and preserve cleanup obligations."""
+        now = time.time() if now is None else now
+        released = 0
+        reservations = self._pool_reservations(
+            state=(
+                f"{SpawnState.RESERVING},{SpawnState.SPAWNED},"
+                f"{SpawnState.COLD},{SpawnState.RELEASING}"
+            )
+        )
+        reservations.extend(
+            self._pool_reservations(
+                state=(f"{SpawnState.FAILED},{SpawnState.SETTLED}"),
+                conclusion_state=_CONCLUSION_PENDING,
+            )
+        )
+        for res in reservations:
+            if not res.get("release_requested"):
+                continue
+            try:
+                task = self.client.get(res["task_id"])
+            except DispatchError:
+                continue
+            if not self._matches_pool(task):
+                continue
+            body_already_released = res.get("state") in SpawnState.RELEASABLE
+            can_release = body_already_released
+            conclusion_session: str | None = None
+            released_target_dir: str | None = None
+            retry_payload = self._conclusion_retry_payload(res)
+            recorded_acp = retry_payload.get("acp_session_id")
+            if recorded_acp:
+                conclusion_session = str(recorded_acp)
+            fleet = _parse_fleet_body_handle(res.get("session_handle"))
+            local_sid = _parse_local_body_handle(res.get("session_handle"))
+            claim_token: str | None = None
+            session_end = retry_payload.get("session_end")
+            session_end_pending = (
+                isinstance(session_end, dict) and session_end.get("state") == _CONCLUSION_PENDING
+            )
+            prior_attempts, next_attempt_at = self._conclusion_retry_meta(res)
+            cleanup_envelope = isinstance(
+                retry_payload.get("worktree_cleanup"),
+                dict,
+            )
+            stored_worktree = retry_payload.get("worktree_cleanup")
+            stored_worktree_state = (
+                stored_worktree.get("state") if isinstance(stored_worktree, dict) else None
+            )
+            stored_worktree_outcome = (
+                stored_worktree.get("outcome") if isinstance(stored_worktree, dict) else None
+            )
+            _, session_next_attempt = self._component_retry_meta(session_end)
+            _, worktree_next_attempt = self._component_retry_meta(stored_worktree)
+            session_due = (
+                body_already_released and session_end_pending and session_next_attempt <= now
+            )
+            worktree_due = (
+                body_already_released
+                and stored_worktree_state == _CONCLUSION_PENDING
+                and worktree_next_attempt <= now
+            )
+            if body_already_released and not cleanup_envelope:
+                if next_attempt_at > now:
+                    continue
+                if prior_attempts >= _CONCLUSION_MAX_ATTEMPTS:
+                    try:
+                        claim = self.client.claim_spawn_conclusion_retry(res["key"])
+                    except DispatchError:
+                        continue
+                    if not claim.get("claimed"):
+                        continue
+                    claim_token = claim.get("claim_token")
+                    held_payload = self._hold_pending_cleanup(retry_payload)
+                    try:
+                        self.client.record_spawn_conclusion(
+                            res["key"],
+                            conclusion_state=_CONCLUSION_HELD,
+                            conclusion_detail=json.dumps(
+                                held_payload,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            claim_token=claim_token,
+                        )
+                    except DispatchError:
+                        pass
+                    continue
+            if body_already_released and cleanup_envelope:
+                if not session_due and not worktree_due:
+                    continue
+                try:
+                    claim = self.client.claim_spawn_conclusion_retry(res["key"])
+                except DispatchError:
+                    log.exception(
+                        "failed to claim session cleanup retry for %s",
+                        res["key"],
+                    )
+                    continue
+                if not claim.get("claimed"):
+                    continue
+                claim_token = claim.get("claim_token")
+                try:
+                    self.client.validate_spawn_conclusion_claim(
+                        res["key"],
+                        claim_token,
+                    )
+                except DispatchError:
+                    continue
+            if session_due:
+                cleanup_sid = str(session_end.get("session_id") or local_sid or "")
+                try:
+                    session_ended = bool(cleanup_sid and self.local_end_fn(cleanup_sid))
+                except Exception:
+                    session_ended = False
+                    log.exception(
+                        "failed to retry local session cleanup %s",
+                        cleanup_sid,
+                    )
+                if not session_ended:
+                    _, updated_session = self._bounded_component_failure(
+                        session_end,
+                        now=now,
+                    )
+                    retry_payload = {
+                        **retry_payload,
+                        "session_end": updated_session,
+                    }
+                completed_session_end = {
+                    **session_end,
+                    "state": _CONCLUSION_COMPLETE,
+                }
+                if session_ended:
+                    retry_payload = {
+                        **retry_payload,
+                        "session_end": completed_session_end,
+                    }
+            if body_already_released:
+                if conclusion_session is None:
+                    conclusion_session = task.get("owner_session_id")
+            elif fleet is not None:
+                try:
+                    verdict = self.fleet_verdict_fn(*fleet)
+                except Exception:
+                    verdict = _tracking().UNKNOWN
+                if verdict == _tracking().UNKNOWN:
+                    continue
+                if verdict == _tracking().GONE:
+                    conclusion_state, cleanup_payload = self._retired_cleanup_plan(
+                        res,
+                        conclusion_session=conclusion_session,
+                    )
+                    try:
+                        retired = self._retire_release_for_cleanup(
+                            res,
+                            conclusion_state=conclusion_state,
+                            cleanup_payload=cleanup_payload,
+                        )
+                    except DispatchError:
+                        log.exception(
+                            "failed to retire absent fleet body %s",
+                            res["key"],
+                        )
+                        continue
+                    if conclusion_state == _CONCLUSION_PENDING:
+                        reservations.append(retired)
+                    released += 1
+                    continue
+                else:
+                    try:
+                        can_release = self.fleet_end_fn(*fleet)
+                    except Exception:
+                        log.exception(
+                            "failed to end release-requested fleet body %s",
+                            fleet,
+                        )
+            else:
+                if local_sid is not None:
+                    try:
+                        target_dir = self.local_body_target_dir_fn(local_sid)
+                    except Exception:
+                        log.exception(
+                            "failed to resolve target directory for releasing cold session %s",
+                            local_sid,
+                        )
+                        target_dir = None
+                    released_target_dir = target_dir
+                    try:
+                        resolved_acp = self.local_acp_session_fn(local_sid)
+                    except Exception:
+                        resolved_acp = None
+                    conclusion_session = (
+                        str(recorded_acp)
+                        if recorded_acp
+                        else (resolved_acp or task.get("owner_session_id"))
+                    )
+                    try:
+                        verdict = self.local_body_verdict_fn(local_sid)
+                    except Exception:
+                        verdict = _tracking().UNKNOWN
+                    if verdict == _tracking().UNKNOWN:
+                        continue
+                    if verdict == _tracking().GONE:
+                        released_target_missing = (
+                            _target_directory_missing(released_target_dir) is True
+                            if released_target_dir is not None
+                            else False
+                        )
+                        conclusion_state, cleanup_payload = self._retired_cleanup_plan(
+                            res,
+                            local_session_id=local_sid,
+                            conclusion_session=conclusion_session,
+                            target_missing=released_target_missing,
+                        )
+                        try:
+                            retired = self._retire_release_for_cleanup(
+                                res,
+                                conclusion_state=conclusion_state,
+                                cleanup_payload=cleanup_payload,
+                            )
+                        except DispatchError:
+                            log.exception(
+                                "failed to retire absent local body %s",
+                                res["key"],
+                            )
+                            continue
+                        if conclusion_state == _CONCLUSION_PENDING:
+                            reservations.append(retired)
+                        released += 1
+                        continue
+                    else:
+                        try:
+                            can_release = self.local_end_fn(local_sid)
+                        except Exception:
+                            log.exception(
+                                "failed to end release-requested local body %s",
+                                local_sid,
+                            )
+                else:
+                    raw_session = res.get("session_handle")
+                    if isinstance(raw_session, str) and raw_session:
+                        conclusion_session = raw_session
+                    worktree = _worktree_from_reservation(
+                        res,
+                        task.get("owner"),
+                    )
+                    if not worktree:
+                        can_release = res.get("state") == SpawnState.RESERVING and not res.get(
+                            "session_handle"
+                        )
+                    else:
+                        try:
+                            verdict = self.verdict_fn(
+                                worktree,
+                                _machine_from_owner(task.get("owner")),
+                                task.get("owner_session_id"),
+                            )
+                        except Exception:
+                            verdict = _tracking().UNKNOWN
+                        if (
+                            verdict == _tracking().UNKNOWN
+                            and task.get("owner") is None
+                            and task.get("owner_session_id") is None
+                            and not res.get("session_handle")
+                            and res.get("worktree") == worktree
+                            and res.get("worktree_ownership") == "created"
+                            and isinstance(res.get("creating_host"), str)
+                            and res["creating_host"].casefold()
+                            == (self.machine or "").casefold()
+                        ):
+                            # This reservation's own recorded worktree was
+                            # created by agent-dispatch itself on THIS host
+                            # (embody.prepare_reusable_worktree), so the local
+                            # agent-worktrees registry is authoritative for
+                            # whether it still exists on disk -- unlike
+                            # verdict_fn's general owner-identity-keyed
+                            # contract (required for arbitrary claimed tasks
+                            # whose worktree may have no agent-worktrees
+                            # record at all), an uncaptured owner_session_id
+                            # here just means this RESERVING-stage attempt's
+                            # spawn failed before any session/claim ever
+                            # existed. The `not session_handle` gate matters
+                            # separately: a spawned-but-never-claimed body
+                            # (or one that yielded after claiming) can ALSO
+                            # have owner/owner_session_id both None while
+                            # `session_handle` still names a real recorded
+                            # body -- that body's actual liveness must be
+                            # resolved through its own recorded handle (the
+                            # fleet/local-body branches above, or verdict_fn's
+                            # ordinary session comparison once claimed), never
+                            # bypassed by this worktree-directory-only
+                            # shortcut. The creating_host gate matters
+                            # separately from the owner-machine check above:
+                            # an owner is unset for an unclaimed reservation
+                            # regardless of which host actually created the
+                            # worktree, so without it a supervisor polling a
+                            # shared cross-machine queue could probe its OWN
+                            # local registry for a worktree that in fact
+                            # lives on a different host and wrongly retire a
+                            # still-live remote reservation. Confirm absence
+                            # directly (scoped to the same allocation project
+                            # this worktree was actually created under, since
+                            # this daemon is CWD-neutral) instead of staying
+                            # unknown forever.
+                            from . import embody
+
+                            try:
+                                # Resolution happens inside this same guarded
+                                # block: `_spawn_attribute` can invoke an
+                                # I/O-backed `allocation_project_for`
+                                # selector (the default headless one calls a
+                                # strict registry lookup) that may raise when
+                                # a backing registry is unavailable -- that
+                                # must degrade this reservation to `unknown`
+                                # for this cycle, not abort the whole
+                                # `release_requested_bodies` polling pass.
+                                probe_project = self._spawn_attribute(
+                                    task,
+                                    "allocation_project",
+                                    embody.project_for_task(task) or "",
+                                ) or None
+                                present = self.worktree_directory_present_fn(
+                                    worktree, probe_project
+                                )
+                            except Exception:
+                                present = None
+                            if present is False:
+                                verdict = _tracking().GONE
+                        if verdict == _tracking().GONE:
+                            conclusion_state, cleanup_payload = self._retired_cleanup_plan(
+                                res,
+                                conclusion_session=conclusion_session,
+                            )
+                            try:
+                                retired = self._retire_release_for_cleanup(
+                                    res,
+                                    conclusion_state=conclusion_state,
+                                    cleanup_payload=cleanup_payload,
+                                )
+                            except DispatchError:
+                                log.exception(
+                                    "failed to retire absent worktree body %s",
+                                    res["key"],
+                                )
+                                continue
+                            if conclusion_state == _CONCLUSION_PENDING:
+                                reservations.append(retired)
+                            released += 1
+                            continue
+                        can_release = False
+            if not can_release:
+                continue
+            released_target_missing = (
+                _target_directory_missing(released_target_dir) is True
+                if released_target_dir is not None
+                else False
+            )
+            if cleanup_envelope and not worktree_due:
+                conclusion_state = str(stored_worktree_state or _CONCLUSION_COMPLETE)
+                outcome = (
+                    stored_worktree_outcome
+                    if isinstance(stored_worktree_outcome, dict)
+                    else {
+                        "action": "pending",
+                        "reason": "worktree-cleanup-not-due",
+                    }
+                )
+            elif (
+                body_already_released
+                and stored_worktree_state
+                in {
+                    _CONCLUSION_COMPLETE,
+                    _CONCLUSION_HELD,
+                }
+                and isinstance(stored_worktree_outcome, dict)
+            ):
+                conclusion_state = str(stored_worktree_state)
+                outcome = stored_worktree_outcome
+            elif released_target_missing:
+                outcome = {
+                    "action": "already-removed",
+                    "reason": "recorded-target-directory-missing",
+                }
+                conclusion_state = _CONCLUSION_COMPLETE
+            elif res.get("conclusion_state") == _CONCLUSION_COMPLETE and not session_end_pending:
+                outcome = retry_payload or {
+                    "action": "already-removed",
+                    "reason": "preconfirmed-before-release",
+                }
+                conclusion_state = _CONCLUSION_COMPLETE
+            elif res.get("conclusion_state") == _CONCLUSION_HELD and not session_end_pending:
+                outcome = retry_payload or {
+                    "action": "preserved",
+                    "reason": "cleanup-held",
+                }
+                conclusion_state = _CONCLUSION_HELD
+            else:
+                if body_already_released and claim_token is None:
+                    try:
+                        claim = self.client.claim_spawn_conclusion_retry(res["key"])
+                    except DispatchError:
+                        log.exception(
+                            "failed to claim cleanup retry for %s",
+                            res["key"],
+                        )
+                        continue
+                    if not claim.get("claimed"):
+                        continue
+                    claim_token = claim.get("claim_token")
+                    try:
+                        self.client.validate_spawn_conclusion_claim(
+                            res["key"],
+                            claim_token,
+                        )
+                    except DispatchError:
+                        continue
+                elif body_already_released and claim_token is not None:
+                    try:
+                        self.client.validate_spawn_conclusion_claim(
+                            res["key"],
+                            claim_token,
+                        )
+                    except DispatchError:
+                        continue
+                if retry_payload.get("cleanup_kind") == "terminal":
+                    outcome = self._conclude_terminal_worker(
+                        res,
+                        task,
+                        session_override=conclusion_session,
+                    ) or {
+                        "action": "skipped",
+                        "reason": "terminal-cleanup-not-configured",
+                    }
+                    conclusion_state = self._conclusion_state(outcome)
+                else:
+                    conclusion_state, outcome = self._conclude_released_attempt(
+                        res,
+                        session_id=conclusion_session,
+                    )
+            detail_outcome = outcome
+            cleanup_envelope = body_already_released and isinstance(
+                retry_payload.get("worktree_cleanup"), dict
+            )
+            if cleanup_envelope:
+                worktree_state = conclusion_state
+                outcome = {
+                    **retry_payload,
+                    "reason": "retired-body-cleanup",
+                    "worktree_cleanup": {
+                        **retry_payload["worktree_cleanup"],
+                        "state": worktree_state,
+                        "outcome": detail_outcome,
+                    },
+                }
+                if worktree_state == _CONCLUSION_PENDING and worktree_due:
+                    _, updated_worktree = self._bounded_component_failure(
+                        outcome["worktree_cleanup"],
+                        now=now,
+                    )
+                    outcome["worktree_cleanup"] = {
+                        **updated_worktree,
+                        "outcome": detail_outcome,
+                    }
+                conclusion_state = self._cleanup_envelope_state(outcome)
+                outcome["action"] = (
+                    "pending"
+                    if conclusion_state == _CONCLUSION_PENDING
+                    else ("preserved" if conclusion_state == _CONCLUSION_HELD else "complete")
+                )
+            elif conclusion_state == _CONCLUSION_PENDING:
+                conclusion_state, outcome = self._bounded_cleanup_failure(
+                    outcome,
+                    attempts=prior_attempts,
+                    now=now,
+                )
+            conclusion_detail = json.dumps(
+                outcome,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            try:
+                detail = self._append_conclusion_detail(
+                    res.get("detail") or "spawn release requested",
+                    detail_outcome,
+                )
+                if body_already_released:
+                    self.client.record_spawn_conclusion(
+                        res["key"],
+                        conclusion_state=conclusion_state,
+                        conclusion_detail=conclusion_detail,
+                        detail=detail,
+                        claim_token=claim_token,
+                    )
+                else:
+                    self.client.retire_spawn(
+                        res["key"],
+                        exact_absence=True,
+                        detail=detail,
+                        conclusion_state=conclusion_state,
+                        conclusion_detail=conclusion_detail,
+                    )
+                if not body_already_released:
+                    released += 1
+            except DispatchError:
+                log.exception(
+                    "failed to settle release-requested reservation %s",
+                    res["key"],
                 )
         return released
 
@@ -860,7 +1947,7 @@ class Supervisor:
         """Settle-detail for a terminal task, with completion-claim verification.
 
         Implements *verify-the-completion-claim*: a **goal-bearing** task that
-        reaches ``completed`` is corroborated against what was recorded -- a
+        reaches ``submitted`` is corroborated against what was recorded -- a
         result reference, or at least one progress-log entry. A goal completed
         with **neither** is not trusted at face value: it is flagged in the
         reservation detail and logged, so an empty "done" is **held for review**
@@ -868,7 +1955,7 @@ class Supervisor:
         simple deferred-completion contract.
         """
         status = task.get("status")
-        if status != Status.COMPLETED or not task.get("goal"):
+        if status not in {Status.SUBMITTED, Status.COMPLETED} or not task.get("goal"):
             return f"task {status}"
         if task.get("result_ref"):
             return "task completed (result-ref recorded)"
@@ -890,6 +1977,341 @@ class Supervisor:
             "result-ref and no progress -- held for review"
         )
 
+    def _conclude_terminal_worker(
+        self,
+        reservation: dict,
+        task: dict,
+        *,
+        session_override: str | None = None,
+    ) -> dict | None:
+        """Run the opt-in exact-identity terminal conclusion policy."""
+        if not self.disposable_cli_labels.intersection(task.get("labels") or []):
+            return None
+        worktree = reservation.get("worktree")
+        if not isinstance(worktree, str) or not worktree:
+            return {"action": "skipped", "reason": "reservation-has-no-worktree"}
+        recorded_handle = reservation.get("session_handle")
+        bridge_session = (
+            _parse_local_body_handle(recorded_handle) if isinstance(recorded_handle, str) else None
+        )
+        session = session_override or recorded_handle
+        if not isinstance(session, str) or not session:
+            session = None
+        elif bridge_session and session_override is None:
+            retry_payload = self._conclusion_retry_payload(reservation)
+            recorded_acp = retry_payload.get("acp_session_id")
+            try:
+                session = (
+                    str(recorded_acp)
+                    if recorded_acp
+                    else self.local_acp_session_fn(bridge_session)
+                )
+            except Exception:
+                log.exception(
+                    "ACP session identity lookup failed for bridge session %s",
+                    bridge_session,
+                )
+                session = None
+            if not session:
+                return {
+                    "action": "failed",
+                    "reason": "session-identity-unavailable",
+                }
+        try:
+            outcome = self.conclusion_fn(worktree, session)
+            if bridge_session and session:
+                outcome = {**outcome, "acp_session_id": session}
+            return outcome
+        except Exception as exc:
+            log.exception(
+                "terminal conclusion failed for task %s reservation %s",
+                task.get("id"),
+                reservation.get("key"),
+            )
+            failure = {"action": "failed", "reason": str(exc)[:300]}
+            if bridge_session and session:
+                failure["acp_session_id"] = session
+            return failure
+
+    def _nudge_terminal_conclusion(self, reservation: dict, task: dict) -> bool:
+        """Reawaken the exact local body once to finish its worktree lifecycle."""
+        session_id = _parse_local_body_handle(reservation.get("session_handle"))
+        worktree = reservation.get("worktree")
+        if session_id is None or not isinstance(worktree, str) or not worktree:
+            return False
+        prompt = (
+            f"Task {task.get('id')} is already terminal, but managed worktree "
+            f"{worktree} is not FINAL. Conclude this same worktree now: finalize "
+            "landed work, or explicitly unwind/transfer any outstanding work to "
+            "a named tracked objective. Do not create a replacement worktree. "
+            "End the turn after the worktree reaches FINAL or the tracked "
+            "transfer/blocker is recorded."
+        )
+        try:
+            return bool(self.local_resume_fn(session_id, prompt))
+        except Exception:
+            log.exception(
+                "failed to nudge terminal conclusion for task %s session %s",
+                task.get("id"),
+                session_id,
+            )
+            return False
+
+    def _refresh_terminal_session(self, reservation: dict, task: dict) -> dict:
+        """Capture an exact live session id before releasing the reservation."""
+        worktree = reservation.get("worktree")
+        if not isinstance(worktree, str) or not worktree:
+            return reservation
+        recorded_session = reservation.get("session_handle")
+        if (
+            isinstance(recorded_session, str)
+            and recorded_session
+            and recorded_session != f"wt-{worktree}"
+        ):
+            return reservation
+        durable_session = task.get("owner_session_id")
+        raw_completed_by = task.get("completed_by")
+        completed_by = _worktree_from_owner(raw_completed_by)
+        if (
+            isinstance(durable_session, str)
+            and durable_session
+            and (completed_by is None or completed_by == worktree)
+        ):
+            session_handle = durable_session
+            if isinstance(raw_completed_by, str) and raw_completed_by.startswith("headless-"):
+                session_handle = f"{_LOCAL_BODY_PREFIX}{durable_session}"
+            try:
+                self.client.record_spawn(
+                    reservation["key"],
+                    session_handle=session_handle,
+                    worktree=worktree,
+                )
+            except DispatchError:
+                return reservation
+            return {
+                **reservation,
+                "session_handle": session_handle,
+                "worktree": worktree,
+            }
+        try:
+            session = self.liveness_fn(worktree, None)
+        except Exception:
+            session = None
+        if not session:
+            return reservation
+        session_id = session.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return reservation
+        exact_worktree = session.get("worktree_id")
+        if not isinstance(exact_worktree, str) or not exact_worktree:
+            exact_worktree = worktree
+        try:
+            self.client.record_spawn(
+                reservation["key"],
+                session_handle=session_id,
+                worktree=exact_worktree,
+            )
+        except DispatchError:
+            return reservation
+        return {
+            **reservation,
+            "session_handle": session_id,
+            "worktree": exact_worktree,
+        }
+
+    # -- pure terminal-conclusion classification helpers, extracted to
+    # -- supervisor_conclusion.py; re-exposed for existing call sites -------
+    _conclusion_state = staticmethod(_conclusion_state)
+    _append_conclusion_detail = staticmethod(_append_conclusion_detail)
+    _conclusion_retry_payload = staticmethod(_conclusion_retry_payload)
+    _conclusion_retry_meta = staticmethod(_conclusion_retry_meta)
+
+    def _exclusive_terminal_release_ready(
+        self,
+        reservation: dict,
+        task: dict,
+        *,
+        policy_applies: bool,
+    ) -> tuple[bool, dict | None]:
+        """Require body conclusion before releasing an exclusive reservation."""
+        local_sid = _parse_local_body_handle(reservation.get("session_handle"))
+        if not reservation.get("exclusive_key") and not (policy_applies and local_sid is not None):
+            return True, None
+
+        fleet = _parse_fleet_body_handle(reservation.get("session_handle"))
+        if fleet is not None:
+            try:
+                verdict = self.fleet_verdict_fn(*fleet)
+            except Exception:
+                verdict = _tracking().UNKNOWN
+            if verdict == _tracking().UNKNOWN:
+                return False, None
+            if verdict == _tracking().GONE:
+                return True, None
+            try:
+                return self.fleet_end_fn(*fleet), None
+            except Exception:
+                log.exception(
+                    "failed to end terminal exclusive fleet body %s for task %s",
+                    fleet,
+                    task.get("id"),
+                )
+                return False, None
+
+        if local_sid is not None:
+            try:
+                verdict = self.local_body_verdict_fn(local_sid)
+            except Exception:
+                verdict = _tracking().UNKNOWN
+            if verdict == _tracking().UNKNOWN:
+                return False, None
+            if verdict == _tracking().GONE and not policy_applies:
+                return True, None
+            if policy_applies:
+                if verdict != _tracking().GONE:
+                    try:
+                        if self.local_body_activity_fn(local_sid) != "IDLE":
+                            return False, None
+                    except Exception:
+                        return False, None
+                attempts, next_attempt_at = self._conclusion_retry_meta(reservation)
+                now = time.time()
+                if attempts >= _CONCLUSION_MAX_ATTEMPTS or next_attempt_at > now:
+                    return False, None
+                prior_payload = self._conclusion_retry_payload(reservation)
+                acp_session = prior_payload.get("acp_session_id")
+                if not acp_session:
+                    try:
+                        acp_session = self.local_acp_session_fn(local_sid)
+                    except Exception:
+                        acp_session = None
+                if not acp_session:
+                    attempts += 1
+                    failure = {
+                        "action": "failed",
+                        "reason": "session-identity-unavailable",
+                        "attempts": attempts,
+                        "next_attempt_at": now
+                        + min(
+                            300,
+                            _CONCLUSION_RETRY_BASE_SECONDS * (2 ** max(0, attempts - 1)),
+                        ),
+                    }
+                    try:
+                        self.client.record_spawn_conclusion(
+                            reservation["key"],
+                            conclusion_state=(
+                                _CONCLUSION_HELD
+                                if attempts >= _CONCLUSION_MAX_ATTEMPTS
+                                else _CONCLUSION_PENDING
+                            ),
+                            conclusion_detail=json.dumps(
+                                failure,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                        )
+                    except DispatchError:
+                        pass
+                    return False, None
+                checkpoint = {
+                    "action": "pending",
+                    "reason": "ending-terminal-body",
+                    "acp_session_id": str(acp_session),
+                    "attempts": attempts,
+                    "next_attempt_at": 0,
+                }
+                try:
+                    self.client.record_spawn_conclusion(
+                        reservation["key"],
+                        conclusion_state=_CONCLUSION_PENDING,
+                        conclusion_detail=json.dumps(
+                            checkpoint,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
+                except DispatchError:
+                    return False, None
+                try:
+                    ended = self.local_end_fn(local_sid)
+                except Exception:
+                    log.exception(
+                        "failed to end terminal disposable local body %s for task %s",
+                        local_sid,
+                        task.get("id"),
+                    )
+                    ended = False
+                if not ended:
+                    attempts += 1
+                    failure = {
+                        **checkpoint,
+                        "action": "failed",
+                        "reason": "terminal-body-end-failed",
+                        "attempts": attempts,
+                        "next_attempt_at": now
+                        + min(
+                            300,
+                            _CONCLUSION_RETRY_BASE_SECONDS * (2 ** max(0, attempts - 1)),
+                        ),
+                    }
+                    try:
+                        self.client.record_spawn_conclusion(
+                            reservation["key"],
+                            conclusion_state=(
+                                _CONCLUSION_HELD
+                                if attempts >= _CONCLUSION_MAX_ATTEMPTS
+                                else _CONCLUSION_PENDING
+                            ),
+                            conclusion_detail=json.dumps(
+                                failure,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                        )
+                    except DispatchError:
+                        pass
+                    return False, None
+                outcome = self._conclude_terminal_worker(
+                    reservation,
+                    task,
+                    session_override=str(acp_session),
+                )
+                return True, outcome
+            if task.get("status") in {Status.SUBMITTED, Status.COMPLETED} and task.get("completed_by"):
+                try:
+                    if self.local_body_activity_fn(local_sid) == "IDLE":
+                        return True, None
+                except Exception:
+                    pass
+            try:
+                return self.local_end_fn(local_sid), None
+            except Exception:
+                log.exception(
+                    "failed to end terminal exclusive local body %s for task %s",
+                    local_sid,
+                    task.get("id"),
+                )
+                return False, None
+
+        worktree = _worktree_from_reservation(reservation, task.get("owner"))
+        if not worktree:
+            return reservation.get("state") == SpawnState.RESERVING, None
+        try:
+            verdict = self.verdict_fn(
+                worktree,
+                _machine_from_owner(task.get("completed_by") or task.get("owner")),
+                task.get("owner_session_id"),
+            )
+        except Exception:
+            verdict = _tracking().UNKNOWN
+        if verdict == _tracking().GONE:
+            return True, None
+        if verdict == _tracking().UNKNOWN or not policy_applies:
+            return False, None
+        outcome = self._conclude_terminal_worker(reservation, task)
+        return self._conclusion_state(outcome or {}) == _CONCLUSION_COMPLETE, outcome
+
     def reconcile(self) -> int:
         """Settle ``spawned`` reservations whose task reached a terminal state.
 
@@ -900,19 +2322,470 @@ class Supervisor:
         detail rather than silently accepted. Returns the number settled.
         """
         settled = 0
-        for res in self._pool_reservations(
-            state=f"{SpawnState.SPAWNED},{SpawnState.COLD}"
-        ):
+        reservations = self._pool_reservations(
+            state=(f"{SpawnState.RESERVING},{SpawnState.SPAWNED},{SpawnState.COLD}")
+        )
+        reservations.extend(
+            self._pool_reservations(
+                state=SpawnState.SETTLED,
+                conclusion_state=_CONCLUSION_PENDING,
+            )[:_CONCLUSION_PER_CYCLE]
+        )
+        now = time.time()
+        for res in reservations:
             try:
                 task = self.client.get(res["task_id"])
             except DispatchError:
                 continue  # task vanished; leave the reservation for a human
             if task.get("status") in _TERMINAL:
+                conclusion_claim_token: str | None = None
+                if (
+                    res.get("worktree_ownership") == "created"
+                    and res.get("state") != SpawnState.SETTLED
+                ):
+                    try:
+                        if res.get("state") != SpawnState.RELEASING:
+                            self.client.request_spawn_release(
+                                res["key"],
+                                detail=self._completion_detail(task),
+                                disposition="settled",
+                            )
+                    except DispatchError:
+                        log.exception(
+                            "could not fence terminal allocation cleanup for %s",
+                            res["key"],
+                        )
+                    continue
+                prior_attempts = 0
+                exclusive = bool(res.get("exclusive_key"))
+                if res.get("state") == SpawnState.RESERVING and not exclusive:
+                    continue
+                policy_applies = bool(
+                    self.disposable_cli_labels.intersection(task.get("labels") or [])
+                )
+                if (
+                    policy_applies
+                    and res.get("state") != SpawnState.SETTLED
+                    and res.get("conclusion_state")
+                    in {
+                        _CONCLUSION_PENDING,
+                        _CONCLUSION_HELD,
+                    }
+                ):
+                    prior_attempts, next_attempt_at = self._conclusion_retry_meta(res)
+                    if res.get("conclusion_state") == _CONCLUSION_HELD:
+                        continue
+                    if next_attempt_at > now:
+                        continue
+                    if prior_attempts >= _CONCLUSION_MAX_ATTEMPTS:
+                        try:
+                            self.client.record_spawn_conclusion(
+                                res["key"],
+                                conclusion_state=_CONCLUSION_HELD,
+                                conclusion_detail=res.get("conclusion_detail") or "{}",
+                            )
+                        except DispatchError:
+                            pass
+                        continue
+                if policy_applies and res.get("state") != SpawnState.SETTLED:
+                    res = self._refresh_terminal_session(res, task)
+                local_sid = _parse_local_body_handle(res.get("session_handle"))
+                if (
+                    policy_applies
+                    and local_sid is not None
+                    and res.get("state") != SpawnState.SETTLED
+                ):
+                    try:
+                        body_verdict = self.local_body_verdict_fn(local_sid)
+                    except Exception:
+                        body_verdict = _tracking().UNKNOWN
+                    try:
+                        body_activity = self.local_body_activity_fn(local_sid)
+                    except Exception:
+                        body_activity = None
+                    if body_verdict != _tracking().GONE and body_activity != "IDLE":
+                        if body_verdict == _tracking().LIVE:
+                            continue
+                        attempts = prior_attempts + 1
+                        checkpoint = {
+                            **self._conclusion_retry_payload(res),
+                            "action": "skipped",
+                            "reason": (
+                                "body-not-idle"
+                                if body_verdict == _tracking().LIVE
+                                else "body-liveness-unknown"
+                            ),
+                            "liveness": body_verdict,
+                            "activity": body_activity,
+                            "attempts": attempts,
+                            "next_attempt_at": now
+                            + min(
+                                300,
+                                _CONCLUSION_RETRY_BASE_SECONDS * (2 ** max(0, attempts - 1)),
+                            ),
+                        }
+                        state = (
+                            _CONCLUSION_HELD
+                            if attempts >= _CONCLUSION_MAX_ATTEMPTS
+                            else _CONCLUSION_PENDING
+                        )
+                        try:
+                            self.client.record_spawn_conclusion(
+                                res["key"],
+                                conclusion_state=state,
+                                conclusion_detail=json.dumps(
+                                    checkpoint,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ),
+                            )
+                        except DispatchError:
+                            pass
+                        continue
+                if (
+                    res.get("state") == SpawnState.SETTLED
+                    and res.get("conclusion_state") == _CONCLUSION_PENDING
+                ):
+                    ready, preconcluded = True, None
+                else:
+                    gone_local_sid: str | None = None
+                    gone_conclusion_session: str | None = None
+                    gone_target_missing = False
+                    exact_gone = False
+                    fleet = _parse_fleet_body_handle(res.get("session_handle"))
+                    if fleet is not None:
+                        try:
+                            exact_gone = self.fleet_verdict_fn(*fleet) == _tracking().GONE
+                        except Exception:
+                            exact_gone = False
+                    elif local_sid is not None:
+                        try:
+                            exact_gone = self.local_body_verdict_fn(local_sid) == _tracking().GONE
+                        except Exception:
+                            exact_gone = False
+                        if exact_gone:
+                            gone_local_sid = local_sid
+                            try:
+                                target_dir = self.local_body_target_dir_fn(local_sid)
+                            except Exception:
+                                target_dir = None
+                            gone_target_missing = (
+                                _target_directory_missing(target_dir) is True
+                                if target_dir is not None
+                                else False
+                            )
+                            try:
+                                gone_conclusion_session = self.local_acp_session_fn(
+                                    local_sid
+                                ) or task.get("owner_session_id")
+                            except Exception:
+                                gone_conclusion_session = task.get("owner_session_id")
+                    else:
+                        worktree = _worktree_from_reservation(
+                            res,
+                            task.get("owner"),
+                        )
+                        if worktree:
+                            try:
+                                exact_gone = (
+                                    self.verdict_fn(
+                                        worktree,
+                                        _machine_from_owner(task.get("owner")),
+                                        task.get("owner_session_id"),
+                                    )
+                                    == _tracking().GONE
+                                )
+                            except Exception:
+                                exact_gone = False
+                            if exact_gone:
+                                raw_session = res.get("session_handle")
+                                gone_conclusion_session = (
+                                    raw_session if isinstance(raw_session, str) else None
+                                )
+                    if exact_gone:
+                        try:
+                            releasing = self.client.request_spawn_release(
+                                res["key"],
+                                detail=self._completion_detail(task),
+                                disposition="settled",
+                            )
+                            conclusion_state, cleanup_payload = self._retired_cleanup_plan(
+                                releasing,
+                                local_session_id=gone_local_sid,
+                                conclusion_session=gone_conclusion_session,
+                                target_missing=gone_target_missing,
+                                cleanup_kind="terminal",
+                            )
+                            self.client.retire_spawn(
+                                res["key"],
+                                exact_absence=True,
+                                detail=self._completion_detail(task),
+                                conclusion_state=conclusion_state,
+                                conclusion_detail=json.dumps(
+                                    cleanup_payload,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ),
+                            )
+                        except DispatchError:
+                            log.exception(
+                                "failed to retire terminal absent body %s",
+                                res["key"],
+                            )
+                            continue
+                        settled += 1
+                        if conclusion_state == _CONCLUSION_PENDING:
+                            self.release_requested_bodies()
+                        continue
+                    ready, preconcluded = self._exclusive_terminal_release_ready(
+                        res,
+                        task,
+                        policy_applies=policy_applies,
+                    )
+                if not ready:
+                    continue
+                local_sid = _parse_local_body_handle(res.get("session_handle"))
+                script_handle = _parse_script_body_handle(res.get("session_handle"))
+                if script_handle is not None:
+                    _worker_id, _pid, _start_token, task_file = script_handle
+                    _cleanup_script_task_file(task_file)
+                if (
+                    not exclusive
+                    and local_sid is not None
+                    and res.get("state") != SpawnState.SETTLED
+                    and not policy_applies
+                ):
+                    try:
+                        verdict = self.local_body_verdict_fn(local_sid)
+                    except Exception:
+                        verdict = _tracking().UNKNOWN
+                    if verdict == _tracking().UNKNOWN:
+                        continue
+                    try:
+                        ended = self.local_end_fn(local_sid)
+                    except Exception:
+                        log.exception(
+                            "failed to end terminal local body %s for task %s",
+                            local_sid,
+                            task.get("id"),
+                        )
+                        continue
+                    if not ended:
+                        continue
+                detail = self._completion_detail(task)
+                if res.get("state") == SpawnState.SETTLED:
+                    if not policy_applies or res.get("conclusion_state") != _CONCLUSION_PENDING:
+                        continue
+                    prior_attempts, next_attempt_at = self._conclusion_retry_meta(res)
+                    if next_attempt_at > now:
+                        continue
+                    if prior_attempts >= _CONCLUSION_MAX_ATTEMPTS:
+                        try:
+                            claim = self.client.claim_spawn_conclusion_retry(res["key"])
+                            if not claim.get("claimed"):
+                                continue
+                            claim_token = claim.get("claim_token")
+                            self.client.validate_spawn_conclusion_claim(
+                                res["key"],
+                                claim_token,
+                            )
+                            self.client.record_spawn_conclusion(
+                                res["key"],
+                                detail=detail,
+                                conclusion_state=_CONCLUSION_HELD,
+                                conclusion_detail=res.get("conclusion_detail"),
+                                claim_token=claim_token,
+                            )
+                        except DispatchError:
+                            pass
+                        continue
+                else:
+                    if policy_applies:
+                        local_sid = _parse_local_body_handle(res.get("session_handle"))
+                    if policy_applies and local_sid is not None and preconcluded is None:
+                        preconcluded = self._conclude_terminal_worker(res, task)
+                        if (
+                            preconcluded is not None
+                            and self._conclusion_state(preconcluded) == _CONCLUSION_PENDING
+                        ):
+                            retry_key = f"conclusion:{res['key']}"
+                            if now < self._resume_retry_after.get(retry_key, 0.0):
+                                continue
+                            prior_payload = self._conclusion_retry_payload(res)
+                            if prior_payload.get("same_owner_nudge") == "delivered":
+                                attempts = prior_attempts + 1
+                                checkpoint = {
+                                    **preconcluded,
+                                    "attempts": attempts,
+                                    "next_attempt_at": now
+                                    + min(
+                                        300,
+                                        _CONCLUSION_RETRY_BASE_SECONDS
+                                        * (2 ** max(0, attempts - 1)),
+                                    ),
+                                    "same_owner_nudge": "delivered",
+                                }
+                                state = (
+                                    _CONCLUSION_HELD
+                                    if attempts >= _CONCLUSION_MAX_ATTEMPTS
+                                    else _CONCLUSION_PENDING
+                                )
+                                try:
+                                    self.client.record_spawn_conclusion(
+                                        res["key"],
+                                        conclusion_state=state,
+                                        conclusion_detail=json.dumps(
+                                            checkpoint,
+                                            sort_keys=True,
+                                            separators=(",", ":"),
+                                        ),
+                                    )
+                                except DispatchError:
+                                    pass
+                                if exclusive:
+                                    continue
+                                preconcluded = checkpoint
+                            elif not self._nudge_terminal_conclusion(res, task):
+                                attempts = prior_attempts + 1
+                                conclusion_payload = {
+                                    **preconcluded,
+                                    "attempts": attempts,
+                                    "next_attempt_at": now
+                                    + min(
+                                        300,
+                                        _CONCLUSION_RETRY_BASE_SECONDS
+                                        * (2 ** max(0, attempts - 1)),
+                                    ),
+                                    "same_owner_nudge": "unavailable",
+                                }
+                                state = (
+                                    _CONCLUSION_HELD
+                                    if attempts >= _CONCLUSION_MAX_ATTEMPTS
+                                    else _CONCLUSION_PENDING
+                                )
+                                try:
+                                    self.client.record_spawn_conclusion(
+                                        res["key"],
+                                        conclusion_state=state,
+                                        conclusion_detail=json.dumps(
+                                            conclusion_payload,
+                                            sort_keys=True,
+                                            separators=(",", ":"),
+                                        ),
+                                    )
+                                except DispatchError:
+                                    pass
+                                self._resume_retry_after[retry_key] = (
+                                    now + _CONCLUSION_RETRY_BASE_SECONDS
+                                )
+                                continue
+                            else:
+                                self._resume_retry_after[retry_key] = (
+                                    now + _CONCLUSION_RETRY_BASE_SECONDS
+                                )
+                                preconcluded = {
+                                    **preconcluded,
+                                    "attempts": prior_attempts + 1,
+                                    "next_attempt_at": 0,
+                                    "same_owner_nudge": "delivered",
+                                }
+                                try:
+                                    res = self.client.record_spawn_conclusion(
+                                        res["key"],
+                                        conclusion_state=_CONCLUSION_PENDING,
+                                        conclusion_detail=json.dumps(
+                                            preconcluded,
+                                            sort_keys=True,
+                                            separators=(",", ":"),
+                                        ),
+                                    )
+                                except DispatchError:
+                                    continue
+                                self._resume_retry_after.pop(retry_key, None)
+                                if exclusive:
+                                    continue
+                    try:
+                        # Release the process slot before priming the worktree.
+                        # A durable pending marker keeps transient liveness or
+                        # command failures retryable after settlement.
+                        self.client.settle_spawn(
+                            res["key"],
+                            detail=detail,
+                            conclusion_state=(_CONCLUSION_PENDING if policy_applies else None),
+                        )
+                        settled += 1
+                    except DispatchError:
+                        continue
+                if policy_applies and conclusion_claim_token is None:
+                    try:
+                        claim = self.client.claim_spawn_conclusion_retry(res["key"])
+                    except DispatchError:
+                        log.exception(
+                            "failed to claim terminal cleanup retry for %s",
+                            res["key"],
+                        )
+                        continue
+                    if not claim.get("claimed"):
+                        continue
+                    conclusion_claim_token = claim.get("claim_token")
+                    try:
+                        self.client.validate_spawn_conclusion_claim(
+                            res["key"],
+                            conclusion_claim_token,
+                        )
+                    except DispatchError:
+                        continue
+                outcome = (
+                    preconcluded
+                    if preconcluded is not None
+                    else self._conclude_terminal_worker(res, task)
+                )
+                if outcome is None:
+                    continue
+                final_detail = self._append_conclusion_detail(detail, outcome)
+                conclusion_state = self._conclusion_state(outcome)
+                conclusion_payload: dict = dict(outcome)
+                if conclusion_state == _CONCLUSION_PENDING:
+                    attempts = prior_attempts + 1
+                    conclusion_payload["attempts"] = attempts
+                    conclusion_payload["next_attempt_at"] = now + min(
+                        300,
+                        _CONCLUSION_RETRY_BASE_SECONDS * (2 ** (attempts - 1)),
+                    )
+                    if attempts == 1 and "same_owner_nudge" not in conclusion_payload:
+                        conclusion_payload["same_owner_nudge"] = (
+                            "delivered"
+                            if self._nudge_terminal_conclusion(res, task)
+                            else "unavailable"
+                        )
+                    if attempts >= _CONCLUSION_MAX_ATTEMPTS:
+                        conclusion_state = _CONCLUSION_HELD
                 try:
-                    self.client.settle_spawn(res["key"], detail=self._completion_detail(task))
-                    settled += 1
+                    encoded_conclusion = json.dumps(
+                        conclusion_payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    if conclusion_claim_token is not None:
+                        self.client.record_spawn_conclusion(
+                            res["key"],
+                            conclusion_state=conclusion_state,
+                            conclusion_detail=encoded_conclusion,
+                            detail=final_detail,
+                            claim_token=conclusion_claim_token,
+                        )
+                    else:
+                        self.client.settle_spawn(
+                            res["key"],
+                            detail=final_detail,
+                            conclusion_state=conclusion_state,
+                            conclusion_detail=encoded_conclusion,
+                        )
                 except DispatchError:
-                    pass
+                    log.exception(
+                        "could not record terminal conclusion outcome for %s",
+                        res["key"],
+                    )
         return settled
 
     def hold_live_leases(self) -> int:
@@ -935,7 +2808,7 @@ class Supervisor:
         tracking = _tracking()
         local_by_id: dict[str, dict] | None = None
         held = 0
-        for res in self.client.list_reservations(state=SpawnState.SPAWNED, limit=500):
+        for res in self._pool_reservations(state=SpawnState.SPAWNED):
             try:
                 task = self.client.get(res["task_id"])
             except DispatchError:
@@ -1013,12 +2886,39 @@ class Supervisor:
                     except DispatchError:
                         pass
                 continue
+            script_handle = _parse_script_body_handle(res.get("session_handle"))
+            if script_handle is not None:
+                _worker_id, pid, start_token, _task_file = script_handle
+                if self.publish_activity:
+                    try:
+                        verdict = self.script_body_verdict_fn(pid, start_token)
+                    except Exception:
+                        verdict = _tracking().UNKNOWN
+                    try:
+                        self.client.set_activity(
+                            task["id"],
+                            "ACTIVE" if verdict == _tracking().LIVE else None,
+                            reservation_key=res["key"],
+                        )
+                    except DispatchError:
+                        pass
+                if task.get("status") not in _LEASED or not owner:
+                    continue
+                try:
+                    sverdict = self.script_body_verdict_fn(pid, start_token)
+                except Exception:
+                    sverdict = _tracking().UNKNOWN
+                if sverdict == _tracking().LIVE and self.heartbeat:
+                    try:
+                        self.client.heartbeat(task["id"], owner)
+                        held += 1
+                    except DispatchError:
+                        pass
+                continue
             if task.get("status") not in _LEASED:
                 if self.publish_activity:
                     try:
-                        self.client.set_activity(
-                            task["id"], None, reservation_key=res["key"]
-                        )
+                        self.client.set_activity(task["id"], None, reservation_key=res["key"])
                     except DispatchError:
                         pass
                 continue
@@ -1032,9 +2932,7 @@ class Supervisor:
             if not session:
                 if self.publish_activity:
                     try:
-                        self.client.set_activity(
-                            task["id"], None, reservation_key=res["key"]
-                        )
+                        self.client.set_activity(task["id"], None, reservation_key=res["key"])
                     except DispatchError:
                         pass
                 continue  # not confirmed alive -> let the lease ride
@@ -1087,7 +2985,7 @@ class Supervisor:
         from . import tracking
 
         recovered = 0
-        for res in self.client.list_reservations(state=SpawnState.SPAWNED, limit=500):
+        for res in self._pool_reservations(state=SpawnState.SPAWNED):
             try:
                 task = self.client.get(res["task_id"])
             except DispatchError:
@@ -1097,12 +2995,6 @@ class Supervisor:
                 continue  # reconcile() settles provably-finished tasks
             if status == Status.SUSPENDED:
                 continue  # dormant ownership is intentional, not a gone body
-            if status == Status.DEAD_LETTER:
-                try:
-                    self.client.settle_spawn(res["key"], detail="task dead_lettered")
-                except DispatchError:
-                    pass
-                continue
             owner = task.get("owner")
             # Headless fleet body: no worktree handle, but its recovery handle is
             # the pool host's agent-bridge session -- probe THAT for liveness and
@@ -1128,30 +3020,45 @@ class Supervisor:
                     if status in _LEASED and owner:
                         try:
                             self.client.yield_task(
-                                task["id"], owner,
+                                task["id"],
+                                owner,
                                 note="fleet body confirmed gone; requeued for re-embody",
+                                release_spawn=False,
                             )
                         except DispatchError:
                             pass  # lease-expiry GC is the backstop requeue
                     try:
                         detail = f"fleet body confirmed gone ({host}:{bridge_sid})"
-                        if _reservation_made_progress(res, task):
+                        productive = _reservation_made_progress(res, task)
+                        if res.get("worktree_ownership") == "created":
+                            self.client.request_spawn_release(
+                                res["key"],
+                                detail=(
+                                    f"{detail}; productive turn completed"
+                                    if productive
+                                    else detail
+                                ),
+                                disposition="settled" if productive else "failed",
+                            )
+                        elif productive:
                             self.client.settle_spawn(
                                 res["key"],
                                 detail=f"{detail}; productive turn completed",
+                                release_requested=True,
                             )
                         else:
-                            self.client.fail_spawn(res["key"], detail=detail)
+                            self.client.fail_spawn(
+                                res["key"], detail=detail, release_requested=True
+                            )
                         recovered += 1
                         log.info(
                             "recovered gone fleet body for task %s (%s); reservation "
                             "released for re-embody",
-                            task["id"], res["key"],
+                            task["id"],
+                            res["key"],
                         )
                     except DispatchError:
-                        log.exception(
-                            "recovery release failed for reservation %s", res["key"]
-                        )
+                        log.exception("recovery release failed for reservation %s", res["key"])
                 continue  # fleet body handled -> don't fall to the worktree path
             # Local headless body: no worktree handle either, but its recovery
             # handle is THIS host's agent-bridge session -- probe it locally (no
@@ -1175,31 +3082,83 @@ class Supervisor:
                     if status in _LEASED and owner:
                         try:
                             self.client.yield_task(
-                                task["id"], owner,
+                                task["id"],
+                                owner,
                                 note="local body confirmed gone; requeued for re-embody",
+                                release_spawn=False,
                             )
                         except DispatchError:
                             pass  # lease-expiry GC is the backstop requeue
                     try:
                         detail = f"local body confirmed gone ({local_sid})"
-                        if _reservation_made_progress(res, task):
+                        productive = _reservation_made_progress(res, task)
+                        if res.get("worktree_ownership") == "created":
+                            self.client.request_spawn_release(
+                                res["key"],
+                                detail=(
+                                    f"{detail}; productive turn completed"
+                                    if productive
+                                    else detail
+                                ),
+                                disposition="settled" if productive else "failed",
+                            )
+                        elif productive:
                             self.client.settle_spawn(
                                 res["key"],
                                 detail=f"{detail}; productive turn completed",
+                                release_requested=True,
                             )
                         else:
-                            self.client.fail_spawn(res["key"], detail=detail)
+                            self.client.fail_spawn(
+                                res["key"], detail=detail, release_requested=True
+                            )
                         recovered += 1
                         log.info(
                             "recovered gone local body for task %s (%s); reservation "
                             "released for re-embody",
-                            task["id"], res["key"],
+                            task["id"],
+                            res["key"],
                         )
                     except DispatchError:
-                        log.exception(
-                            "recovery release failed for reservation %s", res["key"]
-                        )
+                        log.exception("recovery release failed for reservation %s", res["key"])
                 continue  # local body handled -> don't fall to the worktree path
+            script_handle = _parse_script_body_handle(res.get("session_handle"))
+            if script_handle is not None:
+                worker_id, pid, start_token, task_file = script_handle
+                try:
+                    sverdict = self.script_body_verdict_fn(pid, start_token)
+                except Exception:
+                    sverdict = tracking.UNKNOWN
+                if sverdict == tracking.GONE:
+                    _cleanup_script_task_file(task_file)
+                    detail = (
+                        "script body exited without explicit complete/abandon "
+                        f"(worker {worker_id}, pid {pid})"
+                    )
+                    try:
+                        self.client.abandon(
+                            task["id"],
+                            worker_id=worker_id,
+                            permitted=True,
+                            reason=detail,
+                            expected_generation=task.get("generation"),
+                            expected_owner_session_id=task.get("owner_session_id"),
+                        )
+                    except DispatchError:
+                        log.exception("failed to abandon gone script task %s", task["id"])
+                    try:
+                        self.client.settle_spawn(
+                            res["key"], detail=detail, release_requested=True
+                        )
+                        recovered += 1
+                        log.info(
+                            "abandoned gone script body for task %s (%s)",
+                            task["id"],
+                            res["key"],
+                        )
+                    except DispatchError:
+                        log.exception("failed to settle gone script reservation %s", res["key"])
+                continue
             worktree = _worktree_from_reservation(res, owner)
             if not worktree:
                 continue  # headless / no worktree handle -> not recoverable here
@@ -1223,24 +3182,34 @@ class Supervisor:
                 if status in _LEASED and owner:
                     try:
                         self.client.yield_task(
-                            task["id"], owner,
+                            task["id"],
+                            owner,
                             note="worktree owner confirmed gone; requeued for re-embody",
+                            release_spawn=False,
                         )
                     except DispatchError:
                         pass  # lease-expiry GC is the backstop requeue
                 detail = f"owner confirmed gone ({worktree})"
-                if _reservation_made_progress(res, task):
+                productive = _reservation_made_progress(res, task)
+                if res.get("worktree_ownership") == "created":
+                    self.client.request_spawn_release(
+                        res["key"],
+                        detail=(f"{detail}; productive turn completed" if productive else detail),
+                        disposition="settled" if productive else "failed",
+                    )
+                elif productive:
                     self.client.settle_spawn(
                         res["key"],
                         detail=f"{detail}; productive turn completed",
+                        release_requested=True,
                     )
                 else:
-                    self.client.fail_spawn(res["key"], detail=detail)
+                    self.client.fail_spawn(res["key"], detail=detail, release_requested=True)
                 recovered += 1
                 log.info(
-                    "recovered gone embody for task %s (%s); reservation released "
-                    "for re-embody",
-                    task["id"], res["key"],
+                    "recovered gone embody for task %s (%s); reservation released for re-embody",
+                    task["id"],
+                    res["key"],
                 )
             except DispatchError:
                 log.exception("recovery release failed for reservation %s", res["key"])
@@ -1257,13 +3226,17 @@ class Supervisor:
         worktree session is re-driven; unknown bridge state is left untouched.
         """
         redriven = 0
-        for res in self.client.list_reservations(state=SpawnState.SPAWNED, limit=500):
+        for res in self._pool_reservations(state=SpawnState.SPAWNED):
             key = res.get("key")
             if not key or key in self._redriven_spawn_keys:
+                continue
+            if res.get("release_requested"):
                 continue
             if _parse_fleet_body_handle(res.get("session_handle")) is not None:
                 continue
             if _parse_local_body_handle(res.get("session_handle")) is not None:
+                continue
+            if _parse_script_body_handle(res.get("session_handle")) is not None:
                 continue
             try:
                 task = self.client.get(res["task_id"])
@@ -1295,14 +3268,13 @@ class Supervisor:
                     redriven += 1
                     if self.publish_activity:
                         try:
-                            self.client.set_activity(
-                                task["id"], "ACTIVE", reservation_key=key
-                            )
+                            self.client.set_activity(task["id"], "ACTIVE", reservation_key=key)
                         except DispatchError:
                             pass
                     log.info(
                         "re-drove live unclaimed embody for task %s (%s)",
-                        task["id"], key,
+                        task["id"],
+                        key,
                     )
             except Exception:
                 log.exception("redrive failed for reservation %s", key)
@@ -1323,7 +3295,7 @@ class Supervisor:
             return 0
         now = time.time() if now is None else now
         nudged = 0
-        for res in self.client.list_reservations(state=SpawnState.SPAWNED, limit=500):
+        for res in self._pool_reservations(state=SpawnState.SPAWNED):
             try:
                 task = self.client.get(res["task_id"])
             except DispatchError:
@@ -1352,96 +3324,47 @@ class Supervisor:
                     nudged += 1
                     log.info(
                         "nudged stalled-but-live worker for task %s (%s)",
-                        task["id"], worktree,
+                        task["id"],
+                        worktree,
                     )
             except Exception:  # a failed nudge is never fatal
                 log.exception("nudge failed for task %s", task["id"])
         return nudged
 
-    # -- reactive wait (react-to-turn-end) -----------------------------------
-
-    def _embodied_owners(self) -> list[tuple[str, str | None]]:
-        """``(worktree, machine)`` for each spawned reservation whose task is
-        currently **leased** -- the set of workers with a live turn to react to.
-
-        A headless reservation (no worktree handle) or a task not presently leased
-        (``claimed``/``started``) contributes nothing: there is no live turn
-        boundary to watch. Deduped, order-stable.
-        """
-        owners: list[tuple[str, str | None]] = []
-        seen: set[tuple[str, str | None]] = set()
-        for res in self.client.list_reservations(state=SpawnState.SPAWNED, limit=500):
-            try:
-                task = self.client.get(res["task_id"])
-            except DispatchError:
-                continue
-            if task.get("status") not in _LEASED:
-                continue
-            owner = task.get("owner")
-            worktree = _worktree_from_reservation(res, owner)
-            if not worktree:
-                continue
-            key = (worktree, _machine_from_owner(owner))
-            if key in seen:
-                continue
-            seen.add(key)
-            owners.append(key)
-        return owners
-
-    def _safe_turn_state(self, owner: tuple[str, str | None]) -> str | None:
-        """Resolve one worker's coarse turn state, swallowing any probe error.
-
-        A resolver failure is treated as *no signal* (``None``), never as a
-        turn-end -- so a flaky bridge only costs promptness, never correctness."""
-        worktree, machine = owner
-        try:
-            return self.turn_state_fn(worktree, machine)
-        except Exception:  # turn-state is best-effort -- never let a probe be fatal
-            return None
+    # -- retired reactive wait compatibility seam -----------------------------
 
     def wait_for_turn_end(
         self,
         timeout: float,
         *,
         sleep: Callable[[float], None] | None = None,
-        clock: Callable[[], float] | None = None,
     ) -> bool:
-        """Block up to ``timeout`` seconds, returning early on a worker **turn-end**.
-
-        The interruptible inter-cycle wait behind *react-to-turn-end*. It baselines
-        each embodied worker's coarse turn state (:meth:`_embodied_owners`), then
-        re-samples every :attr:`reactive_interval` seconds and returns ``True`` as
-        soon as any worker is observed transitioning **running -> idle** (a turn just
-        settled), so the caller runs its next supervision pass immediately.
-
-        Returns ``False`` when ``timeout`` elapses with no turn-end observed -- the
-        periodic poll then fires as the correctness **floor**. Only a *transition* to
-        idle wakes it: a worker already idle at entry is not a fresh turn-end (that
-        would wake instantly every cycle), and a worker with no observable turn state
-        (``None``) contributes no signal -- so with no embodied workers, or no
-        reachable bridge, the wait degrades to exactly a plain sleep. ``sleep`` and
-        ``clock`` are injectable for deterministic tests.
-        """
+        """Wait for one coalesced push wake or the ordinary interval."""
         sleep = sleep or time.sleep
-        clock = clock or time.monotonic
-        if timeout <= 0 or not self.reactive:
-            return False
-        owners = self._embodied_owners()
-        if not owners:
-            sleep(timeout)  # nothing to react to -> one plain sleep of the interval
-            return False
-        seen = {o: self._safe_turn_state(o) for o in owners}
-        deadline = clock() + timeout
-        while True:
-            remaining = deadline - clock()
-            if remaining <= 0:
-                return False
-            sleep(min(self.reactive_interval, remaining))
-            for o in owners:
-                state = self._safe_turn_state(o)
-                if state == "idle" and seen.get(o) == "running":
-                    return True  # a turn just settled -> supervise now
-                seen[o] = state
+        if timeout < 0:
+            raise ValueError("supervisor interval must be non-negative")
+        if self.event_wake is not None:
+            return self.event_wake.wait(timeout)
+        sleep(timeout)
+        return False
+
+    def _sync_event_subscriptions(self) -> None:
+        if self.event_wake is None:
+            return
+        subscriptions: list[BridgeSubscription] = []
+        for reservation in self._pool_reservations(state=SpawnState.SPAWNED):
+            fleet = _parse_fleet_body_handle(reservation.get("session_handle"))
+            if fleet is None:
+                continue
+            host, session_id = fleet
+            subscriptions.append(
+                BridgeSubscription(
+                    host=host,
+                    session_id=session_id,
+                    caller_id=self._event_caller_id,
+                )
+            )
+        self.event_wake.update(subscriptions)
 
     def _effective_max_attempts(self, task: dict) -> int:
         """The dead-letter bound for ``task``: the most-permissive per-label
@@ -1455,12 +3378,12 @@ class Supervisor:
         return max(overrides) if overrides else self.max_attempts
 
     def advance_via_evaluator(self) -> int:
-        """Feed each newly-terminal task's lifecycle event to the evaluator and
+        """Feed each newly-concluded task's lifecycle event to the evaluator and
         apply its decisions (the service-driven loop-advancement pass).
 
-        Lists recent terminal tasks in the lane (completed / abandoned), and for
+        Lists recent concluded tasks in the lane (submitted / abandoned), and for
         each one not yet seen this process, synthesizes the coordinator-shaped
-        lifecycle event ``{"type": "task.completed"|"task.abandoned", "task":
+        lifecycle event ``{"type": "task.submitted"|"task.abandoned", "task":
         {...}}``, runs the evaluator, and applies the returned decisions through
         :func:`~agent_dispatch.producers.evaluator.apply_decisions` (an ``Emit``
         creates a follow-up task in this lane). Returns the number of follow-up
@@ -1468,7 +3391,7 @@ class Supervisor:
 
         Best-effort and non-fatal: a bad evaluator or a failed create is logged
         and skipped, never allowed to abort the supervision cycle. Each task's
-        terminal event fires **at most once per process**; the emitted follow-up's
+        concluded event fires **at most once per process**; the emitted follow-up's
         ``dedup_key`` is the durable cross-restart guard against duplicates.
         """
         if self.evaluator is None:
@@ -1478,7 +3401,7 @@ class Supervisor:
         try:
             terminal = self.client.list(
                 repo=self.repo,
-                status=[Status.COMPLETED, Status.ABANDONED],
+                status=[Status.SUBMITTED, Status.COMPLETED, Status.ABANDONED],
                 evaluator_ref=self.evaluator_ref or "",
                 limit=self.evaluate_limit,
             )
@@ -1497,11 +3420,29 @@ class Supervisor:
             if task.get("evaluator_ref") != self.evaluator_ref:
                 continue
             self._evaluated.add(tid)  # fire once per process, success or not
-            event = {"type": f"task.{task.get('status')}", "task": task}
+            status = task.get("status")
+            if status == Status.SUBMITTED and task.get("require_verification"):
+                continue
+            event_type = "task.abandoned" if status == Status.ABANDONED else "task.submitted"
+            event_task = dict(task)
+            if status == Status.COMPLETED and not task.get("require_verification"):
+                event_task["status"] = Status.SUBMITTED
+            event = {"type": event_type, "task": event_task}
             try:
                 decisions = self.evaluator.evaluate(event)
                 results = apply_decisions(
-                    decisions, creator=self.client.create, repo=self.repo
+                    decisions,
+                    creator=self.client.create,
+                    repo=self.repo,
+                    task_id=tid,
+                    confirmer=self.client.confirm,
+                    abandoner=lambda task_id, **kwargs: self.client.abandon(
+                        task_id,
+                        worker_id=kwargs.get("actor"),
+                        permitted=True,
+                        reason=kwargs.get("reason"),
+                        expected_status=Status.SUBMITTED,
+                    ),
                 )
             except Exception:  # a domain evaluator/create must never crash the loop
                 log.exception("evaluator pass: advancing task %s failed", tid)
@@ -1511,7 +3452,15 @@ class Supervisor:
                     emitted += 1
                     log.info(
                         "evaluator pass: task %s (%s) -> emitted follow-up %s",
-                        tid, event["type"], r["created"].get("id"),
+                        tid,
+                        event["type"],
+                        r["created"].get("id"),
+                    )
+                elif r.get("decision") == "confirm" and r.get("completed"):
+                    log.info(
+                        "evaluator pass: task %s (%s) -> completed",
+                        tid,
+                        event["type"],
                     )
         # Bound the in-process guard so a long-lived supervisor doesn't grow it
         # without limit -- keep the most recent terminal ids (dedup_key still
@@ -1521,10 +3470,21 @@ class Supervisor:
             self._evaluated = keep
         return emitted
 
-    def _failed_spawn_counts(self) -> dict[str, int]:
-        """Count FAILED spawn reservations per task id (the dead-letter signal)."""
+    def _failed_spawn_counts(self) -> dict[str, int] | None:
+        """Count FAILED spawn reservations per task id (the dead-letter signal).
+
+        Returns ``None`` (not ``{}``) when the coordinator can't be reached,
+        so ``poll_once`` can fail closed -- block new spawns this cycle --
+        instead of assuming zero failures for every task, which could let one
+        that has already exhausted ``max_attempts`` keep retrying past its
+        bound during an outage.
+        """
+        try:
+            reservations = self._pool_reservations(state=SpawnState.FAILED, strict=True)
+        except _ReservationsUnavailable:
+            return None
         counts: dict[str, int] = {}
-        for res in self.client.list_reservations(state=SpawnState.FAILED, limit=1000):
+        for res in reservations:
             counts[res["task_id"]] = counts.get(res["task_id"], 0) + 1
         return counts
 
@@ -1541,9 +3501,7 @@ class Supervisor:
             return False
         return failed_counts.get(task["id"], 0) >= cap
 
-    def _log_dead_lettered(
-        self, tasks: Sequence[dict], failed_counts: dict[str, int]
-    ) -> set[str]:
+    def _log_dead_lettered(self, tasks: Sequence[dict], failed_counts: dict[str, int]) -> set[str]:
         blocked = [
             (
                 task["id"],
@@ -1558,12 +3516,9 @@ class Supervisor:
             self._dead_letter_signature = signature
             if signature:
                 shown = ", ".join(
-                    f"{task_id} ({failures}/{cap})"
-                    for task_id, failures, cap in signature[:10]
+                    f"{task_id} ({failures}/{cap})" for task_id, failures, cap in signature[:10]
                 )
-                suppressed = (
-                    f"; +{len(signature) - 10} more" if len(signature) > 10 else ""
-                )
+                suppressed = f"; +{len(signature) - 10} more" if len(signature) > 10 else ""
                 log.warning(
                     "%d spawn-dead-lettered task(s): %s%s; inspect with "
                     "`agent-dispatch reservations list --state failed`; rearm one "
@@ -1583,21 +3538,47 @@ class Supervisor:
         """
         now = time.time() if now is None else now
         self.reconcile()
+        self.reconcile_reserving()
+        self.release_requested_bodies(now=now)
+        self.bind_headless_owner_sessions()
+        self.nudge_idle_headless_tasks(now=now)
         self.cool_dormant_bodies()
-        self.release_resumed_cold_tasks()
+        self.release_resumed_cold_tasks(now=now)
+        self.recover_stranded_cold_reservations()
+        self.recover_stranded_releasing_reservations(now=now)
         if self.evaluator is not None:
             self.advance_via_evaluator()
         if self.heartbeat or self.publish_activity:
             self.hold_live_leases()
         if self.recover:
             self.recover_gone()
+        if self.consistency_sweep:
+            # Read-only and additive (see sweep_spawn_consistency's own
+            # docstring) -- never gates spawning, only classifies+logs.
+            try:
+                self.sweep_spawn_consistency()
+            except Exception:  # pragma: no cover -- never let a cycle die on this
+                log.exception("spawn-consistency sweep failed")
+            try:
+                self.sweep_task_reservation_consistency()
+            except Exception:  # pragma: no cover -- never let a cycle die on this
+                log.exception("task-reservation consistency sweep failed")
         self.redrive_unclaimed_spawns()
         if self.nudge:
             self.nudge_stalled(now=now)
         failed_counts = self._failed_spawn_counts()
         eligible = list(self._eligible(now))
-        dead_lettered = self._log_dead_lettered(eligible, failed_counts)
-        active = len(self._active_reservations())
+        if failed_counts is None:
+            log.warning(
+                "could not determine failed-spawn counts this cycle; "
+                "blocking new spawns rather than risking a retry past "
+                "max_attempts (existing active work is unaffected)"
+            )
+            dead_lettered: set[str] = set()
+            active = self.max_concurrent
+        else:
+            dead_lettered = self._log_dead_lettered(eligible, failed_counts)
+            active = len(self._active_reservations())
         spawned: list[str] = []
         for task in eligible:
             if task["id"] in dead_lettered:
@@ -1610,13 +3591,105 @@ class Supervisor:
                 # burned toward the dead-letter bound -- it is retried next cycle.
                 continue
             try:
+                before_reserve = self._recheck_governance("pre-mutation:reserve-spawn")
+                if before_reserve is not None and before_reserve.get("status") != "ready":
+                    log.warning(
+                        "supervisor refused reservation at %s: %s (%s)",
+                        before_reserve.get("checkpoint"),
+                        before_reserve.get("reason"),
+                        before_reserve.get("status"),
+                    )
+                    break
                 resp = self.client.reserve_spawn(task["id"], reserved_by=self.supervisor_id)
             except DispatchError:
                 continue
             if not resp.get("reserved"):
                 continue  # already actively reserved -> never double-spawn
-            key = resp["reservation"]["key"]
-            ok, handle = self.spawn_fn(task)
+            reservation = resp["reservation"]
+            key = reservation["key"]
+            from . import bridge
+            from .embody import EmbodyUnavailable
+
+            try:
+                spawn_task = self._prepare_spawn_task(task, reservation)
+            except SpawnPreparationRetained as exc:
+                log.error(
+                    "spawn preparation retained reservation %s for task %s: %s",
+                    key,
+                    task["id"],
+                    exc,
+                )
+                continue
+            except (
+                DispatchError,
+                EmbodyUnavailable,
+                bridge.BridgeUnavailable,
+            ) as exc:
+                try:
+                    self.client.fail_spawn(
+                        key,
+                        detail=f"reusable worktree preparation failed: {exc}",
+                    )
+                except DispatchError:
+                    log.exception("bookkeeping failed for reservation %s", key)
+                log.warning(
+                    "spawn preparation failed for task %s (%s): %s",
+                    task["id"],
+                    key,
+                    exc,
+                )
+                continue
+            before_spawn = self._recheck_governance("pre-mutation:spawn")
+            if before_spawn is not None and before_spawn.get("status") != "ready":
+                try:
+                    if spawn_task.get("spawn_worktree_ownership") == "created":
+                        self.client.request_spawn_release(
+                            key,
+                            detail=(
+                                "installation governance changed before spawn: "
+                                f"{before_spawn.get('reason')}"
+                            ),
+                            disposition="failed",
+                        )
+                    else:
+                        self.client.fail_spawn(
+                            key,
+                            detail=(
+                                "installation governance changed before spawn: "
+                                f"{before_spawn.get('reason')}"
+                            ),
+                        )
+                except DispatchError:
+                    log.exception("bookkeeping failed for reservation %s", key)
+                log.warning(
+                    "supervisor released reservation %s after %s: %s (%s)",
+                    key,
+                    before_spawn.get("checkpoint"),
+                    before_spawn.get("reason"),
+                    before_spawn.get("status"),
+                )
+                break
+            ok, handle = self.spawn_fn(spawn_task)
+            if ok and not handle.get("session"):
+                # A spawn_fn reporting success with no session id would
+                # record a SPAWNED reservation with session_handle=None --
+                # indistinguishable from a reservation that never reached
+                # spawning anything at all, which release_requested_bodies'
+                # absent-worktree shortcut requires in order to avoid
+                # bypassing a real (if unidentifiable) body's own liveness
+                # resolution. This guards every spawn_fn generically (not
+                # only the built-in make_embody_spawn/make_headless_spawn
+                # factories, which already enforce this themselves) by
+                # downgrading to the ordinary failed/retry path instead of
+                # ever calling record_spawn with an empty handle.
+                ok = False
+                handle = {
+                    **handle,
+                    "error": (
+                        handle.get("error")
+                        or "spawn reported success with no session id"
+                    ),
+                }
             try:
                 if ok:
                     self.client.record_spawn(
@@ -1625,20 +3698,43 @@ class Supervisor:
                         worktree=handle.get("worktree"),
                     )
                     if self.publish_activity:
-                        self.client.set_activity(
-                            task["id"], "ACTIVE", reservation_key=key
-                        )
+                        self.client.set_activity(task["id"], "ACTIVE", reservation_key=key)
                     active += 1
                     spawned.append(task["id"])
                     log.info("spawned embody for task %s (%s)", task["id"], key)
                 else:
-                    self.client.fail_spawn(key, detail=handle.get("error", "spawn failed"))
-                    log.warning(
-                        "spawn failed for task %s (%s): %s",
-                        task["id"], key, handle.get("error"),
-                    )
+                    detail = handle.get("error", "spawn failed")
+                    if handle.get("deferred"):
+                        self.client.defer_spawn(key, detail=detail)
+                        log.info(
+                            "spawn deferred (carried session busy) for task %s (%s): %s",
+                            task["id"],
+                            key,
+                            handle.get("error"),
+                        )
+                    elif spawn_task.get("spawn_worktree_ownership") == "created":
+                        request_failed_created_spawn_release(
+                            self.client, key, handle, spawn_task, detail
+                        )
+                        log.warning(
+                            "spawn failed for task %s (%s): %s",
+                            task["id"],
+                            key,
+                            handle.get("error"),
+                        )
+                    else:
+                        self.client.fail_spawn(key, detail=detail)
+                        log.warning(
+                            "spawn failed for task %s (%s): %s",
+                            task["id"],
+                            key,
+                            handle.get("error"),
+                        )
             except DispatchError:
                 log.exception("bookkeeping failed for reservation %s", key)
+        if self.event_wake is not None:
+            self.event_wake.acknowledge()
+        self._sync_event_subscriptions()
         return spawned
 
     def serve(
@@ -1649,26 +3745,36 @@ class Supervisor:
     ) -> None:
         """Run :meth:`poll_once` each cycle, waiting between cycles.
 
-        The inter-cycle wait is **interruptible by a worker turn-end** when
-        :attr:`reactive` is set (*react-to-turn-end*): it returns as soon as an
-        embodied worker settles a turn, so a completed goal is reconciled and the
-        next task embodied promptly instead of only on the ``interval`` cadence.
-        The full ``interval`` remains the floor (and the whole wait when nothing is
-        embodied); ``reactive=False`` restores a plain fixed sleep.
+        Push delivery changes latency only; the timeout always preserves ordinary
+        fixed-interval reconciliation as the correctness floor.
         """
-        while True:
-            try:
-                spawned = self.poll_once()
-                if on_cycle is not None:
-                    on_cycle(spawned)
-            except KeyboardInterrupt:
-                return
-            except Exception:  # pragma: no cover -- never let the loop die on a blip
-                log.exception("supervision cycle failed")
-            try:
-                if self.reactive:
+        try:
+            while True:
+                boundary = self._recheck_governance("iteration-boundary")
+                if boundary is not None and boundary.get("status") != "ready":
+                    log.warning(
+                        "supervisor backing off at %s: %s (%s)",
+                        boundary.get("checkpoint"),
+                        boundary.get("reason"),
+                        boundary.get("status"),
+                    )
+                    try:
+                        self.wait_for_turn_end(_GOVERNANCE_BACKOFF_SECONDS)
+                    except KeyboardInterrupt:
+                        return
+                    continue
+                try:
+                    spawned = self.poll_once()
+                    if on_cycle is not None:
+                        on_cycle(spawned)
+                except KeyboardInterrupt:
+                    return
+                except Exception:  # pragma: no cover -- never let the loop die on a blip
+                    log.exception("supervision cycle failed")
+                try:
                     self.wait_for_turn_end(interval)
-                else:
-                    time.sleep(interval)
-            except KeyboardInterrupt:
-                return
+                except KeyboardInterrupt:
+                    return
+        finally:
+            if self.event_wake is not None:
+                self.event_wake.close()

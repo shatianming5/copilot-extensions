@@ -35,13 +35,25 @@ Exit code 0 = conformant, 1 = violations (suitable for a pre-push hook).
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import installer_engine_ref as ier
+
+from install_contract_guard import (
+    PERSISTENT_ENV_END,
+    PERSISTENT_ENV_START,
+    is_ignored_scan_path,
+    persistent_environment_violations,
+)
+
 REPO = Path(__file__).resolve().parent.parent
 PLUGINS_DIR = REPO / "plugins"
+INSTALLER_ENGINE_SYNC = Path(__file__).resolve().parent / "sync-installer-engine.py"
 
 # Immutable-versioned-runtime invariant (dotfiles #581): every Python runtime
 # plugin ships the byte-identical scripts/versioned_runtime.py primitive AND
@@ -121,6 +133,30 @@ def _session_hook_problem(plugin: Path) -> str | None:
         data = json.loads((plugin / "plugin.json").read_text(encoding="utf-8"))
     except Exception:
         return "plugin.json unreadable (cannot verify sessionStart reconcile hook)"
+    try:
+        invocation = json.loads(
+            (plugin / "payload-invocation.json").read_text(encoding="utf-8")
+        )
+    except Exception:
+        invocation = {}
+    if invocation.get("sessionStartBootstrap") is False:
+        dispatcher = invocation.get("payloadDispatcher")
+        if not isinstance(invocation.get("catalogGate"), str) or not invocation[
+            "catalogGate"
+        ]:
+            return (
+                "sessionStartBootstrap false requires a fail-closed catalogGate"
+            )
+        if not isinstance(dispatcher, dict) or not all(
+            isinstance(dispatcher.get(platform), str)
+            and dispatcher[platform]
+            for platform in ("posix", "windows")
+        ):
+            return (
+                "sessionStartBootstrap false requires gated payload dispatchers "
+                "for both platforms"
+            )
+        return None
     hooks_ref = data.get("hooks")
     if not hooks_ref:
         return ('no sessionStart runtime-reconcile hook -- set plugin.json "hooks" to a '
@@ -177,6 +213,7 @@ def _extract_marker(text: str, start_marker: str, end_marker: str) -> str | None
     return text[i : j + len(end_marker)]
 
 
+
 def _entrypoint_base(plugin: Path) -> str | None:
     """Return the runtime entrypoint base for a plugin, or None.
 
@@ -192,6 +229,74 @@ def _entrypoint_base(plugin: Path) -> str | None:
     if (scripts / "init.ps1").exists() or (scripts / "init.sh").exists():
         return "init"
     return None
+
+
+def _verify_installer_engine_sync() -> list[str]:
+    spec = importlib.util.spec_from_file_location("sync_installer_engine", INSTALLER_ENGINE_SYNC)
+    if spec is None or spec.loader is None:
+        return [f"unable to load {INSTALLER_ENGINE_SYNC.relative_to(REPO)}"]
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return list(module.verify())
+
+
+def _strip_quoted_strings(line: str) -> str:
+    line = re.sub(r"'(?:[^']|'')*'", "''", line)
+    line = re.sub(r'"(?:[^"`]|`.)*"', '""', line)
+    return line
+
+
+def _non_comment_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        lines.append(line)
+    return lines
+
+
+def _uses_installer_engine(text: str, ext: str) -> bool:
+    return any(
+        ier.source_match_count_text(line, ext) > 0 for line in _non_comment_lines(text)
+    )
+
+
+def _calls_engine_function(text: str, ext: str, *names: str) -> bool:
+    code_lines = [_strip_quoted_strings(line) for line in _non_comment_lines(text)]
+    if ext == "ps1":
+        return any(
+            re.search(
+                rf"""(?<![\w-])(?:{"|".join(re.escape(name) for name in names)})(?=\s|\(|$)""",
+                line,
+            )
+            for line in code_lines
+        )
+    return any(
+        re.search(
+            rf"""(?<![\w])(?:{"|".join(re.escape(name) for name in names)})(?=\s|\(|$)""",
+            line,
+        )
+        for line in code_lines
+    )
+
+
+def _uses_engine_uv_install(text: str, ext: str) -> bool:
+    return _uses_installer_engine(text, ext) and _calls_engine_function(
+        text,
+        ext,
+        "Invoke-UvPipInstallResilient",
+        "invoke_uv_pip_install_resilient",
+    )
+
+
+def _uses_engine_manifest_writer(text: str, ext: str) -> bool:
+    return _uses_installer_engine(text, ext) and _calls_engine_function(
+        text,
+        ext,
+        "Write-DeployManifest",
+        "write_deploy_manifest",
+    )
 
 
 def check() -> int:
@@ -212,6 +317,64 @@ def check() -> int:
     if not plugins:
         print("No plugins with install scripts found.", file=sys.stderr)
         return 1
+
+    persistent_environment_blocks: dict[str, str | None] = {}
+    for path in sorted(PLUGINS_DIR.rglob("*.ps1")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        direct_access = persistent_environment_violations(text)
+        uses_adapter = (
+            "Get-CopilotPersistentEnvironmentVariable" in text
+            or "Set-CopilotPersistentEnvironmentVariable" in text
+        )
+        if (
+            PERSISTENT_ENV_START not in text
+            and not uses_adapter
+            and not direct_access
+        ):
+            continue
+        relative = path.relative_to(REPO).as_posix()
+        block = _extract_marker(text, PERSISTENT_ENV_START, PERSISTENT_ENV_END)
+        persistent_environment_blocks[relative] = _norm(block)
+        if block is None:
+            violations.append(
+                f"{relative}: direct User/Machine environment access is not "
+                "test-virtualized"
+            )
+            continue
+        if not uses_adapter:
+            violations.append(
+                f"{relative}: test-persistent-environment adapter is present "
+                "but no persistent access routes through it"
+            )
+        for problem in direct_access:
+            violations.append(
+                f"{relative}: {problem} outside the shared "
+                "test-persistent-environment adapter"
+            )
+
+    # Repo-wide backstop: the loop above enforces the full installer contract
+    # (adapter present + wired) only for `plugins/**/*.ps1`. A test/helper
+    # script living anywhere else in the repo (e.g. under a plugin's `tests/`,
+    # a shared `libs/*/tests/`, or a future integration harness) never had to
+    # carry the adapter at all, so it was free to call the real
+    # `[Environment]::SetEnvironmentVariable(..., 'User'|'Machine')` (or the
+    # registry paths/APIs) directly and leak into the operator's real,
+    # persistent Windows User PATH -- exactly the leak this repo hit live. This
+    # pass only checks the same direct-access detector against every other
+    # tracked `.ps1` in the repo; it does not require the adapter marker or
+    # `PLUGINS_DIR`'s stricter identical-block rules, which are installer-only.
+    for path in sorted(REPO.rglob("*.ps1")):
+        if PLUGINS_DIR in path.parents or is_ignored_scan_path(path):
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for problem in persistent_environment_violations(text):
+            relative = path.relative_to(REPO).as_posix()
+            violations.append(
+                f"{relative}: {problem} (persistent User/Machine environment "
+                "write outside the shared test-persistent-environment adapter "
+                "-- route through Set-CopilotPersistentEnvironmentVariable, "
+                "or use an explicit 'Process' target in a test)"
+            )
 
     for plugin in plugins:
         name = plugin.name
@@ -253,7 +416,12 @@ def check() -> int:
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
 
-            if not is_payload and "uv pip install" not in text:
+            uses_engine = _uses_installer_engine(text, ext)
+            if (
+                not is_payload
+                and "uv pip install" not in text
+                and not (uses_engine and _uses_engine_uv_install(text, ext))
+            ):
                 violations.append(f"{name}/{script}: no 'uv pip install' (package must not be file-copied)")
             if not is_payload and VERSIONED_MARKER not in text:
                 violations.append(
@@ -275,9 +443,14 @@ def check() -> int:
                     )
             if FORBIDDEN_PYTHONPATH.search(text):
                 violations.append(f"{name}/{script}: binstub sets PYTHONPATH to a runtime lib/ dir")
-            if "schema_version" not in text or '"source"' not in text and "source " not in text:
+            if (
+                "schema_version" not in text
+                or ('"source"' not in text and "source " not in text)
+            ) and not (uses_engine and _uses_engine_manifest_writer(text, ext)):
                 violations.append(f"{name}/{script}: no schema_version 3 manifest with a source block")
-            elif not re.search(r"schema_version[\"'=:\s]+3", text):
+            elif not re.search(r"schema_version[\"'=:\s]+3", text) and not (
+                uses_engine and _uses_engine_manifest_writer(text, ext)
+            ):
                 violations.append(f"{name}/{script}: manifest is not schema_version 3")
 
             if ext == "ps1":
@@ -309,6 +482,11 @@ def check() -> int:
     for ext in ("ps1", "sh"):
         _check_identical(f"install-contract:v4 self-stage ({ext})", v4_selfstage[ext], violations)
         _check_identical(f"install-contract:v4 smoke seam ({ext})", v4_smoke[ext], violations)
+    _check_identical(
+        "test-persistent-environment (ps1)",
+        persistent_environment_blocks,
+        violations,
+    )
 
     # The versioned_runtime.py primitive is a self-contained per-plugin copy
     # vendored byte-identically from the canonical source
@@ -330,6 +508,14 @@ def check() -> int:
                 f"({VERSIONED_RUNTIME_CANONICAL.relative_to(REPO).as_posix()}) in: "
                 f"{', '.join(drifted)} -- run 'python tools/sync-versioned-runtime.py'"
             )
+
+    installer_engine_drift = _verify_installer_engine_sync()
+    if installer_engine_drift:
+        violations.append(
+            "vendored installer-engine files are out of sync -- run "
+            "'python tools/sync-installer-engine.py'"
+        )
+        violations.extend(f"installer-engine: {problem}" for problem in installer_engine_drift)
 
     if violations:
         print("Install-contract violations:", file=sys.stderr)

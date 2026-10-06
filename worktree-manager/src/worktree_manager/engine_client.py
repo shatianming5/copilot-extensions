@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from . import agent_plugin_runtime
 
 #: The engine binstub name (the self-provisioning agent-worktrees tool CLI).
 ENGINE_BIN = "agent-worktrees"
@@ -33,7 +34,7 @@ ENGINE_BIN = "agent-worktrees"
 #: instead of the real one -- the seam that makes the Manager (and its Picker)
 #: buildable, testable, and demo-able without a live agent-worktrees, faithfully
 #: through the same subprocess + JSON-parse path. The ``--demo`` Picker mode sets
-#: this to the bundled Aperture Labs fake engine.
+#: this to the bundled Example Labs fake engine.
 ENGINE_CMD_ENV = "WORKTREE_MANAGER_ENGINE_CMD"
 
 #: Exact provider argv handed to the Manager by agent-worktrees. JSON avoids
@@ -43,6 +44,32 @@ ENGINE_ARGV_ENV = "WORKTREE_MANAGER_ENGINE_ARGV"
 #: A generous ceiling: a cold engine self-provisions on first use, and a classify
 #: pass can enumerate many worktrees. Kept bounded so the Manager never hangs.
 _DEFAULT_TIMEOUT = 120
+_PYTHON_PARENT_ENV = {
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONEXECUTABLE",
+    "VIRTUAL_ENV",
+    "UV_INTERNAL__PYTHONHOME",
+    "__PYVENV_LAUNCHER__",
+}
+
+
+def _is_parent_python_variable(name: str, *, windows: bool) -> bool:
+    candidate = name.upper() if windows else name
+    return candidate in _PYTHON_PARENT_ENV
+
+
+def _engine_environment() -> dict[str, str]:
+    """Build a clean environment for the independently installed engine."""
+    windows = os.name == "nt"
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not _is_parent_python_variable(key, windows=windows)
+    }
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONSAFEPATH"] = "1"
+    return env
 
 
 class EngineError(RuntimeError):
@@ -125,111 +152,18 @@ def accept_inherited_engine_command() -> str | None:
     return None
 
 
-def _state_home() -> Path:
-    override = os.environ.get("AGENT_HOME")
-    if override:
-        return Path(override)
-    variable = "USERPROFILE" if os.name == "nt" else "HOME"
-    return Path(os.environ.get(variable) or Path.home())
-
-
-def _version_key(version: str):
-    supported = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-dev(\d+))?", version)
-    if supported:
-        major, minor, patch, dev = supported.groups()
-        return (
-            1,
-            int(major),
-            int(minor),
-            int(patch),
-            1 if dev is None else 0,
-            int(dev or 0),
-        )
-    tokens = re.split(r"(\d+)", version.casefold())
-    return (0, tuple((1, int(t)) if t.isdigit() else (0, t) for t in tokens))
-
-
-def _runtime_candidates(root: Path) -> list[Path]:
-    versions = root / "versions"
-    candidates: list[Path] = []
-
-    def contained_slot(version: str) -> Path | None:
-        if (
-            not version
-            or version in {".", ".."}
-            or Path(version).name != version
-        ):
-            return None
-        try:
-            versions_root = versions.resolve()
-            candidate = (versions / version).resolve()
-        except OSError:
-            return None
-        if candidate.parent != versions_root:
-            return None
-        return candidate
-
-    for marker_name in ("current-version", "last-known-good"):
-        try:
-            version = (root / marker_name).read_text(encoding="utf-8").strip()
-        except OSError:
-            version = ""
-        candidate = contained_slot(version)
-        if candidate is not None:
-            candidates.append(candidate)
-    try:
-        fallback = sorted(
-            (path for path in versions.iterdir() if path.is_dir()),
-            key=lambda path: _version_key(path.name),
-            reverse=True,
-        )
-    except OSError:
-        fallback = []
-    candidates.extend(
-        candidate
-        for path in fallback
-        if (candidate := contained_slot(path.name)) is not None
-    )
-    out: list[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = os.path.normcase(str(candidate.resolve()))
-        if key not in seen:
-            seen.add(key)
-            out.append(candidate)
-    return out
-
-
 def installed_engine_command() -> list[str] | None:
     """Resolve the exact marker-selected agent-worktrees runtime.
 
-    The deployment manifest attests the owning provider; its marker/fallback
-    files select the immutable runtime slot. A bare command name or PATH lookup
-    is never accepted.
+    Delegates to the generic, plugin-name-parameterized resolver in
+    ``agent_plugin_runtime`` (Phase 3b/4 follow-on) so every agent-* peer is
+    located the same way agent-worktrees is here: the attributable install
+    receipt (legacy ``deploy-manifest.json``, or a namespaced ``install.json``
+    when the shared installation-mode policy has marketplace cells enabled
+    and an explicit context names this exact plugin) selects the immutable
+    runtime slot. A bare command name or PATH lookup is never accepted.
     """
-    root = _state_home() / ".agent-worktrees"
-    try:
-        manifest = json.loads(
-            (root / "deploy-manifest.json").read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError, TypeError):
-        return None
-    if not isinstance(manifest, dict):
-        return None
-    source = manifest.get("source")
-    if (
-        manifest.get("service") != ENGINE_BIN
-        or not isinstance(source, dict)
-        or source.get("plugin") != ENGINE_BIN
-    ):
-        return None
-    for slot in _runtime_candidates(root):
-        if not (slot / ".install-complete.json").is_file():
-            continue
-        python = slot / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-        if python.is_file():
-            return [str(python), "-m", "agent_worktrees"]
-    return None
+    return agent_plugin_runtime.resolve_installed_plugin_command(ENGINE_BIN)
 
 
 #: In-process base-command override (wins over the env). Set by the Picker's
@@ -279,13 +213,14 @@ def _run(
     timeout: int = _DEFAULT_TIMEOUT,
     allow_nonzero: bool = False,
     runner=None,
+    cwd: str | None = None,
 ) -> str:
     """Run ``agent-worktrees [--project <p>] <args>`` and return stdout.
 
     Raises :class:`EngineError` when the binstub is missing (``install_hint``),
-    the process fails, or times out. A non-zero exit whose stdout is a JSON error
-    envelope surfaces the engine's own ``error`` message.
-    """
+    the process fails, or times out. A non-zero exit whose stdout is a JSON
+    error envelope surfaces the engine's own ``error`` message. ``cwd``, when
+    given, runs the engine from that directory (cwd-scoped verbs)."""
     base = engine_base_command()
     if base is None:
         raise EngineError(
@@ -299,16 +234,10 @@ def _run(
             proc = runner(cmd, timeout)
         else:
             kwargs = {
-                "capture_output": True,
-                "text": True,
-                "timeout": timeout,
-                "check": False,
-                "env": {
-                    **os.environ,
-                    "PYTHONUTF8": "1",
-                    "PYTHONSAFEPATH": "1",
-                },
+                "capture_output": True, "text": True, "timeout": timeout,
+                "check": False, "env": _engine_environment(),
                 "stdin": subprocess.DEVNULL,
+                **({"cwd": cwd} if cwd else {}),
             }
             if os.name == "nt":
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -388,11 +317,7 @@ def run_engine_passthrough(project: str | None, args: list[str], *,
     try:
         return subprocess.run(
             cmd, timeout=timeout, check=False,
-            env={
-                **os.environ,
-                "PYTHONUTF8": "1",
-                "PYTHONSAFEPATH": "1",
-            },
+            env=_engine_environment(),
         ).returncode
     except subprocess.TimeoutExpired as e:
         raise EngineError(f"{ENGINE_BIN} {' '.join(args)} timed out") from e
@@ -436,11 +361,7 @@ def run_project_passthrough(
             argv,
             timeout=timeout,
             check=False,
-            env={
-                **os.environ,
-                "PYTHONUTF8": "1",
-                "PYTHONSAFEPATH": "1",
-            },
+            env=_engine_environment(),
         ).returncode
     except subprocess.TimeoutExpired as e:
         raise EngineError(f"{project} {' '.join(args)} timed out") from e
@@ -451,6 +372,51 @@ def run_project_passthrough(
 def get_value(project: str, key: str, *, timeout: int = _DEFAULT_TIMEOUT) -> str:
     """Read a pinned scalar value from ``agent-worktrees get <key>``."""
     return _run(project, ["get", key], timeout=timeout).strip()
+
+
+def repository_account(project: str, *, timeout: int = _DEFAULT_TIMEOUT) -> str:
+    """Resolve the project's repository-scoped account through the engine."""
+    value = run_json(
+        project,
+        ["repos", "account-for", "--json"],
+        timeout=timeout,
+    )
+    account = value.get("account")
+    return str(account) if account else ""
+
+
+def repository_token(
+    project: str,
+    account: str,
+    *,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> str:
+    """Mint the exact account's token through the engine's scoped ``gh`` seam."""
+    if not account:
+        raise EngineError("repository token resolution requires an account")
+    return _run(
+        project,
+        ["repos", "gh", "--", "auth", "token", "--user", account],
+        timeout=timeout,
+    ).strip()
+
+
+# Execution-leg CLI calls (get/set/clear/reserve/renew/release) moved to
+# engine_execution_leg.py purely to control this module's size (module-size
+# gate). Re-exported via a lazy module __getattr__ (PEP 562) at the bottom of
+# this file -- NOT a top-level import -- so `engine_execution_leg.py`'s own
+# `from .engine_client import run_json, ...` can fully resolve this module
+# first without a circular-import deadlock (reproducible if anything ever
+# imports `engine_execution_leg` directly, before `engine_client`). See
+# `__getattr__` below.
+_EXECUTION_LEG_NAMES = frozenset({
+    "execution_leg_clear",
+    "execution_leg_get",
+    "execution_leg_release",
+    "execution_leg_renew",
+    "execution_leg_reserve",
+    "execution_leg_set",
+})
 
 
 @dataclass(frozen=True)
@@ -595,6 +561,7 @@ def resolve_launch_plan(
     target_machine: str | None = None,
     target_environment: str | None = None,
     target_no_mux: bool = False,
+    seed: str | None = None,
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> LaunchPlan:
     """Fetch a launch plan via ``agent-worktrees resolve --json`` (process boundary).
@@ -602,7 +569,11 @@ def resolve_launch_plan(
     Exactly one of ``worktree_id`` (resume the worktree), ``new`` (create +
     launch a fresh worktree), or ``base`` (launch the anchor checkout) must be
     given. ``target_machine`` asks the engine to return an environment-specific
-    remote SSH handoff plan for that same selection.
+    remote SSH handoff plan for that same selection. ``seed`` is an optional
+    prompt queued as the fresh session's first interactive turn (picker-new-
+    session-prompt-and-composer Phase A); only meaningful with ``new=True`` --
+    the engine's own CLI already rejects it otherwise (and alongside
+    ``target_machine``), so this is intentionally NOT re-validated here.
 
     Version-skew tolerant: an older engine that does not know ``--bare-resume`` is
     retried as a plain resume (degrade the feature, don't fail) -- the same contract
@@ -629,6 +600,8 @@ def resolve_launch_plan(
             args += ["--environment", target_environment]
         if target_no_mux:
             args.append("--target-no-mux")
+    if seed:
+        args += ["--seed", seed]
 
     try:
         obj = run_json(project, args, timeout=timeout)
@@ -639,7 +612,7 @@ def resolve_launch_plan(
                 project, worktree_id=worktree_id, new=new,
                 base=base, target_machine=target_machine,
                 target_environment=target_environment,
-                target_no_mux=target_no_mux,
+                target_no_mux=target_no_mux, seed=seed,
                 bare_resume=False, timeout=timeout)
         if target_machine and any(
             flag in detail
@@ -763,6 +736,72 @@ def list_worktrees(project: str, *, classify: bool = True) -> list[Worktree]:
     ]
 
 
+def current_worktree_status(
+    *,
+    path: str | None = None,
+    fetch: bool = False,
+    project: str | None = None,
+    runner=None,
+) -> dict | None:
+    """Cheap, single-worktree status snapshot via ``status-segment --json``.
+
+    Prefer this over ``list_worktree_rows(..., worktree_id=...)`` for a
+    single current-worktree lookup (the Mux Companion's use case): that verb
+    still negotiates with the resident classify daemon using project-wide
+    filters even when scoped to one id, paying a whole-fleet round trip
+    regardless. This reuses the status bar's own non-daemon classify pass.
+
+    Resolves from ``path`` (default: cwd). Returns the envelope payload
+    (``id``/``path``/``repo``/``branch``/``state``/``ahead``/``behind``/
+    ``dirty``/``turn_count``/``status``/``closure``), with an ``"error"`` key
+    when unresolved -- never raises for that case. Raises
+    :class:`EngineError` only when the engine itself is unreachable.
+    """
+    args = ["status-segment", "--json"]
+    if path:
+        args += ["--path", path]
+    if fetch:
+        args.append("--fetch")
+    return run_json(project, args, runner=runner)
+
+
+def find_worktree_for_path(
+    path: str,
+    *,
+    project: str | None = None,
+    runner=None,
+) -> dict | None:
+    """Return the raw ``list --json`` row whose worktree contains ``path``.
+
+    Cache-only (no ``--classify``) so this is cheap enough to call before the
+    caller even knows a worktree id -- exactly the resolution a hotkey-summoned,
+    "what worktree am I in" surface (the Mux Companion) needs on every launch.
+    Matches ``path`` itself or, walking upward, its nearest containing
+    worktree root, so a caller whose cwd is a subdirectory of the worktree
+    still resolves (mirrors ``agent-worktrees``' own path-to-record matching).
+    Returns ``None`` when no tracked worktree contains ``path``.
+    """
+    rows = list_worktree_rows(project, classify=False, cache_only=True, runner=runner)
+    by_path: dict[str, dict] = {}
+    for row in rows:
+        row_path = row.get("path")
+        if not isinstance(row_path, str) or not row_path:
+            continue
+        try:
+            by_path[str(Path(row_path).resolve())] = row
+        except OSError:
+            continue
+    try:
+        current = Path(path).resolve()
+    except OSError:
+        return None
+    for candidate in (current, *current.parents):
+        row = by_path.get(str(candidate))
+        if row is not None:
+            return row
+    return None
+
+
 def list_worktree_sessions(
     project: str,
     worktree_id: str,
@@ -801,3 +840,46 @@ def recent_worktree_messages(
         ],
         runner=runner,
     )
+
+
+def orphaned_obligations(project: str, *, runner=None) -> list[dict]:
+    """Return this machine's durable claims-orphanage for ``project``.
+
+    Mirrors ``agent-worktrees claims orphans --json``: obligations re-homed by
+    an ``--abandon`` finalize, awaiting ``claims cleanup`` -- a re-homed claim
+    with no worktree row of its own to attach to (worktree-claims-transitive-
+    finalization Phase 4 item 2). The orphanage registry is per-machine local
+    state (never git-synced), so this never reaches beyond the engine this
+    call targets -- there is no cross-machine aggregation to perform here.
+
+    Degrades to an empty list rather than raising on an older engine that
+    predates the ``claims orphans`` verb: this is a visibility nicety for the
+    Picker, never a required capability.
+    """
+    try:
+        obj = run_json(project, ["claims", "orphans", "--json"], runner=runner)
+    except EngineError:
+        return []
+    rows = obj.get("orphaned")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def __getattr__(name: str):
+    """Lazily resolve the re-exported `execution_leg_*` names (PEP 562).
+
+    Deferring the import to first access (rather than a top-level import)
+    is what breaks the circular-import deadlock: `engine_execution_leg.py`
+    itself does `from .engine_client import run_json, ...`, which needs this
+    module fully initialized first. A module-level import here would try to
+    import `engine_execution_leg` while THIS module is still mid-init
+    whenever something imports `engine_execution_leg` directly before
+    `engine_client` -- this function is never even called until something
+    does `engine_client.execution_leg_get(...)` etc., well after both
+    modules have finished initializing.
+    """
+    if name in _EXECUTION_LEG_NAMES:
+        from . import engine_execution_leg
+        return getattr(engine_execution_leg, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

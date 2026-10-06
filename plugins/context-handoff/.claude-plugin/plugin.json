@@ -1,13 +1,10 @@
 {
   "name": "context-handoff",
-  "description": "Context window monitoring and session handoff for Copilot CLI -- a session-start continuity kernel plus an extension that tracks token utilization via session.usage_info, nudges before auto-compaction, stores handoffs as worktree-pinned agent-dispatch tasks when available or one-time machine-local files otherwise, and performs Herdr- or mux-hosted live cutover",
+  "description": "Context window monitoring and native goal continuity for Copilot CLI -- durable task/file handoffs, exact remaining soft caps, profile-preserving successor admission, and identity-checked live cutover through Herdr or agent-worktrees",
   "hooks": "./hooks/claude-hooks.json",
   "mcpServers": {
     "context-handoff": {
-      "command": "python3",
-      "args": [
-        "${CLAUDE_PLUGIN_ROOT}/scripts/handoff-mcp.py"
-      ],
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/handoff-mcp.sh",
       "alwaysLoad": true
     }
   }

@@ -6,7 +6,11 @@ import json
 from pathlib import Path
 
 import pytest
-from worktree_manager.production_picker.picker_tui import pivots
+from worktree_manager.production_picker.picker_tui import (
+    pivot_manifest,
+    pivot_registry_scan,
+    pivots,
+)
 
 #: Repo root (…/copilot-extensions), derived from this test's location:
 #: worktree-manager/tests/production_picker/test_pivots.py -> parents[3].
@@ -31,7 +35,7 @@ def test_preview_mode_suppresses_ambient_pivot_materialization(tmp_path, monkeyp
     calls = []
     monkeypatch.setenv("WORKTREE_MANAGER_PICKER_NO_PIVOT_MATERIALIZE", "1")
     monkeypatch.setattr(
-        pivots,
+        pivot_registry_scan,
         "_materialize_active_pivots",
         lambda *args, **kwargs: calls.append((args, kwargs)),
     )
@@ -55,6 +59,7 @@ def test_parse_minimal_manifest_applies_defaults(tmp_path):
     assert p.badge_fields == ()
     assert p.actions == ()
     assert p.kind == "registered"
+    assert p.create_action is None
 
 
 def test_parse_full_manifest(tmp_path):
@@ -91,6 +96,101 @@ def test_parse_full_manifest(tmp_path):
     assert p.actions[1].confirm is True
     # External actions carry no internal verb.
     assert p.actions[0].internal is None
+
+
+def test_state_root_file_visibility_is_lazy_and_configuration_gated(
+    tmp_path,
+    monkeypatch,
+):
+    manifests = tmp_path / "pivots"
+    manifests.mkdir()
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    _write(manifests, "always", {"label": "Always", "list": ["always"]})
+    _write(
+        manifests,
+        "configured",
+        {
+            "label": "Configured",
+            "list": ["configured"],
+            "visible_when": {"state_root_file": "workflows/sources.json"},
+        },
+    )
+    calls = []
+    monkeypatch.setattr(
+        pivot_manifest,
+        "_resolve_state_root_path",
+        lambda: calls.append(True) or state_root,
+    )
+
+    assert [pivot.label for pivot in pivots.discover_pivots(manifests)] == ["Always"]
+    assert len(calls) == 1
+
+    sources = state_root / "workflows" / "sources.json"
+    sources.parent.mkdir()
+    sources.write_text("{}", encoding="utf-8")
+    assert [pivot.label for pivot in pivots.discover_pivots(manifests)] == [
+        "Always",
+        "Configured",
+    ]
+    assert len(calls) == 2
+
+
+def test_ungated_pivots_do_not_resolve_state_root(tmp_path, monkeypatch):
+    _write(tmp_path, "always", {"label": "Always", "list": ["always"]})
+    monkeypatch.setattr(
+        pivot_manifest,
+        "_resolve_state_root_path",
+        lambda: pytest.fail("ungated discovery must not resolve the state root"),
+    )
+
+    assert [pivot.label for pivot in pivots.discover_pivots(tmp_path)] == ["Always"]
+
+
+def test_unbound_state_root_is_resolved_once_for_all_gated_pivots(
+    tmp_path,
+    monkeypatch,
+):
+    for name in ("first", "second"):
+        _write(
+            tmp_path,
+            name,
+            {
+                "label": name.title(),
+                "list": [name],
+                "visible_when": {"state_root_file": f"{name}.json"},
+            },
+        )
+    calls = []
+    monkeypatch.setattr(
+        pivot_manifest,
+        "_resolve_state_root_path",
+        lambda: calls.append(True) or None,
+    )
+
+    assert pivots.discover_pivots(tmp_path) == []
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "state_root_file",
+    ["/absolute.json", "../escape.json", "C:/escape.json", ""],
+)
+def test_state_root_file_visibility_rejects_unsafe_paths(
+    tmp_path,
+    state_root_file,
+):
+    _write(
+        tmp_path,
+        "unsafe",
+        {
+            "label": "Unsafe",
+            "list": ["unsafe"],
+            "visible_when": {"state_root_file": state_root_file},
+        },
+    )
+
+    assert pivots.discover_pivots(tmp_path) == []
 
 
 def test_parse_internal_action(tmp_path):
@@ -130,6 +230,38 @@ def test_internal_action_without_verb_is_skipped(tmp_path):
         },
     )
     assert [p.name for p in pivots.discover_pivots(tmp_path)] == ["ok"]
+
+
+def test_driving_worktree_actions_gate_on_explicit_flag(tmp_path):
+    _write(
+        tmp_path,
+        "venues",
+        {
+            "label": "Venues",
+            "list": ["agent-example", "list", "--json"],
+            "entry": {"id": "id", "title": "title", "worktree": "worktree"},
+            "actions": [
+                {
+                    "key": "jump-driving-worktree",
+                    "label": "View driving worktree",
+                    "kind": "internal",
+                    "verb": "jump-host",
+                    "when": {"has_driving_worktree": "true"},
+                },
+                {
+                    "key": "worktree-status",
+                    "label": "Worktree status",
+                    "kind": "card",
+                    "when": {"has_driving_worktree": "true"},
+                },
+            ],
+        },
+    )
+    [p] = pivots.discover_pivots(tmp_path)
+    visible = [a.label for a in p.actions if pivots.entry_matches(a.when, {"has_driving_worktree": "true"})]
+    hidden = [a.label for a in p.actions if pivots.entry_matches(a.when, {"has_driving_worktree": "false"})]
+    assert visible == ["View driving worktree", "Worktree status"]
+    assert hidden == []
 
 
 def test_malformed_manifest_is_skipped_not_fatal(tmp_path):
@@ -233,11 +365,17 @@ def test_ensure_pivots_restores_missing_manifest(tmp_path):
 
 
 def test_ensure_pivots_does_not_clobber_existing(tmp_path):
+    """A locally-present manifest at the plugin's canonical pointer name (one
+    an operator wrote, or a newer contributor install left behind) owns that
+    slot outright: the materializer never publishes the plugin's own pointer
+    anywhere else, so the plugin's contribution is not restored while that
+    name is taken -- exactly like an operator override winning a naming
+    collision in the identity-verified scan path."""
     src_root = tmp_path / "installed-plugins"
     dest = tmp_path / "pivots"
     dest.mkdir()
-    # A locally-present manifest (e.g. one a newer contributor install wrote).
-    (dest / "agent-dispatch.json").write_text(
+    local = dest / "agent-dispatch.json"
+    local.write_text(
         json.dumps({"label": "Local", "list": ["x"]}), encoding="utf-8"
     )
     _plugin_manifest(
@@ -247,15 +385,9 @@ def test_ensure_pivots_does_not_clobber_existing(tmp_path):
 
     restored = pivots.ensure_pivots(base=dest, plugins_root=src_root)
 
-    assert len(restored) == 1
-    assert restored[0].startswith("agent-dispatch.")
-    assert json.loads(
-        (dest / "agent-dispatch.json").read_text(encoding="utf-8")
-    )["label"] == "Local"  # untouched
-    assert {p.label for p in pivots.discover_pivots(dest)} == {
-        "Local",
-        "Source",
-    }
+    assert restored == []
+    assert json.loads(local.read_text(encoding="utf-8"))["label"] == "Local"
+    assert {p.label for p in pivots.discover_pivots(dest)} == {"Local"}
 
 
 def test_ensure_pivots_missing_source_root_is_noop(tmp_path):
@@ -298,6 +430,26 @@ def test_ensure_pivots_restores_multiple_plugins(tmp_path):
 def test_installed_plugins_dir_env_override(tmp_path, monkeypatch):
     monkeypatch.setenv(pivots.PLUGINS_ROOT_ENV, str(tmp_path / "custom"))
     assert pivots.installed_plugins_dir() == tmp_path / "custom"
+
+
+def test_runtime_dirs_use_picker_paths_contract(monkeypatch):
+    monkeypatch.delenv(pivots.PIVOTS_DIR_ENV, raising=False)
+    monkeypatch.delenv(pivots.PLUGINS_ROOT_ENV, raising=False)
+    monkeypatch.setattr(pivot_manifest.picker_context, "project", lambda: "dotfiles")
+    monkeypatch.setattr(
+        pivot_manifest.engine_group_a,
+        "picker_paths",
+        lambda project: {
+            "version": 1,
+            "install_dir": "C:/Users/test/.agent-worktrees",
+            "installed_plugins_dir": "C:/Users/test/.copilot/installed-plugins",
+        },
+    )
+
+    assert pivots.pivots_dir() == Path("C:/Users/test/.agent-worktrees/pivots")
+    assert pivots.installed_plugins_dir() == Path(
+        "C:/Users/test/.copilot/installed-plugins"
+    )
 
 
 # ---- config_sections (B slice 2) ----------------------------------------
@@ -657,6 +809,293 @@ def test_form_action_requires_run(tmp_path):
         pivots.parse_manifest(
             {"label": "M", "list": ["x"], "actions": [
                 {"label": "Steer", "kind": "form", "fields_from": "card.request_input"}]},
+            name="m", source_path="x")
+
+
+@pytest.mark.guard
+def test_create_action_parses(tmp_path):
+    _write(tmp_path, "m", {"label": "M", "list": ["agent-x", "y"], "create_action": {
+        "label": "New task\u2026", "key": "new-task",
+        "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "prompt", "type": "textarea"},
+            {"name": "priority", "type": "choice", "options": ["low", "high"]},
+        ],
+        "run": ["agent-dispatch", "create", "{field.title}",
+                "--prompt", "{field.prompt}"],
+    }})
+    [p] = pivots.discover_pivots(tmp_path)
+    ca = p.create_action
+    assert ca is not None
+    assert ca.label == "New task\u2026"
+    assert ca.key == "new-task"
+    assert ca.confirm is False
+    assert [f["name"] for f in ca.fields] == ["title", "prompt", "priority"]
+    assert ca.fields[2]["options"] == ("low", "high")
+    assert ca.run[:2] == ("agent-dispatch", "create")
+
+
+@pytest.mark.guard
+def test_create_action_absent_defaults_to_none(tmp_path):
+    _write(tmp_path, "m", {"label": "M", "list": ["agent-x", "y"]})
+    [p] = pivots.discover_pivots(tmp_path)
+    assert p.create_action is None
+
+
+@pytest.mark.guard
+def test_create_action_requires_label(tmp_path):
+    with pytest.raises(pivots.ManifestError):
+        pivots.parse_manifest(
+            {"label": "M", "list": ["x"],
+             "create_action": {"run": ["x"]}},
+            name="m", source_path="x")
+
+
+@pytest.mark.guard
+def test_create_action_requires_run(tmp_path):
+    with pytest.raises(pivots.ManifestError):
+        pivots.parse_manifest(
+            {"label": "M", "list": ["x"],
+             "create_action": {"label": "New"}},
+            name="m", source_path="x")
+
+
+@pytest.mark.guard
+def test_create_action_choice_field_requires_options(tmp_path):
+    with pytest.raises(pivots.ManifestError):
+        pivots.parse_manifest(
+            {"label": "M", "list": ["x"], "create_action": {
+                "label": "New", "run": ["x"],
+                "fields": [{"name": "priority", "type": "choice"}],
+            }},
+            name="m", source_path="x")
+
+
+@pytest.mark.guard
+def test_create_action_rejects_blank_choice_options(tmp_path):
+    for bad_options in (["", "high"], ["  ", "high"], [""], [None, "high"],
+                        [1, "high"]):
+        with pytest.raises(pivots.ManifestError):
+            pivots.parse_manifest(
+                {"label": "M", "list": ["x"], "create_action": {
+                    "label": "New", "run": ["x"],
+                    "fields": [{"name": "priority", "type": "choice",
+                                "options": bad_options}],
+                }},
+                name="m", source_path="x")
+    # A fully valid options array still parses fine.
+    [p] = [pivots.parse_manifest(
+        {"label": "M", "list": ["x"], "create_action": {
+            "label": "New", "run": ["x"],
+            "fields": [{"name": "priority", "type": "multichoice",
+                        "options": ["low", "high"]}],
+        }},
+        name="m", source_path="x")]
+    assert p.create_action.fields[0]["options"] == ("low", "high")
+
+
+@pytest.mark.guard
+def test_create_action_options_command_allows_omitted_static_options(tmp_path):
+    [p] = [pivots.parse_manifest(
+        {"label": "M", "list": ["x"], "create_action": {
+            "label": "New", "run": ["x"],
+            "fields": [{"name": "criteria", "type": "multichoice",
+                        "options_command": ["agent-dispatch", "registrar", "vocabulary"]}],
+        }},
+        name="m", source_path="x")]
+    field = p.create_action.fields[0]
+    assert field["options_command"] == ("agent-dispatch", "registrar", "vocabulary")
+    assert "options" not in field
+    # allow_other is auto-forced true -- a live-sourced field must always
+    # degrade to free text if its command fails or returns nothing.
+    assert field["allow_other"] is True
+
+
+@pytest.mark.guard
+def test_create_action_options_command_keeps_static_options_as_fallback(tmp_path):
+    [p] = [pivots.parse_manifest(
+        {"label": "M", "list": ["x"], "create_action": {
+            "label": "New", "run": ["x"],
+            "fields": [{"name": "criteria", "type": "choice",
+                        "options": ["low", "high"],
+                        "options_command": ["agent-dispatch", "registrar", "vocabulary"]}],
+        }},
+        name="m", source_path="x")]
+    field = p.create_action.fields[0]
+    assert field["options"] == ("low", "high")
+    assert field["options_command"] == ("agent-dispatch", "registrar", "vocabulary")
+
+
+@pytest.mark.guard
+def test_create_action_options_command_rejects_blank_argv(tmp_path):
+    for bad in ([], [""], "agent-dispatch", [1, "y"]):
+        with pytest.raises(pivots.ManifestError):
+            pivots.parse_manifest(
+                {"label": "M", "list": ["x"], "create_action": {
+                    "label": "New", "run": ["x"],
+                    "fields": [{"name": "criteria", "type": "multichoice",
+                                "options_command": bad}],
+                }},
+                name="m", source_path="x")
+
+
+@pytest.mark.guard
+def test_create_action_field_requires_name(tmp_path):
+    with pytest.raises(pivots.ManifestError):
+        pivots.parse_manifest(
+            {"label": "M", "list": ["x"], "create_action": {
+                "label": "New", "run": ["x"], "fields": [{"type": "text"}],
+            }},
+            name="m", source_path="x")
+
+
+@pytest.mark.guard
+def test_create_action_bad_manifest_is_skipped_not_fatal(tmp_path):
+    _write(tmp_path, "ok", {"label": "Ok", "list": ["agent-x", "y"]})
+    _write(tmp_path, "bad", {"label": "Bad", "list": ["agent-x", "y"],
+           "create_action": {"label": "New"}})
+    assert {p.name for p in pivots.discover_pivots(tmp_path)} == {"ok"}
+
+
+@pytest.mark.guard
+def test_create_action_default_key_is_create(tmp_path):
+    [p] = [pivots.parse_manifest(
+        {"label": "M", "list": ["x"],
+         "create_action": {"label": "New", "run": ["x"]}},
+        name="m", source_path="x")]
+    assert p.create_action.key == "create"
+    assert p.create_action.fields == ()
+
+
+@pytest.mark.guard
+def test_create_action_rejects_duplicate_field_names_after_normalization(tmp_path):
+    with pytest.raises(pivots.ManifestError):
+        pivots.parse_manifest(
+            {"label": "M", "list": ["x"], "create_action": {
+                "label": "New", "run": ["x"],
+                "fields": [{"name": "title"}, {"name": " title "}],
+            }},
+            name="m", source_path="x")
+
+
+@pytest.mark.guard
+def test_create_action_non_string_type_is_manifest_error_not_fatal(tmp_path):
+    # A `type` that isn't even hashable-comparable (list/dict) must not crash
+    # discovery with an unhandled TypeError -- it must sink to ManifestError
+    # (and discover_pivots must skip only the bad manifest, per below).
+    with pytest.raises(pivots.ManifestError):
+        pivots.parse_manifest(
+            {"label": "M", "list": ["x"], "create_action": {
+                "label": "New", "run": ["x"],
+                "fields": [{"name": "f", "type": []}],
+            }},
+            name="m", source_path="x")
+    with pytest.raises(pivots.ManifestError):
+        pivots.parse_manifest(
+            {"label": "M", "list": ["x"], "create_action": {
+                "label": "New", "run": ["x"],
+                "fields": [{"name": "f", "type": {}}],
+            }},
+            name="m", source_path="x")
+    _write(tmp_path, "ok", {"label": "Ok", "list": ["agent-x", "y"]})
+    _write(tmp_path, "bad", {"label": "Bad", "list": ["agent-x", "y"],
+           "create_action": {"label": "New", "run": ["x"],
+                              "fields": [{"name": "f", "type": []}]}})
+    assert {p.name for p in pivots.discover_pivots(tmp_path)} == {"ok"}
+
+
+@pytest.mark.guard
+def test_create_action_rejects_non_boolean_allow_other(tmp_path):
+    with pytest.raises(pivots.ManifestError):
+        pivots.parse_manifest(
+            {"label": "M", "list": ["x"], "create_action": {
+                "label": "New", "run": ["x"],
+                "fields": [{"name": "p", "type": "choice", "options": ["a"],
+                            "allow_other": "false"}],
+            }},
+            name="m", source_path="x")
+    # allow_other is validated for EVERY field type, not just choice/
+    # multichoice -- a text/textarea field carrying a malformed value must
+    # not silently pass discovery just because the property is unused there.
+    for ftype in ("text", "textarea"):
+        with pytest.raises(pivots.ManifestError):
+            pivots.parse_manifest(
+                {"label": "M", "list": ["x"], "create_action": {
+                    "label": "New", "run": ["x"],
+                    "fields": [{"name": "p", "type": ftype,
+                                "allow_other": "false"}],
+                }},
+                name="m", source_path="x")
+
+
+@pytest.mark.guard
+def test_create_action_show_when_requires_a_matching_unconditional_choice(tmp_path):
+    # Valid: a forward OR backward reference to a plain `choice` field whose
+    # `options` include the predicate's `equals` value.
+    [p] = [pivots.parse_manifest(
+        {"label": "M", "list": ["x"], "create_action": {
+            "label": "New", "run": ["x"], "fields": [
+                {"name": "priority", "type": "choice",
+                 "options": ["low", "high"]},
+                {"name": "escalation", "type": "text",
+                 "show_when": {"field": "priority", "equals": "high"}},
+            ],
+        }},
+        name="m", source_path="x")]
+    assert p.create_action.fields[1]["show_when"] == {
+        "field": "priority", "equals": "high"}
+
+    # Invalid: the controller is a text field (the runtime evaluator
+    # (`steering_form._condition_value`) can only resolve a `choice`
+    # controller's current answer).
+    with pytest.raises(pivots.ManifestError):
+        pivots.parse_manifest(
+            {"label": "M", "list": ["x"], "create_action": {
+                "label": "New", "run": ["x"], "fields": [
+                    {"name": "note", "type": "text"},
+                    {"name": "dep", "type": "text",
+                     "show_when": {"field": "note", "equals": "x"}},
+                ],
+            }},
+            name="m", source_path="x")
+
+    # Invalid: `equals` isn't one of the controller's declared options.
+    with pytest.raises(pivots.ManifestError):
+        pivots.parse_manifest(
+            {"label": "M", "list": ["x"], "create_action": {
+                "label": "New", "run": ["x"], "fields": [
+                    {"name": "priority", "type": "choice",
+                     "options": ["low", "high"]},
+                    {"name": "dep", "type": "text",
+                     "show_when": {"field": "priority", "equals": "urgent"}},
+                ],
+            }},
+            name="m", source_path="x")
+
+    # Invalid: the controller itself is conditional (chained predicates the
+    # evaluator doesn't support).
+    with pytest.raises(pivots.ManifestError):
+        pivots.parse_manifest(
+            {"label": "M", "list": ["x"], "create_action": {
+                "label": "New", "run": ["x"], "fields": [
+                    {"name": "a", "type": "choice", "options": ["x", "y"]},
+                    {"name": "b", "type": "choice", "options": ["low", "high"],
+                     "show_when": {"field": "a", "equals": "x"}},
+                    {"name": "dep", "type": "text",
+                     "show_when": {"field": "b", "equals": "high"}},
+                ],
+            }},
+            name="m", source_path="x")
+
+    # Invalid: no field by that name at all.
+    with pytest.raises(pivots.ManifestError):
+        pivots.parse_manifest(
+            {"label": "M", "list": ["x"], "create_action": {
+                "label": "New", "run": ["x"], "fields": [
+                    {"name": "dep", "type": "text",
+                     "show_when": {"field": "nope", "equals": "x"}},
+                ],
+            }},
             name="m", source_path="x")
 
 

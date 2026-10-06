@@ -39,6 +39,8 @@ EVAL_PLUGIN_ROOT="$HOME/effort-handoff-plugins"
 mkdir -p "$EVAL_PLUGIN_ROOT"
 cat > "$HOME/.copilot/settings.json" <<JSON
 {
+  "sandbox": { "enabled": false },
+  "experimental": true,
   "extraKnownMarketplaces": {
     "$MARKETPLACE_NAME": $MARKETPLACE_SOURCE
   },

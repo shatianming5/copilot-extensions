@@ -1,186 +1,128 @@
-"""Lightweight built-in status UX -- ``GET /ui``.
+"""Built-in web control surface -- ``GET /ui``.
 
-A single, dependency-free HTML page for inspecting bridge status (agents and
-live sessions) and copying the ACP-over-WebSocket URLs to plug into an external
-ACP client such as acp-ui. The page is auth-exempt static HTML; it reads the
-bridge token from a local input (persisted to ``localStorage``) and calls the
-existing token-protected ``/api/v1`` endpoints, so no new data surface is
-exposed without auth.
+A dependency-free page for watching and steering the sessions registered with
+this bridge: a task board that joins each orchestrator with the venue workers
+it supervises (``venue.supervisor_ref``), a session viewer that folds tool
+calls into collapsed work blocks, a sessions table, and the ACP agent/session
+URLs for an external ACP client such as acp-ui.
+
+The page, script, and stylesheet ship as package data (``ui_static/``) and are
+served auth-exempt from a fixed allowlist -- never a path taken from the
+request. They hold no data: the page signs in with a one-time login code
+(``agent-bridge ui``), keeps the bearer token in ``localStorage``, and calls
+the existing token-protected ``/api/v1`` routes. Event content is rendered as
+text only, under a Content-Security-Policy that allows same-origin script and
+style files and no inline code.
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter
-from fastapi.responses import HTMLResponse
+import hashlib
+import secrets
+import time
+from functools import cache
+from importlib import resources
+from typing import Any
+
+from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+
+from . import ui_history, ui_tasks
 
 router = APIRouter()
+# The UI's task verbs (workspaces / start / resume) ride on this router so the
+# app wires the whole control surface with one include.
+router.include_router(ui_tasks.router)
+router.include_router(ui_history.router)
 
-_PAGE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Agent Bridge - Status</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 1.25rem;
-         max-width: 1100px; margin-inline: auto; }
-  h1 { font-size: 1.3rem; margin: 0 0 .25rem; }
-  h2 { font-size: 1rem; margin: 1.5rem 0 .5rem; }
-  .sub { opacity: .7; margin: 0 0 1rem; }
-  .bar { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap;
-         margin-bottom: 1rem; }
-  input[type=password], input[type=text] { padding: .4rem .5rem; border-radius: 6px;
-         border: 1px solid #8884; min-width: 22rem; font: inherit; }
-  button { padding: .4rem .8rem; border-radius: 6px; border: 1px solid #8884;
-           background: #8882; font: inherit; cursor: pointer; }
-  button:hover { background: #8883; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #8883;
-           vertical-align: top; }
-  th { font-weight: 600; opacity: .8; }
-  code { font-family: ui-monospace, monospace; background: #8882; padding: .1rem .3rem;
-         border-radius: 4px; word-break: break-all; }
-  .pill { display: inline-block; padding: .05rem .5rem; border-radius: 999px;
-          font-size: .8rem; border: 1px solid #8884; }
-  .s-running, .s-idle { background: #2a82; }
-  .s-starting { background: #fa02; }
-  .s-failed, .s-stopped, .s-disconnected { background: #f442; }
-  .muted { opacity: .6; }
-  .err { color: #e44; }
-  .copy { font-size: .75rem; padding: .1rem .4rem; }
-  .ws { white-space: nowrap; }
-</style>
-</head>
-<body>
-  <h1>Agent Bridge</h1>
-  <p class="sub">Built-in status UX. Connect an external ACP client (e.g.
-     <a href="https://acp-ui.github.io/" target="_blank" rel="noopener">acp-ui</a>)
-     to any <code>ws://</code> URL below using transport
-     <b>websocket</b> and <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+#: Same-origin script/style files only (no inline code); data calls only to
+#: this origin; no framing, forms, or base-URL changes.
+_CSP = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; "
+    "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; "
+    "frame-ancestors 'none'"
+)
 
-  <div class="bar">
-    <input id="token" type="password" placeholder="Bridge token (run: agent-bridge token)" />
-    <button id="save">Save token</button>
-    <button id="refresh">Refresh</button>
-    <span id="status" class="muted"></span>
-  </div>
-  <p class="sub">Token: run <code>agent-bridge token</code> (or read
-     <code>~/.agent-bridge/auth.yaml</code>).</p>
-
-  <h2>Agents</h2>
-  <table id="agents"><thead>
-    <tr><th>Name</th><th>Description</th><th>Target</th><th>ACP WebSocket URL</th></tr>
-  </thead><tbody></tbody></table>
-
-  <h2>Sessions</h2>
-  <table id="sessions"><thead>
-    <tr><th>Session</th><th>Agent</th><th>Caller</th><th>Status</th><th>Turns</th>
-        <th>Context</th><th>Adopt URL</th></tr>
-  </thead><tbody></tbody></table>
-
-<script>
-const $ = (s) => document.querySelector(s);
-const TOKEN_KEY = "agentBridgeToken";
-let token = localStorage.getItem(TOKEN_KEY) || "";
-$("#token").value = token;
-
-const wsBase = (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
-
-function setStatus(msg, isErr) {
-  const el = $("#status");
-  el.textContent = msg;
-  el.className = isErr ? "err" : "muted";
+#: The only files ``/ui/assets/{name}`` serves, with their content types.
+ASSETS: dict[str, str] = {
+    "app.js": "text/javascript; charset=utf-8",
+    "viewer.js": "text/javascript; charset=utf-8",
+    "model.js": "text/javascript; charset=utf-8",
+    "dom.js": "text/javascript; charset=utf-8",
+    "app.css": "text/css; charset=utf-8",
 }
 
-function esc(s) {
-  return String(s == null ? "" : s).replace(/[&<>"]/g,
-    (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+_SECURITY_HEADERS = {
+    "Content-Security-Policy": _CSP,
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
 }
 
-function copyBtn(text) {
-  return `<button class="copy" data-copy="${esc(text)}">copy</button>`;
-}
 
-async function api(path) {
-  const r = await fetch(path, { headers: { Authorization: "Bearer " + token } });
-  if (!r.ok) throw new Error(path + " -> " + r.status);
-  return r.json();
-}
+@cache
+def _asset(name: str) -> tuple[bytes, str]:
+    """Return (bytes, etag) for a packaged ``ui_static`` file."""
+    data = resources.files("agent_bridge").joinpath("ui_static", name).read_bytes()
+    return data, '"' + hashlib.sha256(data).hexdigest()[:20] + '"'
 
-async function refresh() {
-  if (!token) { setStatus("Enter the bridge token to load status.", true); return; }
-  setStatus("Loading...");
-  try {
-    const [agents, sessions] = await Promise.all([
-      api("/api/v1/agents"), api("/api/v1/sessions"),
-    ]);
-    renderAgents(agents.agents || []);
-    renderSessions(sessions.sessions || []);
-    setStatus("Updated " + new Date().toLocaleTimeString());
-  } catch (e) {
-    setStatus(e.message, true);
-  }
-}
 
-function renderAgents(list) {
-  const rows = list.map((a) => {
-    const name = a.name || a.display_name || "";
-    const url = wsBase + "/acp/" + encodeURIComponent(name);
-    const target = a.host ? ("ssh:" + a.host) : (a.target_type || "local");
-    return `<tr>
-      <td><b>${esc(a.display_name || name)}</b><div class="muted">${esc(name)}</div></td>
-      <td>${esc(a.description || "")}</td>
-      <td>${esc(target)}</td>
-      <td class="ws"><code>${esc(url)}</code> ${copyBtn(url)}</td></tr>`;
-  });
-  $("#agents tbody").innerHTML = rows.join("") ||
-    `<tr><td colspan="4" class="muted">No agents registered.</td></tr>`;
-}
+def _serve(name: str, media_type: str, request: Request) -> Response:
+    data, etag = _asset(name)
+    # no-cache: revalidate every load so a daemon upgrade is picked up at once.
+    headers = {**_SECURITY_HEADERS, "ETag": etag, "Cache-Control": "no-cache"}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    return Response(content=data, media_type=media_type, headers=headers)
 
-function renderSessions(list) {
-  const rows = list.map((s) => {
-    const url = wsBase + "/acp/session/" + encodeURIComponent(s.session_id);
-    const ctx = (s.context_pct != null) ? (s.context_pct.toFixed(0) + "%") : "-";
-    const st = esc(s.status || "");
-    return `<tr>
-      <td><code>${esc(s.session_id)}</code><div class="muted">${esc(s.name || "")}</div></td>
-      <td>${esc(s.agent_name || "-")}</td>
-      <td>${esc(s.caller_id || "-")}</td>
-      <td><span class="pill s-${st}">${st}</span></td>
-      <td>${esc(s.turn_count != null ? s.turn_count : "-")}</td>
-      <td>${esc(ctx)}</td>
-      <td class="ws"><code>${esc(url)}</code> ${copyBtn(url)}</td></tr>`;
-  });
-  $("#sessions tbody").innerHTML = rows.join("") ||
-    `<tr><td colspan="7" class="muted">No active sessions.</td></tr>`;
-}
+#: A login code is single-use and valid this long (seconds).
+LOGIN_CODE_TTL = 60.0
 
-document.addEventListener("click", (e) => {
-  const b = e.target.closest("button[data-copy]");
-  if (b) {
-    navigator.clipboard.writeText(b.dataset.copy);
-    b.textContent = "copied";
-    setTimeout(() => (b.textContent = "copy"), 1200);
-  }
-});
 
-$("#save").addEventListener("click", () => {
-  token = $("#token").value.trim();
-  localStorage.setItem(TOKEN_KEY, token);
-  refresh();
-});
-$("#refresh").addEventListener("click", refresh);
+def _login_codes(request: Request) -> dict[str, float]:
+    codes = getattr(request.app.state, "ui_login_codes", None)
+    if codes is None:
+        codes = request.app.state.ui_login_codes = {}
+    now = time.monotonic()
+    for code in [c for c, expiry in codes.items() if expiry <= now]:
+        codes.pop(code, None)
+    return codes
 
-refresh();
-setInterval(refresh, 5000);
-</script>
-</body>
-</html>
-"""
 
+@router.post("/api/v1/ui/login-codes", include_in_schema=False)
+async def create_login_code(request: Request) -> dict[str, Any]:
+    """Mint a one-time code that lets a browser sign in to /ui (auth required).
+
+    The URL a browser records carries only this code, never the bearer token:
+    history (which may sync) keeps a code that is already used or expired.
+    """
+    code = secrets.token_urlsafe(24)
+    _login_codes(request)[code] = time.monotonic() + LOGIN_CODE_TTL
+    return {"code": code, "expires_in": LOGIN_CODE_TTL}
+
+
+@router.post("/ui/exchange", include_in_schema=False)
+async def exchange_login_code(request: Request) -> JSONResponse:
+    """Trade a valid, unused login code for the bearer token (auth-exempt; single use)."""
+    try:
+        code = str((await request.json()).get("code") or "")
+    except ValueError:
+        code = ""
+    if not code or _login_codes(request).pop(code, None) is None:
+        return JSONResponse({"detail": "invalid or expired login code"}, status_code=403)
+    return JSONResponse(
+        {"token": request.app.state.auth_token}, headers={"Cache-Control": "no-store"},
+    )
 
 @router.get("/ui", response_class=HTMLResponse, include_in_schema=False)
-async def status_ui() -> str:
-    """Serve the built-in status UX page."""
-    return _PAGE
+async def status_ui(request: Request) -> Response:
+    """Serve the control-surface page."""
+    return _serve("index.html", "text/html; charset=utf-8", request)
+
+
+@router.get("/ui/assets/{name}", include_in_schema=False)
+async def ui_asset(name: str, request: Request) -> Response:
+    """Serve one allowlisted script or stylesheet (auth-exempt; static)."""
+    media_type = ASSETS.get(name)
+    if media_type is None:
+        return JSONResponse({"detail": "not found"}, status_code=404)
+    return _serve(name, media_type, request)

@@ -86,11 +86,301 @@ def test_specs_resolve_correct_per_repo_paths(tmp_path, monkeypatch) -> None:
     assert engine._connector_kwargs(specs["github:owner/dotfiles"]) == {"token": "tok-someacct"}
 
 
+def test_explicit_commits_source_resolves_against_parent_repo(tmp_path, monkeypatch) -> None:
+    """A direct ``--source git:X:commits`` request (as a per-source full-reindex
+    task, not the ``source=None``/"all" sweep that naturally bundles commits
+    as a ``discover()`` byproduct of its parent) must resolve the SAME repo
+    path/ref/auth as its parent ``git:X`` file source -- not synthesize a bare,
+    repo-less spec that silently falls back to the wrong cwd (#1350)."""
+    dotfiles, ce = _registry(tmp_path, monkeypatch)
+    _write(dotfiles / ".agent-index" / "config.yaml", """\
+        corpus:
+          sources:
+            - name: git:dotfiles
+              repo: dotfiles
+            - name: git:copilot-extensions
+              repo: copilot-extensions
+              ref: origin/dev
+              auth: {account: someacct}
+    """)
+    monkeypatch.setattr(engine, "_resolve_gh_token", lambda account: f"tok-{account}")
+    by_name = {s.name: s for s in engine.configured_source_specs()}
+
+    spec = engine._resolve_explicit_source_spec("git:copilot-extensions:commits", by_name)
+    # Resolved to the PARENT spec's own bare name -- not the ":commits" (never
+    # an independent source) that was requested. Correct for a git source
+    # (GitRepoConnector derives its own commit/file sub-source names from the
+    # resolved repo, not from this ``source`` string) and REQUIRED for a
+    # github source (see the github test below -- its ``source`` param IS
+    # parsed for owner/repo, so a leftover suffix breaks it outright).
+    assert spec.name == "git:copilot-extensions"
+    assert engine._connector_kwargs(spec) == {
+        "repo_path": str(ce),
+        "ref": "origin/dev",
+        "token": "tok-someacct",
+    }
+
+
+def test_explicit_github_issues_or_pulls_source_resolves_against_parent(
+    tmp_path, monkeypatch
+) -> None:
+    """A direct ``--source github:owner/repo:issues`` (or ``:pulls``) request
+    must resolve to its PARENT ``github:owner/repo`` spec -- both sub-sources
+    are a BYPRODUCT one ``_iter_issue_timeline`` crawl emits together, never
+    independently configured. Critically, the connector must be constructed
+    with the BASE name: ``GitHubConnector._parse_source`` naively splits on
+    the first ``/``, so a lingering ``:issues``/``:pulls`` suffix parses as
+    part of the REPO name (``owner/repo:issues`` -> repo ``"repo:issues"``),
+    producing a malformed API URL and a 404 on every request -- confirmed live
+    across every configured github source when this was still unfixed."""
+    dotfiles, ce = _registry(tmp_path, monkeypatch)
+    _write(dotfiles / ".agent-index" / "config.yaml", """\
+        corpus:
+          sources:
+            - name: github:owner/dotfiles
+              type: github
+              repo: owner/dotfiles
+              auth: {account: someacct}
+    """)
+    monkeypatch.setattr(engine, "_resolve_gh_token", lambda account: f"tok-{account}")
+    by_name = {s.name: s for s in engine.configured_source_specs()}
+
+    for suffix in (":issues", ":pulls"):
+        spec = engine._resolve_explicit_source_spec(f"github:owner/dotfiles{suffix}", by_name)
+        assert spec.name == "github:owner/dotfiles", (
+            f"a {suffix} request must resolve to the PARENT's bare name, not keep "
+            "the suffix -- GitHubConnector parses `source` directly for owner/repo"
+        )
+        assert engine._connector_kwargs(spec) == {"token": "tok-someacct"}
+
+
+def test_unconfigured_commits_source_without_parent_raises(tmp_path, monkeypatch) -> None:
+    """A ``:commits`` request whose base name ISN'T a configured source either
+    (typo, stale name) still can't silently resolve to a bogus cwd default --
+    it must raise, same as any other unresolvable explicit source name."""
+    _registry(tmp_path, monkeypatch)
+    by_name = {s.name: s for s in engine.configured_source_specs()}
+
+    spec = engine._resolve_explicit_source_spec("git:nonexistent:commits", by_name)
+    assert spec.repo is None and spec.repo_path is None
+    try:
+        engine._connector_kwargs(spec)
+        raise AssertionError("expected RuntimeError for an unresolvable named source")
+    except RuntimeError as exc:
+        assert "git:nonexistent:commits" in str(exc)
+
+
+def test_unconfigured_named_source_raises_not_silent_cwd_fallback(tmp_path, monkeypatch) -> None:
+    """Any OTHER explicitly-named (non-``:commits``, non-bare-``git``) source
+    that fails to resolve a checkout path must also raise loudly -- not just
+    the narrower repo/repo_path-hinted case #1350 originally covered."""
+    _registry(tmp_path, monkeypatch)
+    by_name = {s.name: s for s in engine.configured_source_specs()}
+
+    spec = engine._resolve_explicit_source_spec("git:totally-unknown", by_name)
+    try:
+        engine._connector_kwargs(spec)
+        raise AssertionError("expected RuntimeError for an unresolvable named source")
+    except RuntimeError as exc:
+        assert "git:totally-unknown" in str(exc)
+
+
+def test_git_source_ref_override_and_authenticated_fetch(tmp_path, monkeypatch) -> None:
+    """A ``git:`` source may declare ``ref:`` (index a branch other than the
+    remote's default, e.g. a repo whose integration branch is ``dev`` not
+    ``main``) and ``auth.account`` (authenticate its fetch step the same way a
+    ``github:`` source's token is resolved) -- both wired through to the
+    connector kwargs, independent of each other and of other sources."""
+    dotfiles, ce = _registry(tmp_path, monkeypatch)
+    _write(dotfiles / ".agent-index" / "config.yaml", """\
+        corpus:
+          sources:
+            - name: git:dotfiles
+              repo: dotfiles
+              trust_domain: work
+            - name: git:copilot-extensions
+              repo: copilot-extensions
+              ref: origin/dev
+              auth: {account: someacct}
+              trust_domain: personal
+            - name: github:owner/dotfiles
+              type: github
+              repo: owner/dotfiles
+              auth: {account: someacct}
+    """)
+    monkeypatch.setattr(engine, "_resolve_gh_token", lambda account: f"tok-{account}")
+    specs = {s.name: s for s in engine.configured_source_specs()}
+
+    assert engine._connector_kwargs(specs["git:dotfiles"]) == {"repo_path": str(dotfiles)}
+    assert engine._connector_kwargs(specs["git:copilot-extensions"]) == {
+        "repo_path": str(ce),
+        "ref": "origin/dev",
+        "token": "tok-someacct",
+    }
+
+
+def test_git_source_ref_override_does_not_require_auth(tmp_path, monkeypatch) -> None:
+    """``ref:`` alone (no ``auth:``) does not force a token resolution -- a
+    repo may need a non-default branch without needing authenticated fetch."""
+    dotfiles, ce = _registry(tmp_path, monkeypatch)
+    _write(dotfiles / ".agent-index" / "config.yaml", """\
+        corpus:
+          sources:
+            - name: git:dotfiles
+              repo: dotfiles
+            - name: git:copilot-extensions
+              repo: copilot-extensions
+              ref: origin/dev
+    """)
+
+    def _unexpected_resolve(account):
+        raise AssertionError("must not resolve a token when auth.account is unset")
+
+    monkeypatch.setattr(engine, "_resolve_gh_token", _unexpected_resolve)
+    specs = {s.name: s for s in engine.configured_source_specs()}
+    assert engine._connector_kwargs(specs["git:copilot-extensions"]) == {
+        "repo_path": str(ce),
+        "ref": "origin/dev",
+    }
+
+
+def test_git_source_auth_token_resolution_failure_is_non_fatal(tmp_path, monkeypatch) -> None:
+    """Unlike a ``github:`` source (hard failure), a ``git:`` source whose
+    token can't be resolved proceeds WITHOUT one -- GitRepoConnector's own
+    fetch already falls back gracefully to stale-but-canonical remote-tracking
+    state or the local HEAD, so there's no need to fail the whole source."""
+    dotfiles, ce = _registry(tmp_path, monkeypatch)
+    _write(dotfiles / ".agent-index" / "config.yaml", """\
+        corpus:
+          sources:
+            - name: git:dotfiles
+              repo: dotfiles
+            - name: git:copilot-extensions
+              repo: copilot-extensions
+              auth: {account: someacct}
+    """)
+    monkeypatch.setattr(engine, "_resolve_gh_token", lambda account: None)
+    specs = {s.name: s for s in engine.configured_source_specs()}
+    assert engine._connector_kwargs(specs["git:copilot-extensions"]) == {"repo_path": str(ce)}
+
+
 def test_env_override_wins(tmp_path, monkeypatch) -> None:
     _registry(tmp_path, monkeypatch)
     monkeypatch.setenv("AGENT_INDEX_SOURCES", "git:only")
     specs = engine.configured_source_specs()
     assert [s.name for s in specs] == ["git:only"]
+
+
+def test_current_repo_layers_union_sources_and_preserve_overlay_indexer(
+    tmp_path, monkeypatch
+) -> None:
+    aw = tmp_path / ".agent-worktrees"
+    _write(aw / "projects.yaml", "schema_version: 2\nprojects: {}\n")
+    _write(aw / "repos.yaml", "schema_version: 1\nrepos: {}\n")
+    root = tmp_path / "harness"
+    _write(root / ".agent-index" / "config.yaml", """\
+        corpus:
+          sources:
+            - name: github:example-org/example-repo
+              trust_domain: harness
+    """)
+    _write(root / ".copilot-extensions" / "agent-index" / "config.yaml", """\
+        indexer:
+          machine: boxA
+        corpus:
+          sources:
+            - name: github:ThomasMichon/copilot-extensions
+              trust_domain: marketplace
+    """)
+    monkeypatch.setenv("AGENT_WORKTREES_HOME", str(aw))
+    monkeypatch.setenv("AGENT_INDEX_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cfg, "repo_root", lambda explicit=None: root)
+
+    assert cfg.read_indexer(root) == {"machine": "boxA"}
+    sources = cfg.read_corpus_sources()
+    assert [s["name"] for s in sources] == [
+        "github:ThomasMichon/copilot-extensions",
+        "github:example-org/example-repo",
+    ]
+
+
+def test_current_repo_duplicate_source_name_uses_higher_precedence_overlay(
+    tmp_path, monkeypatch
+) -> None:
+    aw = tmp_path / ".agent-worktrees"
+    _write(aw / "projects.yaml", "schema_version: 2\nprojects: {}\n")
+    _write(aw / "repos.yaml", "schema_version: 1\nrepos: {}\n")
+    root = tmp_path / "harness"
+    _write(root / ".agent-index" / "config.yaml", """\
+        corpus:
+          sources:
+            - name: git:dotfiles
+              repo: dotfiles
+              trust_domain: shareable
+    """)
+    _write(root / ".copilot-extensions" / "agent-index" / "config.yaml", """\
+        corpus:
+          sources:
+            - name: git:dotfiles
+              repo: override
+              trust_domain: overlay
+    """)
+    monkeypatch.setenv("AGENT_WORKTREES_HOME", str(aw))
+    monkeypatch.setenv("AGENT_INDEX_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cfg, "repo_root", lambda explicit=None: root)
+
+    sources = cfg.read_corpus_sources()
+    assert sources == [
+        {
+            "name": "git:dotfiles",
+            "repo": "override",
+            "trust_domain": "overlay",
+            "_repo_path": str(root),
+            "_contributed_by": "effective-config",
+        }
+    ]
+
+
+def test_current_repo_unions_base_knowledge_and_machine_local_sources(
+    tmp_path, monkeypatch
+) -> None:
+    aw = tmp_path / ".agent-worktrees"
+    _write(aw / "projects.yaml", "schema_version: 2\nprojects: {}\n")
+    _write(aw / "repos.yaml", "schema_version: 1\nrepos: {}\n")
+    root = tmp_path / "harness"
+    knowledge = tmp_path / "knowledge"
+    _write(root / ".agent-worktrees" / "config.yaml", """\
+        requires_external_state_root: true
+    """)
+    _write(root / ".agent-index" / "config.yaml", """\
+        corpus:
+          sources:
+            - name: github:example-org/example-repo
+              trust_domain: harness
+    """)
+    _write(knowledge / ".agent-index" / "config.yaml", """\
+        corpus:
+          sources:
+            - name: github:owner/dotfiles
+              trust_domain: knowledge
+    """)
+    _write(tmp_path / "home" / "config.yaml", """\
+        corpus:
+          sources:
+            - name: github:personal/notes
+              trust_domain: machine
+    """)
+    monkeypatch.setenv("AGENT_WORKTREES_HOME", str(aw))
+    monkeypatch.setenv("AGENT_INDEX_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cfg, "repo_root", lambda explicit=None: root)
+    monkeypatch.setattr(cfg, "_external_state_root", lambda _root: ("ready", knowledge))
+
+    sources = cfg.read_corpus_sources()
+    assert [s["name"] for s in sources] == [
+        "github:owner/dotfiles",
+        "github:example-org/example-repo",
+        "github:personal/notes",
+    ]
 
 
 def test_default_when_no_registry(tmp_path, monkeypatch) -> None:

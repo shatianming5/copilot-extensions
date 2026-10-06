@@ -16,11 +16,80 @@ agent-ssh doctor
 agent-ssh verify --timeout 8 my-machine
 agent-ssh explore my-machine --json
 agent-ssh mesh-status
+agent-ssh refresh-mesh --json
+agent-ssh copilot-config set my-machine --workspace /workspaces/repo
+agent-ssh copilot my-machine
+agent-ssh copilot my-machine --detach --seed-file task.md
+agent-ssh copilot my-machine --stop
 ```
 
 The CLI manages only SSH aliases. Once `ssh <name>` works, sibling plugins such
 as agent-bridge or agent-codespaces can use that OpenSSH surface, but agent-ssh
 does not import their runtimes or require them to be installed.
+
+`copilot <ssh-target>` attaches a real interactive Copilot CLI session in this
+terminal through the SSH target, matching the venue contract of
+`agent-codespaces copilot <name>` and `agent-containers copilot <name>`.
+Re-running the command re-attaches the same remote tmux-backed anchor session;
+if another process already holds the bridge reverse-forward route, the attached
+command reuses that route instead of trying to bind the same remote port again.
+`--detach` starts or rejoins the session in the background without taking over
+the caller terminal and prints a JSON handle with `status`, `observe`, `nudge`,
+`attach`, and `stop` commands; `--stop` verifies the detached session is gone and
+releases its bridge forward. The remote machine must already have `bash`, `tmux`,
+`copilot`, `agent-worktrees`, and the `agent-bridge` Copilot plugin installed.
+Windows SSH targets are not supported yet; run the orchestrator on that machine
+and use local `agent-worktrees embody` there.
+
+The remote checkout is resolved fail-closed: explicit `--workspace` first, then
+the agent-ssh-owned host config written by
+`agent-ssh copilot-config set <ssh-target> --workspace /path/to/checkout`
+(`~/.agent-ssh/copilot-hosts.json`). The command does not guess by scanning the
+remote machine; if neither source is present, it fails before launch with
+instructions to pass or configure the workspace. `--ttl-seconds` applies only
+to attached mode; detached launches use their short fixed launch reservation
+and release it after registration. A new detached session starts on the caller's
+own model, reasoning effort, and context tier (from `~/.copilot/settings.json`);
+an explicit
+`--copilot-arg=--model=...` wins and `AGENT_CODESPACES_MODEL_PROPAGATE=0` opts
+out.
+`--ref-file PATH` (repeatable) copies an operator file outside the checkout to
+`~/.agent-bridge/refs/<batch>/` and names it to the worker (seed for a new
+session, a message on rejoin).
+
+`restore-host` exposes transport-owned host setup to declarative orchestrators
+without requiring them to know installed payload paths:
+
+```powershell
+agent-ssh restore-host --transport dtssh --alias example-host --port 2222 --dry-run
+agent-ssh restore-host --transport dtssh --alias example-host --port 2222 --apply
+```
+
+The default/dry-run path executes the dtssh host status contract without
+mutation. `--apply` invokes the transport's idempotent installer with
+interactive login disabled; authentication remains an external prerequisite
+and is never captured. When `--apply` is invoked from an SSH session on
+Windows, it brokers the updater through WMI so stopping the serving sshd cannot
+reap the updater with the SSH session. That mode returns
+`verification_required: true` and does not claim `applied` until the caller
+reconnects and runs the dry-run/status contract. Use `--json` for structured
+command, output, and result data.
+
+On Windows, the installer preserves the dtssh server host identity across
+updates before restarting the host. It automatically uses an available
+`OneDriveCommercial` folder for an alias-scoped durable backup, otherwise it
+uses a separate local backup outside dtssh's state directory. The
+`AGENT_SSH_DTSSH_HOST_KEY_BACKUP_ROOT` environment variable or the install
+script's `-HostKeyBackupRoot` parameter selects an explicit location. Partial,
+corrupt, or conflicting identities fail closed instead of silently rotating a
+key that clients have pinned.
+
+The dtssh launcher now also persists a local dispatch-companion config under
+`%LOCALAPPDATA%\agent-ssh-dtssh`, and the plugin's session-start hook publishes
+an attributed `agent-dispatch` companion declaration. On a configured Windows
+host, the already-durable interactive-session dispatch coordinator can
+re-launch the watchdog even when the historical Startup-folder shortcut did not
+fire for that logon or the launcher died later in the session.
 
 `mesh-status [--json]` is a fail-open view of a calling repository's
 `machines.yaml`. In addition to SSH readiness and environments, it shows the
@@ -28,6 +97,29 @@ optional static machine metadata shared with agent-worktrees and agent-bridge:
 `role` is a stable terse classification, `description` explains the machine's
 purpose, and `capabilities` is an ordered list of broad discovery hints. These
 fields describe topology, not live machine state.
+
+`refresh-mesh [--path machines.yaml] [--config-d dir] [--timeout N] [--json]`
+reconciles this machine's *outbound* reach into the mesh: it re-runs the
+transport's own discovery (e.g. `dtssh discover` for the dtssh transport) to
+capture live tunnel/host ids, re-renders this machine's managed
+`config.d` fragment from that live state, and probes reachability of every
+declared alias. It never trusts a previously cached id -- transports such as
+dtssh rotate tunnel ids on every host restart, and nothing else re-validates a
+peer's cached id once it goes stale. `agent-machines`' hourly `watchdog`
+self-update tier calls this on every opted-in machine, so a stale cached id
+self-heals within about an hour instead of silently breaking inbound SSH until
+an operator notices and re-runs discovery by hand.
+
+The repository-gated mesh pointer also names the maintenance fallback for a
+machine that remains unreachable after bounded diagnosis. Repeatable state
+belongs in agent-machines requirement packages or another declared auto-update
+owner; residual local execution becomes a machine-scoped maintenance issue in
+an explicitly identified user repository. The target drains that queue with
+the optional `agent-machines:performing-machine-maintenance` skill when that
+plugin is active. The emitted rule remains self-contained when it is absent:
+maintenance becomes inspection-only and mutation stops until an equivalent
+trusted workflow is available. agent-ssh reports the routing boundary but does
+not own the queue or execute issue instructions.
 
 ## Minimal setup
 

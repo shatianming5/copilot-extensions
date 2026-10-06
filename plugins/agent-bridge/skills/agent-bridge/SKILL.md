@@ -160,15 +160,15 @@ with macOS support planned.
 plugin. Source code lives in the installed plugin directory at
 `~/.copilot/installed-plugins/copilot-extensions/agent-bridge/`.
 
-**Config lives at:** `~/.agent-bridge/config.yaml` (topology profiles
+**Config lives at:** `~/.agent-bridge/config.yaml` (topology profiles <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 pointing to optional `machines.yaml`; the roster is derived from it when present.
-Provider namespaces from `~/.agent-bridge/providers.d/` work without a topology.)
+Provider namespaces from `~/.agent-bridge/providers.d/` work without a topology.) <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 
 ### Repository edits vs configuration adoption
 
 The payload-local `config adopt` operation is a **machine-local projection
 command**. It reads
-repository topology and writes the current user's `~/.agent-bridge/config.yaml`;
+repository topology and writes the current user's `~/.agent-bridge/config.yaml`; <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 it never edits, publishes, or deploys repository files.
 
 When topology or purpose-built agent definitions must change:
@@ -190,7 +190,7 @@ external paths can become invalid if it names a disposable worktree; `config
 validate` reports the missing file.
 
 Before repairing a profile with `config adopt`, back up its topology-profile
-stanza in `~/.agent-bridge/config.yaml`, including `default_copilot_args` and
+stanza in `~/.agent-bridge/config.yaml`, including `default_copilot_args` and <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 `default_env`: adoption replaces the named profile rather than merging those
 spawn defaults. Re-adopt against canonical source paths, then restore any
 recorded defaults.
@@ -204,8 +204,10 @@ The essential one is **send**:
 
 ```bash
 <agent-bridge catalog argv[0]> send <agent|machine|codespace:name|container:name> "<prompt>"
-<agent-bridge catalog argv[0]> agents          # list cwd-project agents (--json)
-<agent-bridge catalog argv[0]> machines        # list cwd-project machines + SSH readiness (--json)
+<agent-bridge catalog argv[0]> agents              # list cwd-project agents
+<agent-bridge catalog argv[0]> machines            # list cwd-project machines + SSH readiness
+<agent-bridge catalog argv[0]> --json agents       # --json is a TOP-LEVEL flag -- it must come
+<agent-bridge catalog argv[0]> --json machines     # BEFORE the subcommand, not after it; `agents --json` fails
 <agent-bridge catalog argv[0]> --project <repo> agents
 <agent-bridge catalog argv[0]> agents --all-projects
 ```
@@ -256,7 +258,7 @@ configuration, see `plugins/agent-bridge/docs/machine-config.md`.
 <agent-bridge catalog argv[0]> sessions
 
 # Get JSON for programmatic use
-<agent-bridge catalog argv[0]> sessions --json
+<agent-bridge catalog argv[0]> --json sessions
 ```
 
 ### Reading liveness -- `stalled` is usually deep thinking, NOT a wedge
@@ -719,7 +721,7 @@ The fabric can deliver a message **into a live interactive session** (yours or a
 peer's). It arrives as a user turn wrapped in a structured envelope:
 
 ```
-<agent-message from="cjohnson@orchestrator" reply-to="81ec1b77-…" msg-id="2">
+<agent-message from="contributor_user@orchestrator" reply-to="81ec1b77-…" msg-id="2">
 …body…
 </agent-message>
 ```
@@ -760,9 +762,12 @@ two capabilities without the destructive take-over:
 - **Addressing by worktree handle.** `resolve` maps a worktree handle → its
   currently-live session, so `reply-to` survives a session handoff (an agent is
   a *series of sessions in one worktree*).
+- **Supervised venue workers.** A detached venue launch records its launching
+  worktree as `venue.supervisor_ref`, so a successor (after a handoff) finds
+  its workers with `live-sessions list --supervisor <machine/project/worktree_id>`.
 - **Reading the registry (CLI).**
   `<agent-bridge catalog argv[0]> live-sessions list
-  [--worktree-id <id>]` and
+  [--worktree-id <id>] [--supervisor <machine/project/worktree_id>]` and
   `<agent-bridge catalog argv[0]> live-sessions resolve --handle
   <session-id|worktree-handle>` expose the registry from the shell (add global
   `--json` for machine-readable output). Beyond registration/liveness the view
@@ -785,6 +790,14 @@ two capabilities without the destructive take-over:
   Every field is hard-capped
   so the beat stays a status line, never a chat log. The bundled extension nudges
   an operator-driven session to emit one at a gentle cadence.
+- **A detached CLI-mode session on a CodeSpace, trusted container, or SSH target** (`create
+  codespace:<name> --cli --detach` / `create container:<name> --cli --detach` /
+  `create ssh:<name> --cli --detach`,
+  see [cli-commands.md](references/cli-commands.md#detached-cli-mode-session-on-a-codespace-trusted-container-or-ssh-target-observable-steerable))
+  is this same surface: it registers here with its venue recorded, so an
+  orchestrator observes it with `live-sessions resolve` / bounded `result`
+  reads and steers it with `send`, while a human can attach its real terminal
+  or use `ui` to watch it in a browser.
 
 **Durable work gets a CLI body, not a headless one.** When you *dispatch* work
 meant to outlive its caller, prefer a **CLI-backed autopilot session** (via
@@ -795,6 +808,52 @@ NF-viewable, and completes its task explicitly. Ephemeral, caller-bounded helper
 still use headless bridge agents (`send`/`create`). A **handoff** is the in-place
 variant: a live cutover replaces the current CLI in its mux with a successor that
 takes the work over (see the `context-handoff:context-handoff` and `agent-dispatch:agent-dispatch` skills).
+
+## Session identity: durable vs bridge-internal (read this before persisting an id)
+
+A session carries **two different identifiers**, and conflating them breaks
+every downstream deep link or cross-service reference:
+
+- **`session_id`** — agent-bridge's own internal handle. For a *live*
+  bridge-owned ACP session it is a short-lived escrow id, assigned only to
+  correlate a spawn attempt to its bridge session while creating it. It is
+  **not durable**: agent-bridge prunes its own session store aggressively,
+  and nothing outside that exact bridge instance can resolve it once the
+  session ends.
+- **`acp_session_id`** — the real Copilot ACP session id
+  (`~/.copilot/session-state/<uuid>/`). This is the durable identity every
+  other surface (Neuron Forge, Permanent Record, agent-dispatch, any future
+  consumer) actually needs, live or archived.
+
+Every `SessionInfo` response (`GET /api/v1/sessions/{id}`,
+`GET /api/v1/dispatch-tasks/{id}/session`, a `/api/v1/worktrees` entry's
+session linkage) also carries a **`durable_session_id`** field: `acp_session_id`
+when known, else the (non-durable) `session_id` as a last resort. **Use
+`durable_session_id` for anything that outlives the current call** — a deep
+link, a database column, a task binding, a log line meant to be resolvable
+later. Never persist `session_id` directly.
+
+This is not a hypothetical footgun: agent-dispatch's `owner_session_id` was
+captured from the ephemeral `session_id` instead of the durable one for every
+headless dispatch task, silently breaking Intelligence Dampener's "View
+reviewer" deep link for every completed review (copilot-extensions PR #2964,
+the downstream PR fixed the fallout). Retrofit any code that reads a
+bridge session's id and stores or forwards it — check it uses
+`durable_session_id`, not `session_id`.
+
+**Traversing from a dispatch task to its conversation.** A caller holding
+only an agent-dispatch task id (not a session id) resolves it durably with
+one call: `GET /api/v1/dispatch-tasks/{id}/session` (`durable_session_id` on
+the response). This tries the task's current owner session first, then its
+durable attachment history (agent-dispatch's own `GET /tasks/{id}/attachments`),
+across every session tier the bridge knows (bridge-owned, cold-store
+archived, and a represented interactive CLI session), then the task's
+target worktree's latest known session as a last resort (live-only — a
+reclaimed worktree with no resolvable candidate is a genuine 404). Never
+invent a per-consumer naming convention (e.g. deriving a worktree name from a
+PR number) to get there — this route is the one shared primitive; see
+`visions/plugins/agent-bridge`'s *topology and resolver layer* concept and
+*resolve-by-any-origin-reference* feature.
 
 ## Troubleshooting
 
@@ -820,3 +879,7 @@ takes the work over (see the `context-handoff:context-handoff` and `agent-dispat
   `<agent-bridge catalog argv[0]> machines` for
   SSH readiness status, then follow the guidebook without changing provider
   state.
+
+## See Also
+
+- [docs/entity-relationship-model.md](../../docs/entity-relationship-model.md) -- the suite-wide diagnostic playbook: given a session/worktree/task, which command resolves the rest (assigned worktree, bridge/liveness state, rendered history + usage stats)

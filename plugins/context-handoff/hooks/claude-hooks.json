@@ -7,7 +7,8 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-adapter.py\" SessionStart",
-            "timeout": 40
+            "timeout": 15,
+            "statusMessage": "Loading context-handoff..."
           }
         ]
       }
@@ -17,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/context-pressure.py\"",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/context-pressure.mjs\"",
             "timeout": 10
           }
         ]

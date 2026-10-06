@@ -45,6 +45,19 @@ Escape hatches / modes:
     write-routing guard family.
   * ``ANCHOR_WRITE_GUARD_MODE=deny|ask|warn|off`` (default ``deny``) picks the
     action on a hit.
+  * ``git pull --ff-only`` (and a bare ``git fetch`` alone, which never
+    mutates the working tree) is never blocked on an anchor: git structurally
+    refuses to create a merge commit or apply a configured ``pull.rebase``
+    when a fast-forward isn't possible, so this exact form can never
+    introduce the agent-authored content ("no agent-authored content" is
+    this guard's whole invariant) that a stray edit/commit would. A bare
+    ``git pull`` (no ``--ff-only``) remains blocked like any other write-sub
+    verb -- on a diverged anchor its default merge WOULD create a genuine
+    new local merge commit, or a configured rebase would rewrite existing
+    ones. ``agent-worktrees repos sync <repo>`` is the always-available
+    equivalent (fetch + ``merge --ff-only``, skipping rather than forcing a
+    dirty/diverged/detached checkout) when a plain ``--ff-only`` pull isn't
+    convenient to type.
   * ``agent-worktrees repos allow-edits <repo> --reason "..."`` opens a
     time-boxed break-glass (``~/.agent-worktrees/allow-edits.json``) the guard
     honors.
@@ -58,6 +71,12 @@ import re
 import sys
 import time
 from pathlib import Path
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from registry_root import resolve_registry_root
 
 # --- Tool classification (mirrors the sibling guards) -------------------------
 WRITE_TOOLS = frozenset({
@@ -75,7 +94,16 @@ CMD_ARG_KEYS = ("command", "cmd", "script", "commandLine", "commandline", "input
 
 # Write-ish verbs (PowerShell cmdlets + POSIX + git mutations); presence
 # alongside an anchor-path literal in a shell command flips a read into a
-# suspected write. Mirrors cross_repo_guard.
+# suspected write. Mirrors cross_repo_guard. ``pull`` stays in this cheap
+# early-out list -- an unsafe (non-``--ff-only``) pull must still reach the
+# precise per-segment analysis below, which is where the real ``--ff-only``
+# exemption lives (see ``_GIT_FF_ONLY_FLAG``). The optional ``-C <path>``
+# uses the same quoted-or-unquoted grammar as ``_GIT_SUBCOMMAND`` below
+# (``"[^"]*"|'[^']*'|\S+``, not a bare ``\S+``) -- an anchor path containing
+# a space (``-C "my anchor path" commit ...``) otherwise makes ``\S+``
+# match only the first word, so the whole early-out fails to match and the
+# entire per-segment analysis below is skipped outright, silently allowing
+# the write.
 _WRITE_VERBS = re.compile(
     "|".join([
         "Set-Content", "Add-Content", "Out-File", "New-Item", "Remove-Item",
@@ -84,9 +112,9 @@ _WRITE_VERBS = re.compile(
         ">>?",
         r"\btee\b", r"\bsed\b\s+-i", r"\bcp\b", r"\bmv\b", r"\brm\b",
         r"\btouch\b", r"\bmkdir\b", r"\bdd\b", r"\btruncate\b", r"\bpatch\b",
-        r"git\s+(?:-C\s+\S+\s+)?(?:apply|commit|checkout|switch|reset|"
-        r"restore|clean|rm|mv|stash|merge|rebase|pull|cherry-pick|revert|"
-        r"add|init)",
+        r"""git\s+(?:-C\s+(?:"[^"]*"|'[^']*'|\S+)\s+)?(?:apply|commit|checkout|switch|reset|"""
+        r"""restore|clean|rm|mv|stash|merge|rebase|pull|cherry-pick|revert|"""
+        r"""add|init|branch)""",
     ]),
     re.IGNORECASE,
 )
@@ -124,11 +152,95 @@ _WRITE_CMD_START = re.compile(
 _GIT_START = re.compile(r"^\s*[\"']?git\b", re.IGNORECASE)
 _GIT_WRITE_SUB = re.compile(
     r"\b(?:add|commit|apply|checkout|switch|reset|restore|clean|rm|mv|stash|"
-    r"merge|rebase|pull|cherry-pick|revert|init)\b",
+    r"merge|rebase|pull|cherry-pick|revert|init|branch)\b",
     re.IGNORECASE,
+)
+# ``pull`` is the one write-sub verb with a narrow, precise exemption: this
+# guard's invariant is "no agent-authored content lands in the anchor" (a
+# stray commit, an edit that never goes through the worktree/PR flow) -- and
+# ``git pull --ff-only`` structurally CANNOT create one: git aborts instead
+# of ever creating a merge commit or invoking a configured ``pull.rebase``
+# when a fast-forward isn't possible. A bare ``git pull`` (no ``--ff-only``)
+# has no such guarantee -- on a diverged anchor its default merge creates a
+# genuine new local merge commit, or a configured rebase rewrites existing
+# ones -- so it remains blocked exactly like every other write-sub verb;
+# ``agent-worktrees repos sync <repo>`` (fetch + ``merge --ff-only``,
+# skipping rather than forcing a dirty/diverged/detached checkout) is the
+# always-available equivalent. ``cross_repo_guard`` keeps its own
+# independent copy of this list (different guard, different repo-delegation
+# reasoning) and is unaffected either way.
+#
+# The exemption must identify the actual git SUBCOMMAND, not merely search
+# the segment for the word ``pull`` -- a bare substring search would
+# misclassify ``git commit -m 'pull --ff-only'`` (a real commit, quoting
+# unrelated text) as an exempt pull. This anchors on ``git`` (+ optional
+# ``-C <path>``) followed immediately by the subcommand word.
+_GIT_SUBCOMMAND = re.compile(
+    r"""^\s*["']?git\b(?:\s+-C\s+(?:"[^"]*"|'[^']*'|\S+))?\s+([A-Za-z][\w-]*)""",
+    re.IGNORECASE,
+)
+_GIT_FF_ONLY_FLAG = re.compile(
+    r"""(?:^|\s)["']?--ff-only["']?(?=\s|$)""", re.IGNORECASE,
 )
 # A ``-C`` (git change-directory) flag anywhere in a git segment.
 _GIT_DASH_C_FLAG = re.compile(r"(?:^|\s)-C\b", re.IGNORECASE)
+
+# ``branch`` is the other write-sub verb with a narrow, precise exemption:
+# listing/inspecting branches is a common, safe operation that should
+# remain allowed even against the anchor, while any mutation of a ref or
+# its config must stay denied.
+#
+# ALLOWLIST, not a blacklist: enumerating known MUTATING flags
+# (``-f``/``-d``/``--force``/etc.) and exempting everything else is
+# insufficient -- git's ``branch`` subcommand has more mutating forms than
+# any such list reliably enumerates (``--track`` creates a ref + upstream
+# config; ``--set-upstream-to``/``--unset-upstream`` rewrite config;
+# ``--edit-description`` opens an editor that rewrites a ref-note; a bare
+# positional name creates a ref) -- a blacklist is only ever as safe as its
+# most recently discovered gap. This instead enumerates every known
+# READ-ONLY flag (below) and the exemption applies ONLY when every token
+# after ``branch`` is one of them; an unrecognized flag or any bare
+# positional argument (a branch name, a filter pattern, anything) means
+# "unknown, possibly mutating" and the invocation stays denied -- the safe
+# direction for a write guard, even at the cost of occasionally denying a
+# few benign-but-unrecognized read invocations (e.g. a separate-argument
+# form of ``--contains <ref>`` instead of ``--contains=<ref>``).
+_GIT_BRANCH_SAFE_LONG_FLAG = re.compile(
+    r"""^(?:
+        --list|--all|--remotes|--verbose|--show-current|
+        --column(?:=\S+)?|--no-column|--ignore-case|--omit-empty|
+        --no-abbrev|--no-color|--color(?:=\S+)?|--sort=\S+|--format=\S+|
+        --abbrev=\S+|--points-at=\S+|--contains=\S+|--no-contains=\S+|
+        --merged(?:=\S+)?|--no-merged(?:=\S+)?
+    )$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+# A short-option cluster containing ONLY safe letters (v=verbose,
+# a=all, r=remotes, i=ignore-case, l=list) -- e.g. ``-v``, ``-a``, ``-vv``,
+# ``-avr``, ``-l``. Any OTHER letter anywhere in the cluster (including a
+# mutating one like ``f``/``d``/``m``/``c``, combined or not) fails this
+# and falls through to "unrecognized -> deny".
+_GIT_BRANCH_SAFE_SHORT_CLUSTER = re.compile(r"^-[varil]+$", re.IGNORECASE)
+_GIT_BRANCH_ARG_TOKEN = re.compile(r'"[^"]*"|\'[^\']*\'|\S+')
+
+
+def _git_branch_invocation_is_readonly(args_text: str) -> bool:
+    """Whether every token in ``args_text`` (everything after the ``branch``
+    subcommand word in a git invocation) is a known read-only flag -- see
+    the allowlist rationale above. Quoted tokens are unwrapped before
+    classification so ``"--list"`` and ``--list`` are treated alike."""
+    for raw in _GIT_BRANCH_ARG_TOKEN.findall(args_text):
+        token = raw
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+            token = token[1:-1]
+        if not token:
+            continue
+        if _GIT_BRANCH_SAFE_LONG_FLAG.match(token):
+            continue
+        if _GIT_BRANCH_SAFE_SHORT_CLUSTER.match(token):
+            continue
+        return False
+    return True
 
 # Leading benign prefixes to strip so a write verb after them is still seen at
 # "command position": env-assignments (``VAR=val``) and wrapper commands
@@ -263,8 +375,8 @@ def active_break_glass(repo_name: str, home: Path) -> bool:
 
 # --- Worktree-class anchor discovery (repos.yaml, stdlib parse) ---------------
 
-def _repos_yaml(home: Path) -> Path:
-    return home / ".agent-worktrees" / "repos.yaml"
+def _repos_yaml(registry_root: Path) -> Path:
+    return registry_root / "repos.yaml"
 
 
 def _yaml_unquote(val: str) -> str:
@@ -279,7 +391,55 @@ def _yaml_unquote(val: str) -> str:
     return val
 
 
-def load_worktree_anchors(home: Path) -> list[dict]:
+def load_base_repo_names(registry_root: Path) -> set[str]:
+    """Names adopted in **base-repo (no-worktree)** mode in ``projects.yaml``.
+
+    A base-repo anchor is edited in place by design (the anchor *is* the working
+    checkout -- e.g. a CodeSpace dedicated to one task), so it is never guarded
+    even when ``repos.yaml`` lists it ``class: worktree``. Stdlib-only like
+    :func:`load_worktree_anchors`; never raises.
+    """
+    try:
+        text = (registry_root / "projects.yaml").read_text("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return set()
+    try:
+        import yaml  # type: ignore
+        projects = (yaml.safe_load(text) or {}).get("projects") or {}
+        return {
+            str(name) for name, meta in projects.items()
+            if isinstance(meta, dict) and meta.get("base_repo") is True
+        } if isinstance(projects, dict) else set()
+    except Exception:
+        pass
+    names: set[str] = set()
+    in_projects = False
+    cur_name: str | None = None
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        stripped = raw.strip()
+        if indent == 0:
+            in_projects = stripped == "projects:"
+            cur_name = None
+        elif in_projects and indent == 2 and stripped.endswith(":"):
+            cur_name = _yaml_unquote(stripped[:-1])
+        elif in_projects and indent >= 4 and cur_name:
+            key, sep, val = stripped.partition(":")
+            if sep and key.strip() == "base_repo" and _yaml_unquote(val).lower() == "true":
+                names.add(cur_name)
+    return names
+
+
+def load_worktree_anchors(registry_root: Path) -> list[dict]:
+    """The guarded anchors: every ``class: worktree`` repo in ``repos.yaml``
+    that is not adopted in base-repo mode (:func:`load_base_repo_names`)."""
+    base_repos = load_base_repo_names(registry_root)
+    return [a for a in _load_worktree_class_anchors(registry_root) if a["name"] not in base_repos]
+
+
+def _load_worktree_class_anchors(registry_root: Path) -> list[dict]:
     """Parse ``repos.yaml`` -> ``[{name, path}]`` for every ``class: worktree``
     repo, across all platform path keys (windows/wsl/linux).
 
@@ -288,7 +448,7 @@ def load_worktree_anchors(home: Path) -> list[dict]:
     regular ``repos:`` shape. Prefers PyYAML when importable. Never raises.
     """
     try:
-        text = _repos_yaml(home).read_text("utf-8")
+        text = _repos_yaml(registry_root).read_text("utf-8")
     except (OSError, UnicodeDecodeError):
         return []
 
@@ -362,7 +522,11 @@ def _deny_reason(name: str, path: str) -> str:
         f"edit/commit is a latent hazard (dirty anchor blocks pulls; work that "
         f"never lands through the PR flow). Create/use a linked worktree and edit "
         f"THERE: `{name} create --json` (or `agent-worktrees create`), then work "
-        f"in the returned path. Reading the anchor is fine. If a direct anchor "
+        f"in the returned path. Reading the anchor is fine. Need only to catch "
+        f"the anchor up with its remote (no new commits, no edits)? "
+        f"`agent-worktrees repos sync {name}` does a safe fetch + "
+        f"`merge --ff-only` (skips a dirty/diverged/detached anchor rather than "
+        f"forcing it) and is exempt from this guard. If a direct anchor "
         f"edit is genuinely unavoidable (a recovery/bootstrap action), break "
         f"glass: `agent-worktrees repos allow-edits {name} --reason \"<why>\"` "
         f"(logged, time-boxed), then retry. (Disable: ANCHOR_WRITE_GUARD=off.)"
@@ -409,6 +573,22 @@ def _shell_hit(cmd: str, cwd: str, anchors: list[dict]) -> dict | None:
         at_write_cmd = bool(_WRITE_CMD_START.match(eff))
         is_git = bool(_GIT_START.match(eff))
         git_write = is_git and bool(_GIT_WRITE_SUB.search(seg))
+        # A ``pull`` invocation is exempt from ``git_write`` ONLY when its
+        # actual SUBCOMMAND (not merely the word ``pull`` anywhere in the
+        # segment -- see ``_GIT_SUBCOMMAND``'s comment) is ``pull`` and the
+        # segment also explicitly carries ``--ff-only``. Any other write-sub
+        # verb (or a pull lacking that flag) is untouched.
+        subcmd = _GIT_SUBCOMMAND.match(eff)
+        is_pull = bool(subcmd and subcmd.group(1).lower() == "pull")
+        if git_write and is_pull and _GIT_FF_ONLY_FLAG.search(seg):
+            git_write = False
+        # A ``branch`` invocation is exempt from ``git_write`` ONLY when its
+        # actual SUBCOMMAND is ``branch`` and every argument after it is a
+        # known read-only flag -- see ``_git_branch_invocation_is_readonly``'s
+        # allowlist rationale.
+        is_branch = bool(subcmd and subcmd.group(1).lower() == "branch")
+        if git_write and is_branch and _git_branch_invocation_is_readonly(eff[subcmd.end():]):
+            git_write = False
         has_dash_c = is_git and bool(_GIT_DASH_C_FLAG.search(seg))
         for a in anchors:
             gp = a.get("path")
@@ -503,7 +683,11 @@ def decide(payload: dict, *, env=None, home=None,
 
     cwd = str(payload.get("cwd") or "")
     if anchors is None:
-        anchors = load_worktree_anchors(home)
+        registry_root = resolve_registry_root(
+            legacy_root=home / ".agent-worktrees",
+            environment=env,
+        )
+        anchors = load_worktree_anchors(registry_root)
     if not anchors:
         return None
 

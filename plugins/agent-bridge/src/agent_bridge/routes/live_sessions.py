@@ -10,17 +10,21 @@ is reaped by staleness rather than relying on a clean deregister.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import math
 import time
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from ..models import (
     AckMessagesRequest,
     AckMessagesResult,
+    CliModeReservationInfo,
+    CreateCliModeReservationRequest,
+    DelegatedResultSnapshot,
     IngestLiveEventsRequest,
     IngestLiveEventsResult,
     LiveMessage,
@@ -28,14 +32,38 @@ from ..models import (
     LiveProgressRequest,
     LiveSessionInfo,
     LiveSessionListResponse,
+    LiveSessionVenue,
     RegisterLiveSessionRequest,
     SendMessageRequest,
     SendMessageResult,
 )
+from ..events import EventLog
+from ..live_controls import (
+    CLAIMED_CONTROL_GRACE_SECONDS,
+    CONTROL_MAX_AGE_SECONDS,
+    SET_MODE_CONTROL,
+    ControlAckRequest,
+    SetModeRequest,
+    SetModeResult,
+)
 from ..live_representation import (
+    progress_from_events,
     await_turn_reply,
     build_progress_snapshot,
     derive_turn_state,
+    translate_reconnect_cursor,
+)
+from ..result_tokens import retarget
+from ..db_live_session_aliases import PROCESS_START_TOLERANCE_SECONDS
+from ..result_snapshot import (
+    DEFAULT_MAX_ITEMS,
+    DEFAULT_MAX_TEXT_CHARS,
+    MAX_MAX_ITEMS,
+    MAX_MAX_TEXT_CHARS,
+    ResultHistoryChangedError,
+    ResultTokenError,
+    build_represented_result_snapshot,
+    expand_represented_result_ref,
 )
 from .sessions import _sse_event_stream
 
@@ -50,17 +78,28 @@ if TYPE_CHECKING:
 router = APIRouter(prefix="/api/v1/live-sessions", tags=["live-sessions"])
 
 
-@dataclass
 class _RepresentedSession:
     """Minimal object satisfying ``_sse_event_stream``'s duck-typed access.
 
     The SSE helper only reads ``.session_id`` and ``.event_log`` (subscriber
     tracking is skipped when ``mgr=None``), so a represented live session needs
     no bridge ``Session`` -- keeping it off the ACP-owned ``SessionManager``.
+    With a ``store``, ``event_log`` is re-resolved on every read, so a stream
+    follows its session's log when a session-id change merges it into another.
     """
 
-    session_id: str
-    event_log: EventLog
+    def __init__(self, session_id: str, event_log: EventLog,
+                 store: LiveEventStore | None = None) -> None:
+        from ..live_representation import MergeFollowingLog
+
+        self.session_id = session_id
+        self._log = event_log
+        # One view per stream: it carries the stream's cursor across a merge.
+        self._view = MergeFollowingLog(store, session_id, event_log) if store is not None else None
+
+    @property
+    def event_log(self) -> EventLog:
+        return self._view if self._view is not None else self._log  # type: ignore[return-value]
 
 
 def _db(request: Request) -> Database:
@@ -75,6 +114,35 @@ def _store(request: Request) -> LiveEventStore:
     if store is None:
         raise HTTPException(status_code=503, detail="live event store not ready")
     return store
+
+
+def _result_history(request: Request, session_id: str):
+    """The log and its merge map from one snapshot (see ``snapshot``); a merge
+    still copying events is a retryable 503, never a stale-history answer."""
+    from ..live_representation import MergePendingError
+
+    try:
+        return _store(request).snapshot(session_id)
+    except MergePendingError as exc:
+        raise HTTPException(
+            status_code=503, headers={"Retry-After": "1"},
+            detail="represented history is merging (a session-id change); retry shortly",
+        ) from exc
+
+
+def _resolve_registration(db: Database, ref: str) -> dict[str, Any] | None:
+    exact = db.get_live_session(ref)
+    if exact is not None:
+        return exact
+    ownership = db.get_worktree_ownership(ref)
+    if ownership:
+        owned = db.get_session(ownership.get("session_id") or "")
+        if owned is not None and owned.get("status") in {"running", "idle"}:
+            return None
+    session_id = db.current_represented_session_for_worktree(
+        ref, now=time.time()
+    )
+    return db.get_live_session(session_id) if session_id else None
 
 
 def _live_liveness(row: dict[str, Any], *, now: float | None = None) -> str | None:
@@ -109,6 +177,26 @@ def _parse_progress(raw: Any) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _parse_venue(raw: Any) -> LiveSessionVenue | None:
+    """Parse the stored ``venue`` JSON string into a model, or None.
+
+    Malformed/legacy-shaped stored JSON reads back as "no venue" rather than
+    raising -- this is read-side reattach guidance, not an admission gate.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        return LiveSessionVenue(**data)
+    except (TypeError, ValueError):
+        return None
+
+
 def _to_info(row: dict[str, Any]) -> LiveSessionInfo:
     return LiveSessionInfo(
         session_id=row["session_id"],
@@ -125,9 +213,18 @@ def _to_info(row: dict[str, Any]) -> LiveSessionInfo:
         last_activity_at=row.get("last_activity_at"),
         liveness=_live_liveness(row),
         latest_progress=_parse_progress(row.get("latest_progress")),
+        cli_mode=bool(row.get("cli_mode")),
+        venue=_parse_venue(row.get("venue")),
         registered_at=row["registered_at"],
         updated_at=row["updated_at"],
     )
+
+
+def _require_finite_start(started: float | None) -> None:
+    """A process start time must be finite: NaN never compares as different from
+    a recorded one, so it would pass the identity checks for any process."""
+    if started is not None and not math.isfinite(started):
+        raise HTTPException(status_code=422, detail="process_started_at must be a finite timestamp")
 
 
 @router.post("", response_model=LiveSessionInfo)
@@ -139,8 +236,30 @@ async def register_live_session(
     Idempotent: a re-POST for the same ``session_id`` upserts the row and
     refreshes ``updated_at``, which is how the extension heartbeats liveness.
     """
+    _require_finite_start(body.process_started_at)
     db = _db(request)
     now = time.time()
+    prior = db.get_live_session(body.session_id)
+    # The pid alone can be reused; a known, different process start time is a
+    # different process even when the pid matches (same tolerance as rollover).
+    prior_started, started = (prior or {}).get("process_started_at"), body.process_started_at
+    pid_changed = bool(
+        prior
+        and prior.get("pid") is not None
+        and body.pid is not None
+        and prior.get("pid") != body.pid
+    ) or bool(
+        prior_started is not None and started is not None
+        and abs(prior_started - started) >= PROCESS_START_TOLERANCE_SECONDS
+    )
+    if pid_changed:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "incarnation_mismatch",
+                "session_id": body.session_id,
+            },
+        )
     status = db.register_live_session(
         body.session_id,
         machine=body.machine,
@@ -151,6 +270,8 @@ async def register_live_session(
         pid=body.pid,
         role=body.role,
         driven_by=body.driven_by,
+        venue=body.venue.model_dump_json() if body.venue is not None else None,
+        process_started_at=body.process_started_at,
         now=now,
     )
     if status != "live":
@@ -169,7 +290,85 @@ async def register_live_session(
     row = db.get_live_session(body.session_id)
     if row is None:  # pragma: no cover -- write-then-read on the same connection
         raise HTTPException(status_code=500, detail="registration not persisted")
+    store = getattr(request.app.state, "live_event_store", None)
+    if store is not None:
+        for alias_id in db.live_session_aliases_to(row["session_id"]):
+            store.alias(alias_id, row["session_id"])
     return _to_info(row)
+
+
+# -- CLI-mode Session Host reservations (agent-bridge-cli-mode-sessions) -----
+#
+# An explicit, operator-initiated allocation made *before* a muxed, interactive
+# CLI process starts (§allocate-before-launch, §opt-in-not-ambient-default).
+# A later live-session registration for the same worktree_id atomically claims
+# it (see ``register_live_session`` above); nothing here changes the ordinary
+# registration flow's behavior when no reservation was ever created.
+
+
+@router.post(
+    "/cli-mode-reservations/{worktree_id}", response_model=CliModeReservationInfo
+)
+async def create_cli_mode_reservation(
+    worktree_id: str, body: CreateCliModeReservationRequest, request: Request
+) -> CliModeReservationInfo:
+    db = _db(request)
+    if body.worktree_id != worktree_id:
+        raise HTTPException(
+            status_code=400,
+            detail="worktree_id path segment and body must match",
+        )
+    now = time.time()
+    reservation_id = db.create_cli_mode_reservation(
+        worktree_id, now=now, ttl_seconds=body.ttl_seconds,
+        venue=body.venue.model_dump_json() if body.venue else None,
+    )
+    if reservation_id is None:
+        # One-host-per-cwd-lane (§one-host-per-cwd-lane): a not-yet-expired
+        # reservation already holds this worktree.
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": "reservation_active", "worktree_id": worktree_id},
+        )
+    row = db.get_cli_mode_reservation(worktree_id)
+    if row is None:  # pragma: no cover -- write-then-read on the same connection
+        raise HTTPException(status_code=500, detail="reservation not persisted")
+    return _reservation_info(row)
+
+
+def _reservation_info(row: dict[str, Any]) -> CliModeReservationInfo:
+    return CliModeReservationInfo(**{**row, "venue": _parse_venue(row.get("venue"))})
+
+
+@router.get(
+    "/cli-mode-reservations/{worktree_id}", response_model=CliModeReservationInfo
+)
+async def get_cli_mode_reservation(
+    worktree_id: str, request: Request
+) -> CliModeReservationInfo:
+    db = _db(request)
+    row = db.get_cli_mode_reservation(worktree_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no reservation for worktree")
+    return _reservation_info(row)
+
+
+@router.delete("/cli-mode-reservations/{worktree_id}")
+async def release_cli_mode_reservation(
+    worktree_id: str,
+    request: Request,
+    reservation_id: str | None = None,
+    unclaimed_only: bool = False,
+) -> dict[str, int]:
+    """Release a reservation; with ``?reservation_id=`` only that exact one
+    (compare-and-delete), never a newer reservation created since. With
+    ``?unclaimed_only=true``, atomically leave already-claimed reservations
+    intact."""
+    db = _db(request)
+    removed = db.release_cli_mode_reservation(
+        worktree_id, reservation_id=reservation_id, unclaimed_only=unclaimed_only,
+    )
+    return {"removed": removed}
 
 
 @router.get("", response_model=LiveSessionListResponse)
@@ -211,6 +410,17 @@ async def resolve_live_session(handle: str, request: Request) -> LiveSessionInfo
     return _to_info(row)
 
 
+@router.get("/result-target", response_model=LiveSessionInfo)
+def resolve_live_result_target(handle: str, request: Request) -> LiveSessionInfo:
+    """Resolve an exact session or readable live/wedged worktree target."""
+    row = _resolve_registration(_db(request), handle)
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail="no represented result target for handle"
+        )
+    return _to_info(row)
+
+
 @router.get("/{session_id}", response_model=LiveSessionInfo)
 async def get_live_session(session_id: str, request: Request) -> LiveSessionInfo:
     """Fetch a single registered live interactive CLI session."""
@@ -219,6 +429,82 @@ async def get_live_session(session_id: str, request: Request) -> LiveSessionInfo
     if row is None:
         raise HTTPException(status_code=404, detail="live session not found")
     return _to_info(row)
+
+
+@router.get(
+    "/{session_ref}/result",
+    response_model=DelegatedResultSnapshot,
+)
+def get_live_result_snapshot(
+    session_ref: str,
+    request: Request,
+    position: str | None = Query(default=None, max_length=2048),
+    max_items: int = Query(default=DEFAULT_MAX_ITEMS, ge=1, le=MAX_MAX_ITEMS),
+    max_text_chars: int = Query(
+        default=DEFAULT_MAX_TEXT_CHARS, ge=256, le=MAX_MAX_TEXT_CHARS
+    ),
+):
+    """Return a bounded reduced-fidelity result for a represented session."""
+    db = _db(request)
+    row = _resolve_registration(db, session_ref)
+    if row is None:
+        raise HTTPException(status_code=404, detail="live session not found")
+    log, history = _result_history(request, row["session_id"])
+    position = retarget(position, history)
+    if log is None:
+        log = EventLog(
+            session_id=row["session_id"],
+            worktree_id=row.get("worktree_id"),
+            telemetry_source="represented",
+        )
+    try:
+        return build_represented_result_snapshot(
+            registration=_to_info(row).model_dump(mode="json"),
+            event_log=log,
+            requested_ref=session_ref,
+            position=position,
+            max_items=max_items,
+            max_text_chars=max_text_chars,
+            retired_ids=frozenset(db.live_session_aliases_to(row["session_id"])),
+        )
+    except ResultTokenError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{session_ref}/result/detail")
+def get_live_result_detail(
+    session_ref: str,
+    request: Request,
+    ref: str = Query(max_length=2048),
+):
+    """Resolve a process-lifetime represented result detail reference."""
+    db = _db(request)
+    row = _resolve_registration(db, session_ref)
+    if row is None:
+        raise HTTPException(status_code=404, detail="live session not found")
+    # The log and its merge map from one snapshot: a merge still copying
+    # events would otherwise leave a valid reference with no map (409).
+    log, history = _result_history(request, row["session_id"])
+    if log is None:
+        raise HTTPException(
+            status_code=404,
+            detail="represented event history is no longer available",
+        )
+    ref = retarget(ref, history) or ref
+    try:
+        return expand_represented_result_ref(
+            event_log=log,
+            session_id=row["session_id"],
+            token=ref,
+            retired_ids=frozenset(db.live_session_aliases_to(row["session_id"])),
+        )
+    except ResultHistoryChangedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ResultTokenError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        detail = str(exc.args[0]) if exc.args else "Result detail is unavailable"
+        raise HTTPException(status_code=404, detail=detail) from exc
 
 
 @router.post("/{session_id}/progress", response_model=LiveSessionInfo)
@@ -254,19 +540,29 @@ async def record_live_progress(
 
 @router.delete("/{session_id}")
 async def deregister_live_session(
-    session_id: str, request: Request
+    session_id: str, request: Request,
+    pid: int | None = Query(default=None),
+    process_started_at: float | None = Query(default=None),
 ) -> dict[str, Any]:
     """Deregister a live interactive CLI session (best-effort on session exit).
 
     Deleting an unknown session_id is a no-op (idempotent), so a duplicate or
     late deregister never errors. Also drops any represented event log so the
-    live tail's memory is reclaimed when the session goes away.
+    live tail's memory is reclaimed when the session goes away. An extension
+    passes its own ``pid``/``process_started_at``: a row another process has
+    since registered under the id is then left alone.
     """
+    _require_finite_start(process_started_at)
     db = _db(request)
-    db.deregister_live_session(session_id)
+    # Only the call that deletes the exact registration drops the represented
+    # log: a late DELETE through a retired id (or one that lost a race with a
+    # rollover) deletes nothing and must not drop the live successor's log.
+    deleted = db.deregister_live_session(
+        session_id, pid=pid, process_started_at=process_started_at)
     store = getattr(request.app.state, "live_event_store", None)
-    if store is not None:
-        store.drop(session_id)
+    if store is not None and deleted:
+        for sid in store.ids_of(session_id) or [session_id]:
+            store.drop(sid)
     return {"ok": True, "session_id": session_id}
 
 
@@ -286,6 +582,8 @@ async def ingest_live_events(
     registration = db.get_live_session(session_id)
     if registration is None:
         raise HTTPException(status_code=404, detail="live session not found")
+    # A retired id forwards here: ingest, derive and report under the current id.
+    session_id = registration["session_id"]
     store = _store(request)
     raw = [e.model_dump() for e in body.events]
     ingested = store.ingest(
@@ -297,11 +595,30 @@ async def ingest_live_events(
     # tracker sees running/idle/stalled -- objective and token-free.
     prior = (db.get_live_session(session_id) or {}).get("turn_state")
     new_state, saw_activity = derive_turn_state(raw, prior_state=prior)
+    # A represented turn-end can arrive even while the current process-lifetime
+    # tail still has an open root tool call. In that case the open tool is the
+    # strongest local evidence: status surfaces must not read idle while
+    # active_work can name a running command.
+    log = store.get(session_id)
+    if (
+        new_state == "idle"
+        and log is not None
+        and log.active_tool_call(include_nested=False) is not None
+    ):
+        new_state = "running"
+        saw_activity = True
     if new_state != prior or saw_activity:
         db.update_live_turn_state(
             session_id, turn_state=new_state, last_activity_at=time.time()
         )
-    log = store.get(session_id)
+    beat = progress_from_events(
+        raw, _parse_progress(registration.get("latest_progress")), ts=time.time(),
+    )
+    if beat is not None:
+        db.update_live_progress(
+            session_id, latest_progress=json.dumps(beat, separators=(",", ":")),
+            now=time.time(),
+        )
     last_id = log.latest_id if log is not None else 0
     return IngestLiveEventsResult(
         session_id=session_id, ingested=ingested, last_id=last_id
@@ -310,7 +627,8 @@ async def ingest_live_events(
 
 @router.get("/{session_id}/events")
 async def stream_live_events(
-    session_id: str, request: Request, after: int | None = None
+    session_id: str, request: Request, after: int | None = None,
+    continuity_id: str | None = None,
 ) -> StreamingResponse:
     """SSE stream of a represented live session's translated events.
 
@@ -319,30 +637,58 @@ async def stream_live_events(
     identically to a bridge-owned one -- read-only: there is no turn/stop/cursor
     surface here, and permission events arrive unanswerable. Starts from
     ``?after=<id>`` (default 0 = the whole in-memory tail).
+
+    ``X-Agent-Bridge-Continuity`` names the log the ids are numbered on, and an
+    in-band ``continuity`` event names the new one when the stream follows a
+    session-id change into a merged log. A reconnect that passes that name back
+    as ``?continuity_id=`` has its ``after`` translated to the merged numbering.
     """
     db = _db(request)
     registration = db.get_live_session(session_id)
     if registration is None:
         raise HTTPException(status_code=404, detail="live session not found")
+    session_id = registration["session_id"]
     store = _store(request)
     log = store.get_or_create(
         session_id, worktree_id=registration.get("worktree_id")
     )
-    shim = _RepresentedSession(session_id=session_id, event_log=log)
+    start = translate_reconnect_cursor(store, log, continuity_id, after or 0)
+    shim = _RepresentedSession(session_id=session_id, event_log=log, store=store)
     server = getattr(request.app.state, "uvicorn_server", None)
+    # One snapshot for the header and the announcer: an empty log gains its
+    # continuity with its first event, which must then be announced in-band.
+    initial_continuity = log.continuity_id
+
+    async def _announcing_continuity(stream):
+        announced = initial_continuity
+        async for chunk in stream:
+            following = getattr(shim.event_log, "followed_continuity_id", announced)
+            if following and following != announced:
+                note = {"continuity_id": following}
+                moved = getattr(shim.event_log, "translated_cursor", None)
+                if moved is not None:
+                    note["after"] = moved  # the reader's cursor, renumbered with it
+                elif announced is None:
+                    note["after"] = start  # an empty log's first event: the cursor the header couldn't carry
+                announced = following
+                yield f"event: continuity\ndata: {json.dumps(note)}\n\n"
+            yield chunk
+
     return StreamingResponse(
-        _sse_event_stream(
+        _announcing_continuity(_sse_event_stream(
             shim,
-            after or 0,
+            start,
             server=server,
             is_disconnected=getattr(request, "is_disconnected", None),
             mgr=None,
-        ),
+        )),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
+            **({"X-Agent-Bridge-Continuity": initial_continuity,
+                "X-Agent-Bridge-Cursor": str(start)} if initial_continuity else {}),
         },
     )
 
@@ -365,8 +711,15 @@ async def post_live_message(
     head is captured **before** enqueue so the reply window starts at the moment
     of sending.
     """
+    if body.kind.startswith("control:"):
+        raise HTTPException(
+            status_code=400,
+            detail="control kinds are reserved; use the session's control routes (e.g. /mode)",
+        )
     db = _db(request)
     now = time.time()
+    target = db.get_live_session(session_id)
+    target_session_id = target["session_id"] if target is not None else session_id
 
     # Freshness lease (#2906): validate the target registration's heartbeat
     # lease and enqueue *atomically* -- the check + insert run under one write
@@ -381,16 +734,17 @@ async def post_live_message(
         # rejected send must not leak a permanent LiveEventStore log for a
         # stale/absent id. get_or_create is deferred until after the enqueue
         # succeeds below.
-        existing_log = _store(request).get(session_id)
+        existing_log = _store(request).get(target_session_id)
         after = existing_log.latest_id if existing_log is not None else 0
 
     message_id, reason = db.enqueue_live_message_if_fresh(
-        session_id,
+        target_session_id,
         sender=body.sender,
         body=body.body,
         now=now,
         reply_to=body.reply_to,
         kind=body.kind,
+        delivery=body.delivery,
         expected_session_id=body.expected_session_id,
         idempotency_key=body.idempotency_key,
     )
@@ -400,7 +754,7 @@ async def post_live_message(
         raise HTTPException(
             status_code=409,
             detail=(
-                f"live session {session_id} is no longer fresh (it ended, was "
+                f"live session {target_session_id} is no longer fresh (it ended, was "
                 "reaped, or was taken over); refusing delivery"
             ),
         )
@@ -435,21 +789,146 @@ async def post_live_message(
         raise HTTPException(status_code=500, detail="enqueue produced no id")
 
     if not body.wait:
-        return SendMessageResult(session_id=session_id, message_id=message_id)
+        return SendMessageResult(session_id=target_session_id, message_id=message_id)
 
     store = _store(request)
-    registration = db.get_live_session(session_id) or {}
+    registration = db.get_live_session(target_session_id) or {}
     log = store.get_or_create(
-        session_id, worktree_id=registration.get("worktree_id")
+        target_session_id, worktree_id=registration.get("worktree_id")
     )
     reply = await await_turn_reply(log, after=after, timeout=body.wait_timeout)
     return SendMessageResult(
-        session_id=session_id,
+        session_id=target_session_id,
         message_id=message_id,
         replied=bool(reply["replied"]),
         reply=reply["reply"],
         stop_reason=reply["stop_reason"],
     )
+
+
+#: How often ``POST /mode`` checks whether the extension applied the change.
+MODE_POLL_SECONDS = 0.25
+
+
+@router.post("/{session_id}/mode", response_model=SetModeResult)
+async def set_live_mode(
+    session_id: str, body: SetModeRequest, request: Request
+) -> SetModeResult:
+    """Switch a live session's agent mode, as ``/autopilot on`` or ``/plan``
+    would from its own terminal (ACP's ``session/set_mode``).
+
+    The change is queued as a session control that the session's extension
+    claims from ``/controls`` (never from ``/messages``, so an extension that
+    predates controls can't deliver it as a prompt), applies through the CLI's
+    own ``session.rpc.mode.set``, and reports through ``/controls/ack``. The
+    claim orders the two sides: at ``wait_timeout`` an unclaimed control is
+    withdrawn (``withdrawn``: it never applies later); a claimed one is waited
+    on briefly for its outcome, else reported ``in_flight`` (it may still apply).
+    """
+    db = _db(request)
+    target = db.get_live_session(session_id)
+    target_session_id = target["session_id"] if target is not None else session_id
+    control_id, reason = db.enqueue_live_message_if_fresh(
+        target_session_id,
+        sender=body.sender,
+        body=body.mode,
+        now=time.time(),
+        kind=SET_MODE_CONTROL,
+        delivery="queue",
+        expected_session_id=body.expected_session_id,
+    )
+    if reason == "not_found":
+        raise HTTPException(status_code=404, detail="live session not found")
+    if reason is not None or control_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"live session {session_id} can't take a mode change now ({reason})",
+        )
+    def settled() -> SetModeResult | None:
+        # Follow a session-id change while waiting: the control moves with it.
+        # (the DB reads and writes resolve the alias in-statement).
+        nonlocal target_session_id
+        outcome = (db.live_control_state(target_session_id, control_id) or {}).get("outcome")
+        target_session_id = db.resolve_live_session_id(target_session_id)
+        if outcome == "applied":
+            return SetModeResult(session_id=target_session_id, mode=body.mode, applied=True, state="applied")
+        if outcome is not None:
+            return SetModeResult(
+                session_id=target_session_id, mode=body.mode, applied=False, state="rejected",
+                detail="the session couldn't apply it",
+            )
+        return None
+
+    deadline = time.monotonic() + body.wait_timeout
+    while time.monotonic() < deadline:
+        if (result := settled()) is not None:
+            return result
+        await asyncio.sleep(MODE_POLL_SECONDS)
+    withdrawn = db.withdraw_live_control(target_session_id, control_id, time.time())
+    target_session_id = db.resolve_live_session_id(target_session_id)
+    if withdrawn:
+        return SetModeResult(
+            session_id=target_session_id, mode=body.mode, applied=False, state="withdrawn",
+            detail=(
+                "the session didn't take it in time: its agent-bridge extension may "
+                "predate mode changes, or the session isn't responding"
+            ),
+        )
+    # Claimed: the session is applying it; wait briefly for its outcome.
+    grace = time.monotonic() + CLAIMED_CONTROL_GRACE_SECONDS
+    while True:
+        if (result := settled()) is not None:
+            return result
+        if time.monotonic() >= grace:
+            break
+        await asyncio.sleep(MODE_POLL_SECONDS)
+    return SetModeResult(
+        session_id=target_session_id, mode=body.mode, applied=None, state="in_flight",
+        detail="the session took the change but hasn't reported it applied; it may still apply",
+    )
+
+
+@router.get("/{session_id}/controls", response_model=LiveMessageListResponse)
+async def list_live_controls(
+    session_id: str, request: Request
+) -> LiveMessageListResponse:
+    """Claim pending session controls (a mode change), oldest-first: the
+    extension's control poll. Each is returned once; the extension applies it
+    and reports the outcome through ``/controls/ack``."""
+    db = _db(request)
+    row = db.get_live_session(session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="live session not found")
+    target_session_id = row["session_id"]
+    rows = db.claim_live_controls(target_session_id, time.time(), CONTROL_MAX_AGE_SECONDS)
+    return LiveMessageListResponse(
+        messages=[
+            LiveMessage(
+                id=r["id"], sender=r["sender"], body=r["body"],
+                kind=r.get("kind") or SET_MODE_CONTROL, created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+    )
+
+
+@router.post("/{session_id}/controls/ack", response_model=AckMessagesResult)
+async def ack_live_controls(
+    session_id: str, body: ControlAckRequest, request: Request
+) -> AckMessagesResult:
+    """Record the outcome of claimed controls (``applied``, else ``rejected``).
+    Only controls are settled here, and only once claimed; unlike a message
+    ack, it doesn't mark the session busy: a mode change starts no turn."""
+    db = _db(request)
+    row = db.get_live_session(session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="live session not found")
+    target_session_id = row["session_id"]
+    acked = db.ack_live_messages(
+        target_session_id, body.ids, now=time.time(), controls=True,
+        outcome="applied" if body.applied else "rejected",
+    )
+    return AckMessagesResult(acked=acked)
 
 
 @router.get("/{session_id}/messages", response_model=LiveMessageListResponse)
@@ -462,9 +941,11 @@ async def list_live_messages(
     ``session.send``, then acks. 404 if the session is not registered.
     """
     db = _db(request)
-    if db.get_live_session(session_id) is None:
+    row = db.get_live_session(session_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="live session not found")
-    rows = db.list_pending_live_messages(session_id)
+    target_session_id = row["session_id"]
+    rows = db.list_pending_live_messages(target_session_id)
     return LiveMessageListResponse(
         messages=[
             LiveMessage(
@@ -473,6 +954,7 @@ async def list_live_messages(
                 body=r["body"],
                 reply_to=r.get("reply_to"),
                 kind=r.get("kind") or "prompt",
+                delivery=r.get("delivery") or "queue",
                 created_at=r["created_at"],
             )
             for r in rows
@@ -490,7 +972,18 @@ async def ack_live_messages(
     is a no-op, so a redelivered ack never errors or double-counts.
     """
     db = _db(request)
-    if db.get_live_session(session_id) is None:
+    row = db.get_live_session(session_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="live session not found")
-    acked = db.ack_live_messages(session_id, body.ids, now=time.time())
+    target_session_id = row["session_id"]
+    now = time.time()
+    acked = db.ack_live_messages(target_session_id, body.ids, now=now)
+    if acked:
+        # The extension acks only after ``session.send`` resolves. That is the
+        # bridge's first reliable evidence that a queued/steered prompt reached
+        # the live CLI after an idle turn, so mark the represented session busy
+        # until later mirrored events (or a turn boundary) refine it.
+        db.update_live_turn_state(
+            target_session_id, turn_state="running", last_activity_at=now
+        )
     return AckMessagesResult(acked=acked)

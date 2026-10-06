@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-bridge"
-version = "0.4.0-dev410"
+version = "0.9.13-dev1"
 description = "Persistent inter-agent communication service for Copilot CLI"
 readme = "README.md"
 license = "MIT"
@@ -38,15 +38,26 @@ dependencies = [
     "agent-procutil",
     "agent-dropin-registry",
     "agent-plugin-activation",
+    "agent-remote-login-shell",
 ]
 
 [tool.uv.sources]
 # Always resolve the vendored lib from the local path, never an index.
 # The distribution is named agent-ssh-manager (not the squatted PyPI name
 # "ssh-manager") to prevent dependency-confusion; the import module stays
-# ``ssh_manager``.
+# ``ssh_manager``. This is a `uv`-editable canonical reference
+# (vendor-pointer-generalization effort, Phase 1): `path` escapes this
+# plugin's own root and resolves live to `libs/ssh-manager`, so this
+# `dev`-branch checkout has nothing to keep manually in sync -- only a
+# real `main`-branch release (tools/materialize_main.py) ever gets a real
+# local copy.
 agent-ssh-manager = { path = "libs/ssh-manager" }
 # credential-relay framework + host-credential sources (module ``credential_relay``).
+# This is a `uv`-editable canonical reference (vendor-pointer-generalization
+# effort, Phase 1): `path` escapes this plugin's own root and resolves live
+# to `libs/credential-relay`, so this `dev`-branch checkout has nothing to
+# keep manually in sync -- only a real `main`-branch release
+# (tools/materialize_main.py) ever gets a real local copy.
 agent-credential-relay = { path = "libs/credential-relay" }
 # zero-downtime cutover primitives -- the routing table + cutover orchestrator
 # (module ``zdd``), extracted from this plugin so other services reuse them.
@@ -54,17 +65,38 @@ agent-zdd = { path = "libs/zdd" }
 # single-instance lease + supersession self-retire + reconcile-set reaper
 # (module ``single_instance_lease``), extracted from this plugin's singleton /
 # self_retire so other services inherit one correct "one active per host" impl.
+# This is a `uv`-editable canonical reference (vendor-pointer-generalization
+# effort, Phase 1): `path` escapes this plugin's own root and resolves live to
+# `libs/single-instance-lease`, so every consumer shares one canonical copy.
 agent-single-instance-lease = { path = "libs/single-instance-lease" }
-# config schema versioning + migration (module ``config_migrate``).
+# config schema versioning + migration (module ``config_migrate``). This is
+# a `uv`-editable canonical reference (vendor-pointer-generalization
+# effort, Phase 1): `path` escapes this plugin's own root and resolves
+# live to `libs/config-migrate`, so every consumer shares one canonical
+# copy.
 agent-config-migrate = { path = "libs/config-migrate" }
 # Copilot CLI + Claude plugin resolution -- marketplaces, plugins, repo settings
 # (module ``plugin_resolve``). Shared with agent-codespaces.
 agent-plugin-resolve = { path = "libs/plugin-resolve" }
 # Shared Windows-headless / detached process-spawn kwargs (module
-# ``agent_procutil``). Vendored per plugin; byte-identical src across copies.
+# ``agent_procutil``). This is a `uv`-editable canonical reference
+# (vendor-pointer-generalization effort, Phase 1 -- converted early as a
+# prerequisite for `ssh-manager`'s own conversion, which depends on it):
+# `path` escapes this plugin's own root and resolves live to
+# `libs/agent-procutil`, so this `dev`-branch checkout has nothing to keep
+# manually in sync -- only a real `main`-branch release
+# (tools/materialize_main.py) ever gets a real local copy.
 agent-procutil = { path = "libs/agent-procutil" }
 # Resilient tri-state scans/findings for providers.d.
 agent-dropin-registry = { path = "libs/dropin-registry" }
+# Shared POSIX login-shell command wrapping for remote SSH exec (module
+# ``remote_login_shell``, copilot-extensions#5207). This is a `uv`-editable
+# canonical reference (vendor-pointer-generalization effort, Phase 1): `path`
+# escapes this plugin's own root and resolves live to
+# `libs/remote-login-shell`, so this `dev`-branch checkout has nothing to
+# keep manually in sync -- only a real `main`-branch release
+# (tools/materialize_main.py) ever gets a real local copy.
+agent-remote-login-shell = { path = "libs/remote-login-shell" }
 # Effective plugin enablement and identity-verified root resolution.
 agent-plugin-activation = { path = "libs/plugin-activation" }
 
@@ -73,6 +105,10 @@ agent-bridge = "agent_bridge.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# The /ui control surface's page, scripts, and stylesheet (routes/ui.py).
+agent_bridge = ["ui_static/*.html", "ui_static/*.js", "ui_static/*.css"]
 
 [tool.ruff]
 target-version = "py310"

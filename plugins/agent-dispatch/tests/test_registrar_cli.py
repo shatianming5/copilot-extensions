@@ -79,3 +79,77 @@ def test_registrar_discover_repo(tmp_path, monkeypatch, capsys):
     assert rc == 0
     assert data[0]["name"] == "review"
     assert data[0]["owner"] == "repo:myrepo"
+
+
+def test_registrar_discover_repo_evaluator_kind_shows_real_fields(tmp_path, monkeypatch, capsys):
+    """An evaluator-kind declaration's real ``kind``/``spec`` must surface
+    through ``discover-repo`` -- never the generic supervised-lane
+    pool-profile shape, which would make a correctly-parsed evaluator look
+    like an inert, misconfigured worker-pool profile instead."""
+    monkeypatch.setenv(REGISTRAR_DIR_ENV, str(tmp_path))
+    reg = tmp_path / "myrepo" / ".agent-dispatch" / "registrar"
+    reg.mkdir(parents=True)
+    (reg / "my-evaluator.yaml").write_text(
+        "\n".join(
+            [
+                "name: my-evaluator",
+                "kind: evaluator",
+                "spec:",
+                "  repo: example.com/owner/name",
+                "  evaluator_ref: my-evaluator",
+                "  evaluator_spec:",
+                "    scripts:",
+                "      my-evaluator: [/usr/bin/python3, -m, my_module]",
+                "    timeout_seconds: 30",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rc, out = _run(["registrar", "discover-repo", str(tmp_path / "myrepo")], capsys)
+    data = json.loads(out)
+    assert rc == 0
+    (decl,) = data
+    assert decl["name"] == "my-evaluator"
+    assert decl["kind"] == "evaluator"
+    assert decl["spec"]["evaluator_ref"] == "my-evaluator"
+    assert decl["spec"]["evaluator_spec"]["scripts"]["my-evaluator"] == [
+        "/usr/bin/python3",
+        "-m",
+        "my_module",
+    ]
+    # Never the generic pool-profile shape for a non-lane kind.
+    assert "body" not in decl
+    assert "concurrency" not in decl
+
+
+def test_registrar_discover_repo_surfaces_body_charter(tmp_path, monkeypatch, capsys):
+    """A declared ``body.charter`` (and the label-override fields) must
+    surface through ``discover-repo`` -- the summary previously hardcoded
+    only ``type``/``agent``, silently dropping a correctly-parsed charter
+    from view and making the venue-vs-charter split look unsupported to
+    anyone debugging a declaration this way (the exact false signal that
+    led a prior investigation to conclude this field didn't exist)."""
+    monkeypatch.setenv(REGISTRAR_DIR_ENV, str(tmp_path))
+    reg = tmp_path / "myrepo" / ".agent-dispatch" / "registrar"
+    reg.mkdir(parents=True)
+    (reg / "charter-worker.yaml").write_text(
+        "\n".join(
+            [
+                "name: charter-worker",
+                "labels: [charter-worker]",
+                "body:",
+                "  type: headless",
+                "  agent: example-project@example-host",
+                "  charter: charter-worker",
+                "  disposable_cli_labels: [charter-worker]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rc, out = _run(["registrar", "discover-repo", str(tmp_path / "myrepo")], capsys)
+    data = json.loads(out)
+    assert rc == 0
+    (decl,) = data
+    assert decl["body"]["agent"] == "example-project@example-host"
+    assert decl["body"]["charter"] == "charter-worker"
+    assert decl["body"]["disposable_cli_labels"] == ["charter-worker"]

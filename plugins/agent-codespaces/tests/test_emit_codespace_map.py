@@ -6,6 +6,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 _SCRIPT = (
     Path(__file__).resolve().parents[1] / "scripts" / "emit_codespace_map.py"
 )
@@ -54,6 +56,9 @@ def test_filters_only_codespace_delegated():
     assert r["vessel"] == "example-org/example-web-codespaces"
     assert r["workspace_folder"] == "/workspaces/example-web"
     assert r["machine"] == "largePremiumLinux256gb"
+    assert r["role"] == "product"
+    assert r["locus"] == "codespace"
+    assert r["delegate"] == "agent-codespaces"
 
 
 def test_render_is_brief_markdown():
@@ -66,25 +71,73 @@ def test_render_is_brief_markdown():
     assert "sample-standard" not in md
 
 
-def test_render_survives_missing_codespace_block():
+def test_missing_codespace_locus_is_not_a_codespace_route():
     related = [{
         "name": "bare",
         "delegate": "agent-codespaces",
         "locus": {},
     }]
-    rows = mod._codespace_delegated(related)
-    assert rows[0]["name"] == "bare"
-    md = mod._render(rows)
-    assert "**bare**" in md
+    assert mod._codespace_delegated(related) == []
 
 
 def test_aggregate_render_is_owned_and_bounded():
     rows = mod._codespace_delegated(RELATED)
     context = mod._render_aggregate(rows * 20, "1.2.3")
     assert context.startswith("[owner: agent-codespaces@1.2.3]\n")
-    assert "no local checkout" in context
-    assert "`agent-codespaces` skill" in context
-    assert len(context.encode("utf-8")) <= 384
+    assert "No local checkout" in context
+    assert "delegate=agent-codespaces" in context
+    assert "example-web(role=product,locus=codespace)" in context
+    assert "+16 more" in context
+    assert len(mod._serialize_context(context).encode("utf-8")) <= 384
+
+
+def test_aggregate_render_includes_exact_route_fields():
+    context = mod._render_aggregate(mod._codespace_delegated(RELATED), "1.2.3")
+    assert (
+        "CodeSpace routes (delegate=agent-codespaces): "
+        "example-web(role=product,locus=codespace)"
+    ) in context
+
+
+def test_missing_preferred_locus_uses_related_default_and_is_filtered():
+    assert mod._codespace_delegated(
+        [
+            {
+                "name": "bare",
+                "role": "tooling",
+                "delegate": "agent-codespaces",
+                "locus": {},
+            }
+        ]
+    ) == []
+
+
+def test_preferred_locus_kind_is_case_insensitive():
+    rows = mod._codespace_delegated(
+        [
+            {
+                "name": "case-route",
+                "role": "tooling",
+                "delegate": "agent-codespaces",
+                "locus": {"preferred": "CodeSpace"},
+            }
+        ]
+    )
+
+    assert rows[0]["locus"] == "codespace"
+
+
+def test_qualified_codespace_locus_is_rejected():
+    assert mod._codespace_delegated(
+        [
+            {
+                "name": "invalid-route",
+                "role": "tooling",
+                "delegate": "agent-codespaces",
+                "locus": {"preferred": "codespace:typo"},
+            }
+        ]
+    ) == []
 
 
 def test_empty_when_no_delegated_repos():
@@ -97,3 +150,102 @@ def test_additional_context_shape():
     md = mod._render(mod._codespace_delegated(RELATED))
     payload = json.dumps({"additionalContext": md})
     assert json.loads(payload)["additionalContext"] == md
+
+
+def test_empty_emission_has_no_record_separator(capsys):
+    with pytest.raises(SystemExit):
+        mod._emit_empty()
+
+    assert capsys.readouterr().out == "{}"
+
+
+def test_main_uses_one_managed_agent_worktrees_start(monkeypatch, capsys):
+    calls = []
+
+    def fake_aw(*args, **kwargs):
+        calls.append((args, kwargs.get("cwd")))
+        return json.dumps({"related": RELATED})
+
+    monkeypatch.setattr(mod, "_aw", fake_aw)
+    monkeypatch.setattr(mod.sys, "argv", ["emit_codespace_map.py", "--aggregate"])
+
+    mod.main()
+
+    assert calls == [
+        (("related", "list", "--json", "--require-managed"), None),
+    ]
+    assert "example-web(role=product,locus=codespace)" in json.loads(
+        capsys.readouterr().out
+    )["additionalContext"]
+
+
+def test_main_is_empty_when_managed_related_query_is_rejected(monkeypatch, capsys):
+    calls = []
+
+    def fake_aw(*args, **kwargs):
+        calls.append((args, kwargs.get("cwd")))
+        return None
+
+    monkeypatch.setattr(mod, "_aw", fake_aw)
+
+    with pytest.raises(SystemExit):
+        mod.main()
+
+    assert calls == [(("related", "list", "--json", "--require-managed"), None)]
+    assert capsys.readouterr().out == "{}"
+
+
+def test_main_forwards_authoritative_cwd_argument(monkeypatch, capsys):
+    calls = []
+
+    def fake_aw(*args, **kwargs):
+        calls.append((args, kwargs.get("cwd")))
+        return json.dumps({"related": RELATED})
+
+    monkeypatch.setattr(mod, "_aw", fake_aw)
+    monkeypatch.setattr(
+        mod.sys, "argv", ["emit_codespace_map.py", "--cwd", "/repo/worktree"]
+    )
+
+    mod.main()
+
+    assert calls == [
+        (("related", "list", "--json", "--require-managed"), "/repo/worktree"),
+    ]
+
+
+def test_powershell_wrapper_preserves_newline_free_output():
+    wrapper = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "emit-codespace-map.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "Write-Output" not in wrapper
+    assert "[Console]::Out.Write([string]$out)" in wrapper
+
+
+def test_agent_procutil_src_prefers_materialized_payload_copy(tmp_path: Path):
+    """A real release (materialize_main.py copies canonical in at
+    promotion time) has a local libs/agent-procutil/src -- prefer it."""
+    payload = tmp_path / "payload"
+    local_src = payload / "libs" / "agent-procutil" / "src"
+    local_src.mkdir(parents=True)
+
+    assert mod._agent_procutil_src(payload) == str(local_src)
+
+
+def test_agent_procutil_src_falls_back_to_canonical_when_local_copy_absent(
+    tmp_path: Path,
+):
+    """vendor-pointer-generalization effort, Phase 1: agent-procutil is a
+    `uv`-editable canonical reference for agent-codespaces, so a dev
+    checkout has NO local payload/libs/agent-procutil copy at all -- must
+    resolve the canonical repo-root libs/agent-procutil/src instead."""
+    repo_root = tmp_path / "repo"
+    payload = repo_root / "plugins" / "agent-codespaces"
+    payload.mkdir(parents=True)
+    canonical_src = repo_root / "libs" / "agent-procutil" / "src"
+    canonical_src.mkdir(parents=True)
+
+    assert mod._agent_procutil_src(payload) == str(canonical_src)

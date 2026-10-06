@@ -9,7 +9,7 @@
   all three of its roles.
 - **Scope:** leaf (concrete component; links its sibling capability visions)
 - **Status:** Active
-- **Last revised:** 2026-08-14
+- **Last revised:** 2026-09-04
 - **Reality docs:** [`docs/install-contract.md`](../../docs/install-contract.md) ·
   [`docs/architecture.md`](../../docs/architecture.md)
 
@@ -53,9 +53,11 @@ Two roles at first, a third as the harness grows — **one app**:
   when the harness is invoked with no project context.
 - **Control-plane** (optional): the app is also the **optional worktree- and
   agent- control-plane** — the interactive front door for **picking, launching,
-  and managing** worktree-backed agent sessions, with **session management**,
-  **terminal multiplexing**, and **visual decision aids** for choosing where to
-  launch. This is where the Worktree Picker lives. It is **optional** in the
+  and managing** worktree-backed agent sessions through whichever compatible
+  **session-host provider** the user selects, with visual decision aids for
+  choosing where and how to launch. A terminal multiplexer is one optional
+  provider capability, not the control-plane's universal execution model. This
+  is where the Worktree Picker lives. It is **optional** in the
   strongest sense: the plugins carry the in-session tools an agent needs to do
   its job and **provision and manage themselves — daemons included — with this
   control-plane entirely absent**. The control-plane makes the fleet *legible and
@@ -77,11 +79,12 @@ and fix how it is wired.
   familiar single-command `curl … | bash` / `iex …` shape) that fetches and runs
   the installer directly, independent of any plugin or prior harness tooling. It
   is the front door the inert-plugin failure mode requires.
-- **Prerequisite layer** — the step that ensures the machine's foundational tools
-  exist (a terminal multiplexer, a Python runtime, the Python package/venv
-  manager, and kin), installing what is missing and **pausing for a restart when
-  it changes the environment** (PATH, shell integration) so later steps run
-  against a ready machine.
+- **Prerequisite layer** — the step that ensures the machine's foundational
+  tools and the prerequisites of the user's selected session hosts exist,
+  installing what is missing and **pausing for a restart when it changes the
+  environment** (PATH, shell integration) so later steps run against a ready
+  machine. A terminal multiplexer is required only when the user selects a host
+  that depends on one.
 - **Core install** — driving the harness's **own** real install flow (not a
   reimplementation) so the **core actually exists**: the user-global ground
   runtime for Copilot, its binstubs, and the baseline services every other layer
@@ -97,11 +100,11 @@ and fix how it is wired.
   presents the harness's real state (installed plugins and their prerequisites,
   machine/config, registered repos and accounts) and lets a human browse and
   adjust it. It is the same app as the installer, entered in its ongoing mode.
-- **The optional control-plane (Worktree Picker & session launcher)** — the
+- **The optional control-plane (Worktree Picker & host selector)** — the
   interactive front door for the fleet of worktree-backed agents: viewing,
-  joining, resuming, creating, and **launching** agent sessions, with **session
-  management**, **terminal multiplexing**, and **visual decision aids** for
-  choosing *where* to launch before paying the cost. The Worktree Picker's role,
+  joining, resuming, creating, and **launching** agent sessions through
+  discovered providers, with visual decision aids for choosing *where and how*
+  to launch before paying the cost. The Worktree Picker's role,
   guarantees, and interaction promises are defined by the
   [picker](../picker/README.md) vision; this app is where that surface is
   **delivered and kept current**. It is **optional**: a user who only wants the
@@ -117,10 +120,16 @@ and fix how it is wired.
   plugin pipe) and *wraps* session launches, the app **keeps itself up to date on
   its own**, out-of-band from any Copilot session, so the launcher never depends
   on a session to refresh the launcher.
-- **Presets** — shareable, **Git-referenced** configuration bundles a user can
-  pull in to preconfigure a whole work arrangement at once (related repos,
-  account/identity config, venue/CodeSpace settings), rather than assembling each
-  by hand. A preset is a portable starting point, resolved by reference.
+- **Presets** — a shareable configuration bundle a `<repo>-harness` plugin
+  carries **as part of its own payload** (related-repo declarations, venue/
+  CodeSpace product defaults, and more), so adopting the plugin preconfigures
+  the whole work arrangement at once rather than assembling each piece by
+  hand. A preset is adopted the same way the plugin itself is — no separate
+  reference-resolution step to repeat. It carries only portable, repo-neutral
+  defaults; account/identity configuration stays repo-owned and always wins
+  (the existing provider-config-is-the-floor precedence,
+  [`docs/patterns/codespace-repo-provenance.md`](../../docs/patterns/codespace-repo-provenance.md)),
+  never shipped in the plugin bundle itself.
 
 ## Features
 
@@ -179,17 +188,28 @@ configurator, making the standing surface reachable by the most natural gesture.
 The app **optionally** serves as the worktree- and agent- control-plane: the
 interactive front door (the Worktree Picker) for viewing, joining, resuming,
 creating, and **launching** worktree-backed agent sessions, with **session
-management**, **terminal multiplexing**, and **visual decision aids** for
-choosing where to launch. This surface is **additive and optional** — the plugins
+management supplied by the selected execution host** and **visual decision
+aids** for choosing where and how to launch. This surface is **additive and
+optional** — the plugins
 provide the in-session tools agents use and are fully functional without it — and
 its role/guarantees are owned by the [picker](../picker/README.md) vision; this
 app is where it is delivered and kept current. The interactive Picker opens by the
 **single most natural gesture — a bare, no-args invocation** of a project's front
 door; **every** other invocation routes programmatically to the plugins' own CLIs,
-whether or not it is interactive. And because a **terminal multiplexer is a heavy,
-invasive dependency**, muxing is a capability this app **provides** (the plugins
-detect it and use it when present, and run **non-muxed** when it is absent) rather
-than something the lightweight plugins carry.
+whether or not it is interactive. Execution is provider-neutral: the app
+currently drives both the **TMux/PSMux presentation layer** and the **AHP
+session backend** — composable, not exclusive, choices — for launch, resume,
+and reattach, and may add ACP, SDK, App, or third-party hosts alongside them.
+The app is also the phased destination for **Terminal Fragment handling**
+(which launch targets a machine's terminal app — Windows Terminal, Tabby,
+... — carries a profile for, and mirroring that selection into real
+terminal-app fragments): a machine-local concern relocating here the same way
+Mux/AHP already did. **Per-project binstubs are a different, unrelated
+artifact and are explicitly out of scope for this relocation** — deploying
+and repairing the PATH launcher scripts a registered project resolves to
+remains agent-worktrees' own responsibility; only the terminal-app *profile*
+selection model and its fragment-mirroring CLI verbs move here. No
+lightweight plugin carries or assumes any of these dependencies.
 
 ### plugin-updating-and-alignment
 Keeps the installed plugin set **current and mutually consistent** — updates
@@ -211,9 +231,17 @@ Inspects the live install for drift and breakage — missing prerequisites,
 stale or broken binstubs, unmet plugin prerequisites, mis-registered repos — and
 offers to repair, so a machine can be brought back to turnkey without an agent.
 
-### git-referenced-presets
-Ingests shareable presets by Git reference to preconfigure related repos,
-accounts, and venue settings for a specific work arrangement in one step.
+### harness-plugin-onboard-presets
+Ingests a shareable preset **as part of a `<repo>-harness` plugin's own
+payload** — related-repo declarations, CodeSpace/venue product defaults, and
+more — discovered and merged automatically, the same layered way CodeSpace
+config already merges a generic `config.yaml` across every adopted repo, to
+preconfigure a specific work arrangement in one step. A plugin-carried preset
+is adopted the same way the plugin itself is, with no separate
+reference-resolution step a human must remember to repeat. It carries only
+portable, repo-neutral defaults — never account/identity configuration, which
+stays repo-owned and always takes precedence over anything a plugin bundle
+supplies.
 
 ## Behaviors
 
@@ -263,8 +291,8 @@ never present behaves exactly the same; the installer's role is to *guarantee*
 the plugins' prerequisites and interop, never to be a thing they are wired to.
 
 ### control-plane-is-optional-plugins-are-self-sufficient
-The worktree/agent **control-plane** (picker, session launch, terminal muxing) is
-a convenience layer, not a foundation. With it absent, every plugin still
+The worktree/agent **control-plane** (picker and provider-backed session launch)
+is a convenience layer, not a foundation. With it absent, every plugin still
 **provisions and manages itself — its runtime *and* its daemons — and exposes the
 in-session tools an agent needs**, driven by the plugins' own self-provisioning
 model (see [plugin-services](../plugin-services/README.md)). The control-plane
@@ -292,7 +320,7 @@ the app to keep *itself* current.
   deterministic, human- (or script-) driven surface — orchestrating agents is not
   the same as being one.
 - **Its control-plane role is optional and additive, never a foundation.** The
-  picker / session-launch / terminal-mux surface is a convenience for a human
+  picker / provider-backed session-launch surface is a convenience for a human
   running the fleet. The plugins provide the in-session tools agents use and
   **self-provision and self-manage — daemons included — with this app absent**;
   the app must never become a prerequisite for a plugin (or an agent using its
@@ -319,12 +347,35 @@ the app to keep *itself* current.
   [picker](../picker/README.md) (the Worktree Picker — the control-plane's
   interactive surface, delivered and kept current by this app) ·
   [agent-fabric](../agent-fabric/README.md) (the fabric whose turnkey adoption it
-  enables)
+  enables) · [session-hosting](../session-hosting/README.md) (the plural
+  execution-provider boundary the control-plane selects and presents)
 - Reality docs: [`docs/install-contract.md`](../../docs/install-contract.md) ·
   [`docs/architecture.md`](../../docs/architecture.md)
 
 ## Provenance
 
+- **2026-09-25** — Renamed *terminal-app profile selection and fragment
+  mirroring* to **Terminal Fragment handling** and added an explicit
+  carve-out: per-project binstubs (the PATH launcher scripts a registered
+  project resolves to) are a different, unrelated artifact and stay
+  agent-worktrees' own responsibility — only the terminal-app profile
+  selection model and its fragment-mirroring CLI verbs relocate here.
+  Operator direction while landing Phase 3e Step 6 (copilot-extensions#3390):
+  the code-level cutover surfaced real ambiguity between "terminal handling
+  of every kind" and the still-owned `repair --binstubs` surface, so this
+  vision is tightened to match the intended, narrower boundary. See the
+  mirrored provenance entry in
+  [`visions/plugins/agent-worktrees`](../plugins/agent-worktrees/README.md).
+- **2026-09-23** — Generalized the control-plane's ownership of terminal
+  handling one step further: beyond Mux presentation and the AHP backend
+  (#2062), **terminal-app profile selection and fragment mirroring**
+  (currently `agent-worktrees profiles`/`terminal-fragment`/`repair`) is also
+  relocating here, in phases — the same eventual direction as
+  `agent-worktrees update` becoming `worktree-manager update`. Operator
+  direction while scoping copilot-extensions#3360. See the mirrored
+  provenance entry in
+  [`visions/plugins/agent-worktrees`](../plugins/agent-worktrees/README.md)
+  and the `worktree-manager-control-plane` effort's Phase 3e.
 - **2026-08-10** — Conceived from the operator's diagnosis that plugin delivery
   leaves code **inert until a session launches**, so users who adopt the suite
   without running the setup flows never get the core (binstubs, runtime, config)
@@ -367,3 +418,13 @@ the app to keep *itself* current.
   #540 (`setup` checkout discovery) and #541
   (unconditional tool-binstub deploy); the new surfaces are #543 / #544, and the
   Picker first-run behavior is #542. Umbrella #352; Phase 3/4 #356/#357.
+- **2026-09-04** — Generalized the optional control-plane from owning terminal
+  multiplexing to selecting and presenting pluggable session-host providers.
+  TMux/PSMux-backed Copilot CLI remains one optional host alongside ACP, SDK,
+  App, and third-party rigs; plugins and durable worktree state assume none of
+  them.
+- **2026-09-04** — Named the app as the current, near-term owner of **both**
+  the Mux presentation layer and the AHP session backend (previously
+  implemented inside agent-worktrees as an internal config branch). The two
+  compose rather than exclude each other: an AHP-hosted session may still be
+  Mux-wrapped for terminal access. Tracked by #2062.

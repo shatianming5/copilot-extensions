@@ -11,21 +11,25 @@ from typing import Any
 
 IS_WINDOWS = platform.system() == "Windows"
 DEFAULT_TCP_PORT = 19999
+HOME_ENV = "AGENT_VAULT_HOME"
+INSTALLATION_ID_ENV = "AGENT_VAULT_INSTALLATION_ID"
+SYSTEMD_UNIT_ENV = "AGENT_VAULT_SYSTEMD_UNIT"  # marketplace-isolation: allow env-var-name-declaration
+TASK_NAME_ENV = "AGENT_VAULT_TASK_NAME"  # marketplace-isolation: allow env-var-name-declaration
 
 # Runtime endpoint paths. Each honors an environment override so a deployment can
 # run the daemon at custom paths (e.g. a branded service, or several named vaults
 # side by side without colliding). Unset -> the platform default below.
-SOCKET_ENV = "AGENT_VAULT_SOCKET"
+SOCKET_ENV = "AGENT_VAULT_SOCKET"  # marketplace-isolation: allow env-var-name-declaration
 PID_ENV = "AGENT_VAULT_PID"
 LOG_ENV = "AGENT_VAULT_LOG"
 
-DEFAULT_SOCKET_PATH = "/tmp/agent-vault-service.sock"
+DEFAULT_SOCKET_PATH = "/tmp/agent-vault-service.sock"  # marketplace-isolation: allow legacy-compatibility
 SOCKET_PATH = os.environ.get(SOCKET_ENV) or DEFAULT_SOCKET_PATH
 
 # Windows named-pipe endpoint (rung 2 on Windows). Honors an override so a
 # branded/side-by-side deployment keeps its own pipe namespace.
-PIPE_ENV = "AGENT_VAULT_PIPE"
-DEFAULT_PIPE_PATH = r"\\.\pipe\agent-vault"
+PIPE_ENV = "AGENT_VAULT_PIPE"  # marketplace-isolation: allow env-var-name-declaration
+DEFAULT_PIPE_PATH = r"\\.\pipe\agent-vault"  # marketplace-isolation: allow legacy-compatibility
 PIPE_PATH = os.environ.get(PIPE_ENV) or DEFAULT_PIPE_PATH
 PID_FILE_LINUX = "/tmp/agent-vault-service.pid"
 PID_FILE_WIN = Path(os.environ.get("TEMP", "C:/Temp")) / "agent-vault-service.pid"
@@ -44,12 +48,25 @@ RUN_DIR_ENV = "AGENT_VAULT_RUN_DIR"
 # ``"<transport>:<address>"`` spec (e.g. ``tcp:127.0.0.1:52731`` or
 # ``unix:/tmp/agent-vault.sock``) that a client dials before consulting the
 # rendezvous file or the legacy fixed port.
-ENDPOINT_ENV = "AGENT_VAULT_ENDPOINT"
+ENDPOINT_ENV = "AGENT_VAULT_ENDPOINT"  # marketplace-isolation: allow env-var-name-declaration
+
+
+def home_dir() -> Path:
+    """Return the runtime root for the active vault installation."""
+    return Path(os.environ.get(HOME_ENV) or (Path.home() / ".agent-vault"))  # marketplace-isolation: allow legacy compatibility root
+
+
+def installation_id() -> str | None:
+    value = os.environ.get(INSTALLATION_ID_ENV)
+    if value is None:
+        return None
+    trimmed = value.strip()
+    return trimmed or None
 
 
 def run_dir() -> Path:
     """Return the service runtime dir that holds the rendezvous (endpoint) file."""
-    return Path(os.environ.get(RUN_DIR_ENV) or (Path.home() / ".agent-vault" / "run"))
+    return Path(os.environ.get(RUN_DIR_ENV) or (home_dir() / "run"))
 
 
 CONFIG_ENV = "AGENT_VAULT_CONFIG"
@@ -303,10 +320,11 @@ def resolve_context(
         _validate_config_data(ext_data, "extension vault configuration")
         env_port = os.environ.get("AGENT_VAULT_PORT")
         if env_port is not None:
-            _validate_config_data(
-                {"port": env_port},
-                "AGENT_VAULT_PORT environment override",
-            )
+            if not (env_port.strip() == "0" and installation_id()):
+                _validate_config_data(
+                    {"port": env_port},
+                    "AGENT_VAULT_PORT environment override",
+                )
 
     vault_name, vault_source = _pick_vault_name(registry, repo_data, global_data, ext_data)
     named_base = registry.get(vault_name or "")

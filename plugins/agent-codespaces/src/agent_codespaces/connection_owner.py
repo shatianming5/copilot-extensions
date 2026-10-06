@@ -48,12 +48,19 @@ import logging
 import os
 import platform
 import time
+import uuid
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from .config import RUNTIME_DIR, ensure_runtime_dir
+from .owner_identity import beacon_identity, owner_identity_matches, owner_process_identity
+from .owner_ports import sanitize_port as _sanitize_port
+from .owner_ports import clear_session_forwards, sanitize_hold_forwards, set_hold_forwards
+
+if TYPE_CHECKING:
+    from .session_forwards import SessionForwards
 
 log = logging.getLogger("agent-codespaces")
 
@@ -66,6 +73,12 @@ _LOCK_FILE = RUNTIME_DIR / "connection-owner.lock"
 # TTL. A **pinned** relay has no TTL -- it persists until explicitly unpinned.
 DEFAULT_TTL = 3600.0
 
+# A session tenant (a detached CLI-mode session) is renewed by the Owner's own
+# venue probe while its mux session exists, but never beyond this absolute cap
+# from its first hold -- a forgotten session cannot hold a CodeSpace's
+# connection (and keep it awake) forever.
+DEFAULT_SESSION_MAX_LEASE = 24 * 3600.0
+
 
 @dataclass
 class OwnerHold:
@@ -75,6 +88,16 @@ class OwnerHold:
     ``tenants`` maps a tenant id -> its last heartbeat epoch; the ref-count is
     the number of *live* (non-stale) tenants. A hold is kept while ``pinned`` or
     any tenant is live (see :meth:`should_hold`).
+
+    ``daemon_port`` asks the Owner to also keep a reverse forward of the host
+    agent-bridge daemon into the CodeSpace (CodeSpace-side listen port; the
+    host side follows the daemon's live port), so a detached CLI-mode session
+    there can keep registering/heartbeating/receiving messages after its
+    launcher exits. ``sessions`` records, per such tenant, only transport facts
+    the Owner needs to renew it on its own: the remote ``mux_session`` whose
+    existence keeps the tenant alive and an absolute ``expires_at`` lease cap.
+    ``reverse_forwards`` / ``local_forwards`` live as long as ``daemon_port``;
+    assigned local forwards mark ports allocated from ``0:VENUE_PORT``.
     """
 
     codespace: str
@@ -83,6 +106,11 @@ class OwnerHold:
     heartbeat_at: float
     pinned: bool = False
     tenants: dict[str, float] = field(default_factory=dict)
+    daemon_port: int | None = None
+    sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    reverse_forwards: dict[str, int] = field(default_factory=dict)
+    local_forwards: dict[str, int] = field(default_factory=dict)
+    assigned_local_forwards: dict[str, int] = field(default_factory=dict)
 
     def live_tenants(self, ttl: float = DEFAULT_TTL) -> dict[str, float]:
         """Tenants whose heartbeat is within ``ttl``."""
@@ -170,6 +198,25 @@ def _read_holds() -> dict[str, OwnerHold]:
                 except (TypeError, ValueError):
                     continue
         hold.tenants = tenants
+        hold.daemon_port = _sanitize_port(hold.daemon_port)
+        sanitize_hold_forwards(hold)
+        sessions: dict[str, dict[str, Any]] = {}
+        if isinstance(hold.sessions, dict):
+            for tenant, meta in hold.sessions.items():
+                if not isinstance(meta, dict):
+                    continue
+                mux = meta.get("mux_session")
+                try:
+                    expires_at = float(meta.get("expires_at"))
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(mux, str) and mux:
+                    sessions[str(tenant)] = {
+                        "mux_session": mux, "expires_at": expires_at,
+                        "confirmed": bool(meta.get("confirmed", False)),
+                        "generation": str(meta.get("generation") or ""),
+                    }
+        hold.sessions = sessions
         holds[codespace] = hold
     return holds
 
@@ -184,7 +231,15 @@ def _write_holds(holds: dict[str, OwnerHold]) -> None:
 
 
 def _prune_hold(hold: OwnerHold, ttl: float) -> None:
-    """Drop stale tenants from ``hold`` in place."""
+    """Drop stale (or lease-expired session) tenants from ``hold`` in place."""
+    now = time.time()
+    for tenant, meta in list(hold.sessions.items()):
+        if meta.get("expires_at", 0.0) <= now and tenant in hold.tenants:
+            log.info(
+                "Session tenant %s on %s reached its absolute lease cap; releasing",
+                tenant, hold.codespace,
+            )
+            hold.tenants.pop(tenant, None)
     live = hold.live_tenants(ttl)
     if len(live) != len(hold.tenants):
         for tenant in list(hold.tenants):
@@ -194,6 +249,10 @@ def _prune_hold(hold: OwnerHold, ttl: float) -> None:
                     tenant, hold.codespace,
                 )
         hold.tenants = live
+    hold.sessions = {t: m for t, m in hold.sessions.items() if t in hold.tenants}
+    if not hold.sessions:
+        # The daemon forward exists only for session tenants.
+        clear_session_forwards(hold)
 
 
 def _prune(holds: dict[str, OwnerHold], ttl: float) -> dict[str, OwnerHold]:
@@ -244,6 +303,14 @@ def hold(
     *,
     pin: bool = False,
     ttl: float = DEFAULT_TTL,
+    daemon_port: int | None = None,
+    mux_session: str | None = None,
+    confirmed: bool = False,
+    max_lease: float = DEFAULT_SESSION_MAX_LEASE,
+    fresh: bool = False,
+    restore: dict | None = None,
+    reverse_forwards: dict[int, int] | None = None,
+    local_forwards: dict[int, int] | None = None,
 ) -> OwnerHold:
     """Register (or refresh) ``tenant`` on the connection to ``codespace``.
 
@@ -251,6 +318,19 @@ def hold(
     tenant just refreshes its heartbeat and preserves ``created_at``. ``pin=True``
     marks the credential relay as pinned (the Owner's always-on service); pin is
     sticky and only cleared by :func:`release` with ``unpin=True``.
+
+    ``mux_session`` makes this a **session tenant**: the Owner renews it on its
+    own while that mux session exists, up to an absolute ``max_lease`` counted
+    from the tenant's first hold (a re-hold never extends it). A session tenant
+    is *unconfirmed* until its launcher re-holds it with ``confirmed=True`` once
+    the session is up: until then a probe that cannot see the mux session never
+    releases it -- only the TTL does. ``daemon_port`` asks for the host bridge
+    daemon reverse forward. ``fresh=True`` starts a new launch
+    generation (unconfirmed, new lease), so nothing -- neither an older
+    session's confirmation nor an in-flight probe of it -- can release the new
+    launch; ``restore`` puts back a session entry exactly as it was before a
+    failed relaunch (its ``assigned_local_forwards`` key, too). ``reverse_forwards`` / ``local_forwards`` replace the
+    hold's extra forwards of that direction.
     """
     if not codespace:
         raise RuntimeError("hold requires a CodeSpace name")
@@ -272,9 +352,22 @@ def hold(
         existing.heartbeat_at = now
         if pin:
             existing.pinned = True
+        if mux_session:
+            prior = restore if restore is not None else ({} if fresh else existing.sessions.get(tenant) or {})
+            existing.sessions[tenant] = {
+                "mux_session": mux_session,
+                "expires_at": prior.get("expires_at", now + max_lease),
+                "confirmed": bool(confirmed or prior.get("confirmed", False)),
+                "generation": prior.get("generation") or uuid.uuid4().hex,
+            }
+        port = _sanitize_port(daemon_port)
+        if port is not None:
+            existing.daemon_port = port
+        from .owner_local_forwards import reuse_assigned_local_forwards
+        local_forwards = reuse_assigned_local_forwards(existing, local_forwards)
+        set_hold_forwards(existing, reverse_forwards, local_forwards, (restore or {}).get("assigned_local_forwards"))
         _write_holds(holds)
         return existing
-
 
 def heartbeat(
     codespace: str, tenant: str, ttl: float = DEFAULT_TTL,
@@ -304,8 +397,12 @@ def release(
     *,
     unpin: bool = False,
     ttl: float = DEFAULT_TTL,
+    generation: str | None = None,
 ) -> OwnerHold | None:
     """Drop ``tenant`` (and/or unpin) from the hold on ``codespace``.
+
+    With ``generation``, a session tenant is dropped only if it is still that
+    launch generation (compare-and-delete); a newer launch is left alone.
 
     Returns the updated hold, or ``None`` if the hold no longer has any reason to
     persist (no live tenants and not pinned) and was removed -- the signal a
@@ -317,8 +414,13 @@ def release(
         existing = holds.get(codespace)
         if existing is None:
             return None
+        if generation is not None and (existing.sessions.get(tenant) or {}).get("generation") != generation:
+            return existing
         if tenant is not None:
             existing.tenants.pop(tenant, None)
+            existing.sessions.pop(tenant, None)
+            if not existing.sessions:
+                clear_session_forwards(existing)
         if unpin:
             existing.pinned = False
         existing.heartbeat_at = time.time()
@@ -352,10 +454,9 @@ LIVE_FILE = RUNTIME_DIR / "connection-owner.live.json"
 # flap on scheduler jitter).
 _LIVE_STALE_INTERVALS = 3
 _LIVE_STALE_FLOOR = 45.0
-# A heartbeat timestamp this far in the future is treated as NOT fresh: a bogus
-# future beacon or a backward clock jump must fail safe (a tenant falls back to
-# owning its own relay), while a sub-second skew is tolerated so liveness does not
-# flap on ordinary clock jitter.
+_PROCESS_STARTED_AT = time.time()
+# A future heartbeat (bogus beacon / backward clock jump) is NOT fresh, beyond a
+# sub-second-ish skew, so a tenant fails safe to owning its own relay.
 _LIVE_FUTURE_TOLERANCE = 5.0
 
 
@@ -367,10 +468,10 @@ class OwnerLiveness:
     host: str
     heartbeat_at: float
     interval: float
-    # CodeSpaces the Owner currently has a *live* relay channel for (published so
-    # a tenant can tell the relay it wants to defer to is actually up before it
-    # skips standing up its own -- the timing seam the ssh/dispatch rewire needs).
-    active: tuple[str, ...] = ()
+    process_started_at: float = 0.0
+    process_identity: str | None = None  # OS birth identity of ``pid`` (beacon writer)
+    active: tuple[str, ...] = ()  # CodeSpaces with live relay channels (tenants defer)
+    bridge_forwards: tuple[str, ...] = ()  # CodeSpaces with a live host-bridge forward
 
     def staleness_threshold(self) -> float:
         return max(_LIVE_STALE_FLOOR, _LIVE_STALE_INTERVALS * max(self.interval, 0.0))
@@ -385,21 +486,28 @@ class OwnerLiveness:
         return age <= self.staleness_threshold()
 
 
-def _write_liveness(interval: float, active: Iterable[str] | None = None) -> None:
+def _write_liveness(
+    interval: float,
+    active: Iterable[str] | None = None,
+    bridge_forwards: Iterable[str] | None = None,
+) -> None:
     """Refresh the daemon liveness beacon (best-effort; never raises).
 
-    ``active`` is the set of CodeSpaces the Owner currently has a live relay
-    channel for; it is published so a tenant can wait for the relay it wants
-    before deferring.
+    ``active`` names CodeSpaces with live relay channels; ``bridge_forwards``
+    names CodeSpaces with live host-bridge-daemon forwards.
     """
     try:
         ensure_runtime_dir()
         payload = {
             "pid": os.getpid(),
             "host": _this_host(),
+            "process_started_at": _PROCESS_STARTED_AT,
+            "process_identity": owner_process_identity(os.getpid()),
             "heartbeat_at": time.time(),
             "interval": float(interval),
             "active": sorted(active or ()),
+            "bridge_forwards": sorted(bridge_forwards or ()),
+            "heals": ["bridge-serving", "single-owner"],  # what this Owner repairs itself
         }
         tmp = LIVE_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -409,9 +517,10 @@ def _write_liveness(interval: float, active: Iterable[str] | None = None) -> Non
 
 
 def _clear_liveness() -> None:
-    """Remove the daemon liveness beacon (best-effort; never raises)."""
+    """Remove this daemon's own liveness beacon (never another Owner's; never raises)."""
     try:
-        LIVE_FILE.unlink(missing_ok=True)
+        if (current := read_liveness()) is None or current.pid == os.getpid():
+            LIVE_FILE.unlink(missing_ok=True)
     except Exception as exc:
         log.debug("Connection Owner liveness beacon clear failed: %s", exc)
 
@@ -429,13 +538,19 @@ def read_liveness() -> OwnerLiveness | None:
     active_raw = raw.get("active")
     if not isinstance(active_raw, list):
         active_raw = []
+    bridge_raw = raw.get("bridge_forwards")
+    if not isinstance(bridge_raw, list):
+        bridge_raw = []
     try:
         return OwnerLiveness(
             pid=int(raw.get("pid", 0)),
             host=str(raw.get("host", "")),
             heartbeat_at=float(raw.get("heartbeat_at", 0.0)),
             interval=float(raw.get("interval", 0.0)),
+            process_started_at=float(raw.get("process_started_at", 0.0)),
+            process_identity=beacon_identity(raw),
             active=tuple(str(cs) for cs in active_raw if isinstance(cs, str)),
+            bridge_forwards=tuple(str(cs) for cs in bridge_raw if isinstance(cs, str)),
         )
     except (TypeError, ValueError):
         return None
@@ -444,9 +559,9 @@ def read_liveness() -> OwnerLiveness | None:
 def _pid_alive(pid: int) -> bool | None:
     """Best-effort: is ``pid`` a live process? ``None`` when undeterminable.
 
-    POSIX uses ``os.kill(pid, 0)``. On Windows ``os.kill`` with a non-control
-    signal calls ``TerminateProcess`` (it would KILL the pid), so we never probe
-    there -- return ``None`` and let heartbeat freshness be the sole signal.
+    POSIX uses ``os.kill(pid, 0)``; on Windows that would KILL the pid, so we
+    never probe there (heartbeat freshness plus the beacon's birth identity
+    decide instead).
     """
     if pid <= 0:
         return False
@@ -475,7 +590,7 @@ def _live_snapshot(now: float | None = None) -> OwnerLiveness | None:
         return None
     if not live.is_fresh(now):
         return None
-    if _pid_alive(live.pid) is False:
+    if _pid_alive(live.pid) is False or not owner_identity_matches(live, _this_host()):
         return None
     return live
 
@@ -509,16 +624,37 @@ def owner_serves_relay(codespace: str, now: float | None = None) -> bool:
     return bool(codespace) and codespace in owner_active_codespaces(now)
 
 
+def claim_owner_singleton(interval: float) -> bool:
+    """Atomically become the machine's only Connection Owner daemon.
+
+    Two tenants may call :func:`ensure_owner_running` at nearly the same moment
+    (e.g. two detached launches fanned out in parallel), spawning two daemons
+    that would each open a competing ``-R`` bind. Under the registry lock, a
+    starting daemon refuses when another live Owner's beacon is present, and
+    otherwise publishes its own beacon immediately so a racing sibling sees it.
+    """
+    with _owner_lock():
+        live = _live_snapshot()
+        if live is not None and live.pid != os.getpid():
+            return False
+        _write_liveness(interval)
+        return True
+
+
 def should_defer_to_owner(
     config: Any, *, no_relay: bool = False, env: Any | None = None
 ) -> bool:
-    """Whether a one-off tenant should defer its credential relay to a live Owner.
+    """Whether a one-off tenant should defer its credential relay to the Owner.
 
     True only when the relay is wanted (not ``no_relay``), the operator has not
-    set the ``AGENT_CODESPACES_NO_OWNER_DEFER`` escape hatch,
-    ``connection_owner.enabled`` is on, and an Owner daemon is actually live. On
-    the default fleet (feature off / no daemon) this is False, so the tenant keeps
-    owning its own relay and behavior is unchanged.
+    set the ``AGENT_CODESPACES_NO_OWNER_DEFER`` escape hatch, and
+    ``connection_owner.enabled`` is on. The Owner does not need to already be
+    running: this spins it up on-demand (:func:`ensure_owner_running`) when it
+    is not yet live, since the daemon is deliberately not assumed to be a
+    permanently-resident background service. Only when the feature is disabled,
+    or spin-up genuinely fails, does this return False -- the tenant then keeps
+    owning its own relay and behavior is unchanged from before this feature
+    existed.
     """
     if no_relay:
         return False
@@ -528,7 +664,9 @@ def should_defer_to_owner(
     co = getattr(config, "connection_owner", None)
     if not (co and getattr(co, "enabled", False)):
         return False
-    return is_owner_live()
+    if is_owner_live():
+        return True
+    return ensure_owner_running(config)
 
 
 async def await_owner_relay(
@@ -582,7 +720,6 @@ class RelayChannel(Protocol):
 # Build a (not-yet-started) relay channel for a CodeSpace by name.
 RelayFactory = Callable[[str], RelayChannel]
 
-
 class ConnectionOwner:
     """Reconciles live credential-relay channels against the registry.
 
@@ -590,19 +727,36 @@ class ConnectionOwner:
     is the single owner of each CodeSpace's relay (so the ``-R`` bind is
     single-owner by construction, dotfiles#561); agent-bridge dispatch and one-off
     ``agent-codespaces ssh`` are non-owning tenants that only ``hold``/``release``
-    in the registry. Nothing in production constructs this yet (increment 2 is
-    additive); a later increment supplies the real transport factory and runs the
-    reconcile loop in a persistent daemon.
+    in the registry.
+
+    With ``sessions`` (a :class:`~agent_codespaces.session_forwards.SessionForwards`)
+    it also keeps each hold's host-bridge-daemon forward and renews/releases
+    detached-session tenants from its own venue probe (see that module).
     """
 
-    def __init__(self, factory: RelayFactory, *, ttl: float = DEFAULT_TTL) -> None:
+    def __init__(
+        self,
+        factory: RelayFactory,
+        *,
+        ttl: float = DEFAULT_TTL,
+        sessions: SessionForwards | None = None,
+    ) -> None:
         self._factory = factory
         self._ttl = ttl
         self._channels: dict[str, RelayChannel] = {}
+        self._sessions = sessions
+
+    def idle_limit(self, idle: float) -> float:
+        """How long it stays up with no hold: longer while a transcript push is owed."""
+        return max(idle, self._sessions.owed_grace()) if self._sessions is not None else idle
 
     def active_codespaces(self) -> set[str]:
         """CodeSpaces with a currently-live relay channel under this Owner."""
         return {cs for cs, channel in self._channels.items() if channel.is_alive}
+
+    def active_daemon_forwards(self) -> dict[str, int]:
+        """CodeSpace -> listen port of each currently-live daemon forward."""
+        return self._sessions.active() if self._sessions else {}
 
     async def ensure(self, codespace: str) -> bool:
         """Ensure a started relay channel for ``codespace`` iff it is held.
@@ -618,7 +772,7 @@ class ConnectionOwner:
             return False
         channel = self._channels.get(codespace)
         if channel is None:
-            channel = self._factory(codespace)
+            channel = await asyncio.to_thread(self._factory, codespace)  # runs gh: off the loop
             self._channels[codespace] = channel
         if not channel.is_alive:
             try:
@@ -645,8 +799,14 @@ class ConnectionOwner:
 
         Resilient per CodeSpace: a channel that fails to start is logged and
         dropped (retried next cycle) without aborting reconciliation of the rest.
+        Session tenants are probed first so a released tenant's forwards are
+        torn down in the same cycle.
         """
-        held = {h.codespace for h in list_holds(self._ttl)}
+        if self._sessions is not None:
+            await self._sessions.probe(list_holds(self._ttl))
+        holds = {h.codespace: h for h in list_holds(self._ttl)}
+        holds = await self._sessions.usable(holds, self) if self._sessions is not None else holds
+        held = set(holds)
         for codespace in list(self._channels):
             if codespace not in held:
                 await self.drop(codespace)
@@ -659,11 +819,15 @@ class ConnectionOwner:
                     codespace, exc,
                 )
                 self._channels.pop(codespace, None)
+        if self._sessions is not None:
+            await self._sessions.reconcile(holds)
 
     async def shutdown(self) -> None:
-        """Stop all relay channels (daemon shutdown). The registry is untouched."""
+        """Stop all relay and daemon channels (daemon shutdown). Registry untouched."""
         for codespace in list(self._channels):
             await self.drop(codespace)
+        if self._sessions is not None:
+            await self._sessions.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -724,11 +888,18 @@ def make_supervised_relay_factory(
     return factory
 
 
+def _bridge_forwards_of(owner: Any) -> dict[str, int]:
+    """The Owner's live bridge forwards (an Owner without session support has none)."""
+    method = getattr(owner, "active_daemon_forwards", None)
+    return method() if callable(method) else {}
+
+
 async def run_owner_daemon(
     owner: ConnectionOwner,
     *,
     interval: float = 15.0,
     stop_event: asyncio.Event | None = None,
+    idle_shutdown_after: float | None = None,
 ) -> None:
     """Run the Connection Owner reconcile loop until ``stop_event`` is set.
 
@@ -737,23 +908,93 @@ async def run_owner_daemon(
     one interval). A failed reconcile cycle is logged and the loop continues (a
     transient error must not kill the daemon). On exit -- normal stop or an
     unexpected error -- all channels are stopped (registry intent is untouched).
-    Additive + opt-in: nothing starts this by default.
+
+    Deliberately **not** meant to run forever unconditionally: when
+    ``idle_shutdown_after`` is set (the default), the loop exits cleanly on its
+    own once the hold registry has been completely empty (no pinned CodeSpace,
+    no live tenant -- nothing bridge-controlled or direct-driven currently needs
+    it) for that many seconds, rather than being forced to remain resident
+    indefinitely. A tenant that needs it again later starts it back up
+    on-demand (:func:`ensure_owner_running`). ``None`` disables idle shutdown.
+
+    Refuses to start (returns immediately, touching nothing) when another
+    live Owner already holds the machine -- see :func:`claim_owner_singleton`.
     """
+    if not claim_owner_singleton(interval):
+        log.info("Connection Owner already live on this machine; not starting a second one.")
+        return
     stop = stop_event if stop_event is not None else asyncio.Event()
+    idle_since: float | None = None
+    from .owner_beacon import BeaconKeeper  # it builds on this module
+    loop = asyncio.get_running_loop()
+    (keeper := BeaconKeeper(owner, interval, lambda: loop.call_soon_threadsafe(stop.set))).start()
     try:
-        _write_liveness(interval, active=owner.active_codespaces())
+        keeper.beat()
         while not stop.is_set():
             try:
                 await owner.reconcile()
             except Exception as exc:  # a bad cycle must not kill the daemon
                 log.warning("Connection Owner reconcile cycle failed: %s", exc)
-            # Refresh the beacon each cycle, publishing which CodeSpaces now have
-            # a live relay channel so tenants can defer to them.
-            _write_liveness(interval, active=owner.active_codespaces())
+            # Refresh the beacon (live channels, so tenants can defer to them), or
+            # stand down if another Owner took the machine over (BeaconKeeper).
+            if keeper.yielded or not keeper.beat():
+                break
+            if idle_shutdown_after is not None:
+                if list_holds():
+                    idle_since = None
+                else:
+                    if idle_since is None:
+                        idle_since = time.monotonic()
+                    elif time.monotonic() - idle_since >= owner.idle_limit(idle_shutdown_after):
+                        log.info("Connection Owner idle (no held CodeSpaces, no owed push) -- exiting;"
+                                 " a tenant starts it back up on demand.")
+                        break
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except (TimeoutError, asyncio.TimeoutError):
                 pass
     finally:
+        keeper.stop()
         _clear_liveness()
         await owner.shutdown()
+
+
+def ensure_owner_running(
+    config: Any, *, spawn_timeout: float = 5.0, poll: float = 0.2
+) -> bool:
+    """Best-effort on-demand start of the Connection Owner daemon.
+
+    Returns ``True`` once the Owner is live -- already running, or freshly
+    spawned (detached, surviving this caller's own exit) and observed to become
+    live within ``spawn_timeout``. Returns ``False`` (never raises) on any
+    spawn failure or timeout, so a caller always has a safe fallback: keep
+    owning its own relay exactly as if the Owner did not exist. This is the
+    on-demand half of "spins up when needed, exits when idle" -- the daemon is
+    never assumed to already be running as a permanent background service.
+    """
+    if is_owner_live():
+        return True
+    try:
+        import subprocess
+        import sys
+        from agent_procutil import windowless_daemon_kwargs
+
+        argv = [sys.executable, "-m", "agent_codespaces", "owner"]
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+            "cwd": os.path.expanduser("~"),  # never the caller's cwd
+            **windowless_daemon_kwargs(breakaway=True),
+        }
+        subprocess.Popen(argv, **popen_kwargs)
+    except Exception as exc:
+        log.warning("Connection Owner on-demand spin-up failed: %s", exc)
+        return False
+    deadline = time.monotonic() + max(0.0, spawn_timeout)
+    while time.monotonic() < deadline:
+        if is_owner_live():
+            return True
+        time.sleep(poll)
+    return is_owner_live()

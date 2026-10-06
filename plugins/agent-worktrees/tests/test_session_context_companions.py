@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import time
@@ -35,11 +34,11 @@ def _payload(
 
 
 def _bash() -> str:
+    if os.name == "nt":
+        pytest.skip("POSIX companion semantics run in the Linux/WSL suite")
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("Bash is not available")
-    if os.name == "nt" and "WindowsApps" in Path(bash).parts:
-        pytest.skip("WSL Bash cannot execute Windows test paths directly")
     return bash
 
 
@@ -47,7 +46,32 @@ def _powershell() -> str:
     powershell = shutil.which("pwsh") or shutil.which("powershell.exe")
     if powershell is None:
         pytest.skip("PowerShell is not available")
+    if os.name != "nt" and Path(powershell).suffix.lower() == ".exe":
+        pytest.skip("Windows PowerShell cannot execute POSIX test paths")
     return powershell
+
+
+def _scrubbed_env(home: Path) -> dict[str, str]:
+    """Base subprocess env for a sandboxed session-context script run.
+
+    Starts from the real environment (needed for PATH etc.) but scrubs
+    ambient Copilot/agent-worktrees identity vars this test process may
+    itself be running under (e.g. when pytest is invoked from inside a live
+    Copilot CLI session) -- those must never leak into the sandbox, which
+    fully re-derives its own identity from ``home``/``cwd``.
+    """
+    environment = {**os.environ}
+    for stray in (
+        "COPILOT_PLUGIN_ROOT",
+        "COPILOT_EXTENSIONS_CONTEXT",
+        "AGENT_WORKTREES_PAYLOAD_ROOT",
+        "COPILOT_AGENT_SESSION_ID",
+        "COPILOT_CUSTOM_INSTRUCTIONS_DIRS",
+    ):
+        environment.pop(stray, None)
+    environment["HOME"] = str(home)
+    environment["USERPROFILE"] = str(home)
+    return environment
 
 
 def _run(
@@ -67,11 +91,7 @@ def _run(
         command.append("--side-effect-only")
     elif await_context:
         command.append("--await-context")
-    environment = {
-        **os.environ,
-        "HOME": str(home),
-        "USERPROFILE": str(home),
-    }
+    environment = _scrubbed_env(home)
     return subprocess.run(
         command,
         input=payload,
@@ -106,11 +126,7 @@ def _run_powershell(
         command.append("--side-effect-only")
     elif await_context:
         command.append("--await-context")
-    environment = {
-        **os.environ,
-        "HOME": str(home),
-        "USERPROFILE": str(home),
-    }
+    environment = _scrubbed_env(home)
     return subprocess.run(
         command,
         input=payload,
@@ -313,149 +329,6 @@ def test_register_nudge_awaits_direct_completion_receipt(tmp_path: Path) -> None
     )["additionalContext"]
 
 
-def test_marketplace_context_only_replays_without_reconciling(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "home"
-    repo = tmp_path / "repo"
-    bin_dir = home / ".agent-worktrees" / "bin"
-    bin_dir.mkdir(parents=True)
-    repo.mkdir()
-    fake_python = tmp_path / "fake-python"
-    fake_python.write_text(
-        "#!/usr/bin/env bash\n"
-        "cat >/dev/null\n"
-        "printf '%s' "
-        + shlex.quote(
-            json.dumps(
-                {
-                    "additionalContext": (
-                        "Local marketplace sources changed; restart the session."
-                    )
-                }
-            )
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    fake_python.chmod(0o755)
-    (bin_dir / "resolve-runtime.sh").write_text(
-        f"AW_PY={shlex.quote(str(fake_python))}\n",
-        encoding="utf-8",
-    )
-    _write_version(home)
-    payload = _payload("session-marketplace", repo)
-
-    direct = _run("marketplace-overrides.sh", payload, home=home, cwd=repo)
-    assert direct.returncode == 0, direct.stderr
-    direct_payload = json.loads(direct.stdout)
-    state_file = next(
-        (home / ".agent-worktrees" / ".session-context").glob(
-            "marketplace-overrides-*"
-        )
-    )
-    state_mtime = state_file.stat().st_mtime_ns
-
-    fake_python.write_text(
-        "#!/usr/bin/env bash\nexit 97\n",
-        encoding="utf-8",
-    )
-    replay = _run(
-        "marketplace-overrides.sh",
-        payload,
-        home=home,
-        cwd=repo,
-        context_only=True,
-    )
-    assert replay.returncode == 0, replay.stderr
-    assert json.loads(replay.stdout) == direct_payload
-    assert state_file.stat().st_mtime_ns == state_mtime
-
-    changed_cwd = _run(
-        "marketplace-overrides.sh",
-        _payload("session-marketplace", tmp_path),
-        home=home,
-        cwd=repo,
-        context_only=True,
-    )
-    assert json.loads(changed_cwd.stdout) == {}
-    changed_source = _run(
-        "marketplace-overrides.sh",
-        _payload("session-marketplace", repo, source="resume"),
-        home=home,
-        cwd=repo,
-        context_only=True,
-    )
-    assert json.loads(changed_source.stdout) == {}
-    for stale_payload in (
-        _payload("session-marketplace", repo, timestamp=1_001),
-        _payload("session-marketplace", repo, timestamp=None),
-        _payload("session-marketplace", repo, timestamp="later"),
-    ):
-        stale_timestamp = _run(
-            "marketplace-overrides.sh",
-            stale_payload,
-            home=home,
-            cwd=repo,
-            context_only=True,
-        )
-        assert json.loads(stale_timestamp.stdout) == {}
-    _write_version(home, "1.2.4")
-    changed_version = _run(
-        "marketplace-overrides.sh",
-        payload,
-        home=home,
-        cwd=repo,
-        context_only=True,
-    )
-    assert json.loads(changed_version.stdout) == {}
-
-
-def test_marketplace_side_effect_mode_suppresses_but_preserves_context(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "home"
-    repo = tmp_path / "repo"
-    bin_dir = home / ".agent-worktrees" / "bin"
-    bin_dir.mkdir(parents=True)
-    repo.mkdir()
-    fake_python = tmp_path / "fake-python"
-    expected = {
-        "additionalContext": "Local marketplace sources changed; restart."
-    }
-    fake_python.write_text(
-        "#!/usr/bin/env bash\ncat >/dev/null\nprintf '%s' "
-        + shlex.quote(json.dumps(expected))
-        + "\n",
-        encoding="utf-8",
-    )
-    fake_python.chmod(0o755)
-    (bin_dir / "resolve-runtime.sh").write_text(
-        f"AW_PY={shlex.quote(str(fake_python))}\n",
-        encoding="utf-8",
-    )
-    _write_version(home)
-    payload = _payload("session-marketplace-side-effect", repo)
-
-    direct = _run(
-        "marketplace-overrides.sh",
-        payload,
-        home=home,
-        cwd=repo,
-        side_effect_only=True,
-    )
-    replay = _run(
-        "marketplace-overrides.sh",
-        payload,
-        home=home,
-        cwd=repo,
-        context_only=True,
-    )
-
-    assert json.loads(direct.stdout) == {}
-    assert json.loads(replay.stdout) == expected
-
-
 def test_register_nudge_powershell_context_only_replays(
     tmp_path: Path,
 ) -> None:
@@ -528,91 +401,6 @@ def test_register_nudge_powershell_context_only_replays(
     _write_version(home, "1.2.4")
     changed_version = _run_powershell(
         "register-nudge.ps1",
-        payload,
-        home=home,
-        cwd=repo,
-        context_only=True,
-    )
-    assert json.loads(changed_version.stdout) == {}
-
-
-def test_marketplace_powershell_context_only_replays(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "home"
-    repo = tmp_path / "repo"
-    bin_dir = home / ".agent-worktrees" / "bin"
-    bin_dir.mkdir(parents=True)
-    repo.mkdir()
-    fake_python = tmp_path / "fake-python.ps1"
-    expected = {
-        "additionalContext": "Local marketplace sources changed; restart."
-    }
-    escaped = json.dumps(expected).replace("'", "''")
-    fake_python.write_text(
-        f"Write-Output '{escaped}'\n",
-        encoding="utf-8",
-    )
-    escaped_python = str(fake_python).replace("'", "''")
-    (bin_dir / "resolve-runtime.ps1").write_text(
-        f"$AwPy = '{escaped_python}'\n",
-        encoding="utf-8",
-    )
-    _write_version(home)
-    payload = _payload("session-marketplace-ps", repo)
-
-    direct = _run_powershell(
-        "marketplace-overrides.ps1",
-        payload,
-        home=home,
-        cwd=repo,
-    )
-    assert direct.returncode == 0, direct.stderr
-    assert json.loads(direct.stdout) == expected
-
-    fake_python.write_text("exit 97\n", encoding="utf-8")
-    replay = _run_powershell(
-        "marketplace-overrides.ps1",
-        payload,
-        home=home,
-        cwd=repo,
-        context_only=True,
-    )
-    assert replay.returncode == 0, replay.stderr
-    assert json.loads(replay.stdout) == expected
-
-    changed_cwd = _run_powershell(
-        "marketplace-overrides.ps1",
-        _payload("session-marketplace-ps", tmp_path),
-        home=home,
-        cwd=repo,
-        context_only=True,
-    )
-    assert json.loads(changed_cwd.stdout) == {}
-    changed_source = _run_powershell(
-        "marketplace-overrides.ps1",
-        _payload("session-marketplace-ps", repo, source="resume"),
-        home=home,
-        cwd=repo,
-        context_only=True,
-    )
-    assert json.loads(changed_source.stdout) == {}
-    for stale_payload in (
-        _payload("session-marketplace-ps", repo, timestamp=1_001),
-        _payload("session-marketplace-ps", repo, timestamp=None),
-        _payload("session-marketplace-ps", repo, timestamp="later"),
-    ):
-        stale_timestamp = _run_powershell(
-            "marketplace-overrides.ps1",
-            stale_payload,
-            home=home,
-            cwd=repo,
-            context_only=True,
-        )
-        assert json.loads(stale_timestamp.stdout) == {}
-    _write_version(home, "1.2.4")
-    changed_version = _run_powershell(
-        "marketplace-overrides.ps1",
         payload,
         home=home,
         cwd=repo,

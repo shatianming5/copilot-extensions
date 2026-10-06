@@ -39,9 +39,17 @@ import tarfile
 import tempfile
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Deferred: agent_logger.catalog imports this module (for
+    # iter_session_refs/read_review_annotations), so importing it at module
+    # load time here would be circular. Only needed for the type hint below.
+    from agent_logger.catalog import ReviewCatalogIndex
 
 #: Subdirectory of ``~/.copilot`` holding live session directories.
 SESSION_STATE_SUBDIR = "session-state"
@@ -49,7 +57,23 @@ SESSION_STATE_SUBDIR = "session-state"
 #: Sidecar metadata kept uncompressed beside an archive for cheap selection.
 #: These are the files the selection/listing/routing paths read; keeping them
 #: out of the tarball means those paths never decompress anything.
-SIDECAR_MEMBERS: tuple[str, ...] = ("workspace.yaml", "origin.json")
+#:
+#: ``review-annotations.json`` is a durable, first-class annotation --
+#: deliberately not a worktree-naming convention -- recording which external
+#: work item(s) (e.g. a code-review PR) a session worked, so a consumer can
+#: eventually query "every session that reviewed PR N" without sweeping every
+#: session's raw transcript. Most sessions never write it;
+#: :func:`read_review_annotations` returns ``[]`` when absent, exactly like
+#: :func:`read_origin` returns ``{}``.
+SIDECAR_MEMBERS: tuple[str, ...] = (
+    "workspace.yaml",
+    "origin.json",
+    "review-annotations.json",
+)
+
+#: The sidecar member name for :func:`write_review_annotation` /
+#: :func:`read_review_annotations`.
+REVIEW_ANNOTATIONS_MEMBER = "review-annotations.json"
 
 #: The member every real session has; used to tell a session dir from noise.
 EVENTS_MEMBER = "events.jsonl"
@@ -385,6 +409,140 @@ def read_origin(ref: SessionRef) -> dict[str, object]:
     except json.JSONDecodeError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _utcnow_iso() -> str:
+    """The sortable UTC timestamp format review annotations are recorded in."""
+    return datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def read_review_annotations(ref: SessionRef) -> list[dict[str, object]]:
+    """Return this session's review-annotation entries (``[]`` if none).
+
+    Each entry has at least ``repo``, ``pr_number``, ``role``, and
+    ``recorded_at`` (see :func:`write_review_annotation`). A session most
+    commonly carries zero or one entry; more than one means it worked
+    multiple review-dispatch PRs.
+    """
+    text = read_text(ref, REVIEW_ANNOTATIONS_MEMBER, errors="replace")
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    return [entry for entry in data if isinstance(entry, dict)] if isinstance(data, list) else []
+
+
+def write_review_annotation(
+    session_dir: Path,
+    *,
+    repo: str,
+    pr_number: int,
+    role: str = "reviewer",
+    recorded_at: str | None = None,
+    index: "ReviewCatalogIndex | None" = None,
+) -> None:
+    """Append a review annotation to a **live** session's sidecar, idempotently.
+
+    Only ever writes into a live session directory (``session_dir`` must
+    already exist -- this never creates one): an archived session's sidecar
+    is a read-only artifact produced by :func:`archive_session`, not a
+    target for later mutation. A duplicate ``(repo, pr_number, role)`` entry
+    is not re-appended (safe to call repeatedly from a backfill/sweep without
+    growing the file unboundedly), but ``recorded_at`` on a genuinely new
+    entry always reflects this call.
+
+    When ``index`` (an :class:`agent_logger.catalog.ReviewCatalogIndex`) is
+    given, the same fact is recorded into it -- the sidecar remains the
+    durable source of truth; the index is a queryable derived cache kept in
+    sync at the same call site. Recorded unconditionally (even for an
+    already-present sidecar entry), so a caller that later adds ``index`` to
+    an existing write path can pass it in to backfill the index as a side
+    effect of ordinary re-annotation, without needing a separate rebuild.
+
+    The read-modify-write is serialized with an advisory lock (colocated
+    ``.lock`` file, the same cross-platform primitive
+    :func:`agent_logger.sync.lock.sync_lock` uses elsewhere) so two
+    concurrent callers annotating the same session never race -- one losing
+    the other's update, or two temp files colliding on the same fixed name.
+    The temp file itself is a unique per-call name (via
+    :func:`tempfile.mkstemp` in the same directory) rather than a fixed
+    ``.tmp`` suffix, for the same reason.
+
+    Deferred import of :mod:`agent_logger.sync.lock` -- that package imports
+    this module (for archive-aware session reads), so importing it at module
+    load time here would be circular.
+    """
+    from agent_logger.sync.lock import sync_lock
+
+    path = session_dir / REVIEW_ANNOTATIONS_MEMBER
+    lock_path = session_dir / f"{REVIEW_ANNOTATIONS_MEMBER}.lock"
+
+    with sync_lock(lock_path) as acquired:
+        if not acquired:
+            raise TimeoutError(f"timed out acquiring review-annotation lock for {session_dir}")
+        try:
+            existing_text = path.read_text(encoding="utf-8") if path.is_file() else "[]"
+        except FileNotFoundError:
+            existing_text = "[]"
+        try:
+            existing = json.loads(existing_text)
+        except json.JSONDecodeError:
+            existing = []
+        entries: list[dict[str, object]] = (
+            [e for e in existing if isinstance(e, dict)] if isinstance(existing, list) else []
+        )
+
+        for entry in entries:
+            if (
+                entry.get("repo") == repo
+                and entry.get("pr_number") == pr_number
+                and entry.get("role") == role
+            ):
+                if index is not None:
+                    existing_recorded_at = entry.get("recorded_at")
+                    index.record(
+                        session_id=session_dir.name,
+                        repo=repo,
+                        pr_number=pr_number,
+                        role=role,
+                        recorded_at=existing_recorded_at
+                        if isinstance(existing_recorded_at, str)
+                        else (recorded_at or _utcnow_iso()),
+                    )
+                return
+
+        new_recorded_at = recorded_at or _utcnow_iso()
+        entries.append(
+            {
+                "repo": repo,
+                "pr_number": pr_number,
+                "role": role,
+                "recorded_at": new_recorded_at,
+            }
+        )
+
+        fd, tmp_name = tempfile.mkstemp(
+            dir=session_dir, prefix=f"{REVIEW_ANNOTATIONS_MEMBER}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(entries))
+            os.replace(tmp_name, path)
+        except BaseException:
+            with suppress(OSError):
+                os.unlink(tmp_name)
+            raise
+
+        if index is not None:
+            index.record(
+                session_id=session_dir.name,
+                repo=repo,
+                pr_number=pr_number,
+                role=role,
+                recorded_at=new_recorded_at,
+            )
 
 
 @contextmanager

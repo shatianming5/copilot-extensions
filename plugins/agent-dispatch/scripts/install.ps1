@@ -58,11 +58,47 @@ param(
     [switch]$NoSupervisor,
     [switch]$Interactive,
     [switch]$Purge,
-    [switch]$Force
+    [switch]$Force,
+
+    # DEPRECATED / no-op (Thread B): the graceful zdd cutover
+    # (Invoke-CoordinatorCutover) is already the DEFAULT on `update` whenever a
+    # live, routed coordinator is running -- activation always cuts over
+    # automatically, so this opt-in is not required. The switch is still
+    # ACCEPTED (so a caller such as the launch-path reconciler, which appends
+    # it whenever a plugin declares `"zeroDowntimeUpdate": true`, doesn't
+    # break) but has no effect.
+    [switch]$ZeroDowntime,
+
+    # Preview mode for the 'uninstall' action: print what WOULD be removed
+    # without touching the filesystem, scheduled task, autostart, or firewall.
+    [switch]$DryRun
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+
+# === install-contract:test-persistent-environment -- keep byte-identical across installers ===
+function Get-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    return [Environment]::GetEnvironmentVariable($Name, $effectiveTarget)
+}
+
+function Set-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [AllowNull()][string]$Value,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    [Environment]::SetEnvironmentVariable($Name, $Value, $effectiveTarget)
+}
+# === end install-contract:test-persistent-environment ===
 
 # === install-contract:v4 self-stage -- keep byte-identical across plugins ===
 # dotfiles #935: a plugin installer reads its own payload (src/, libs/,
@@ -239,6 +275,99 @@ function Write-Fail    { param([string]$Msg) Write-Host "  [FAIL] $Msg" -Foregro
 function Write-Warn    { param([string]$Msg) Write-Host "  [WARN] $Msg" -ForegroundColor Yellow }
 function Write-Step    { param([string]$Msg) Write-Host "  ...    $Msg" -ForegroundColor DarkGray }
 
+# Stable, documented contract (ThomasMichon/copilot-extensions#5066): a file
+# containing a single epoch-seconds expiry, present for the duration of a
+# live-service update/start lifecycle -- any downstream consumer (a local
+# liveness watchdog, a diagnostic tool) can check its content without needing
+# any plugin-specific caller-side wrapping. $UpdateMarker itself is set once
+# $InstallDir is finalized below; these two functions only reference it at
+# call time, so defining them here is safe.
+#
+# Process-local: true once THIS invocation holds a refcount slot.
+$script:UpdateMarkerHeld = $false
+
+# Reference-counted, not single-owner: Invoke-Update holding the marker for
+# a long cutover and a separate, brief Invoke-Start both legitimately want
+# it live at once, and a single-owner/last-writer-wins scheme would let the
+# SHORT invocation's own exit delete the marker while the LONG one is still
+# mid-transition -- the marker must stay present until every concurrent
+# holder has released its own slot, not just the most recent one. A named
+# System.Threading.Mutex (the standard cross-process lock primitive on
+# Windows) makes increment/decrement atomic across processes.
+#
+# `New-Item -Force` the parent directory first: on a fresh or deleted
+# install root, $InstallDir itself may not exist yet at the point either
+# live-service lifecycle starts (its own provisioning step is what would
+# normally create it) -- the marker must not fail BEFORE that provisioning
+# ever gets a chance to run.
+function Get-UpdateMarkerMutex {
+    $name = 'Local\' + ($UpdateMarker -replace '[^a-zA-Z0-9]', '_') + '_refcount'
+    return New-Object System.Threading.Mutex($false, $name)
+}
+function Write-UpdateMarker {
+    param([int]$TtlSeconds = $UpdateMarkerTtlDefault)
+    if ($script:UpdateMarkerHeld) { return }
+    New-Item -ItemType Directory -Force -Path (Split-Path $UpdateMarker -Parent) | Out-Null
+    $countPath = "$UpdateMarker.refcount"
+    $mutex = Get-UpdateMarkerMutex
+    $acquired = $false
+    try {
+        $acquired = $mutex.WaitOne(10000)
+        $count = 0
+        if (Test-Path $countPath) {
+            $raw = Get-Content -Path $countPath -Raw -ErrorAction SilentlyContinue
+            if ($raw) { [int]::TryParse($raw.Trim(), [ref]$count) | Out-Null }
+        }
+        if ($count -eq 0) {
+            # First holder: stamp a fresh marker. A later joiner deliberately
+            # does NOT refresh the expiry -- the TTL is a safety-net backstop,
+            # not a per-holder renewal lease.
+            $expiry = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + $TtlSeconds
+            $tmp = "$UpdateMarker.$([Guid]::NewGuid().ToString('N'))"
+            Set-Content -Path $tmp -Value $expiry -NoNewline
+            Move-Item -Path $tmp -Destination $UpdateMarker -Force
+        }
+        $count++
+        $tmp2 = "$countPath.$([Guid]::NewGuid().ToString('N'))"
+        Set-Content -Path $tmp2 -Value $count -NoNewline
+        Move-Item -Path $tmp2 -Destination $countPath -Force
+        $script:UpdateMarkerHeld = $true
+    } finally {
+        if ($acquired) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+# Releases this invocation's own refcount slot; only the holder that takes
+# the count to zero actually removes the marker file, so it stays present
+# for the full duration of whichever concurrent transition runs longest.
+function Clear-UpdateMarker {
+    if (-not $script:UpdateMarkerHeld) { return }
+    $script:UpdateMarkerHeld = $false
+    $countPath = "$UpdateMarker.refcount"
+    $mutex = Get-UpdateMarkerMutex
+    $acquired = $false
+    try {
+        $acquired = $mutex.WaitOne(10000)
+        $count = 0
+        if (Test-Path $countPath) {
+            $raw = Get-Content -Path $countPath -Raw -ErrorAction SilentlyContinue
+            if ($raw) { [int]::TryParse($raw.Trim(), [ref]$count) | Out-Null }
+        }
+        if ($count -gt 0) { $count-- }
+        if ($count -le 0) {
+            Remove-Item -Path $UpdateMarker -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path $countPath -Force -ErrorAction SilentlyContinue
+        } else {
+            $tmp = "$countPath.$([Guid]::NewGuid().ToString('N'))"
+            Set-Content -Path $tmp -Value $count -NoNewline
+            Move-Item -Path $tmp -Destination $countPath -Force
+        }
+    } finally {
+        if ($acquired) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
 # -- Paths --------------------------------------------------------------
 
 $PluginDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -247,6 +376,26 @@ $PkgSrcDir = Join-Path $PluginDir 'src\agent_dispatch'
 if (-not $InstallDir) {
     $InstallDir = Join-Path $env:USERPROFILE '.agent-dispatch'
 }
+$InstallDir = [IO.Path]::GetFullPath($InstallDir)
+$UpdateMarker = Join-Path $InstallDir 'update-in-progress'
+$UpdateMarkerTtlDefault = 1200  # 20 min -- generous past any observed real cutover
+$legacyInstallDir = [IO.Path]::GetFullPath((Join-Path $env:USERPROFILE '.agent-dispatch'))
+$publishLegacyNames = [StringComparer]::OrdinalIgnoreCase.Equals($InstallDir, $legacyInstallDir)
+$serviceSuffix = if ($publishLegacyNames) {
+    ''
+} else {
+    $serviceSha = [Security.Cryptography.SHA256]::Create()
+    try {
+        ([BitConverter]::ToString(
+            $serviceSha.ComputeHash(
+                [Text.Encoding]::UTF8.GetBytes($InstallDir.ToLowerInvariant())
+            )
+        )).Replace('-', '').Substring(0, 12).ToLowerInvariant()
+    } finally {
+        $serviceSha.Dispose()
+    }
+}
+$env:AGENT_DISPATCH_INSTALL_DIR = $InstallDir
 $VenvDir  = Join-Path $InstallDir '.venv'
 $LocalBin = Join-Path $env:USERPROFILE '.local\bin'
 
@@ -256,8 +405,12 @@ if ($env:OS -eq 'Windows_NT') {
     $VenvPython = Join-Path $VenvDir 'bin/python'
 }
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-$TaskName = 'agent-dispatch'
-$SupervisorTaskName = 'agent-dispatch-supervisor'
+$TaskName = if ($publishLegacyNames) { 'agent-dispatch' } else { "agent-dispatch-$serviceSuffix" }
+$SupervisorTaskName = if ($publishLegacyNames) {
+    'agent-dispatch-supervisor'
+} else {
+    "agent-dispatch-supervisor-$serviceSuffix"
+}
 $SupervisorProfileDir = Join-Path $InstallDir 'supervisors'
 $DefaultPort = 9847
 
@@ -613,6 +766,81 @@ function Test-ZddInstalled {
     return $LASTEXITCODE -eq 0
 }
 
+function Remove-PluginBuildArtifacts {
+    <# Installing FROM the pristine payload directory ($PluginDir, under the
+       plugin install root) leaves setuptools' own build/ + *.egg-info staging
+       behind IN that tree. Left in place, a stale build/ can silently shadow
+       fresh src/ on a later install if setuptools' incremental-build mtime
+       check decides nothing "changed" -- confirmed live on POSIX
+       (copilot-extensions#3444): a truncated recipes_cli.py shipped this way
+       and crash-looped a production daemon for ~8h.
+
+       Every vendored `[tool.uv.sources]` workspace path dep under
+       libs/<name>/ (agent-procutil, zdd, dropin-registry, ...) is its OWN
+       independent setuptools build root and accumulates the identical
+       residue -- confirmed live: a stale libs/agent-procutil/build/lib
+       silently shipped a version of agent_procutil missing a since-added
+       function even after a fully clean `uv cache clean` + a forced
+       `--reinstall-package`/`--refresh-package` rebuild, because every
+       rebuild kept reading the stale build/lib copy instead of the fresh
+       src/ underneath it (those flags bust uv's resolution/build cache, not
+       a stale artifact sitting directly in the source tree uv builds FROM).
+
+       Shared by BOTH the standalone zdd pre-install (which runs before the
+       main package install below) and that main install's own scrub --
+       the zdd pre-install builds from the exact same libs/zdd/ tree and is
+       equally vulnerable if it runs first without this.
+
+       -ExtraDir (optional): Resolve-Zdd/Resolve-VendoredLib can also
+       resolve to a checkout/registry path OUTSIDE $PluginDir entirely (a
+       sibling copilot-extensions checkout, not the marketplace-installed
+       payload) -- $PluginDir/libs/* scrubbing never reaches that tree, so
+       the standalone zdd pre-install passes its own resolved $ZddDir here
+       too. #>
+    param([string]$PluginDir, [string]$ExtraDir)
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
+        (Join-Path $PluginDir 'build'), `
+        (Join-Path $PluginDir '*.egg-info'), `
+        (Join-Path (Join-Path $PluginDir 'src') '*.egg-info')
+    # Directory names under libs/ don't map 1:1 to package names (e.g.
+    # agent-zdd -> libs/zdd), so glob every immediate child rather than
+    # trying to enumerate them.
+    $libsDir = Join-Path $PluginDir 'libs'
+    if (Test-Path -LiteralPath $libsDir) {
+        Get-ChildItem -LiteralPath $libsDir -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
+                    (Join-Path $_.FullName 'build'), `
+                    (Join-Path $_.FullName '*.egg-info'), `
+                    (Join-Path (Join-Path $_.FullName 'src') '*.egg-info')
+            }
+    }
+    if ($ExtraDir -and $ExtraDir -ne $PluginDir) {
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
+            (Join-Path $ExtraDir 'build'), `
+            (Join-Path $ExtraDir '*.egg-info'), `
+            (Join-Path (Join-Path $ExtraDir 'src') '*.egg-info')
+    }
+}
+
+function Get-AdoptedProjects {
+    <# The adopted-project names from agent-worktrees' adoption registry (empty
+       when the registry is absent). Used only to give `agent-worktrees get
+       machine` a project so it resolves the machine registry from any CWD. #>
+    $reg = Join-Path $HOME '.agent-worktrees/projects.yaml'
+    if (-not (Test-Path $reg)) { return @() }
+    $names = @()
+    $inProjects = $false
+    foreach ($line in [System.IO.File]::ReadAllLines($reg)) {
+        if ($line -match '^projects:\s*$') { $inProjects = $true; continue }
+        if ($line -match '^[^\s#]') { $inProjects = $false }
+        if ($inProjects -and $line -match '^  ([A-Za-z0-9._-]+):\s*$') {
+            $names += $Matches[1]
+        }
+    }
+    return $names
+}
+
 function Deploy-SelfProvisioningBinstub {
     <# Deploy the agent-dispatch CLI binstubs into ~/.local/bin, SELF-PROVISIONING
        (#1393): fast-path the built versioned slot's python; if no slot is built
@@ -633,6 +861,19 @@ function Deploy-SelfProvisioningBinstub {
         try {
             $aw = Get-Command agent-worktrees -ErrorAction Stop # marketplace-isolation: allow installer-management
             $machine = (& $aw.Source get machine 2>$null | Select-Object -First 1)
+            # `get machine` resolves the machine registry THROUGH a project and
+            # discovers context from the CWD, so it yields nothing when the
+            # installer runs outside an adopted repo/worktree. Falling straight
+            # through to the OS name then pins an identity that need not equal the
+            # registry key the Picker substitutes for `{machine}` (a key may be
+            # decoupled from COMPUTERNAME). Every adopted project resolves the
+            # same identity, so retry with an explicit --project first.
+            if (-not $machine) {
+                foreach ($p in (Get-AdoptedProjects)) {
+                    $machine = (& $aw.Source --project $p get machine 2>$null | Select-Object -First 1) # marketplace-isolation: allow installer-management
+                    if ($machine) { break }
+                }
+            }
         } catch {}
     }
     if (-not $machine) { $machine = [Environment]::MachineName.ToLowerInvariant() }
@@ -691,8 +932,10 @@ setlocal
 set "PYTHONUTF8=1"
 set "_PS1=%USERPROFILE%\.local\bin\agent-dispatch.ps1"
 if not exist "%_PS1%" (echo [agent-dispatch] binstub not found: %_PS1%>&2 & exit /b 127)
-where pwsh >nul 2>&1
-if %ERRORLEVEL%==0 (pwsh -NoProfile -ExecutionPolicy Bypass -File "%_PS1%" %*) else (powershell -NoProfile -ExecutionPolicy Bypass -File "%_PS1%" %*)
+set "_PSHOST="
+for /f "delims=" %%I in ('"%SystemRoot%\System32\where.exe" pwsh 2^>nul') do if not defined _PSHOST set "_PSHOST=%%I"
+if not defined _PSHOST set "_PSHOST=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+"%_PSHOST%" -NoProfile -ExecutionPolicy Bypass -File "%_PS1%" %*
 exit /b %ERRORLEVEL%
 '@
     [System.IO.File]::WriteAllText($stubPath, $stubContent, $utf8NoBom)
@@ -754,7 +997,7 @@ function Install-Runtime {
             $ErrorActionPreference = 'Continue'
             & winget install --id astral-sh.uv --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
             $ErrorActionPreference = $prevEAP
-            $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+            $env:PATH = (Get-CopilotPersistentEnvironmentVariable -Name 'PATH' -Target 'Machine') + ';' + (Get-CopilotPersistentEnvironmentVariable -Name 'PATH' -Target 'User')
             if (Get-Command uv -ErrorAction SilentlyContinue) { Write-Ok 'uv installed' }
         }
     }
@@ -822,11 +1065,20 @@ function Install-Runtime {
     # install below finds the requirement already satisfied.
     $ZddDir = Resolve-Zdd
     if ($ZddDir) {
+        # Scrub BEFORE this standalone pre-install too, not just the main
+        # install below -- this build reads from the exact same libs/zdd/
+        # tree (or, via Resolve-VendoredLib's registry/checkout fallback, a
+        # sibling checkout entirely OUTSIDE $PluginDir) and is equally
+        # vulnerable to stale build/lib residue shadowing a fresh source
+        # change if it runs first without this -- pass $ZddDir explicitly
+        # so an external resolved path is reached too, not just libs/*.
+        Remove-PluginBuildArtifacts -PluginDir $PluginDir -ExtraDir $ZddDir
         if (Get-Command uv -ErrorAction SilentlyContinue) {
             $zddOut = & uv pip install --python $VenvPython "$ZddDir" --reinstall-package agent-zdd --refresh-package agent-zdd --quiet 2>&1
         } else {
             $zddOut = & $VenvPython -m pip install "$ZddDir" 2>&1
         }
+        Remove-PluginBuildArtifacts -PluginDir $PluginDir -ExtraDir $ZddDir
         if ($LASTEXITCODE -ne 0) {
             $ErrorActionPreference = $prevEAP
             Write-Fail "zdd install failed (exit $LASTEXITCODE)"
@@ -841,14 +1093,126 @@ function Install-Runtime {
         exit 1
     }
 
+    # Every OTHER `[tool.uv.sources]` workspace path dep that is a `uv`-
+    # editable canonical reference (vendor-pointer-generalization effort,
+    # Phase 1: no local copy in a dev checkout at all) needs the exact same
+    # standalone pre-install as zdd above, and for the same reason: when
+    # `uv` is unavailable the fallback below uses bare `python -m pip`
+    # install, which does NOT honor `[tool.uv.sources]` at all -- without a
+    # local copy AND without this pre-install, that non-uv path cannot
+    # resolve the dependency and may instead try (and fail) to resolve a
+    # same-named index package. `plugin-activation` is installed LAST since
+    # it imports `dropin_registry`/`plugin_resolve` at module load time.
+    foreach ($lib in @(
+        @{ Dir = 'dropin-registry'; Pkg = 'agent-dropin-registry'; Display = 'dropin-registry' },
+        @{ Dir = 'plugin-resolve'; Pkg = 'agent-plugin-resolve'; Display = 'plugin-resolve' },
+        @{ Dir = 'single-instance-lease'; Pkg = 'agent-single-instance-lease'; Display = 'single-instance-lease' },
+        @{ Dir = 'agent-procutil'; Pkg = 'agent-procutil'; Display = 'agent-procutil' },
+        @{ Dir = 'plugin-activation'; Pkg = 'agent-plugin-activation'; Display = 'plugin-activation' }
+    )) {
+        $libDir = Resolve-VendoredLib -LibName $lib.Dir
+        if (-not $libDir) {
+            Write-Fail "Cannot locate $($lib.Display) library. Reinstall the agent-dispatch plugin from the marketplace (copilot plugin install agent-dispatch@copilot-extensions), then rerun this installer."
+            exit 1
+        }
+        Remove-PluginBuildArtifacts -PluginDir $PluginDir -ExtraDir $libDir
+        if (Get-Command uv -ErrorAction SilentlyContinue) {
+            $libOut = & uv pip install --python $VenvPython "$libDir" --reinstall-package $lib.Pkg --refresh-package $lib.Pkg --quiet 2>&1
+        } else {
+            $libOut = & $VenvPython -m pip install "$libDir" 2>&1
+        }
+        Remove-PluginBuildArtifacts -PluginDir $PluginDir -ExtraDir $libDir
+        if ($LASTEXITCODE -ne 0) {
+            $ErrorActionPreference = $prevEAP
+            Write-Fail "$($lib.Display) install failed (exit $LASTEXITCODE)"
+            if ($libOut) { Write-Host ($libOut | Out-String) }
+            exit 1
+        }
+        Write-Ok "$($lib.Display) installed"
+    }
+
+    # -ReinstallPackage/-RefreshPackage (uv only): this installs from a local
+    # PATH source (not a registry), and uv's local-path build cache is keyed
+    # by source path, not source content. A version string that was ever
+    # built before -- at this exact path, or a different one -- can silently
+    # serve a stale cached wheel instead of rebuilding from what's actually
+    # on disk right now. This is the confirmed root cause behind
+    # ThomasMichon/copilot-extensions#2863: a deployed package was missing a
+    # function its own import site required, even though every verified copy
+    # of that release's actual source (git history and the exact snapshot
+    # used for the install alike) defined it correctly. Force a fresh
+    # build/install every time so a stale cache entry can never silently ship
+    # again -- covering agent-dispatch itself AND its own local
+    # `[tool.uv.sources]` workspace path deps (agent-procutil, agent-zdd,
+    # agent-dropin-registry, agent-plugin-activation, agent-plugin-resolve,
+    # agent-single-instance-lease), which are equally local PATH sources and
+    # equally vulnerable. #2863 also flagged a second, same-class ImportError
+    # in the self-update fallback (`from agent_procutil import ...`) --
+    # agent-procutil is exactly one of these.
+    $StaleCacheRefreshPackages = @(
+        'agent-dispatch',
+        'agent-procutil',
+        'agent-zdd',
+        'agent-dropin-registry',
+        'agent-plugin-activation',
+        'agent-plugin-resolve',
+        'agent-single-instance-lease'
+    )
     $installPkg = {
         param([string]$Spec)
-        if (Get-Command uv -ErrorAction SilentlyContinue) {
-            $out = & uv pip install --python $VenvPython $Spec 2>&1 | Out-String
-        } else {
-            $out = & $VenvPython -m pip install $Spec 2>&1 | Out-String
+        # Installing FROM the pristine payload directory ($PluginDir, under
+        # the plugin install root) leaves setuptools' own build/lib +
+        # *.egg-info staging behind IN that tree -- pip's build isolation
+        # covers the *environment* the build runs in, not where the legacy
+        # build_meta backend writes intermediate files. Left in place, a
+        # stale build/lib/ (or a src-layout package's src/*.egg-info, one
+        # level deeper than a root-level glob reaches) can silently shadow
+        # fresh src/ on a later install if setuptools' incremental-build
+        # mtime check decides nothing "changed". Scrub on every attempt
+        # (success or not) so the payload directory stays the pristine
+        # clone it's supposed to be -- mirrors the POSIX installer's
+        # cleanup in install.sh. Also reaches every vendored
+        # `[tool.uv.sources]` workspace path dep under libs/<name>/, which
+        # is its own independent build root and equally vulnerable -- see
+        # Remove-PluginBuildArtifacts's own docstring for the confirmed
+        # live incident.
+        $scrubArtifacts = { Remove-PluginBuildArtifacts -PluginDir $PluginDir }
+        # Scrub BEFORE installing too, not just after: residue already
+        # sitting in $PluginDir the moment this call starts (an earlier
+        # failed attempt, a marketplace resync, a concurrent process) is
+        # what shadows THIS build -- an after-only scrub only protects the
+        # NEXT install, not this one. Confirmed live (2026-09-23,
+        # copilot-extensions#3444): a truncated recipes_cli.py shipped this
+        # way on POSIX and crash-looped a production daemon for ~8h; the
+        # Windows path had the identical gap.
+        & $scrubArtifacts
+        try {
+            if (Get-Command uv -ErrorAction SilentlyContinue) {
+                $refreshFlags = @()
+                foreach ($pkg in $StaleCacheRefreshPackages) {
+                    $refreshFlags += @('--reinstall-package', $pkg, '--refresh-package', $pkg)
+                }
+                $out = & uv pip install --python $VenvPython @refreshFlags $Spec 2>&1 | Out-String
+            } else {
+                # The refresh pre-pass's own exit status must gate the real
+                # install: if it fails, letting the plain install below run
+                # anyway could silently succeed from a cached/existing wheel,
+                # defeating the whole stale-wheel guard.
+                $preOut = & $VenvPython -m pip install --force-reinstall --no-deps $Spec 2>&1 | Out-String
+                if ($LASTEXITCODE -ne 0) {
+                    return [pscustomobject]@{ Code = $LASTEXITCODE; Output = $preOut }
+                }
+                # The pre-pass above can itself recreate build/egg-info
+                # residue before the real install's own build starts below --
+                # re-scrub between the two calls so that build isn't shadowed
+                # by residue the pre-pass just left behind.
+                & $scrubArtifacts
+                $out = & $VenvPython -m pip install $Spec 2>&1 | Out-String
+            }
+            [pscustomobject]@{ Code = $LASTEXITCODE; Output = $out }
+        } finally {
+            & $scrubArtifacts
         }
-        [pscustomobject]@{ Code = $LASTEXITCODE; Output = $out }
     }
 
     $mcpResult = & $installPkg "$($PluginDir)[mcp]"
@@ -893,11 +1257,27 @@ function Install-Runtime {
     # mode. Remember the previously-active version as the gc keep target (a
     # not-yet-cycled daemon may still run it).
     $prevVersion = ''
+    # `embody` is only ever imported lazily, inside spawn_factories.
+    # make_headless_spawn -- so a bare `import agent_dispatch` never touches
+    # it, and a slot that is broken ONLY at that import (as in #2863) would
+    # otherwise sail through this gate and only fail on the first real spawn
+    # attempt, invisibly to `agent-dispatch health`/`daemon-status`.
+    # `__main__` is the CLI entry point (argparse wiring, e.g. the
+    # `recipes_cli.register_recipes_commands` import) -- a bare `import
+    # agent_dispatch` never touches it either, so a slot whose package
+    # content got truncated/corrupted in a way that only breaks `__main__`'s
+    # own top-level imports (as in #3419: a partially-written source file
+    # produced a published payload silently missing a whole function) would
+    # otherwise sail through this gate and only surface on the very next
+    # `agent-dispatch <anything>` invocation -- including inside the
+    # coordinator's own service, which then crash-loops. Import both
+    # explicitly here so each class of defect is caught before a slot is
+    # ever activated.
     if ($VersionedRuntime) {
         $prevVersion = Get-VersionedCurrent
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        & $VenvPython -c 'import agent_dispatch' 2>$null
+        & $VenvPython -c 'import agent_dispatch, agent_dispatch.embody, agent_dispatch.__main__' 2>$null
         $slotOk = ($LASTEXITCODE -eq 0)
         $ErrorActionPreference = $prevEAP
         if (-not $slotOk) {
@@ -915,7 +1295,7 @@ function Install-Runtime {
     $ErrorActionPreference = 'Continue'
     $importOk = $false
     for ($i = 0; $i -lt 3; $i++) {
-        & $LinkPython -c 'import agent_dispatch' 2>$null
+        & $LinkPython -c 'import agent_dispatch, agent_dispatch.embody, agent_dispatch.__main__' 2>$null
         if ($LASTEXITCODE -eq 0) { $importOk = $true; break }
         Start-Sleep -Seconds 1
     }
@@ -932,9 +1312,9 @@ function Install-Runtime {
     if ($pathDirs -contains $LocalBin) {
         Write-Ok "PATH: $LocalBin is on PATH"
     } else {
-        $currentUserPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+        $currentUserPath = Get-CopilotPersistentEnvironmentVariable -Name 'PATH' -Target 'User'
         if (-not ($currentUserPath -split ';' | Where-Object { $_ -eq $LocalBin })) {
-            [System.Environment]::SetEnvironmentVariable('PATH', "$LocalBin;$currentUserPath", 'User')
+            Set-CopilotPersistentEnvironmentVariable -Name 'PATH' -Value "$LocalBin;$currentUserPath" -Target 'User'
             $env:PATH = "$LocalBin;$env:PATH"
             Write-Ok "PATH: Added $LocalBin to User PATH"
         }
@@ -1018,7 +1398,7 @@ function Remove-CoordinatorTask {
 function Get-ServiceMode {
     # Resolve the service auto-start mode for this host:
     #   'interactive' -- an interactive (RDP/console) logon is required before the
-    #                    box is usable (verified: dev6/cloud1/augloop1 must be
+    #                    box is usable (verified: dev6/cloud1/box1 must be
     #                    RDP-kicked before SSH works). Such a logon ALWAYS precedes
     #                    dispatch, so the non-elevated HKCU logon auto-start is the
     #                    first-class coordinator service -- no elevated boot task.
@@ -1418,7 +1798,10 @@ function Install-CoordinatorTask {
 # AGENT_DISPATCH_PORT=$DefaultPort  # unset = OS-assigned dynamic port (Stage C), advertised via the rendezvous file; uncomment to pin
 # AGENT_DISPATCH_DB=%USERPROFILE%\.agent-dispatch\tasks.db   # default; uncomment to override
 # AGENT_DISPATCH_TOKEN=                                       # set to require bearer auth
-# AGENT_DISPATCH_CONTROL_TOKEN=                               # required to manage producer scopes
+# AGENT_DISPATCH_CONTROL_TOKEN=                               # required to manage producer scopes (and to register evaluators)
+# AGENT_DISPATCH_CONTROL_TOKEN_COMMAND=                       # or fetch it on demand (e.g. a vault CLI) instead of a raw value above
+# refuse task creation against an unregistered repo lane; register every real lane first with 'agent-dispatch registrar add-pointer'
+# AGENT_DISPATCH_ENFORCE_REGISTERED_REPOS=1
 "@
         [System.IO.File]::WriteAllText($envFile, $envDefault, $utf8NoBom)
         Write-Ok "Service env: $envFile (defaults; edit to pin the bind host / add a token)"
@@ -1466,6 +1849,7 @@ function Install-CoordinatorTask {
 # Task runs headless (conhost --headless), so console output is otherwise lost.
 `$ErrorActionPreference = 'Stop'
 `$env:PYTHONUTF8 = '1'
+`$env:AGENT_DISPATCH_INSTALL_DIR = '$($InstallDir -replace "'","''")'
 Set-Location -LiteralPath `$PSScriptRoot
 `$envFile = Join-Path `$PSScriptRoot 'service.env'
 if (Test-Path `$envFile) {
@@ -1491,6 +1875,15 @@ if ((Split-Path -Leaf `$_root) -eq 'versions') { `$_root = Split-Path `$_root }
 try { `$_ver = ([IO.File]::ReadAllText((Join-Path `$_root 'current-version'))).Trim() } catch {}
 `$_slot = if (`$_ver) { Join-Path `$_root ('versions\' + `$_ver) } else { '' }
 `$_py = if (`$_slot) { Join-Path `$_slot 'Scripts\python.exe' } else { '' }
+if (-not (`$_py -and (Test-Path -LiteralPath `$_py))) {
+    # #742: marker missing/stale -> prefer last-known-good (the last version
+    # activate() published) over a raw newest-slot guess, which could bind a
+    # still-installing/never-activated slot mid-swap.
+    `$_lkg = ''
+    try { `$_lkg = ([IO.File]::ReadAllText((Join-Path `$_root 'last-known-good'))).Trim() } catch {}
+    if (`$_lkg) { `$_slot = Join-Path `$_root ('versions\' + `$_lkg); `$_py = Join-Path `$_slot 'Scripts\python.exe' }
+    if (-not (`$_py -and (Test-Path -LiteralPath `$_py))) { `$_py = ''; `$_slot = '' }
+}
 if (-not (`$_py -and (Test-Path -LiteralPath `$_py))) { `$_py = Get-ChildItem (Join-Path `$_root 'versions') -Directory -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { Join-Path `$_.FullName 'Scripts\python.exe' } | Where-Object { Test-Path -LiteralPath `$_ } | Select-Object -Last 1; `$_slot = if (`$_py) { Split-Path (Split-Path `$_py) } else { '' } }
 # A busy/locked log must NEVER block the coordinator launch. Prefer the canonical
 # serve-service.log; if it cannot be opened for append (a stale or concurrent
@@ -1537,15 +1930,23 @@ try {
 "@
     [System.IO.File]::WriteAllText($launcher, $launcherBody, $utf8NoBom)
 
-    # -- Interactive-required host: the logon auto-start IS the service ----------
-    # On a box that requires an RDP/console logon before it is usable (and where
-    # Task Scheduler registration is admin-gated), an interactive logon always
-    # precedes dispatch, so the non-elevated HKCU logon auto-start is the
-    # first-class coordinator service -- no boot task, no elevation. See the
-    # interactive-service-mode design.
+    # -- Interactive-required host: prefer an Interactive-logon Scheduled Task --
+    # Same desktop access as the HKCU Run auto-start it replaces (an interactive
+    # logon always precedes dispatch on this class of host), PLUS Task
+    # Scheduler's own RestartCount/RestartInterval crash-restart policy, which
+    # HKCU Run cannot provide (copilot-extensions#2172). Degrade to the
+    # non-elevated logon auto-start only when elevation is unavailable (first
+    # install, non-elevated) -- see the interactive-service-mode design.
     if ((Get-ServiceMode) -eq 'interactive') {
         if ($Interactive) { Save-ServiceMode 'interactive' }
         Set-ServiceEnvLoopback
+        if ($haveSchedMod -and (Install-InteractiveScheduledTask -Name $TaskName -Launcher $launcher `
+                -Description 'agent-dispatch -- portable agent task-queue coordinator (interactive)' -NoStart:$NoStart)) {
+            if (Remove-CoordinatorAutostart) {
+                Write-Step "Removed the non-elevated logon fallback -- the Scheduled Task supersedes it"
+            }
+            return
+        }
         if ($haveSchedMod) {
             switch (Remove-CoordinatorTask) {
                 'removed' { Write-Step 'Removed prior boot Scheduled Task (interactive mode: logon auto-start owns startup)' }
@@ -1856,6 +2257,101 @@ function Remove-ProfileSupervisorTasks {
     } catch { }
 }
 
+function Install-InteractiveScheduledTask {
+    <#
+      Idempotent Interactive-logon-type Scheduled Task installer shared by the
+      coordinator and supervisor on an interactive-service-mode host. An
+      -AtLogOn task with LogonType Interactive/RunLevel Limited gets the SAME
+      desktop access as the historical HKCU Run auto-start it replaces (embody
+      CLI/mux sessions need an interactive station -- S4U's non-interactive
+      station, used by the headless boot-mode coordinator, cannot provide one),
+      but ALSO gets Task Scheduler's own RestartCount/RestartInterval
+      crash-restart policy, which HKCU Run cannot: closing the "who restarts
+      the watchdog after it dies mid-session" gap (copilot-extensions#2172).
+
+      Register-ONCE model, same as the boot-mode supervisor task below: a
+      non-elevated call that finds the task already registered (as an
+      Interactive-logon task -- a mismatched leftover, e.g. a stale S4U boot
+      task, is NOT treated as a match) must never re-register (Register -Force
+      needs elevation); it just cycles (stop/start) the task onto the freshly
+      activated launcher slot, which resolves the current version itself. First
+      registration needs ONE elevated run.
+
+      Returns $true when the task ends up registered+enabled (whether by this
+      call or a prior one); $false when elevation is unavailable (first
+      install, non-elevated) and the caller should fall back to its own
+      non-elevated logon auto-start path -- unchanged, degrade-gracefully
+      behavior for a host where elevation truly cannot be obtained. Also
+      returns $false (never throws) when the ScheduledTasks cmdlets themselves
+      are unavailable, so a caller that skips the `$haveSchedMod` guard still
+      degrades gracefully instead of crashing the install.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Launcher,
+        [Parameter(Mandatory)][string]$Description,
+        [string]$WorkingDirectory = $InstallDir,
+        [switch]$NoStart
+    )
+
+    if (-not (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+
+    $existingTask = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+    $matchingType = $existingTask -and ($existingTask.Principal.LogonType -eq 'Interactive')
+    if ($matchingType -and (-not (Test-Elevated))) {
+        Enable-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue | Out-Null
+        if ($NoStart) {
+            # The caller explicitly asked not to (re)start anything right now
+            # (e.g. the coordinator's graceful-cutover path, where a NEW
+            # coordinator has already been brought up out-of-band and
+            # stopping/restarting this task would race or kill it) -- leave an
+            # already-running task's process completely untouched.
+            Write-Ok "$Description already registered (Scheduled Task '$Name'; left running as-is, -NoStart)"
+        } else {
+            # Start-ScheduledTask on an already-Running task is a no-op in Task
+            # Scheduler, so picking up a freshly activated launcher slot needs
+            # an explicit stop before the restart.
+            Stop-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+            Start-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+            Write-Ok "$Description refreshed in place (Scheduled Task '$Name'; restarted onto the new build -- no re-register, no elevation)"
+        }
+        return $true
+    }
+
+    $action = New-ScheduledTaskAction -Execute 'conhost.exe' `
+        -Argument "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Launcher`"" `
+        -WorkingDirectory $WorkingDirectory
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable
+    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Limited
+
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $regOk = $false
+    try {
+        Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger `
+            -Settings $settings -Principal $principal -Force `
+            -Description $Description | Out-Null
+        $regOk = $?
+    } catch {
+        $regOk = $false
+    }
+    $ErrorActionPreference = $prevEAP
+    if (-not $regOk) {
+        return $false
+    }
+    Enable-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue | Out-Null
+    if (-not $NoStart) { Start-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue }
+    Write-Ok "$Description installed + started (Scheduled Task '$Name'; interactive logon, self-restarting)"
+    return $true
+}
+
 function Install-SupervisorLogonAutostart {
     # Interactive-mode supervisor: start it now (detached) and register an HKCU
     # Run key so it (re)starts at each interactive logon. An interactive logon
@@ -1936,7 +2432,7 @@ AGENT_DISPATCH_SUPERVISE_EXTRA_ARGS=
 AGENT_DISPATCH_SUPERVISE_MODE=
 # MODE=serve only: explicit machine scope for this host's daemon. Recommended in a
 # service context -- CWD-based identity resolution can fail there, and without a
-# machine the daemon SKIPS every machine-pinned declaration (aperture-labs #5001).
+# machine the daemon SKIPS every machine-pinned declaration (the downstream tracker).
 # Leave blank to fall back to the host node name at runtime; set to this host's
 # alias to pin it explicitly.
 AGENT_DISPATCH_SUPERVISE_MACHINE=
@@ -1963,6 +2459,7 @@ param([string]`$EnvFile = (Join-Path `$PSScriptRoot 'supervisor.env'))
 # Do not edit; edit supervisor.env or supervisors/<name>.env instead.
 `$ErrorActionPreference = 'Stop'
 `$env:PYTHONUTF8 = '1'
+`$env:AGENT_DISPATCH_INSTALL_DIR = '$($InstallDir -replace "'","''")'
 Set-Location -LiteralPath `$PSScriptRoot
 `$envFile = `$EnvFile
 `$labels = ''
@@ -2006,10 +2503,10 @@ if (`$mode -eq 'serve') {
     # pointers) + this host's legacy env profiles (--legacy-env: supervisor.env +
     # supervisors/*.env), each in its own subprocess. It is self-gating (only
     # labeled declarations/profiles run), so it needs no label opt-in here.
-    `$argsList = @('supervise', 'serve', '--legacy-env')
+    `$argsList = @('supervise', 'serve', '--legacy-env', '--interval', `$interval)
     # Explicit machine scope (recommended for a service context, where CWD-based
     # identity resolution can fail and leave the daemon unable to scope
-    # machine-pinned declarations -- aperture-labs #5001). Falls back to the host
+    # machine-pinned declarations -- the downstream tracker). Falls back to the host
     # node name at runtime when unset.
     if (`$sMachine) { `$argsList += @('--machine', `$sMachine) }
     if (`$extra) { `$argsList += (`$extra -split '\s+') }
@@ -2049,6 +2546,15 @@ if ((Split-Path -Leaf `$_root) -eq 'versions') { `$_root = Split-Path `$_root }
 try { `$_ver = ([IO.File]::ReadAllText((Join-Path `$_root 'current-version'))).Trim() } catch {}
 `$_slot = if (`$_ver) { Join-Path `$_root ('versions\' + `$_ver) } else { '' }
 `$_py = if (`$_slot) { Join-Path `$_slot 'Scripts\python.exe' } else { '' }
+if (-not (`$_py -and (Test-Path -LiteralPath `$_py))) {
+    # #742: marker missing/stale -> prefer last-known-good (the last version
+    # activate() published) over a raw newest-slot guess, which could bind a
+    # still-installing/never-activated slot mid-swap.
+    `$_lkg = ''
+    try { `$_lkg = ([IO.File]::ReadAllText((Join-Path `$_root 'last-known-good'))).Trim() } catch {}
+    if (`$_lkg) { `$_slot = Join-Path `$_root ('versions\' + `$_lkg); `$_py = Join-Path `$_slot 'Scripts\python.exe' }
+    if (-not (`$_py -and (Test-Path -LiteralPath `$_py))) { `$_py = ''; `$_slot = '' }
+}
 if (-not (`$_py -and (Test-Path -LiteralPath `$_py))) { `$_py = Get-ChildItem (Join-Path `$_root 'versions') -Directory -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { Join-Path `$_.FullName 'Scripts\python.exe' } | Where-Object { Test-Path -LiteralPath `$_ } | Select-Object -Last 1; `$_slot = if (`$_py) { Split-Path (Split-Path `$_py) } else { '' } }
 # A busy/locked log must NEVER block the supervisor launch -- prefer the canonical
 # supervise-service.log, else a VERSION- and pid-aware fallback (see serve-service).
@@ -2123,39 +2629,74 @@ function Install-SupervisorTaskInstance {
     # unconditionally (no label opt-in); the direct loop stays label-gated.
     $mode = Get-SupervisorMode -EnvFile $EnvFile
 
-    # Interactive-required host: use the non-elevated logon auto-start (HKCU Run)
-    # instead of a Scheduled Task -- registration is admin-gated here, and an
-    # interactive station is the right fit for the supervisor anyway. Only when a
-    # label opt-in is configured (else stay inert, like the disabled-task case).
+    # Interactive-required host: prefer an Interactive-logon Scheduled Task (same
+    # desktop access as the HKCU Run auto-start it replaces, PLUS Task
+    # Scheduler's own crash-restart policy -- copilot-extensions#2172); degrade
+    # to the non-elevated logon auto-start only when elevation is unavailable.
+    # Only when a label opt-in is configured (else stay inert, like the
+    # disabled-task case).
     if ((Get-ServiceMode) -eq 'interactive') {
+        if ($mode -eq 'serve' -or (Test-SupervisorLabelsConfigured -EnvFile $EnvFile)) {
+            if (Install-InteractiveScheduledTask -Name $Name -Launcher $Launcher `
+                    -Description 'agent-dispatch -- embody + companion supervisor (interactive)') {
+                if (Remove-SupervisorAutostart -Name $Name) {
+                    Write-Step "Removed the non-elevated logon fallback -- the Scheduled Task supersedes it"
+                }
+                return
+            }
+            # Elevation unavailable (first install, non-elevated): degrade to the
+            # non-elevated logon auto-start, exactly as before this task-based
+            # path existed.
+            switch (Remove-SupervisorTask -Name $Name) {
+                'removed' { Write-Step "Removed prior supervisor Scheduled Task '$Name' (interactive mode)" }
+                default   { }
+            }
+            Install-SupervisorLogonAutostart -Name $Name -Launcher $Launcher -EnvFile $EnvFile
+            return
+        }
         switch (Remove-SupervisorTask -Name $Name) {
             'removed' { Write-Step "Removed prior supervisor Scheduled Task '$Name' (interactive mode)" }
             default   { }
         }
-        if ($mode -eq 'serve' -or (Test-SupervisorLabelsConfigured -EnvFile $EnvFile)) {
-            Install-SupervisorLogonAutostart -Name $Name -Launcher $Launcher -EnvFile $EnvFile
-        } else {
-            if (Remove-SupervisorAutostart -Name $Name) { Write-Step "Removed supervisor logon auto-start '$Name' (no opt-in label)" }
-            Write-Ok "$DisplayName INERT (no opt-in label). Set AGENT_DISPATCH_SUPERVISE_LABELS in $EnvFile + re-run update to enable."
-        }
-        return
-    }
-
-    # Register-ONCE model (#689 / non-elevated live-update): if the task already
-    # exists AND we are non-elevated, it was registered once (one-time elevated
-    # install) and its action points at the STABLE launcher path, so we must NOT
-    # re-register on update (that needs elevation and is why the supervisor used to
-    # go stale). Just restart it in place to cycle onto the freshly-activated slot.
-    # When elevated we fall through and re-register so a task DEFINITION change is
-    # still applied (Register -Force cycles it too).
-    if ((-not (Test-Elevated)) -and (Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue)) {
-        Restart-SupervisorTaskInPlace -Name $Name -EnvFile $EnvFile -Mode $mode -DisplayName $DisplayName
+        if (Remove-SupervisorAutostart -Name $Name) { Write-Step "Removed supervisor logon auto-start '$Name' (no opt-in label)" }
+        Write-Ok "$DisplayName INERT (no opt-in label). Set AGENT_DISPATCH_SUPERVISE_LABELS in $EnvFile + re-run update to enable."
         return
     }
 
     $action = New-ScheduledTaskAction -Execute 'conhost.exe' `
         -Argument "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Launcher`" -EnvFile `"$EnvFile`"" `
         -WorkingDirectory $InstallDir
+
+    # Register-ONCE model (#689 / #1837): re-registering (Register -Force, which
+    # needs elevation) is reserved for first install or an ACTUAL task-definition
+    # change -- never a routine update, elevated or not. Compare the
+    # already-registered task's action against the one this update would
+    # produce; the launcher/env-file/install-dir paths are all stable across
+    # ordinary updates, so a match here means "already correct", regardless of
+    # the caller's elevation state. Only a genuine drift (a real migration, e.g.
+    # an install-dir move) falls through to re-register.
+    $existingTask = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+    if ($existingTask) {
+        $existingAction = $existingTask.Actions | Select-Object -First 1
+        $matchesDesired = $existingAction -and
+            $existingAction.Execute -eq $action.Execute -and
+            $existingAction.Arguments -eq $action.Arguments -and
+            $existingAction.WorkingDirectory -eq $action.WorkingDirectory
+        if ($matchesDesired) {
+            Restart-SupervisorTaskInPlace -Name $Name -EnvFile $EnvFile -Mode $mode -DisplayName $DisplayName
+            return
+        }
+        if (-not (Test-Elevated)) {
+            # A genuine definition drift, but we cannot re-register without
+            # elevation -- keep the existing (stale) task registration rather
+            # than losing it, and just cycle the running process onto the new
+            # slot; say so instead of silently no-op'ing the migration.
+            Write-Warn "$DisplayName task definition changed but elevation is unavailable to migrate it -- run elevated once to update the task; refreshing the running process onto the new slot meanwhile"
+            Restart-SupervisorTaskInPlace -Name $Name -EnvFile $EnvFile -Mode $mode -DisplayName $DisplayName
+            return
+        }
+    }
+
     $trigger = New-ScheduledTaskTrigger -AtLogOn
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -2462,6 +3003,12 @@ function Invoke-CoordinatorCutover {
 
 function Invoke-Update {
     Write-Host ''; Write-Host '=== agent-dispatch update ===' -ForegroundColor Cyan; Write-Host ''
+    # Mark the live-service update lifecycle as in-progress (ce#5066) so a
+    # local liveness watchdog never force-restarts a daemon that is
+    # legitimately, briefly mid-cutover. try/finally (not a trap, which
+    # PowerShell only fires for terminating errors) covers every exit path.
+    Write-UpdateMarker
+    try {
     Invoke-DowngradeGuard
     Install-Runtime
     # Thread B (graceful daemon cutover): a version update must NEVER kill
@@ -2502,9 +3049,15 @@ function Invoke-Update {
         Install-SupervisorTask
     }
     Write-Host ''; Write-Host '=== agent-dispatch update complete ===' -ForegroundColor Cyan
+    } finally {
+        Clear-UpdateMarker
+    }
 }
 
 function Invoke-Start {
+    # Mark the live-service start lifecycle as in-progress (ce#5066).
+    Write-UpdateMarker
+    try {
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($task) {
         Start-ScheduledTask -TaskName $TaskName
@@ -2524,6 +3077,9 @@ function Invoke-Start {
     # primary/profile supervisors are left alone.
     Invoke-SupervisorsStart
     Confirm-CoordinatorRunning
+    } finally {
+        Clear-UpdateMarker
+    }
 }
 
 function Invoke-Stop {
@@ -2573,51 +3129,109 @@ function Invoke-Status {
 }
 
 function Invoke-Uninstall {
-    Write-Host ''; Write-Host '=== agent-dispatch uninstall ===' -ForegroundColor Cyan; Write-Host ''
-    Invoke-SupervisorsStop
-    $retired = Retire-SupervisorProcesses
-    if ($retired -gt 0) { Write-Ok "Embody supervisor stopped ($retired process(es))" }
-    Remove-AllSupervisorTasks
-    Write-Ok 'Embody supervisor tasks removed'
-    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-        Write-Ok 'Coordinator task removed'
+    Write-Host ''; Write-Host '=== agent-dispatch uninstall ===' -ForegroundColor Cyan
+    if ($DryRun) { Write-Host '(dry run -- nothing will be changed)' -ForegroundColor Yellow }
+    Write-Host ''
+
+    if ($DryRun) {
+        Write-Host '[dry-run] would stop supervisors + retire supervisor processes'
+        if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+            $supervisorTasks = @(Get-ScheduledTask -TaskName $SupervisorTaskName -ErrorAction SilentlyContinue) +
+                @(Get-ScheduledTask -TaskName "$SupervisorTaskName-*" -ErrorAction SilentlyContinue)
+            foreach ($t in $supervisorTasks) { Write-Host "[dry-run] would remove supervisor task: $($t.TaskName)" }
+        }
+        $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+        if (Get-ItemProperty -Path $runKey -Name $SupervisorTaskName -ErrorAction SilentlyContinue) {
+            Write-Host "[dry-run] would remove supervisor autostart (HKCU Run): $SupervisorTaskName"
+        }
+    } else {
+        Invoke-SupervisorsStop
+        $retired = Retire-SupervisorProcesses
+        if ($retired -gt 0) { Write-Ok "Embody supervisor stopped ($retired process(es))" }
+        Remove-AllSupervisorTasks
+        Write-Ok 'Embody supervisor tasks removed'
     }
-    if (Remove-CoordinatorAutostart) { Write-Ok 'Coordinator logon auto-start (HKCU Run) removed' }
+
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        if ($DryRun) {
+            Write-Host "[dry-run] would remove scheduled task: $TaskName"
+        } else {
+            Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Ok 'Coordinator task removed'
+        }
+    }
+
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    if (Get-ItemProperty -Path $runKey -Name $TaskName -ErrorAction SilentlyContinue) {
+        if ($DryRun) {
+            Write-Host "[dry-run] would remove coordinator logon auto-start (HKCU Run): $TaskName"
+        } elseif (Remove-CoordinatorAutostart) {
+            Write-Ok 'Coordinator logon auto-start (HKCU Run) removed'
+        }
+    }
+
     if (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) {
         $fwRule = 'agent-dispatch coordinator (WSL)'
         if (Get-NetFirewallRule -DisplayName $fwRule -ErrorAction SilentlyContinue) {
-            Remove-NetFirewallRule -DisplayName $fwRule -ErrorAction SilentlyContinue
-            Write-Ok 'Coordinator firewall rule removed'
+            if ($DryRun) {
+                Write-Host "[dry-run] would remove firewall rule: $fwRule"
+            } else {
+                Remove-NetFirewallRule -DisplayName $fwRule -ErrorAction SilentlyContinue
+                Write-Ok 'Coordinator firewall rule removed'
+            }
         }
     }
+
     foreach ($n in @(
         'agent-dispatch.cmd', 'agent-dispatch.ps1', 'agent-dispatch',
         'agent-dispatch-board.cmd'
     )) {
         $p = Join-Path $LocalBin $n
-        if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $p) {
+            if ($DryRun) { Write-Host "[dry-run] would remove binstub: $p" }
+            else { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+        }
     }
-    Write-Ok 'Binstub removed'
+    if (-not $DryRun) { Write-Ok 'Binstub removed' }
+
     $pivot = Join-Path $env:USERPROFILE '.agent-worktrees\pivots\agent-dispatch.json'
-    if (Test-Path $pivot) { Remove-Item $pivot -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $pivot) {
+        if ($DryRun) { Write-Host "[dry-run] would remove pivot: $pivot" }
+        else { Remove-Item $pivot -Force -ErrorAction SilentlyContinue }
+    }
+
     if ($Purge) {
-        if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
-        Write-Ok "Runtime purged: $InstallDir (config + DB deleted)"
+        if (Test-Path $InstallDir) {
+            if ($DryRun) { Write-Host "[dry-run] would PURGE (config + DB): $InstallDir" }
+            else { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue; Write-Ok "Runtime purged: $InstallDir (config + DB deleted)" }
+        }
     } else {
         # Remove the runtime venv. Versioned: the `.venv` link + the versions/
         # tree; otherwise the single real venv dir.
         if ($VersionedRuntime) {
-            if (Test-VenvIsLink $LinkDir) { & cmd /c rmdir "$LinkDir" 2>$null }
-            elseif (Test-Path $LinkDir) { Remove-Item -Recurse -Force $LinkDir -ErrorAction SilentlyContinue }
-            $verRoot = Join-Path $InstallDir 'versions'
-            if (Test-Path $verRoot) { Remove-Item -Recurse -Force $verRoot -ErrorAction SilentlyContinue }
+            if ($DryRun) {
+                if ((Test-VenvIsLink $LinkDir) -or (Test-Path $LinkDir)) { Write-Host "[dry-run] would remove: $LinkDir" }
+                $verRoot = Join-Path $InstallDir 'versions'
+                if (Test-Path $verRoot) { Write-Host "[dry-run] would remove: $verRoot" }
+            } else {
+                if (Test-VenvIsLink $LinkDir) { & cmd /c rmdir "$LinkDir" 2>$null }
+                elseif (Test-Path $LinkDir) { Remove-Item -Recurse -Force $LinkDir -ErrorAction SilentlyContinue }
+                $verRoot = Join-Path $InstallDir 'versions'
+                if (Test-Path $verRoot) { Remove-Item -Recurse -Force $verRoot -ErrorAction SilentlyContinue }
+            }
         } elseif (Test-Path $VenvDir) {
-            Remove-Item -Recurse -Force $VenvDir -ErrorAction SilentlyContinue
+            if ($DryRun) { Write-Host "[dry-run] would remove venv: $VenvDir" }
+            else { Remove-Item -Recurse -Force $VenvDir -ErrorAction SilentlyContinue }
         }
-        Write-Ok 'Venv removed (config + DB kept; -Purge to delete)'
+        if ($DryRun) {
+            Write-Host "[dry-run] config + DB at $InstallDir would be kept (-Purge to delete)"
+        } else {
+            Write-Ok 'Venv removed (config + DB kept; -Purge to delete)'
+        }
     }
+
+    if ($DryRun) { Write-Host 'agent-dispatch uninstall dry run complete -- nothing was changed' -ForegroundColor Yellow }
 }
 
 switch ($Action) {

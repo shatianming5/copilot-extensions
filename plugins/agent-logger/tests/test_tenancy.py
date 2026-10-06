@@ -1,0 +1,775 @@
+"""Tests for single-install multi-tenant orchestration (agent_logger.tenancy)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import yaml
+
+from agent_logger import tenancy
+from agent_logger.config import load_config
+
+from .conftest import init_git_repo
+
+# --------------------------------------------------------------------------- #
+# fixtures / helpers                                                            #
+# --------------------------------------------------------------------------- #
+
+
+def _make_session(source: Path, name: str, git_root: str) -> None:
+    sess = source / "session-state" / name
+    sess.mkdir(parents=True)
+    (sess / "events.jsonl").write_text('{"ts": 1}\n', encoding="utf-8")
+    (sess / "workspace.yaml").write_text(
+        f"id: {name}\ngit_root: {git_root}\n", encoding="utf-8"
+    )
+
+
+def _make_copilot(root: Path) -> Path:
+    """A fake ~/.copilot with one session per repo family."""
+    src = root / "copilot"
+    _make_session(src, "sess-apl", "/work/private-downstream-repo/wt")
+    _make_session(src, "sess-cext", "/work/copilot-extensions/wt")
+    _make_session(src, "sess-dot", "/work/dotfiles/wt")
+    _make_session(src, "sess-work", "/work/acme-webapp/wt")
+    return src
+
+
+HARNESS = ["private-downstream-repo", "copilot-extensions", "dotfiles", "acme-webapp"]
+
+
+def _write_tenant_repo(repo: Path, block: dict) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / ".agent-logger.yaml").write_text(
+        yaml.safe_dump({"schema_version": 1, "tenant": block}), encoding="utf-8"
+    )
+
+
+def _write_registry(aw_home: Path, src_parent: Path, names: list[str]) -> None:
+    aw_home.mkdir(parents=True, exist_ok=True)
+    (aw_home / "projects.yaml").write_text(
+        yaml.safe_dump({"projects": {n: {} for n in names}}), encoding="utf-8"
+    )
+    (aw_home / "repos.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "srcroot": {tenancy.current_platform(): str(src_parent)},
+                "repos": {n: {} for n in names},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# registry reader                                                              #
+# --------------------------------------------------------------------------- #
+
+
+def test_adopted_repo_paths_absent_registry_is_empty(tmp_path):
+    assert tenancy.adopted_repo_paths(aw_home=tmp_path / "nope") == []
+
+
+def test_adopted_repo_paths_resolves_srcroot(tmp_path):
+    src = tmp_path / "src"
+    (src / "private-downstream-repo").mkdir(parents=True)
+    (src / "dotfiles").mkdir(parents=True)
+    _write_registry(tmp_path / ".aw", src, ["private-downstream-repo", "dotfiles"])
+    resolved = dict(tenancy.adopted_repo_paths(aw_home=tmp_path / ".aw"))
+    assert resolved["private-downstream-repo"] == src / "private-downstream-repo"
+    assert resolved["dotfiles"] == src / "dotfiles"
+
+
+# --------------------------------------------------------------------------- #
+# tenant block parsing                                                         #
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_tenant_block_absent_is_none():
+    assert tenancy.parse_tenant_block(
+        {"schema_version": 1, "log": {}}, source="x", default_id="r"
+    ) is None
+
+
+def test_parse_tenant_block_defaults_id_and_roles():
+    block = tenancy.parse_tenant_block(
+        {"tenant": {}}, source="x", default_id="private-downstream-repo"
+    )
+    assert block["id"] == "private-downstream-repo"
+    assert block["roles"] == ["source"]
+    assert block["enabled"] is True
+
+
+def test_parse_tenant_block_rejects_unknown_field():
+    with pytest.raises(tenancy.TenantConfigError):
+        tenancy.parse_tenant_block(
+            {"tenant": {"bogus": 1}}, source="x", default_id="r"
+        )
+
+
+def test_parse_tenant_block_rejects_unknown_role():
+    with pytest.raises(tenancy.TenantConfigError):
+        tenancy.parse_tenant_block(
+            {"tenant": {"roles": ["source", "wat"]}}, source="x", default_id="r"
+        )
+
+
+def test_parse_tenant_block_future_schema_is_tolerant():
+    """A tenant block from a newer schema is read tolerantly: unknown fields,
+    unknown per-machine keys, and roles this build can't serve are dropped, not
+    fatal."""
+    block = tenancy.parse_tenant_block(
+        {
+            "schema_version": 99,
+            "tenant": {
+                "id": "private-downstream-repo",
+                "roles": ["source", "index"],  # 'index' is a future role
+                "future_field": {"x": 1},
+                "machines": {"book2": {"future_key": 1, "sync": {}}},
+            },
+        },
+        source="x",
+        default_id="private-downstream-repo",
+    )
+    assert block["roles"] == ["source"]  # future role dropped, known kept
+    assert block["future_schema"] is True
+
+
+def test_parse_tenant_block_future_schema_all_roles_unknown_is_inert():
+    block = tenancy.parse_tenant_block(
+        {"schema_version": 99, "tenant": {"id": "r", "roles": ["index"]}},
+        source="x",
+        default_id="r",
+    )
+    assert block["roles"] == []  # inert here; a newer build would serve it
+
+
+def test_parse_tenant_block_rejects_path_injecting_id():
+    for bad in ("../evil", "a/b", "a\\b", ".", ".."):
+        with pytest.raises(tenancy.TenantConfigError):
+            tenancy.parse_tenant_block(
+                {"tenant": {"id": bad}}, source="x", default_id="r"
+            )
+
+
+@pytest.mark.parametrize("bad", [False, "99", 0, -1, 1.5])
+def test_parse_tenant_block_rejects_bad_schema_version(bad):
+    with pytest.raises(tenancy.TenantConfigError):
+        tenancy.parse_tenant_block(
+            {"schema_version": bad, "tenant": {"id": "r"}}, source="x", default_id="r"
+        )
+
+
+def test_parse_tenant_block_rejects_non_bool_machine_enabled():
+    with pytest.raises(tenancy.TenantConfigError):
+        tenancy.parse_tenant_block(
+            {"tenant": {"id": "r", "machines": {"book2": {"enabled": "false"}}}},
+            source="x",
+            default_id="r",
+        )
+
+
+def test_parse_tenant_block_rejects_unknown_machine_role():
+    with pytest.raises(tenancy.TenantConfigError):
+        tenancy.parse_tenant_block(
+            {"tenant": {"id": "r", "machines": {"book2": {"roles": ["wat"]}}}},
+            source="x",
+            default_id="r",
+        )
+
+
+@pytest.mark.parametrize(
+    "machine,key,expected",
+    [
+        ("book2", "book2", True),
+        ("book2-wsl", "book2", True),
+        ("book2", "atlas-core", False),
+        ("book2extra", "book2", False),  # not a "-" boundary
+    ],
+)
+def test_machine_matches(machine, key, expected):
+    assert tenancy.machine_matches(machine, key) is expected
+
+
+# --------------------------------------------------------------------------- #
+# per-machine resolution                                                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_tenant_applies_machine_override_and_lock_name(tmp_path):
+    block = tenancy.parse_tenant_block(
+        {
+            "tenant": {
+                "id": "private-downstream-repo",
+                "roles": ["source"],
+                "sync": {"harness_repos": HARNESS},
+                "machines": {
+                    "book2": {
+                        "sync": {
+                            "repo_allowlist": ["private-downstream-repo", "copilot-extensions"],
+                            "repo_allowlist_fail_closed": True,
+                        }
+                    }
+                },
+            }
+        },
+        source="x",
+        default_id="private-downstream-repo",
+    )
+    resolved = tenancy.resolve_tenant(
+        block,
+        repo_name="private-downstream-repo",
+        repo_path=tmp_path / "repo",
+        config_path=tmp_path / "repo" / ".agent-logger.yaml",
+        machine="book2",
+        home=tmp_path / "home",
+    )
+    cfg = resolved.config
+    assert cfg.sync_repo_allowlist == ["private-downstream-repo", "copilot-extensions"]
+    assert cfg.sync_repo_allowlist_fail_closed is True
+    assert cfg.sync_lock_name == "session-sync.lock"  # shared source lock
+    # A non-book2 machine takes the unfiltered base scope.
+    other = tenancy.resolve_tenant(
+        block,
+        repo_name="private-downstream-repo",
+        repo_path=tmp_path / "repo",
+        config_path=tmp_path / "repo" / ".agent-logger.yaml",
+        machine="atlas-core",
+        home=tmp_path / "home",
+    )
+    assert other.config.sync_repo_allowlist == []
+    assert other.config.sync_repo_allowlist_fail_closed is False
+
+
+def test_resolve_tenant_namespaces_change_tracker_db_for_source_role(tmp_path):
+    """A source-role tenant gets its own change-tracker db under home, so
+    multiple tenants syncing the same ~/.copilot never share "already
+    synced" state."""
+    block = tenancy.parse_tenant_block(
+        {"tenant": {"id": "private-downstream-repo", "roles": ["source"]}},
+        source="x",
+        default_id="private-downstream-repo",
+    )
+    resolved = tenancy.resolve_tenant(
+        block,
+        repo_name="private-downstream-repo",
+        repo_path=tmp_path / "repo",
+        config_path=tmp_path / "repo" / ".agent-logger.yaml",
+        machine="book2",
+        home=tmp_path / "home",
+    )
+    db_path = resolved.config.sync_change_tracking["db_path"]
+    assert db_path == str(tmp_path / "home" / "sync-state-private-downstream-repo.db")
+
+
+def test_resolve_tenant_change_tracker_db_honors_explicit_override(tmp_path):
+    """An explicit ``sync.change_tracking.db_path`` in the tenant block wins
+    over the per-tenant default namespacing."""
+    block = tenancy.parse_tenant_block(
+        {
+            "tenant": {
+                "id": "private-downstream-repo",
+                "roles": ["source"],
+                "sync": {"change_tracking": {"db_path": "/custom/tracker.db"}},
+            }
+        },
+        source="x",
+        default_id="private-downstream-repo",
+    )
+    resolved = tenancy.resolve_tenant(
+        block,
+        repo_name="private-downstream-repo",
+        repo_path=tmp_path / "repo",
+        config_path=tmp_path / "repo" / ".agent-logger.yaml",
+        machine="book2",
+        home=tmp_path / "home",
+    )
+    assert resolved.config.sync_change_tracking["db_path"] == "/custom/tracker.db"
+
+
+def test_resolve_tenant_sink_role_does_not_get_change_tracker_db(tmp_path):
+    """A sink-only tenant (no ``source`` role) must not get a change-tracker
+    db_path injected -- it never pushes, so the setting is meaningless."""
+    block = tenancy.parse_tenant_block(
+        {"tenant": {"id": "sink-only", "roles": ["sink"]}},
+        source="x",
+        default_id="sink-only",
+    )
+    resolved = tenancy.resolve_tenant(
+        block,
+        repo_name="sink-only",
+        repo_path=tmp_path / "repo",
+        config_path=tmp_path / "repo" / ".agent-logger.yaml",
+        machine="book2",
+        home=tmp_path / "home",
+    )
+    assert resolved.config.sync_change_tracking["db_path"] is None
+
+
+def test_resolve_tenant_null_db_path_treated_as_unspecified(tmp_path):
+    """An explicit ``db_path: null`` (the shipped config examples' spelling
+    for "use the default") must not collapse onto the shared db -- it still
+    gets this tenant's own namespaced default."""
+    block = tenancy.parse_tenant_block(
+        {
+            "tenant": {
+                "id": "private-downstream-repo",
+                "roles": ["source"],
+                "sync": {"change_tracking": {"db_path": None}},
+            }
+        },
+        source="x",
+        default_id="private-downstream-repo",
+    )
+    resolved = tenancy.resolve_tenant(
+        block,
+        repo_name="private-downstream-repo",
+        repo_path=tmp_path / "repo",
+        config_path=tmp_path / "repo" / ".agent-logger.yaml",
+        machine="book2",
+        home=tmp_path / "home",
+    )
+    assert resolved.config.sync_change_tracking["db_path"] == str(
+        tmp_path / "home" / "sync-state-private-downstream-repo.db"
+    )
+
+
+def test_resolve_tenant_layers_machine_local_supplement(tmp_path):
+    home = tmp_path / "home"
+    (home / tenancy.TENANT_SUPPLEMENT_DIR).mkdir(parents=True)
+    (home / tenancy.TENANT_SUPPLEMENT_DIR / "private-downstream-repo.yaml").write_text(
+        yaml.safe_dump(
+            {"sync": {"target": "onedrive", "notify": {"url": "https://secret/hook"}}}
+        ),
+        encoding="utf-8",
+    )
+    block = tenancy.parse_tenant_block(
+        {"tenant": {"id": "private-downstream-repo"}}, source="x", default_id="private-downstream-repo"
+    )
+    resolved = tenancy.resolve_tenant(
+        block,
+        repo_name="private-downstream-repo",
+        repo_path=tmp_path / "repo",
+        config_path=tmp_path / "repo" / ".agent-logger.yaml",
+        machine="book2",
+        home=home,
+    )
+    assert resolved.config.sync_target == "onedrive"
+    assert resolved.config.sync_notify["url"] == "https://secret/hook"
+
+
+# --------------------------------------------------------------------------- #
+# discovery                                                                    #
+# --------------------------------------------------------------------------- #
+
+
+def _standing_tenants(tmp_path) -> tuple[Path, Path, Path]:
+    """Build the book2 private-downstream-repo + dotfiles standing tenants + a fake home."""
+    src = tmp_path / "src"
+    copilot = _make_copilot(tmp_path)
+    home = tmp_path / "home"
+
+    _write_tenant_repo(
+        src / "private-downstream-repo",
+        {
+            "id": "private-downstream-repo",
+            "roles": ["source"],
+            "sync": {"harness_repos": HARNESS},
+            "machines": {
+                "book2": {
+                    "sync": {
+                        "repo_allowlist": ["private-downstream-repo", "copilot-extensions"],
+                        "repo_allowlist_fail_closed": True,
+                    }
+                }
+            },
+        },
+    )
+    _write_tenant_repo(
+        src / "dotfiles",
+        {
+            "id": "dotfiles",
+            "roles": ["source"],
+            "sync": {"harness_repos": HARNESS},
+            "machines": {
+                "book2": {
+                    "sync": {
+                        "repo_denylist": ["private-downstream-repo", "copilot-extensions"],
+                    }
+                }
+            },
+        },
+    )
+    # copilot-extensions is adopted but carries NO tenant block -- it is a
+    # session origin, not a tenant.
+    (src / "copilot-extensions").mkdir(parents=True)
+    (src / "copilot-extensions" / ".agent-logger.yaml").write_text(
+        yaml.safe_dump({"schema_version": 1, "log": {"voice_pack": "none"}}),
+        encoding="utf-8",
+    )
+
+    _write_registry(
+        tmp_path / ".aw", src, ["private-downstream-repo", "dotfiles", "copilot-extensions"]
+    )
+
+    # Machine-local supplements: transport (local target -> distinct dest) + source.
+    supp = home / tenancy.TENANT_SUPPLEMENT_DIR
+    supp.mkdir(parents=True)
+    for tid in ("private-downstream-repo", "dotfiles"):
+        (supp / f"{tid}.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "sync": {
+                        "source": str(copilot),
+                        "target": "local",
+                        "targets": {"local": {"path": str(home / f"dest-{tid}")}},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+    return copilot, home, tmp_path / ".aw"
+
+
+def test_discover_only_tenant_blocked_repos(tmp_path):
+    _copilot, home, aw = _standing_tenants(tmp_path)
+    tenants = tenancy.discover_tenants(machine="book2", home=home, aw_home=aw)
+    ids = sorted(t.tenant_id for t in tenants)
+    assert ids == ["dotfiles", "private-downstream-repo"]  # not copilot-extensions
+
+
+def test_discover_prefers_dedicated_tenant_file(tmp_path):
+    """A dedicated .agent-logger.tenant.yaml carries the tenant, and a log-only
+    .agent-logger.yaml alongside it does not shadow it."""
+    src = tmp_path / "src"
+    repo = src / "private-downstream-repo"
+    repo.mkdir(parents=True)
+    (repo / ".agent-logger.yaml").write_text(
+        yaml.safe_dump({"schema_version": 1, "log": {"note_marker": "NOTE:"}}),
+        encoding="utf-8",
+    )
+    (repo / ".agent-logger.tenant.yaml").write_text(
+        yaml.safe_dump(
+            {"schema_version": 1, "tenant": {"id": "private-downstream-repo", "roles": ["source"]}}
+        ),
+        encoding="utf-8",
+    )
+    _write_registry(tmp_path / ".aw", src, ["private-downstream-repo"])
+    tenants = tenancy.discover_tenants(
+        machine="book2", home=tmp_path / "home", aw_home=tmp_path / ".aw"
+    )
+    assert [t.tenant_id for t in tenants] == ["private-downstream-repo"]
+    assert tenants[0].config_path.name == ".agent-logger.tenant.yaml"
+
+
+@pytest.mark.no_autotrust
+def test_discover_tenant_ignored_when_not_on_default_branch(tmp_path, monkeypatch):
+    """A registered adopted repo checked out on a feature/PR branch must not
+    have its committed tenant block honored -- the same registered-project +
+    default-branch trust gate config.py's find_repo_config applies (see
+    agent_logger.repo_trust.repo_config_is_trusted), now also applied to
+    tenant discovery."""
+    src = tmp_path / "src"
+    repo = src / "private-downstream-repo"
+    init_git_repo(
+        repo,
+        remote="https://example.test/example-owner/private-downstream-repo.git",
+        branch="feature-x",
+    )
+    (repo / ".agent-logger.yaml").write_text(
+        yaml.safe_dump(
+            {"schema_version": 1, "tenant": {"id": "private-downstream-repo", "roles": ["source"]}}
+        ),
+        encoding="utf-8",
+    )
+    aw_home = tmp_path / ".aw"
+    aw_home.mkdir(parents=True)
+    (aw_home / "projects.yaml").write_text(
+        yaml.safe_dump({"projects": {"private-downstream-repo": {}}}), encoding="utf-8"
+    )
+    registry = aw_home / "repos.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "srcroot": {tenancy.current_platform(): str(src)},
+                "repos": {
+                    "private-downstream-repo": {
+                        "remote": "https://example.test/example-owner/private-downstream-repo.git",
+                        "default_branch": "main",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_WORKTREES_REPOS_YAML", str(registry))
+
+    tenants = tenancy.discover_tenants(
+        machine="book2", home=tmp_path / "home", aw_home=aw_home
+    )
+    assert tenants == []
+
+
+def test_discover_malformed_tenant_is_skipped(tmp_path):
+    src = tmp_path / "src"
+    (src / "bad").mkdir(parents=True)
+    (src / "bad" / ".agent-logger.yaml").write_text(
+        yaml.safe_dump({"tenant": {"roles": ["nonsense-role"]}}), encoding="utf-8"
+    )
+    _write_registry(tmp_path / ".aw", src, ["bad"])
+    tenants = tenancy.discover_tenants(
+        machine="book2", home=tmp_path / "home", aw_home=tmp_path / ".aw"
+    )
+    assert tenants == []
+
+
+def test_discover_future_schema_tenant_carries_advisory(tmp_path):
+    """A tenant config from a newer schema is still discovered (tolerant read),
+    carrying an advisory that fields were ignored."""
+    src = tmp_path / "src"
+    repo = src / "private-downstream-repo"
+    repo.mkdir(parents=True)
+    (repo / ".agent-logger.tenant.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 99,
+                "tenant": {"id": "private-downstream-repo", "roles": ["source"], "new": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_registry(tmp_path / ".aw", src, ["private-downstream-repo"])
+    tenants = tenancy.discover_tenants(
+        machine="book2", home=tmp_path / "home", aw_home=tmp_path / ".aw"
+    )
+    assert [t.tenant_id for t in tenants] == ["private-downstream-repo"]
+    assert any("newer schema" in a for a in tenants[0].advisories)
+
+
+def test_discover_dedupes_duplicate_tenant_ids(tmp_path):
+    """Two adopted repos declaring the same id -> keep the first, drop the
+    collision (they would otherwise share lock/supplement/sink state)."""
+    src = tmp_path / "src"
+    for repo in ("one", "two"):
+        _write_tenant_repo(src / repo, {"id": "shared", "roles": ["source"]})
+    _write_registry(tmp_path / ".aw", src, ["one", "two"])
+    tenants = tenancy.discover_tenants(
+        machine="book2", home=tmp_path / "home", aw_home=tmp_path / ".aw"
+    )
+    assert [t.tenant_id for t in tenants] == ["shared"]
+
+
+# --------------------------------------------------------------------------- #
+# orchestration -- the complementary no-leak proof                             #
+# --------------------------------------------------------------------------- #
+
+
+def _dest_sessions(home: Path, tid: str, machine: str = "book2") -> set[str]:
+    ss = home / f"dest-{tid}" / machine / "session-state"
+    if not ss.is_dir():
+        return set()
+    return {d.name for d in ss.iterdir() if d.is_dir()}
+
+
+def test_run_all_book2_complementary_no_leak(tmp_path):
+    _copilot, home, aw = _standing_tenants(tmp_path)
+    tenants = tenancy.discover_tenants(machine="book2", home=home, aw_home=aw)
+    result = tenancy.run_all(tenants, roles=("source",), machine="book2")
+
+    assert all(o.status == "ok" for o in result.outcomes), result.as_dict()
+
+    apl = _dest_sessions(home, "private-downstream-repo")
+    dot = _dest_sessions(home, "dotfiles")
+
+    # private-downstream-repo takes ONLY facility sessions (fail-closed).
+    assert apl == {"sess-apl", "sess-cext"}
+    # dotfiles takes EVERYTHING ELSE (denylist catch-all).
+    assert dot == {"sess-dot", "sess-work"}
+    # Exact complements: every session in exactly one tenant, no overlap/gap.
+    assert apl.isdisjoint(dot)
+    assert apl | dot == {"sess-apl", "sess-cext", "sess-dot", "sess-work"}
+
+
+def test_run_all_shared_source_lock(tmp_path):
+    """Tenants sharing one ~/.copilot source share the default lock so their
+    source-mutating steps serialize (corrects an earlier per-tenant-lock race)."""
+    _copilot, home, aw = _standing_tenants(tmp_path)
+    tenants = tenancy.discover_tenants(machine="book2", home=home, aw_home=aw)
+    locks = {t.config.sync_lock_name for t in tenants}
+    assert locks == {"session-sync.lock"}
+
+
+def test_run_all_source_conflict_fails_closed(tmp_path):
+    """Two source tenants claiming the same session -> fail closed: a conflict
+    is reported and NO source tenant is synced (never double-push a session)."""
+    src = tmp_path / "src"
+    copilot = _make_copilot(tmp_path)
+    home = tmp_path / "home"
+    for name in ("alpha", "beta"):
+        _write_tenant_repo(
+            src / name,
+            {
+                "id": name,
+                "roles": ["source"],
+                "sync": {"harness_repos": HARNESS, "repo_allowlist": ["private-downstream-repo"]},
+            },
+        )
+    _write_registry(tmp_path / ".aw", src, ["alpha", "beta"])
+    supp = home / tenancy.TENANT_SUPPLEMENT_DIR
+    supp.mkdir(parents=True)
+    for name in ("alpha", "beta"):
+        (supp / f"{name}.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "sync": {
+                        "source": str(copilot),
+                        "target": "local",
+                        "targets": {"local": {"path": str(home / f"dest-{name}")}},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+    tenants = tenancy.discover_tenants(machine="book2", home=home, aw_home=tmp_path / ".aw")
+    assert tenancy.source_conflicts(tenants)  # both claim sess-apl
+
+    result = tenancy.run_all(tenants, roles=("source",), machine="book2")
+    assert any(
+        o.status == "failed" and "conflict" in o.detail for o in result.outcomes
+    )
+    # Fail closed: nothing was pushed to either destination.
+    assert not (home / "dest-alpha").exists()
+    assert not (home / "dest-beta").exists()
+
+
+def test_run_all_skips_disabled_tenant(tmp_path):
+    src = tmp_path / "src"
+    _write_tenant_repo(
+        src / "private-downstream-repo",
+        {"id": "private-downstream-repo", "roles": ["source"], "enabled": False},
+    )
+    _write_registry(tmp_path / ".aw", src, ["private-downstream-repo"])
+    tenants = tenancy.discover_tenants(
+        machine="book2", home=tmp_path / "home", aw_home=tmp_path / ".aw"
+    )
+    result = tenancy.run_all(tenants, roles=("source",), machine="book2")
+    assert [o.status for o in result.outcomes] == ["skipped"]
+
+
+def test_run_all_dry_run_does_not_write(tmp_path):
+    _copilot, home, aw = _standing_tenants(tmp_path)
+    tenants = tenancy.discover_tenants(machine="book2", home=home, aw_home=aw)
+    tenancy.run_all(tenants, roles=("source",), dry_run=True, machine="book2")
+    assert _dest_sessions(home, "private-downstream-repo") == set()
+    assert _dest_sessions(home, "dotfiles") == set()
+
+
+# --------------------------------------------------------------------------- #
+# behavior-preserving: default single-tenant config unchanged                  #
+# --------------------------------------------------------------------------- #
+
+
+def test_tenants_sync_falls_back_to_single_tenant(monkeypatch):
+    """`tenants sync` with no adopted tenants falls back to the legacy
+    single-home run_sync so a scheduler wired to it keeps syncing."""
+    from agent_logger import __main__ as cli
+
+    monkeypatch.setattr(tenancy, "discover_tenants", lambda **k: [])
+    called = {}
+
+    def fake_run_sync(cfg, *, dry_run=False, prune=False):
+        called["ran"] = True
+        return 0
+
+    monkeypatch.setattr("agent_logger.sync.engine.run_sync", fake_run_sync)
+    rc = cli.main(["tenants", "sync", "--machine", "book2"])
+    assert rc == 0
+    assert called.get("ran") is True
+
+
+def test_default_lock_name_preserved(tmp_path):
+    cfg = load_config(home=tmp_path, include_repo=False)
+    assert cfg.sync_lock_name == "session-sync.lock"
+
+
+def test_repo_config_tolerates_tenant_block(tmp_path):
+    """A repo-local .agent-logger.yaml carrying a tenant block still loads for
+    ambient (log-only) use without raising."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / ".agent-logger.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "log": {"note_marker": "NOTE:"},
+                "tenant": {"id": "private-downstream-repo", "roles": ["source"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(home=tmp_path / "home", repo_start=repo)
+    # tenant block ignored by the ambient loader; log block still honored.
+    assert cfg.repo_config_path == repo / ".agent-logger.yaml"
+
+
+def test_repo_config_tenant_only_no_log(tmp_path):
+    """A tenant-only repo config (no log block) is a no-op for ambient load."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / ".agent-logger.yaml").write_text(
+        yaml.safe_dump({"schema_version": 1, "tenant": {"id": "r"}}),
+        encoding="utf-8",
+    )
+    cfg = load_config(home=tmp_path / "home", repo_start=repo)
+    assert cfg.repo_config_path == repo / ".agent-logger.yaml"
+
+
+# --------------------------------------------------------------------------- #
+# repo-owned sync opt-in gate propagated to the tenancy preflight               #
+# --------------------------------------------------------------------------- #
+
+
+def test_source_include_honors_require_repo_opt_in(tmp_path):
+    """`_source_include` (the tenancy conflict preflight) must apply the same
+    require_repo_opt_in gate as run_sync -- otherwise it can report a false
+    source overlap/clearance for a repo that opted itself out."""
+    from agent_logger.config import Config
+
+    opted_in_repo = tmp_path / "srcroot" / "test-chamber"
+    opted_out_repo = tmp_path / "srcroot" / "dotfiles"
+    opted_in_repo.mkdir(parents=True)
+    opted_out_repo.mkdir(parents=True)
+    (opted_in_repo / ".copilot-extensions" / "agent-logger").mkdir(parents=True)
+    (opted_in_repo / ".copilot-extensions" / "agent-logger" / "config.yaml").write_text(
+        "sync:\n  opt_in: true\n", encoding="utf-8"
+    )
+
+    copilot = tmp_path / "copilot"
+    _make_session(copilot, "sess-in", str(opted_in_repo))
+    _make_session(copilot, "sess-out", str(opted_out_repo))
+
+    cfg = Config(
+        {
+            "sync": {
+                "source": str(copilot),
+                "harness_repos": ["test-chamber", "dotfiles"],
+                "require_repo_opt_in": True,
+            }
+        },
+        tmp_path / "home",
+    )
+    tenant = tenancy.ResolvedTenant(
+        tenant_id="t",
+        repo_name="t",
+        repo_path=tmp_path,
+        roles=("source",),
+        enabled=True,
+        config=cfg,
+        config_path=tmp_path / "tenant.yaml",
+    )
+
+    _source_path, include = tenancy._source_include(tenant)
+    assert include == {"sess-in"}

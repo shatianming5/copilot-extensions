@@ -32,8 +32,9 @@ Choose the simplest shape that fits; don't impose structure a plugin doesn't nee
 |-------|-----------|----------|
 | **Payload-only** | Skills / hooks / a session extension; enabling the plugin is the whole install — no runtime | efforts, visions, context-handoff, customizing-copilot, harness-* |
 | **Runtime CLI** | Target: installation-cell runtime + payload-local shim, invoked on demand; legacy implementations still use a global binstub during migration | agent-mcp, agent-containers (migration targets) |
-| **Runtime service** | Runtime CLI **plus** a long-lived local service under platform-native supervision | agent-bridge, agent-dispatch, agent-vault |
+| **Runtime service** | Runtime CLI **plus** a long-lived local service under platform-native supervision. Choosing this shape — or adding an equivalent resident daemon under any other label — must reconcile to [`graceful-daemon-cutover`](graceful-daemon-cutover.md); the cutover contract is a design invariant, not a follow-up enhancement. | agent-bridge, agent-dispatch, agent-vault |
 | **Namespace-provider** | A plugin that registers a namespace with a sibling service via a filesystem **manifest** (its binstub driven over a process boundary), rather than running its own daemon | agent-codespaces / agent-containers (providers to agent-bridge) |
+| **Managed companion capability** | An explicitly configured optional heavyweight capability whose attributed runtime declaration is materialized only by an already-running trusted supervisor | agent-ssh dtssh host through agent-dispatch |
 
 ## Design principles
 
@@ -55,7 +56,10 @@ Choose the simplest shape that fits; don't impose structure a plugin doesn't nee
    its own installer per the install contract. Nothing at run time depends on a
    git checkout of this repo, and a bare plugin name never selects mutable state.
 4. **Right-size the surface.** Payload-only < runtime CLI < runtime service.
-   Don't add a daemon, a port, or a resolver a plugin doesn't need.
+   Don't add a daemon, a port, or a resolver a plugin doesn't need. If you do
+   add a long-lived resident daemon under any shape, you have taken on the
+   [`graceful-daemon-cutover`](graceful-daemon-cutover.md) obligation at design
+   time and must justify any claimed exemption explicitly.
 5. **Cross-platform parity is a feature.** A plugin behaves the same on Windows
    and Linux/WSL; platform differences are handled at the edges (installer,
    binstub, supervision), never leaked into behavior.
@@ -79,10 +83,15 @@ Invariants are **must-always-hold contracts between a vision and the code** — 
 narrow set of properties a change may never quietly break. They are the enforceable
 core of the principles above; a reviewer checks a change against these.
 
-- **No shared-infrastructure dependency.** A plugin service is installable and
-  reachable using only what its *own* installer deployed. It must never *require*
-  an external reverse proxy, tunnel, mesh, load balancer, or service registry.
-  (Serves *Vision plugin-services §Non-Goals/no-shared-infrastructure-dependency*.)
+- **No shared-infrastructure dependency by default.** A plugin service is
+  installable and reachable using only what its *own* installer deployed. It
+  must never *require* an external reverse proxy, tunnel, mesh, load balancer,
+  or service registry. The sole explicit exception is a
+  [`managed-companion-runtime`](managed-companion-runtime.md): an optional
+  heavyweight capability that is inert without its declared trusted supervisor
+  and never masquerades as the plugin's ordinary standalone runtime. (Serves
+  *Vision plugin-services §Non-Goals/no-shared-infrastructure-dependency* and
+  §Features/`delegated-heavy-companion-runtime`.)
 - **Endpoints are collision-free by construction.** Two plugin services — and the
   same service across the Windows/WSL boundary — never contend for one address by
   design, not by a human maintaining a fixed-port table or applying per-platform
@@ -129,8 +138,10 @@ core of the principles above; a reviewer checks a change against these.
   `COPILOT_EXT_NO_VERSIONED` opt-out and the legacy in-place-venv fork are retired.
   (Serves *Vision plugin-services §Behaviors/immutable-versioned-runtime*; tracked
   in dotfiles #581.)
-- **A version bump ships the change.** Every plugin change bumps its version in the
-  same commit (see `CONTRIBUTING.md`); an un-bumped push is silently ignored.
+- **A version bump ships the change.** Every plugin change adds a changefile in the
+  same PR (see `docs/pipelines.md`); the promotion pipeline applies the actual
+  version bump when it consumes that changefile. An un-changefiled plugin
+  change is silently ignored by the marketplace.
 - **Enabling a runtime provisions it.** A runtime plugin that a repo/session
   **enables** is installed, started, and kept **version-matched to its enabled
   payload automatically at session start** — idempotent, version-keyed, throttled,
@@ -144,14 +155,19 @@ core of the principles above; a reviewer checks a change against these.
   launch" — but that path must not be a *dependency*: the sibling-independent,
   confined-env realization (self-provisioning binstub + `stamp` + skill readiness
   self-check) is [`runtime-self-provisioning.md`](runtime-self-provisioning.md).)
+  An explicitly configured optional
+  [`managed-companion-runtime`](managed-companion-runtime.md) is the narrow
+  exception: enabling the lightweight plugin does not provision that heavyweight
+  capability, and only its already-running trusted supervisor may do so.
 - **Every runtime command is payload-attributable.** Every runtime-bearing
-  marketplace `agent-*` plugin declares all agent-facing commands in
+  marketplace plugin declares all agent-facing commands in
   `payload-invocation.json`, commits the generated POSIX/PowerShell/CMD shims,
   and wires both-platform bootstrap and command-glossary hooks through
   `COPILOT_PLUGIN_ROOT`. Static prose names logical commands, never another
   plugin's direct path; missing or ambiguous ownership never falls through to
   `PATH`. Enforced by
-  `libs/payload-invocation/tests/test_agent_plugin_coverage.py`. See
+  Core `agent-*` runtimes additionally participate in the installation-cell
+  coverage enforced by `libs/payload-invocation/tests/test_agent_plugin_coverage.py`. See
   [`runtime-agent-plugin.md`](runtime-agent-plugin.md).
 - **Enabled machine-gated runtimes are never silently omitted.** Each enabled
   `runtimeScope: machine-gated` plugin publishes a bounded, plugin-owned
@@ -190,6 +206,41 @@ core of the principles above; a reviewer checks a change against these.
   baked into the primitive's owner. A layer must not draw a higher layer's
   orchestration concern inward. (Serves *Vision agent-fabric
   §Behaviors/handoff-orchestrated-above-primitives*.)
+- **Handoff takeover is successor-acknowledged and predecessor-preserving.**
+  Persist the baton before launch; candidate startup never moves the head;
+  explicit successor consumption checkpoints and acknowledges before
+  succession/head/title changes; predecessor retirement is last and requires
+  the originally observed process creation identity. A failed or unacknowledged
+  successor leaves the predecessor and stored baton recoverable. (Serves
+  *Vision agent-fabric §Features/delegate-and-hand-off*; see
+  [`context-handoff-lifecycle.md`](context-handoff-lifecycle.md).)
+- **A handoff seed is a locator, never the baton.** The full-fidelity
+  continuation has exactly one durable home. The startup seed is bounded,
+  single-line, and carries only a task lead, the canonical consume action, and
+  one short opaque recovery locator. It contains no executable source, shell
+  command, quote-sensitive recovery text, or installed path, so terminal
+  rendering, shell quoting, and process argv never become the storage channel. (Serves *Vision agent-fabric
+  §Behaviors/context-pressure-is-a-continuity-signal*; see
+  [`context-handoff-lifecycle.md`](context-handoff-lifecycle.md).)
+- **Cross-plugin payload argv remains data.** A payload-only orchestrator
+  resolves a sibling command only inside its own provenance-checked marketplace
+  installation cell. If it must enter the sibling's runtime directly, it uses
+  that payload's authoritative runtime resolver, then launches exact argv
+  without ambient `PATH` choosing the payload/runtime, shell source
+  interpolation of user-controlled arguments, shell-to-native re-serialization,
+  cwd/PYTHONPATH import shadowing, or locale-dependent text encoding. First-use
+  provisioning has a separate installation-sized timeout.
+  (Serves *Vision plugin-services/installation-cells* and
+  *agent-fabric/delegate-and-hand-off*; see
+  [`context-handoff-lifecycle.md`](context-handoff-lifecycle.md).)
+- **Durable coordination identity precedes ownership.** When a project requires
+  an external state root, every claim/lease/resource producer resolves the
+  qualified owner's versioned coordination readiness before its first mutation
+  or external side effect. Known compatible rejection fails closed; teardown
+  and read-only inspection remain available; optional peers degrade only when
+  absent or incompatible. See
+  [`state-root-coordination.md`](state-root-coordination.md). (Serves *Vision
+  agent-fabric* resource claims, leasing, and accountability.)
 - **Lifecycle logging is durable, fail-silent, parity-equal, and joinable.**
   High-level worktree/session lifecycle events go through the single
   `activity.log_event` writer (or its `activity-log` binstub) into the durable,
@@ -223,6 +274,45 @@ core of the principles above; a reviewer checks a change against these.
   §Features/self-auditing-drop-in-composition* and
   §Behaviors/stale-drop-ins-are-inert-and-legible*; see
   [`drop-in-registry-hygiene.md`](drop-in-registry-hygiene.md).)
+- **Depended-on guidance never relies solely on `sessionStart`
+  `additionalContext` composition.** Multi-hook `additionalContext` aggregation
+  is empirically unreliable -- sessions have been observed where no
+  contributor's output reached the model at all, not just a last-writer-wins
+  loss. Guidance a harness genuinely depends on must be delivered through a
+  checked-in static pointer projection plus an output-free `sessionStart` hook
+  side effect that writes session-scoped content to
+  `~/.copilot/session-state/<sessionId>/instructions/<plugin>/<topic>.instructions.md`,
+  which the pointer instructs the agent to read; the hook itself always emits
+  `{}`. Direct plugin-owned `additionalContext` output remains the preferred
+  fully dynamic path once native host composition is proven at the supported
+  version floor across fresh, resume, non-interactive, and ACP launches -- only
+  then should a plugin add it, and only as a declared, scanner-visible
+  contract, never as an undeclared "redundant" supplement alongside the
+  exact-session file. (Serves
+  *Vision harness-guidance §Features/concise-context-kernel*,
+  *§Behaviors/ambient-delivery-fails-open*; see
+  [`session-scoped-dynamic-guidance.md`](session-scoped-dynamic-guidance.md).)
+- **Projected static instruction content gets a worktree-scoped local cache,
+  never a per-session rewrite.** A plugin's rendered `instructions.md` body is
+  too large and too stable to belong in the session-scoped file above, but
+  relying solely on a consumer repo's checked-in copy leaves ordinary
+  contributors unable to self-correct sync-lag they lack push rights to fix.
+  A gitignored `*.local.instructions.md` sibling, refreshed at worktree
+  create/resume (backed up by `sessionStart`), sits between the checked-in
+  floor and the fully computed session file. (Serves *Vision harness-guidance
+  §Behaviors/ambient-delivery-fails-open*,
+  *§Behaviors/resume-stable-context*; see
+  [`worktree-scoped-dynamic-guidance.md`](worktree-scoped-dynamic-guidance.md).)
+- **A module extracted from a monolith never grows a reverse-import
+  accessor back into it.** A sibling module calling back into the root it was
+  just split from via a lazy `core()`/`_core()` accessor — kept only so a
+  test's `monkeypatch.setattr(m, "<name>", ...)` against the root still takes
+  effect — is a trap, not a shortcut: it makes every future split preserve
+  the same indirection instead of actually decoupling anything. A genuinely
+  shared helper gets a real shared-module home both siblings import
+  directly; a test patches the module where a name is actually defined,
+  never a historical re-export. See
+  [`compatibility-root-decoupling.md`](compatibility-root-decoupling.md).
 
 ## Patterns
 
@@ -232,25 +322,38 @@ the exemplars, and the vision it serves):
 | Pattern | Concern |
 |---------|---------|
 | [runtime-agent-plugin](runtime-agent-plugin.md) | The complete “add an `agent-*` plugin” path: choose the smallest runtime shape, implement the cross-platform install contract, generate payload-local commands, wire attributable bootstrap/glossary hooks, write skills against logical commands, and add service/provider ownership without dynamic initial-context snapshots |
-| [context-injection](context-injection.md) | How repositories, plugins, skills, and operator policy retain clear ownership while plugin-owned ambient guidance is injected as a concise, gated `sessionStart` context kernel with fail-open behavior, static safety fallback, cross-platform parity, and non-executing budget inventory |
+| [session-scoped-dynamic-guidance](session-scoped-dynamic-guidance.md) | The primary delivery path for guidance a harness depends on: a checked-in static pointer projection plus a `sessionStart` hook side effect that writes per-session dynamic content to `~/.copilot/session-state/<sessionId>/instructions/<plugin>/<topic>.instructions.md`, avoiding unreliable `additionalContext` aggregation entirely |
+| [worktree-scoped-dynamic-guidance](worktree-scoped-dynamic-guidance.md) | The sibling delivery path for large/stable projected instruction content (too big for the session-scoped file, too permission-gated to trust the checked-in copy alone): a gitignored `*.local.instructions.md` cache refreshed at worktree create/resume and backed up by `sessionStart`, with a per-file "prefer local" preamble and a repo-wide catch-all for not-yet-synced sources |
+| [context-handoff-lifecycle](context-handoff-lifecycle.md) | How a stored continuation becomes a successor-owned session without losing prompt fidelity, moving the head early, trusting a reused PID, depending on effort/knowledge state, or crossing an ambient/lossy command boundary |
 | [local-endpoint-discovery](local-endpoint-discovery.md) | How a service exposes a discoverable, collision-free, local-first endpoint — the anti-static-port pattern, incl. the rendezvous / port-mapping file |
 | [service-transport](service-transport.md) | Which channel a service exposes — the transport ladder (stdio → OS-native socket/pipe → OS-assigned loopback → tunnel) and the named-pipe/UDS reality |
-| [service-lifecycle-supervision](service-lifecycle-supervision.md) | Platform-native always-on supervision (Windows Scheduled Task / systemd user unit) and its lifecycle verbs |
+| [service-lifecycle-supervision](service-lifecycle-supervision.md) | Least-privilege lifecycle tiers (user-mode ensure → scheduled activation → system service → container), stable register-once launchers, and cutover-safe updates |
+| [ephemeral-process-reaping](ephemeral-process-reaping.md) | Why detaching a process to survive its parent (SSH drop, env-var scoping, terminal close) removes the parent's own ability to clean it up, and how to pair it with a liveness-polling reaper (not just a graceful-shutdown hook) that fires on every death path |
+| [process-slot-ownership](process-slot-ownership.md) | Managing background processes like memory-safe allocations — an owner-liveness tether (generation supersession + abandoned-passive reap) paired with a single-owner slot + debounce (the OS-level `single-instance-lease` + token election), so a role never gains a second live holder and never outlives its owner |
 | [install-vs-adopt-boundary](install-vs-adopt-boundary.md) | Which lifecycle verb may mutate what — `install`/`update` is machine-local (schema-migrate + warn), while each explicit `register`/`adopt` command owns only its documented repo and/or user-state integration scope |
 | [config-schema-migration](config-schema-migration.md) | How a machine-local YAML config gains an explicit `schema_version` + scripted `vN -> vN+1` migrate-by-rewrite (the vendored `config-migrate` primitive), applied lazily on read + eagerly on install/update, with a fixture-guarded backward-compat window |
 | [a-la-carte-independence](a-la-carte-independence.md) | Standalone-first plugins that compose gracefully, incl. the provider-manifest registry pattern |
+| [entity-relationship-model](entity-relationship-model.md) | The suite's ten tracked entity types (worktree, session, task, machine, agent, repo, project, bridge, container, codespace — nine durable, one transient), their owning plugin tier, and a diagnostic playbook mapping each cross-entity traversal question to its current CLI command — or its tracked gap |
+| [state-root-coordination](state-root-coordination.md) | How claim/lease/resource producers resolve a qualified owner's versioned durable coordination identity before side effects, while teardown stays available and optional peers degrade by compatible contract |
 | [drop-in-registry-hygiene](drop-in-registry-hygiene.md) | How cross-plugin `*.d` registries keep routine sweeps non-blocking while making malformed, missing, disabled, ambiguous, duplicate, and stale contributions visible and safely cleanable through consumer-owned doctor commands |
 | [runtime-self-provisioning](runtime-self-provisioning.md) | How a plugin provisions its own runtime with no manual step and **no dependency on a sibling launcher** — the layered bootstrap (self-provisioning binstub → sessionStart auto-stamp → skill-driven readiness self-check) + toolchain self-acquisition (vendored uv, pip-index bridge), reaching confined envs (Copilot app, cloud agent) |
 | [installer-readiness-modules](installer-readiness-modules.md) | How enabled machine-gated plugins publish attributable installer/readiness modules (or an explicit decline), how discovery joins settings to installation-cell provenance without cache/PATH assumptions, and how strict graph validation produces an execution-free deterministic plan |
 | [cross-platform-parity](cross-platform-parity.md) | One behavior across Windows and Linux/WSL: shells, UTF-8, the WSL/Windows boundary, binstubs |
+| [windows-background-process-launch](windows-background-process-launch.md) | How Windows background children and daemons remain invisible from consoleless parents without depending on Default Terminal behavior |
 | [project-scoped-invocation](project-scoped-invocation.md) | Reach any layer against an explicitly named project (`--project`), CWD-independently, and the per-project `<repo>` binstub as a uniform `<repo> <layer> …` dispatcher over the agent-* fleet |
 | [marketplace-installation-cells](marketplace-installation-cells.md) | Qualify runtime, state, lifecycle, invocation, composition, project adoption, migration, and uninstall by globally distinguishing marketplace provenance so same-named plugin suites coexist safely |
 | [durable-vs-versioned-runtime](durable-vs-versioned-runtime.md) | When a plugin carries an expensive, warm, stateful runtime (heavy stack + loaded model) that must outlive routine service cutovers: a durable runtime + warm daemon on its own lifecycle, decoupled from the swappable versioned runtime, config-resolved + capability-matched per host |
-| [uniform-runtime-resolution](uniform-runtime-resolution.md) | Exactly one way to resolve+spawn a versioned runtime's interpreter — marker → `last-known-good` → newest complete slot, junction-free, never a `venv`/`.venv` link, never a PATH python — reachable identically from a binstub, a service unit, a hook, and an agent, so no two callers ever bind different slots |
+| [uniform-runtime-resolution](uniform-runtime-resolution.md) | Exactly one way to resolve+spawn a versioned runtime's interpreter — marker → `last-known-good` → newest complete slot, junction-free, never a `venv`/`.venv` link, never a PATH python — reachable identically from a binstub, a service unit, a hook, and an agent, so no two callers ever bind different slots; the same discipline applies when a companion file relocates to a new plugin — sweep every caller, not just the cutover site |
 | [graceful-daemon-cutover](graceful-daemon-cutover.md) | How a long-lived local service updates its version **without killing in-flight, non-resumable work** — and **the installer drives the cutover automatically** (no externally-driven `deploy` command): the shared `zdd` active/passive primitive (routing-table flip + drain at a safe cutover point + breadcrumb recovery), the consumer contract each daemon implements, and per-plugin adoption (agent-bridge reference; agent-index service+engine; agent-dispatch repossession; agent-vault connection-owner) |
 | [session-state-access](session-state-access.md) | How worktree↔session discovery stays O(worktrees) at any history size: resolve session-state by exact id via the registry, quarantine the unbounded directory sweep to one explicit user/agent-initiated backfill/recovery verb |
 | [lifecycle-activity-logging](lifecycle-activity-logging.md) | How worktree/session lifecycle events stay a reconstructable trace: the durable-coarse activity log vs. the ephemeral-verbose setup log, one fail-silent writer, cross-platform parity, symmetric start/end marks, and a per-launch `launch_id` correlation key |
-| [codespace-repo-provenance](codespace-repo-provenance.md) | How a `<repo>-harness` plugin defines a CodeSpace venue's **repo provenance** (vessel→product `workspace_repo` → the agent's `/workspaces/<product>` checkout + ACP cwd) and its in-venue plugins, via agent-codespaces' two convention-discovered seams — the `config.d` config-provider drop-in and `codespacePlugins` — so the example-web-style golden path works with **no control-plane repo** |
+| [codespace-repo-provenance](codespace-repo-provenance.md) | How a provider plugin defines a CodeSpace venue's **repo provenance** (vessel→product `workspace_repo` → the agent's `/workspaces/<product>` checkout + ACP cwd) and its in-venue plugins, via agent-codespaces' two convention-discovered manifest fields — `codespaceConfig` and `codespacePlugins` — so the golden path works with **no control-plane repo or user-level pointer** |
+| [work-coalescing-singleton](work-coalescing-singleton.md) | How many callers of the **same cheap, idempotent, shareable** work fold onto one warm, refcounted daemon instead of fanning out one worker per caller — the generalized `hook_ipc.py` wire protocol, the boot-wait/request-deadline timeout budgets, the ref-count/linger idle-exit algorithm, and the always-correct inline fallback, applied to agent-worktrees' resident classify/list accelerator and agent-mcp's per-`(host, server)` multiplexer |
+| [cold-spawn-latency-budget](cold-spawn-latency-budget.md) | Measured Windows cold-start cost per process kind (`node`/`python`/`powershell`/`pwsh`/warm-daemon-IPC), why hook *count* (not body size) drives `powershell.exe` spawns, why concurrent batches spike tail latency non-linearly, and the priority order for cutting cost: merge sibling hook entries, route through `work-coalescing-singleton` first, prefer a native wire-protocol client over a second cold interpreter, and optimize extension time-to-ready rather than chasing a language swap |
+| [mutable-dev-slot](mutable-dev-slot.md) | The one narrow, worktree-scoped exception to immutable versioned runtimes: a claimed, single-owner `dev` slot an installer may rebuild in place, GC-protected only while claimed, so validating a real unmerged change against the actual deployed CLI no longer needs a throwaway hot-patch |
+| [vendor-pointer](vendor-pointer.md) | How a duplicated payload surface stays DRY on `dev` yet ships self-contained on `main`: file-pointer stubs for mirrored docs, `uv`-editable canonical references for shared libs, direct canonical source lines for the shared installer engine, and the promotion-time copy-and-rewrite tools that turn each dev-time reference back into shipped local content |
+| [dev-main-promotion-pipeline](dev-main-promotion-pipeline.md) | The reusable, repo-portable template for this repo's own `dev`→`main` split: a stable zero-review `main` gated by content-shape (not identity) rather than a redundant second review, a changefile-driven version-bump system, the wholesale-tree-replace promotion mechanic, and the two ruleset misconfigurations that jammed it in production and why |
+| [compatibility-root-decoupling](compatibility-root-decoupling.md) | Why a reverse-import accessor back into a module you just extracted from (kept only so tests can keep monkeypatching the original root) is a trap that self-reinforces against every future split, and how to migrate off it incrementally: a real shared-module home for genuinely shared helpers, tests that patch at the definition site, retired per-name instead of a mass rewrite |
 
 The **runtime deploy contract** (venv + binstub + manifest, `uv`, marketplace-vs-
 runtime split) is its own established pattern doc:

@@ -21,7 +21,12 @@ session-to-log pipeline out of any single bespoke service:
   `local` dotfolder, `onedrive`, `ssh`/`ssh-tunnel`, or a generic `ingest`
   endpoint. It archives only Copilot session state, can scope by repo
   allow/deny lists, and can fire a target-independent best-effort HTTP notify
-  after a successful push. Its `rescue-push` source adapter validates
+  after a successful push. `session-sync health` classifies freshness and
+  repeated partial passes for one machine or a filesystem-backed fleet, with
+  JSON output and alert-friendly exit status. A bounded detritus policy detects
+  Chromium-family user-data roots captured under session `files/`, excludes
+  them from every transport, and removes stale copies from filesystem-backed
+  targets without deleting the local source evidence. Its `rescue-push` source adapter validates
   provider-owned rescue captures, accepts only independently complete sessions,
   and projects them into the same target layout under stable venue keys, with
   host-authoritative generic per-session provenance. Configure with
@@ -85,9 +90,22 @@ optional background-chronicling core with its session-source + log-sink seams.
    capture, while missing/invalid event streams are rejected visibly. Rescue
    capture-ID fingerprints remain as compact durable tombstones after provider
    retention, and checkpoint rewrites are size/record bounded before atomic
-   replacement. Venue pushes remain isolated, but any target failure makes the
+   replacement. A rescued `agent-worktrees.json` sidecar is accepted only as
+   bounded schema-v1 data whose session ID matches its enclosing directory; it
+   remains inert restored evidence at the destination. Invalid or newer
+   sidecars are omitted without discarding the session, and every rescued
+   session receives a restored-origin marker. Venue pushes remain isolated, but
+   any target failure makes the
    final command nonzero. Rescue destination pruning is not yet wired to
    `sync.retention_days`.
+   Use `session-sync health --max-age-hours 12 --partial-threshold 3` for one
+   machine, or add `--fleet --json` on a filesystem-backed hub. Repeat
+   `--machine NAME` to restrict a fleet alert to active machines. A fresh
+   one-off partial result is degraded but exits successfully; stale metadata,
+   unreadable/missing metadata, and a partial streak at the threshold are
+   unhealthy and exit nonzero.
+   `session-sync status` reports the number, size, and bounded path sample of
+   generated browser-profile roots omitted by the latest filesystem sync.
 4. For takeover, use `ramp-up-session`; it delegates the transcript-heavy read
    to the neutral `session-rampup` agent by default.
 
@@ -109,8 +127,13 @@ checkpoint-and-digest reconstruction path.
 
 Layered: built-in defaults → `$AGENT_LOGGER_HOME/config.yaml` → repo-local
 organization config (`.agent-logger.yaml` / `.agent-logger.yml` /
-`.config/agent-logger.yaml` / `.config/agent-logger.yml`, `log:` block only)
-→ `AGENT_LOGGER_*` environment overrides. Inspect runtime config with:
+`.config/agent-logger.yaml` / `.config/agent-logger.yml`, `log:` block plus
+schema v3's single `sync.local_path` field)
+→ `AGENT_LOGGER_*` environment overrides. Repo-local config is only honored
+for a checkout that is both a project registered with `agent-worktrees` and
+currently on that project's registered default branch -- see
+[`docs/manifest-contract.md`](docs/manifest-contract.md#trust-gate-only-a-registered-projects-default-branch-is-honored).
+Inspect runtime config with:
 
 ```
 agent-logger config
@@ -119,11 +142,52 @@ agent-logger config
 Inspect the repository organization fields exactly as they enter a writer
 manifest with `agent-logger organization`.
 
-Repository files use schema version 1 (an omitted version is accepted as v1
-for compatibility) and may set only `log.root`, `log.path_template`,
-`log.timezone`, `log.note_marker`, `log.template`, `log.narration_style`,
-`log.exemplars`, and `log.closing_remark`. Invalid or unsafe configuration
-fails explicitly instead of silently falling back.
+Aggregate operational policy is a separate surface. Machine admission lives
+under `aggregate:` in `$AGENT_LOGGER_HOME/config.yaml`; each admitted
+authoritative checkout may publish
+`.copilot-extensions/agent-logger/config.yaml`. Inspect the same compiled plan
+used by aggregate diagnostics with:
+
+```
+agent-logger config --resolved --json
+agent-logger doctor --json
+agent-logger chronicle status
+```
+
+These commands are read-only. `config --resolved` and `doctor` exit non-zero
+when the complete plan is unauthorized; `chronicle status` remains a successful
+status read and exposes the decision under its `aggregate` field. Checkout
+identity, default-branch state, declaration provenance, machine selectors,
+normalized claims, resource readiness, and conflicts are resolved before any
+later execution integration can perform side effects.
+
+Repository files declare a `schema_version` (an omitted version is treated as
+the current schema, 3 as of this release) and may set `log.root`,
+`log.path_template`, `log.timezone`, `log.note_marker`, `log.template`,
+`log.narration_style`, `log.exemplars`, and `log.closing_remark`. Schema v3
+additionally allows a single `sync.local_path` (an absolute path, the same
+value for every machine in the fleet) -- no other sync setting, machine
+identity, or credential is ever repo-configurable. Invalid or unsafe
+configuration fails explicitly instead of silently falling back.
+
+### Discovering a fleet config repo for the scheduled sync
+
+The scheduled sync (a systemd user timer on POSIX, a Scheduled Task on
+Windows) runs with no meaningful working directory of its own, so it can't
+rely on CWD-based repo-local config discovery the way an interactive shell
+does. To still pick up a fleet repo's schema v3 `sync.local_path`
+declaration, set `config_repo: <name>` in
+`$AGENT_LOGGER_HOME/config.yaml` at install time -- `<name>` is a project
+name resolvable via `agent-worktrees repos find`. When set, the installer
+(`install.sh` / `install.ps1`) resolves that project's checkout, validates
+it against the same registered-project + default-branch trust gate as
+normal discovery, and wires the resolved config file into the scheduled
+unit/task as `AGENT_LOGGER_REPO_CONFIG`. Leaving `config_repo` unset (the
+default) only omits *repo-local* discovery for the scheduled run -- the
+generated unit/task still sets `AGENT_LOGGER_HOME`, so the scheduled sync
+continues to read the machine-local `$AGENT_LOGGER_HOME/config.yaml` (and
+any `AGENT_LOGGER_*` environment overrides) exactly as it always did; only
+a fleet repo's own `sync.local_path` declaration is unreachable without it.
 
 ## License
 

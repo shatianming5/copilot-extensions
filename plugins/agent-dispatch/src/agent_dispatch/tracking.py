@@ -35,11 +35,12 @@ import subprocess
 import time
 from typing import Any
 
-from . import remote_dispatch
+from . import bridge_remote, remote_dispatch
 from .procutil import (
     agent_bridge_launch_prefix,
-    run_background_capture,
     run_agent_worktrees_capture,
+    run_background_capture,
+    run_ssh_capture,
 )
 
 #: Sentinel distinguishing "local machine not yet computed" from a resolved
@@ -130,6 +131,7 @@ def _bridge_resolve_argv(worktree: str, *, machine: str | None) -> list[str] | N
     ssh = shutil.which("ssh")
     if ssh is None:
         return None
+    machine = bridge_remote.normalize_host(machine)
     remote_cmd = " ".join(shlex.quote(a) for a in remote_argv)
     # `machine` is the SSH alias (never a raw IP). BatchMode + a short
     # ConnectTimeout so an unreachable peer fails fast instead of hanging.
@@ -137,27 +139,105 @@ def _bridge_resolve_argv(worktree: str, *, machine: str | None) -> list[str] | N
 
 
 def _run_capture(
-    argv: list[str], *, timeout: float
+    argv: list[str], *, timeout: float, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str] | None:
     """Run a passive probe without allocating a headed Windows console."""
-    return run_background_capture(argv, timeout=timeout)
+    if os.path.basename(argv[0]).casefold() in {"ssh", "ssh.exe"}:
+        return run_ssh_capture(argv, timeout=timeout)
+    return run_background_capture(argv, timeout=timeout, env=env)
+
+
+#: How long a fetched satellite roster is trusted before re-fetching (seconds).
+#: A `list`/`show` enrichment batch can resolve many owners in one call; without
+#: this cache each one would separately hit the shared coordinator's directory
+#: endpoint even though the satellite roster cannot change mid-batch.
+_SATELLITE_CACHE_TTL_S = 5.0
+_satellite_cache: dict[str, dict] | None = None
+_satellite_cache_at: float = 0.0
+
+
+def _satellite_roster() -> dict[str, dict]:
+    """Normalized-machine -> live directory entry, for every ``role=satellite``
+    entry on the shared/hosted federation directory (see the
+    ``satellite-agent-exposure`` effort's Design item D).
+
+    Best-effort and cheap to call repeatedly: no ``AGENT_DISPATCH_SHARED_URL``
+    configured, or the directory unreachable, degrades to ``{}`` -- exactly the
+    signal a caller needs to fall through to its existing SSH-back path (the
+    pre-existing behavior, for a machine this cannot confirm is a satellite).
+    Cached briefly (:data:`_SATELLITE_CACHE_TTL_S`) so a whole enrichment batch
+    pays for at most one directory round-trip.
+    """
+    global _satellite_cache, _satellite_cache_at
+    now = time.time()
+    if _satellite_cache is not None and (now - _satellite_cache_at) < _SATELLITE_CACHE_TTL_S:
+        return _satellite_cache
+    roster: dict[str, dict] = {}
+    try:
+        from . import config
+        from .federation_runner import hosted_rendezvous
+        from .satellites import ROLE_SATELLITE
+
+        if config.shared_url():
+            rv = hosted_rendezvous()
+            if rv is not None:
+                for entry in rv.discover_peers(role=ROLE_SATELLITE):
+                    candidate = entry.get("machine") or entry.get("instance")
+                    if candidate:
+                        roster[bridge_remote.normalize_host(str(candidate))] = entry
+    except Exception:
+        roster = {}
+    _satellite_cache = roster
+    _satellite_cache_at = now
+    return roster
+
+
+def _satellite_entry_for(machine: str) -> dict | None:
+    """The live directory entry for ``machine`` if it is currently registered
+    as ``role=satellite``, else ``None``."""
+    return _satellite_roster().get(bridge_remote.normalize_host(machine))
 
 
 def resolve_live_session(
     worktree: str, *, machine: str | None = None, timeout: float | None = None
 ) -> dict[str, Any] | None:
-    """Resolve a worktree handle to its live session via the agent-bridge CLI.
+    """Resolve a worktree handle through Agent Bridge.
 
-    Shells ``agent-bridge --json live-sessions resolve --handle <worktree>`` --
-    the same shell-the-binstub pattern agent-dispatch uses for spawn, keeping the
-    plugin decoupled (no cross-plugin import, no bridge URL/token discovery). When
-    ``machine`` names a *remote* host, the same command runs **on that host** over
-    the SSH mesh (Phase 8 Slice 8b). All failure modes (no CLI/ssh,
-    non-zero exit, timeout, empty/invalid JSON, no live session) collapse to None
-    so the caller degrades cleanly.
+    A registered ``role=satellite`` owner opens **no** inbound listener, so an
+    SSH-back (or any dial-in) would only ever time out -- resolve straight from
+    its own **pushed** status instead (see
+    :func:`satellite_status_snapshot`/the ``satellite-agent-exposure`` effort's
+    Design item D). Every other remote owner is unaffected: this check is a
+    no-op (fast cache hit or a quick ``{}``) for a machine that isn't a live
+    satellite, and falls through to the pre-existing behavior below.
+
+    Remote owners use the local Bridge carrier first and shell the remote
+    ``agent-bridge`` binstub over SSH only when that optional capability is
+    absent. Local owners use the local binstub directly. All failures collapse
+    to ``None`` so display-only enrichment degrades cleanly.
     """
     if not worktree:
         return None
+    if machine is not None:
+        satellite_entry = _satellite_entry_for(machine)
+        if satellite_entry is not None:
+            data = satellite_entry.get("status") or {}
+            return data.get(worktree)
+        machine = bridge_remote.normalize_host(machine)
+        effective_timeout = timeout if timeout is not None else 6.0
+        try:
+            data = bridge_remote.LocalBridgeRemoteClient().resolve_live_session(
+                machine,
+                worktree,
+                timeout=effective_timeout,
+            )
+            if not isinstance(data, dict) or not data:
+                return None
+            return data
+        except bridge_remote.RemoteBridgeUnavailable:
+            pass
+        except bridge_remote.RemoteBridgeOperationError:
+            return None
     argv = _bridge_resolve_argv(worktree, machine=machine)
     if argv is None:
         return None
@@ -178,12 +258,28 @@ def resolve_live_session(
     return data
 
 
-def list_local_body_sessions(*, timeout: float = 3.0) -> list[dict[str, Any]]:
-    """List local headless sessions; observation failures degrade to no rows."""
+def list_local_body_sessions(
+    *, timeout: float = 3.0, ensure_daemon: bool = True
+) -> list[dict[str, Any]]:
+    """List local headless sessions; observation failures degrade to no rows.
+
+    ``ensure_daemon`` (default ``True``, preserving prior behavior): the
+    underlying ``agent-bridge --json sessions`` CLI command boots the local
+    daemon on demand if it isn't already running (its own ``_get_client()``
+    default). Pass ``ensure_daemon=False`` for a genuinely passive,
+    unattended probe (e.g. a periodic background tick) that must never start
+    a daemon merely by checking whether anything is running -- this sets
+    ``AGENT_BRIDGE_NO_ENSURE=1`` for the subprocess only, degrading cleanly
+    to no rows when the daemon isn't already up rather than booting one.
+    """
     prefix = agent_bridge_launch_prefix()
     if prefix is None:
         return []
-    proc = _run_capture([*prefix, "--json", "sessions"], timeout=timeout)
+    env = None
+    if not ensure_daemon:
+        env = dict(os.environ)
+        env["AGENT_BRIDGE_NO_ENSURE"] = "1"
+    proc = _run_capture([*prefix, "--json", "sessions"], timeout=timeout, env=env)
     if proc is None:
         return []
     if proc.returncode != 0 or not proc.stdout.strip():
@@ -205,6 +301,72 @@ def embodiment_overlay(session: dict[str, Any] | None) -> dict[str, Any] | None:
     return overlay or None
 
 
+#: Session lifecycle states that still *occupy* a worktree (resumable) but are
+#: not currently doing live work -- a satellite must not advertise these as an
+#: active/embodied worktree (a stopped session is retired-but-resumable, not
+#: "the agent is here right now").
+_TERMINAL_SESSION_STATUSES = frozenset({"stopped", "ended", "failed"})
+
+
+def satellite_status_snapshot(
+    *, timeout: float = 3.0
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    """The (``worktrees``, ``status``) pair a ``role=satellite`` federation node
+    pushes on register/heartbeat (see the ``satellite-agent-exposure`` effort's
+    Phase 1 item C -- "pushing each live worktree's embodiment status").
+
+    Reads **only this machine's own** local headless sessions via
+    :func:`list_local_body_sessions` (the same local ``agent-bridge --json
+    sessions`` call the embodiment overlay already uses) -- no SSH, no new
+    outbound reach, and nothing opened for anyone to reach *in*.
+    ``ensure_daemon=False``: a periodic federation tick is a passive
+    background probe, not an interactive request for accurate status, so it
+    must never *boot* a local agent-bridge daemon merely to check whether
+    anything is running -- it degrades to ``([], {})`` when the daemon isn't
+    already up, exactly as if ``agent-bridge`` itself were absent.
+
+    Two things the raw session list requires filtering for before it's fit to
+    publish as "what's live right now": it can carry **resumable-but-stopped**
+    sessions (``status`` in :data:`_TERMINAL_SESSION_STATUSES`) alongside truly
+    active ones -- those are skipped, not advertised as active worktrees. And a
+    worktree can appear **more than once** after a session roll (a retired
+    predecessor plus its successor); since the bridge's list is newest-first,
+    only the *first* row seen per ``worktree_id`` is kept so an older row can
+    never silently overwrite the newer one's status. A session missing a
+    resolvable ``worktree_id`` or whose overlay is empty is also skipped; an
+    unreachable/absent ``agent-bridge`` degrades to ``([], {})`` exactly like
+    the rest of this module's best-effort tracking.
+    """
+    worktrees: list[str] = []
+    status: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
+    for session in list_local_body_sessions(timeout=timeout, ensure_daemon=False):
+        worktree_id = session.get("worktree_id")
+        if not isinstance(worktree_id, str) or not worktree_id:
+            continue
+        if worktree_id in seen:
+            continue
+        # Mark seen BEFORE the terminal-status filter: the newest row for a
+        # worktree is authoritative regardless of whether it passes the
+        # live-status filter -- if the newest row is stopped/ended/failed, an
+        # OLDER (and possibly still "live"-looking) row for the same worktree
+        # must not be resurrected from further down the list.
+        seen.add(worktree_id)
+        session_status = str(session.get("status") or "").lower()
+        if session_status in _TERMINAL_SESSION_STATUSES:
+            continue
+        overlay = embodiment_overlay(session)
+        if overlay is None:
+            continue
+        entry = dict(overlay)
+        activity = session_activity(session)
+        if activity is not None:
+            entry["activity"] = activity
+        worktrees.append(worktree_id)
+        status[worktree_id] = entry
+    return worktrees, status
+
+
 def session_activity(session: dict[str, Any] | None) -> str | None:
     """Map an agent-bridge session snapshot to the task activity vocabulary."""
     if not session:
@@ -214,9 +376,22 @@ def session_activity(session: dict[str, Any] | None) -> str | None:
     turn_state = str(session.get("turn_state") or "").lower()
     if liveness == "stalled":
         return "STALLED"
-    if liveness == "active" or turn_state == "running":
+    # "disconnected" (agent-bridge __main__.py's own vocabulary: "DISCONNECTED
+    # - transport down") must never be reported ACTIVE, however stale/live-
+    # looking the rest of the snapshot's fields are -- a dead transport can
+    # still carry a lingering turn_state=="running" from before it dropped,
+    # particularly now that satellite_status_snapshot() can publish this
+    # fleet-wide. Guarded on every ACTIVE-producing branch below, not just
+    # the last one.
+    if liveness != "disconnected" and (liveness == "active" or turn_state == "running"):
         return "ACTIVE"
-    if status in {"starting", "running"} and liveness not in {"idle", "stalled"}:
+    if status == "idle" or liveness == "idle" or turn_state == "idle":
+        return "IDLE"
+    if status in {"starting", "running"} and liveness not in {
+        "idle",
+        "stalled",
+        "disconnected",
+    }:
         return "ACTIVE"
     return None
 
@@ -299,11 +474,48 @@ def liveness_verdict(
       register window). GC leaves the task alone (degrade safe; never requeue on
       ignorance or an unattributable snapshot).
 
+    This function is the shared resolver for *every* claimed/started task's
+    liveness GC (:meth:`agent_dispatch.queue.TaskQueue.reconcile_liveness`), not
+    only spawn-reservation-owned worktrees -- a generically claimed task's
+    ``worktree`` may be an arbitrary handle with no agent-worktrees record at
+    all, and an uncaptured ``owner_session_id`` can legitimately mean "claim
+    not yet registered" for a still-live worker. It therefore never escalates
+    an uncaptured ``owner_session_id`` to :data:`GONE` by itself, no matter
+    what the bridge or the local agent-worktrees registry reports. A caller
+    that positively knows a specific worktree is exclusively owned by its own
+    spawn reservation (so the local agent-worktrees registry is authoritative
+    for that worktree's existence) may layer an additional, narrowly-scoped
+    absent-worktree check of its own on top of this result -- see
+    :func:`worktree_directory_present` and its caller in
+    ``supervisor.release_requested_bodies``.
+
     Never raises. Mirrors :func:`resolve_live_session`'s transport (local
-    ``agent-bridge``; a remote owner over ``ssh <machine> agent-bridge``).
+    ``agent-bridge``; a remote owner over ``ssh <machine> agent-bridge``; a
+    registered ``role=satellite`` owner over its own pushed status instead of
+    an SSH-back that would only ever time out -- see that function's matching
+    branch).
     """
     if not worktree:
         return UNKNOWN
+    # An owner's ``machine`` is populated from the stored ``"<machine>/<worktree>"``
+    # owner string, which is non-empty for *every* claimed/started task -- local or
+    # remote. Without this gate, every local task's liveness probe would shell an
+    # unnecessary self-SSH loopback (visible OpenSSH window flash) instead of the
+    # direct local ``agent-bridge`` call every other caller in this module already
+    # takes.
+    if machine is not None and not remote_dispatch.is_peer_machine(machine):
+        machine = None
+    if machine is not None:
+        satellite_entry = _satellite_entry_for(machine)
+        if satellite_entry is not None:
+            # A registered satellite opens no inbound listener, so an SSH-back
+            # probe would only ever time out -- read its own pushed status
+            # instead (see `resolve_live_session`'s matching branch and the
+            # `satellite-agent-exposure` effort's Design item D). A worktree
+            # absent from the pushed status is "not embodied there right now",
+            # the same as the CLI's `{}` empty-registry answer below.
+            data = (satellite_entry.get("status") or {}).get(worktree) or {}
+            return _verdict_from_resolved_data(data, owner_session_id)
     argv = _bridge_resolve_argv(worktree, machine=machine)
     if argv is None:
         return UNKNOWN
@@ -324,11 +536,27 @@ def liveness_verdict(
     if not isinstance(data, dict):
         return UNKNOWN
     # The resolver answered. Without a captured owner identity we cannot safely
-    # attribute the worktree's state to this task's owner -> can't-tell.
+    # attribute the worktree's state to this task's owner -> can't-tell. This
+    # holds regardless of what the resolver answered (empty or occupied): a
+    # generically claimed task's worktree may have no agent-worktrees record
+    # at all, and an uncaptured owner_session_id can legitimately mean "claim
+    # not yet registered" for a still-live worker. A caller that knows better
+    # (its own spawn-reservation-owned worktree) layers its own additional
+    # check on top of this result instead -- see `worktree_directory_present`.
+    return _verdict_from_resolved_data(data, owner_session_id)
+
+
+def _verdict_from_resolved_data(
+    data: dict[str, Any], owner_session_id: str | None
+) -> str:
+    """Shared tail of :func:`liveness_verdict`: turn an already-resolved
+    ``{session_id: ...}``-shaped answer (or ``{}`` for "worktree empty") into
+    the tri-state verdict. Shared by both the SSH-back path and the satellite
+    pushed-status path so they apply identical identity-attribution rules."""
     if owner_session_id is None:
         return UNKNOWN
     if not data:
-        return GONE  # `{}` (CLI 404): the worktree is empty -> our owner is gone
+        return GONE  # empty registry: the worktree is empty -> our owner is gone
     current = data.get("session_id") or data.get("id")
     if current is None:
         return UNKNOWN  # answered but unattributable
@@ -371,11 +599,90 @@ def live_worktrees(*, timeout: float = 5.0) -> set[str] | None:
     }
 
 
+def worktree_directory_present(
+    worktree: str, *, project: str | None = None, timeout: float = 5.0
+) -> bool | None:
+    """Whether ``worktree`` still exists on disk, per the local agent-worktrees
+    registry, in **any** tracking status.
+
+    Unlike :func:`live_worktrees` (deliberately ACTIVE-only, for orphan
+    reaping), this checks presence across ``active``/``complete``/
+    ``finalized``/``orphaned`` alike: a ``finalized`` worktree is explicitly
+    allowed to remain fully present on disk, so an ACTIVE-only scope would
+    misreport it as absent. The registry's own default listing (no ``--all``)
+    already excludes rows whose directory no longer exists on disk, so a
+    present row for this exact id is authoritative directory-presence
+    evidence; an empty result means the directory is genuinely gone.
+
+    ``project`` names the target project explicitly (``agent-worktrees``'
+    global ``--project`` option, preceding the subcommand) -- required in
+    practice for a CWD-neutral caller (a supervisor daemon's working
+    directory is a service runtime dir, not necessarily the repo whose
+    reservation this worktree belongs to), exactly like
+    :func:`agent_dispatch.embody.project_for_task`'s callers. Omitting it
+    falls back to ``agent-worktrees``' own CWD-based project discovery,
+    which is only correct when the caller's CWD happens to match.
+
+    Always passes ``--include-other-platforms``: the registry's default
+    ``list`` filters to the host's *current* detected local platform, so a
+    reservation created on this same host under a different local platform
+    (e.g. Windows vs. WSL) would otherwise be silently omitted -- this
+    function answers presence, not per-platform enumeration.
+
+    Returns ``None`` on **any** resolver failure (no CLI, non-zero exit,
+    timeout, empty or unparseable output) so the caller degrades safe --
+    an unresolved probe never counts as "gone". Never raises.
+
+    **Known residual risk (shared with** :func:`live_worktrees` **, not new
+    here):** agent-worktrees' own registry reader silently skips a tracking
+    record that fails to load (corrupt/partially-written YAML) rather than
+    reporting it, so an empty result cannot be perfectly distinguished from
+    "this exact record is transiently unreadable." This is an existing,
+    platform-wide characteristic of every caller of that registry today, not
+    a regression introduced by this function; closing it fully needs an
+    agent-worktrees-side signal (e.g. a skipped-record count or an exact-ID
+    lookup that reports "unreadable" distinctly from "absent"), which is out
+    of scope for this caller to invent unilaterally.
+    """
+    args: list[str] = []
+    if project:
+        args += ["--project", project]
+    args += [
+        "list",
+        "--json",
+        "--tracking-status",
+        "all",
+        # A queue-recorded reservation may have been created on the same
+        # host but a different local platform (e.g. Windows vs. WSL); the
+        # registry's default platform filter would otherwise omit that row
+        # and make a live worktree look absent. Presence, not per-platform
+        # enumeration, is what this probe answers.
+        "--include-other-platforms",
+        "--worktree-id",
+        worktree,
+    ]
+    proc = run_agent_worktrees_capture(*args, timeout=timeout)
+    if proc is None:
+        return None
+    if proc.returncode != 0:
+        return None
+    out = (proc.stdout or "").strip()
+    if not out:
+        return None
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    wts = data.get("worktrees", data) if isinstance(data, dict) else data
+    if not isinstance(wts, list):
+        return None
+    return len(wts) > 0
+
+
 def enrich_task(
     task: Any,
     *,
     bridge_ok: bool | None = None,
-    ssh_ok: bool | None = None,
     local: Any = _UNSET,
 ) -> Any:
     """Return ``task`` with an ``embodiment`` overlay when it is leased and its
@@ -383,10 +690,9 @@ def enrich_task(
 
     The overlay resolves against the *owner's* machine (Phase 8 Slice 8b): a
     local owner uses the local ``agent-bridge`` (gated on
-    :func:`bridge_available`); a remote owner resolves over the SSH mesh (gated
-    on :func:`~remote_dispatch.ssh_available`). A batch caller (``list``) hoists
-    the one-time ``bridge_available`` / ``ssh_available`` / ``local_machine``
-    probes so a lane of tasks makes at most one of each.
+    :func:`bridge_available`); a remote owner first uses the local Bridge carrier
+    and resolves SSH only if that optional capability is absent. A batch caller
+    (``list``) hoists local Bridge and machine-identity probes.
     """
     if not isinstance(task, dict) or task.get("status") not in _LEASED:
         return task
@@ -396,13 +702,14 @@ def enrich_task(
         return task
     machine = machine_from_owner(owner)
     if local is _UNSET:
-        local = remote_dispatch.local_machine()
-    is_remote = bool(machine) and bool(local) and machine != local
+        is_remote = remote_dispatch.is_peer_machine(machine)
+    else:
+        is_remote = (
+            bool(machine)
+            and bool(local)
+            and machine.strip().casefold() != str(local).strip().casefold()
+        )
     if is_remote:
-        if ssh_ok is None:
-            ssh_ok = remote_dispatch.ssh_available()
-        if not ssh_ok:
-            return task
         session = resolve_live_session(worktree, machine=machine)
     else:
         if bridge_ok is None:
@@ -433,11 +740,8 @@ def enrich_tasks(tasks: Any) -> Any:
             isinstance(t, dict) and t.get("status") in _LEASED for t in tasks
         ):
             return tasks
-        # Hoist the environment probes once for the whole batch: the local bridge
-        # (local owners), ssh (remote owners), and this machine's identity (to
-        # tell local from remote).
+        # Hoist the local Bridge and machine-identity probes once for the batch.
         bridge_ok = bridge_available()
-        ssh_ok = remote_dispatch.ssh_available()
         local = remote_dispatch.local_machine()
         deadline = time.monotonic() + _enrich_budget()
         out = []
@@ -453,7 +757,7 @@ def enrich_tasks(tasks: Any) -> Any:
                 out.append(t)
                 continue
             out.append(
-                enrich_task(t, bridge_ok=bridge_ok, ssh_ok=ssh_ok, local=local)
+                enrich_task(t, bridge_ok=bridge_ok, local=local)
             )
         return out
     return enrich_task(tasks)

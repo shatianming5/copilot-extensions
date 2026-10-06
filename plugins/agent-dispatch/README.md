@@ -126,13 +126,42 @@ such as `--pool host-a,host-b --origin origin --headless` in
 [`docs/spawn-supervisor.md`](docs/spawn-supervisor.md#running-as-a-persistent-service-the-always-on-last-mile)
 for the full supervisor/profile contract.
 
+### Same-cell sibling invocation
+
+With an explicit `COPILOT_EXTENSIONS_CONTEXT`, dispatch's worktrees/bridge
+`list[str]` launch prefixes enter the packaged `agent_dispatch/peer_launch.py`
+native child boundary. It validates dispatch, the namespace, and the peer using
+the canonical installation-context primitive, then checks the peer's own shipped
+governance API and calls its `scripts/resolve-runtime.{sh,ps1}`. Runtime selection
+belongs to that peer, including completion-marker and last-known-good semantics;
+dispatch does not reconstruct a slot resolver or require exemplar-only
+`.runtime-slot-completion` receipts from generic runtime peers. Dispatch's
+resident loop-governance rechecks use the same packaged canonical primitive,
+without loading code through a deploy-manifest payload pointer.
+
+The boundary rebinds `COPILOT_EXTENSIONS_CONTEXT` to the peer's `install.json`,
+`COPILOT_PLUGIN_ROOT` and its plugin-specific payload root to the peer payload,
+and runtime/config routing to the peer installation. The entire `AGENT_DISPATCH_`
+environment namespace is removed, including credentials and endpoint routing,
+along with generic/sibling root overrides and Python import overrides. Peer code runs under
+isolated native Python with UTF-8 and inherited stdio. User argv, including seed
+JSON, quotes, empty strings, and shell metacharacters, never enters a shell:
+PowerShell 5.1 or POSIX shell executes only a constant, read-only resolver probe.
+
+Receipt/governance failures report a diagnostic and exit 126 before running peer
+code, even if the dispatch install root points at legacy. Missing runtimes fail
+without provisioning, activating, or starting services. Validation is repeated
+at invocation time so a previously constructed prefix cannot bypass deactivation.
+Without an explicit context, the historical home-root resolver and POSIX PATH
+fallback are unchanged, including their argv and environment behavior.
+
 ### Worktree-picker "Tasks" pivot
 
 The installer drops a pivot manifest at
 `~/.agent-worktrees/pivots/agent-dispatch.json` so the agent-worktrees Textual
 picker grows a **Tasks** pivot (between Worktrees and Maintenance). It renders the
 status-grouped board through the stdlib-only `agent-dispatch-board` API client
-(Blocked / Proposed / Queued / Started / Suspended / recently terminal). A separate **ACTIVE** badge appears only
+(Blocked / Proposed / Started / Queued / Suspended / recently terminal). A separate **ACTIVE** badge appears only
 when embodiment tracking reports an assigned agent executing a turn; **STALLED**
 marks a running turn with no recent activity. That execution badge is independent
 from lifecycle phase -- `Started` alone never implies a live agent. The
@@ -143,6 +172,39 @@ agent-worktrees or agent-bridge. Enter
 opens a per-task action sub-menu. The seam is a filesystem manifest registry,
 not a Python import -- the plugins live in separate venvs -- so a stale or absent
 picker simply ignores it. Source: `pivots/agent-dispatch.json`.
+
+The manifest declares `"stream": true, "subscribe": true` (pivot-streaming-
+transport Phase 1): the Picker runs `agent-dispatch-board --stream` instead of
+the plain one-shot call, consuming a line-delimited NDJSON envelope
+(`begin`/`row`/`done`) so the board paints progressively, then holds that
+channel open -- every two seconds (`--interval`, `board_cli.py`'s
+`DEFAULT_SUBSCRIBE_INTERVAL`) the board is re-fetched in-process and diffed
+against the last snapshot, emitting `delta`/`removed` frames so an open pivot
+updates live without re-invoking the CLI per refresh. Falls back automatically
+to the plain one-shot JSON call on an older `agent-dispatch-board` that
+doesn't understand `--stream` (`stream` is "always safe to declare" per the
+Picker's own contract); a held channel that drops mid-session reconnects with
+bounded backoff rather than freezing (the Picker-owned `subscribe` EOF/
+reconnect contract -- see `worktree-manager`'s `tasks.py`).
+
+### Declared lifecycle tier (per `docs/patterns/service-lifecycle-supervision.md`)
+
+- **Default tier: 2 — scheduled activation**, layered around a tier-1
+  user-mode ensure path — **partially realized today, one gap found and
+  filed** (#2524, not yet fixed): the coordinator's Windows `Invoke-Start`
+  already falls back to a direct detached launch when no Scheduled Task is
+  registered (fixed for #3602), but the POSIX `do_start` still hard-fails
+  when the systemd unit isn't installed/available, with no direct-launch
+  fallback (unlike agent-bridge's own `do_start`). Until #2524 lands, POSIX
+  `start` is effectively tier-2-only, not tier-1-convergent.
+- **Availability promise:** starts with the user's session; restarts at
+  logon; does not survive full logout or start before login.
+- **Windows:** Scheduled Task `agent-dispatch`, `AtLogOn`, non-elevated;
+  the embody supervisor(s) register their own named tasks the same way.
+- **POSIX:** systemd **user** unit `agent-dispatch.service` (no system-level
+  unit); supervisor profiles register their own named units.
+- **No escalation:** no tier-3/tier-4 requirement has been identified for
+  the standalone per-host coordinator.
 
 ### Running the coordinator as a service
 
@@ -218,16 +280,16 @@ q.reconcile_liveness()
 ### State model
 
 ```
-proposed -> queued -> claimed -> started -> completed        (terminal)
-                ^         |          |
-                +-- decline/yield ---+
-                ^
+proposed -> queued -> claimed -> started -> submitted -> completed
+                ^         |          |            |            (terminal)
+                +-- decline/yield ---+            |
+                ^                                  +-- confirm
                 +-- owner-gone (liveness GC requeue, attempts++)
-started -> suspended -> started                              (resume; same owner)
-               |
-               +-----------> queued                          (release; replacement)
-               +-----------> completed                       (condition resolved)
-   (any non-terminal) --------------------------> abandoned   (terminal, permission-gated)
+started -> suspended -> started
+               |                                   (resume; same owner)
+               +-----------> queued                (release; replacement)
+               +-----------> submitted             (condition resolved)
+   (any non-terminal except completed) -------> abandoned     (terminal, permission-gated)
 ```
 
 - **proposed** -- written but not yet claimable (a draft handoff / undecided idea).
@@ -237,9 +299,24 @@ started -> suspended -> started                              (resume; same owner
 - **suspended** -- previously started but dormant and non-claimable; retains the
   same owner/session, worktree identity, generation, progress, and card while
   clearing active lease/activity.
-- **completed** / **abandoned** / **dead_letter** -- terminal (abandon requires
-  permission; **dead_letter** is where a task lands when GC has requeued it past
-  the attempts cap -- its owner kept going gone -- an actionable failure state).
+- **submitted** -- the worker's provisional completion claim. A task reaches
+  this state only when `require_verification=true`; it then waits for a
+  whole-goal evaluator (or an operator override) to decide whether the stated
+  goal is actually complete or should be abandoned.
+- **completed** / **abandoned** -- terminal (abandon requires permission).
+  Liveness GC moves a held task whose owner has gone past the attempts cap to
+  **abandoned**, clearing its ownership and completion metadata. The legacy
+  **dead_letter** value is retained only for migration/read compatibility.
+  `completed`/`submitted` briefly traded names (2026-09-25..2026-09-29) --
+  if you see a stray `confirmed` status anywhere, see
+  [`docs/status-rename-migration-2026-09-29.md`](docs/status-rename-migration-2026-09-29.md).
+- `require_verification` is explicit and opt-in. The default (`false`) keeps the
+  legacy single-call behavior: `complete` self-attests and lands the task at
+  **completed** immediately. When `true`, `complete` stops at **submitted**
+  instead, and the task needs evaluator corroboration or a manual override.
+- The Tasks pivot is the manual override surface for that gate: a submitted
+  verification-gated task can be **Completed** (accept the claim) or
+  **Force-abandoned** directly from the picker.
 - A **liveness** GC pass returns a held task to **queued** only when its owner's
   **session** is *confirmed gone* (keyed on the captured `owner_session_id`, not
   mere worktree occupancy) -- never on elapsed time, so a long-running live
@@ -256,6 +333,17 @@ started -> suspended -> started                              (resume; same owner
   explicitly clears ownership and moves **suspended → queued**. Suspended tasks
   do not participate in liveness GC, supervisor capacity/claiming, or retry
   accounting.
+- A bare `suspend` always attaches a **cooldown monitor** (default
+  `DEFAULT_SUSPEND_COOLDOWN_SECONDS`, override with `--cooldown-seconds`, or
+  suppress with `--no-cooldown` for a caller that has arranged its own, more
+  specific wait) -- see `agent_dispatch.monitors`. The coordinator's
+  liveness-GC loop piggybacks a cooldown reconciler on the same always-on
+  cadence: once a monitor elapses, the task is auto-resumed under its
+  existing owner (a cold-headless owner's `resume` flips `resume_requested`
+  for the supervisor's own pool reservation poll rather than transitioning
+  straight to `started`) -- turning a bare suspend into a genuine
+  round-robin time-slice instead of an unwatched idle a task can get stuck
+  in forever.
 - `complete <id> <owner>` is also legal directly from **suspended**. An external
   resolver may therefore record a satisfied dormant goal atomically under the
   preserved owner without waking a process or fabricating an active turn.
@@ -279,6 +367,13 @@ started -> suspended -> started                              (resume; same owner
   events, `task.wake` SSE events, and `/health` wake metrics expose
   pending/delivering/delivered/failed/stale state. The steer is durable even
   when all delivery attempts fail.
+- A detached `run --detach --task <id>` wait is also durable: the coordinator
+  records the waiter PID, host, and start-identity fence. On startup it sweeps
+  any still-active waiter records; a confirmed-dead waiter wakes the task with an
+  explicit infrastructure-failure retry note, while a live or indeterminate
+  waiter is left alone. A subscribed emitter's event note can supersede a still-
+  running waiter and wake the task early, with the waiter-generation fence
+  dropping any later stale completion from that superseded process.
 
 ### Goal-bearing tasks -- a durable goal, not a fire-once prompt
 
@@ -322,9 +417,11 @@ external deps). `read_payload()` (engine) / `GET /tasks/{id}/payload` /
 `agent-dispatch payload <id> [--raw]` resolve either form transparently; an
 external `payload_ref` (e.g. `pr/123`) is left opaque for the caller.
 `agent-dispatch consume <id>` is the resume-and-consume shortcut: it idempotently
-drives the task to `completed` (approve → claim → start → complete) and then
+drives the task to `submitted` (approve → claim → start → complete) and then
 prints the payload, so a handoff successor's single command both loads the brief
-and spends the baton.
+and spends the baton. A handoff that is already spent, or was abandoned because a
+newer handoff superseded it (or it was aborted), is refused with exit `3`
+instead of delivered.
 
 ### Dedup & scheduling
 
@@ -372,8 +469,12 @@ Scope transitions require the coordinator's separate
 does not authorize them. The control token is intentionally a **superset queue
 credential**: it can authenticate ordinary queue operations and additionally
 authorize scope transitions, so it is not a least-privilege producer
-credential. Keep it out of process arguments; prefer the control-token
-environment setting, or the shared token-command setting where configured. A
+credential. Keep it out of process arguments; set it directly, or resolve it
+**on demand** via `AGENT_DISPATCH_CONTROL_TOKEN_COMMAND` (or
+`AGENT_DISPATCH_SHARED_CONTROL_TOKEN_COMMAND` for `--shared`) -- a fetch
+command (e.g. a credential/vault CLI) so the secret need not persist in the
+environment, mirroring `AGENT_DISPATCH_SHARED_TOKEN_COMMAND`'s pattern for the
+ordinary shared bearer. A
 tokenless local coordinator still refuses to manage scopes until a control
 token is explicitly configured. Each successful new transition mints a
 high-entropy `producer_capability`, stores only its SHA-256 hash, and returns
@@ -570,10 +671,451 @@ one producer election.
 surface used by the supervised child. Normal deployments declare the emitter
 rather than wiring cron, a Scheduled Task, or another external timer.
 
+### Repository reviewer loops (`agent-dispatch reviewer-loop`)
+
+A repository can compose its review source, lifecycle evaluator, and bounded
+worker pool in one `kind: reviewer-loop` declaration. The registrar expands it
+in memory to the same existing emitter/evaluator/supervised-lane units; the
+declaration remains the only source of truth.
+
+The loop's `task_label` is always included in its worker pool. A repository
+that already shares one bounded reviewer fleet with another producer may add
+that producer's labels through `pool.additional_labels`; duplicates are removed
+and the loop still expands to one pool with one process cap.
+
+Optional top-level `filters` place the whole loop on one or more machines: the
+source, evaluator, and worker pool inherit the same `machine` constraint.
+`pool.filters` remains the worker-specific filter surface and may narrow that
+placement further; permit values are intersected, reject values are combined,
+and an impossible composition is rejected instead of creating a loop with no
+runnable worker.
+
+An optional top-level `stale_after_days` adds a reviewer-lifecycle stale-exit
+policy to the declaration's evaluator registration. When set, submitted
+verification abandons a reviewer task once the target change's last commit is
+older than that many days. The timestamp may come from inline reviewer metadata
+(`payload_inline.reviewer_loop.last_commit_at`) or, for the built-in
+provider-backed flows, from a `payload_ref` like
+`github-pr:owner/repo#123` or
+`azure-devops-pr:organization/project/repository#123` resolved through the
+persisted PR-observation cache. Suspended reviewer tasks also use the same
+deadline to wake a parked hibernation waiter instead of remaining dormant
+forever. The threshold is per declaration; omitting the key disables
+stale-exit checking entirely.
+
+**Provider state today.** The reusable `reviewer-loop` lifecycle is recipe-able
+today (`global:reviewer` / `global:conflict-resolution` in the `extends:`
+registry below). Its read-side provider observation *primitives* now cover
+GitHub and Azure DevOps (provider-backed `payload_ref` parsing, persisted
+observation lookup for stale-exit checks, a provider-aware poll observer
+helper, and a read-only Azure DevOps PR adapter alongside the existing GitHub
+one). The forge-facing webhook receiver and the worker's direct
+verdict-posting / merge-or-close action path remain GitHub-shaped today, and
+this plugin does not yet ship a live Azure DevOps webhook or poll-service
+producer that seeds observations on its own. Gitea remains deferred to a
+structural stub only.
+
+```bash
+agent-dispatch reviewer-loop setup .copilot-extensions/agent-dispatch/registrar/reviewer-loop.json
+agent-dispatch reviewer-loop inspect .copilot-extensions/agent-dispatch/registrar/reviewer-loop.json
+agent-dispatch reviewer-loop status .copilot-extensions/agent-dispatch/registrar/reviewer-loop.json
+agent-dispatch reviewer-loop doctor .copilot-extensions/agent-dispatch/registrar/reviewer-loop.json
+agent-dispatch reviewer-loop disable .copilot-extensions/agent-dispatch/registrar/reviewer-loop.json \
+  --reason "maintenance"
+agent-dispatch reviewer-loop enable .copilot-extensions/agent-dispatch/registrar/reviewer-loop.json
+agent-dispatch reviewer-loop side-load \
+  .copilot-extensions/agent-dispatch/registrar/reviewer-loop.json owner/repo#123
+```
+
+`setup` validates that the declaration lives under the repository's canonical
+`.copilot-extensions/agent-dispatch/registrar/` directory (legacy
+`.agent-dispatch/registrar/` remains accepted), then idempotently adds the
+repository to the existing registrar pointer index. It never copies or rewrites
+the declaration. The runtime reads the canonical directory first, falls back to
+the legacy directory, and merges an explicit marketplace overlay from
+`.copilot-extensions/agent-dispatch/marketplaces/<marketplace-id>/registrar/`.
+`inspect` shows the three effective declared registration ids and their local
+override state.
+
+`status` joins the declaration with its pointer, local supervisor scope,
+effective registrations, the supervisor's atomic per-cycle child-process
+snapshot, associated actionable tasks, pool filters, and failed spawn
+reservations. `doctor` emits the same JSON and exits nonzero when it finds a
+missing pointer, a declared-but-unserved unit, an unavailable coordinator, a
+local override, a task excluded by the worker filter, a task awaiting input, a
+spawn-dead-lettered task, or a truncated task scan.
+Dead-lettered task entries include the existing atomic
+`reservations rearm <task> --permit --reason <reason>` action; doctor does not
+mutate task state.
+
+`disable` and `enable` atomically apply or clear the existing machine-local
+supervisor overrides for the whole loop. `side-load` invokes the declared
+emitter's on-demand command directly, preserving its producer-owned provenance,
+evaluator association, and target-stable dedup.
+Disabling prevents a new side-load from starting; like disabling a periodic
+emitter, it does not cancel a command that was already in flight.
+An explicitly conflicting direct registration remains a separate supervised
+unit; loop controls do not guess that a different spec should be stopped.
+
+### Repository issue loops (`agent-dispatch repository-issue-loop`)
+
+A repository can adopt a bounded issue-backlog worker with one complete
+`kind: repository-issue-loop` declaration. The registrar expands it into an
+epoch-anchored periodic issue-source emitter and one concurrency-one headless
+worker lane. No overlay or second policy file is merged into the declaration.
+
+```yaml
+name: repository-backlog
+kind: repository-issue-loop
+repo: owner/project
+source: repository-backlog
+cadence_seconds: 21600
+tick_interval_seconds: 60
+quiet_period_seconds: 1800
+include_labels: [ready]
+exclude_labels: [bootstrap, wontfix]
+priority_labels: [priority:high, priority:medium]
+batch_size: 3
+task_label: repository-issue-work
+forge:
+  provider: github
+  producer_login: issue-bot
+reservation:
+  label: agent-reserved
+  comment: true
+  orphan_after_seconds: 3600
+pool:
+  max_active_processes: 1
+  body:
+    type: headless
+    agent: repository-issue-worker
+```
+
+An optional top-level `task_contract:` mapping lets a declaration replace
+the created task's `title`, `goal`, `done_criteria`, and/or `prompt`
+templates without changing the issue-discovery/reservation engine itself.
+Each field is a string template with the placeholders
+`{issue_numbers}`, `{issues_bullets}`, `{self_config_clause}`, and
+`{worker_guidance}`. This is how `global:backlog-triager` keeps the same
+repository-issue-loop forge/emitter mechanism while swapping in a triage-only
+task contract instead of the default implementation-through-merge one.
+
+The emitter may tick more frequently than the configured cadence, but each
+occurrence is anchored to the Unix epoch. A completed task suppresses a replay
+of its occurrence after restart, and any nonterminal loop task backpressures
+later occurrences. Eligible issues must satisfy the quiet window and label
+policy, then sort by configured priority-label rank, creation time, and issue
+number. One goal-bearing task represents at most `batch_size` issues and carries
+a loop-wide `exclusive_key`; the lane's concurrency-one cap is defense in depth.
+Suppressed occurrences return before forge discovery. Unsuppressed GitHub
+discovery fetches issue fields and marker comments in bounded GraphQL pages,
+avoiding one comment request per issue.
+
+GitHub is the first forge adapter. It reserves each issue visibly with the
+declared label and an ownership marker comment before task creation, promotes
+the marker after creation, and reconciles its own orphaned reservation after a
+partial failure. A coordinator-atomic canonical repository/issue reservation
+elects exactly one winner before task creation when overlapping declarations
+race. Opaque acquisition tokens fence stale same-owner bind/release calls, and
+an indeterminate create response is resolved by deterministic task lookup
+before any release. Each token is renewed before a non-runnable proposed task
+is created; the task enters the worker queue only after every issue binds, and
+a bind failure abandons it. Later ticks retry approval for fully bound proposed
+tasks and terminal abandonment for incomplete ones, retaining reservations
+until terminal state is confirmed. Losers visibly release their provisional
+marker; an exact shared label remains while a distinct loser label is removed.
+Reservations owned by another loop are selection blockers and are never
+silently cleared.
+
+**Provider state today.** The provider-neutral backlog surface is realized for
+GitHub and Azure DevOps. GitHub uses the label + marker-comment flow described
+above; Azure DevOps implements the same list / reserve / claim / release
+surface for work-item backlogs through its own adapter. Gitea is only a
+structural future seam today: a stub provider exists so the runtime has a named
+adapter slot, but declarations with `forge.provider: gitea` are still
+validation-rejected until a real adapter lands (tracked separately as
+`ThomasMichon/copilot-extensions#4825`).
+
+The configured producer identity is verified against the selected provider
+immediately before every mutation (for example `gh` against the GitHub repo, or
+the authenticated Azure DevOps surface against its project/work-item backend);
+comments from other authors are untrusted issue data.
+
+**Rehearsing a new or edited declaration before trusting it to run
+unattended:** `rehearsal_mode: true` (default `false`) makes every
+auto-approval step above a no-op -- the forge-side reservation/label still
+binds for real (so the rehearsal is observably real, not a dry run), but the
+task itself is deliberately left `proposed` rather than promoted to `queued`,
+so no pool worker ever auto-claims it. It stays parked across every later
+tick (re-examined and left alone each time, not abandoned) until an operator
+explicitly promotes it with `agent-dispatch approve <task-id>` -- at which
+point it becomes claimable exactly like any other queued task, and the
+normal evaluator/verification path applies unchanged once it completes. This
+is the recommended way to validate a brand-new declaration end-to-end (one
+real occurrence, one manually-approved task, watched through to completion
+via `agent-dispatch watch`/`agent-bridge`) before removing `rehearsal_mode`
+and letting it run autonomously. `discover` (below) remains the right first
+step when you don't want *any* forge-side side effect yet; `rehearsal_mode`
+is the next step once you do.
+
+```bash
+agent-dispatch repository-issue-loop setup .copilot-extensions/agent-dispatch/registrar/issues.yaml
+agent-dispatch repository-issue-loop inspect .copilot-extensions/agent-dispatch/registrar/issues.yaml
+agent-dispatch repository-issue-loop discover .copilot-extensions/agent-dispatch/registrar/issues.yaml
+agent-dispatch repository-issue-loop status .copilot-extensions/agent-dispatch/registrar/issues.yaml
+agent-dispatch repository-issue-loop doctor .copilot-extensions/agent-dispatch/registrar/issues.yaml
+agent-dispatch repository-issue-loop disable .copilot-extensions/agent-dispatch/registrar/issues.yaml \
+  --reason "maintenance"
+agent-dispatch repository-issue-loop enable .copilot-extensions/agent-dispatch/registrar/issues.yaml
+```
+
+`discover` is read-only. `status`/`doctor` report the last emitter success or
+failure, staleness, active occurrence, forge-visible reservations, pool state,
+and local kill switch. Forge discovery or credential failures are explicit
+health failures, not indistinguishable from an empty eligible set. See
+[`docs/repository-issue-loop.md`](docs/repository-issue-loop.md) for the worker
+contract, migration sequence, and provider boundary, and
+[`docs/repository-issue-loop-adoption.md`](docs/repository-issue-loop-adoption.md)
+for the declaration schema reference, the available worker identities, and a
+worked example for standing up a new declaration from scratch.
+
+
+### Registrar `extends:` -- recipe references
+
+Any registrar declaration file (not just `repository-issue-loop`/
+`reviewer-loop`) may carry an `extends:` key instead of (or in addition to)
+spelling out every field directly:
+
+```yaml
+extends: "global:<name>"                 # plugin-shipped recipe (see below for the shipped set)
+# or
+extends: "./recipes/my-loop.yaml"        # repo-local, relative to the repo root
+# or
+extends: "../other-repo/.../recipe.yaml" # cross-repo, an explicit path
+
+# ordinary override keys sit alongside `extends:`, same file:
+name: concrete-lane
+repo: owner/name
+```
+
+Resolution happens once, before any other registrar processing: `extends:`
+is replaced by its referenced recipe document, every string leaf of that
+document is filled from the declaration's own scalar override values
+(`{param}`-style placeholders -- see below), then the declaration's own
+keys (everything except `extends`/`params`) are **deep-merged over** the
+filled template -- a nested mapping (`forge:`, `pool:`, `reservation:`,
+...) merges key-by-key; a list or scalar is replaced wholesale, never
+concatenated; the declaration's own value always wins on conflict -- and
+the result is an ordinary `kind:`-shaped declaration indistinguishable from
+one written out by hand. A declaration with no `extends:` key is
+completely unaffected.
+
+**Placeholder substitution.** A recipe template's string fields may contain
+`{param}` tokens, filled from the declaration's own scalar (`str`/`int`/
+`float`/`bool`) field values before the deep-merge step:
+
+```yaml
+# the recipe template:
+spec:
+  command: ["review", "{repo}", "--login", "{producer_login}"]
+
+# the concrete declaration:
+extends: "./recipes/review-loop.yaml"
+repo: owner/name          # an ordinary field: fills {repo} AND is merged into the output
+params:
+  producer_login: issue-bot  # substitution-only: fills {producer_login}, never merged in
+```
+
+An ordinary override field (like `repo` above) both fills a placeholder
+*and* becomes part of the resolved declaration, since it's a legitimate
+field in its own right. The reserved `params:` block is for a value the
+template needs purely for substitution but that isn't itself a valid
+top-level declaration field (e.g. a provider login interpolated into a
+nested command string) -- it's used to fill placeholders and then
+discarded, never merged into the output. If the same key appears in both
+an ordinary field and `params:`, the `params:` value wins for substitution
+(only for substitution -- the ordinary field still ends up in the resolved
+declaration as always). An unresolved placeholder (no matching override or
+`params` entry) is left completely intact, and only a bare `{identifier}`
+token is ever recognized -- a template's prose may freely contain literal
+unrelated braces (e.g. documenting an expected JSON shape like
+`{"decision": "emit"}`) without being mistaken for a placeholder or
+breaking substitution.
+
+A repo-local or cross-repo ref is a plain file path (relative paths resolve
+against the repo root when known, otherwise the declaration file's own
+directory), read with the same suffix contract (`.yaml`/`.yml`/`.json`)
+every other declaration file uses; a `global:<name>` ref looks up a
+plugin-shipped recipe built into
+`agent_dispatch.registrar_recipes.GLOBAL_RECIPES`.
+
+**Shipped global recipes.** Eight named recipes ship today. Four are the base
+archetype recipes (`reviewer`, `conflict-resolution`, `goal-driven`,
+`repository-issue-loop`). `backlog-triager`, `issue-reproducer`, and
+`effort-builder` are thin named instantiations of the existing
+`repository-issue-loop` engine, while `effort-driver` is the repo-local
+active-effort recipe and expands to `kind: effort-driver-loop` rather than the
+forge-backed issue engine. Each recipe covers the fields real adopters already
+repeat verbatim (shared exclude-label conventions, the headless pool body type,
+the archetype's standing-conduct charter) while leaving everything genuinely
+repo-specific (target repo, forge producer login, task label, emitter discovery
+command, evaluator verdict-application policy) for the declaration itself to
+supply:
+
+| `global:` name | Resolves to | What it supplies by default |
+|---|---|---|
+| `repository-issue-loop` | `kind: repository-issue-loop` | The common `exclude_labels` set (`bootstrap`/`wontfix`/`invalid`/`duplicate`/`question`) and `pool.body.type: headless`. Genuinely thin -- what the loop is *for* varies completely per adopter, so no charter/identity default is supplied. |
+| `goal-driven` | `kind: repository-issue-loop` | The same defaults as above, plus `worker_identity: goal-driven` (a built-in identity: drive the assigned issue's stated goal to completion through one or more pull requests, suspend/resume on external waits, never supersede another contributor's open PR). The standing-loop counterpart of this package's ad-hoc `goal-driven` CLI recipe -- same standing-conduct clauses, reused rather than duplicated. |
+| `backlog-triager` | `kind: repository-issue-loop` | The same common loop defaults as `repository-issue-loop`, plus `worker_identity: backlog-triager`, `require_verification: true`, and `evaluator_ref: backlog-triager`. The built-in identity handles the shared backlog-triage shape (classify the issue, confirm it is a legitimate bug, assign priority, apply the repository's own triage markers, and ensure it is attached to tracked effort work before triage is considered complete). The *exact* triage label/body-marker schema and what counts as "assigned to an effort" stay repository-specific and are enforced by a consumer-supplied trusted evaluator registration under that `evaluator_ref`; this package deliberately does not hardcode one repo's label taxonomy into every adopter. |
+| `issue-reproducer` | `kind: repository-issue-loop` | The same common loop defaults as `repository-issue-loop`, plus `worker_identity: issue-reproducer`, `require_verification: true`, and `evaluator_ref: issue-reproducer`. The built-in identity handles the shared reproduction-only shape (attempt reproduction with relevant repo/stack strategies, attach durable evidence, and leave either a reproducible marker or a not-reproducible outcome plus strike marker). The *exact* evidence/comment schema, reproducible/not-reproducible tags, and strike-marker convention stay repository-specific and are enforced by a consumer-supplied trusted evaluator registration under that `evaluator_ref`; this package deliberately does not hardcode one repo's issue-process vocabulary into every adopter. |
+| `effort-builder` | `kind: repository-issue-loop` | The same common loop defaults as `repository-issue-loop`, plus `worker_identity: effort-builder`, `require_verification: true`, and `evaluator_ref: effort-builder`. The built-in identity handles the shared planning-only shape: take a bounded set of already-triaged related issues (for example a filtered query result or an explicit `issue_numbers` set), group them into one coherent tracked effort, create or join that effort, assign every selected issue to it, and stop once the effort's own tracking artifact has reached the repository's review gate. The *exact* effort-assignment marker and review-gate evidence stay repository-specific and are enforced by a consumer-supplied trusted evaluator registration under that `evaluator_ref`; this package deliberately does not hardcode one repo's effort schema into every adopter. |
+| `effort-driver` | `kind: effort-driver-loop` | `worker_identity: effort-driver`, `require_verification: true`, and `evaluator_ref: effort-driver`. Unlike the forge-backed `repository-issue-loop` family, discovery is repo-local: the emitter scans active effort READMEs under the consumer's own state root (`efforts/active/<slug>/README.md` shape) but requires an explicit `effort_slugs` selector so it drives only already-assigned efforts, never every draft in the tree by default. The built-in identity handles the shared execution-only shape: drive an already-assigned effort relentlessly through its remaining PRs and tightly-coupled bug fixes until it reaches archive state. The *exact* archive-state evidence, PR-proof shape, and constituent-issue-resolution contract stay repository-specific and are enforced by a consumer-supplied trusted evaluator registration under that `evaluator_ref`; this package deliberately does not hardcode one repo's effort archive schema into every adopter. |
+| `reviewer` | `kind: reviewer-loop` | `pool.body.type: headless` plus a default `pool.body.charter`: a generalized (no `{repo}`/`{pr}` placeholders -- those vary per discovered PR and live in that PR's own task, not this static charter) standing-reviewer charter covering the `land=self`/`land=author` landing models, suspend/resume, never superseding another author's PR, and stagnation handling. |
+| `conflict-resolution` | `kind: reviewer-loop` | Same pool defaults as `reviewer`, with a charter specialized to taking a stuck, conflict-producer-opened PR the last mile: rebase, resolve, force-push back over the same PR head, never open a second PR. |
+
+A declaration can still override any of these defaults outright (an
+ordinary scalar/mapping override replaces the template's value, same
+deep-merge rule as everywhere else) -- e.g. `extends: "global:reviewer"`
+plus its own `pool.body.charter` to replace the shipped default charter
+entirely, or its own `worker_identity`/`exclude_labels` to replace
+`global:goal-driven`'s or `global:repository-issue-loop`'s defaults. For
+`global:backlog-triager`, the expected adoption shape is: use the shipped
+recipe/identity as the shared generic half, then register the repo's own
+trusted evaluator named `backlog-triager` to validate its concrete triage
+label/marker schema and effort-assignment convention. `global:issue-reproducer`
+follows the same split: the shipped recipe/identity owns the generic
+reproduction workflow, while a repo-scoped trusted evaluator named
+`issue-reproducer` validates the repo's concrete evidence/comment schema and
+its reproducible / not-reproducible / strike-marker convention.
+`global:effort-builder` follows the same pattern: the shipped recipe/identity
+owns the generic grouping-and-effort-creation workflow, while a repo-scoped
+trusted evaluator named `effort-builder` validates the repo's concrete
+effort-assignment convention and what "that effort reached the review gate"
+means there (for example an open or merged effort-creation PR).
+`global:effort-driver` mirrors that split for the execution half: the shipped
+recipe/identity owns repo-local active-effort discovery plus the generic
+drive-through-archive worker contract, while a repo-scoped trusted evaluator
+named `effort-driver` validates the repo's concrete archive-state evidence
+shape (for example which archive path, which merged-PR proof, and how the
+effort demonstrates its constituent issues are resolved or transferred).
+
+**Adoption boundary and provider matrix.** The shipped recipe library gives a
+consumer the shared loop shape and lifecycle contract; it does not erase the
+remaining provider boundaries:
+
+- Backlog-side provider neutrality is realized for GitHub and Azure DevOps.
+  Gitea remains a declared future adapter slot and is still validation-rejected
+  pending the real implementation (`ThomasMichon/copilot-extensions#4825`).
+- Reviewer-side provider neutrality is still partial. The `reviewer-loop`
+  engine and its `global:reviewer` / `global:conflict-resolution` recipes
+  exist, and the read-side observation adapter surface plus provider-aware
+  poll helper now cover GitHub and Azure DevOps; however, the forge-facing
+  webhook receiver plus the worker's direct verdict-posting / merge-or-close
+  action path are still GitHub-shaped, and no live Azure DevOps trigger/poll
+  producer is wired yet. Gitea remains the deferred future adapter slot.
+- For `global:backlog-triager`, `global:issue-reproducer`,
+  `global:effort-builder`, and `global:effort-driver`, the shared recipe stops
+  at the reusable lifecycle contract. The consuming repo still supplies its own
+  trusted evaluator registration for the repo-specific schema (labels, markers,
+  archive evidence, effort-linking rules, and similar local policy).
+
+There is no path-traversal hardening on a file-path ref today; a
+declaration author is already a trusted party for the repo's own registrar
+declarations.
+
+**Worked migration example.** A hand-written `repository-issue-loop`
+declaration:
+
+```yaml
+name: my-backlog
+kind: repository-issue-loop
+exclude_labels: [bootstrap, wontfix, invalid, duplicate, question]
+repo: owner/name
+source: my-backlog
+cadence_seconds: 28800
+task_label: my-backlog-work
+forge: {provider: github, producer_login: my-bot}
+reservation: {label: agent-reserved}
+pool:
+  max_active_processes: 1
+  body: {type: headless, agent: my-worker}
+```
+
+becomes, with `extends:`, the same five genuinely repo-specific fields and
+nothing else:
+
+```yaml
+name: my-backlog
+extends: "global:repository-issue-loop"
+repo: owner/name
+source: my-backlog
+task_label: my-backlog-work
+cadence_seconds: 28800
+forge: {provider: github, producer_login: my-bot}
+reservation: {label: agent-reserved}
+pool: {max_active_processes: 1, body: {agent: my-worker}}
+```
+
+(`exclude_labels` and `pool.body.type` are dropped entirely -- the recipe
+already supplies them; every field that *is* still spelled out is
+genuinely repo-specific, matching exactly what the sub-plan calls the
+"fields a real declaration commonly varies".)
+
+A hand-written `reviewer-loop` declaration with repo-local emitter wiring and
+an inline copy of the stock standing-reviewer charter collapses the same way:
+
+```yaml
+name: external-review
+kind: reviewer-loop
+repo: github.com/example/project
+task_label: external-review
+stale_after_days: 7
+emitter:
+  command: ["python", "tools/reviews.py", "discover"]
+  interval_seconds: 60
+  cwd: "../.."
+  task_output: json
+  side_load:
+    command: ["python", "tools/reviews.py", "side-load", "{change_ref}"]
+evaluator: {evaluator_spec: {rules: []}, interval: 30}
+pool:
+  max_active_processes: 2
+  body:
+    type: headless
+    agent: reviewer
+    charter: |
+      You are a standing reviewer for this pool's target repository...
+```
+
+becomes:
+
+```yaml
+name: external-review
+extends: "global:reviewer"
+repo: github.com/example/project
+task_label: external-review
+stale_after_days: 7
+emitter:
+  command: ["python", "tools/reviews.py", "discover"]
+  interval_seconds: 60
+  cwd: "../.."
+  task_output: json
+  side_load:
+    command: ["python", "tools/reviews.py", "side-load", "{change_ref}"]
+evaluator: {evaluator_spec: {rules: []}, interval: 30}
+pool:
+  max_active_processes: 2
+  body: {agent: reviewer}
+```
+
+The repo still owns the genuinely local parts (its discovery command,
+evaluator registration, worker agent name, and any lane-specific
+concurrency/filtering), but the shared standing-reviewer charter and headless
+body type are no longer a repo-local copy.
 
 ### Reactive webhook producer (`agent-dispatch webhook`)
 
-A small HTTP app that maps two generic, forge-neutral event shapes onto tasks:
+A small HTTP app that maps three generic, forge-neutral event shapes onto tasks:
 
 - `POST /webhook/pr` -- a git-forge PR event; when **merged**, creates a
   follow-up task (`source=pr-webhook`, `origin_ref=pr/<n>`) in the lane derived
@@ -581,10 +1123,40 @@ A small HTTP app that maps two generic, forge-neutral event shapes onto tasks:
 - `POST /webhook/telemetry` -- a monitoring alert; a **firing** alert creates a
   remediation task (`source=telemetry`). Accepts an Alertmanager-style
   `{"alerts": [...]}` batch or a single flat alert object.
+- `POST /webhook/issue` -- a git-forge issue event (GitHub's `issues` webhook
+  shape, which Gitea mirrors closely enough to reuse). Driven by a list of
+  independent **rules** (`config["issues"]`) rather than one fixed template, so
+  several label-watching backlogs can share one listener. Each rule matches on
+  issue `action` (default `opened`/`labeled`/`label_updated` -- the latter is
+  Gitea's own label-change action name, fired for both additions and
+  removals; a pure removal, with no `changes.added_labels`, is treated as a
+  no-op and never enqueues) and a set of required forge labels, optionally
+  restricts to a repo allowlist, and creates a task
+  (`source=issue-webhook`, `origin_ref=issue/<n>`) with a deterministic
+  `dedup_key` of `<task_label>:<repo full name>#<issue number>` -- this is the
+  reactive half of a "webhook-primary, polling-fallback" pair: a deployer-owned
+  periodic poller using the same dedup-key shape is an idempotent backstop for
+  a missed or undelivered webhook **while the first task is still
+  non-terminal** (the dedup key releases once its task completes/is abandoned,
+  so a very late redelivery or poll after that point mints a fresh task rather
+  than being recognized as a repeat).
 
-Every task carries a deterministic `dedup_key`, so a redelivered webhook doesn't
-double-enqueue. Behavior (templates, base-branch/severity allowlists, an optional
-inbound bearer token, the coordinator URL) is set in an optional JSON config:
+Every task carries a deterministic `dedup_key`, so a redelivered webhook
+doesn't double-enqueue **as long as the original task is still in flight** --
+see the caveat above for what happens after it reaches a terminal status.
+Behavior (templates, base-branch/severity/label allowlists, the coordinator
+URL) is set in an optional JSON config. Two authentication mechanisms are
+supported, and `github_secret` takes precedence when both are configured:
+`github_secret` verifies GitHub's own `X-Hub-Signature-256` HMAC header (the
+mechanism a real GitHub webhook delivery actually uses -- GitHub never sends
+a bearer header); `inbound_token` is a simple shared-secret bearer check for
+any other caller (a Gitea delivery, a manual/scripted trigger). Both also
+accept an env-var fallback (`AGENT_DISPATCH_WEBHOOK_GITHUB_SECRET` /
+`AGENT_DISPATCH_WEBHOOK_INBOUND_TOKEN`) when the config key is omitted --
+for a declarative registrar deployment (`kind: emitter`, no `command` key),
+the config dict *is* the committed registrar spec, materialized verbatim to
+a file; it must never carry a literal secret, so a deployer sets the real
+value via a local, non-committed env file instead.
 
 ```bash
 agent-dispatch webhook --config webhook.json --host 127.0.0.1 --port 9331
@@ -592,29 +1164,41 @@ agent-dispatch webhook --config webhook.json --host 127.0.0.1 --port 9331
 
 ### Evaluator -- a producer's lifecycle handler (`agent-dispatch evaluate`)
 
-A producer puts work on the queue; an **evaluator** decides what happens *next* as
-that work progresses -- the *judgment* half of emitters-and-evaluators. It is
-hook-like: it receives one task **lifecycle event** (the coordinator shape
-`{"type": "task.completed", "task": {...}}`) and returns decisions -- emit a
-follow-up task, or nothing. A declarative spec of rules matches on the event and
-mints follow-ups from templates, so a standing domain automates a whole cycle
-(reviewer done -> open a conflict-resolution follow-up; a goal met -> the next
-goal) without a bespoke module.
+A producer puts work on the queue; a **whole-goal evaluator** decides whether a
+verification-gated submitted task is actually done. It is event-triggered, not a
+polling audit loop: the coordinator invokes it when a task first reaches
+`task.submitted`, when an operator explicitly backfills a named submitted task
+(`agent-dispatch verify-submitted --evaluator-ref <name> <task-id>...` for a
+legacy row that is not yet opted in, or the same command without
+`--evaluator-ref` for an already-flagged row), and when a subscribed emitter's
+event note re-triggers a still-submitted task after external state changes.
+
+Two evaluator kinds are supported:
+
+- **Declarative `SpecEvaluator`** — a `rules` list matching on the event/task
+  fields and returning `confirm` / `abandon` / `noop`.
+- **Trusted script evaluator** — a separately registered opaque selector mapped
+  to a fixed `argv`, run with `shell=False` and no caller-supplied arguments;
+  the task's `evaluator_ref` names that selector, never a literal command.
+
+For the verification gate itself, evaluators may decide only **complete**,
+**abandon**, or **noop**. They do not rewrite the task goal, perform a generic
+progress audit, or run as an interval sweep.
 
 ```bash
 # apply an evaluator to an event read from stdin (a hook/producer pipes it in):
-echo '{"type":"task.completed","task":{"id":"t1","labels":["recipe:reviewer"],"status":"completed","origin_ref":"o/n#42"}}' \
+echo '{"type":"task.submitted","task":{"id":"t1","labels":["recipe:reviewer"],"status":"submitted","origin_ref":"o/n#42"}}' \
   | agent-dispatch evaluate --spec evaluator.json --repo o/n
 agent-dispatch evaluate --spec evaluator.json --event-file event.json --dry-run
+agent-dispatch verify-submitted t1 t2
 ```
 
-Spec shape (JSON): a `rules` list, each with `on` (event type, or a list), an
-optional `when` predicate (`labels_any` / `labels_all` / `status` / `source`), and
-an `emit` block that templates the follow-up (`title_template`, `prompt_template`,
-`labels`, `requires`, `dedup_template`, ...). The first matching rule wins; a
-follow-up defaults `source=evaluator`. The **degenerate case is the ad-hoc kick**:
-a one-off task with no evaluator still runs -- an evaluator is opt-in judgment,
-never required. See
+Spec shape (JSON): either a `rules` list, each with `on` (event type, or a
+list), an optional `when` predicate (`labels_any` / `labels_all` / `status` /
+`source`), and `confirm` / `abandon` / `noop` behavior; or a trusted `scripts`
+registry mapping opaque evaluator refs to fixed argv lists. The **degenerate
+case is the ad-hoc kick**: a one-off task with no evaluator still runs -- an
+evaluator is opt-in judgment, never required. See
 [`visions/plugins/agent-dispatch`](../../visions/plugins/agent-dispatch/README.md)
 (§Concepts/*The evaluator*, §Features/*emitters-and-evaluators*).
 
@@ -689,9 +1273,12 @@ agent-dispatch emitter side-load <registration-id> owner/name#42
 With `task_output=json`, discovery and side-load commands emit one task object
 or a list of task objects on stdout. Each object contains `title` plus ordinary
 create fields (`repo`, `prompt`, `labels`, `dedup_key`, and so on).
-agent-dispatch authors the tasks and forcibly stamps `source=emitter`,
+agent-dispatch authors the tasks and forcibly stamps `source=emitter` by
+default,
 `origin_ref=<emitter id>`, and the declaration's `evaluator_ref`; command output
-cannot spoof that provenance. The same operation is exposed as
+cannot spoof that provenance. A command emitter may declare a non-empty
+`source` to use a dedicated producer identity; existing declarations that omit
+it retain `source=emitter`. The same operation is exposed as
 `dispatch_emitter_side_load` by local and coordinator-hosted MCP.
 
 An evaluator registration may declare the same `evaluator_ref`. Its service
@@ -705,6 +1292,37 @@ content is untrusted data: side-load/discovery commands must not execute target
 branch code by default, and any sandboxed test or `land=self` permission is an
 explicit repository policy. An identity that cannot approve or land records a
 visible blocked/terminal outcome instead of retrying indefinitely.
+
+### Emitter command receipts (`agent-dispatch emitter receipts`)
+
+A `task_output=json` command-emitter authors tasks on every tick, but the
+resulting ids are otherwise visible for exactly that tick and then gone. A
+durable **receipts** log records each created task's id keyed by the same
+`dedup_key` the command emitted, readable on a **later** invocation -- so a
+domain producer (one with its own backing state: a carved reservation, a
+tracked work item) can learn which dispatch task its own emitted description
+became, and close its own transaction (link the id, stop re-offering the
+same work) without inventing a per-domain polling reconciliation.
+
+```bash
+agent-dispatch emitter receipts <emitter-id> [--since <cursor>]
+```
+
+Returns `{"receipts": [...], "cursor": N}` -- each receipt is
+`{"seq", "ts", "tick_id", "dedup_key", "task_id", "status"}`. Pass the
+returned `cursor` back as `--since` on the next call to read only new
+receipts; `since` defaults to 0 (everything recorded so far). The log is
+bounded (oldest records trimmed once it exceeds a cap) and `seq` is stable
+across a trim -- it is never reused or shifted, so a cursor from before a
+trim still reads correctly after one.
+
+The declared command's own subprocess also receives the receipts path
+directly via the `AGENT_DISPATCH_EMITTER_RECEIPTS_PATH` environment
+variable, so it can read its own prior tick's receipts with no CLI round
+trip. Both the `tick`/`serve` path and the on-demand `side-load` path write
+to the identical sink, keyed by the emitter's declared `id` (not by its spec
+file path -- a side-loaded emitter's spec lives only in a coordinator
+registration, with no local file to sit beside).
 
 ### Driving a recipe loop (`agent-dispatch recipes drive`)
 
@@ -772,7 +1390,11 @@ expectation, not a silent one. See
 A worker that can only wait on a slow external condition (a review, a build, a PR
 becoming mergeable) shouldn't sit on a live session and its token budget. It hands
 the wait to the layer: `run` executes the blocking command and, when it resolves,
-resumes the worktree-affinitied worker via an agent-bridge nudge.
+resumes the worktree-affinitied worker via an agent-bridge nudge. A wait command
+exiting `124` (timed out, nothing changed) re-arms in place rather than waking the
+worker -- but only up to a bounded number of times (`MAX_TIMEOUT_REATTEMPTS`,
+default 3); past that, `run` gives up and resumes anyway with a `gave_up` report
+and an explicit "never resolved" message, rather than hibernating indefinitely.
 
 ```bash
 # foreground: run the wait, then nudge the worker to resume:
@@ -780,7 +1402,7 @@ agent-dispatch run --resume <machine/worktree> --task <id> -- agent-worktrees pr
 
 # detached: the wait runs in a process that outlives this one, so the worker can
 # be torn down (costing nothing) while it waits -- true hibernation:
-agent-dispatch run --detach --resume <machine/worktree> -- agent-worktrees pr-watch 42
+agent-dispatch run --detach --resume <machine/worktree> --task <id> -- agent-worktrees pr-watch 42
 ```
 
 Everything after `--` is the blocking wait command (its own flags are never parsed
@@ -788,9 +1410,145 @@ as `run` options). With `--detach` the wait is re-exec'd as a fully detached,
 cheap OS-level waiter (no agent, no tokens); the expensive worker session is spun
 down and re-woken with its context intact when the wait returns. The resume is a
 best-effort bridge nudge -- a genuinely-gone worker is handled by liveness
-recovery, not the nudge. See
+recovery, not the nudge.
+
+Always pass `--task` with `--detach`: the coordinator transactionally prepares a
+new detached-waiter generation (suspending the task in the same durable step),
+the child process must then **arm** that generation with its PID/host/start-token
+identity fence before it owns the wait, and any pre-arm failure aborts or
+recovers that prepared generation instead of leaving an unrecoverable suspended
+task behind. A `task`-kind agent-worktrees claim is journaled on the current
+worktree as part of the detach flow, blocking finalize/managed-GC from
+reclaiming it out from under the still-open task; durable wake delivery retires
+that claim only while the same waiter generation still owns completion. These
+guardrails are best-effort and non-fatal -- they backstop hibernation rather
+than blocking the detach itself. See
 [`visions/plugins/agent-dispatch`](../../visions/plugins/agent-dispatch/README.md)
 (§Features/*hibernate-the-wait*).
+
+### Diagnosing a stuck hibernation (`agent-dispatch doctor`)
+
+A hibernating task's session is *supposed* to be gone -- that's the whole
+point -- so ordinary liveness classification can't tell "still legitimately
+waiting" from "the detached waiter died, or its worktree was reclaimed out
+from under it, and this will never self-resume". `doctor` checks the one
+signal strong enough to know for certain: whether the task's worktree is
+still a live, resumable checkout.
+
+```bash
+# report-only: never mutates anything
+agent-dispatch doctor --repo <lane>
+
+# diagnose exactly one task (any status), instead of sweeping --repo/--label
+agent-dispatch doctor --task <task-id>
+
+# also walk that task's full spawn-reservation history and probe every
+# attempt's actual embody-session liveness by session id (opt-in: one
+# extra bridge probe per recorded attempt) -- catches an earlier attempt
+# that's still alive but shadowed by a later dead/unknown one
+agent-dispatch doctor --task <task-id> --check-live-sessions
+
+# unbind + re-queue every task whose worktree is confirmed gone
+# (fails its stale reservation, then releases/yields the task back to queued)
+agent-dispatch doctor --repo <lane> --repair
+```
+
+Each examined `claimed`/`started`/`suspended` task gets one of these
+verdicts: `orphaned_worktree_gone` (its worktree is
+`finalized`/`orphaned`/untracked -- the only verdict `--repair` acts on),
+`stale_lease` (a `started` task's lease long expired with no reported
+activity, but the worktree itself couldn't be confirmed gone -- advisory
+only, never auto-repaired), `unknown` (no reservation/worktree on record to
+check), or `healthy`. `--repair` never re-creates a worker and never guesses
+from an indeterminate agent-worktrees lookup -- see [ThomasMichon/copilot-extensions#2577](https://github.com/ThomasMichon/copilot-extensions/issues/2577)
+for the full design rationale. Distinct from `agent-dispatch reviewer-loop
+doctor` (a single declared reviewer-loop's health across its emitter/
+evaluator/supervised-lane units, never mutating) -- this `doctor` is
+task-scoped and repo-wide, with an explicit opt-in mutation.
+
+`--check-live-sessions` adds two more possible verdicts, reported instead of
+(never alongside) the ones above: `earlier_attempt_live` -- an earlier
+spawn attempt's embody session is confirmed live but shadowed by a later
+dead/unknown one (the task's own `owner`/latest reservation always reflects
+only the *latest* attempt, which can hide this); the diagnosis names the
+live `live_attempt`, `live_session_id`, and (for a fleet body) `live_host` so
+an operator can `agent-bridge resume` it -- and
+`reservation_history_truncated` -- the task's reservation history page came
+back at the request limit, so the check was skipped rather than risk
+analyzing an incomplete page. Neither verdict is ever auto-repaired -- see
+[ThomasMichon/copilot-extensions#2884](https://github.com/ThomasMichon/copilot-extensions/issues/2884).
+
+### Recovering a shadowed live session (`agent-dispatch reattach`)
+
+`doctor --check-live-sessions` can *find* an `earlier_attempt_live` session
+-- a still-alive, fully resumable embody session that a task's tracked
+reservation no longer points at -- but finding it isn't recovering it.
+`reattach` is that missing act-on-it step: it re-mints the source task's
+work under a fresh task id, claimed by the live session, so it can pick the
+work straight back up.
+
+```bash
+# task-id must be TERMINAL (abandoned/completed) and carry a
+# dedup_key -- see below for why. session-id must be confirmed live right now.
+agent-dispatch reattach <task-id> <session-id>
+
+# the session lives on a fleet pool host, not locally
+agent-dispatch reattach <task-id> <session-id> --host <pool-host>
+
+# claim/start/bind only -- skip delivering the agent-bridge resume prompt
+# (deliver it by hand instead, e.g. after inspecting the new task first)
+agent-dispatch reattach <task-id> <session-id> --no-resume
+```
+
+A task's `dedup_key` only releases from the create-dedup index once the task
+reaches a **terminal** status -- so `reattach` only works against a task
+that's already terminal, typically one just `abandon`ed for exactly this
+reason. It refuses (non-zero exit, no mutation) unless `session-id` is
+itself confirmed live, the source task is terminal, it carries a
+`dedup_key`, and it is **not** producer-managed (a `producer_fence` can't be
+safely replayed -- recover it through its owning producer instead). If the
+source task carries an `exclusive_key`, its own (never auto-released)
+reservation is retired first, since `reserve_spawn` fences that key across
+every task sharing it. On success it re-mints a fresh task under that
+`dedup_key`, pinned to an unclaimable synthetic `target_worktree` (the
+recovery handle itself -- no ordinary worker advertises it, closing the race
+window between creating the row and this command's own claim), carrying
+forward the source task's full metadata (payload, capability requires/
+excludes/affinity, `exclusive_key`, source/origin/evaluator refs) plus its
+progress log and any answered steer folded into the new task's own prompt
+(neither transfers automatically -- they're keyed to the *old* task id);
+reserves and records a real spawn reservation (so the new task is genuinely
+liveness-tracked, not just owned by a bare string) whose `session_handle` is
+the `local-body:<session>` / `fleet-body:<host>:<session>` recovery-handle
+identity (a `--host` alias is normalized before it's baked into that handle
+or used to deliver the resume prompt); claims, starts, and binds the exact
+session id for liveness tracking; and delivers a resume prompt via
+agent-bridge so the live session picks the new task straight back up --
+explicitly told to pass that recovery-handle worker id on every owner-gated
+command going forward, since it won't resolve from the resumed session's own
+CWD identity.
+
+**Known limitation:** `abandon --override-live` (see below) leaves the
+source task's own reservation active; supervisor reconciliation may treat a
+terminal task's still-active reservation as cleanup and end its body before
+an operator reattaches. `reattach` orders its liveness check as late as
+reasonably possible (right before the mutating create/reserve/claim
+sequence) to minimize -- no server-side atomic fence eliminates it entirely
+-- that window; reattach promptly after an override-live abandon.
+
+### Guarding against discarding a live session (`abandon --override-live`)
+
+`abandon` now refuses (non-zero exit) when the task's *current* reservation
+session is confirmed live -- abandoning it would discard the only tracking
+link to a still-good session, with no path back (`abandoned` is terminal).
+Pass `--override-live` to abandon it anyway once you've confirmed that's
+really what you want (e.g. you've already captured the session id
+separately and plan to `reattach` once the abandon completes). An unknown or
+confirmed-gone session never blocks -- only a *confirmed*-live one does.
+
+```bash
+agent-dispatch abandon <task-id> --permit --override-live
+```
 
 ## Steer a blocked worker (`agent-dispatch card` / `steer`)
 
@@ -899,7 +1657,7 @@ the MCP SDK may normalize a JSON-encoded object string before tool invocation.
 the potentially large value and expose `has_result`; retrieve it with
 `result <id>`, `GET /tasks/<id>/result`, or MCP `dispatch_result`. SSE events
 also expose only `has_result`, never the result body. Initial completion emits
-`task.completed`; a later retry that fills a previously missing result emits
+`task.submitted`; a later retry that fills a previously missing result emits
 `task.result_recorded`. Repeating the identical recorded result is a no-op and
 emits neither event again.
 
@@ -969,6 +1727,18 @@ taken from the coordinator before anything is launched: a dedup collision
 worker **exactly once**; the rest skip. See
 [`docs/spawn-supervisor.md`](docs/spawn-supervisor.md) for the reservation model.
 
+An optional **routing assignment** may be attached to a reservation before
+launch. Agent-dispatch is the single writer for this append-only provenance:
+purpose, literal selected model, demonstrated/candidate state, selection reason,
+execution surface, trial/decision references, session linkage, lifecycle
+events, terminal disposition, and optional unique opaque provider-event
+references. The record contains no prompt, source body, credential, or monetary
+value; external accounting systems may join provider events without
+double-counting them.
+
+Routing provenance is not candidate admission by itself. Existing spawn callers
+remain unchanged, and no routing record is required for legacy tasks.
+
 ### Supervising a lane (`agent-dispatch supervise`)
 
 The supervisor turns **queued** tasks into host embody autopilots — **exactly
@@ -982,8 +1752,9 @@ agent-dispatch supervise --once                       # one cycle (this repo's l
 agent-dispatch supervise --label autopilot            # loop; only spawn opted-in tasks
 agent-dispatch supervise --all-repos --max-active-processes 3
 agent-dispatch supervise --label sweep --headless-label sweep   # embody 'sweep' headless-ACP
+agent-dispatch supervise --label maintenance --script-label maintenance
 agent-dispatch supervise --pool host-a,host-b --origin origin --headless --label sweep
-agent-dispatch supervise --no-reactive --interval 30            # fixed polling only
+agent-dispatch supervise --interval 30                          # fixed reconciliation
 agent-dispatch supervise --evaluator eval.json --evaluator-ref repository-review-lifecycle
 agent-dispatch reservations list --state spawned      # what's in flight
 agent-dispatch reservations fail <key>                # release a confirmed-dead spawn
@@ -1007,9 +1778,11 @@ re-embodiment, and can **nudge stalled-but-live workers** before recovery. An
 `unknown` liveness probe is always left alone. Repeated spawn failures are
 treated as a supervisor dead-letter condition (failed reservation history; no
 more auto-retry until a human intervenes), not as a second task state change.
-The serve loop is reactive by default: within the poll interval it wakes early
-when an embodied worker's turn goes `running -> idle`; `--no-reactive` restores
-plain fixed-interval polling.
+The serve loop uses fixed-interval reconciliation. The former two-second
+turn-state sampler was retired because remote owners turned each sample into a
+new SSH command. Prompt turn-end wakeups will return only through a cursor-based
+Agent Bridge event subscription over a shared persistent carrier; until then,
+`--no-reactive` and `--reactive-interval` are accepted as compatibility no-ops.
 
 The bare `supervise` above runs the loop in the foreground. The
 `supervise register|status|list|remove` subcommands instead manage durable
@@ -1032,32 +1805,76 @@ Exactly **one** daemon per machine-and-environment runs every registration, each
 in its own subprocess, reconciling on change (start / restart-on-spec-change /
 wind-down-on-remove / crash-revive) and single-instance-guarded by a crash-safe OS
 lock (a second daemon stands down; a crashed one's lock is auto-released so a
-restart reclaims it). All four kinds are daemon-run: **supervised-lane** and
-**evaluator** drive the embody loop (the latter subsuming `supervise
---evaluator`), **schedule** runs the timer producer, while **emitter** runs either a periodic
-lease-gated command or the webhook producer. Re-registering the
-same unit is idempotent (the derived handle identifies it). See
+restart reclaims it). The daemon directly runs the standing **supervised-lane**,
+**schedule**, and **emitter** kinds; **registered evaluator rows are
+coordinator-owned** and run only on the concrete verification triggers described
+below, while the bare `supervise --evaluator` surface remains a one-off local
+manual pass. Re-registering the same unit is idempotent (the derived handle
+identifies it). See
 [`docs/spawn-supervisor.md`](docs/spawn-supervisor.md#the-singleton-daemon-built--one-master-per-unit-subprocesses)
 for the registration + daemon model.
 
+An attributed active plugin may also contribute a strict
+`kind: plugin-companion` declaration. Its command, stop command, health probe,
+and optional configuration provider are plugin-relative argv; plugin root,
+version, declaration path, and activation scopes remain attached to the desired
+registration. This kind cannot be registered through the CLI/coordinator API or
+trusted registrar pointers. The singleton daemon resolves the provider on every
+reconcile, retains the last confirmed result only while declaration authority is
+unchanged, and launches an active companion inside an OS-owned process tree.
+Commands cannot escape the attributed plugin root or traverse symlink/reparse
+components, and inherited `AGENT_DISPATCH_*` authority is stripped. A process
+receipt fences recovery by PID plus process-start identity; confirmed unhealthy
+probes restart the unit, while an unavailable or invalid probe is
+indeterminate and leaves a live unit alone. On Windows, kill-on-close Jobs
+retire companion trees with the daemon. On POSIX, process groups and receipts
+allow a restarted daemon to recover a matching live companion without
+duplicating it.
 
-**Evaluator pass — advance the loop (`--evaluator <spec>`).** With an evaluator
-spec, each cycle feeds every **newly-terminal** task's lifecycle event
-(`task.completed` / `task.abandoned`) to the evaluator (§ Evaluator) and applies
-its decisions — emitting a follow-up task. This is the **service-driven** half of
-*a-loop-runs-with-or-without-a-service*: a standing supervisor advances a domain's
-loop (reviewer done → conflict-resolution follow-up; goal met → the next goal)
-with no bespoke module. It's idempotent — each task fires once per process and the
-emitted follow-up's `dedup_key` guards duplicates across restarts — and best-effort
-(a bad evaluator or failed create is logged, never crashing the cycle). Add
-`--evaluator-ref <id>` (or the same field in an evaluator registration) to
-consume only tasks explicitly associated by their producing emitter.
+A companion may also declare versioned Python runtime inputs. The singleton
+daemon prepares those inputs asynchronously under a supervisor-owned root:
+plugin projects are copied into immutable snapshots, installed from disposable
+working copies with a supervisor-selected toolchain, import-validated, and
+atomically published as content-addressed cells. Root-wide process locks,
+complete receipts, full-cell integrity checks, Windows base-Python signature
+verification, and POSIX base-runtime identity prevent partial or ambiguous
+reuse. Preparation does not inject the interpreter into launch state or restart
+a healthy companion; selection and cutover are separate lifecycle increments.
 
-Tasks embody as a mux-wrapped **CLI autopilot** by default. Mark **self-contained
-sweep** labels with `--headless-label L` (repeatable, `--headless-agent` to name the
-agent-bridge agent) to embody *those* labels as a **headless agent-bridge ACP** body
-instead — no human attach, no CLI-start-prompt race — while other labels stay
-CLI-first. See the design doc's "Per-label embody body" section.
+
+**Evaluator pass — local/manual evaluation (`--evaluator <spec>`).** The bare
+`supervise --evaluator <spec>` surface still exists for a one-off local
+supervisor pass over lifecycle events, but **registered evaluator rows are
+coordinator-owned**, not daemon-launched: the coordinator invokes them only on the
+settled verification triggers (`task.submitted`, explicit `verify-submitted`
+backfill, or an event-note re-trigger on an already-submitted task). That keeps
+verification out of a polling loop and scoped to concrete external events.
+
+Tasks embody as **headless ACP** by default, but the lane can mix bodies by
+label: keep **self-contained sweep** labels headless, opt interactive labels to
+the mux-wrapped **CLI autopilot** with `--cli-label L`, or opt deterministic
+maintenance labels to a **plain script subprocess** with `--script-label L`.
+Local headless bodies run in the exact reservation worktree pre-created and
+attributed before launch, so failed, yielded, and terminal attempts can be
+conservatively reclaimed without guessing ownership. Script bodies use no LLM at
+all: they are ordinary subprocesses that drive claim/start/progress/complete/
+abandon through the same lifecycle protocol. See the design doc's
+"Per-label embody body" section.
+
+Script-embodied tasks carry a JSON `payload_inline` that describes what to
+launch:
+
+- `{"path":"C:\\absolute\\worker.py","args":["..."],"env":{"K":"V"}}`
+  runs the file with agent-dispatch's own runtime Python.
+- `{"argv":["some-exe","arg1","arg2"],"cwd":"C:\\absolute\\dir","env":{"K":"V"}}`
+  runs the exact argv directly.
+
+`agent_dispatch.script_worker.ScriptTaskRuntime` is the small helper contract
+for those bodies: it reads the supervisor-injected task/coordinator context from
+environment variables and wraps claim/start/heartbeat/progress/complete/
+abandon. Returning without an explicit terminal call is treated as a protocol
+violation: an orderly exit auto-abandons in the helper, and a confirmed-gone
+process is abandoned by supervisor recovery.
 
 For a remote host pool, `--pool host-a,host-b [--origin <alias>]` dispatches the
 body to the first live pool host. The default body is still CLI/mux embody on
@@ -1127,8 +1944,10 @@ agent.
 Configuration (all optional): `AGENT_DISPATCH_HOST`, `AGENT_DISPATCH_PORT`
 (server bind pin; omitted means OS-assigned port), `AGENT_DISPATCH_DB`,
 `AGENT_DISPATCH_TOKEN` (ordinary bearer auth),
-`AGENT_DISPATCH_CONTROL_TOKEN` (superset queue credential with
-managed-producer transition authority),
+`AGENT_DISPATCH_CONTROL_TOKEN` / `AGENT_DISPATCH_CONTROL_TOKEN_COMMAND`
+(superset queue credential with managed-producer transition authority;
+required-but-unset also gates evaluator registrations, not just scope
+transitions -- see Evaluator below),
 `AGENT_DISPATCH_PRODUCER_CAPABILITY_COMMAND` (preferred on-demand capability
 fetch) / `AGENT_DISPATCH_PRODUCER_CAPABILITY` (raw fallback; applied only with
 the rest of the fence tuple),
@@ -1137,8 +1956,64 @@ in seconds; `0` disables), `AGENT_DISPATCH_RUN_DIR` /
 `AGENT_DISPATCH_ENDPOINT` (local endpoint discovery), `AGENT_DISPATCH_URL`
 (client override), `AGENT_DISPATCH_SHARED_URL` /
 `AGENT_DISPATCH_SHARED_TOKEN` / `AGENT_DISPATCH_SHARED_CONTROL_TOKEN` (opt-in
-shared coordinator), and `AGENT_DISPATCH_NO_AUTOSTART` (disable lazy local
-coordinator start).
+shared coordinator), `AGENT_DISPATCH_NO_AUTOSTART` (disable lazy local
+coordinator start), and `AGENT_DISPATCH_ENFORCE_REGISTERED_REPOS` (opt-in,
+default off: refuse task creation against a repo lane with no registered
+`repo`-kind registrar pointer alias -- a repo with no pointer has no
+coordinator/supervisor of its own watching it, so a task queued against it
+can sit unclaimed indefinitely. Register one with `agent-dispatch registrar
+add-pointer <name> <repo-root> --kind repo [--alias <canonical-lane> ...]`
+before enabling this on a coordinator that serves more than one lane.
+**Migration note:** a pointer registered *before* this flag existed has no
+alias at all (`aliases` defaults to empty for a legacy record), and
+re-registering it with no `--alias` **preserves that empty set** rather than
+auto-deriving one -- enabling enforcement without first adding an explicit
+`--alias` to every pre-existing pointer will reject their lanes' tasks).
+
+### Federation (`agent-dispatch federation run|status`)
+
+Opt-in cross-machine awareness/claim-plane participation (see the
+`agent-dispatch-federation` effort): `AGENT_DISPATCH_FEDERATION_ROLE`
+(`peer` / `coordinator` / `standby` / `satellite`; unset = federation
+disabled), `AGENT_DISPATCH_FEDERATION_INSTANCE` (directory id override;
+defaults to the resolved machine id), `AGENT_DISPATCH_FEDERATION_INTERVAL`
+(seconds between ticks; default 15), `AGENT_DISPATCH_FEDERATION_BACKEND`
+(`gateway` default / `devtunnels`), `AGENT_DISPATCH_FEDERATION_DEVTUNNEL_BIN`
+/ `AGENT_DISPATCH_FEDERATION_DEVTUNNEL_LABEL` (Dev Tunnels backend only).
+
+**`role=satellite`** additionally pushes this machine's own live worktree/
+embodiment status (never anything reached over SSH), gated by
+`AGENT_DISPATCH_SATELLITE_GATE` -- accepted open values: `open`, `1`, `true`,
+`yes`, `on` (case-insensitive); anything else, including unset, is **closed**.
+The gate defaults **closed**: a configured `role=satellite` node never
+registers, heartbeats, or pushes status until an operator explicitly opens
+it, and it withdraws on the very next tick if the gate closes mid-session.
+
+While the gate is open, a satellite also **pulls its own affinitied work**
+(the `satellite-agent-exposure` effort's Phase 3 claim-loop --
+:mod:`agent_dispatch.satellite_work_intake`): it discovers its own `queued`
+tasks on the shared coordinator and locally embodies a bounded number of
+them via `agent-worktrees embody` (the spawned session performs the actual
+atomic claim itself, under its own worktree identity -- no new claim
+transport). Tunable via `AGENT_DISPATCH_SATELLITE_MAX_CONCURRENT`
+(concurrency cap, default `1`), `AGENT_DISPATCH_SATELLITE_PROJECT` (an
+explicit `--project` override; unset derives one per task from its own repo
+lane instead -- set this only when every task this satellite pulls belongs
+to the same project), `AGENT_DISPATCH_SATELLITE_SPAWN_TIMEOUT` (seconds
+bounding one spawn attempt so a hung `embody` launch can never block this
+node's own heartbeats indefinitely; default `30`), and
+`AGENT_DISPATCH_SATELLITE_DISCOVERY_TIMEOUT` (seconds bounding the whole
+queued-task discovery pagination for one tick, independent of any single
+request's own HTTP timeout; default `10`).
+
+`agent-dispatch federation status` prints the discovered coordinator + live
+peers, plus a `self` section (`role` / `instance` / `gate_state`) reporting
+THIS node's own state. A gate-closed satellite never registers at all, so it
+would otherwise be invisible even to its own operator running this command
+locally; `self.gate_state` (`open`/`closed`, satellite roles only) makes that
+distinguishable from "not yet started." Pass `--role`/`--instance` to report
+a role/instance other than the environment default
+(`AGENT_DISPATCH_FEDERATION_ROLE`/`AGENT_DISPATCH_FEDERATION_INSTANCE`).
 
 Bearer scheme matching is case-insensitive. Prefer environment or token-command
 configuration over token flags where process arguments may be observable.

@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from .config_sources import SSHConfig
-from .forward import _creation_flags, build_forward_ssh_args
+from .forward import build_forward_ssh_args
+from .locks import process_identity
+from .process import terminate_ssh_process_tree
+from .proxy import create_ssh_subprocess
 
 log = logging.getLogger("ssh-manager.relay")
 
@@ -59,11 +61,16 @@ class SupervisedRelayForward:
     ``host_port_resolver`` is supplied the host-side target is re-resolved live
     on each (re-)establish so it follows a relay that rebinds after a daemon
     restart, while the CodeSpace-listen ``relay_port`` stays stable (#855).
-    ``ExitOnForwardFailure`` is
-    deliberately omitted so a transient remote bind collision does not make ssh
-    exit. Because OpenSSH can then leave the process alive after a failed
-    remote ``-R`` bind, ``establish()`` watches stderr during the readiness
-    window and retries if that failure is observed.
+    ``ExitOnForwardFailure=yes`` is set: the channel carries only this ``-R``,
+    so a failed remote bind leaves nothing worth keeping. Without it OpenSSH
+    stays connected with no forward -- silently, since a CodeSpace's
+    ``LogLevel=quiet`` hides the warning and the bind reply often arrives after
+    the readiness window -- and the far side has no relay until something
+    kills the process. With it, ssh exits and the monitor re-establishes the
+    forward with backoff, including once a stale far-side listener (a previous
+    connection the CodeSpace hasn't reaped yet) lets go of the port.
+    ``establish()`` still watches stderr during the readiness window and
+    retries a bind failure it sees there.
     """
 
     def __init__(
@@ -77,6 +84,7 @@ class SupervisedRelayForward:
         ready_timeout: float = 40.0,
         serving_probe: Callable[[], Awaitable[bool]] | None = None,
         host_port_resolver: Callable[[], int] | None = None,
+        on_pid_change: Callable[[], None] | None = None,
     ) -> None:
         self._config = config
         self._relay_port = int(relay_port)
@@ -87,6 +95,7 @@ class SupervisedRelayForward:
         self._backoff_max = float(backoff_max)
         self._ready_timeout = float(ready_timeout)
         self._serving_probe = serving_probe
+        self._on_pid_change = on_pid_change
         self._proc: asyncio.subprocess.Process | None = None
         self._monitor_task: asyncio.Task[None] | None = None
 
@@ -94,6 +103,29 @@ class SupervisedRelayForward:
     def is_alive(self) -> bool:
         """Whether the supervised ``ssh -N -R`` process is currently running."""
         return self._proc is not None and self._proc.returncode is None
+
+    @property
+    def process_pid(self) -> int | None:
+        """The current ``ssh -N -R`` child pid, when one is live."""
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return None
+        pid = getattr(proc, "pid", None)
+        return pid if isinstance(pid, int) and pid > 0 else None
+
+    @property
+    def process_birth_identity(self) -> str | None:
+        pid = self.process_pid
+        return process_identity(pid) if isinstance(pid, int) and pid > 0 else None
+
+    def _notify_pid_change(self) -> None:
+        callback = self._on_pid_change
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception as exc:  # noqa: BLE001 - best-effort state refresh
+            log.warning("Credential relay pid-change callback failed: %s", exc)
 
     def _resolve_host_port(self) -> int:
         """Resolve the host-side ``-R`` target port.
@@ -138,6 +170,7 @@ class SupervisedRelayForward:
                 None,
                 None,
                 reverse_forwards=[spec],
+                exit_on_forward_failure=True,
             )
             log.debug(
                 "Establishing credential relay reverse-forward "
@@ -146,15 +179,15 @@ class SupervisedRelayForward:
                 _ESTABLISH_ATTEMPTS,
                 " ".join(args),
             )
-            proc = await asyncio.create_subprocess_exec(
+            proc = await create_ssh_subprocess(
                 *args,
+                config=self._config,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
-                creationflags=_creation_flags(),
-                start_new_session=(sys.platform != "win32"),
             )
             self._proc = proc
+            self._notify_pid_change()
             try:
                 settled = await self._wait_settled(proc)
             except asyncio.CancelledError:
@@ -164,6 +197,7 @@ class SupervisedRelayForward:
                 raise
             if settled.ready:
                 self._established_host_port = host_port
+                self._notify_pid_change()
                 log.info(
                     "Credential relay reverse-forward up on %s "
                     "(-R %d:127.0.0.1:%d)",
@@ -174,12 +208,17 @@ class SupervisedRelayForward:
                 return
 
             stderr = settled.stderr or await self._drain_stderr(proc)
-            last_err = stderr or "ssh exited"
+            last_err = stderr or last_err or "ssh exited"
+            exited_early = proc.returncode is not None
             await self._kill(proc)
             if self._proc is proc:
                 self._proc = None
 
-            if settled.remote_forward_failed and attempt < _ESTABLISH_ATTEMPTS:
+            # This channel runs with ExitOnForwardFailure, so an early exit is
+            # almost always the remote bind failing -- and under a CodeSpace's
+            # LogLevel=quiet ssh may exit without saying so. Retry either way.
+            if (settled.remote_forward_failed or exited_early) \
+                    and attempt < _ESTABLISH_ATTEMPTS:
                 delay = min(
                     self._backoff_max,
                     max(2.0, self._backoff_base * (2 ** (attempt - 1))),
@@ -334,9 +373,10 @@ class SupervisedRelayForward:
 
     async def _cancel_process(self) -> None:
         proc = self._proc
-        self._proc = None
         if proc is not None:
             await self._kill(proc)
+            self._proc = None
+            self._notify_pid_change()
 
     @staticmethod
     async def _drain_stderr(proc: asyncio.subprocess.Process) -> str:
@@ -351,10 +391,7 @@ class SupervisedRelayForward:
     @staticmethod
     async def _kill(proc: asyncio.subprocess.Process) -> None:
         if proc.returncode is None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+            await terminate_ssh_process_tree(proc)
         try:
             await asyncio.wait_for(proc.communicate(), timeout=5.0)
         except (asyncio.TimeoutError, TimeoutError, ProcessLookupError):

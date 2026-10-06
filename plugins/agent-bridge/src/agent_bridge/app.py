@@ -16,15 +16,19 @@ from fastapi import FastAPI
 
 from . import __version__, telemetry
 from .agent_registry import AgentResolver, daemon_resolver
+from .app_agent_roster import start_agent_roster_cache, stop_agent_roster_cache
 from .auth import BearerAuthMiddleware
 from .config import load_config, load_or_create_auth_token
 from .db import Database
+from .loop_governance import LoopGovernance
 from .routes import (
     acp_ws,
     admin,
     agents,
+    dispatch_tasks,
     health,
     live_sessions,
+    remote,
     sessions,
     ui,
     worktrees,
@@ -33,6 +37,7 @@ from .session_manager import session_manager_from_config
 from .transport import shutdown_ssh
 
 log = logging.getLogger("agent-bridge")
+_GOVERNANCE_BACKOFF_SECONDS = 10.0
 
 # Session statuses that mean "a host is actively using this daemon". When none
 # of these are present, the idle-shutdown monitor (if armed) counts down.
@@ -97,6 +102,28 @@ async def _run_in_daemon_thread(fn, *args):
 
     threading.Thread(target=run, daemon=True, name="bridge-readiness").start()
     return await future
+
+
+async def _governance_backoff(
+    governance: LoopGovernance | None,
+    checkpoint: str,
+    *,
+    loop_name: str,
+) -> bool:
+    if governance is None:
+        return False
+    result = governance.recheck(checkpoint)
+    if result is None or result.get("status") == "ready":
+        return False
+    log.warning(
+        "%s backing off at %s: %s (%s)",
+        loop_name,
+        result.get("checkpoint"),
+        result.get("reason"),
+        result.get("status"),
+    )
+    await asyncio.sleep(_GOVERNANCE_BACKOFF_SECONDS)
+    return True
 
 
 # Generation self-retire tuning. Default-ON (opt-out): validated on real cutovers
@@ -283,7 +310,7 @@ async def _start_credential_relay(app: FastAPI):
         from .agent_registry import register_credential_sources
 
         builder = RelayBuilder()
-        register_credential_sources(builder)
+        await _run_in_daemon_thread(register_credential_sources, builder)  # may retry
         if builder.empty:
             log.debug("No credential-relay sources registered -- relay disabled")
             return None
@@ -344,7 +371,23 @@ async def lifespan(app: FastAPI):
 
     mgr = session_manager_from_config(db, cfg)
     app.state.session_manager = mgr
+    # Record/stage this process's real generation_id -- see
+    # runtime_version.py's own module docstring for the full rationale (why
+    # this file not /health, and why a passive successor stages rather than
+    # writes the canonical marker directly). Role signal is_subdaemon(), NOT
+    # enable_credential_relay -- the latter is user-configurable persisted
+    # config, so a relay-disabled NORMAL primary must still record directly.
+    from .elevated import is_subdaemon
+    from .runtime_version import record_manager_generation_id, stage_manager_generation_id
+    if is_subdaemon():
+        pass  # shares the primary's runtime dir, never promoted -- skip.
+    elif getattr(app.state, "passive", False):
+        stage_manager_generation_id(mgr)
+    else:
+        record_manager_generation_id(mgr)
+    governance = LoopGovernance()
     app.state.resolver = AgentResolver({}, {})
+    mgr.set_resolver(app.state.resolver)
     app.state.ready = False
     app.state.readiness_error = None
     app.state.readiness_exception = None
@@ -364,20 +407,21 @@ async def lifespan(app: FastAPI):
         from . import __version__ as _ver
         from . import lifecycle_hooks
         from .config import config_dir
+        from .routing_state import ForwardedRouteRefused, publish_daemon_route_unless_forwarded, skip_forwarded_daemon_start
         from zdd import routing
 
         _bound_port = getattr(app.state, "bound_port", cfg.port)
         await asyncio.to_thread(lifecycle_hooks.startup_sweep, config_dir())
         try:
             published_endpoint, previous_endpoint = await asyncio.to_thread(
-                routing.publish_active_with_previous,
-                config_dir(),
-                bind=cfg.bind,
-                port=_bound_port,
-                pid=_os.getpid(),
-                version=_ver,
-                demote_existing=True,
+                publish_daemon_route_unless_forwarded, config_dir(), bind=cfg.bind,
+                port=_bound_port, pid=_os.getpid(), version=_ver,
             )
+        except ForwardedRouteRefused as exc:
+            await asyncio.to_thread(db.close)
+            skip_forwarded_daemon_start(app, exc)
+            yield
+            return
         except Exception as exc:
             await asyncio.to_thread(db.close)
             log.exception("Failed to publish the bound daemon endpoint")
@@ -396,19 +440,19 @@ async def lifespan(app: FastAPI):
     # immediately; surviving sessions reattach concurrently, moments after
     # startup. The task is cancelled on shutdown.
     async def _reattach_session_hosts_bg() -> None:
+        if getattr(app.state, "passive", False):
+            return  # passive: ATTACHing would disconnect the old generation
         try:
             n = await mgr.reattach_session_hosts()
             if n:
                 logging.getLogger("agent-bridge").info(
-                    "Reattached %d session(s) to surviving Session Hosts", n
-                )
+                    "Reattached %d session(s) to surviving Session Hosts", n)
         except asyncio.CancelledError:
             # Normal on shutdown (the task is cancelled) -- never a failure.
             raise
         except Exception:
             logging.getLogger("agent-bridge").warning(
-                "Session-Host reattach on startup failed", exc_info=True
-            )
+                "Session-Host reattach on startup failed", exc_info=True)
 
     reattach_task = asyncio.create_task(_reattach_session_hosts_bg())
 
@@ -437,13 +481,14 @@ async def lifespan(app: FastAPI):
                     else daemon_resolver(cfg)
                 )
                 app.state.resolver = resolver
+                mgr.set_resolver(resolver)
                 app.state.topology_ready = True
-
+                await start_agent_roster_cache(app, resolver, cfg)
                 if resolver.agents or resolver.machines:
                     from .routes.worktrees import get_cache
                     wt_cache = get_cache()
                     wt_cache.configure(interval=cfg.worktree_discovery_interval)
-                    wt_cache.start(resolver)
+                    wt_cache.start(resolver, governance=governance)
 
                 if not getattr(cfg, "enable_credential_relay", True):
                     log.info(
@@ -529,7 +574,19 @@ async def lifespan(app: FastAPI):
             interval = sweep_hours * 3600.0
             while True:
                 await asyncio.sleep(interval)
+                if await _governance_backoff(
+                    governance,
+                    "iteration-boundary:gc",
+                    loop_name="periodic GC",
+                ):
+                    continue
                 try:
+                    if await _governance_backoff(
+                        governance,
+                        "pre-mutation:gc",
+                        loop_name="periodic GC",
+                    ):
+                        continue
                     await asyncio.to_thread(mgr.gc, reason="sweep")
                 except Exception:
                     log.warning("Periodic GC sweep failed", exc_info=True)
@@ -547,6 +604,18 @@ async def lifespan(app: FastAPI):
         while True:
             await asyncio.sleep(15.0)
             try:
+                if await _governance_backoff(
+                    governance,
+                    "iteration-boundary:heartbeat",
+                    loop_name="heartbeat loop",
+                ):
+                    continue
+                if await _governance_backoff(
+                    governance,
+                    "pre-mutation:heartbeat",
+                    loop_name="heartbeat loop",
+                ):
+                    continue
                 mgr.note_heartbeats()
             except Exception:
                 log.warning("Liveness heartbeat beat failed", exc_info=True)
@@ -556,6 +625,12 @@ async def lifespan(app: FastAPI):
             # redialing the host and resuming by cursor with no restart and no
             # lost turn.
             try:
+                if await _governance_backoff(
+                    governance,
+                    "pre-mutation:recover-disconnected-hosts",
+                    loop_name="heartbeat loop",
+                ):
+                    continue
                 await mgr.recover_disconnected_hosts()
             except Exception:
                 log.warning("Liveness-driven reattach failed", exc_info=True)
@@ -563,6 +638,12 @@ async def lifespan(app: FastAPI):
             # host so a subsequently-lost front can self-reap an idle child
             # (#51). Backstop beneath the precise turn-boundary pushes.
             try:
+                if await _governance_backoff(
+                    governance,
+                    "pre-mutation:refresh-host-reapable",
+                    loop_name="heartbeat loop",
+                ):
+                    continue
                 await mgr.refresh_host_reapable()
             except Exception:
                 log.warning("Host reapable-state refresh failed", exc_info=True)
@@ -571,6 +652,12 @@ async def lifespan(app: FastAPI):
             # cannot mirror "Responding..." forever. Runs regardless of host mode;
             # it never touches a progressing or locally-driven turn.
             try:
+                if await _governance_backoff(
+                    governance,
+                    "pre-mutation:reconcile-wedged-running",
+                    loop_name="heartbeat loop",
+                ):
+                    continue
                 await mgr.reconcile_wedged_running()
             except Exception:
                 log.warning("Wedged-session reconciliation failed", exc_info=True)
@@ -588,6 +675,12 @@ async def lifespan(app: FastAPI):
             last_active = time.monotonic()
             while True:
                 await asyncio.sleep(poll)
+                if await _governance_backoff(
+                    governance,
+                    "iteration-boundary:idle-shutdown",
+                    loop_name="idle shutdown",
+                ):
+                    continue
                 try:
                     active = await asyncio.to_thread(_count_active_sessions, mgr)
                 except Exception:
@@ -598,6 +691,12 @@ async def lifespan(app: FastAPI):
                     continue
                 idle_for = time.monotonic() - last_active
                 if idle_for >= idle_secs:
+                    if await _governance_backoff(
+                        governance,
+                        "pre-mutation:idle-shutdown",
+                        loop_name="idle shutdown",
+                    ):
+                        continue
                     log.info(
                         "Idle %.0fs with no active sessions -- shutting down",
                         idle_for,
@@ -626,6 +725,18 @@ async def lifespan(app: FastAPI):
         while True:
             await asyncio.sleep(interval)
             try:
+                if await _governance_backoff(
+                    governance,
+                    "iteration-boundary:host-sweep",
+                    loop_name="host sweep",
+                ):
+                    continue
+                if await _governance_backoff(
+                    governance,
+                    "pre-mutation:host-sweep",
+                    loop_name="host sweep",
+                ):
+                    continue
                 n = await asyncio.to_thread(mgr.sweep_stranded_hosts)
                 if n:
                     log.info("Version-mux sweep reaped %d stranded host(s)", n)
@@ -646,6 +757,18 @@ async def lifespan(app: FastAPI):
             while True:
                 await asyncio.sleep(interval)
                 try:
+                    if await _governance_backoff(
+                        governance,
+                        "iteration-boundary:idle-reap",
+                        loop_name="idle reaper",
+                    ):
+                        continue
+                    if await _governance_backoff(
+                        governance,
+                        "pre-mutation:idle-reap",
+                        loop_name="idle reaper",
+                    ):
+                        continue
                     n = await mgr.sweep_idle_sessions()
                     if n:
                         log.info(
@@ -677,6 +800,18 @@ async def lifespan(app: FastAPI):
         while True:
             await asyncio.sleep(interval)
             try:
+                if await _governance_backoff(
+                    governance,
+                    "iteration-boundary:live-reap",
+                    loop_name="live-session reaper",
+                ):
+                    continue
+                if await _governance_backoff(
+                    governance,
+                    "pre-mutation:live-reap",
+                    loop_name="live-session reaper",
+                ):
+                    continue
                 n = await asyncio.to_thread(
                     db.reap_stale_live_sessions, now=time.time()
                 )
@@ -747,16 +882,25 @@ async def lifespan(app: FastAPI):
             from zdd.routing import Endpoint
 
             from .config import config_dir
-            from .self_retire import is_superseded
+            from .self_retire import (
+                initial_self_retire_status,
+                retire_check,
+            )
 
             my_pid = _os.getpid()
+            # Phase 5 observability (private-downstream-repo): status /health renders as "slot".
+            status = app.state.self_retire_status = initial_self_retire_status()
             # Observe our own publish landing first, capturing our generation.
-            # Until we are the recorded active we cannot meaningfully be
-            # "superseded"; a passive instance that is never promoted simply
-            # never arms the watch (returns without ever calling is_superseded).
+            # A passive instance never promoted simply never arms the watch.
             my_gen: int | None = None
             for _ in range(600):  # ~5 min ceiling to see our own publish
                 await asyncio.sleep(0.5)
+                if await _governance_backoff(
+                    governance,
+                    "iteration-boundary:self-retire-arm",
+                    loop_name="self-retire",
+                ):
+                    continue
                 data = await asyncio.to_thread(routing.read_table, config_dir())
                 raw = data.get("active") if isinstance(data, dict) else None
                 ep = Endpoint.from_dict(raw) if isinstance(raw, dict) else None
@@ -765,29 +909,39 @@ async def lifespan(app: FastAPI):
                     break
             if my_gen is None:
                 return
-            confirms = 0
+            status.update(armed=True, generation=my_gen)
             while True:
                 await asyncio.sleep(_sr_poll)
+                if await _governance_backoff(
+                    governance,
+                    "iteration-boundary:self-retire",
+                    loop_name="self-retire",
+                ):
+                    status["confirms"] = 0
+                    continue
                 try:
-                    superseded = await asyncio.to_thread(
-                        is_superseded, config_dir(), my_pid, my_gen
+                    superseded, ready, why = await asyncio.to_thread(
+                        retire_check, config_dir(), my_pid, my_gen,
+                        lambda: _count_active_sessions(mgr, db),
                     )
-                    idle = superseded and (
-                        await asyncio.to_thread(_count_active_sessions, mgr, db) == 0
-                    )
+                    status["superseded"] = superseded
                 except Exception:
-                    confirms = 0
+                    status.update(superseded=False, confirms=0)
                     log.debug("Self-retire supersession check failed", exc_info=True)
                     continue
-                if not (superseded and idle):
-                    confirms = 0  # any miss resets: only a sustained state acts
+                if not ready:
+                    status["confirms"] = 0  # any miss resets: only sustained acts
                     continue
-                confirms += 1
-                if confirms >= _sr_confirmations:
-                    log.info(
-                        "Superseded by a live newer generation and idle -- "
-                        "self-retiring (was gen %d, pid %d)", my_gen, my_pid,
-                    )
+                status["confirms"] += 1
+                if status["confirms"] >= _sr_confirmations:
+                    if await _governance_backoff(
+                        governance,
+                        "pre-mutation:self-retire",
+                        loop_name="self-retire",
+                    ):
+                        status["confirms"] = 0
+                        continue
+                    log.info("%s -- self-retiring (was gen %d, pid %d)", why, my_gen, my_pid)
                     server = getattr(app.state, "uvicorn_server", None)
                     if server is not None:
                         server.should_exit = True
@@ -890,6 +1044,7 @@ async def lifespan(app: FastAPI):
     # Shutdown: stop worktree discovery
     from .routes.worktrees import get_cache
     await get_cache().stop()
+    await stop_agent_roster_cache(app)  # Phase 3b
 
     # Shutdown: prepare in-flight turns for the frontend restart. By default
     # (dotfiles#1661) this is DETACH-ONLY -- it does NOT cancel the remote
@@ -902,20 +1057,20 @@ async def lifespan(app: FastAPI):
         log.warning("Graceful-cancel on shutdown failed", exc_info=True)
 
     # Shutdown: detach all active sessions (host + child + turn survive for
-    # reattach). `cancel_turn` mirrors the redeploy policy: detach-only by
-    # default, cancel only if `cancel_turns_on_redeploy` is set.
+    # reattach); `cancel_turn` mirrors `cancel_turns_on_redeploy`. Recovery
+    # stays on regardless -- a redeploy detach is never a stop (#3058).
     for session in mgr.list_sessions():
         if session.client and session.client.is_running:
             try:
                 log.info("Detaching session %s on shutdown", session.session_id)
                 await mgr.stop_session(
                     session.session_id,
-                    cancel_turn=mgr.cancel_turns_on_redeploy,
+                    cancel_turn=mgr.cancel_turns_on_redeploy, allow_background_recovery=True,
                 )
             except Exception:
                 log.warning(
-                    "Failed to stop session %s on shutdown",
-                    session.session_id, exc_info=True,
+                    "Failed to stop session %s on shutdown", session.session_id,
+                    exc_info=True,
                 )
 
     # Shutdown: disconnect SSH master connections (after sessions are stopped)
@@ -965,8 +1120,10 @@ def create_app(*, config=None, token: str | None = None) -> FastAPI:
     app.include_router(acp_ws.router)
     app.include_router(sessions.router)
     app.include_router(live_sessions.router)
+    app.include_router(remote.router)
     app.include_router(agents.router)
     app.include_router(worktrees.router)
     app.include_router(admin.router)
+    app.include_router(dispatch_tasks.router)
 
     return app

@@ -4,6 +4,7 @@ name: CI
 #
 # Design (see tools/run-plugin-tests.py + the repo guards under tools/):
 #   * checks         - repo guards + repo-wide ruff F/E9. Cheap (~1 min); always.
+#   * test-runner    - Linux/Windows admission + state-isolation contract.
 #   * discover       - resolve which plugin suites to run (changed on PR, all on
 #                      push to main), split into a fast set (smoke) and the one
 #                      heavy plugin (agent-worktrees, ~11 min) handled separately.
@@ -14,16 +15,41 @@ name: CI
 #                      suite runs via the manual `full` workflow below.
 #   * full           - workflow_dispatch only: every plugin's full suite,
 #                      including agent-worktrees, no tight timeout.
+#
+# `dev` is included in the push trigger for the dev-branch-release-pipeline
+# effort's Phase 3 (ThomasMichon/copilot-extensions#3336): a green run of
+# THIS workflow on `dev` is what `.github/workflows/validate-and-promote.yml`
+# waits on (`workflow_run`) before generating the wholesale-replace commit
+# onto `main`. Nobody is asked to target `dev` yet -- see that effort's Plan
+# for the sequencing note on when contributor-facing docs actually flip.
+#
+# See also: .github/workflows/context-handoff-exhaustive.yml -- a SEPARATE
+# workflow (not a job here) for the real-git/child-process/lock-race matrix
+# under plugins/context-handoff/tests/exhaustive/. It is intentionally its
+# own workflow file, not a job in this one: a top-level `schedule` trigger
+# applies to EVERY job in whatever workflow it is declared on, so adding it
+# here would have put the entire fast/smoke/full matrix on a weekly cron
+# too, not just the one exhaustive suite that needs it.
 
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, dev]
   workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # `false` (not the prior `true`): a rolling build, not cancel-and-restart.
+  # GitHub's default queue:single semantics for a shared group already give
+  # exactly this -- at most one run in progress, at most one pending, and a
+  # newer push only ever supersedes the *pending* run, never kills the one
+  # already in progress. `cancel-in-progress: true` risked starving this
+  # workflow entirely under rapid pushes to the same ref (an in-flight run
+  # gets killed and restarted from zero every time, so if pushes arrive
+  # faster than this suite completes, NO run ever finishes) -- which in turn
+  # means Validation Gate/Promote downstream never fire at all
+  # (ThomasMichon/copilot-extensions#3592).
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -32,8 +58,230 @@ env:
   # The heavy plugin (~11 min) kept out of the fast lane; runs full only on
   # workflow_dispatch, and gets a collect-only smoke on PR/push.
   HEAVY_PLUGIN: agent-worktrees
+  # coverage-guided-ci Phase 4 rollout kill-switch (see
+  # efforts/active/coverage-guided-ci's Journal). "shadow": compute +
+  # report decide()'s own selection for HEAVY_PLUGIN as a non-blocking
+  # step-summary annotation only -- the real PR gate stays collect-only +
+  # guards exactly as before, completely unaffected. "off": skip the step
+  # entirely (flip this if shadow mode itself ever misbehaves -- a stuck
+  # `gh` call, excessive noise, rate limiting). A future "live" mode
+  # (actually gating worktrees-smoke on this decision) is intentionally
+  # not implemented yet -- see the effort's own Plan; this repo-wide env
+  # var is the single place that rollout will flip from.
+  COVERAGE_GUIDED_SELECTION_MODE: shadow
 
 jobs:
+  main-gate:
+    name: main source gate
+    # The gate for any PR targeting `main`. Exactly five shapes are legitimate:
+    # (1) the promotion pipeline's own PR (a release/promote-<run id> branch,
+    #     opened via the APERTURE_RELEASE_TOKEN PAT -- a personal fine-grained
+    #     token minted under the maintainer's own account, this repo having no
+    #     separate bot identity, so the PR author is this repo's owner
+    #     (`github.repository_owner`), not github-actions[bot]); or
+    # (2) a workflow-file-ONLY bootstrap PR by the repo owner: workflow_run-
+    #     triggered workflows (validate-and-promote.yml itself) always resolve
+    #     their own YAML from `main`, never the branch that triggered them, so
+    #     a fix to those files must occasionally land on main directly, ahead
+    #     of the next real promotion -- the pipeline can't fix itself via its
+    #     own not-yet-working promotion path otherwise; or
+    # (3) module-size-baseline-widen.yml's own automated PR (fixed branch
+    #     name `automation/module-size-baseline-widen`, also opened via the
+    #     APERTURE_RELEASE_TOKEN PAT so it's PR_AUTHOR == the repo owner too,
+    #     and whose diff is never anything but the one generated baseline
+    #     JSON file); or
+    # (4) tools/rollback_release.py's own pause/resume state-commit PR
+    #     (branch name `release-pipeline/state-<epoch ms>`, same PAT, whose
+    #     diff is never anything but the one pipeline-state JSON file). This
+    #     shape was added after a real gap found during the 2026-10-04
+    #     main-history-rewrite effort: `_land_via_pr`'s documented path
+    #     (open a PR, let it land normally) could never actually complete
+    #     against this gate for a state-commit PR, forcing an admin-merge
+    #     bypass every single time `pause`/`resume --push` ran -- see
+    #     `tools/rollback_release.py`'s own module docstring and
+    #     `docs/pipelines.md`'s pause/resume section for the full story; or
+    # (5) tools/rollback_release.py's own `revert` rollback PR (branch name
+    #     `release-pipeline/rollback-<epoch ms>`, same PAT) -- a wholesale
+    #     revert of main's tree to its pre-promotion state, generated as a
+    #     single `commit-tree` call (`_write_state_commit`/`revert`'s own
+    #     "never a force-push/history-rewrite" commit message), so unlike
+    #     shape (4) its diff is NOT single-file by nature; recognized
+    #     instead by branch-name pattern plus the PR carrying exactly ONE
+    #     commit (`github.event.pull_request.commits == 1`) -- a real,
+    #     hand-assembled multi-commit PR can never match a mechanically
+    #     generated single `commit-tree` push. Added alongside shape (4)
+    #     after the same main-history-rewrite effort found `revert --push`
+    #     hits the identical gap.
+    #
+    # Shapes (2), (3), (4), and (5) are enforced by DIFF CONTENT or commit-shape here,
+    # not by admin/human bypass --
+    # this is deliberate, prompted by a real incident (an unrelated
+    # vision-doc PR landed directly on `main` via `gh pr merge --admin`,
+    # stranding content that the next promotion would have silently reverted,
+    # ThomasMichon/copilot-extensions#3622-erratum). Admin-merge capability on
+    # this repo is legitimate (we're the maintainers) and is NOT being removed
+    # here -- but after this check exists, it is never *needed*: a genuine
+    # workflow-only bootstrap PR passes this gate on its own, unassisted. Any
+    # future reach for `--admin` on a PR this gate rejects is itself the
+    # signal something is wrong -- retarget to `dev` instead of overriding.
+    if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Only the promotion pipeline's own PR, a workflow-only bootstrap PR, or a recognized automated/state PR, may land on main
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          # `github.repository_owner` -- an immutable, platform-controlled
+          # context value (the account that literally owns this repo/fork),
+          # never a repository secret/variable. Repository *variables* are
+          # writable via the API/CLI by anyone with ordinary Write access --
+          # the same Maintainer tier this gate exists to restrict -- so using
+          # one here would let a Maintainer defeat the gate by simply
+          # re-pointing it at their own login, with no file-path change for
+          # workflow-lockdown-guard to ever catch. This automatically tracks
+          # a fork's own owner with zero configuration -- for a USER-owned
+          # fork. KNOWN LIMITATION: in an ORGANIZATION-owned fork,
+          # `github.repository_owner` is the org login, which no individual
+          # PR author (`pull_request.user.login`) can ever equal, so this
+          # gate and workflow-lockdown-guard's equivalent check permanently
+          # reject every PR there -- this policy is scoped to user-owned
+          # repos only; an org-owned fork needs its own explicit
+          # authorization mechanism (e.g. a trusted team), not addressed
+          # here.
+          REPO_OWNER: ${{ github.repository_owner }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Used only by shape (5) below -- the PR's own total commit count,
+          # straight from the webhook payload (no extra API call needed).
+          PR_COMMITS: ${{ github.event.pull_request.commits }}
+        run: |
+          if [[ "$HEAD_REF" == release/promote-* && "$PR_AUTHOR" == "$REPO_OWNER" ]]; then
+            echo "Legitimate promotion-pipeline PR -- OK."
+            exit 0
+          fi
+          if [ "$PR_AUTHOR" != "$REPO_OWNER" ]; then
+            echo "::error::This PR targets 'main' and is not the promotion pipeline's own PR. main only ever moves via a release/promote-* PR, a workflow-file-only bootstrap PR, module-size-baseline-widen.yml's own automated PR, or rollback_release.py's own state-commit/revert PR (all by the repo owner). Please retarget this PR's base branch to 'dev' -- see docs/pipelines.md > Release & Versioning."
+            exit 1
+          fi
+          # Merge-base-relative (three-dot semantics), not a literal
+          # base_sha..head_sha diff: matches GitHub's own "Files changed"
+          # tab and the `pulls.listFiles` API (used by
+          # base-branch-reminder.yml's equivalent recognition check) --
+          # "what this PR's own commits introduce," not "every difference
+          # between the current tips of base and head." A literal two-commit
+          # diff would wrongly reject this PR the moment `main` independently
+          # gains any unrelated file after this branch forked from it (that
+          # file would show up as "removed" relative to head, even though
+          # this PR never touched it), and would wrongly accept a PR that
+          # re-introduces a change base already carries identically.
+          changed="$(git diff --name-only "$(git merge-base "$BASE_SHA" "$HEAD_SHA")" "$HEAD_SHA")"
+          if [ -z "$changed" ]; then
+            echo "::error::No changed files detected between base and head -- refusing to land on main."
+            exit 1
+          fi
+          # Third legitimate shape: module-size-baseline-widen.yml's own
+          # automated, purely-mechanical PR (see that workflow) -- it opens
+          # from a fixed branch name, authored under this same PAT (hence
+          # PR_AUTHOR == REPO_OWNER, checked above; the PAT's owning account
+          # MUST equal this repo's owner or this gate rejects the PR), and
+          # its diff is never anything but the one generated baseline file.
+          # Checked by exact branch name AND single-file diff content
+          # together (not one alone) so this narrow exception can't be
+          # widened by pushing unrelated content onto that branch name, or
+          # by a real PR simply touching that one file.
+          if [[ "$HEAD_REF" == "automation/module-size-baseline-widen" \
+                && "$changed" == "tools/module-size-baseline.json" ]]; then
+            echo "Automated module-size-baseline-widen PR -- OK. Files:"
+            echo "$changed"
+            exit 0
+          fi
+          # Fourth legitimate shape: tools/rollback_release.py's own
+          # pause/resume state-commit PR (see that tool's `_write_state_commit`
+          # / `_land_via_pr`) -- branch name is always `release-pipeline/
+          # state-<epoch ms>` (never reused, never hand-typed), and its diff
+          # is never anything but the one pipeline-state JSON file
+          # (`.github/release-pipeline-state.json`, `PIPELINE_STATE_PATH` in
+          # that tool). Checked by branch-name PATTERN (not exact match --
+          # the timestamp varies every run) AND single-file diff content
+          # together, same shape as the module-size-baseline-widen check
+          # above, for the same reason: neither alone should be enough to
+          # widen this narrow exception.
+          if [[ "$HEAD_REF" == release-pipeline/state-* \
+                && "$changed" == ".github/release-pipeline-state.json" ]]; then
+            echo "Automated rollback_release.py state-commit PR -- OK. Files:"
+            echo "$changed"
+            exit 0
+          fi
+          # Fifth legitimate shape: tools/rollback_release.py's own
+          # `revert` rollback PR (see that tool's `revert`/`_land_via_pr`)
+          # -- branch name is always `release-pipeline/rollback-<epoch ms>`
+          # (never reused, never hand-typed), generated as a SINGLE
+          # mechanical `commit-tree` call that wholesale-restores main's
+          # pre-promotion tree. Unlike shape (4), this diff is deliberately
+          # NOT single-file (a real tree-wide revert can touch many files),
+          # so it cannot be checked by diff content the same way. Branch
+          # name and commit count alone are NOT enough here, though -- any
+          # owner-authored, single-commit PR could otherwise reuse this
+          # prefix to land an arbitrary tree-wide change, since a single
+          # hand-authored commit is routine. Verify the actual shape
+          # instead: the head's SOLE parent must be this PR's base sha
+          # (proving it is a direct, un-rebased child of main's tip at
+          # open time, matching `commit-tree -p <main tip>`), and every
+          # file it changes relative to the REAL promotion commit's OWN
+          # parent must be the one pipeline-state file -- i.e. the
+          # revert's tree, aside from that one file, is byte-identical to
+          # the commit immediately before the promotion it reverts,
+          # exactly what `revert()` constructs. The "real promotion
+          # commit" is NOT simply `BASE_SHA^`: the documented operator
+          # flow is pause THEN revert, so a pause/resume bookkeeping
+          # commit is often main's actual tip by the time `revert` runs,
+          # making `BASE_SHA` itself that pause commit and `BASE_SHA^` the
+          # promotion commit being reverted, not its parent. Walk
+          # `BASE_SHA`'s history for the most recent `promote-*`-tagged
+          # commit instead, mirroring `_find_last_promotion_commit`
+          # exactly, and compare against THAT commit's parent.
+          if [[ "$HEAD_REF" == release-pipeline/rollback-* && "$PR_COMMITS" == "1" ]]; then
+            parent_count="$(git rev-list --parents -n 1 "$HEAD_SHA" | wc -w)"
+            sole_parent="$(git rev-parse "$HEAD_SHA^" 2>/dev/null || true)"
+            if [[ "$parent_count" != "2" || "$sole_parent" != "$BASE_SHA" ]]; then
+              echo "::error::This PR's head is not a single, direct child of its base (expected exactly one parent equal to \$BASE_SHA) -- refusing to treat it as an automated rollback_release.py revert."
+              exit 1
+            fi
+            promotion_commit=""
+            for sha in $(git log --format=%H "$BASE_SHA"); do
+              if git tag --points-at "$sha" | grep -q '^promote-'; then
+                promotion_commit="$sha"
+                break
+              fi
+            done
+            if [ -z "$promotion_commit" ]; then
+              echo "::error::Could not find a tagged promotion commit reachable from this PR's base -- refusing to treat it as an automated rollback_release.py revert."
+              exit 1
+            fi
+            rollback_diff="$(git diff --name-only "$promotion_commit^" "$HEAD_SHA" | grep -v '^\.github/release-pipeline-state\.json$' || true)"
+            if [ -n "$rollback_diff" ]; then
+              echo "::error::This PR's tree (beyond the pipeline-state file) does not match main's pre-promotion state -- refusing to treat it as an automated rollback_release.py revert. Unexpected diff:"
+              echo "::error::$rollback_diff"
+              exit 1
+            fi
+            echo "Automated rollback_release.py revert PR -- OK."
+            exit 0
+          fi
+          non_workflow="$(echo "$changed" | grep -v '^\.github/workflows/' || true)"
+          if [ -n "$non_workflow" ]; then
+            echo "::error::This PR touches file(s) outside .github/workflows/, so it cannot use the workflow-only bootstrap exception:"
+            echo "::error::$non_workflow"
+            echo "::error::main only ever moves via a release/promote-* PR, a workflow-file-ONLY bootstrap PR, module-size-baseline-widen.yml's own automated PR, or rollback_release.py's own state-commit/revert PR. Please retarget this PR's base branch to 'dev' -- see docs/pipelines.md > Release & Versioning."
+            exit 1
+          fi
+          echo "Workflow-file-only bootstrap PR by the repo owner -- OK. Files:"
+          echo "$changed"
+
+
   checks:
     name: guards + lint
     runs-on: ubuntu-latest
@@ -48,15 +296,170 @@ jobs:
         run: python -m pip install --upgrade pip pytest pyyaml ruff
       - name: Version consistency
         run: python tools/check-version-consistency.py
-      - name: Version bump (touched plugins must bump; PR diff only)
+      - name: Changefile presence (touched plugins must have a pending changefile; PR-into-dev only)
         # Every plugin whose content -- or a vendored lib it ships -- changes in
-        # the PR must advance its version, else the marketplace serves stale code
-        # under an unchanged version (silent stale deploy, dotfiles #1025).
+        # a PR targeting `dev` must carry a pending changefile (tools/changefile.py),
+        # else the promotion pipeline has nothing to bump and the marketplace serves
+        # stale code under an unchanged version (silent stale deploy, dotfiles #1025).
         # Scoped to the PR diff so a pre-existing state never blocks unrelated PRs.
+        # Replaces the old manual three-file version-bump requirement
+        # (tools/check-version-bump.py) now that dev-branch-release-pipeline's CI
+        # promotion pipeline (Phase 3) exists to actually consume changefiles.
+        #
+        # --head is pinned explicitly (not left to default to "HEAD") because
+        # actions/checkout with no `ref:` override checks out the ephemeral
+        # refs/pull/<n>/merge commit -- the PR's head merged into whatever the
+        # CURRENT tip of `dev` happens to be, not the PR's own head. Once `dev`
+        # has moved since the PR opened, diffing that merge commit against the
+        # (increasingly stale) base.sha silently folds every intervening dev
+        # commit into "this PR's diff", misattributing other PRs' plugin
+        # changes to this one. Pinning --head to the PR's real head sha keeps
+        # the diff scoped to this PR's own commits regardless of dev's drift.
+        if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'dev'
+        run: python tools/check-changefile-presence.py --base ${{ github.event.pull_request.base.sha }} --head ${{ github.event.pull_request.head.sha }}
+      - name: Changefile presence guard tests
+        # Unconditional (unlike the step above): this is the tool's own unit
+        # suite, not a PR-diff check, so it must run on every push/PR
+        # regardless of base branch. Previously not wired in at all -- the
+        # suite silently bit-rotted (a missing test-fixture dependency broke
+        # every test with an import error) with nothing to catch it
+        # (PR #4942 review).
+        run: python -m pytest -q tools/test_check_changefile_presence.py
+      - id: version-bump-engine
+        name: Detect version-bump diff-engine changes
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            base="${{ github.event.before }}"
+            head="HEAD"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Pin the real PR head sha, not the checkout's synthetic
+          # refs/pull/<n>/merge commit (same reason the changefile-presence
+          # step above pins --head explicitly): once dev advances past this
+          # PR's recorded base, a bare "HEAD" diff would fold in every
+          # intervening dev commit too, so an unrelated change to any listed
+          # file could wrongly trigger this subprocess-heavy suite.
+          if git diff --name-only "$base...$head" | grep -Eq \
+            '^tools/(check-version-bump\.py|test_check_version_bump\.py|installer_engine_ref\.py|uv_editable_ref\.py|check-changefile-presence\.py|accumulate_bumps\.py)$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Version-bump diff engine guard tests
+        # check-version-bump.py no longer gates an ordinary PR directly (see
+        # the step above), but check-changefile-presence.py and
+        # accumulate_bumps.py both import its plugin-diff detection as a
+        # shared engine, and its own standalone CLI remains a documented
+        # release/recovery check (docs/pipelines.md § Release & Versioning)
+        # -- so its own regression suite still needs to run somewhere, not
+        # just when a dependent guard's tests happen to exercise it.
+        # Path-gated (over 20 tests, each launching the real script as a
+        # subprocess inside a throwaway git repo): too heavy to run
+        # unconditionally on every PR per this repo's change-scoped CI
+        # policy, so it only runs when a file it actually exercises changed
+        # (or unconditionally on a non-PR/push trigger, e.g. workflow_dispatch).
+        if: steps.version-bump-engine.outputs.run == 'true'
+        run: python -m pytest -q tools/test_check_version_bump.py
+      - name: Module size (hard cap + shrink-only baseline, PR diff only)
+        # Scoped to files THIS PR's own commits touch (like the changefile-
+        # presence step above) -- a PR is never blocked by growth in a file it
+        # never touched, which used to happen whenever another already-merged PR
+        # grew a shared module faster than the post-merge widen job below
+        # could catch up.
+        #
+        # --head is pinned explicitly for the exact same reason as the
+        # changefile-presence step above: without it, --changed-since's
+        # default HEAD resolves to the ephemeral refs/pull/<n>/merge commit
+        # actions/checkout produces (PR head merged into dev's CURRENT tip),
+        # which silently folds every commit dev gained since this PR opened
+        # into what looks like this PR's own diff.
         if: github.event_name == 'pull_request'
-        run: python tools/check-version-bump.py --base ${{ github.event.pull_request.base.sha }}
+        run: python tools/check-module-size.py --changed-since ${{ github.event.pull_request.base.sha }} --head ${{ github.event.pull_request.head.sha }}
+      - name: Module size (hard cap + shrink-only baseline, full sweep)
+        # Every tracked, non-test source module must stay within its line-count
+        # cap, or its grandfathered ceiling for pre-existing offenders -- the
+        # componentization failure that let queue.py reach ~7,200 lines had no
+        # automated guard before this. See CONTRIBUTING.md § Code Style. Runs
+        # unconditionally (push/workflow_dispatch too) so the full-tree state
+        # this repo's own widen job and doc/watchdog tooling depend on is
+        # never scoped away.
+        if: github.event_name != 'pull_request'
+        run: python tools/check-module-size.py
+      - name: Module size guard tests
+        run: python -m pytest -q tools/test_check_module_size.py
+      - name: compat-root-migration scanner guard tests
+        # Backs efforts/active/compatibility-root-decoupling/: this
+        # scanner's output controls when a compatibility-root re-export is
+        # considered safe to delete, and several of its regex edge cases
+        # (whole-identifier alias matching, indented/local imports, three
+        # independent dotted-string patch shapes) have already needed
+        # fixes once each -- gate future regressions the same way every
+        # other tools/ scanner is gated.
+        run: python -m pytest -q tools/test_compat_root_migration.py
+      - name: Large files (generous image cap, tight default cap, PR diff only)
+        # Same pinned-sha pattern as the changefile-presence/module-size steps
+        # above, for the same reason: without an explicit --head, the default
+        # diff base resolves against the ephemeral refs/pull/<n>/merge commit
+        # actions/checkout produces, silently folding dev's drift since this
+        # PR opened into what looks like this PR's own diff.
+        if: github.event_name == 'pull_request'
+        run: python tools/check-large-files.py --base ${{ github.event.pull_request.base.sha }} --head ${{ github.event.pull_request.head.sha }}
+      - name: Large files (full sweep)
+        # Runs unconditionally (push/workflow_dispatch too), mirroring the
+        # module-size full-sweep step above, so organic drift on trunk is
+        # still caught outside any single diff.
+        if: github.event_name != 'pull_request'
+        run: python tools/check-large-files.py --all
+      - name: Large files guard tests
+        run: python -m pytest -q tools/test_check_large_files.py
+      - name: No agent-machines consuming-side packages in this repo
+        # agent-machines packages declare a CONSUMING repo's own desired
+        # machine state (sometimes gated down to a literal machine name);
+        # that content belongs exclusively in the repo that adopts the
+        # pattern (e.g. the facility's own private control repo), never in
+        # copilot-extensions itself -- this repo is public and has no
+        # machine of its own to converge. See the guard's own docstring for
+        # the live incident that motivated it.
+        run: python tools/check-no-agent-machines-packages.py
+      - name: No agent-machines consuming-side packages guard tests
+        run: python -m pytest -q tools/test_check_no_agent_machines_packages.py
+      - name: No sibling plugin writes tracking YAML directly
+        # agent-worktrees-authoritative-daemon effort, Phase 4: only
+        # agent-worktrees itself may mutate a worktree's tracking record --
+        # a sibling plugin importing one of its write functions directly
+        # would bypass the resident daemon's own lock/cache/verb
+        # machinery, reintroducing the cross-process atomicity hazard that
+        # effort exists to close. See the guard's own docstring for scope
+        # (every plugins/* directory except agent-worktrees itself, not
+        # filtered by an agent-* name prefix; worktree-manager's own known,
+        # separately-tracked exception is documented there, not silently
+        # exempted).
+        run: python tools/check-no-sibling-tracking-writes.py
+      - name: No sibling tracking-writes guard tests
+        run: python -m pytest -q tools/test_check_no_sibling_tracking_writes.py
+      - name: Module health watchdog tests
+        run: python -m pytest -q tools/test_module_health_watchdog.py
+      - name: Stale branch sweep tests
+        run: python -m pytest -q tools/test_sweep_stale_branches.py
+      - name: CI failure watchdog tests
+        # promotion-failure-reactive-fix-agent effort, Phase 1: the
+        # detect+dedup reporting logic validate-and-promote.yml's own
+        # report-failure job depends on.
+        run: python -m pytest -q tools/test_ci_failure_watchdog.py
       - name: Install contract
         run: python tools/check-install-contract.py
+      - name: Install contract guard tests
+        run: python -m pytest -q tools/test_check_install_contract.py
+      - name: Installer-engine vendoring sync guard tests
+        run: python -m pytest -q tools/test_sync_installer_engine.py
+      - name: Bootstrap-killswitch vendoring sync guard tests
+        run: python -m pytest -q tools/test_sync_bootstrap_killswitch.py
       - name: Runtime resolution (marker-only, uniform)
         # Every versioned-runtime plugin must resolve its interpreter the one
         # uniform marker-only way (uniform-runtime-resolution, #765): the
@@ -72,6 +475,15 @@ jobs:
         run: python tools/check-marketplace-isolation.py
       - name: Marketplace isolation guard tests
         run: python -m pytest -q tools/test_check_marketplace_isolation.py
+      - name: Agent Bridge contract registry
+        run: python tools/check-agent-bridge-contracts.py
+      - name: Agent Bridge contract source coverage (PR diff only)
+        if: github.event_name == 'pull_request'
+        run: python tools/check-agent-bridge-contracts.py --base ${{ github.event.pull_request.base.sha }}
+      - name: Agent Bridge contract registry guard tests
+        run: python -m pytest -q tools/test_check_agent_bridge_contracts.py
+      - name: Git hook interpreter tests
+        run: python -m pytest -q tools/test_hook_interpreter.py
       - name: Payload invocation generated files
         run: python libs/payload-invocation/generate.py --all --check
       - name: Payload invocation foundation tests
@@ -92,7 +504,7 @@ jobs:
             exit 0
           fi
           if git diff --name-only "$base"...HEAD | grep -Eq \
-            '^(libs/installation-context/|plugins/(agent-index|agent-machines|agent-worktrees)/scripts/installation-context/|tools/sync-installation-context.py$)'; then
+            '^(libs/installation-context/|plugins/(agent-codespaces|agent-containers|agent-index|agent-machines|agent-worktrees)/scripts/installation-context/|tools/sync-installation-context.py$)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -105,8 +517,62 @@ jobs:
           libs/installation-context/tests
       - name: Installation context vendoring
         run: python tools/sync-installation-context.py --check
+      - name: Bootstrap-killswitch guard vendoring
+        run: python tools/sync-bootstrap-killswitch.py --check
+      - name: Bootstrap-killswitch guard tests
+        run: python -m pytest -q libs/bootstrap-killswitch/tests
+      - name: Same-cell peer launcher vendoring
+        run: >-
+          python tools/sync-peer-launch.py --check &&
+          python -m pytest -q libs/peer-launch/tests
       - name: Installer readiness contract tests
         run: python -m pytest -q libs/installer-readiness/tests
+      - name: Canonical shared-library tests (uv-editable referenced libs)
+        # These libs are consumed through `uv`-editable canonical references
+        # (vendor-pointer-generalization, Phase 1), so no consumer checkout
+        # carries a pointer copy whose tests a consumer's own pytest run would
+        # collect. Run the canonical suites here so their wire/server coverage
+        # stays enforced. Each suite puts its own lib on `sys.path` from its
+        # `tests/conftest.py`, as the sibling canonical-lib suites do -- run
+        # one invocation per lib so a suite only ever sees its own `src`.
+        # `credential-relay`'s suite uses `@pytest.mark.asyncio` (its own
+        # `pyproject.toml` declares `pytest-asyncio` as a `dev` extra, never
+        # installed here since this job only installs bare `pytest`) --
+        # install it explicitly or collection fails outright. `agent-procutil`
+        # is only converted for 4 of its 11 consumers so far -- included here
+        # too (rather than waiting for its own full conversion) since its
+        # canonical suite is the one this step is designed to keep testing,
+        # independent of which pointer form any particular consumer uses.
+        run: >-
+          python -m pip install pytest-asyncio &&
+          python -m pytest -q libs/work-coalescing-singleton/tests &&
+          python -m pytest -q libs/lazy-cli-dispatch/tests &&
+          python -m pytest -q libs/credential-relay/tests &&
+          python -m pytest -q libs/ssh-manager/tests &&
+          python -m pytest -q libs/agent-procutil/tests &&
+          python -m pytest -q libs/single-instance-lease/tests &&
+          python -m pytest -q libs/config-migrate/tests &&
+          python -m pytest -q libs/dropin-registry/tests &&
+          python -m pytest -q libs/plugin-resolve/tests &&
+          python -m pytest -q libs/plugin-activation/tests &&
+          python -m pytest -q libs/session-liveness-probe/tests &&
+          python -m pytest -q libs/venue-copilot/tests
+      - name: Vendored library synchronization
+        run: >-
+          python tools/check-vendored-libs-sync.py &&
+          python -m pytest -q tools/test_check_vendored_libs_sync.py
+      - name: Windows headless launch invariants
+        run: >-
+          python tools/check-headless-launch.py &&
+          python -m pytest -q tools/test_check_headless_launch.py
+      - name: Picker inbox discipline
+        # The Picker's Textual-based Worktree Manager UI may only marshal a
+        # background producer's result back to the render thread through
+        # Inbox.post()/background.run_background() -- never a raw
+        # app.call_from_thread(...). See tools/check-picker-inbox-discipline.py.
+        run: >-
+          python tools/check-picker-inbox-discipline.py &&
+          python -m pytest -q tools/test_check_picker_inbox_discipline.py
       - name: Hook process hygiene
         # PowerShell command hooks already run inside PowerShell. Spawning a
         # second interpreter can surface Default Terminal windows on Windows.
@@ -117,6 +583,55 @@ jobs:
         run: python tools/check-docs-consistency.py
       - name: Runbook references
         run: python tools/check-runbook-references.py
+      - name: Trusted self-hosted CI contract
+        run: >-
+          python tools/check-trusted-ci.py &&
+          python -m pytest -q tools/test_check_trusted_ci.py
+      - name: gh-aw action pin guard
+        run: >-
+          python tools/check-gh-aw-action-pins.py &&
+          python -m pytest -q tools/test_check_gh_aw_action_pins.py
+      - name: gh-aw compiler version guard
+        run: >-
+          python tools/check-gh-aw-compiler-version.py &&
+          python -m pytest -q tools/test_check_gh_aw_compiler_version.py
+      - name: Feed neutrality (no hardcoded public package-feed pins)
+        # No config/Dockerfile/install-script/CI-workflow file may hardcode a
+        # public package-feed URL (pypi.org, registry.npmjs.org,
+        # download.pytorch.org, ...) as the only usable endpoint -- this repo
+        # runs on machines whose default feed is network-blocked and replaced
+        # with an internal mirror. See #2389 / tools/clean-room's
+        # --block-public-feeds mode, which reproduces that condition.
+        run: >-
+          python tools/check-feed-neutrality.py &&
+          python -m pytest -q tools/test_check_feed_neutrality.py
+      - id: python-artifact-builder
+        name: Detect Python artifact-builder changes
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            base="${{ github.event.before }}"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$base"...HEAD | grep -Eq \
+            '^tools/(build_python_artifacts\.py|build_toolchain_lock\.py|governed_feed_trust\.py|uv_editable_ref\.py|test_build_python_artifacts\.py)$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Governed Python artifact build/toolchain-lock guard tests
+        if: steps.python-artifact-builder.outputs.run == 'true'
+        # governed-python-artifact-promotion effort, Phase 2: build_python_artifacts.py
+        # + build_toolchain_lock.py/governed_feed_trust.py's own trust-gate,
+        # concurrency, and build-requirement regressions -- gated by changed
+        # paths (TESTING.md's "Gate specialized suites by changed paths"
+        # invariant) since this is a large, subprocess-adjacent suite most
+        # PRs never touch.
+        run: python -m pytest -q tools/test_build_python_artifacts.py
       - name: Asyncio timeout handlers (Python 3.10 daemon)
         # The agent-bridge daemon venv is pinned to Python 3.10 (uv venv
         # --python 3.10), where asyncio.wait_for raises asyncio.TimeoutError --
@@ -124,16 +639,23 @@ jobs:
         # builtin TimeoutError without asyncio.TimeoutError, so the class of bug
         # behind dotfiles#1549 cannot recur unseen (dev-box/CI are 3.11/3.12).
         run: python tools/check-asyncio-timeout-handlers.py
-      - name: Internal-identifier guard (PR diff only)
-        # Public repo: the denylist is never committed. When the FORBIDDEN_IDS
-        # secret is configured this enforces that a PR introduces no forbidden
-        # identifier -- scoped to the PR diff (never the whole tree, which would
-        # trip on pre-existing content; see the guard's own #541). No-op unless
-        # the secret is set. Only meaningful on a PR, so skipped otherwise.
-        if: github.event_name == 'pull_request'
-        env:
-          COPILOT_EXTENSIONS_FORBIDDEN_IDS: ${{ secrets.FORBIDDEN_IDS }}
-        run: python tools/check-no-internal-identifiers.py --base ${{ github.event.pull_request.base.sha }}
+      - name: Coverage-guided-ci selection prototype tests (Phase 0 pilot)
+        # tools/coverage_guided_selection/'s own synthetic unit tests (fast,
+        # pure stdlib). The one real-suite integration test in this same
+        # file self-skips unless CGS_RUN_INTEGRATION_TEST=1 (set only by the
+        # separate, workflow_dispatch-only
+        # 'coverage-guided-selection-integration' job below): it spawns a
+        # real 'uv run --with coverage ...' subprocess against a real
+        # plugin's suite, which doesn't belong in this fast, always-on lane.
+        run: python -m pytest -q tools/test_coverage_guided_selection.py
+      # Internal-identifier enforcement moved out of this untrusted PR lane.
+      # Fork PRs receive no repository secrets on `pull_request`, and repo
+      # `vars.*` would be plain-text/public, so this workflow can never hold the
+      # real denylist safely. `.github/workflows/identifier-leak-guard.yml`
+      # follows GitHub's documented `pull_request` -> `workflow_run` pattern:
+      # CI stays unprivileged here, then the trusted follow-up workflow reads
+      # the PR head as inert data only, runs the trusted scanner with secrets,
+      # and reports a custom Check Run back onto the PR head SHA.
       - name: Ruff (F, E9)
         run: ruff check --select F,E9 --output-format=github .
       - name: JS unit tests (node --test)
@@ -141,6 +663,19 @@ jobs:
         # plugins/<name>/tests/*.test.mjs -- there is no pytest suite to carry
         # them. Run any that exist; a clean no-op when there are none, so this
         # step costs nothing until a plugin adds JS tests.
+        #
+        # context-handoff's crash-diagnostics.test.mjs deliberately keeps its
+        # own required-CI footprint to a small, always-run smoke contract
+        # (cheap subprocess cases only); its POSIX-toolchain-dependent attack
+        # simulations and its 1 MiB rotation fixture self-gate behind
+        # CONTEXT_HANDOFF_CRASH_DIAGNOSTICS_STRESS (unset here, so those cases
+        # skip unconditionally in this lane) and only run in the
+        # scheduled/dispatch `crash-diagnostics-stress.yml` workflow -- never
+        # in required PR CI, regardless of what any given PR touches (an
+        # earlier revision of this step instead set that env var whenever a
+        # PR's diff touched plugins/context-handoff/, but per review that
+        # still put a subprocess-heavy matrix in the required lane instead of
+        # using a focused/scheduled split).
         run: |
           shopt -s nullglob
           suites=(plugins/*/tests/*.test.mjs)
@@ -151,11 +686,98 @@ jobs:
           echo "running ${#suites[@]} JS test file(s): ${suites[*]}"
           node --test "${suites[@]}"
 
+  windows-python-artifact-builder:
+    name: Governed Python artifact build (Windows-only paths)
+    # Mirrors `checks`' own "Detect Python artifact-builder changes" gate
+    # (TESTING.md's "Gate specialized suites by changed paths" invariant):
+    # the Ubuntu `guards + lint` job runs this suite's full 198+ tests, but
+    # 4 of them are genuinely Windows-OS-API-only (`_trusted_system32_tool`/
+    # `_well_known_sid_display_name`'s real `GetSystemDirectoryW`/
+    # `LookupAccountSidW`/`ConvertStringSidToSidW` calls, plus
+    # `_provenance_key_lock`'s real `LockFileEx` cross-process exclusion,
+    # which a same-process cross-thread test cannot exercise) and skip
+    # themselves out on that Ubuntu runner -- so they never actually
+    # execute in required CI at all. This job runs ONLY those, selected by
+    # the `windows_only` marker, rather than duplicating the entire suite
+    # on windows-latest.
+    if: github.event_name != 'pull_request' || github.event.pull_request.base.ref != 'main'
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v9.0.0
+      - id: python-artifact-builder
+        name: Detect Python artifact-builder changes
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            base="${{ github.event.before }}"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$base"...HEAD | grep -Eq \
+            '^tools/(build_python_artifacts\.py|build_toolchain_lock\.py|governed_feed_trust\.py|uv_editable_ref\.py|test_build_python_artifacts\.py)$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Windows-only governed Python artifact builder tests
+        if: steps.python-artifact-builder.outputs.run == 'true'
+        run: >-
+          uv run --with pytest python -m pytest -q -m windows_only
+          -W ignore::pytest.PytestUnknownMarkWarning
+          tools/test_build_python_artifacts.py
+
+  windows-hooks:
+    name: Git hooks (Windows)
+    if: github.event_name != 'pull_request' || github.event.pull_request.base.ref != 'main'
+    runs-on: windows-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pytest
+      - run: python -m pytest -q tools/test_hook_interpreter.py
+
+  bootstrap-killswitch-powershell-5-1:
+    name: Bootstrap-killswitch guard (Windows PowerShell 5.1)
+    # windows-latest ships Windows PowerShell 5.1 (powershell.exe) alongside
+    # PowerShell 7+ (pwsh.exe). The guard's own test suite defaults to pwsh,
+    # which is BOM-less by default and therefore can never reproduce the
+    # Set-Content -Encoding utf8 BOM regression this suite specifically
+    # exists to catch -- that defect is PS 5.1-only. This job forces the
+    # legacy interpreter so the real contract is exercised, not just the
+    # modern one every other job already covers.
+    if: github.event_name != 'pull_request' || github.event.pull_request.base.ref != 'main'
+    runs-on: windows-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pytest
+      - name: Guard tests under Windows PowerShell 5.1
+        env:
+          BOOTSTRAP_KILLSWITCH_TEST_SHELL: powershell.exe
+        run: python -m pytest -q libs/bootstrap-killswitch/tests/test_guard_powershell.py
+
   worktree-manager:
     name: worktree-manager (out-of-plugin)
     # The Worktree Manager is delivered OUTSIDE the plugin pipe, so the
     # per-plugin matrix below never runs its tests. This dedicated job gives it
     # real CI.
+    if: github.event_name != 'pull_request' || github.event.pull_request.base.ref != 'main'
     runs-on: ubuntu-latest
     timeout-minutes: 6
     steps:
@@ -165,9 +787,50 @@ jobs:
         working-directory: worktree-manager
         run: uv run --extra dev pytest -q
 
+  test-runner-linux:
+    name: test runner (ubuntu-latest)
+    if: github.event_name != 'pull_request' || github.event.pull_request.base.ref != 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v9.0.0
+      - name: Test runner admission and isolation
+        env:
+          PYTHONPATH: libs/single-instance-lease/src
+        run: >-
+          uv run --with pytest python -m pytest -q
+          libs/single-instance-lease/tests/test_lease.py
+          tools/test_run_plugin_tests.py
+          tools/test_run_tests_in_devcontainer.py
+
+  test-runner-windows:
+    name: test runner (windows-latest)
+    if: github.event_name != 'pull_request' || github.event.pull_request.base.ref != 'main'
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v9.0.0
+      - name: Test runner admission and isolation
+        env:
+          PYTHONPATH: libs/single-instance-lease/src
+        run: >-
+          uv run --with pytest python -m pytest -q
+          libs/single-instance-lease/tests/test_lease.py
+          tools/test_run_plugin_tests.py
+
   discover:
     name: discover suites
-    if: github.event_name != 'workflow_dispatch'
+    if: >-
+      github.event_name != 'workflow_dispatch' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.base.ref != 'main')
     runs-on: ubuntu-latest
     outputs:
       smoke: ${{ steps.set.outputs.smoke }}
@@ -210,18 +873,102 @@ jobs:
         plugin: ${{ fromJson(needs.discover.outputs.smoke) }}
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch Agent Bridge contract provenance
+        if: matrix.plugin == 'agent-bridge'
+        run: git fetch --no-tags --prune --unshallow
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v9.0.0
       - name: Test ${{ matrix.plugin }}
         run: python tools/run-plugin-tests.py ${{ matrix.plugin }}
+      - name: Test shared SSH proxy contracts
+        if: matrix.plugin == 'agent-bridge'
+        # ssh-manager is now consumed as a `uv`-editable canonical
+        # reference (vendor-pointer-generalization, Phase 1), so
+        # agent-bridge no longer carries a local libs/ssh-manager/src
+        # copy -- point PYTHONPATH at canonical instead. ssh-manager
+        # itself depends on agent-procutil, so that canonical src/ must
+        # be on the path too.
+        env:
+          PYTHONPATH: libs/ssh-manager/src:libs/agent-procutil/src
+        run: >-
+          .test-venvs/linux/agent-bridge/bin/python -m pytest -q
+          libs/ssh-manager/tests/test_process.py
+          libs/ssh-manager/tests/test_proxy.py
 
   worktrees-smoke:
-    name: agent-worktrees (collect-only)
+    name: agent-worktrees (collect-only + guard tests)
     needs: discover
     if: needs.discover.outputs.heavy == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history (not the default shallow depth-1 clone): Phase 4's
+          # shadow-mode step below needs `main`'s own full pointer-file
+          # history (`ancestor_resolution.resolve_nearest_baseline`) and a
+          # real base..head diff, neither of which a shallow clone can
+          # satisfy. `discover`/`full` already do the same for the same
+          # reason.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v9.0.0
+      - name: Collect-only smoke for ${{ env.HEAVY_PLUGIN }}
+        run: python tools/run-plugin-tests.py "$HEAVY_PLUGIN" --collect-only
+      - name: Guard tests for ${{ env.HEAVY_PLUGIN }}
+        # Collect-only alone never actually EXECUTES this plugin's suite on
+        # a PR -- its real ~3 min full suite only runs post-merge, in
+        # validate-and-promote.yml's "full" job (see run-plugin-tests.py's
+        # own docstring: "no automatic push/PR gate wired to it yet"). A
+        # regression here can land on `dev` fully untested and silently
+        # block every subsequent promotion until someone notices the red
+        # post-merge run (confirmed live: #4378/#4379, a lazy-dispatch
+        # table drift that sat undetected through PR review). `--guards`
+        # runs only @pytest.mark.guard tests -- cheap, deterministic,
+        # subprocess/tmux-free checks (like the lazy-dispatch drift-scan
+        # pair) explicitly marked safe to run on every PR, without paying
+        # for this plugin's full heavy suite.
+        run: python tools/run-plugin-tests.py "$HEAVY_PLUGIN" --guards
+      - name: Coverage-guided selection (shadow, non-blocking)
+        # coverage-guided-ci Phase 4 rollout, step 1 of 2 (see this
+        # effort's Journal): computes decide()'s own selection for
+        # HEAVY_PLUGIN against this PR/push's real diff and reports it as
+        # a step-summary annotation ONLY -- it never affects which tests
+        # actually ran above, and `continue-on-error: true` means even a
+        # genuine crash here (belt-and-suspenders on top of `cli.py`'s own
+        # internal try/except -- see that module's docstring) shows up as
+        # a neutral/skipped annotation, never a red X blocking the PR.
+        # Gated on the kill-switch above so this can be disabled with a
+        # one-line env-var change if it ever misbehaves (a stuck `gh`
+        # call, excessive noise) without touching this step's own body.
+        if: env.COVERAGE_GUIDED_SELECTION_MODE == 'shadow'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # `github.event.before` is all-zeros for a branch's first push
+          # ever (no real prior commit to diff against) -- decide()'s own
+          # CLI wraps every failure in a reported `mode: "error"` decision
+          # rather than crashing, so an invalid BASE_REF here degrades to
+          # a visible, harmless annotation rather than a job failure
+          # either way.
+          python tools/coverage_guided_selection/cli.py \
+            --repo "${{ github.repository }}" \
+            --plugin "$HEAVY_PLUGIN" \
+            --cov-source "plugins/$HEAVY_PLUGIN/src/${HEAVY_PLUGIN//-/_}" \
+            --base-ref "$BASE_REF" \
+            --head-ref "${{ github.sha }}"
+
+  worktrees-windows-launch:
+    name: agent-worktrees (Windows launch)
+    needs: discover
+    if: needs.discover.outputs.heavy == 'true'
+    runs-on: windows-latest
     timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
@@ -229,8 +976,46 @@ jobs:
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v9.0.0
-      - name: Collect-only smoke for ${{ env.HEAVY_PLUGIN }}
-        run: python tools/run-plugin-tests.py "$HEAVY_PLUGIN" --collect-only
+      - name: Install psmux
+        shell: pwsh
+        run: |
+          $version = "3.3.8"
+          $archive = Join-Path $env:RUNNER_TEMP "psmux.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "psmux"
+          Invoke-WebRequest `
+            "https://github.com/psmux/psmux/releases/download/v$version/psmux-v$version-windows-x64.zip" `
+            -OutFile $archive
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          $expected = "1ad127ba937194a890b933a73d9b023e297bd73dc742abd841bf159984c2effe"
+          if ($actual -ne $expected) {
+            throw "psmux archive checksum mismatch"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $psmux = Get-ChildItem -LiteralPath $destination -Filter psmux.exe -Recurse |
+            Select-Object -First 1
+          if (-not $psmux) {
+            throw "psmux.exe not found in release archive"
+          }
+          Add-Content -LiteralPath $env:GITHUB_PATH `
+            -Value $psmux.DirectoryName `
+            -Encoding utf8
+      - name: Start psmux test session
+        shell: pwsh
+        run: >-
+          psmux new-session -d -s aw-ci --
+          powershell.exe -NoProfile -Command "Start-Sleep -Seconds 300"
+      - name: Test Windows status-loop launch
+        run: >-
+          python tools/run-plugin-tests.py agent-worktrees
+          -k status_daemon_console_root_contains_psmux_descendants
+      - name: Stop psmux test session
+        if: always()
+        shell: pwsh
+        run: |
+          if (Get-Command psmux -ErrorAction SilentlyContinue) {
+            psmux kill-session -t aw-ci 2>$null
+          }
+          exit 0
 
   full:
     name: full - ${{ matrix.plugin }}
@@ -251,9 +1036,90 @@ jobs:
           - agent-worktrees
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v9.0.0
       - name: Full suite - ${{ matrix.plugin }}
         run: python tools/run-plugin-tests.py ${{ matrix.plugin }}
+
+  coverage-guided-selection-integration:
+    name: coverage-guided-ci selection prototype (real-suite integration)
+    # The two real-subprocess integration tests in
+    # tools/test_coverage_guided_selection.py self-skip unless
+    # CGS_RUN_INTEGRATION_TEST=1 -- deliberately opt-in/manual (this phase 0
+    # pilot's own effort Journal), not part of required PR CI, since they
+    # spawn a real 'uv run --with coverage --with pytest-cov --with
+    # pytest-json-report' subprocess against a real plugin's suite (or a
+    # constructed throwaway one).
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v9.0.0
+      - name: Real-suite round-trip + fixture-phase integration tests
+        env:
+          CGS_RUN_INTEGRATION_TEST: "1"
+        run: >-
+          uv run --with pytest python -m pytest -q
+          tools/test_coverage_guided_selection.py
+
+  pr-gate:
+    name: PR gate (required check)
+    # The single, fixed-name aggregate this repo's branch protection points
+    # at. Every job this depends on either uses dynamic matrix names (smoke's
+    # own per-plugin job name changes per PR) or conditionally no-ops
+    # (worktrees-smoke/worktrees-windows-launch skip unless the heavy plugin
+    # is in scope) -- neither shape can be named directly as a GitHub
+    # required status check without risking a PR that never triggers a given
+    # dynamic/conditional name getting stuck forever on "Expected -- waiting
+    # for status to be reported." This job is unconditional (`if: always()`)
+    # and always reports exactly one of success/failure, so it is always
+    # itself observable regardless of what its dependencies did.
+    #
+    # Exists because neither of #4151 nor #4166 (the regressions that stalled
+    # dev's CI for hours) was actually invisible: #4151's own PR-time
+    # `agent-logger` check WAS red, and still merged, because this repo had
+    # no required-status-checks branch protection on dev/main at all --
+    # nothing technically blocked it. This job is the anchor that lets that
+    # protection finally exist without brittleness.
+    if: always() && github.event_name == 'pull_request' && github.event.pull_request.base.ref != 'main'
+    needs:
+      - checks
+      - windows-python-artifact-builder
+      - windows-hooks
+      - worktree-manager
+      - test-runner-linux
+      - test-runner-windows
+      - discover
+      - smoke
+      - worktrees-smoke
+      - worktrees-windows-launch
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Confirm every required job succeeded or was legitimately skipped
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          results = json.loads(os.environ["NEEDS_JSON"])
+          bad = {name: info["result"] for name, info in results.items()
+                 if info["result"] not in ("success", "skipped")}
+          if bad:
+              print("Failing/cancelled required job(s):", bad)
+              sys.exit(1)
+          print("All required jobs succeeded or were legitimately skipped:")
+          for name, info in results.items():
+              print(f"  {name}: {info['result']}")
+          PY

@@ -15,6 +15,7 @@ set -euo pipefail
 _ok()   { printf '  [OK]   %s\n' "$1"; }
 _skip() { printf '  [SKIP] %s\n' "$1"; }
 _fail() { printf '  [FAIL] %s\n' "$1" >&2; }
+_warn() { printf '  [WARN] %s\n' "$1" >&2; }
 _step() { printf '  ...    %s\n' "$1"; }
 
 FORCE=0
@@ -270,6 +271,25 @@ CFG_MIGRATE_DIR="$PLUGIN_DIR/libs/config-migrate"
 if [[ ! -f "$CFG_MIGRATE_DIR/pyproject.toml" ]]; then
     CFG_MIGRATE_DIR="$(cd "$PLUGIN_DIR/../.." && pwd)/libs/config-migrate"
 fi
+# zdd dir (uv-editable canonical reference in a dev checkout, real copy in a
+# materialized release payload): plugin-vendored or repo-root.
+ZDD_DIR="$PLUGIN_DIR/libs/zdd"
+if [[ ! -f "$ZDD_DIR/pyproject.toml" ]]; then
+    ZDD_DIR="$(cd "$PLUGIN_DIR/../.." && pwd)/libs/zdd"
+fi
+# venue-copilot dir (uv-editable canonical reference in a dev checkout, real
+# copy in a materialized release payload): plugin-vendored or repo-root.
+VENUE_COPILOT_DIR="$PLUGIN_DIR/libs/venue-copilot"
+if [[ ! -f "$VENUE_COPILOT_DIR/pyproject.toml" ]]; then
+    VENUE_COPILOT_DIR="$(cd "$PLUGIN_DIR/../.." && pwd)/libs/venue-copilot"
+fi
+# session-liveness-probe dir (uv-editable canonical reference in a dev
+# checkout, real copy in a materialized release payload): plugin-vendored or
+# repo-root.
+SESSION_LIVENESS_PROBE_DIR="$PLUGIN_DIR/libs/session-liveness-probe"
+if [[ ! -f "$SESSION_LIVENESS_PROBE_DIR/pyproject.toml" ]]; then
+    SESSION_LIVENESS_PROBE_DIR="$(cd "$PLUGIN_DIR/../.." && pwd)/libs/session-liveness-probe"
+fi
 
 # --- self-provisioning (runtime-self-provisioning pattern) -------------------
 # Vendor a standalone uv when absent (pristine box has neither uv nor pip/venv).
@@ -456,34 +476,107 @@ else
 fi
 
 # -- 3. Install the package into the venv ------------------------------
+PACKAGE_STATUS=0
+PACKAGE_TAIL=''
+run_bounded_package_command() {
+    local log_path
+    log_path=$(mktemp -t agent-containers-install.XXXXXX) || {
+        PACKAGE_STATUS=1
+        PACKAGE_TAIL='could not create a temporary package-manager log'
+        return 0
+    }
+    PACKAGE_STATUS=0
+    "$@" >"$log_path" 2>&1 || PACKAGE_STATUS=$?
+    PACKAGE_TAIL=''
+    if [[ "$PACKAGE_STATUS" -ne 0 ]]; then
+        PACKAGE_TAIL=$(tail -n 40 "$log_path" | sed -E \
+            -e 's#(https?://)[^/@[:space:]]+@#\1***@#Ig' \
+            -e 's#((token|password|secret)=)[^&[:space:]]+#\1***#Ig')
+    fi
+    rm -f -- "$log_path"
+    return 0
+}
+
+print_package_diagnostics() {
+    if [[ -n "$PACKAGE_TAIL" ]]; then
+        while IFS= read -r line; do
+            _warn "package-manager: $line"
+        done <<< "$PACKAGE_TAIL"
+    fi
+}
+
 if [[ "$HAVE_UV" -eq 1 ]]; then
-    # credential-relay first (vendored lib), force-reinstalled so local code
-    # changes propagate even without a version bump; then agent-containers.
+    # credential-relay/config-migrate/zdd/venue-copilot/session-liveness-probe
+    # first (workspace path deps), force-reinstalled so local code changes
+    # propagate even without a version bump; then agent-containers.
     if [[ ! -f "$CRED_RELAY_DIR/pyproject.toml" ]]; then
         _fail "credential-relay source not found at $CRED_RELAY_DIR"
         exit 1
     fi
-    if ! uv pip install --python "$VENV_PYTHON" --reinstall-package agent-credential-relay "$CRED_RELAY_DIR" --quiet 2>/dev/null; then
+    run_bounded_package_command uv pip install --python "$VENV_PYTHON" --reinstall-package agent-credential-relay "$CRED_RELAY_DIR" --quiet
+    if [[ "$PACKAGE_STATUS" -ne 0 ]]; then
         _fail 'credential-relay install failed'
+        print_package_diagnostics
         exit 1
     fi
     if [[ ! -f "$CFG_MIGRATE_DIR/pyproject.toml" ]]; then
         _fail "config-migrate source not found at $CFG_MIGRATE_DIR"
         exit 1
     fi
-    if ! uv pip install --python "$VENV_PYTHON" --reinstall-package agent-config-migrate "$CFG_MIGRATE_DIR" --quiet 2>/dev/null; then
+    run_bounded_package_command uv pip install --python "$VENV_PYTHON" --reinstall-package agent-config-migrate "$CFG_MIGRATE_DIR" --quiet
+    if [[ "$PACKAGE_STATUS" -ne 0 ]]; then
         _fail 'config-migrate install failed'
+        print_package_diagnostics
         exit 1
     fi
-    if ! uv pip install --python "$VENV_PYTHON" "$PLUGIN_DIR" --quiet 2>/dev/null; then
-        _fail 'Failed to install agent-containers package into venv'
+    if [[ ! -f "$ZDD_DIR/pyproject.toml" ]]; then
+        _fail "zdd source not found at $ZDD_DIR"
         exit 1
+    fi
+    run_bounded_package_command uv pip install --python "$VENV_PYTHON" --reinstall-package agent-zdd "$ZDD_DIR" --quiet
+    if [[ "$PACKAGE_STATUS" -ne 0 ]]; then
+        _fail 'zdd install failed'
+        print_package_diagnostics
+        exit 1
+    fi
+    if [[ ! -f "$VENUE_COPILOT_DIR/pyproject.toml" ]]; then
+        _fail "venue-copilot source not found at $VENUE_COPILOT_DIR"
+        exit 1
+    fi
+    run_bounded_package_command uv pip install --python "$VENV_PYTHON" --reinstall-package agent-venue-copilot "$VENUE_COPILOT_DIR" --quiet
+    if [[ "$PACKAGE_STATUS" -ne 0 ]]; then
+        _fail 'venue-copilot install failed'
+        print_package_diagnostics
+        exit 1
+    fi
+    if [[ ! -f "$SESSION_LIVENESS_PROBE_DIR/pyproject.toml" ]]; then
+        _fail "session-liveness-probe source not found at $SESSION_LIVENESS_PROBE_DIR"
+        exit 1
+    fi
+    run_bounded_package_command uv pip install --python "$VENV_PYTHON" --reinstall-package agent-session-liveness-probe "$SESSION_LIVENESS_PROBE_DIR" --quiet
+    if [[ "$PACKAGE_STATUS" -ne 0 ]]; then
+        _fail 'session-liveness-probe install failed'
+        print_package_diagnostics
+        exit 1
+    fi
+    run_bounded_package_command uv pip install --python "$VENV_PYTHON" "${PLUGIN_DIR}[provider-exec]" --quiet
+    if [[ "$PACKAGE_STATUS" -ne 0 ]]; then
+        _warn 'Could not install the optional provider-exec SSH transport; falling back to the base package'
+        print_package_diagnostics
+        run_bounded_package_command uv pip install --python "$VENV_PYTHON" "$PLUGIN_DIR" --quiet
     fi
 else
-    if ! "$VENV_PYTHON" -m pip install --quiet "$PLUGIN_DIR" 2>/dev/null; then
-        _fail 'Failed to install agent-containers package into venv'
-        exit 1
+    run_bounded_package_command "$VENV_PYTHON" -m pip install --quiet "${PLUGIN_DIR}[provider-exec]"
+    if [[ "$PACKAGE_STATUS" -ne 0 ]]; then
+        _warn 'Could not install the optional provider-exec SSH transport; falling back to the base package'
+        print_package_diagnostics
+        run_bounded_package_command "$VENV_PYTHON" -m pip install --quiet "$PLUGIN_DIR"
     fi
+fi
+if [[ "$PACKAGE_STATUS" -ne 0 ]]; then
+    _fail 'Failed to install agent-containers package into venv'
+    print_package_diagnostics
+    exit 1
 fi
 _ok 'Package installed: agent-containers'
 

@@ -94,6 +94,32 @@ def test_conflict_resolution_charter_names_producer_origin_and_force_push():
     assert "never open a second pr" in charter
 
 
+def test_reviewer_charter_forbids_a_competing_pr_against_an_external_author():
+    # Under land=self, "own landing" must never be read as "replace the
+    # author's own PR with a competing one under this identity" -- even when
+    # their fork/branch is temporarily unreachable. Lock that in the charter
+    # so a worker never rediscovers "just open a repair-patch PR" on its own.
+    r = recipes.get_recipe("reviewer")
+    charter = r.charter_template.lower()
+    assert "competing pull request" in charter
+    assert "repairs, patches, or supersedes" in charter
+    assert "cooperative" in charter
+
+
+def test_every_recipe_charter_requires_escalating_genuine_stagnation():
+    # A worker that keeps resuming with no real forward movement (no operator
+    # answer, nothing new to react to) must proactively set/re-affirm a
+    # steering card rather than silently loop forever -- this is the guidance
+    # gap a real production task fell through (58+ consecutive false wakes,
+    # never once carding the blocker). Lock it into every recipe's charter so
+    # a worker can't silently drift back to endless quiet re-suspension.
+    for name in ("reviewer", "conflict-resolution", "goal-driven"):
+        charter = recipes.get_recipe(name).charter_template.lower()
+        assert "non-productive cycles" in charter
+        assert "--request-input" in charter
+        assert "re-affirm" in charter
+
+
 def test_render_missing_required_param_raises_listing_them():
     with pytest.raises(recipes.RecipeError) as exc:
         recipes.render_recipe("reviewer", {"repo": "o/n"})
@@ -245,6 +271,45 @@ def test_kick_without_labels_is_recipe_labels_only(monkeypatch):
     )
     _cmd_recipes_kick(_args(["recipes", "kick", "goal-driven", "--param", "goal=x"]))
     assert captured["ns"].label == ["recipe:goal-driven", "kind:goal"]
+
+
+def test_kick_inherits_recipe_verification_default_and_allows_override(monkeypatch):
+    recipe = recipes.Recipe(
+        name="verifying",
+        summary="test",
+        params=(recipes.RecipeParam("goal", "goal"),),
+        title_template="{goal}",
+        goal_template="{goal}",
+        done_criteria="done",
+        charter_template="do it",
+        suspend_on=(),
+        resolution="done",
+        require_verification=True,
+    )
+    monkeypatch.setitem(recipes.REGISTRY, "verifying", recipe)
+    captured = {}
+    monkeypatch.setattr(
+        "agent_dispatch.__main__._cmd_create",
+        lambda ns: captured.setdefault("ns", ns) or 0,
+    )
+
+    _cmd_recipes_kick(_args(["recipes", "kick", "verifying", "--param", "goal=x"]))
+    assert captured["ns"].require_verification is True
+
+    captured.clear()
+    _cmd_recipes_kick(
+        _args(
+            [
+                "recipes",
+                "kick",
+                "verifying",
+                "--param",
+                "goal=x",
+                "--no-require-verification",
+            ]
+        )
+    )
+    assert captured["ns"].require_verification is False
 
 
 # -- MCP tools ---------------------------------------------------------------

@@ -4,7 +4,8 @@
 .DESCRIPTION
     The canonical installer is scripts/install.ps1. This bootstrap alias forwards
     to `install.ps1 -Action install` so older references and the runtime
-    reconciler's init fallback keep working.
+    reconciler's init fallback keep working. The lightweight service runtime is
+    installed here; the durable engine remains on its own explicit lifecycle.
 #>
 [CmdletBinding()]
 param(

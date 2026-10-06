@@ -1,0 +1,288 @@
+"""Bounded detection of generated session artifacts that should not be synced.
+
+Detected categories: Chromium browser profiles (may carry live cookies/auth
+state), Python venvs, git clones/worktrees, and ``node_modules`` trees. These
+are the recurring "scope creep" patterns where a session's ``files/`` ends up
+holding a full tool install or repo clone instead of small artifacts -- see
+``docs/deployment-topologies.md`` and the harness issue that motivated this.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import stat
+from dataclasses import dataclass
+from pathlib import Path
+
+from agent_logger.sync.provenance import (
+    is_link_or_reparse,
+    windows_extended_path,
+)
+
+MAX_DETRITUS_DIRECTORIES = 10_000
+MAX_DETRITUS_ENTRIES = 100_000
+MAX_DETRITUS_DEPTH = 16
+MAX_DETRITUS_ROOTS = 100
+
+
+@dataclass(frozen=True)
+class DetritusSummary:
+    """Detected source subtrees and their bounded footprint."""
+
+    roots: tuple[Path, ...] = ()
+    file_count: int = 0
+    byte_count: int = 0
+    measurement_complete: bool = True
+
+    def roots_below(self, prefix: Path) -> tuple[Path, ...]:
+        result = []
+        for root in self.roots:
+            try:
+                result.append(root.relative_to(prefix))
+            except ValueError:
+                continue
+        return tuple(result)
+
+
+def _scan_entries(directory: Path) -> list[tuple[str, Path, int, int]]:
+    entries = []
+    with os.scandir(windows_extended_path(directory)) as scan:
+        for entry in scan:
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            path = directory / entry.name
+            if is_link_or_reparse(path, info.st_mode):
+                continue
+            entries.append((entry.name, path, info.st_mode, info.st_size))
+    return entries
+
+
+def _is_chromium_profile_root(
+    entries: list[tuple[str, Path, int, int]],
+) -> bool:
+    root_entries = {
+        name: mode
+        for name, _path, mode, _size in entries
+    }
+    if not stat.S_ISREG(root_entries.get("Local State", 0)):
+        return False
+    for name, path, mode, _size in entries:
+        if not stat.S_ISDIR(mode):
+            continue
+        if name != "Default" and re.fullmatch(r"Profile [0-9]+", name) is None:
+            continue
+        try:
+            profile_entries = {
+                child_name: child_mode
+                for child_name, _child_path, child_mode, _child_size
+                in _scan_entries(path)
+            }
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(profile_entries.get("Preferences", 0))
+            and stat.S_ISDIR(profile_entries.get("Network", 0))
+        ):
+            return True
+    return False
+
+
+def _is_venv_root(entries: list[tuple[str, Path, int, int]]) -> bool:
+    """Return whether *entries* (a directory's own contents) is a Python venv.
+
+    ``python -m venv``/``virtualenv`` always write a ``pyvenv.cfg`` file at
+    the environment root, regardless of platform or the tool that created it
+    (``venv``, ``virtualenv``, ``uv venv``). This is the one signature
+    reliable enough to exclude the whole tree -- installed packages
+    (``site-packages``/``Lib``/``bin``/``Scripts``) live below it.
+    """
+    root_entries = {name: mode for name, _path, mode, _size in entries}
+    return stat.S_ISREG(root_entries.get("pyvenv.cfg", 0))
+
+
+def _is_git_worktree_root(entries: list[tuple[str, Path, int, int]]) -> bool:
+    """Return whether *entries* (a directory's own contents) is a git clone.
+
+    A ``.git`` entry is a directory for a normal clone, or a regular
+    ``gitdir:``-pointer file for a linked worktree checkout. Either shape
+    identifies the containing directory as a git working tree root.
+    """
+    root_entries = {name: mode for name, _path, mode, _size in entries}
+    git_mode = root_entries.get(".git")
+    if git_mode is None:
+        return False
+    return stat.S_ISDIR(git_mode) or stat.S_ISREG(git_mode)
+
+
+def _is_detritus_root(
+    name: str, entries: list[tuple[str, Path, int, int]]
+) -> bool:
+    """Return whether a directory (by name and its own contents) should be
+    excluded wholesale rather than descended into."""
+    if name == "node_modules":
+        return True
+    return (
+        _is_chromium_profile_root(entries)
+        or _is_venv_root(entries)
+        or _is_git_worktree_root(entries)
+    )
+
+
+def _measure_tree(root: Path) -> tuple[int, int, bool]:
+    """Size an already-detected detritus root, best-effort.
+
+    Detected roots (especially ``node_modules``) can be far larger than a
+    Chromium profile. Hitting the same bounded-scan limits used elsewhere
+    must not raise here: the root is already identified for exclusion, so a
+    size limit only means the reported byte/file count is a partial
+    estimate (``measurement_complete=False``), never a reason to abort the
+    surrounding sync.
+    """
+    files = 0
+    nbytes = 0
+    complete = True
+    pending = [root]
+    directories = 0
+    entries_seen = 0
+    while pending:
+        directory = pending.pop()
+        directories += 1
+        if directories > MAX_DETRITUS_DIRECTORIES:
+            complete = False
+            break
+        try:
+            entries = _scan_entries(directory)
+        except OSError:
+            complete = False
+            continue
+        limit_hit = False
+        for _name, path, mode, size in entries:
+            entries_seen += 1
+            if entries_seen > MAX_DETRITUS_ENTRIES:
+                complete = False
+                limit_hit = True
+                break
+            if stat.S_ISDIR(mode):
+                pending.append(path)
+            elif stat.S_ISREG(mode):
+                files += 1
+                nbytes += size
+        if limit_hit:
+            break
+    return files, nbytes, complete
+
+
+def discover_session_detritus(
+    source: Path,
+    include_sessions: set[str] | None,
+) -> DetritusSummary:
+    """Find generated tool artifacts under ``session-state/<id>/files``.
+
+    Detects Chromium browser profiles, Python venvs, git clones, and
+    ``node_modules`` trees -- the recurring "scope creep" categories that get
+    written into session ``files/`` and should never be archived/synced (see
+    ``docs/deployment-topologies.md``).
+    """
+    state = source / "session-state"
+    try:
+        session_entries = _scan_entries(state)
+    except FileNotFoundError:
+        return DetritusSummary()
+
+    summaries = []
+    for sid, session_path, mode, _size in session_entries:
+        if not stat.S_ISDIR(mode):
+            continue
+        if include_sessions is not None and sid not in include_sessions:
+            continue
+        summary = discover_session_tree_detritus(session_path)
+        prefix = Path("session-state") / sid
+        summaries.append(
+            DetritusSummary(
+                tuple(prefix / root for root in summary.roots),
+                summary.file_count,
+                summary.byte_count,
+                summary.measurement_complete,
+            )
+        )
+    return merge_summaries(*summaries)
+
+
+def discover_session_tree_detritus(session: Path) -> DetritusSummary:
+    """Find generated tool artifacts below one session's ``files`` tree."""
+    files_root = session / "files"
+    try:
+        files_mode = os.lstat(windows_extended_path(files_root)).st_mode
+    except FileNotFoundError:
+        return DetritusSummary()
+    if not stat.S_ISDIR(files_mode) or is_link_or_reparse(files_root, files_mode):
+        return DetritusSummary()
+
+    pending: list[tuple[Path, int]] = [(files_root, 0)]
+    roots: list[Path] = []
+    file_count = 0
+    byte_count = 0
+    measurement_complete = True
+    directories = 0
+    entries_seen = 0
+    while pending:
+        directory, depth = pending.pop()
+        directories += 1
+        if directories > MAX_DETRITUS_DIRECTORIES:
+            raise OSError(
+                f"detritus discovery exceeds {MAX_DETRITUS_DIRECTORIES} directories"
+            )
+        entries = _scan_entries(directory)
+        entries_seen += len(entries)
+        if entries_seen > MAX_DETRITUS_ENTRIES:
+            raise OSError(
+                f"detritus discovery exceeds {MAX_DETRITUS_ENTRIES} entries"
+            )
+        if _is_detritus_root(directory.name, entries):
+            roots.append(directory.relative_to(session))
+            if len(roots) > MAX_DETRITUS_ROOTS:
+                raise OSError(
+                    f"detritus discovery exceeds {MAX_DETRITUS_ROOTS} roots"
+                )
+            files, nbytes, complete = _measure_tree(directory)
+            file_count += files
+            byte_count += nbytes
+            measurement_complete = measurement_complete and complete
+            continue
+        if depth >= MAX_DETRITUS_DEPTH:
+            continue
+        for _name, path, mode, _size in entries:
+            if stat.S_ISDIR(mode):
+                pending.append((path, depth + 1))
+    return DetritusSummary(
+        tuple(sorted(roots)),
+        file_count,
+        byte_count,
+        measurement_complete,
+    )
+
+
+def merge_summaries(*summaries: DetritusSummary) -> DetritusSummary:
+    """Combine independent bounded detections."""
+    return DetritusSummary(
+        tuple(sorted({root for summary in summaries for root in summary.roots})),
+        sum(summary.file_count for summary in summaries),
+        sum(summary.byte_count for summary in summaries),
+        all(summary.measurement_complete for summary in summaries),
+    )
+
+
+def is_excluded(relative: Path, roots: tuple[Path, ...]) -> bool:
+    """Return whether *relative* is at or below a detected detritus root."""
+    return any(relative == root or root in relative.parents for root in roots)
+
+
+def rsync_exclude(root: Path) -> str:
+    """Render one anchored rsync filter with literal path components."""
+    escaped = root.as_posix().replace("\\", "\\\\")
+    for character in ("*", "?", "[", "]"):
+        escaped = escaped.replace(character, f"\\{character}")
+    return f"--exclude=/{escaped}/***"

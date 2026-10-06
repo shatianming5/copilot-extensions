@@ -29,12 +29,18 @@ supports preview); otherwise it is skipped, never executed speculatively.
 
 from __future__ import annotations
 
+import json
+import os
+import re
+import shutil
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from agent_procutil import no_window_kwargs
 
+from .authority import AUTHORITY_MODE_OPAQUE_ADDITIVE, effective_authority
 from .manifest import RequirementPackage
 
 #: Per-platform block fallbacks: a wsl module may reuse the linux block.
@@ -55,6 +61,9 @@ class ModuleResult:
     skipped_reason: str | None = None
     stdout_tail: str = ""
     stderr_tail: str = ""
+    package: str = ""
+    authority: int = 0
+    authority_mode: str = AUTHORITY_MODE_OPAQUE_ADDITIVE
 
     @property
     def ok(self) -> bool:
@@ -68,6 +77,19 @@ def platform_block(module: dict[str, Any], plat: str) -> dict[str, Any] | None:
         if isinstance(block, dict) and block.get("command"):
             return block
     return None
+
+
+def invocation_block(module: dict[str, Any], plat: str) -> dict[str, Any] | None:
+    """Return a payload-attributable invocation supported on ``plat``."""
+    invocation = module.get("invocation")
+    if not isinstance(invocation, dict):
+        return None
+    platforms = invocation.get("platforms")
+    if platforms and plat not in platforms:
+        return None
+    if not invocation.get("plugin") or not invocation.get("command"):
+        return None
+    return invocation
 
 
 def module_applies(module: dict[str, Any], pkg: RequirementPackage, machine: str) -> bool:
@@ -85,14 +107,114 @@ def resolve_modules(
     out: list[tuple[RequirementPackage, dict[str, Any]]] = []
     for pkg in packages:
         for module in pkg.modules:
-            if module_applies(module, pkg, machine) and platform_block(module, plat):
+            if module_applies(module, pkg, machine) and (
+                platform_block(module, plat) or invocation_block(module, plat)
+            ):
                 out.append((pkg, module))
-    return out
+    return sorted(
+        out,
+        key=lambda item: (
+            item[0].source_repo,
+            item[0].name,
+            str(item[1].get("name")),
+        ),
+    )
 
 
 def _tail(text: str, limit: int = 4000) -> str:
     text = text or ""
     return text if len(text) <= limit else text[-limit:]
+
+
+def _active_plugins():
+    from plugin_activation import resolve_active_plugins
+
+    return resolve_active_plugins().active
+
+
+def _payload_invocation_command(
+    invocation: dict[str, Any],
+    plat: str,
+) -> tuple[list[str], dict[str, str]]:
+    source = str(invocation["plugin"])
+    command_name = str(invocation["command"])
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", command_name) is None:
+        raise RuntimeError(f"invalid payload command id: {command_name!r}")
+    active = _active_plugins().get(source)
+    if active is None:
+        raise RuntimeError(f"required active plugin is unavailable: {source}")
+    payload = active.root.resolve()
+    descriptor_path = payload / "payload-invocation.json"
+    try:
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"cannot read payload invocation for {source}: {exc}"
+        ) from exc
+    if not isinstance(descriptor, dict) or descriptor.get("version") not in (1, 2):
+        raise RuntimeError(
+            f"plugin {source} has an invalid payload invocation descriptor"
+        )
+    raw_commands = descriptor.get("commands")
+    if raw_commands is None:
+        declared = [descriptor]
+    elif isinstance(raw_commands, list):
+        declared = [item for item in raw_commands if isinstance(item, dict)]
+    else:
+        declared = []
+    if not any(item.get("command") == command_name for item in declared):
+        raise RuntimeError(
+            f"plugin {source} does not declare payload command {command_name!r}"
+        )
+    output_dir = descriptor.get("outputDir", "bin")
+    output_path = Path(str(output_dir))
+    if (
+        not isinstance(output_dir, str)
+        or not output_dir
+        or output_path.is_absolute()
+        or re.match(r"^[A-Za-z]:", output_dir) is not None
+        or ".." in output_path.parts
+    ):
+        raise RuntimeError(f"plugin {source} has an invalid payload outputDir")
+    if plat == "windows":
+        windows_shim = descriptor.get("windowsCatalogShim", "powershell")
+        if windows_shim == "cmd":
+            shim = payload / output_path / f"{command_name}.cmd"
+            host = os.environ.get("COMSPEC") or shutil.which("cmd")
+            if host is None:
+                raise RuntimeError("cmd.exe is required for a Windows payload command")
+            command = [host, "/d", "/c", str(shim)]
+        elif windows_shim == "powershell":
+            shim = payload / output_path / f"{command_name}.ps1"
+            host = shutil.which("pwsh") or shutil.which("powershell")
+            if host is None:
+                raise RuntimeError(
+                    "PowerShell is required for a Windows payload command"
+                )
+            command = [
+                host,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(shim),
+            ]
+        else:
+            raise RuntimeError(
+                f"plugin {source} has an invalid windowsCatalogShim"
+            )
+    else:
+        shim = payload / output_path / command_name
+        command = [str(shim)]
+    try:
+        shim.resolve().relative_to(payload)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"payload command escapes plugin root: {shim}") from exc
+    if not shim.is_file():
+        raise RuntimeError(f"payload command shim is unavailable: {shim}")
+    env = dict(os.environ)
+    env["COPILOT_PLUGIN_ROOT"] = str(payload)
+    return command, env
 
 
 def run_module(
@@ -104,41 +226,91 @@ def run_module(
 ) -> ModuleResult:
     """Execute one repo-local module (or skip it) and capture the outcome."""
     name = str(module.get("name"))
+    authority = effective_authority(pkg, module)
+    metadata = {
+        "package": pkg.name,
+        "authority": authority,
+        "authority_mode": AUTHORITY_MODE_OPAQUE_ADDITIVE,
+    }
     repo_root = pkg.repo_root()
     block = platform_block(module, plat)
-    if block is None:
+    invocation = invocation_block(module, plat)
+    if block is None and invocation is None:
         return ModuleResult(name, pkg.source_repo, ran=False, dry_run=dry_run,
-                            skipped_reason=f"no command for platform '{plat}'")
+                            skipped_reason=f"no command for platform '{plat}'",
+                            **metadata)
     if repo_root is None:
         return ModuleResult(name, pkg.source_repo, ran=False, dry_run=dry_run,
-                            skipped_reason="could not derive repo root from package path")
+                            skipped_reason="could not derive repo root from package path",
+                            **metadata)
 
-    command = [str(c) for c in block.get("command", [])]
-    if dry_run:
+    env = None
+    if invocation is not None:
+        try:
+            command, env = _payload_invocation_command(invocation, plat)
+        except RuntimeError as exc:
+            return ModuleResult(
+                name,
+                pkg.source_repo,
+                ran=True,
+                dry_run=dry_run,
+                returncode=127,
+                stderr_tail=str(exc),
+                **metadata,
+            )
+        command.extend(str(arg) for arg in invocation.get("arguments", []))
+        mode_args = (
+            invocation.get("dry_run_arguments")
+            if dry_run
+            else invocation.get("apply_arguments", [])
+        )
+        if dry_run and not mode_args:
+            return ModuleResult(
+                name,
+                pkg.source_repo,
+                ran=False,
+                dry_run=True,
+                command=command,
+                skipped_reason=(
+                    "payload invocation declares no dry_run_arguments "
+                    "(skipped in dry-run)"
+                ),
+                **metadata,
+            )
+        command.extend(str(arg) for arg in (mode_args or []))
+    else:
+        assert block is not None
+        command = [str(c) for c in block.get("command", [])]
         dry_args = block.get("dry_run_args")
-        if not dry_args:
-            # Never run a mutating module speculatively during a dry-run.
+        if not dry_run:
+            dry_args = None
+        if dry_run and not dry_args:
             return ModuleResult(
                 name, pkg.source_repo, ran=False, dry_run=True, command=command,
                 skipped_reason="module declares no dry_run_args (skipped in dry-run)",
+                **metadata,
             )
-        command = command + [str(a) for a in dry_args]
+        if dry_args:
+            command = command + [str(a) for a in dry_args]
 
     try:
         proc = subprocess.run(  # noqa: S603 - argv list, repo-declared trusted module
             command, cwd=str(repo_root), capture_output=True,
             encoding="utf-8", errors="replace", timeout=timeout,
+            env=env,
             **no_window_kwargs(),
         )
     except FileNotFoundError as exc:
         return ModuleResult(name, pkg.source_repo, ran=False, dry_run=dry_run, command=command,
-                            skipped_reason=f"interpreter not found: {exc}")
+                            skipped_reason=f"interpreter not found: {exc}", **metadata)
     except subprocess.TimeoutExpired:
         return ModuleResult(name, pkg.source_repo, ran=True, dry_run=dry_run, command=command,
-                            returncode=124, stderr_tail=f"timed out after {timeout}s")
+                            returncode=124, stderr_tail=f"timed out after {timeout}s",
+                            **metadata)
     return ModuleResult(
         name, pkg.source_repo, ran=True, dry_run=dry_run, returncode=proc.returncode,
         command=command, stdout_tail=_tail(proc.stdout), stderr_tail=_tail(proc.stderr),
+        **metadata,
     )
 
 
@@ -149,4 +321,46 @@ def run_modules(
     results: list[ModuleResult] = []
     for pkg, module in resolve_modules(packages, machine, plat):
         results.append(run_module(pkg, module, plat, dry_run))
+    return results
+
+
+#: Shown for every module under a maintenance-safe restore -- modules run
+#: arbitrary repo-local commands (git config, PATH edits, power settings,
+#: package-manager feed configuration, ...) with no per-module opt-in
+#: equivalent to a resource's ``maintenance_safe: true`` yet, so none of them
+#: are safe to execute unattended by default (agent-machines#uv-feed-sweep).
+MAINTENANCE_SAFE_MODULE_SKIP_REASON = (
+    "not maintenance-safe (modules run arbitrary repo-local commands with no "
+    "per-module opt-in yet; run a full restore, or pass --only <module> "
+    "explicitly, to execute it)"
+)
+
+
+def maintenance_safe_skip_results(
+    packages: list[RequirementPackage], machine: str, plat: str, dry_run: bool
+) -> list[ModuleResult]:
+    """Report every applicable module as skipped, without running any of them.
+
+    Used by a ``--maintenance-safe`` restore in place of :func:`run_modules`:
+    modules have no granular safety opt-in the way typed ``resources:`` do, so
+    the whole category stays out of unattended runs by default rather than
+    executing arbitrary repo-local commands (which could touch python/node/az
+    cli/auth/etc.) with no operator review.
+    """
+    results: list[ModuleResult] = []
+    for pkg, module in resolve_modules(packages, machine, plat):
+        name = str(module.get("name"))
+        authority = effective_authority(pkg, module)
+        results.append(
+            ModuleResult(
+                name,
+                pkg.source_repo,
+                ran=False,
+                dry_run=dry_run,
+                skipped_reason=MAINTENANCE_SAFE_MODULE_SKIP_REASON,
+                package=pkg.name,
+                authority=authority,
+                authority_mode=AUTHORITY_MODE_OPAQUE_ADDITIVE,
+            )
+        )
     return results

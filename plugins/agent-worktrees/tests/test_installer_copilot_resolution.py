@@ -28,6 +28,13 @@ def _bash() -> str | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
+    if os.name == "nt":
+        cygpath = subprocess.run(
+            [candidate, "-c", "command -v cygpath >/dev/null 2>&1"],
+            timeout=30,
+        )
+        if cygpath.returncode != 0:
+            return None
     return candidate if probe.returncode == 7 else None
 
 
@@ -148,6 +155,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseInput(
     $source, [ref]$tokens, [ref]$errors
 )
 foreach ($name in @(
+    'Resolve-WinGetPackageExecutable',
     'Get-ApplicationPath',
     'Get-CurrentPowerShellPath',
     'Resolve-CopilotCommand'
@@ -157,6 +165,7 @@ foreach ($name in @(
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
             $node.Name -eq $name
     }, $true)
+    if (-not $functionAst) { throw "Missing installer function: $name" }
     Invoke-Expression $functionAst.Extent.Text
 }
 

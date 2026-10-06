@@ -28,6 +28,8 @@ from typing import BinaryIO, cast
 
 from agent_procutil import no_window_flags
 
+from . import _peer_launch
+from ._invoke import payload_binstub
 from .config import RESTRICTED_PROFILE, RUNTIME_DIR, STATE_DIR
 from .lease import (
     ProviderAdmissionError,
@@ -72,7 +74,8 @@ class SessionRequest:
 
 def provider_module_path() -> Path:
     """Return the provider-owned agent-ssh transport module path."""
-    runtime_root = Path(os.environ.get("AGENT_RT_ROOT", "~/.agent-containers")).expanduser()
+    _default = "~/.agent-containers"  # marketplace-isolation: allow legacy compatibility root
+    runtime_root = Path(os.environ.get("AGENT_RT_ROOT", _default)).expanduser()
     marker = runtime_root / "payload-dir"
     try:
         payload_root = Path(marker.read_text(encoding="utf-8").strip())
@@ -225,9 +228,12 @@ def ssh_profile_spec(
             }
         ],
     }
-    provider_binary = shutil.which("agent-containers")
-    if provider_binary:
-        registry["proxy_command_binary"] = provider_binary
+    provider_binary = payload_binstub()
+    if provider_binary is None:
+        raise RuntimeError(
+            "agent-containers payload-local shim is unavailable; refusing provider-exec profile"
+        )
+    registry["proxy_command_binary"] = str(provider_binary)
     result = {
         "schema_version": 1,
         "module": str(provider_module_path()),
@@ -310,9 +316,8 @@ def _profile_registry_path() -> Path:
 
 
 def _source_registry_path() -> Path:
-    root = Path(
-        os.environ.get("AGENT_WORKTREES_SOURCES_DIR", "~/.agent-worktrees/sources")
-    ).expanduser()
+    _default = "~/.agent-worktrees/sources"  # marketplace-isolation: allow registry
+    root = Path(os.environ.get("AGENT_WORKTREES_SOURCES_DIR", _default)).expanduser()
     return root / "agent-containers.json"
 
 
@@ -508,6 +513,45 @@ def _profile_registry_lock():
             pass
 
 
+def _agent_ssh_prefix() -> list[str]:
+    """Resolve the invocation prefix for the required agent-ssh peer.
+
+    Under an explicit same-cell installation context, this validates the
+    owner and resolves agent-ssh as a same-cell peer via the shared
+    ``libs/peer-launch`` boundary (agent-ssh is itself a canonical
+    installation-context adopter, so its receipt/governance contract
+    matches the already-converted agent-worktrees/agent-bridge peers).
+    A missing same-cell agent-ssh installation is a refusal, not an
+    optional absence -- profile emission always requires it. Legacy
+    ambient-PATH resolution is unchanged when no explicit context is
+    present.
+    """
+    raw = os.environ.get(_peer_launch.CONTEXT_ENV, "")
+    if not raw:
+        exe = shutil.which("agent-ssh")  # marketplace-isolation: allow legacy-compatibility
+        if not exe:
+            raise RuntimeError(
+                "agent-ssh is required to emit provider-exec profiles but is not on PATH"
+            )
+        return [exe]
+    try:
+        own = _peer_launch.validate_owner("agent-containers", RUNTIME_DIR, raw)
+    except (OSError, ValueError, ImportError) as error:
+        raise _peer_launch.ContextRefused(
+            f"Containers installation context refused: {error}"
+        ) from error
+    peer = Path(own["cellRoot"]) / "plugins" / "agent-ssh"
+    if not peer.exists() and not peer.is_symlink():
+        raise _peer_launch.ContextRefused(
+            "agent-ssh is required to emit provider-exec profiles but has no "
+            "same-cell installation"
+        )
+    return _peer_launch.launch_prefix(
+        "agent-containers", Path(own["pluginRoot"]),
+        os.environ[_peer_launch.CONTEXT_ENV], "agent-ssh",
+    )
+
+
 def emit_ssh_profile(
     name: str,
     alias: str | None = None,
@@ -517,11 +561,7 @@ def emit_ssh_profile(
     label: str | None = None,
 ) -> int:
     """Persist provider metadata and ask agent-ssh to publish the named alias."""
-    agent_ssh = shutil.which("agent-ssh")
-    if not agent_ssh:
-        raise RuntimeError(
-            "agent-ssh is required to emit provider-exec profiles but is not on PATH"
-        )
+    agent_ssh_prefix = _agent_ssh_prefix()
     spec = (
         ssh_profile_spec(name, alias, project=project, label=label)
         if project is not None or label is not None
@@ -581,7 +621,7 @@ def emit_ssh_profile(
             )
         atomic_write_json(active_registry, merged, indent=2)
         command = [
-            agent_ssh,
+            *agent_ssh_prefix,
             "emit-profile",
             str(active_registry),
             "--module",

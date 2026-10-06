@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-plugin-activation"
-version = "0.1.0-dev2"
+version = "0.1.0-dev7"
 description = "Inspect plugin inventory and activation and resolve identity-verified roots"
 readme = "README.md"
 license = "MIT"
@@ -19,8 +19,8 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-agent-dropin-registry = { path = "../dropin-registry" }
-agent-plugin-resolve = { path = "../plugin-resolve" }
+agent-dropin-registry = { path = "../dropin-registry", editable = true }
+agent-plugin-resolve = { path = "../plugin-resolve", editable = true }
 
 [tool.setuptools.packages.find]
 where = ["src"]

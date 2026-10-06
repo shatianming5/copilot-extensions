@@ -6,6 +6,17 @@
 # Generic + self-locating: byte-identical across provider plugins. Safe +
 # best-effort: exit 0 (never block/raise) if anything is missing.
 $ErrorActionPreference = 'SilentlyContinue'
+$script:SessionStartJsonEmitted = $false
+function Write-SessionStartJson {
+    if (-not $script:SessionStartJsonEmitted) {
+        [Console]::Out.Write('{}')
+        $script:SessionStartJsonEmitted = $true
+    }
+}
+function Exit-SessionStart {
+    Write-SessionStartJson
+    exit 0
+}
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PluginDir = Split-Path -Parent $ScriptDir
@@ -14,29 +25,29 @@ try {
     $name = (Get-Content (Join-Path $PluginDir 'plugin.json') -Raw | ConvertFrom-Json).name
 } catch { $name = $null }
 if (-not $name) { $name = Split-Path -Leaf $PluginDir }
-if (-not $name) { exit 0 }
+if (-not $name) { Exit-SessionStart }
 
 $template = Join-Path $PluginDir 'references\bridge-provider.json'
-if (-not (Test-Path $template)) { exit 0 }
+if (-not (Test-Path $template)) { Exit-SessionStart }
 
-# Binstub location is a fixed agent-* runtime convention
-# (%USERPROFILE%\.local\bin\<name>.cmd -- a .cmd is directly runnable by the
-# daemon's subprocess call, a .ps1 is not).
-$binstub = Join-Path $env:USERPROFILE ".local\bin\$name.cmd"
-if (-not (Test-Path $binstub)) { exit 0 }
+# Use the payload-local shim, not the mutable machine-global compatibility
+# binstub, so providers stay bound to the exact payload root the current
+# installation context selected.
+$binstub = Join-Path $PluginDir "bin\$name.cmd"
+if (-not (Test-Path $binstub)) { Exit-SessionStart }
 
 if ($env:AGENT_BRIDGE_PROVIDERS_DIR) {
     $dir = $env:AGENT_BRIDGE_PROVIDERS_DIR
 } elseif ($env:AGENT_BRIDGE_CONFIG_DIR) {
     $dir = Join-Path $env:AGENT_BRIDGE_CONFIG_DIR 'providers.d'
 } else {
-    $dir = Join-Path $env:USERPROFILE '.agent-bridge\providers.d'
+    $dir = Join-Path $env:USERPROFILE '.agent-bridge\providers.d' # marketplace-isolation: allow legacy compatibility root
 }
-try { New-Item -ItemType Directory -Force -Path $dir | Out-Null } catch { exit 0 }
+try { New-Item -ItemType Directory -Force -Path $dir | Out-Null } catch { Exit-SessionStart }
 
 try {
     $data = Get-Content $template -Raw | ConvertFrom-Json
-} catch { exit 0 }
+} catch { Exit-SessionStart }
 $data | Add-Member -NotePropertyName command -NotePropertyValue @($binstub) -Force
 $data | Add-Member -NotePropertyName plugin_root -NotePropertyValue ([IO.Path]::GetFullPath($PluginDir)) -Force
 
@@ -64,5 +75,5 @@ try {
             Remove-Item -LiteralPath $tmp, $backup -Force -ErrorAction SilentlyContinue
         }
     }
-} catch { exit 0 }
-exit 0
+} catch { Exit-SessionStart }
+Exit-SessionStart

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+import sys
 import time
+import types
 
 from agent_codespaces.lease import Lease
 from agent_codespaces.lifecycle import CodespaceInfo
@@ -350,6 +354,8 @@ def test_picker_payload_shape_and_summary():
     assert by["held"]["repo"] == "web-cs"          # short repo (trailing segment)
     assert by["held"]["cores"] == "8"
     assert by["held"]["id"] == "held"              # id mirrors name for the pivot
+    assert by["held"]["has_driving_worktree"] == "false"
+    assert by["held"]["worktree_id"] == ""
     # free/stopped entry: no holder, health=stopped, use=free.
     assert by["free"]["holder"] == ""
     assert by["free"]["health"] == "stopped"
@@ -433,6 +439,8 @@ def test_orphaned_claim_flagged_when_worktree_path_gone(tmp_path):
     assert e["occupancy"] == "orphan"    # -> the magenta ORPHAN palette cell
     assert e["disposition"] == IN_USE    # unchanged: Release verb still gates on
     assert e["worktree"] == "example-cloud1-win-DEAD-9f3a"  # which lock is stale
+    assert e["has_driving_worktree"] == "true"
+    assert e["worktree_id"] == "example-cloud1-win-DEAD-9f3a"
 
 
 def test_live_claim_not_flagged_orphaned(tmp_path):
@@ -453,6 +461,8 @@ def test_live_claim_not_flagged_orphaned(tmp_path):
     assert e["orphaned"] is False
     assert e["occupancy"] == IN_USE      # mirrors disposition when not orphaned
     assert e["worktree"] == "example-cloud1-win-LIVE-1a2b"
+    assert e["has_driving_worktree"] == "true"
+    assert e["worktree_id"] == "example-cloud1-win-LIVE-1a2b"
 
 
 def test_advisory_borrow_never_orphaned():
@@ -470,6 +480,62 @@ def test_advisory_borrow_never_orphaned():
     e = picker_payload(members, budget)["entries"][0]
     assert e["occupancy"] == IN_USE
     assert e["worktree"] == "my-effort"  # advisory borrow surfaces via effort id
+
+
+def test_picker_payload_effort_lease_resolves_journaled_claim_owner(monkeypatch):
+    from agent_codespaces import pool as pool_mod
+    now = time.time()
+    borrow = Lease(codespace="held", effort="my-effort", pid=1, host="dev6",
+                   acquired_at=now, heartbeat_at=now)
+    members, budget = build_pool(
+        budget_cores=64, now=now, codespaces=[_cs("held", state="Available")],
+        leases=[borrow], markers={},
+    )
+    monkeypatch.setattr(
+        pool_mod,
+        "codespace_claim_owner_worktrees",
+        lambda names: {"held": "example-win-FEAT-1a2b"},
+    )
+    monkeypatch.setattr(
+        pool_mod,
+        "_claims_summary_for_worktree",
+        lambda worktree_id: f"claims:{worktree_id}" if worktree_id else "",
+    )
+    monkeypatch.setattr(
+        pool_mod,
+        "_worktree_status_for_worktree",
+        lambda worktree_id: {"title": f"Worktree {worktree_id}"},
+    )
+    e = pool_mod.picker_payload(members, budget)["entries"][0]
+    assert e["worktree"] == "example-win-FEAT-1a2b"
+    assert e["worktree_id"] == "example-win-FEAT-1a2b"
+    assert e["has_driving_worktree"] == "true"
+    assert e["claims_summary"] == "claims:example-win-FEAT-1a2b"
+    assert e["worktree_status"]["title"] == "Worktree example-win-FEAT-1a2b"
+
+
+def test_picker_payload_unresolved_effort_lease_keeps_idle_sess(monkeypatch):
+    """An effort-held CodeSpace whose owner can't be resolved still reads as
+    driven (IDLE) and still looks its claims up by the effort label."""
+    from agent_codespaces import pool as pool_mod
+    now = time.time()
+    borrow = Lease(codespace="held", effort="my-effort", pid=1, host="dev6",
+                   acquired_at=now, heartbeat_at=now)
+    members, budget = build_pool(
+        budget_cores=64, now=now, codespaces=[_cs("held", state="Available")],
+        leases=[borrow], markers={},
+    )
+    seen = []
+    monkeypatch.setattr(pool_mod, "codespace_claim_owner_worktrees", lambda names: {})
+    monkeypatch.setattr(
+        pool_mod, "_claims_summary_for_worktree",
+        lambda worktree_id: seen.append(worktree_id) or "",
+    )
+    e = pool_mod.picker_payload(members, budget)["entries"][0]
+    assert e["worktree"] == "my-effort"
+    assert e["has_driving_worktree"] == "false"
+    assert e["sess"] == "IDLE"
+    assert seen == ["my-effort"]
 
 
 def test_picker_payload_friendly_name_and_subtitle():
@@ -497,6 +563,31 @@ def test_picker_payload_friendly_name_and_subtitle():
     # Free box: display falls back to name; no redundant id, no claim -> blank subtitle.
     assert by["free"]["display"] == "free"
     assert by["free"]["subtitle"] == ""
+
+
+def test_real_manifest_maps_picker_payload_subtitle():
+    """Regression guard for the original dropped-field bug: the shipped
+    manifest must still map the real computed ``subtitle`` field."""
+    import time as _t
+    from agent_codespaces.pool import picker_payload
+
+    now = _t.time()
+    lease = Lease(codespace="held", effort="my-effort", pid=1, host="dev6",
+                  acquired_at=now, heartbeat_at=now)
+    held = CodespaceInfo(name="held", display_name="my-feature", repository="o/web-cs",
+                         branch="main", state="Available", machine="premiumLinux",
+                         account="acct1", last_used_at="")
+    members, budget = build_pool(now=now, codespaces=[held], leases=[lease], markers={})
+    entry = picker_payload(members, budget)["entries"][0]
+
+    manifest_path = Path(__file__).resolve().parents[1] / "pivots" / "agent-codespaces.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    subtitle_field = manifest["entry"]["subtitle"]
+
+    assert subtitle_field == "subtitle"
+    assert entry["subtitle"]
+    assert "claimed by my-effort on dev6" in entry[subtitle_field]
+    assert entry[subtitle_field] == entry["subtitle"]
 
 
 def test_picker_payload_group_status_worktree():
@@ -531,6 +622,501 @@ def test_picker_payload_status_stale_and_stopped():
     assert by["s"]["status"] == "STALE"
     assert by["f"]["status"] == "STOPPED"
     assert by["s"]["worktree"] == ""         # unclaimed
+
+
+# --- claims_summary (picker-venue-pivots Phase 1) --------------------------
+
+def test_picker_payload_claims_summary_wired_from_resolved_worktree(monkeypatch):
+    """The ``claims_summary`` entry field is the claiming worktree's ranked
+    claims-list (via the shared ``agent_worktrees.claims_rank`` module),
+    looked up by the resolved driving worktree id, not an effort label."""
+    import time as _t
+    from agent_codespaces.pool import picker_payload
+    now = _t.time()
+    lease = Lease(codespace="held", effort="3bac", pid=1, host="dev6",
+                  acquired_at=now, heartbeat_at=now)
+    held = CodespaceInfo(name="held", display_name="my-feature",
+                         repository="o/web-codespaces", branch="main",
+                         state="Available", machine="premiumLinux", account="a",
+                         last_used_at="")
+    members, budget = build_pool(now=now, codespaces=[held], leases=[lease], markers={})
+    seen_ids = []
+    monkeypatch.setattr(
+        "agent_codespaces.pool.codespace_claim_owner_worktrees",
+        lambda names: {"held": "wt-claiming"},
+    )
+    monkeypatch.setattr(
+        "agent_codespaces.pool._claims_summary_for_worktree",
+        lambda worktree_id: seen_ids.append(worktree_id) or "PR #2481",
+    )
+    e = picker_payload(members, budget)["entries"][0]
+    assert seen_ids == ["wt-claiming"]       # looked up by the driving worktree id
+    assert e["claims_summary"] == "PR #2481"
+
+
+def test_picker_payload_claims_summary_blank_when_unclaimed():
+    import time as _t
+    from agent_codespaces.pool import picker_payload
+    now = _t.time()
+    free = CodespaceInfo(name="free", display_name="", repository="o/web-codespaces",
+                         branch="main", state="Shutdown", machine="premiumLinux",
+                         account="a", last_used_at="")
+    members, budget = build_pool(now=now, codespaces=[free], leases=[], markers={})
+    e = picker_payload(members, budget)["entries"][0]
+    assert e["claims_summary"] == ""
+
+
+def test_claims_summary_for_worktree_degrades_gracefully_without_agent_worktrees():
+    """agent-codespaces does not depend on agent-worktrees (see pyproject.toml);
+    in an environment where it isn't installed alongside, the lookup must
+    degrade to `` "" `` rather than raise."""
+    from agent_codespaces.pool import _claims_summary_for_worktree
+    assert _claims_summary_for_worktree("") == ""
+    assert _claims_summary_for_worktree("some-worktree-id") == ""
+
+
+def test_codespace_claim_owner_worktrees_prefers_single_active(monkeypatch):
+    from agent_codespaces.driving_worktrees import codespace_claim_owner_worktrees
+
+    class _ClaimsOwner:
+        @staticmethod
+        def find_claim_owners_for_refs(kind, refs):
+            assert kind == "codespace"
+            return {
+                "cs-one": [
+                    {"worktree_id": "wt-old", "status": "pushed"},
+                    {"worktree_id": "wt-active", "status": "active"},
+                ],
+                "cs-two": [
+                    {"worktree_id": "wt-a", "status": "active"},
+                    {"worktree_id": "wt-b", "status": "active"},
+                ],
+            }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "agent_worktrees",
+        types.SimpleNamespace(claims_owner=_ClaimsOwner),
+    )
+    assert codespace_claim_owner_worktrees(["cs-one", "cs-two"]) == {
+        "cs-one": "wt-active",
+    }
+
+
+def test_codespace_claim_owner_worktrees_degrades_without_agent_worktrees(monkeypatch):
+    from agent_codespaces.driving_worktrees import codespace_claim_owner_worktrees
+    monkeypatch.setitem(sys.modules, "agent_worktrees", None)
+    assert codespace_claim_owner_worktrees(["cs-one"]) == {}
+
+
+# --- agent-bridge live-session join (picker-venue-pivots Phase 1) ---------
+
+def test_sess_column_live_when_liveness_active_or_stalled():
+    from agent_codespaces.pool import _sess_column
+    assert _sess_column({"liveness": "active"}, "3bac") == "LIVE"
+    assert _sess_column({"liveness": "stalled"}, "3bac") == "LIVE"
+
+
+def test_sess_column_idle_when_driving_but_not_live():
+    from agent_codespaces.pool import _sess_column
+    assert _sess_column(None, "3bac") == "IDLE"
+    assert _sess_column({"liveness": "idle"}, "3bac") == "IDLE"
+
+
+def test_sess_column_blank_when_nothing_driving():
+    from agent_codespaces.pool import _sess_column
+    assert _sess_column(None, "") == ""
+    assert _sess_column({"liveness": "active"}, "") == "LIVE"  # a live session
+    # with no resolved worktree id still reads LIVE -- the signal itself is
+    # authoritative; only the *absence* of both falls back to blank.
+
+
+def test_activity_from_live_session_composes_phase_and_summary():
+    from agent_codespaces.pool import _activity_from_live_session
+    assert _activity_from_live_session(None) == ""
+    assert _activity_from_live_session({"latest_progress": None}) == ""
+    assert _activity_from_live_session({"latest_progress": {}}) == ""
+    assert (
+        _activity_from_live_session(
+            {"latest_progress": {"summary": "wiring claims_summary"}}
+        )
+        == "wiring claims_summary"
+    )
+    assert (
+        _activity_from_live_session(
+            {"latest_progress": {"phase": "impl", "summary": "wiring claims_summary"}}
+        )
+        == "impl: wiring claims_summary"
+    )
+
+
+def test_bridge_client_from_env_degrades_gracefully_without_agent_bridge():
+    """agent-codespaces does not depend on agent-bridge either; the lookup
+    must degrade to ``None`` rather than raise or exit."""
+    from agent_codespaces.pool import _bridge_client_from_env, _live_session_for_venue
+    assert _bridge_client_from_env() is None
+    assert _live_session_for_venue("codespace", "held") is None
+
+
+def test_picker_payload_live_session_join_wires_sess_and_activity(monkeypatch):
+    """The ``sess``/``subtitle`` fields reflect a matching agent-bridge live
+    session, looked up by ``venue.kind == "codespace"`` + this box's own name."""
+    import time as _t
+    from agent_codespaces.pool import picker_payload
+    now = _t.time()
+    lease = Lease(codespace="held", effort="3bac", pid=1, host="dev6",
+                  acquired_at=now, heartbeat_at=now)
+    held = CodespaceInfo(name="held", display_name="held", repository="o/web-cs",
+                         branch="main", state="Available", machine="premiumLinux",
+                         account="a", last_used_at="")
+    members, budget = build_pool(now=now, codespaces=[held], leases=[lease], markers={})
+    seen = []
+
+    def fake_join(kind, target):
+        seen.append((kind, target))
+        return {"session_id": "sid-7", "liveness": "active",
+                "latest_progress": {"phase": "impl", "summary": "wiring"}}
+
+    monkeypatch.setattr("agent_codespaces.pool._live_session_for_venue", fake_join)
+    e = picker_payload(members, budget)["entries"][0]
+    assert seen == [("codespace", "held")]
+    assert e["sess"] == "LIVE"
+    assert e["subtitle"].endswith("impl: wiring")
+    assert e["activity"] == "impl: wiring"  # the worktree-row worker line's source
+    assert e["effort"] == "3bac"            # claim owner, for an attach's --effort
+    assert e["session_id"] == "sid-7"       # Send message target
+    assert "claimed by 3bac on dev6" in e["subtitle"]  # durable half preserved
+
+
+def test_driving_worktree_mark_added_for_claim_owned_rows(tmp_path):
+    import time as _t
+    from agent_codespaces.pool import picker_payload
+    now = _t.time()
+    live = tmp_path / "worktrees" / "example-cloud1-win-LIVE-1a2b"
+    live.mkdir(parents=True)
+    claim = Lease(codespace="held", effort="", pid=1, host="dev6",
+                  acquired_at=now, heartbeat_at=now, worktree=str(live))
+    held = CodespaceInfo(name="held", display_name="held", repository="o/web-cs",
+                         branch="main", state="Available", machine="premiumLinux",
+                         account="a", last_used_at="")
+    members, budget = build_pool(now=now, codespaces=[held], leases=[claim], markers={})
+    e = picker_payload(members, budget)["entries"][0]
+    assert e["subtitle"].startswith("→ ")
+
+
+def test_worktree_status_card_present_for_resolved_driving_worktree(tmp_path):
+    import time as _t
+    from agent_codespaces.pool import picker_payload
+    now = _t.time()
+    live = tmp_path / "worktrees" / "example-cloud1-win-LIVE-1a2b"
+    live.mkdir(parents=True)
+    claim = Lease(codespace="held", effort="", pid=1, host="dev6",
+                  acquired_at=now, heartbeat_at=now, worktree=str(live))
+    held = CodespaceInfo(name="held", display_name="held", repository="o/web-cs",
+                         branch="main", state="Available", machine="premiumLinux",
+                         account="a", last_used_at="")
+    members, budget = build_pool(now=now, codespaces=[held], leases=[claim], markers={})
+    from agent_codespaces import pool as pool_mod
+    original = pool_mod._worktree_status_for_worktree
+    pool_mod._worktree_status_for_worktree = lambda worktree_id: {
+        "title": f"Worktree {worktree_id}",
+        "status": "active",
+        "link": None,
+        "body": "- Claims: PR #2481",
+    }
+    try:
+        e = picker_payload(members, budget)["entries"][0]
+    finally:
+        pool_mod._worktree_status_for_worktree = original
+    assert e["worktree_status"]["title"].startswith("Worktree example-cloud1-win-LIVE-1a2b")
+    assert e["worktree_status"]["status"]
+
+
+def test_worktree_status_card_unavailable_without_resolved_worktree():
+    import time as _t
+    from agent_codespaces.pool import picker_payload
+    now = _t.time()
+    held = CodespaceInfo(name="held", display_name="held", repository="o/web-cs",
+                         branch="main", state="Available", machine="premiumLinux",
+                         account="a", last_used_at="")
+    lease = Lease(codespace="held", effort="3bac", pid=1, host="dev6",
+                  acquired_at=now, heartbeat_at=now)
+    members, budget = build_pool(now=now, codespaces=[held], leases=[lease], markers={})
+    e = picker_payload(members, budget)["entries"][0]
+    assert e["has_driving_worktree"] == "false"
+    assert "No tracked driving worktree" in e["worktree_status"]["body"]
+
+
+def test_ado_remote_ref_parses_ssh_and_https_variants():
+    from agent_codespaces.pool import _ado_remote_ref
+    ssh = _ado_remote_ref("ssh://git@ssh.dev.azure.com/v3/ExampleOrg/ExampleProject/example-web")
+    https = _ado_remote_ref("https://dev.azure.com/ExampleOrg/ExampleProject/_git/example-web")
+    legacy = _ado_remote_ref("https://exampleorg.visualstudio.com/ExampleProject/_git/example-web")
+    optimized = _ado_remote_ref("https://exampleorg.visualstudio.com/Example-Web/_git/_optimized/example-web")
+    assert ssh and ssh.organization == "ExampleOrg" and ssh.project == "ExampleProject"
+    assert https and https.repository == "example-web"
+    assert legacy and legacy.host == "exampleorg.visualstudio.com"
+    assert optimized and optimized.project == "Example-Web" and optimized.repository == "example-web"
+
+
+def test_codespace_git_probe_parses_origin_and_branch(monkeypatch):
+    from agent_codespaces.pool import _codespace_git_probe
+
+    class _Proc:
+        returncode = 0
+        stdout = (
+            "origin=https://exampleorg.visualstudio.com/Example-Web/_git/example-web\n"
+            "branch=feature/operator/docs-navigation-minor-doc-fix\n"
+        )
+
+    monkeypatch.setattr(
+        "agent_codespaces.lifecycle.account_for_codespace",
+        lambda _codespace_name: "example-account",
+    )
+    monkeypatch.setattr(
+        "agent_codespaces.gh_account.env_for_account",
+        lambda account: {"EXAMPLE_ACCOUNT": account or ""},
+    )
+    monkeypatch.setattr("agent_codespaces.pool.subprocess.run", lambda *a, **k: _Proc())
+
+    origin, branch = _codespace_git_probe("cs-1")
+    assert origin == "https://exampleorg.visualstudio.com/Example-Web/_git/example-web"
+    assert branch == "feature/operator/docs-navigation-minor-doc-fix"
+
+
+def test_configured_workspace_repo_reads_merged_config(monkeypatch):
+    from agent_codespaces.pool import _configured_workspace_repo
+    import types
+
+    monkeypatch.setattr(
+        "agent_codespaces.config.load_merged_config",
+        lambda include_cwd=False: types.SimpleNamespace(
+            repos={
+                "example-org/example-web-codespaces": types.SimpleNamespace(
+                    workspace_repo="example-web",
+                ),
+            },
+        ),
+    )
+
+    assert (
+        _configured_workspace_repo("example-org/example-web-codespaces")
+        == "example-web"
+    )
+
+
+def test_configured_workspace_repo_ignores_non_string_value(monkeypatch):
+    from agent_codespaces.pool import _configured_workspace_repo
+    import types
+
+    monkeypatch.setattr(
+        "agent_codespaces.config.load_merged_config",
+        lambda include_cwd=False: types.SimpleNamespace(
+            repos={
+                "example-org/example-web-codespaces": types.SimpleNamespace(
+                    workspace_repo=123,
+                ),
+            },
+        ),
+    )
+
+    assert _configured_workspace_repo("example-org/example-web-codespaces") is None
+
+
+def test_auto_claim_workspace_pr_journals_existing_claim_ledger(monkeypatch):
+    from agent_codespaces.pool import _auto_claim_workspace_pr
+    import sys
+    import types
+
+    class _Record:
+        owner_ref = "machine/project/worktree#session"
+
+    fake_tracking = types.ModuleType("agent_worktrees.tracking")
+    fake_tracking.load_record_by_id = lambda worktree_id: _Record()
+    fake_pkg = types.ModuleType("agent_worktrees")
+    fake_pkg.tracking = fake_tracking
+    monkeypatch.setitem(sys.modules, "agent_worktrees", fake_pkg)
+    monkeypatch.setitem(sys.modules, "agent_worktrees.tracking", fake_tracking)
+    probe_calls: list[tuple[str, str | None, str | None]] = []
+    monkeypatch.setattr(
+        "agent_codespaces.pool._configured_workspace_repo",
+        lambda repository: None,
+    )
+    monkeypatch.setattr(
+        "agent_codespaces.pool._codespace_git_probe",
+        lambda codespace_name, repository=None, owner_worktree=None: (
+            probe_calls.append((codespace_name, repository, owner_worktree)),
+            "https://dev.azure.com/ExampleOrg/ExampleProject/_git/example-web",
+            "users/alex/topic",
+        )[1:],
+    )
+    monkeypatch.setattr(
+        "agent_codespaces.pool._workspace_pr_ref",
+        lambda codespace_name, branch, *, remote_url=None, expected_repository=None: "https://dev.azure.com/ExampleOrg/ExampleProject/_git/example-web/pullrequest/2481",
+    )
+    seen = []
+    monkeypatch.setattr(
+        "agent_codespaces.coordination.journal_claim",
+        lambda kind, ref, owner_ref: seen.append((kind, ref, owner_ref)) or True,
+    )
+
+    ref = _auto_claim_workspace_pr(
+        "cs-1",
+        "example-org/example-web",
+        "users/alex/topic",
+        "host-win-20260922-111111-a1c4",
+    )
+    assert ref and ref.endswith("/2481")
+    assert seen == [(
+        "pr",
+        "https://dev.azure.com/ExampleOrg/ExampleProject/_git/example-web/pullrequest/2481",
+        "machine/project/worktree#session",
+    )]
+    assert probe_calls == [("cs-1", "example-org/example-web", None)]
+
+
+def test_auto_claim_workspace_pr_returns_none_when_probe_repo_mismatches(monkeypatch):
+    from agent_codespaces.pool import _auto_claim_workspace_pr
+    import sys
+    import types
+
+    class _Record:
+        owner_ref = "machine/project/worktree#session"
+
+    fake_tracking = types.ModuleType("agent_worktrees.tracking")
+    fake_tracking.load_record_by_id = lambda worktree_id: _Record()
+    fake_pkg = types.ModuleType("agent_worktrees")
+    fake_pkg.tracking = fake_tracking
+    monkeypatch.setitem(sys.modules, "agent_worktrees", fake_pkg)
+    monkeypatch.setitem(sys.modules, "agent_worktrees.tracking", fake_tracking)
+    monkeypatch.setattr(
+        "agent_codespaces.pool._configured_workspace_repo",
+        lambda repository: "example-org/example-web",
+    )
+    probe_calls: list[tuple[str, str | None, str | None]] = []
+    monkeypatch.setattr(
+        "agent_codespaces.pool._codespace_git_probe",
+        lambda codespace_name, repository=None, owner_worktree=None: (
+            probe_calls.append((codespace_name, repository, owner_worktree)),
+            "https://dev.azure.com/ExampleOrg/OtherProject/_git/other-web",
+            "main",
+        )[1:3],
+    )
+    pr_ref_calls: list[tuple[str, str, str | None, str | None]] = []
+    monkeypatch.setattr(
+        "agent_codespaces.pool._workspace_pr_ref",
+        lambda codespace_name, branch, *, remote_url=None, expected_repository=None: (
+            pr_ref_calls.append((codespace_name, branch, remote_url, expected_repository)),
+            None,
+        )[1],
+    )
+
+    ref = _auto_claim_workspace_pr(
+        "cs-1",
+        "example-org/example-web-codespaces",
+        "main",
+        "host-win-20260922-111111-a1c4",
+    )
+    assert ref is None
+    assert probe_calls == [("cs-1", "example-org/example-web-codespaces", None)]
+    assert pr_ref_calls == [("cs-1", "main", "https://dev.azure.com/ExampleOrg/OtherProject/_git/other-web", "example-web")]
+
+
+def test_auto_claim_workspace_pr_uses_live_workspace_branch_and_remote(monkeypatch):
+    from agent_codespaces.pool import _auto_claim_workspace_pr
+    import sys
+    import types
+
+    class _Record:
+        owner_ref = "machine/project/worktree#session"
+
+    fake_tracking = types.ModuleType("agent_worktrees.tracking")
+    fake_tracking.load_record_by_id = lambda worktree_id: _Record()
+    fake_pkg = types.ModuleType("agent_worktrees")
+    fake_pkg.tracking = fake_tracking
+    monkeypatch.setitem(sys.modules, "agent_worktrees", fake_pkg)
+    monkeypatch.setitem(sys.modules, "agent_worktrees.tracking", fake_tracking)
+    monkeypatch.setattr(
+        "agent_codespaces.pool._configured_workspace_repo",
+        lambda repository: "example-web",
+    )
+    probe_calls: list[tuple[str, str | None, str | None]] = []
+    monkeypatch.setattr(
+        "agent_codespaces.pool._codespace_git_probe",
+        lambda codespace_name, repository=None, owner_worktree=None: (
+            probe_calls.append((codespace_name, repository, owner_worktree)),
+            "https://exampleorg.visualstudio.com/Example-Web/_git/example-web",
+            "feature/operator/docs-navigation-minor-doc-fix",
+        )[1:],
+    )
+    seen: list[tuple[str, str | None]] = []
+
+    def fake_pr_ref(codespace_name, branch, *, remote_url=None, expected_repository=None):
+        seen.append((branch, remote_url, expected_repository))
+        return "https://exampleorg.visualstudio.com/Example-Web/_git/example-web/pullrequest/2398823"
+
+    monkeypatch.setattr("agent_codespaces.pool._workspace_pr_ref", fake_pr_ref)
+    monkeypatch.setattr("agent_codespaces.coordination.journal_claim", lambda *a, **k: True)
+
+    ref = _auto_claim_workspace_pr(
+        "phase4-pr-autoclaim-validation-j6jw4jxww5v2qrj7",
+        "example-org/example-web-codespaces",
+        "main",
+        "operator-cloud1-win-20260921-180855-6e3c",
+    )
+    assert ref and ref.endswith("/2398823")
+    assert seen == [(
+        "feature/operator/docs-navigation-minor-doc-fix",
+        "https://exampleorg.visualstudio.com/Example-Web/_git/example-web",
+        "example-web",
+    )]
+    assert probe_calls == [(
+        "phase4-pr-autoclaim-validation-j6jw4jxww5v2qrj7",
+        "example-org/example-web-codespaces",
+        None,
+    )]
+
+
+def test_picker_payload_auto_claimed_pr_reads_like_existing_claim(monkeypatch, tmp_path):
+    import time as _t
+    from agent_codespaces.pool import picker_payload
+
+    now = _t.time()
+    live = tmp_path / "worktrees" / "host-win-20260922-111111-a1c4"
+    live.mkdir(parents=True)
+    claim = Lease(codespace="held", effort="", pid=1, host="dev6",
+                  acquired_at=now, heartbeat_at=now, worktree=str(live))
+    held = CodespaceInfo(name="held", display_name="held", repository="example-org/example-web",
+                         branch="users/alex/topic", state="Available", machine="premiumLinux",
+                         account="a", last_used_at="")
+    members, budget = build_pool(now=now, codespaces=[held], leases=[claim], markers={})
+    ledger: dict[str, str] = {}
+
+    def fake_auto_claim(_name, _repo, _branch, worktree_id):
+        ledger[worktree_id] = "PR #2481"
+        return "https://dev.azure.com/ExampleOrg/ExampleProject/_git/example-web/pullrequest/2481"
+
+    monkeypatch.setattr("agent_codespaces.pool._auto_claim_workspace_pr", fake_auto_claim)
+    monkeypatch.setattr(
+        "agent_codespaces.pool._claims_summary_for_worktree",
+        lambda worktree_id: ledger.get(worktree_id, ""),
+    )
+    e = picker_payload(members, budget)["entries"][0]
+    assert e["claims_summary"] == "PR #2481"
+
+
+def test_picker_payload_sess_blank_and_no_activity_when_no_live_session():
+    import time as _t
+    from agent_codespaces.pool import picker_payload
+    now = _t.time()
+    free = CodespaceInfo(name="free", display_name="", repository="o/web-cs",
+                         branch="main", state="Shutdown", machine="premiumLinux",
+                         account="a", last_used_at="")
+    members, budget = build_pool(now=now, codespaces=[free], leases=[], markers={})
+    e = picker_payload(members, budget)["entries"][0]
+    assert e["sess"] == ""
+    assert e["subtitle"] == ""
+    assert e["activity"] == ""
 
 
 # --- picker_stream_frames + diff_entries (D2 NDJSON streaming) -------------
@@ -582,7 +1168,7 @@ def test_diff_entries_no_change_is_empty():
     assert removed == []
 
 
-# --- plan_allocation (Phase 2 / #708): reuse-before-create, budget-bounded ----
+# --- plan_allocation (Phase 2b / #708): persist-for-workstream, budget-bounded
 
 
 def _lease_for(cs_name, effort="holder", host="dev6"):
@@ -592,7 +1178,7 @@ def _lease_for(cs_name, effort="holder", host="dev6"):
 
 
 def _plan(codespaces, *, repo, new_cores=0, budget_cores=64,
-          leases=None, markers=None, now=None):
+          leases=None, markers=None, now=None, workstream_box=None):
     from agent_codespaces.pool import build_pool, plan_allocation
 
     now = time.time() if now is None else now
@@ -600,69 +1186,101 @@ def _plan(codespaces, *, repo, new_cores=0, budget_cores=64,
         budget_cores=budget_cores, now=now, codespaces=codespaces,
         leases=leases or [], markers=markers or {},
     )
-    return plan_allocation(members, budget, repo=repo, new_cores=new_cores)
+    return plan_allocation(
+        members, budget, repo=repo, new_cores=new_cores,
+        workstream_box=workstream_box,
+    )
 
 
-def test_plan_reuse_matching_running_idle_no_create():
-    # A matching running idle box is reused -- no new create, no extra budget.
+def test_plan_resumes_this_workstreams_running_box():
+    # workstream_box names a box this workstream already claims -- resumed
+    # regardless of its disposition, no new create, no extra budget.
     from agent_codespaces.pool import ALLOC_REUSE
     d = _plan(
         [_cs("web1", state="Available", machine="premiumLinux",
              repo="o/web-codespaces")],
-        repo="web", new_cores=8,
+        repo="web", new_cores=8, workstream_box="web1",
     )
     assert d.action == ALLOC_REUSE
     assert d.codespace == "web1"
-    assert d.needed_cores == 0        # reusing a running box costs nothing
+    assert d.needed_cores == 0        # already running -- costs nothing
 
 
-def test_plan_reuse_wins_even_at_zero_headroom():
-    # The pool is full (8/8), but the sole box is a matching running idle -- reuse
-    # it (free) rather than report pressure. Proves reuse precedes the budget gate.
+def test_plan_resume_wins_even_at_zero_headroom():
+    # The pool is full (8/8), but the sole box is THIS workstream's own -- it
+    # already spends its cores, so resuming it never needs new headroom.
     from agent_codespaces.pool import ALLOC_REUSE
     d = _plan(
         [_cs("web1", state="Available", machine="premiumLinux",
              repo="o/web-codespaces")],
-        repo="web", new_cores=8, budget_cores=8,
+        repo="web", new_cores=8, budget_cores=8, workstream_box="web1",
     )
     assert d.action == ALLOC_REUSE
     assert d.codespace == "web1"
 
 
-def test_plan_reuse_prefers_running_over_stopped():
+def test_plan_resumes_this_workstreams_stopped_box_when_it_fits_headroom():
+    from agent_codespaces.pool import ALLOC_REUSE
+    d = _plan(
+        [_cs("warm", state="Shutdown", machine="largePremiumLinux",
+             repo="o/web-codespaces")],
+        repo="web", new_cores=8, budget_cores=64, workstream_box="warm",
+    )
+    assert d.action == ALLOC_REUSE
+    assert d.codespace == "warm"
+    assert d.needed_cores == 16       # boot cost, not the create hint
+
+
+def test_plan_workstream_box_still_resumes_even_over_headroom():
+    # Resuming your own persistent box is not gated by headroom at all in this
+    # planner -- it is the SAME box the workstream already spent budget on;
+    # Phase 4 staleness recycling (not this planner) is what would ever
+    # reclaim it if truly abandoned.
     from agent_codespaces.pool import ALLOC_REUSE
     d = _plan(
         [
-            _cs("warm", state="Shutdown", machine="premiumLinux",
-                repo="o/web-codespaces"),
-            _cs("hot", state="Available", machine="premiumLinux",
+            _cs("filler", state="Available", machine="xLargePremiumLinux",
+                repo="o/other"),
+            _cs("warm", state="Shutdown", machine="xLargePremiumLinux",
                 repo="o/web-codespaces"),
         ],
-        repo="web", new_cores=8,
+        repo="web", new_cores=4, budget_cores=40,
+        leases=[_lease_for("filler")], workstream_box="warm",
     )
     assert d.action == ALLOC_REUSE
-    assert d.codespace == "hot"       # running wins the reuse ranking
+    assert d.codespace == "warm"
 
 
-def test_plan_reuse_prefers_clean_over_idle():
-    from agent_codespaces.pool import ALLOC_REUSE
+def test_plan_missing_workstream_box_falls_through_to_create():
+    # Named but no longer in the pool (recycled/deleted out of band) -- never
+    # silently adopt a different box; create a fresh one instead.
+    from agent_codespaces.pool import ALLOC_CREATE
     d = _plan(
-        [
-            _cs("plain", state="Available", machine="premiumLinux",
-                repo="o/web-codespaces"),
-            _cs("rescued", state="Available", machine="premiumLinux",
-                repo="o/web-codespaces"),
-        ],
-        repo="web", new_cores=8,
-        markers={"rescued": STATE_RECOVERED},   # -> disposition CLEAN
+        [_cs("unrelated", state="Available", machine="premiumLinux",
+             repo="o/web-codespaces")],
+        repo="web", new_cores=8, budget_cores=64, workstream_box="gone",
     )
-    assert d.action == ALLOC_REUSE
-    assert d.codespace == "rescued"
+    assert d.action == ALLOC_CREATE
+
+
+def test_plan_no_workstream_box_never_borrows_an_idle_box_creates_instead():
+    # Phase 2b's core retirement: an idle/clean box for the SAME repo is no
+    # longer fair game just because it's free -- it may belong to another
+    # workstream that will come looking for it. No workstream_box -> create.
+    from agent_codespaces.pool import ALLOC_CREATE
+    d = _plan(
+        [_cs("someone_elses", state="Available", machine="premiumLinux",
+             repo="o/web-codespaces")],
+        repo="web", new_cores=8, budget_cores=64,
+    )
+    assert d.action == ALLOC_CREATE
+    assert d.needed_cores == 8
 
 
 def test_plan_no_reuse_with_headroom_creates():
+    # A matching box exists but is IN_USE (held) -- and even an unheld one
+    # would no longer be borrowed cross-workstream; headroom -> create.
     from agent_codespaces.pool import ALLOC_CREATE
-    # A matching box exists but is IN_USE (held) -> not reusable; headroom -> create.
     d = _plan(
         [_cs("busy", state="Available", machine="premiumLinux",
              repo="o/web-codespaces")],
@@ -672,38 +1290,6 @@ def test_plan_no_reuse_with_headroom_creates():
     assert d.action == ALLOC_CREATE
     assert d.codespace is None
     assert d.needed_cores == 8
-
-
-def test_plan_reuse_stopped_when_it_fits_headroom():
-    # Only a stopped matching idle box; booting it (16 cores) fits the headroom.
-    from agent_codespaces.pool import ALLOC_REUSE
-    d = _plan(
-        [_cs("warm", state="Shutdown", machine="largePremiumLinux",
-             repo="o/web-codespaces")],
-        repo="web", new_cores=8, budget_cores=64,
-    )
-    assert d.action == ALLOC_REUSE
-    assert d.codespace == "warm"
-    assert d.needed_cores == 16       # boot cost, not the create hint
-
-
-def test_plan_reuse_ignores_stopped_that_would_overflow_then_creates():
-    # A stopped matching box that would overflow the tiny headroom is NOT reused;
-    # a smaller create still fits -> create (never over-provision by reusing).
-    from agent_codespaces.pool import ALLOC_CREATE
-    d = _plan(
-        [
-            # fill 32/40 with a running IN_USE box -> headroom 8
-            _cs("filler", state="Available", machine="xLargePremiumLinux",
-                repo="o/other"),                       # 32 cores, held below
-            _cs("warm", state="Shutdown", machine="xLargePremiumLinux",
-                repo="o/web-codespaces"),              # 32-core boot > 8 headroom
-        ],
-        repo="web", new_cores=4, budget_cores=40,
-        leases=[_lease_for("filler")],
-    )
-    assert d.action == ALLOC_CREATE   # 4-core create fits the 8 headroom; 32-boot didn't
-    assert d.needed_cores == 4
 
 
 def test_plan_recycle_stale_running_when_full_then_create():
@@ -719,22 +1305,25 @@ def test_plan_recycle_stale_running_when_full_then_create():
     assert d.then_codespace is None
 
 
-def test_plan_recycle_then_reuse_stopped_candidate():
+def test_plan_recycle_then_create_never_reuses_a_stopped_stranger():
+    # Even when a stopped box for the same repo exists, recycling makes room
+    # for a FRESH create -- never for reusing that stranger box either (the
+    # cross-workstream reuse this replaces would have picked "warm" here).
     from agent_codespaces.pool import ALLOC_RECYCLE
     d = _plan(
         [
             _cs("old", state="Available", machine="premiumLinux",
                 repo="o/other"),                       # running STALE, 8 cores
             _cs("warm", state="Shutdown", machine="standardLinux32gb",
-                repo="o/web-codespaces"),              # stopped idle, 4-core boot
+                repo="o/web-codespaces"),              # stopped, unclaimed by us
         ],
         repo="web", new_cores=8, budget_cores=8,
         markers={"old": STATE_PRUNABLE},               # fills 8/8 -> headroom 0
     )
     assert d.action == ALLOC_RECYCLE
     assert d.codespace == "old"                        # recycle frees 8
-    assert d.then == "reuse"
-    assert d.then_codespace == "warm"                  # 4-core boot fits after reclaim
+    assert d.then == "create"
+    assert d.then_codespace is None
 
 
 def test_plan_pressure_when_full_and_nothing_recyclable():
@@ -747,17 +1336,6 @@ def test_plan_pressure_when_full_and_nothing_recyclable():
     assert d.action == ALLOC_PRESSURE
     assert d.codespace is None
     assert d.headroom_cores == 0
-
-
-def test_plan_does_not_reuse_a_different_repos_idle_box():
-    # An idle box for another repo is invisible to a web request -> create.
-    from agent_codespaces.pool import ALLOC_CREATE
-    d = _plan(
-        [_cs("other1", state="Available", machine="premiumLinux",
-             repo="o/other-codespaces")],
-        repo="web", new_cores=8, budget_cores=64,
-    )
-    assert d.action == ALLOC_CREATE
 
 
 def test_plan_unknown_new_cores_still_blocks_a_full_pool():
@@ -788,8 +1366,8 @@ def test_allocation_decision_to_dict_shape():
     out = d.to_dict()
     assert out["action"] == ALLOC_RECYCLE
     assert out["codespace"] == "old"
-    assert out["then"] == "reuse"
-    assert out["then_codespace"] == "warm"
+    assert out["then"] == "create"
+    assert out["then_codespace"] is None
     # create/reuse decisions omit the recycle-only 'then' keys
     plain = _plan(
         [_cs("busy", state="Available", machine="premiumLinux",

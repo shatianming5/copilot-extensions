@@ -7,10 +7,11 @@ whole grid means reading every reachable host's column; applying a column writes
 *that host's* config (and mirrors it to its terminal profiles).
 
 - **Local host** -- read/write in-process via ``agent_worktrees.profiles`` and
-  mirror via ``__main__._mirror_terminal_profiles`` (lazy-imported to keep the
-  picker_tui <-> __main__ cycle broken).
-- **Remote host** -- shell ``<project> profiles get|apply`` over the machine's
-  SSH alias (argv from ``data_ssh.profiles_argv``).
+  mirror via ``terminal_fragment.deploy_fragment`` (Phase 3e Step 6,
+  copilot-extensions#3390 -- Terminal Fragment deploy is now owned here, not
+  proxied back into agent-worktrees).
+- **Remote host** -- shell ``worktree-manager profiles get|apply`` over the
+  machine's SSH alias (argv from ``data_ssh.profiles_argv``).
 
 The SSH runner is injected (default: real subprocess) so tests drive this with
 no network.
@@ -19,7 +20,7 @@ from __future__ import annotations
 
 import json
 
-from .. import profiles as profiles_mod
+from ... import terminal_profiles as profiles_mod
 from . import data_ssh, roster
 
 TargetSel = profiles_mod.TargetSel
@@ -61,7 +62,7 @@ def load_column(machine, env, *, runner=_default_runner):
     Local host reads its own config in-process (always reachable -> set/``None``,
     never ``UNAVAILABLE``); a remote host is queried over SSH.
     """
-    from .. import config as cfg
+    from .. import project_config as cfg
 
     if (machine, env) == _local_key():
         cfg_path = cfg.default_config_path()
@@ -109,7 +110,7 @@ def apply_column(machine, env, sels, *, mirror=True, runner=_default_runner):
     ``TargetSel``; the locked self.agent target is always included by the
     persistence layer.
     """
-    from .. import config as cfg
+    from .. import project_config as cfg
 
     sels = list(sels)
     if (machine, env) == _local_key():
@@ -118,8 +119,24 @@ def apply_column(machine, env, sels, *, mirror=True, runner=_default_runner):
             self_machine=machine, self_env=env)
         mirrored = False
         if mirror:
-            from .. import __main__ as _m
-            mirrored = _m._mirror_terminal_profiles()
+            # Phase 3e Step 6 (copilot-extensions#3390): agent-worktrees'
+            # ``_mirror_terminal_profiles`` proxy is retired along with
+            # Terminal Fragment ownership -- deploy directly via
+            # worktree-manager's own relocated mechanism instead of
+            # reaching back into agent-worktrees. Swallow failures the same
+            # way the retired proxy did: ``apply`` should still report
+            # "saved" rather than raise when a mirror attempt fails.
+            try:
+                from ... import terminal_fragment as tf
+                try:
+                    current_project = cfg.project_name()
+                except (RuntimeError, ValueError):
+                    current_project = None
+                plan = tf.deploy_fragment(
+                    machine, current_project=current_project, apply=True)
+                mirrored = plan.applied
+            except Exception:
+                mirrored = False
         return True, ("mirrored" if mirrored else "saved")
 
     payload = json.dumps([s.as_dict() for s in sels])

@@ -1,4 +1,9 @@
-#!/usr/bin/env bash
+#!/bin/sh
+# Re-exec under a real bash. Testing BASH_VERSION is not enough: on a BSD host
+# /bin/sh IS bash in sh mode, which sets BASH_VERSION but disables the process
+# substitution this hook uses. Gate on an explicit marker instead.
+[ -n "${COPILOT_EXTENSIONS_HOOK_BASH:-}" ] ||
+    COPILOT_EXTENSIONS_HOOK_BASH=1 exec bash "$0" "$@"
 # pre-commit hook: high-signal, staged-only guards for this repo.
 # Enable with:  git config core.hooksPath tools/hooks   (or: tools/setup-hooks.sh)
 #
@@ -9,6 +14,13 @@
 #   2. check-skills   -- staged SKILL.md files: frontmatter validity, name rules,
 #      and the description <=1024-char HARD limit the Copilot CLI enforces (over
 #      it, the loader silently DROPS the skill). See tools/check-skills.py.
+#   3. check-effort-vision-structure -- staged efforts/visions README.md files:
+#      the canonical section-set contract from efforts/README.md and
+#      visions/README.md § Local conventions. See
+#      tools/check-effort-vision-structure.py.
+#   4. check-large-files -- every staged file: a generous cap for images, a
+#      tight cap for everything else, and an outright ban on source
+#      maps/raw diffs. See tools/check-large-files.py.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
@@ -67,6 +79,48 @@ if [[ ${#STAGED_SKILLS[@]} -gt 0 ]]; then
         echo "pre-commit: SKILL.md validation failed (see errors above)." >&2
         echo "  A description over 1024 chars makes the Copilot CLI DROP the skill." >&2
         echo "  Fix it, or run with --no-verify to bypass (discouraged)." >&2
+        failed=1
+    fi
+fi
+
+# --- 3. check-effort-vision-structure on staged efforts/visions READMEs -----
+STAGED_EFFORT_VISION=()
+while IFS= read -r -d '' f; do
+    STAGED_EFFORT_VISION+=("$f")
+done < <(git diff --cached --name-only --diff-filter=ACM -z -- 'efforts/**/README.md' 'visions/**/README.md')
+
+if [[ ${#STAGED_EFFORT_VISION[@]} -gt 0 ]]; then
+    if [[ ${#PY[@]} -eq 0 ]]; then
+        echo "pre-commit: python not found -- skipping effort/vision structure validation" >&2
+    elif ! "${PY[@]}" "$ROOT/tools/check-effort-vision-structure.py" "${STAGED_EFFORT_VISION[@]}"; then
+        echo "" >&2
+        echo "pre-commit: effort/vision structure validation failed (see errors above)." >&2
+        echo "  Fix it, or run with --no-verify to bypass (discouraged)." >&2
+        failed=1
+    fi
+fi
+
+# --- 4. check-large-files on every staged file -------------------------------
+# --diff-filter=d (exclude only Deletions), not ACM: a rename or type-change
+# (R/T) must still be checked at its destination path, or renaming an
+# oversized/disallowed file to dodge detection would silently bypass this.
+STAGED_ALL=()
+while IFS= read -r -d '' f; do
+    STAGED_ALL+=("$f")
+done < <(git diff --cached --name-only --diff-filter=d -z)
+
+if [[ ${#STAGED_ALL[@]} -gt 0 ]]; then
+    if [[ ${#PY[@]} -eq 0 ]]; then
+        echo "pre-commit: python not found -- skipping large-file check" >&2
+    # "--" before the file list: a staged file whose name happens to look
+    # like a flag (e.g. a file literally named "--all") must never be
+    # parsed as one, which would silently switch the guard into full-tree
+    # mode (checking HEAD) instead of checking the actual staged paths.
+    elif ! "${PY[@]}" "$ROOT/tools/check-large-files.py" -- "${STAGED_ALL[@]}"; then
+        echo "" >&2
+        echo "pre-commit: large-file check failed (see errors above)." >&2
+        echo "  Store a large generated artifact as a Release asset/CI artifact" >&2
+        echo "  instead, or run with --no-verify to bypass (discouraged)." >&2
         failed=1
     fi
 fi

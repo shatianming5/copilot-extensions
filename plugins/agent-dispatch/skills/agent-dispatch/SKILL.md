@@ -6,7 +6,7 @@ description: >
   browse/dedup, atomically claim, and drive tasks through their lifecycle so
   multiple worktree/session agents cooperate without racing through
   origin/master or needing an account per agent. Covers the CLI verbs, the
-  eight-state model, worker identity (machine/worktree), capability + affinity
+  nine-state model, worker identity (machine/worktree), capability + affinity
   routing, include/exclude selector matching, targeting, dedup-before-create,
   atomic create-and-claim, spawning workers via agent-bridge,
   and loopback-vs-remote coordinator config.
@@ -52,8 +52,8 @@ queue of *tasks*, so multiple agents coordinate without racing through
 
 A **task** is a graduated handoff: a title + `prompt` + optional Markdown
 `payload`. It carries routing (`requires` / `affinity`), targeting
-(`target_machine` / `target_worktree` / `target_repo`, `labels`), and moves
-through an eight-state lifecycle.
+(`target_machine` / `target_worktree` / `target_repo`, `labels`), optional
+spawn exclusivity (`exclusive_key`), and moves through a nine-state lifecycle.
 
 ## When to reach for it
 
@@ -100,8 +100,8 @@ plugin vision (`visions/plugins/agent-dispatch/` in the source repo).
 Every verb except `serve` is a thin client that talks to a coordinator over
 HTTP. Point the CLI at one with `AGENT_DISPATCH_URL`; otherwise the client
 discovers the local coordinator through the zdd routing table /
-`~/.agent-dispatch/run/endpoint.json`, then falls back to legacy
-`http://127.0.0.1:9847`. Add `AGENT_DISPATCH_TOKEN` if it requires bearer auth.
+`~/.agent-dispatch/run/endpoint.json`, then falls back to legacy <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
+`http://127.0.0.1:9847`. Add `AGENT_DISPATCH_TOKEN` if it requires bearer auth. <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 
 ```bash
 <agent-dispatch catalog argv[0]> health          # confirm a coordinator is reachable first
@@ -209,19 +209,19 @@ so you pass nothing:
   agent-worktrees registry). <!-- marketplace-isolation: allow agent-worktrees-management -->
   Output carries both `repo` (remote) and `repo_name`.
 
-## The eight-state lifecycle
+## The nine-state lifecycle
 
 ```
-proposed -> queued -> claimed -> started -> completed        (terminal)
-                ^         |          |
-                +- decline/yield ----+
-                ^         |          |
+proposed -> queued -> claimed -> started -> submitted -> completed
+                ^         |          |            |            (terminal)
+                +- decline/yield ----+            |
+                ^         |                       +-- confirm
                 +- owner-gone (liveness GC requeue, attempts++)
-started -> suspended -> started                              (resume; same owner)
-               |
-               +-----------> queued                          (release; replacement)
-               +-----------> completed                       (condition resolved)
-   (any non-terminal) --> abandoned (terminal, permission-gated)
+started -> suspended -> started
+               |                                   (resume; same owner)
+               +-----------> queued                (release; replacement)
+               +-----------> submitted             (condition resolved)
+   (any non-terminal except completed) --> abandoned (terminal, permission-gated)
    (owner-gone past the attempts cap) --> dead_letter (terminal)
 ```
 
@@ -232,7 +232,8 @@ started -> suspended -> started                              (resume; same owner
 | **claimed** | held; worker may evaluate before committing | held |
 | **started** | under active implementation | held |
 | **suspended** | previously started, dormant, same owner/session preserved | No |
-| **completed** | driven to done | terminal |
+| **submitted** | provisional completion claim | No |
+| **completed** | corroborated done | terminal |
 | **abandoned** | discarded (duplicate / dropped priority) | terminal |
 | **dead_letter** | requeued too many times (owner kept going gone) -- an actionable failure | terminal |
 
@@ -243,7 +244,7 @@ started -> suspended -> started                              (resume; same owner
   **evaluation window** (`claim --evaluation`) -- a semantic "evaluating, not yet
   committed" marker; elapsed time alone does **not** recover it (see below).
 - **started -> queued** yields **with a note** on a recoverable snag (merge
-  conflict, needs a later cycle); **started -> completed** on success.
+  conflict, needs a later cycle); **started -> submitted** on success, and **submitted -> completed** once corroborated by `confirm`.
 - **started -> suspended** (`suspend --reason <why>`) is owner-gated and parks a
   dormant task without losing its owner/session identity, worktree, generation,
   progress, or card. It clears active lease/activity and is neither claimable nor
@@ -253,7 +254,7 @@ started -> suspended -> started                              (resume; same owner
   without a captured interactive inbox is released to **queued** for safe
   re-embodiment;
   `release` clears ownership and returns it to **queued** for a replacement.
-- **suspended -> completed** is owner-gated and direct: if an external condition
+- **suspended -> submitted** is owner-gated and direct: if an external condition
   satisfies the dormant goal, its resolver calls `complete` under the preserved
   owner without waking a process or manufacturing an active turn.
 - Steering a suspended task durably records the steer and atomically either
@@ -320,6 +321,7 @@ context. The coordinator also backstops with a unique `dedup_key`.
   --label media \
   --target-repo copilot-extensions \ # OPTIONAL: the cross-repo *code* target (stays in THIS lane)
   --dedup-key narration-seg42 \      # makes create idempotent
+  --exclusive-key review:repo:42 \   # optional: one spawned worker for this logical resource
   --goal "segment 42 has a merged narration track" \  # durable objective (see Goal-loop tasks)
   --done-criteria "track rendered, reviewed, merged"  # when --goal is met
 ```
@@ -391,6 +393,21 @@ Defer with `--not-before <epoch>` (scheduled creation). Attach a payload with
 spills to a content-addressed blob automatically), or `--payload-ref` (an
 external pointer like `pr/123`).
 
+**Spawn exclusivity (`--exclusive-key`).** Use this when several task episodes
+represent the same logical resource and only one spawned worker may ever hold it
+at a time -- for example a PR review whose task key includes the changing head
+SHA, but whose reviewer worktree must stay singular for the PR. The ordinary
+`--dedup-key` still answers "is this exact task already present?"; the
+`--exclusive-key` answers "is a worker already spawned for this resource?". A
+new spawn reservation is refused while any active reservation with the same key
+exists, even if it belongs to a different task id. When a prior reservation for
+that key recorded a worktree, the next spawn first reuses that worktree so the
+worker resumes the same durable context; if that soft reuse is gone/reaped, the
+spawner may fall back to a fresh worktree under the same exclusive reservation.
+Add `--supersede-exclusive-key` when the latest episode replaces older queued or
+proposed episodes with the same key. It never yanks a claimed/started/suspended
+worker; the active reservation is the hard no-second-worker guard.
+
 ### Goal-loop tasks — a durable goal a worker loops toward *(the norm for delegated work)*
 
 A dispatched task is **not** a fire-once prompt — it is, by default, a **durable
@@ -451,10 +468,11 @@ eligible for the protected label pool, and is not authorized work from that
 managed producer. The coordinator requires a separate
 `AGENT_DISPATCH_CONTROL_TOKEN` for every transition; ordinary client auth and a
 caller-asserted producer id do not grant authority. The control token is a
-superset queue credential, so prefer its environment setting (or the shared
-token-command setting) over `--control-token`, which can expose it in process
-listings. A successful transition returns a one-time high-entropy capability
-whose hash alone is stored:
+superset queue credential, so prefer its environment or command-fetch setting
+(`AGENT_DISPATCH_CONTROL_TOKEN` / `AGENT_DISPATCH_CONTROL_TOKEN_COMMAND`) over
+`--control-token`, which can expose it in process listings. A successful
+transition returns a one-time high-entropy capability whose hash alone is
+stored:
 
 ```bash
 <agent-dispatch catalog argv[0]> producer-fence status \
@@ -512,16 +530,20 @@ mismatches remain unclaimable and emit a bounded, fingerprinted
 - **`agent-dispatch webhook --config <cfg>`** <!-- marketplace-isolation: allow webhook-management -->
   -- a reactive producer: an HTTP app
   with `POST /webhook/pr` (a **merged** PR -> follow-up task, `source=pr-webhook`,
-  `origin_ref=pr/<n>`, lane from the payload's repo remote) and
+  `origin_ref=pr/<n>`, lane from the payload's repo remote),
   `POST /webhook/telemetry` (a **firing** alert -> remediation task,
-  `source=telemetry`). Deterministic `dedup_key`s make redelivery safe.
+  `source=telemetry`), and `POST /webhook/issue` (a forge issue event matched
+  against a list of independent, config-driven rules -> task,
+  `source=issue-webhook`, `origin_ref=issue/<n>`). Deterministic `dedup_key`s
+  make redelivery safe while the matching task is still non-terminal (the key
+  releases once that task completes/is abandoned).
 - **`<agent-dispatch catalog argv[0]> evaluate --spec <cfg>`** -- the *evaluator*: pipe one task
   lifecycle event (stdin or `--event-file`) through a declarative rule set that
   decides what happens next (emit a follow-up task, or nothing). Hook-like; the
   judgment half of emitters-and-evaluators. `--dry-run` prints decisions only.
   For the **service-driven** loop,
   `agent-dispatch supervise --evaluator <cfg>` <!-- marketplace-isolation: allow supervisor-management -->
-  runs the same rules each cycle over newly-terminal tasks (advancing the loop
+  runs the same rules each cycle over newly-concluded tasks (advancing the loop
   with no bespoke module; idempotent via the emit's `dedup_key`).
 
 See the plugin README (**Producers**) for the spec/config shapes.
@@ -595,7 +617,10 @@ alongside the abandon. See the plugin README
 
 When a loop can only wait on a slow external condition, don't sit on a live
 session. Hand the wait to `run`: it executes the blocking command and, when it
-resolves, resumes the worktree-affinitied worker via an agent-bridge nudge.
+resolves, resumes the worktree-affinitied worker via an agent-bridge nudge. A
+repeated-timeout (nothing ever changes) backstop caps how long it re-arms in
+place before giving up and resuming anyway with an explicit "never resolved"
+message -- see the plugin README (**Hibernate the wait**).
 
 ```bash
 <agent-dispatch catalog argv[0]> run --resume <machine/worktree> --task <id> -- agent-worktrees pr-watch 42 # marketplace-isolation: allow agent-worktrees-management
@@ -624,14 +649,14 @@ Completion may record an optional JSON object/array result with
 `--result-json` or the cross-platform-friendly `--result-file` (`-` reads
 stdin; one leading UTF-8 BOM is accepted on every input path). The canonical
 UTF-8 encoding is capped at 64 KiB and is committed atomically with
-`status=completed`, `result_ref`, and the stable completing identity; invalid
+`status=submitted`, `result_ref`, and the stable completing identity; invalid
 input is HTTP 400, oversized input is HTTP 413, and both leave the task
 non-terminal. JSON null and scalars are rejected. MCP callers should pass a
 decoded object or array; the MCP SDK may normalize a JSON-encoded object string.
 `show` retains the full decoded value; bulk `list`/`find`/`sweep`/`inbox` rows
 expose only `has_result`. Retrieve the value with `result <id>`,
 `GET /tasks/<id>/result`, or `dispatch_result`. SSE events likewise carry only
-`has_result`: initial completion emits `task.completed`, retry-fill emits
+`has_result`: initial completion emits `task.submitted`, retry-fill emits
 `task.result_recorded`, and an identical retry emits no duplicate event.
 
 A client sending a structured result verifies that the coordinator returned the
@@ -740,7 +765,7 @@ to `machine` only when the mismatch is machine-wide.
 <agent-dispatch catalog argv[0]> show    <id>       # full task record
 <agent-dispatch catalog argv[0]> events  <id>       # append-only audit trail of every transition
 <agent-dispatch catalog argv[0]> payload <id>       # resolved payload (inline or blob); --raw prints content only
-<agent-dispatch catalog argv[0]> consume <id>       # resume-and-consume: drive to completed (idempotent) + print payload
+<agent-dispatch catalog argv[0]> consume <id>       # resume-and-consume: drive to submitted (idempotent) + print payload
 <agent-dispatch catalog argv[0]> consume <id> --defer-complete  # TAKEOVER pickup: approve->claim->start + print brief, NO complete
 <agent-dispatch catalog argv[0]> watch              # stream task.* events (SSE) as JSON lines
 ```
@@ -761,12 +786,53 @@ to `machine` only when the mismatch is machine-wide.
 > Best-effort and read-only: with no `agent-bridge`/`ssh` on PATH (or no live
 > session) the overlay is simply omitted and output is unchanged.
 
+> **Reading a task's actual conversation (its transcript), not just its
+> status.** `show`'s embodiment overlay only covers a *currently live*
+> CLI-embodied task. For the general case -- any dispatch task, live or long
+> finished -- a caller holding only its task id resolves durably with one
+> agent-bridge call: `GET /api/v1/dispatch-tasks/{id}/session`. This tries
+> the task's current owner session, then its durable attachment history
+> (`GET /tasks/{id}/attachments`, above), across every session tier agent-
+> bridge itself knows (bridge-owned, cold-store archived, and a represented
+> *interactive* CLI session for an `embody`-spawned task) -- then its target
+> worktree's own latest known session as a last resort. That worktree
+> fallback stays **live-only** (no cold-store "latest session for a
+> worktree" query capability exists, only exact-session-id lookups), so a
+> task whose worktree has already been reclaimed and whose owner/attachment
+> candidates all came up empty is a genuine, expected 404 -- not a bug. The
+> response carries `durable_session_id` -- use that, never the response's
+> own `session_id` (agent-bridge's internal, non-durable escrow id for a
+> still-live bridge-owned session) -- to open the conversation in Neuron
+> Forge or read its transcript. See the `agent-bridge` skill's *Session
+> identity* section for the full contract, and don't invent a per-consumer
+> naming convention to get there (a prior Dampener UI attempt at exactly
+> that was reverted -- `visions/plugins/agent-bridge`'s
+> *resolve-by-any-origin-reference* feature is the one shared primitive).
+
+> **The reverse direction: an arbitrary session id -> its worktree + task
+> history.** `find-by-session <session-id>` is the reverse of the durable
+> attachment history above: given a session id (an agent-bridge escrow id or
+> a durable ACP UUID), it lists every task on **this host's coordinator**
+> that session has ever attached to, newest first, each with the
+> `worktree_id`/`machine` it ran in and its attach/detach timestamps. An
+> empty list means the session id never attached to a task here -- not an
+> error, since (unlike a task id) a session id has no single owning task to
+> 404 against. This is a full-table scan over `task_attachments` (no
+> `session_id` index; the table is keyed for the forward direction), fine for
+> the ad-hoc diagnostic/CLI use this exists for. Local to this machine's
+> coordinator only -- no cross-machine peer-browse yet (see `list --machine`
+> for that pattern on other read verbs).
+>
+> ```bash
+> <agent-dispatch catalog argv[0]> find-by-session <session-id>
+> ```
+
 > **`consume` is the handoff-pickup shortcut -- in two flavors.**
 >
 > - **Baton (default `consume <id>`):** rolls the whole
 >   approve → claim → start → complete lifecycle into one idempotent call and
 >   then prints the payload, so a successor's *single* command loads the brief
->   **and** marks the baton spent -- a handoff is completed the moment it is
+>   **and** marks the baton spent -- a handoff is submitted the moment it is
 >   picked up. The continuation *work* is tracked by its effort/issue, not this
 >   task. Use for a **human in-place resume** (`/resume-handoff`, a pasted seed).
 > - **Deferred (`consume <id> --defer-complete`):** approve → claim → **start**
@@ -775,10 +841,21 @@ to `machine` only when the mismatch is machine-wide.
 >   successor*: it loads the brief, works the task, and runs
 >   `<agent-dispatch catalog argv[0]> complete <id>` **explicitly** only when
 >   it judges the goal reached -- so
->   `completed` means *the work is done*, not *the baton was handed over*.
+>   `submitted` means *the work is done*, not *the baton was handed over*.
 >
-> An already-terminal (or unclaimable) task just has its payload re-printed,
-> never an error. Use plain `payload --raw` to read *without* any state change.
+> An already-terminal **non-handoff** task just has its payload re-printed
+> (idempotent); an already-terminal **handoff** (`submitted`/`completed`,
+> labeled `handoff` or sourced from `context-handoff`) is refused instead
+> (exit `3`) -- see the replay-debounce note above. So is an `abandoned`
+> handoff (superseded by a newer handoff for its worktree, or aborted): its
+> brief is out of date, so a successor seeded with it stands down rather
+> than working alongside the newer handoff's successor. Claiming can likewise
+> fail two ways: a genuine failure (nobody owns the task, not even a
+> concurrent claimant) is a real error (exit `1`); losing a claim race to a
+> concurrent claimant refuses to replay the payload to the loser (exit `3`,
+> the same exactly-once refusal). Neither case silently prints a payload
+> the caller does not actually own. Use plain `payload --raw` to read
+> *without* any state change.
 >
 > **`complete <id>` needs no owner** when run inside the owning worktree: it
 > resolves `machine/worktree` from the CWD (like `claim`), so a taken-over
@@ -796,6 +873,10 @@ to `machine` only when the mismatch is machine-wide.
   leader election.
 - **`affinity`** (repeatable `--affinity key=value`) -- soft *preferences*
   (preferred agent/worktree) that order candidates but **never exclude**.
+- **`exclusive_key`** (`--exclusive-key`) -- hard spawn singleton for one logical
+  resource across several task ids. It prevents two active spawn reservations
+  from existing for that resource and carries the previous worktree as the next
+  spawn's reuse target.
 - A **hard pin** is just a target promoted into `requires`; `detach <id>` demotes
   a hard worktree pin to a soft affinity (e.g. once local work is pushed, a bound
   handoff becomes portable).
@@ -821,23 +902,41 @@ to `machine` only when the mismatch is machine-wide.
 - **`--spawn-backend embody`** -- a **durable, CLI-backed autopilot** session in
   a **fresh parallel worktree on the same machine**, via `agent-worktrees embody
   --new` <!-- marketplace-isolation: allow agent-worktrees-management -->
-  (tools auto-approved with `--allow-all-tools`, stamped `--driver
+  (launched with `--allow-all --experimental` so prompts stay auto-approved and
+  any installed SDK extension can actually load, stamped `--driver
   agent-dispatch` so it's viewable in Neuron Forge with a "driven by" banner).
   This is the **"dispatch an agent to do X"** path: the embodied session claims →
   starts → works the task autonomously → and **completes it explicitly** only
   when it judges the goal reached (**deferred completion** -- the task's
-  `completed` state means the *work is done*, not that a baton was handed over).
+  `submitted` state means the *work is done*, not that a baton was handed over).
 
 **Same body choice in the supervisor, keyed by label.** A persistent
 `agent-dispatch supervise` loop <!-- marketplace-isolation: allow supervisor-management -->
-embodies via the **CLI autopilot** (`embody`) by
-default, but `--headless-label L` (repeatable; `--headless-agent` names the
-bridge agent) routes tasks carrying label `L` to the **headless bridge** body
-instead -- for **self-contained sweeps** that need no human attach (and whose
-seeded CLI session could otherwise race the input caret and never start). Only
-listed labels go headless; the rest stay CLI-first. Service knobs:
-`AGENT_DISPATCH_SUPERVISE_HEADLESS_LABELS` / `_HEADLESS_AGENT` in
-`supervisor.env`. See the design doc's "Per-label embody body" section.
+is **headless by default**, but can route labels to two other bodies:
+
+- `--cli-label L` -> a durable **CLI autopilot** (`embody`) worktree session.
+- `--script-label L` -> a plain deterministic **script subprocess** that never
+  invokes an LLM.
+
+The headless body still reuses the **same autopilot seed** as the CLI backend,
+so a headless-embodied task is *driven* identically; only its body differs. The
+script body is deliberately non-agentic: it drives claim/start/progress/
+complete/abandon through the ordinary lifecycle client surface instead of a live
+Copilot session. Service knobs mirror the flags in `supervisor.env`. See the
+design doc's "Per-label embody body" section.
+
+**Script payload contract.** A script-embodied task carries a JSON
+`payload_inline` describing what to launch:
+
+- `{"path":"C:\\absolute\\worker.py","args":["..."],"env":{"K":"V"}}`
+  runs the file with agent-dispatch's own runtime Python.
+- `{"argv":["some-exe","arg1","arg2"],"cwd":"C:\\absolute\\dir","env":{"K":"V"}}`
+  runs the exact argv directly.
+
+`agent_dispatch.script_worker.ScriptTaskRuntime` is the helper contract for such
+bodies. It reads supervisor-injected task/coordinator context from environment
+variables, wraps claim/start/heartbeat/progress/complete/abandon, and treats a
+return without an explicit terminal call as a protocol violation.
 
 **Fleet mode (`--pool`) is fleet-wide, not per-label.** When the supervisor fans
 bodies out across a **pool of remote hosts** (`--pool a,b [--origin <alias>]`), the
@@ -849,8 +948,8 @@ never claim). `--headless-label` is ignored in fleet mode. See the design doc's
 "Headless-fleet body" section.
 
 **Persistent supervisor profiles.** The installer manages a primary supervisor
-from `~/.agent-dispatch/supervisor.env` plus named profiles in
-`~/.agent-dispatch/supervisors/<name>.env` (safe names: letters, digits, `_`,
+from `~/.agent-dispatch/supervisor.env` plus named profiles in <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
+`~/.agent-dispatch/supervisors/<name>.env` (safe names: letters, digits, `_`, <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 `-`). Each profile uses the same `AGENT_DISPATCH_SUPERVISE_*` schema and becomes
 its own `agent-dispatch-supervisor-<name>` unit/task; `status`/`start`/`stop` and
 `uninstall` iterate them, deleted env files remove orphaned profiles, and
@@ -920,7 +1019,7 @@ returns it in the completed task record; `dispatch_result` retrieves it later.
 |---------|------|
 | `AGENT_DISPATCH_URL` | coordinator base URL the CLI talks to (point at a remote host) |
 | `AGENT_DISPATCH_TOKEN` | ordinary bearer token (client sends, server validates) |
-| `AGENT_DISPATCH_CONTROL_TOKEN` | superset queue bearer required to activate/transition managed producer scopes; prefer env over argv |
+| `AGENT_DISPATCH_CONTROL_TOKEN` / `AGENT_DISPATCH_CONTROL_TOKEN_COMMAND` | superset queue bearer required to activate/transition managed producer scopes (and to register evaluators); prefer env/command over argv |
 | `AGENT_DISPATCH_PRODUCER_CAPABILITY_COMMAND` | preferred command that prints the current producer capability on demand |
 | `AGENT_DISPATCH_PRODUCER_CAPABILITY` | raw fallback capability for one selected producer generation's managed creates; applied only with the rest of the fence tuple |
 | `AGENT_DISPATCH_SHARED_URL` | shared/elected coordinator endpoint for cross-machine dispatch (the hosted coordinator); used only with `--shared` |
@@ -958,7 +1057,43 @@ configuration to token flags where process arguments may be observable.
   line of defense. Write self-contained titles/prompts so the sweep can work.
 - **Explain suspension and yield.** `suspend` requires a meaningful `--reason`;
   `started -> queued` is only useful to the next agent
-  if you say *why* you yielded.
+  if you say *why* you yielded. A bare suspend always attaches a default
+  **cooldown monitor** and auto-resumes once it elapses (round-robin
+  time-slicing, not an unwatched idle) -- override with `--cooldown-seconds`,
+  or `--no-cooldown` only when you've arranged your own, more specific wait.
 - **Don't fake identity.** Let `claim` / `worktree-status` resolve it from CWD;
   only pass `--machine` / `--worktree` to override or where agent-worktrees is
   absent.
+For a standing repository issue backlog, prefer one source-controlled
+`kind: repository-issue-loop` declaration over a custom schedule plus worker
+script. It expands to the stock periodic emitter and a concurrency-one headless
+lane, selects quiet label-eligible issues deterministically, visibly reserves
+them on the forge, and emits one exclusive goal task for the bounded batch.
+Overlapping declarations also compete for one coordinator-atomic
+repository/issue reservation, so exactly one loop wins before task creation;
+the loser visibly releases its provisional forge marker.
+Declare the expected `forge.producer_login`; the runtime verifies the
+repository-scoped authenticated identity and ignores marker-shaped comments
+from every other author.
+
+```bash
+<agent-dispatch catalog argv[0]> repository-issue-loop discover \
+  .copilot-extensions/agent-dispatch/registrar/issues.yaml
+<agent-dispatch catalog argv[0]> repository-issue-loop doctor \
+  .copilot-extensions/agent-dispatch/registrar/issues.yaml
+```
+
+Use `setup|inspect|status|doctor|disable|enable` for lifecycle controls.
+`discover` is the safe dry run. Do not hand-clear another loop's reservation;
+steer, release, or abandon a blocked dispatch task explicitly. During host
+migration, disable the old declaration, release or hand off its emitter lease,
+then transfer declaration placement/producer authority before enabling the new
+host. See the plugin README and `docs/repository-issue-loop.md`. Adopting a
+new declaration from scratch? Start with
+`docs/repository-issue-loop-adoption.md` (schema reference, worker identity
+library, worked example) instead.
+
+## See Also
+
+- [docs/entity-relationship-model.md](../../docs/entity-relationship-model.md) -- the suite-wide diagnostic playbook: given a task id, which command resolves its worktree/session/bridge state (and the reverse: session -> tasks via `find-by-session`)
+- `troubleshooting-agent-dispatch` -- a stalled/stuck lane, dead-lettered task, stuck exclude/hold, or "no logs anywhere" -- this skill covers the happy path; that one covers silent/stuck failures.

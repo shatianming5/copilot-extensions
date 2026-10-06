@@ -37,6 +37,10 @@
   shell : drop into an interactive login shell in the container (start one if
           none is up). Use after `run -Then shell`, or standalone to poke a box.
   down  : remove the container for the selected variant.
+  prune : remove EVERY clean-room container this rig has created on this box
+          (all -NameSuffix variants), not just the currently-selected one --
+          the bulk backstop for containers left up after `run`/`eval`/`shell`
+          (by design, so you can inspect them) but never individually `down`'d.
   all   : build -> (auth if needed) -> run.
 
 .PARAMETER Image     base | pristine (default base).
@@ -62,10 +66,17 @@
   ./run.ps1 -Until 1 -Then shell              # install the plugin, then hand off
 .EXAMPLE
   ./run.ps1 -UvIndex https://…/pypi/simple/   # opt-in uv-index fixture (governed box)
+.EXAMPLE
+  ./run.ps1 -BlockPublicFeeds -UvIndex https://…  # reproduce a network-blocked
+                                                    # machine (book2) from an
+                                                    # unrestricted dev box
+.EXAMPLE
+  ./run.ps1 -Mode prune                       # remove EVERY clean-room container
+                                                # this rig created, all -NameSuffix
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('build','auth','run','eval','shell','down','bridge-register','bridge-unregister','all')]
+    [ValidateSet('build','auth','run','eval','shell','down','prune','bridge-register','bridge-unregister','all')]
     [string]$Mode = 'run',
     [ValidateSet('base','pristine')]
     [string]$Image = 'base',
@@ -87,6 +98,16 @@ param(
     # (governed box). Empty = off, so the governed uv jam surfaces. Runtime
     # analog of -NpmRegistry (which is build-time). Also $env:CR_UV_INDEX.
     [string]$UvIndex = '',
+    # Null-route the known public package-feed hostnames (pypi.org,
+    # files.pythonhosted.org, registry.npmjs.org, download.pytorch.org) at the
+    # container network layer via Docker --add-host, regardless of the HOST's
+    # real connectivity -- reproduces a network-blocked machine (book2) from an
+    # unrestricted dev box. Combine with -UvIndex to prove installs still
+    # succeed under a real substitute feed. Also $env:CR_BLOCK_PUBLIC_FEEDS.
+    # Linux arm (-Os linux, the default) only -- errors if combined with
+    # -Os windows, which is not wired into this flag.
+    # (the downstream feed-neutral-build-config effort, Phase 3)
+    [switch]$BlockPublicFeeds,
     # Auth: by default the runner injects a Copilot token grabbed from the host
     # `gh` (COPILOT_GITHUB_TOKEN) so NO interactive device-code login is needed.
     # -TokenAccount picks which gh account (must have Copilot entitlement);
@@ -149,6 +170,17 @@ if ($Until -ne 'all' -and $Until -notmatch '^\d+$') {
     throw "-Until must be 'all' or a non-negative integer (got '$Until')"
 }
 
+# --block-public-feeds env fallback (mirrors -NpmRegistry's $env: pattern).
+if (-not $BlockPublicFeeds -and $env:CR_BLOCK_PUBLIC_FEEDS -eq '1') {
+    $BlockPublicFeeds = $true
+}
+# Only wired into the Linux arm's Start-Container (below) via --add-host.
+# The Windows arm (-Os windows) uses a different container networking model
+# and does not consume this flag -- fail loudly rather than silently no-op.
+if ($BlockPublicFeeds -and $Os -eq 'windows') {
+    throw "-BlockPublicFeeds is not supported with -Os windows (not wired into the Windows-container arm)"
+}
+
 # =============================================================================
 # Windows arm -- a self-contained branch that runs a Windows scenario (scenario.ps1)
 # in a Windows container, harmonizing the clean-room across Linux and Windows.
@@ -208,12 +240,37 @@ if ($Os -eq 'windows') {
     $untilArgs = @()
     if ($Until -ne 'all') { $untilArgs = @('-e', "CR_UNTIL=$Until") }
 
+    # Auth (mirrors run.sh's resolve_token/token_args): prefer a host-grabbed
+    # Copilot token so no interactive device-code step is needed inside the
+    # container -- `copilot -i` exits immediately with "No authentication
+    # information found" otherwise (confirmed: this is why the Windows arm's
+    # psmux-driven session never produced a live pane to capture). -NoToken
+    # opts out (the scenario then runs unauthenticated, on purpose).
+    $tokenArgs = @()
+    if (-not $NoToken) {
+        $winToken = $env:COPILOT_GITHUB_TOKEN
+        if (-not $winToken) {
+            $ghArgs = @('auth', 'token')
+            if ($TokenAccount) { $ghArgs += @('--user', $TokenAccount) }
+            $winToken = (& gh @ghArgs 2>$null | Select-Object -First 1)
+        }
+        if ($winToken) {
+            Write-Host "auth: injecting COPILOT_GITHUB_TOKEN from host gh ($(if ($TokenAccount) { $TokenAccount } else { 'active gh account' })) -- no device-code needed" -ForegroundColor Cyan
+            $env:COPILOT_GITHUB_TOKEN = $winToken
+            $tokenArgs = @('-e', 'COPILOT_GITHUB_TOKEN')
+        }
+        else {
+            Write-Warning "no host Copilot token found (gh auth token empty) -- scenario will run unauthenticated; pass -TokenAccount or set `$env:COPILOT_GITHUB_TOKEN, or use -NoToken to silence this"
+        }
+    }
+
     Write-Host "== running Windows clean-room scenario '$sname' (through stage $Until) ==" -ForegroundColor Cyan
     & docker @dh run --rm --isolation=hyperv `
         -v "${sdir}:C:\scenario:ro" `
         -v "${libDir}:C:\lib:ro" `
         -v "${ResultsDir}:C:\out" `
         -v "${partner}:C:\partner:ro" `
+        @tokenArgs `
         -e "CR_LIB=C:\lib\clean-room-lib.ps1" `
         -e "CR_PARTNER_PATH=C:\partner" `
         -e "CR_PARTNER_NAME=$PartnerName" `
@@ -269,6 +326,12 @@ $NameTail   = if ($NameSuffix) { "-$NameSuffix" } else { '' }
 $Container  = "cr-$Image$NameTail"
 $AgentName  = "cleanroom-$Image$NameTail"   # legacy label (kept for logs)
 $DriveAgent = "cleanroom:$Container"        # the namespaced agent-bridge address
+# Marks every container this rig creates (including the short-lived cr-auth
+# login box) so -Mode prune can sweep them all regardless of -NameSuffix,
+# without touching unrelated containers on the box. Legacy pre-label
+# containers (created before this existed) are still caught by prune's
+# name-prefix fallback.
+$CleanRoomLabel = 'copilot-extensions.clean-room=1'
 # The in-container Copilot ACP command the cleanroom: provider resolves to. The
 # eval path overrides this to add --plugin-dir for the scenario's plugins (a bare
 # copilot --acp does not reliably load enabled plugins headless). Script-scoped so
@@ -276,7 +339,7 @@ $DriveAgent = "cleanroom:$Container"        # the namespaced agent-bridge addres
 # Core dumps must not dirty a fixture, and the hidden distro rg avoids Copilot's
 # bundled ARM64 binary rejecting hosts with 16 KiB pages.
 $script:AcpPrefix = 'ulimit -c 0 && env USE_BUILTIN_RIPGREP=false PATH=/opt/copilot-cleanroom/bin:$PATH'
-$script:AcpCommand = "$($script:AcpPrefix) copilot --acp --stdio --allow-all-tools"
+$script:AcpCommand = "$($script:AcpPrefix) copilot --acp --stdio --allow-all --experimental"
 $script:AcpCwd = ''
 $script:BridgeContainerId = ''
 
@@ -294,7 +357,7 @@ function Invoke-Build {
     Write-Host "== building $Image image ($BaseTag) from $Dockerfile ==" -ForegroundColor Cyan
     # No host-config auto-forward: pass a feed ONLY when explicitly requested
     # (installs the Copilot CLI prereq on a governed box). Public by default.
-    $reg = if ($NpmRegistry) { $NpmRegistry } elseif ($env:CR_NPM_REGISTRY) { $env:CR_NPM_REGISTRY } else { 'https://registry.npmjs.org/' }
+    $reg = if ($NpmRegistry) { $NpmRegistry } elseif ($env:CR_NPM_REGISTRY) { $env:CR_NPM_REGISTRY } else { 'https://registry.npmjs.org/' }  # feed-guard: allow real -NpmRegistry/CR_NPM_REGISTRY override precedes this default
     Write-Host "   npm registry (build-time, Copilot install only): $reg" -ForegroundColor DarkGray
     docker build --build-arg "NPM_REGISTRY=$reg" -f (Join-Path $Here $Dockerfile) -t $BaseTag $Here
     if ($LASTEXITCODE -ne 0) {
@@ -310,7 +373,7 @@ function Invoke-Auth {
     Write-Host "An interactive Copilot session opens. Run '/login' if not prompted," -ForegroundColor Yellow
     Write-Host "authorize the device code in your browser, then '/exit'." -ForegroundColor Yellow
     docker rm -f cr-auth 2>$null | Out-Null
-    docker run -it --name cr-auth --entrypoint /bin/bash $BaseTag -lc 'copilot; echo "--- login session ended ---"'
+    docker run -it --name cr-auth --label $CleanRoomLabel --entrypoint /bin/bash $BaseTag -lc 'copilot; echo "--- login session ended ---"'
     Write-Host "== committing authed image ($AuthTag) ==" -ForegroundColor Cyan
     docker commit cr-auth $AuthTag | Out-Null
     docker rm -f cr-auth | Out-Null
@@ -338,9 +401,25 @@ function Resolve-CopilotToken {
 # (no interactive step; runs against the plain unauthed image). Fall back to the
 # committed device-code :authed image only when no token is available.
 function Start-Container {
-    $token = Resolve-CopilotToken
+    $manifestPath = Join-Path $ScenarioDir 'manifest.json'
+    $noScenarioAuth = $false
+    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        try {
+            $scenarioManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            $noScenarioAuth = $scenarioManifest.tier -eq 'P' -and $scenarioManifest.auth.copilot -eq 'none'
+        } catch {
+            # A malformed manifest must fail closed to "auth required", never
+            # abort the rig -- this is a best-effort auth-mode inference, not a
+            # manifest-schema gate (that belongs to the scenario's own checks).
+            $noScenarioAuth = $false
+        }
+    }
+    $token = if ($noScenarioAuth) { $null } else { Resolve-CopilotToken }
     $tokenArgs = @()
-    if ($token) {
+    if ($noScenarioAuth) {
+        if (-not (Test-Image $BaseTag)) { Invoke-Build }
+        $img = $BaseTag
+    } elseif ($token) {
         if (-not (Test-Image $BaseTag)) { Invoke-Build }
         $img = $BaseTag
         $acct = if ($TokenAccount) { $TokenAccount } else { 'active gh account' }
@@ -356,7 +435,16 @@ function Start-Container {
         }
         $img = $AuthTag
     }
-    docker rm -f $Container 2>$null | Out-Null
+    $existingContainer = (
+        docker ps -aq --filter "name=^/${Container}$" 2>$null |
+            Select-Object -First 1
+    )
+    if ($existingContainer) {
+        docker rm -f $Container 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "could not remove prior clean-room container $Container"
+        }
+    }
     New-Item -ItemType Directory -Force -Path $Results | Out-Null
     $scenDir = ($ScenarioDir) -replace '\\','/'
     $libDir  = ($LibDir)      -replace '\\','/'
@@ -402,12 +490,30 @@ function Start-Container {
         )
         Write-Host "harness bind: $hm -> /harness (ro)  [CR_HARNESS_MOUNT=/harness]" -ForegroundColor DarkGray
     }
+    # --block-public-feeds (feed-neutral-build-config, the downstream tracker
+    # Phase 3): null-route the known public package-feed hostnames at the
+    # container network layer via Docker --add-host, regardless of the HOST's
+    # real connectivity. Combine with -UvIndex (a real substitute) to prove
+    # installs still succeed under the block; omit it to prove the harness's
+    # existing "toolchain-uv" jam detection catches a hardcoded straggler.
+    $blockArgs = @()
+    if ($BlockPublicFeeds) {
+        $blockArgs = @(
+            '--add-host', 'pypi.org:127.0.0.1',
+            '--add-host', 'files.pythonhosted.org:127.0.0.1',
+            '--add-host', 'registry.npmjs.org:127.0.0.1',
+            '--add-host', 'download.pytorch.org:127.0.0.1'
+        )
+        Write-Host "block-public-feeds: pypi.org, files.pythonhosted.org, registry.npmjs.org, download.pytorch.org null-routed" -ForegroundColor DarkGray
+    }
     docker run -d --name $Container `
+        --label $CleanRoomLabel `
         -v "${scenDir}:/home/operator/scenario:ro" `
         -v "${libDir}:/home/operator/lib:ro" `
         -v "${res}:/home/operator/out" `
         @scenLibArgs `
         @harnessArgs `
+        @blockArgs `
         -e "CR_LIB=/home/operator/lib/clean-room-lib.sh" `
         -e "CR_SCENARIO_NAME=$ScenarioName" `
         -e "CR_MARKETPLACE_REPO=$MarketplaceRepo" `
@@ -481,6 +587,54 @@ function Invoke-Down {
     Write-Host "removed $Container" -ForegroundColor Green
 }
 
+function Invoke-Prune {
+    # Sweep EVERY clean-room container this rig has ever created on this box --
+    # not just the currently-selected $Container -- regardless of -NameSuffix.
+    # run/eval/shell deliberately leave a container up for inspection (see
+    # README "the container stays up until -Mode down"), which is by design but
+    # means containers a caller forgets to `down` individually accumulate
+    # forever (concurrent -NameSuffix runs, ad-hoc debugging boxes, etc.).
+    # prune is the bulk backstop: label-match first (every container this rig
+    # creates now carries $CleanRoomLabel), falling back to the legacy `cr-*`
+    # name prefix so containers created before the label existed are still
+    # swept.
+    $ids = (& docker ps -a -q --filter "label=$CleanRoomLabel" | Out-String).Trim() -split "`n" | Where-Object { $_ }
+    if (-not $ids) {
+        $ids = (& docker ps -a -q --filter 'name=^cr-' | Out-String).Trim() -split "`n" | Where-Object { $_ }
+    }
+    if (-not $ids) {
+        Write-Host "no clean-room containers found" -ForegroundColor DarkGray
+        return
+    }
+    $savedContainer = $script:Container
+    $savedAgentName = $script:AgentName
+    $failures = 0
+    foreach ($id in $ids) {
+        $name = (& docker inspect -f '{{.Name}}' $id 2>$null | Out-String).Trim().TrimStart('/')
+        if (-not $name) { $name = $id }
+        try {
+            # Best-effort agent-bridge unregister before removal -- a stray
+            # registration for a container that's about to disappear is
+            # exactly the kind of debris this command exists to prevent.
+            $script:Container = $name
+            $script:AgentName = "cleanroom-$($name -replace '^cr-', '')"
+            Invoke-BridgeUnregister -ContainerId $id | Out-Null
+        } catch {
+            # unregister failures are best-effort here; removal still proceeds.
+        }
+        docker rm -f $id 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "removed $name" -ForegroundColor Green
+        } else {
+            Write-Host "error: could not remove $name ($id)" -ForegroundColor Red
+            $failures++
+        }
+    }
+    $script:Container = $savedContainer
+    $script:AgentName = $savedAgentName
+    if ($failures -gt 0) { throw "prune: failed to remove $failures container(s)" }
+}
+
 # Register the running container with agent-bridge so you can drive the
 # in-container Copilot with `agent-bridge create cleanroom:<container> ...`. Uses
 # the declarative `providers.d/` namespace-provider model (agent-bridge >= dev307;
@@ -488,7 +642,10 @@ function Invoke-Down {
 # a `cleanroom` manifest and *is* the provider CLI the daemon shells out to.
 function Invoke-BridgeRegister {
     Ensure-Container
-    $py = (Get-Command python -ErrorAction SilentlyContinue) ?? (Get-Command python3 -ErrorAction SilentlyContinue)
+    $py = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $py) {
+        $py = Get-Command python3 -ErrorAction SilentlyContinue
+    }
     if (-not $py) { throw "python not found on PATH (needed to register the agent-bridge provider)" }
     $bridgeArgs = @('--acp-command', $script:AcpCommand)
     if ($script:AcpCwd) { $bridgeArgs += @('--acp-cwd', $script:AcpCwd) }
@@ -508,7 +665,10 @@ function Invoke-BridgeRegister {
     Write-Host "drive it:  agent-bridge create $DriveAgent `"<prompt>`"" -ForegroundColor Green
 }
 function Invoke-BridgeUnregister([string]$ContainerId = '') {
-    $py = (Get-Command python -ErrorAction SilentlyContinue) ?? (Get-Command python3 -ErrorAction SilentlyContinue)
+    $py = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $py) {
+        $py = Get-Command python3 -ErrorAction SilentlyContinue
+    }
     if (-not $py) { throw "python not found on PATH" }
     if (-not $ContainerId) { $ContainerId = $script:BridgeContainerId }
     if (-not $ContainerId) {
@@ -544,34 +704,146 @@ function Invoke-EndAgentSessions([string]$Agent) {
 function Get-Sha256Short([string]$Text) {
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes(($Text ?? ''))
+        $value = if ($null -eq $Text) { '' } else { $Text }
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($value)
         return -join ($sha.ComputeHash($bytes)[0..7] | ForEach-Object { $_.ToString('x2') })
     } finally { $sha.Dispose() }
+}
+
+# Send Python source through a base64 argv so Windows native-command quoting
+# cannot strip quotes from an in-container `python3 -c` script.
+function Invoke-ContainerPython(
+    [Parameter(Mandatory)][string]$Script,
+    [string[]]$Arguments = @()
+) {
+    $encoded = [Convert]::ToBase64String(
+        [System.Text.Encoding]::UTF8.GetBytes($Script)
+    )
+    $encodedArguments = @(
+        foreach ($argument in $Arguments) {
+            [Convert]::ToBase64String(
+                [System.Text.Encoding]::UTF8.GetBytes([string]$argument)
+            )
+        }
+    )
+    $bootstrap = (
+        'import base64,sys;payload=sys.argv.pop(1);' +
+        'sys.argv[1:]=[base64.b64decode(v).decode() for v in sys.argv[1:]];' +
+        'exec(base64.b64decode(payload))'
+    )
+    $previousErrorAction = $ErrorActionPreference
+    $success = $false
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & docker exec $Container python3 -c `
+            $bootstrap $encoded @encodedArguments 2>&1
+        $success = $?
+        $output
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+        $script:ContainerPythonSucceeded = $success
+    }
 }
 
 # Drive one agent turn with a wall-clock timeout. `agent-bridge create` has no
 # --reply-timeout, so bound it host-side via a job: on timeout, stop the job and
 # report the partial transcript so a hung agent is a FAIL, not an infinite wait.
-# Returns @{ transcript; duration_s; timed_out }.
-function Invoke-DriveWithTimeout([string]$Agent, [string]$PromptFile, [int]$TimeoutSec) {
+# Returns @{ transcript; duration_s; timed_out; exit_code; model }.
+function Invoke-DriveWithTimeout(
+    [string]$Agent,
+    [string]$PromptFile,
+    [int]$TimeoutSec,
+    [string]$Model,
+    [string]$SessionIdPath,
+    [string]$SessionsPath,
+    [string]$SessionResolver
+) {
     $t0 = Get-Date
     $job = Start-Job -ScriptBlock {
-        param($a, $pf)
-        & agent-bridge create $a --prompt-file $pf --expand all --no-color 2>&1 | Out-String
-    } -ArgumentList $Agent, $PromptFile
+        param($a, $pf, $model, $sessionIdPath)
+        $createArgs = @(
+            'create', $a, '--prompt-file', $pf, '--expand', 'all', '--no-color'
+        )
+        if ($model) { $createArgs += @('--model', $model) }
+        $createArgs += @('--session-id-file', $sessionIdPath)
+        try {
+            $text = (& agent-bridge @createArgs 2>&1 | Out-String)
+            $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
+        } catch {
+            $text = ($_ | Out-String)
+            $exitCode = 127
+        }
+        [pscustomobject]@{
+            transcript = $text
+            exit_code = [int]$exitCode
+        }
+    } -ArgumentList $Agent, $PromptFile, $Model, $SessionIdPath
     $timedOut = $false
     if ($TimeoutSec -gt 0) {
         if (-not (Wait-Job $job -Timeout $TimeoutSec)) { $timedOut = $true }
     } else {
         Wait-Job $job | Out-Null
     }
-    $out = (Receive-Job $job 2>&1 | Out-String)
+    $jobResult = Receive-Job $job 2>&1
+    $out = if ($jobResult -and $jobResult.transcript) {
+        [string]$jobResult.transcript
+    } else {
+        ($jobResult | Out-String)
+    }
+    $exitCode = if ($timedOut) {
+        124
+    } elseif ($jobResult -and $null -ne $jobResult.exit_code) {
+        [int]$jobResult.exit_code
+    } else {
+        127
+    }
     if ($timedOut) {
         Stop-Job $job -ErrorAction SilentlyContinue
         $out += "`n[clean-room] TIMED OUT after ${TimeoutSec}s -- driven agent did not complete its turn.`n"
     }
     Remove-Job $job -Force -ErrorAction SilentlyContinue
-    return @{ transcript = $out; duration_s = [int]((Get-Date) - $t0).TotalSeconds; timed_out = $timedOut }
+    $afterSessions = (& agent-bridge --json sessions 2>$null | Out-String).Trim()
+    if (-not $afterSessions) { $afterSessions = '[]' }
+    [IO.File]::WriteAllText(
+        $SessionsPath,
+        $afterSessions,
+        [Text.UTF8Encoding]::new($false)
+    )
+    $sessionId = ''
+    $usageModel = ''
+    $sessionResolution = 'resolver-unavailable'
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $python) {
+        $python = Get-Command python3 -ErrorAction SilentlyContinue
+    }
+    if ($python -and (Test-Path -LiteralPath $SessionResolver)) {
+        try {
+            $resolvedText = (& $python.Source $SessionResolver `
+                --session-id-file $SessionIdPath `
+                --sessions $SessionsPath `
+                --agent $Agent | Out-String).Trim()
+            $resolved = $resolvedText | ConvertFrom-Json
+            $sessionId = [string]$resolved.session_id
+            $usageModel = [string]$resolved.model
+            $sessionResolution = [string]$resolved.reason
+        } catch {
+            $sessionId = ''
+            $usageModel = ''
+            $sessionResolution = 'resolver-failed'
+        }
+    }
+    Remove-Item -Force -ErrorAction SilentlyContinue `
+        $SessionIdPath, $SessionsPath
+    return @{
+        transcript = $out
+        duration_s = [int]((Get-Date) - $t0).TotalSeconds
+        timed_out = $timedOut
+        exit_code = $exitCode
+        session_id = $sessionId
+        session_resolution = $sessionResolution
+        model = [string]$usageModel
+    }
 }
 
 # Tier-E (agent-driven eval): establish the scenario's starting state, drive the
@@ -605,6 +877,9 @@ function Invoke-Eval {
     # is resolved after the setup driver runs.
     $acpCwd = ''
     $acpCwdFile = ''
+    $acpModel = ''
+    $invalidEvidenceWriter = ''
+    $invalidEvidenceOutput = ''
     $acpPluginDirs = @()
     $payloadFingerprintDirs = @()
     if ($manifest.eval -and $manifest.eval.acp_plugin_dirs) {
@@ -630,6 +905,32 @@ function Invoke-Eval {
     }
     if ($acpCwd -and $acpCwdFile) {
         throw 'eval.acp_cwd and eval.acp_cwd_file are mutually exclusive'
+    }
+    if ($manifest.eval -and $manifest.eval.model) {
+        $acpModel = [string]$manifest.eval.model
+        if ($acpModel -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') {
+            throw 'eval.model must be a portable model identifier'
+        }
+    }
+    if ($manifest.eval -and $manifest.eval.invalid_evidence_writer) {
+        $invalidEvidenceWriter = [string]$manifest.eval.invalid_evidence_writer
+        if ($invalidEvidenceWriter -notmatch '^[A-Za-z0-9._-]+$') {
+            throw 'eval.invalid_evidence_writer must be a scenario-local file name'
+        }
+    }
+    if ($manifest.eval -and $manifest.eval.invalid_evidence_output) {
+        $invalidEvidenceOutput = [string]$manifest.eval.invalid_evidence_output
+        if (
+            $invalidEvidenceOutput.StartsWith('/') -or
+            $invalidEvidenceOutput -match '\\' -or
+            $invalidEvidenceOutput -match '(^|/)\.\.(/|$)' -or
+            $invalidEvidenceOutput -match "[`0`r`n`t]"
+        ) {
+            throw 'eval.invalid_evidence_output must be a contained results-relative path'
+        }
+    }
+    if ([bool]$invalidEvidenceWriter -ne [bool]$invalidEvidenceOutput) {
+        throw 'eval invalid evidence writer and output must be declared together'
     }
     if ($manifest.eval -and $manifest.eval.payload_fingerprint_dirs) {
         $payloadFingerprintDirs = @(
@@ -659,24 +960,37 @@ function Invoke-Eval {
     $fullPrompt = "$literal`n`n--- TASK ---`n`n$prompt"
     $evalDir = Join-Path $Results 'eval'
     New-Item -ItemType Directory -Force -Path $evalDir | Out-Null
+    function Write-ScenarioInvalidEvidence([string]$Jam) {
+        if (-not $invalidEvidenceWriter) { return }
+        & docker exec $Container python3 `
+            "/home/operator/scenario/$invalidEvidenceWriter" `
+            --manifest /home/operator/scenario/manifest.json `
+            --output "/home/operator/out/$invalidEvidenceOutput" `
+            --jam $Jam | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "could not write scenario INVALID evidence"
+        }
+    }
 
     # --- 1) start box + 2) establish starting state --------------------------
     Start-Container
     Write-Host "== eval: establishing starting state ($setupRel) ==" -ForegroundColor Cyan
     docker exec $Container /bin/bash -lc `
         "bash /home/operator/scenario/$setupRel; rc=`$?; cp -r `$HOME/cr-logs /home/operator/out/ 2>/dev/null; exit `$rc"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "warn: setup driver exited $LASTEXITCODE -- the starting state may be incomplete (see cr-report.json)." -ForegroundColor Yellow
-    }
+    $setupExitCode = $LASTEXITCODE
     $setupReport = Join-Path $Results 'cr-report.json'
     if (Test-Path -LiteralPath $setupReport -PathType Leaf) {
         Copy-Item -LiteralPath $setupReport -Destination (Join-Path $evalDir 'setup-report.json') -Force
+    }
+    if ($setupExitCode -ne 0) {
+        Write-ScenarioInvalidEvidence 'scenario-fixture'
+        throw "eval: setup driver exited $setupExitCode -- refusing to drive an agent from an invalid starting state (see cr-report.json)"
     }
 
     # Resolve and build the driven-agent command after setup. acp_cwd_file lets
     # setup publish a generated managed-worktree path without using a symlink.
     if ($acpCwdFile) {
-        $acpCwd = (& docker exec $Container python3 -c @'
+        $acpCwdScript = @'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1])
 lines = p.read_text(encoding="utf-8").splitlines()
@@ -686,8 +1000,15 @@ cwd = pathlib.Path(lines[0])
 if not cwd.is_dir():
     raise SystemExit("ACP cwd is not a directory")
 print(cwd)
-'@ $acpCwdFile | Out-String).Trim()
-        if ($LASTEXITCODE -ne 0 -or -not $acpCwd) {
+'@
+        $acpCwd = (
+            Invoke-ContainerPython `
+                -Script $acpCwdScript `
+                -Arguments @($acpCwdFile) |
+                Out-String
+        ).Trim()
+        if (-not $script:ContainerPythonSucceeded -or -not $acpCwd) {
+            Write-ScenarioInvalidEvidence 'scenario-fixture'
             throw "eval: could not resolve a valid cwd from '$acpCwdFile'"
         }
     }
@@ -709,13 +1030,19 @@ print(cwd)
         Write-Host "== eval: Tier-P precondition ($tierPCmd) ==" -ForegroundColor Cyan
         docker exec $Container /bin/bash -lc "$tierPCmd" | Out-Null
         if ($LASTEXITCODE -ne 0) {
+            Write-ScenarioInvalidEvidence 'scenario-fixture'
             throw "eval: Tier-P precondition '$tierPCmd' failed (exit $LASTEXITCODE) -- refusing to spend an eval on a broken CLI surface. Fix the plugin's *-solo Tier-P scenario first, or pass -SkipTierPGate to force."
         }
         Write-Host "   precondition OK" -ForegroundColor DarkGray
     }
 
     # --- 3) register the box as a bridge agent -------------------------------
-    Invoke-BridgeRegister
+    try {
+        Invoke-BridgeRegister
+    } catch {
+        Write-ScenarioInvalidEvidence 'scenario-transport-gap'
+        throw
+    }
 
     # --- eval/ artifacts -----------------------------------------------------
     Set-Content -Path (Join-Path $evalDir 'literal-mode.txt') -Value $literal -Encoding utf8
@@ -766,9 +1093,15 @@ for index, root in enumerate(roots):
             digest.update(path.read_bytes())
 print(digest.hexdigest()[:16])
 '@
-    $docsHash = (& docker exec $Container python3 -c $docsHashScript $fingerprintDirsJson |
+    $docsHash = (Invoke-ContainerPython `
+        -Script $docsHashScript `
+        -Arguments @($fingerprintDirsJson) |
         Select-Object -First 1)
-    if ($LASTEXITCODE -ne 0 -or $docsHash -notmatch '^[0-9a-f]{16}$') {
+    if (
+        -not $script:ContainerPythonSucceeded -or
+        $docsHash -notmatch '^[0-9a-f]{16}$'
+    ) {
+        Write-ScenarioInvalidEvidence 'scenario-transport-gap'
         throw 'eval: could not fingerprint the evaluated plugin payloads'
     }
 
@@ -781,24 +1114,139 @@ print(digest.hexdigest()[:16])
     # a FAIL, not an infinite wait.
     Write-Host "== eval: driving '$DriveAgent' x$runCount (fresh session; literal-mode + stated purpose) ==" -ForegroundColor Cyan
     if ($perTurnTimeout -gt 0) { Write-Host "   per-turn timeout: ${perTurnTimeout}s" -ForegroundColor DarkGray }
+    $captureNames = @(
+        'transcript.txt',
+        'structured-result.json',
+        'turn-detail.json',
+        'turns.jsonl'
+    )
+    $priorRunDirs = @($evalDir) + @(
+        Get-ChildItem -Path $evalDir -Directory -Filter 'run-*' `
+            -ErrorAction SilentlyContinue
+    )
+    foreach ($priorRunDir in $priorRunDirs) {
+        foreach ($captureName in $captureNames) {
+            Remove-Item -Force -ErrorAction SilentlyContinue `
+                (Join-Path $priorRunDir $captureName)
+        }
+    }
+    Remove-Item -Force -ErrorAction SilentlyContinue `
+        (Join-Path $evalDir 'drive-runs.json')
     $runRecords = @()
+    $sessionResolver = Join-Path $Here 'resolve_drive_session.py'
     for ($n = 1; $n -le $runCount; $n++) {
         $runDir = if ($runCount -eq 1) { $evalDir } else { $d = Join-Path $evalDir "run-$n"; New-Item -ItemType Directory -Force -Path $d | Out-Null; $d }
         $transcriptPath = Join-Path $runDir 'transcript.txt'
+        $structuredPath = Join-Path $runDir 'structured-result.json'
+        $turnPath = Join-Path $runDir 'turn-detail.json'
+        $turnsPath = Join-Path $runDir 'turns.jsonl'
+        Remove-Item -Force -ErrorAction SilentlyContinue `
+            $transcriptPath, $structuredPath, $turnPath, $turnsPath
         Write-Host "   -- run $n/$runCount --" -ForegroundColor DarkGray
         Invoke-EndAgentSessions $DriveAgent
-        $drv = Invoke-DriveWithTimeout $DriveAgent $promptTxt $perTurnTimeout
+        $provenanceDir = Join-Path (
+            [IO.Path]::GetTempPath()
+        ) ("clean-room-drive-" + [guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Force -Path $provenanceDir | Out-Null
+        $sessionIdPath = Join-Path $provenanceDir 'created-session-id'
+        $sessionsPath = Join-Path $provenanceDir 'sessions.json'
+        try {
+            $drv = Invoke-DriveWithTimeout `
+                $DriveAgent $promptTxt $perTurnTimeout $acpModel `
+                $sessionIdPath $sessionsPath $sessionResolver
+        }
+        finally {
+            Remove-Item -LiteralPath $provenanceDir -Recurse -Force `
+                -ErrorAction SilentlyContinue
+        }
         Set-Content -Path $transcriptPath -Value $drv.transcript -Encoding utf8
+        $turnEvidence = [System.Collections.Generic.List[string]]::new()
+        try {
+            if ($drv.session_id) {
+                $snapshotText = (& agent-bridge --json result $drv.session_id 2>$null |
+                    Out-String).Trim()
+                if ($snapshotText) {
+                    Set-Content -Path $structuredPath -Value $snapshotText -Encoding utf8
+                    $snapshot = $snapshotText | ConvertFrom-Json
+                    $detailRef = $snapshot.latest_result.detail_ref
+                    $seenTurnRefs = @{}
+                    if ($detailRef) {
+                        $latestDetailText = (& agent-bridge --json result `
+                            $drv.session_id --expand $detailRef 2>$null |
+                            Out-String).Trim()
+                        if ($latestDetailText) {
+                            Set-Content -Path $turnPath `
+                                -Value $latestDetailText -Encoding utf8
+                            $latestDetail = $latestDetailText | ConvertFrom-Json
+                            if ($latestDetail.turn) {
+                                $turnEvidence.Add(
+                                    ($latestDetail |
+                                        ConvertTo-Json -Depth 20 -Compress)
+                                )
+                                $seenTurnRefs[$detailRef] = $true
+                            }
+                        }
+                    }
+                    foreach ($item in @($snapshot.incremental.items)) {
+                        if (-not $item.detail_ref) { continue }
+                        if ($seenTurnRefs.ContainsKey($item.detail_ref)) {
+                            continue
+                        }
+                        try {
+                            $detailText = (& agent-bridge --json result `
+                                $drv.session_id `
+                                --expand $item.detail_ref 2>$null |
+                                Out-String).Trim()
+                            if (-not $detailText) { continue }
+                            $detail = $detailText | ConvertFrom-Json
+                            if ($detail.turn) {
+                                $turnEvidence.Add(
+                                    ($detail |
+                                        ConvertTo-Json -Depth 20 -Compress)
+                                )
+                            }
+                        } catch { }
+                    }
+                    if ($turnEvidence.Count -gt 0) {
+                        Set-Content -Path $turnsPath `
+                            -Value $turnEvidence -Encoding utf8
+                    }
+                }
+            }
+        } catch {
+            # Structured evidence is best-effort for general scenarios; a
+            # scenario that requires it must fail closed in post_check.
+        }
         $runRecords += [pscustomobject]@{
             n          = $n
             transcript = ($transcriptPath -replace [regex]::Escape($Results + '\'), '') -replace '\\','/'
+            structured_result = if (Test-Path $structuredPath) {
+                ($structuredPath -replace [regex]::Escape($Results + '\'), '') -replace '\\','/'
+            } else { $null }
+            turn_detail = if (Test-Path $turnPath) {
+                ($turnPath -replace [regex]::Escape($Results + '\'), '') -replace '\\','/'
+            } else { $null }
+            turns = if (Test-Path $turnsPath) {
+                ($turnsPath -replace [regex]::Escape($Results + '\'), '') -replace '\\','/'
+            } else { $null }
             duration_s = $drv.duration_s
             timed_out  = $drv.timed_out
+            exit_code  = $drv.exit_code
+            session_id = if ($drv.session_id) { $drv.session_id } else { $null }
+            session_resolution = $drv.session_resolution
+            model      = $drv.model
         }
         $tag = if ($drv.timed_out) { " -- TIMED OUT" } else { '' }
+        if ($drv.exit_code -ne 0) { $tag += " -- EXIT $($drv.exit_code)" }
+        if ($drv.model) { $tag += " -- MODEL $($drv.model)" }
+        if ($drv.session_resolution -ne 'resolved') {
+            $tag += " -- SESSION $($drv.session_resolution)"
+        }
         $col = if ($drv.timed_out) { 'Yellow' } else { 'DarkGray' }
         Write-Host "      transcript -> $transcriptPath  ($($drv.duration_s)s)$tag" -ForegroundColor $col
     }
+    ConvertTo-Json -InputObject @($runRecords) -Depth 4 |
+        Set-Content -Path (Join-Path $evalDir 'drive-runs.json') -Encoding utf8
 
     # --- 6) optional programmatic post-check (ground-truth evidence) ---------
     if ($postCheck -and (Test-Path (Join-Path $ScenarioDir $postCheck))) {
@@ -833,6 +1281,7 @@ print(digest.hexdigest()[:16])
         docs_hash        = $docsHash
         acp_plugin_dirs  = @($acpPluginDirs)
         payload_fingerprint_dirs = @($fingerprintDirs)
+        requested_model  = $acpModel
         per_turn_timeout_s = $perTurnTimeout
         tier_p_precondition = if ($SkipTierPGate) { "$tierPCmd (SKIPPED)" } else { $tierPCmd }
         bridge_cleanup_error = $bridgeCleanupError
@@ -866,6 +1315,7 @@ switch ($Mode) {
     'eval'  { Invoke-Eval }
     'shell' { Invoke-Shell }
     'down'  { Invoke-Down }
+    'prune' { Invoke-Prune }
     'bridge-register'   { Invoke-BridgeRegister }
     'bridge-unregister' { Invoke-BridgeUnregister }
     'all'   { Invoke-Build; Invoke-Run }

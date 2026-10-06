@@ -17,12 +17,22 @@ from __future__ import annotations
 
 import os
 import platform
+import subprocess
 from pathlib import Path
 
 __all__ = [
+    "copilot_relaunch_path",
+    "count_processes_named",
+    "is_descendant_of",
+    "parent_pid",
+    "process_age_seconds",
+    "process_executable_path",
     "processes_with_cwd_under",
-    "terminate_processes_under",
+    "processes_with_executable_under",
     "terminate_pid",
+    "terminate_pid_if_identity",
+    "terminate_processes_under",
+    "terminate_processes_under_executable",
 ]
 
 
@@ -78,6 +88,27 @@ def _terminate_posix(pid: int) -> bool:
         return False
 
 
+def _parent_pid_posix(pid: int) -> int | None:
+    """Return ``pid``'s parent pid via ``/proc/<pid>/stat`` field 4 (ppid)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(errors="ignore")
+    except OSError:
+        return None
+    # comm (field 2) may contain spaces/parens -- split on the LAST ')'.
+    rparen = stat.rfind(")")
+    if rparen == -1:
+        return None
+    rest = stat[rparen + 1:].split()
+    # After comm, `rest` holds fields from state (field 3) onward, so ppid
+    # (field 4) is rest[1]: state=rest[0], ppid=rest[1].
+    if len(rest) < 2:
+        return None
+    try:
+        return int(rest[1])
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Windows -- read each process's cwd from its PEB (64-bit layout)
 # ---------------------------------------------------------------------------
@@ -107,6 +138,14 @@ def _win_kernel32():
     k32.ReadProcessMemory.restype = wintypes.BOOL
     k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
     k32.TerminateProcess.restype = wintypes.BOOL
+    k32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    k32.GetProcessTimes.restype = wintypes.BOOL
     k32.QueryFullProcessImageNameW.argtypes = [
         wintypes.HANDLE, wintypes.DWORD,
         wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
@@ -210,6 +249,277 @@ def _win_read_cwd(k32, pid: int) -> tuple[str, str]:
         k32.CloseHandle(handle)
 
 
+def _win_parent_pid(pid: int) -> int | None:
+    """Return ``pid``'s parent pid via ``NtQueryInformationProcess``.
+
+    Reads ``PROCESS_BASIC_INFORMATION.InheritedFromUniqueProcessId`` -- the
+    same syscall shape :func:`_win_read_cwd` already makes for cwd, just with
+    the full 6-pointer struct instead of the partial one used there.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        k32 = _win_kernel32()
+    except OSError:
+        return None
+    handle = k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+
+        class _PBI(ctypes.Structure):
+            _fields_ = [
+                ("ExitStatus", ctypes.c_void_p),
+                ("PebBaseAddress", ctypes.c_void_p),
+                ("AffinityMask", ctypes.c_void_p),
+                ("BasePriority", ctypes.c_void_p),
+                ("UniqueProcessId", ctypes.c_void_p),
+                ("InheritedFromUniqueProcessId", ctypes.c_void_p),
+            ]
+
+        ntdll.NtQueryInformationProcess.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+            wintypes.ULONG, ctypes.POINTER(wintypes.ULONG),
+        ]
+        ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+
+        pbi = _PBI()
+        status = ntdll.NtQueryInformationProcess(
+            handle, 0, ctypes.byref(pbi), ctypes.sizeof(pbi), None)
+        if status != 0:
+            return None
+        ppid = int(pbi.InheritedFromUniqueProcessId or 0)
+        return ppid or None
+    except OSError:
+        return None
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _process_age_seconds_posix(pid: int) -> float | None:
+    """Seconds elapsed since ``pid`` started, via ``/proc/<pid>/stat`` +
+    ``/proc/uptime`` (both in the kernel's own clock-tick/uptime units)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(errors="ignore")
+        uptime_text = Path("/proc/uptime").read_text(errors="ignore")
+    except OSError:
+        return None
+    rparen = stat.rfind(")")
+    if rparen == -1:
+        return None
+    rest = stat[rparen + 1:].split()
+    if len(rest) < 20:
+        return None
+    try:
+        starttime_ticks = int(rest[19])
+        clk_tck = os.sysconf("SC_CLK_TCK")
+        uptime_seconds = float(uptime_text.split()[0])
+    except (ValueError, OSError, IndexError):
+        return None
+    if not clk_tck:
+        return None
+    return max(0.0, uptime_seconds - (starttime_ticks / clk_tck))
+
+
+def _win_process_age_seconds(pid: int) -> float | None:
+    """Seconds elapsed since ``pid`` started, via ``GetProcessTimes`` vs
+    ``GetSystemTimeAsFileTime`` (both 100ns-tick Windows ``FILETIME``s)."""
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+    k32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    k32.GetProcessTimes.restype = wintypes.BOOL
+    k32.GetSystemTimeAsFileTime.argtypes = [ctypes.POINTER(wintypes.FILETIME)]
+
+    handle = k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        creation = wintypes.FILETIME()
+        exit_ = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        ok = k32.GetProcessTimes(
+            handle, ctypes.byref(creation), ctypes.byref(exit_),
+            ctypes.byref(kernel), ctypes.byref(user),
+        )
+        if not ok:
+            return None
+        created_ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+        now = wintypes.FILETIME()
+        k32.GetSystemTimeAsFileTime(ctypes.byref(now))
+        now_ticks = (now.dwHighDateTime << 32) | now.dwLowDateTime
+        return max(0.0, (now_ticks - created_ticks) / 10_000_000.0)
+    except OSError:
+        return None
+    finally:
+        k32.CloseHandle(handle)
+
+
+def process_age_seconds(pid: int) -> float | None:
+    """Seconds elapsed since ``pid`` started, or ``None`` when unreadable.
+
+    Best-effort and dependency-free on both platforms; never raises.
+    """
+    if pid <= 0:
+        return None
+    try:
+        if platform.system() == "Windows":
+            return _win_process_age_seconds(pid)
+        return _process_age_seconds_posix(pid)
+    except OSError:
+        return None
+
+
+# A candidate this old is treated as genuinely stuck rather than a launcher's
+# still-in-flight subprocess call -- #4268 observed wedged invocations
+# surviving for roughly two hours; a short-lived `resolve`/`activity-log`/
+# `get` call normally completes in well under a minute. Generous on purpose:
+# ancestor protection is meant to shield brief legitimate work, not
+# indefinitely shelter anything descended from a live launcher.
+_PROTECT_ANCESTOR_GRACE_SECONDS = 120.0
+
+
+def parent_pid(pid: int) -> int | None:
+    """Return ``pid``'s parent pid, or ``None`` when unknown/unreadable.
+
+    Best-effort and dependency-free on both platforms; never raises.
+    """
+    if pid <= 0:
+        return None
+    try:
+        if platform.system() == "Windows":
+            return _win_parent_pid(pid)
+        return _parent_pid_posix(pid)
+    except OSError:
+        return None
+
+
+def is_descendant_of(pid: int, ancestors: set[int], *, max_depth: int = 64) -> bool:
+    """True when ``pid`` (or an ancestor of it) is in ``ancestors``.
+
+    Walks the parent-pid chain, bounded by ``max_depth`` so a misread or
+    (impossible, but never trust an OS API unconditionally) cyclic chain
+    can't loop forever. A broken/unreadable chain simply stops the walk and
+    returns False -- this is a safety exclusion, so failing to *prove*
+    descent must never be treated as descent.
+    """
+    if not ancestors:
+        return False
+    seen: set[int] = set()
+    current = pid
+    for _ in range(max_depth):
+        if current in ancestors:
+            return True
+        if current <= 0 or current in seen:
+            return False
+        seen.add(current)
+        nxt = parent_pid(current)
+        if not nxt:
+            return False
+        current = nxt
+    return False
+
+
+def process_executable_path(pid: int) -> str | None:
+    """Return the absolute executable path for a live process when supported."""
+    if pid <= 0:
+        return None
+    if platform.system() == "Windows":
+        import ctypes
+        from ctypes import wintypes
+
+        try:
+            k32 = _win_kernel32()
+        except OSError:
+            return None
+        handle = k32.OpenProcess(
+            _PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return None
+        try:
+            buf = ctypes.create_unicode_buffer(32768)
+            size = wintypes.DWORD(len(buf))
+            if not k32.QueryFullProcessImageNameW(
+                handle, 0, buf, ctypes.byref(size)
+            ):
+                return None
+            path = buf.value
+        finally:
+            k32.CloseHandle(handle)
+    else:
+        proc_link = Path("/proc") / str(pid) / "exe"
+        try:
+            path = os.readlink(proc_link)
+        except OSError:
+            return None
+        if path.endswith(" (deleted)"):
+            path = str(proc_link) if os.access(proc_link, os.X_OK) else ""
+    return path if path and os.path.isabs(path) else None
+
+
+def copilot_relaunch_path(
+    process_path: str | None,
+    *,
+    timeout: float = 5.0,
+) -> str | None:
+    """Return a predecessor-derived executable that identifies as Copilot.
+
+    Package managers may rename an in-use Windows executable to
+    ``copilot.exe.old-*`` while the predecessor keeps running from that image.
+    Such retained images can exist and report valid file metadata yet silently
+    exit when relaunched. Prefer the canonical sibling for that replacement
+    shape, then require a bounded ``--version`` probe before trusting either
+    path as a handoff launch authority.
+    """
+    if not process_path or not os.path.isabs(process_path):
+        return None
+    original = Path(process_path)
+    candidates: list[Path] = []
+    name = original.name.lower()
+    if platform.system() == "Windows" and name.startswith("copilot.exe.old"):
+        candidates.append(original.with_name("copilot.exe"))
+    candidates.append(original)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = os.path.normcase(os.path.abspath(candidate))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            if not candidate.is_file():
+                continue
+            probe = subprocess.run(
+                [str(candidate), "--version"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=timeout,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        output = f"{probe.stdout}\n{probe.stderr}".lower()
+        if probe.returncode == 0 and "github copilot cli" in output:
+            return str(candidate)
+    return None
+
+
 def _terminate_windows(k32, pid: int) -> bool:
     handle = k32.OpenProcess(_PROCESS_TERMINATE, False, pid)
     if not handle:
@@ -218,6 +528,115 @@ def _terminate_windows(k32, pid: int) -> bool:
         return bool(k32.TerminateProcess(handle, 1))
     finally:
         k32.CloseHandle(handle)
+
+
+def _windows_start_time_from_handle(k32, handle) -> str | None:
+    import ctypes
+    from ctypes import wintypes
+
+    created = wintypes.FILETIME()
+    exited = wintypes.FILETIME()
+    kernel = wintypes.FILETIME()
+    user = wintypes.FILETIME()
+    if not k32.GetProcessTimes(
+        handle,
+        ctypes.byref(created),
+        ctypes.byref(exited),
+        ctypes.byref(kernel),
+        ctypes.byref(user),
+    ):
+        return None
+    return str((created.dwHighDateTime << 32) | created.dwLowDateTime)
+
+
+def _terminate_windows_if_identity(
+    pid: int, expected_start_time: str
+) -> dict:
+    k32 = _win_kernel32()
+    handle = k32.OpenProcess(
+        _PROCESS_QUERY_LIMITED_INFORMATION | _PROCESS_TERMINATE,
+        False,
+        pid,
+    )
+    if not handle:
+        return {
+            "killed": False, "identity_verified": False,
+            "method": "windows-handle-unavailable",
+        }
+    try:
+        current = _windows_start_time_from_handle(k32, handle)
+        if current != str(expected_start_time):
+            return {
+                "killed": False, "identity_verified": False,
+                "method": "windows-handle-identity-mismatch",
+            }
+        return {
+            "killed": bool(k32.TerminateProcess(handle, 1)),
+            "identity_verified": True,
+            "method": "windows-verified-handle",
+        }
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _terminate_posix_if_identity(
+    pid: int, expected_start_time: str
+) -> dict:
+    import signal
+
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if not callable(pidfd_open) or not callable(pidfd_send_signal):
+        return {
+            "killed": False, "identity_verified": False,
+            "method": "pidfd-unavailable",
+        }
+    try:
+        fd = pidfd_open(pid, 0)
+    except OSError:
+        return {
+            "killed": False, "identity_verified": False,
+            "method": "pidfd-open-failed",
+        }
+    try:
+        from . import locks
+
+        if locks.process_start_time(pid) != str(expected_start_time):
+            return {
+                "killed": False, "identity_verified": False,
+                "method": "pidfd-identity-mismatch",
+            }
+        try:
+            pidfd_send_signal(fd, signal.SIGTERM)
+        except OSError:
+            return {
+                "killed": False, "identity_verified": True,
+                "method": "pidfd-signal-failed",
+            }
+        return {
+            "killed": True, "identity_verified": True,
+            "method": "pidfd",
+        }
+    finally:
+        os.close(fd)
+
+
+def terminate_pid_if_identity(pid: int, expected_start_time: str | None) -> dict:
+    """Terminate only through an OS object bound to the verified process.
+
+    Windows verifies creation time and calls ``TerminateProcess`` through the
+    same open handle. POSIX opens a pidfd, verifies the expected ``/proc`` start
+    token, then signals through that pidfd. If either atomic identity mechanism
+    is unavailable, this verified path fails closed.
+    """
+    if pid <= 0 or not expected_start_time:
+        return {
+            "killed": False, "identity_verified": False,
+            "method": "identity-unavailable",
+        }
+    if platform.system() == "Windows":
+        return _terminate_windows_if_identity(pid, str(expected_start_time))
+    return _terminate_posix_if_identity(pid, str(expected_start_time))
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +668,46 @@ def terminate_pid(pid: int) -> bool:
         return killed
     except OSError:
         return False
+
+
+def count_processes_named(name: str, *, exclude_pid: int | None = None) -> int:
+    """Count live processes whose executable basename (stem) matches ``name``.
+
+    Case-insensitive; strips a Windows ``.exe`` suffix before comparing.
+    Best-effort and dependency-free like the rest of this module: any
+    enumeration failure returns 0 rather than raising, so a safety check
+    built on this degrades to "assume none" rather than crashing its caller.
+    Excludes the current process (or an explicit ``exclude_pid``) so a
+    caller checking "is any OTHER copilot process running" doesn't count
+    itself.
+    """
+    exclude = exclude_pid if exclude_pid is not None else os.getpid()
+    target = name.lower().removesuffix(".exe")
+    count = 0
+    try:
+        if platform.system() == "Windows":
+            try:
+                k32 = _win_kernel32()
+            except OSError:
+                return 0
+            for pid in _win_enum_pids():
+                if pid == exclude:
+                    continue
+                try:
+                    _cwd, exe_name = _win_read_cwd(k32, pid)
+                except OSError:
+                    continue
+                if exe_name and exe_name.removesuffix(".exe") == target:
+                    count += 1
+        else:
+            for pid, _cwd, proc_name in _iter_processes_posix():
+                if pid == exclude:
+                    continue
+                if proc_name and proc_name.lower() == target:
+                    count += 1
+    except Exception:
+        return 0
+    return count
 
 
 def processes_with_cwd_under(
@@ -322,6 +781,142 @@ def terminate_processes_under(
             reap_audit.record("cwd-proc", t["pid"],
                               reason="terminate_processes_under", killed=ok,
                               root=root, name=t.get("name"))
+        except Exception:
+            pass
+        results.append({**t, "killed": ok})
+    return results
+
+
+def processes_with_executable_under(
+    root: str, *, exclude: str | None = None, exclude_pids: set[int] | None = None,
+    protect_ancestors: set[int] | None = None,
+) -> list[dict]:
+    """Find processes whose resolved **executable** path is at or under
+    ``root`` -- unlike :func:`processes_with_cwd_under`, which matches a
+    process's *current working directory*, this matches the interpreter/binary
+    image it was launched from (e.g. a ``versions/<v>/Scripts/python.exe``
+    runtime slot). ``exclude``, when given, is itself a path prefix to skip
+    (typically the CURRENT runtime slot nested under the same ``versions/``
+    root) so a caller can find only *other*, non-current instances.
+
+    ``protect_ancestors``, when given, is a set of pids: a candidate whose
+    parent-pid chain includes one of them is skipped even though its own
+    executable matches ``root``. This is how a live worktree-launcher root
+    (registered via :mod:`launch_registry`) shields its own short-lived
+    ``agent_worktrees resolve``/``activity-log`` subprocess calls from being
+    caught mid-flight by a version-cutover sweep (#4454 follow-up) -- those
+    calls are legitimate, still-running work, not a wedged orphan. The
+    exclusion is bounded by :data:`_PROTECT_ANCESTOR_GRACE_SECONDS`: a
+    descendant older than that reads as genuinely stuck (the #4268 case this
+    sweep exists for) and is reaped regardless of its ancestor.
+
+    Returns ``{"pid": int, "name": str, "executable": str}`` dicts.
+    Best-effort: any process that can't be opened or read is silently skipped,
+    matching :func:`processes_with_cwd_under`.
+    """
+    excluded_pids = {os.getpid()}
+    if exclude_pids:
+        excluded_pids |= exclude_pids
+    hits: list[dict] = []
+
+    def _candidates():
+        if platform.system() == "Windows":
+            try:
+                k32 = _win_kernel32()
+            except OSError:
+                return
+            for pid in _win_enum_pids():
+                if pid in excluded_pids:
+                    continue
+                try:
+                    _cwd, name = _win_read_cwd(k32, pid)
+                except OSError:
+                    name = ""
+                yield pid, name
+        else:
+            for pid, _cwd, name in _iter_processes_posix():
+                if pid in excluded_pids:
+                    continue
+                yield pid, name
+
+    for pid, name in _candidates():
+        try:
+            exe = process_executable_path(pid)
+        except OSError:
+            continue
+        if not exe or not _is_under(exe, root):
+            continue
+        if exclude and _is_under(exe, exclude):
+            continue
+        if protect_ancestors and is_descendant_of(pid, protect_ancestors):
+            age = process_age_seconds(pid)
+            # Protection only shields a candidate PROVEN to be recent: a
+            # genuinely wedged descendant of an otherwise-live launcher (the
+            # original #4268 case -- surviving for hours) must remain
+            # reapable, or this exclusion would defeat the sweep's whole
+            # purpose for that class of process. An unmeasurable age fails
+            # CLOSED (no protection) -- protection is the exception path, so
+            # failing to prove "still fresh" must not grant it.
+            if age is not None and age <= _PROTECT_ANCESTOR_GRACE_SECONDS:
+                continue
+        hits.append({"pid": pid, "name": name, "executable": exe})
+    return hits
+
+
+def terminate_processes_under_executable(
+    root: str, *, exclude: str | None = None, exclude_pids: set[int] | None = None,
+    protect_ancestors: set[int] | None = None,
+) -> list[dict]:
+    """Terminate every process whose resolved executable is at or under
+    ``root`` (excluding ``exclude``, typically the current runtime slot).
+
+    The cutover counterpart to :func:`terminate_processes_under`: a version
+    bump publishes a fresh ``versions/<v>`` slot, but any one-shot CLI verb
+    invocation still mid-flight on the OUTGOING slot has no self-check to
+    retire itself -- only the resident status-monitor loop rechecks
+    ``_runtime_superseded`` each tick (dotfiles#911 is the prior incident for
+    that loop's own case). Left alone, such an invocation can wedge
+    indefinitely on a lock/IPC call and pile up across every deploy it
+    survives (#4268 observed 18 such processes for a
+    single project over roughly two hours). Called from the cutover reap
+    alongside the singleton monitor's own known-pid reap.
+
+    ``protect_ancestors`` is forwarded to :func:`processes_with_executable_under`
+    -- see its docstring. This is the mechanism that keeps a live worktree
+    launcher's own short-lived subprocess calls from being killed mid-flight
+    by this same sweep (#4454 follow-up).
+
+    Returns the list of ``{"pid", "name", "executable", "killed": bool}`` that
+    were targeted.
+    """
+    targets = processes_with_executable_under(
+        root, exclude=exclude, exclude_pids=exclude_pids,
+        protect_ancestors=protect_ancestors,
+    )
+    if not targets:
+        return []
+
+    if platform.system() == "Windows":
+        try:
+            k32 = _win_kernel32()
+        except OSError:
+            return [{**t, "killed": False} for t in targets]
+        killer = lambda pid: _terminate_windows(k32, pid)  # noqa: E731
+    else:
+        killer = _terminate_posix
+
+    results: list[dict] = []
+    for t in targets:
+        ok = False
+        try:
+            ok = killer(t["pid"])
+        except OSError:
+            ok = False
+        try:
+            from . import reap_audit
+            reap_audit.record("stale-runtime-exe", t["pid"],
+                              reason="terminate_processes_under_executable",
+                              killed=ok, root=root, name=t.get("name"))
         except Exception:
             pass
         results.append({**t, "killed": ok})

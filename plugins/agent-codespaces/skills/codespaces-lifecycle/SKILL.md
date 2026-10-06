@@ -129,6 +129,13 @@ follow-ups using the session ID:
 
 - **Shutdown CodeSpaces auto-start** when the bridge connects. Startup
   takes 60–120 s; the SSH layer retries automatically (up to ~180 s).
+- **Transient dev-tunnel resets are retried** ("An existing connection was
+  forcibly closed", `error getting tunnel`, RPC `Unavailable`, ssh exit 255):
+  ssh-manager backs off and retries the `gh codespace ssh --config` fetch, the
+  connect, and every idempotent remote step (`exec_with_retry`: probes,
+  staging, settings merges, installs); a detached launch or `--stop` retries
+  its connection once. A failure that survives those retries is real -- read
+  its stderr rather than re-running blindly.
 - **Do NOT pre-start CodeSpaces with manual SSH** — the bridge handles
   startup end-to-end.
 - **Pool pressure:** the catalog command's `create` action consults the pool planner before
@@ -148,6 +155,171 @@ a **cross-harness fence** reads a lockfile inside the CodeSpace (`~/.agent-lease
 and **refuses** the connect if a *foreign harness* holds it (the seam the
 same-harness ref store cannot see). All degrade-safe — a missing store / identity
 never blocks. See `borrowing-codespaces` for the full lease + fence model.
+
+## CLI-mode sessions (`copilot`)
+
+`<agent-codespaces catalog argv[0]> copilot <name>` delivers a real interactive Copilot CLI
+session, running in a tmux session inside the CodeSpace, into **this**
+terminal (it reserves the CLI-mode slot on the host agent-bridge, forwards the
+credential relay and the host bridge port, and runs the venue's agent-worktrees
+`copilot` verb there). Re-running it re-attaches to the same session.
+`--ttl-seconds` applies only to this attached-mode CLI reservation (default
+300 seconds before an unclaimed reservation is reclaimable); do not pass it with
+`--detach` or `--stop`.
+
+An **orchestrating agent** uses the detached form instead -- nothing takes over
+its terminal:
+
+```bash
+<agent-codespaces catalog argv[0]> copilot <name> --detach --seed-file task.md \
+  --driver orchestrator --copilot-arg=--no-ask-user     # prints a JSON handle
+<agent-codespaces catalog argv[0]> copilot <name> --detach --seed-file task.md \
+  --ref-file ./trace.har --ref-file ./session.md        # + reference files for the worker
+<agent-codespaces catalog argv[0]> copilot <name> --detach --dry-run   # resolved plan, no side effects
+<agent-codespaces catalog argv[0]> copilot <name> --stop               # verified stop, then release
+```
+
+Launched with `--effort <owner>`, the attach (`copilot <name>`) and `--stop`
+commands must pass the same `--effort`: they connect, and the CodeSpace claim
+refuses a different owner as busy. The launch's JSON `commands` already carry it.
+
+`--detach` runs the same dispatch-grade venue preparation as an agent-bridge
+dispatch (relay helpers, dotfiles/harness, CodeSpace-scoped plugins staged into
+the session via `--plugin-dir`, repo hooks, auth checks), then from the product
+checkout adopts it as an anchor-only `agent-worktrees` project if needed,
+records that folder in Copilot's `trustedFolders` (nobody is there to answer the
+first-run trust dialog), and launches the session with the venue's agent-worktrees
+`embody` verb.
+A new detached session starts on **the caller's own model**: the launch adds
+`--model`, `--reasoning-effort`, and `--context` from the host
+`~/.copilot/settings.json` (`model`, `effortLevel`, `contextTier`), the same
+resolution the ACP dispatch path uses. `AGENT_CODESPACES_ACP_MODEL` /
+`_EFFORT` / `_CONTEXT` override it, `AGENT_CODESPACES_MODEL_PROPAGATE=0` turns
+it off, and a flag passed explicitly with `--copilot-arg` always wins.
+A resume that names only the session (`--copilot-arg=--resume=<id>`, as a
+supervisor's automatic wake after a CodeSpace stop does) keeps the
+`--copilot-arg`s (host-propagated model flags included) and `--driver` that
+session actually ran with: a launch that starts a session records them, with
+the session's id, under
+`~/.agent-codespaces/launches/<codespace>/` (its JSON lists what was reused
+under `recalled`), and the resume adds no host model defaults the session didn't
+run with. Only a resume of that same session id with no other flags
+and no `--driver` reuses them -- never a new session, another
+session, `--continue`, or a launch with explicit flags -- and a rejoin of an
+already running session leaves the record alone.
+The record keeps the session's `--forward` ports as well, because the
+Connection Owner releases them along with a stopped CodeSpace's session: a
+resume of the recorded session id that passes no `--forward` re-adds them
+(`recalled` then lists `local_forwards`), whatever its other flags; any
+`--forward` given replaces them, and a rejoin that sets them records the new
+set. `--reverse-forward`s are never recorded or recalled -- their host end can
+move (a restarted host browser listens on a new port), and opening this host to
+the venue stays an explicit choice -- so pass them again on every resume.
+`--ref-file` (repeatable; a file or a folder, up to 256 MiB per call) copies
+reference material into `~/.agent-bridge/refs/<batch>/` on the venue -- outside <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
+the product checkout, so it is never committed -- over the same egress-free
+stdin lane as plugin staging, and tells the worker the exact paths: in its seed
+for a new session, or as a message when the session is already running (so
+re-running the same `--detach` command with `--ref-file` hands a running
+worker more files). The caller passes only paths; it never reads the files.
+`--reverse-forward VENUE_PORT:HOST_PORT` (repeatable) asks the Connection Owner
+to keep the CodeSpace's `127.0.0.1:VENUE_PORT` forwarded to this host's
+`127.0.0.1:HOST_PORT` for as long as the session lives -- for example a host
+browser started with `--remote-debugging-port=<HOST_PORT>` exposed as the
+venue's DevTools endpoint on 9222. It binds loopback only on the venue, but
+anything running there can then drive that host process: forward only what the
+worker should control. A rejoin without the flag keeps the session's forwards.
+The launch reports `reverse_forwards_ready` per venue port (it checks each one
+accepts a connection); `false` usually means a Connection Owner that predates
+this option is still running -- it exits once it holds nothing.
+`--forward PORT[:VENUE_PORT]` (repeatable) is the other direction: the Owner
+keeps this host's `127.0.0.1:PORT` forwarded to the CodeSpace's
+`127.0.0.1:VENUE_PORT` (default: the same port) for the session's life -- for
+example the worker's dev server at a fixed `--port`, so a browser on this host
+loads `https://localhost:PORT`. A fixed host port is the default and documented
+contract: it keeps TLS certs, redirect URIs, cookies, and worker-facing URLs
+tied to the expected `https://localhost:PORT`; use `--forward N:VENUE_PORT`
+when the host port must remain pinned to exactly `N`. Use `--forward 0:VENUE_PORT`
+only when the caller explicitly wants the Owner to bind a system-assigned host
+port; `VENUE_PORT` is required, and the launch JSON reports the actual assigned
+host port in `local_forwards` and `local_forwards_ready`. Once assigned, that
+host port is kept for the session's life across reconnects, rejoins, and Owner
+restarts while the Owner can still bind it. If something else grabs that
+kernel-assigned port while the forward is down, the Owner records a replacement
+assigned port rather than reporting another process's listener as ready; the URL
+changes only because the old assigned port is unusable. Re-running the same
+`--forward 0:VENUE_PORT` for a running session reuses the assigned host port the
+hold recorded, even after an Owner restart (the active-forward beacon may be
+missing or stale then): the restarted Owner rebinds that port and assigns a new
+one only on a proven conflict. The forward can exist
+before the server starts. A rejoin without the flag keeps the
+session's existing assigned or fixed port; `--stop` removes it. If the launch
+times out before the Owner reports the assigned port, the session still returns
+`ok: true` with `session_id`, `commands`, `local_forwards_pending: {"0":
+VENUE_PORT}`, and an `error` note; a pre-upgrade Owner that sanitizes away the
+pending `0` key is the usual cause. `false` in `local_forwards_ready` usually
+means the host port is taken or a pre-`--forward` Owner is still running.
+A multi-line or long seed is written to `~/.agent-bridge/seeds/` on the venue and <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
+seeded as a one-line pointer (tmux-typed input must be a single line). It
+succeeds once the session is registered with the host bridge. If the launch
+created a session but Copilot did not reach a confirmed input prompt in time,
+the command keeps the live session and delivers the seed over the existing
+host bridge's message lane; the JSON reports `seed_delivery: "bridge"` (or
+`"failed"` if that follow-up message could not be sent). A seed that may have
+reached Copilot's input without being submitted (typed but Enter failed, or a
+keystroke send that failed part-way) is never resent, since its draft may still
+be there: the session is kept and `seed_delivery` is `"failed"`.
+Only a created session
+that never registers is treated as unrepresented: the failure reports the screen
+(`pane_tail`) and stops what it started. `--register-timeout` covers the host
+bridge claim wait; the venue-side prompt wait can slide while Copilot is visibly
+busy, up to its own hard cap, and the launch transport timeout remains longer
+than that cap.
+The **Connection Owner** keeps the
+credential relay and the host-bridge forward alive while its mux session exists
+(checked from the host every couple of minutes, only after the
+launch confirmed the session; never by waking a stopped CodeSpace), up to a 24h
+cap, and both forwards follow a host bridge restart onto its new port. When a held
+CodeSpace stops (an idle timeout or GitHub's runtime limit), the Owner tears its
+forwards down and does not rebuild them until the CodeSpace is `Available` again
+(a rebuild would boot it back up). A rejoin (`copilot <name> --detach
+--copilot-arg=--resume=<id>`) starts it, and the Owner restores its forwards
+within one cycle. Its `gh` calls run off the loop that carries every forward, so
+one slow or stopped CodeSpace never stalls another CodeSpace's relay or bridge. On the same
+check it mirrors the running session's transcript to this host (whole lines, only
+what was appended) and pushes it into the agent-logger hub under
+`.codespaces-live/<name>` (its own namespace: the close-out capture below uses
+`.codespaces/<name>`), so the session's history is still readable here after a host
+or bridge restart. A push that fails, or lands only partly, is retried until
+it lands whole, across Owner restarts and even after the session ends or the
+box stops (it never contacts the box for that); an Owner with nothing else to
+hold stays up to an hour to retry it, and the next Owner start resumes it after
+that. `delete` removes a CodeSpace's local mirror once its hub copy is current,
+then or on a later retry (`AGENT_CODESPACES_TRANSCRIPT_MIRROR=0` turns this off).
+The Owner usually runs headless, so it logs to
+`~/.agent-codespaces/logs/owner.log` (rotated when an Owner starts; under
+`AGENT_CODESPACES_HOME` when set): its start and stop, every relay or forward
+re-establish, and every failed cycle. Read it first when a worker's credential
+relay or a forward drops. Observe and steer it through agent-bridge
+(`live-sessions resolve`, `result`, `send`, `ui`). A detached launch keeps the
+CodeSpace claim active; `--stop` settles it like any finished connection and
+deregisters the stopped session from the host bridge at once. When close-out
+continues on the box (for example `finalize` to recover its session state),
+pass `--stop --keep-claim`: the session is stopped and deregistered the same
+way, but a clean checkout does not settle the claim at-rest (which releases it
+to the next borrower), so no other task can take the box mid-recovery; release
+the claim last. A CodeSpace that
+is already `Shutdown` is never booted for `--stop`: its session is gone, so it
+only releases and deregisters (`already_shutdown`), and the claim is settled by
+the ordinary release/retire step.
+
+Requires the venue's `agent-worktrees` and `agent-bridge` plugins to support
+`embody --bridge-scope-id/--copilot-arg`; an older venue fails closed with an
+"update agent-worktrees on the CodeSpace" error. The launch's own preflight
+installs `agent-bridge` on the venue when it is missing and updates it when it
+is older than the host bridge's version (an old venue CLI can start a local
+daemon over the forwarded host route); `doctor <name> --fix` does the same and
+reports a plugin that is still behind as a gap.
 
 ## SSH (Diagnostic Only)
 
@@ -209,6 +381,17 @@ the bridge connection instead.
 <agent-codespaces catalog argv[0]> version
 ```
 
+> **A raw `gh codespace list --json gitStatus` (or any `hasUncommittedChanges`/
+> `hasUnpushedChanges`/`ref` field from a direct `gh` call) reports git state for
+> only the CodeSpace's own bound/creation repo** -- never a second repo cloned
+> alongside it under `/workspaces/` (common for a fleet that boots from a
+> scaffold/devcontainer repo, e.g. `*-codespaces`, and clones the real product
+> repo as a sibling). That field is not a reliable presence-of-unfinished-work
+> signal for such a box, in either direction -- see the `cleaning-codespaces`
+> skill's *Dirty work* step for the observed false-positive/false-negative
+> pattern and the correct `verify` / `/workspaces/*` cross-repo check to use
+> instead.
+
 ## Creating and Deleting
 
 ```bash
@@ -229,7 +412,7 @@ the bridge connection instead.
 
 CodeSpace creation uses `gh codespace create` with defaults by convention
 (`largePremiumLinux`/`EastUs`); per-repo overrides from
-`.agent-codespaces/config.yaml` (machine type, location) apply automatically
+`.copilot-extensions/agent-codespaces/config.yaml` (machine type, location) apply automatically
 based on the target repository.
 
 ## Finalize — graceful close-out with session recovery
@@ -359,8 +542,9 @@ It proxies credential requests to local credential stores.
 1. agent-bridge runs the relay server on `127.0.0.1:<live-port>`
 2. The catalog command's `ssh` action includes an SSH reverse-forward for that live port
 3. CodeSpace sends git-credential-protocol requests to `localhost:<live-port>`
-4. Relay routes to matching source (GCM / `git-credential`, plus `az-login` for
-   allowed Azure resources)
+4. Relay routes to matching source (GCM / `git-credential`, plus `gh-auth`
+   only for explicit `get-github-token`, plus `az-login` for allowed Azure
+   resources)
 5. Response flows back through the tunnel
 
 ### Available Sources
@@ -368,6 +552,7 @@ It proxies credential requests to local credential stores.
 | Source | Action | What It Does |
 |--------|--------|-------------|
 | `git-credential` | `get`/`store`/`erase` | Proxies to local Git Credential Manager |
+| `gh-auth` | `get-github-token` | Returns the active `gh auth token` for explicit token requests only; it is not used for git credential `get`/`fill` |
 | `az-login` | `get-azure-token` | Returns Azure access tokens for the built-in ADO/Storage resources plus configured `allowed_resources` |
 
 ### Policy Enforcement
@@ -377,11 +562,18 @@ All requests pass through a policy gate before reaching any source:
 - **Host allowlist** -- fnmatch-style patterns per source
 - **Resource allowlist** -- exact-match for Azure resources (az-login)
 
+GitHub order is per connection: inject the bound CodeSpace account, or the
+active `gh` account for ambient-owned CodeSpaces, as `username=<account>` for
+`github.com`; then call non-interactive GCM. The relay profile is account-free.
+Missing or ambiguous GitHub credentials are warnings for connect/detach (ADO-only
+or interactive work can still proceed) but remain doctor findings. The relay
+does not substitute `gh auth token` for git credential `get`/`fill`.
+
 ## Agent-Bridge Integration
 
 **No manual registration is required.** When agent-codespaces is installed, its
 sessionStart hook drops a small **namespace-provider manifest** into
-`~/.agent-bridge/providers.d/` (declaring the `codespace:` namespace and the
+`~/.agent-bridge/providers.d/` (declaring the `codespace:` namespace and the <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 absolute path to the agent-codespaces binstub). agent-bridge discovers that
 manifest there and registers the `codespace:` **namespace resolver**, driving
 the provider over a process boundary. That resolver lists and resolves your
@@ -416,14 +608,15 @@ by agent-codespaces.
   CodeSpaces and retries SSH (up to ~180 s). If it still fails, try
   `<agent-codespaces catalog argv[0]> ssh <name> --remote-cmd "echo ok" --no-relay`.
   Check `<agent-bridge catalog argv[0]> status` and
-  `~/.agent-bridge/agent-bridge-err.log`.
+  `~/.agent-bridge/agent-bridge-err.log`. <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 - **No `codespace:` targets** -- provider registration still uses the explicit
   management binstub, not the session catalog. If that binstub is missing,
   stamp it from the same explicitly selected payload shown in
   `codespaces-setup` § *Readiness*, then start a new session so the provider
   manifest is registered.
-- **Session fails on start** -- check `~/.agent-bridge/agent-bridge-err.log`.
-  Common cause: wrong `ssh_user` in `.agent-codespaces/config.yaml`.
+- **Session fails on start** -- check `~/.agent-bridge/agent-bridge-err.log`. <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
+  Common cause: wrong `ssh_user` in
+  `.copilot-extensions/agent-codespaces/config.yaml`.
 - **Credential relay not working** -- check that `--no-relay` was not
   accidentally passed, then confirm agent-bridge's relay is up
   (`agent-bridge service restart` repairs the owner daemon). <!-- marketplace-isolation: allow service-management -->
@@ -437,3 +630,32 @@ by agent-codespaces.
 - **"gh CLI not found"** -- install from https://cli.github.com/
 - **WSL credential slowness** -- first GCM call through PowerShell
   takes ~25s. Subsequent calls use the 300s cache.
+- **PowerShell swallows `$` before it ever reaches the remote shell** -- a
+  double-quoted `--remote-cmd` string is expanded by **PowerShell itself**
+  first: `"...$?..."` and `"...$LC_GIT_CREDENTIAL_RELAY..."` become PowerShell's
+  own `$?`/an undefined variable (often silently empty) *before* SSH ever sees
+  them, not the remote bash values. Symptoms: an unexpected literal
+  `True`/`False`, or a variable that reads as empty when the remote-side value
+  is known to be set. Fix: single-quote the whole `--remote-cmd` value (or
+  backtick-escape every `$` you want the remote shell to see), e.g.
+  `--remote-cmd 'echo scope=$LC_GIT_CREDENTIAL_RELAY'`.
+- **A `--remote-cmd` that touches the credential relay or mints a token times
+  out at the 60 s default** -- `stage 4/target-auth-env` (credential-relay
+  warm-up) alone commonly takes 20-40 s, and a live `az`/relay token mint can
+  take significantly longer under host load (tens of seconds is normal, not a
+  hang). Pass explicit, generous budgets for any relay- or `az`-touching
+  command, e.g. `--timeout 90 --connect-timeout 220`, rather than assuming the
+  default 60 s is enough and treating an early cutoff as a real failure.
+- **A `get-azure-token` relay request for an Azure resource/scope not in the
+  CodeSpace's allowlist is denied explicitly** -- the response carries
+  `error=access_denied` / `reason=resource_not_allowed` (fixed in
+  `ThomasMichon/copilot-extensions#4367`; before that fix the request came
+  back as a fully empty response with no diagnostic). `ado-auth-helper-relay`
+  surfaces this on stderr as "the credential relay confirmed this resource is
+  not in the host's Azure allowlist". If you hit this, check what that
+  CodeSpace is actually allowed to mint: the host's
+  `~/.agent-codespaces/relay-tokens.json` has a per-CodeSpace
+  `allowed_resources` list (commonly just the ADO resource GUID
+  `499b84ac-1321-427f-aa17-267ca6975798` and `https://storage.azure.com/`
+  unless the target repo's own `.copilot-extensions/agent-codespaces/config.yaml`
+  grants more) -- test against one of those first.

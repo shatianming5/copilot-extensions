@@ -10,15 +10,121 @@ from agent_worktrees import session_context
 from agent_worktrees import state_root
 
 
-def _record(path: Path) -> SimpleNamespace:
+def _record(path: Path, role: str = "harness") -> SimpleNamespace:
     return SimpleNamespace(
         repo="control",
         worktree_id="wt-control",
-        pair_role="harness",
+        pair_role=role,
         pair_kind="worktree",
         status="active",
         worktree_path=str(path),
     )
+
+
+def _pr_repo(**overrides: object) -> SimpleNamespace:
+    """Minimal repo-config double satisfying pr_config._pr_flow_profile's needs."""
+    defaults = dict(
+        enabled=True,
+        required=True,
+        provider="github",
+        automerge_label="",
+        reviewer="",
+        review_blocking=False,
+        review_latency_hint="",
+        self_approve=False,
+        merge_actor="submitter-direct",
+        conflict_retriggers_review=True,
+        branch_update_strategy="rebase",
+        merge_strategy="squash",
+        prefer_auto_merge=True,
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(pr=SimpleNamespace(**defaults))
+
+
+def test_pr_summary_reports_resolved_profile_and_key_knobs() -> None:
+    config = SimpleNamespace(default_repo=_pr_repo())
+
+    line = session_context._pr_summary(config)
+
+    assert line.startswith("PR: profile=")
+    assert "profile=pr-self-merge" in line
+    assert "enabled=true" in line
+    assert "required=true" in line
+    assert "merge_actor=submitter-direct" in line
+
+
+def test_pr_summary_is_empty_when_config_has_no_default_repo() -> None:
+    assert session_context._pr_summary(SimpleNamespace()) == ""
+
+
+def test_context_includes_pr_line_when_config_resolves_a_repo(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    checkout = tmp_path / "control"
+    checkout.mkdir()
+    monkeypatch.setattr(
+        session_context.state_root,
+        "resolve_state_root",
+        lambda *_a, **_k: state_root.StateRoot(
+            None, "knowledge_repo", "state", True, True, False,
+            error="unavailable",
+        ),
+    )
+    monkeypatch.setattr(
+        session_context.state_root,
+        "resolve_pair",
+        lambda *_a, **_k: state_root.StatePair(paired=False, error="not paired"),
+    )
+    monkeypatch.setattr(session_context, "_related_summary", lambda *_a: ("-", ""))
+
+    config = SimpleNamespace(default_repo=_pr_repo(merge_actor="", self_approve=False))
+    context = session_context.render_registry_context(
+        config,
+        _record(checkout),
+        cwd=str(checkout),
+    )
+
+    assert "PR: profile=" in context
+    assert "enabled=true; required=true" in context
+
+
+def test_related_summary_uses_supplied_plugin_related_anchors(
+    monkeypatch,
+) -> None:
+    seen = {}
+    monkeypatch.setattr(
+        session_context.state_root,
+        "config_source_anchors",
+        lambda *_a, **_k: [],
+    )
+
+    def unexpected_discovery():
+        raise AssertionError("resident snapshot must be reused")
+
+    monkeypatch.setattr(
+        session_context.related,
+        "installed_plugin_related_anchors",
+        unexpected_discovery,
+    )
+    def read_related(anchors):
+        seen["anchors"] = anchors
+        return related.RelatedConfig(primary=None, related={})
+
+    monkeypatch.setattr(
+        session_context.related,
+        "read_related_grafted",
+        read_related,
+    )
+
+    session_context._related_summary(
+        SimpleNamespace(),
+        ".",
+        plugin_related_anchors=["plugin-anchor"],
+    )
+
+    assert seen["anchors"] == ["plugin-anchor"]
 
 
 def test_context_includes_pair_and_bounded_related_topology(
@@ -116,16 +222,140 @@ def test_context_includes_pair_and_bounded_related_topology(
         mux_session="wt-control",
     )
 
-    assert "role=harness; kind=worktree; status=active" in context
-    assert f"status=ready; path={sibling}" in context
+    assert (
+        "role=harness; kind=worktree; status=active; writable=true; "
+        "locus=local; delegate=none"
+    ) in context
+    assert "status=ready; writable=true" in context
+    assert "KnowledgePair: role=knowledge; id=wt-state" in context
+    assert f"path={sibling}" in context
     assert "primary=application" in context
     assert "remote-tool(role=tooling,locus=machine:builder" in context
     assert "cloud-docs(role=docs,locus=codespace" in context
     assert "ordinary-local" not in context
-    assert "`agent-worktrees state-root --pair --json`" in context
-    assert "`agent-worktrees related list`" in context
-    assert "`agent-worktrees related resolve <name>`" in context
+    assert "Fresh queries" not in context
     assert len(context.encode("utf-8")) <= session_context.MAX_TOPOLOGY_BYTES
+
+
+def test_knowledge_checkout_is_writable_but_harness_sibling_is_not(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    knowledge = tmp_path / "knowledge"
+    harness = tmp_path / "harness"
+    knowledge.mkdir()
+    harness.mkdir()
+    monkeypatch.setattr(
+        session_context.state_root,
+        "resolve_state_root",
+        lambda *_a, **_k: state_root.StateRoot(
+            str(knowledge),
+            "knowledge_repo",
+            "state",
+            True,
+            True,
+            True,
+        ),
+    )
+    monkeypatch.setattr(
+        session_context.state_root,
+        "resolve_pair",
+        lambda *_a, **_k: state_root.StatePair(
+            paired=True,
+            pair_id="pair-1",
+            current=state_root.PairCheckout(
+                role="knowledge",
+                path=str(knowledge),
+                repo="state",
+                worktree_id="wt-state",
+                status="active",
+            ),
+            sibling=state_root.PairCheckout(
+                role="harness",
+                path=str(harness),
+                repo="control",
+                worktree_id="wt-control",
+                status="active",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        session_context,
+        "_related_summary",
+        lambda *_a: ("application", ""),
+    )
+
+    context = session_context.render_registry_context(
+        SimpleNamespace(),
+        _record(knowledge, "knowledge"),
+        cwd=str(knowledge),
+    )
+
+    assert "role=knowledge; kind=worktree; status=active; writable=true" in context
+    assert "Pair: role=harness; id=wt-control; kind=worktree; status=active; writable=false; locus=local; delegate=none" in context
+
+
+def test_anchor_pair_does_not_change_current_worktree_kind(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    checkout = tmp_path / "harness"
+    state_anchor = tmp_path / "state-anchor"
+    checkout.mkdir()
+    state_anchor.mkdir()
+    monkeypatch.setattr(
+        session_context.state_root,
+        "resolve_state_root",
+        lambda *_a, **_k: state_root.StateRoot(
+            str(state_anchor),
+            "knowledge_repo",
+            "state",
+            True,
+            True,
+            True,
+        ),
+    )
+    monkeypatch.setattr(
+        session_context.state_root,
+        "resolve_pair",
+        lambda *_a, **_k: state_root.StatePair(
+            paired=True,
+            pair_id="pair-anchor",
+            pair_kind="anchor",
+            current=state_root.PairCheckout(
+                role="harness",
+                path=str(checkout),
+                repo="control",
+                worktree_id="wt-control",
+                status="active",
+                kind="worktree",
+            ),
+            sibling=state_root.PairCheckout(
+                role="knowledge",
+                path=str(state_anchor),
+                repo="state",
+                worktree_id="[main]",
+                status="ready",
+                kind="anchor",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        session_context,
+        "_related_summary",
+        lambda *_a: ("application", ""),
+    )
+    record = _record(checkout)
+    record.pair_kind = "anchor"
+
+    context = session_context.render_registry_context(
+        SimpleNamespace(),
+        record,
+        cwd=str(checkout),
+    )
+
+    assert "role=harness; kind=worktree; status=active; writable=true" in context
+    assert "KnowledgePair: role=knowledge; id=[main]; kind=anchor; status=ready; writable=false; locus=local; delegate=none" in context
 
 
 def test_context_fails_closed_when_state_and_pair_are_unavailable(
@@ -168,7 +398,7 @@ def test_context_fails_closed_when_state_and_pair_are_unavailable(
     assert str(tmp_path / "state-anchor") not in context
 
 
-def test_context_preserves_fresh_queries_under_path_pressure(
+def test_context_truncates_to_checkout_and_state_under_path_pressure(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -205,4 +435,3 @@ def test_context_preserves_fresh_queries_under_path_pressure(
 
     assert len(context.encode("utf-8")) <= session_context.MAX_TOPOLOGY_BYTES
     assert "[agent-worktrees context truncated]" in context
-    assert "`agent-worktrees related resolve <name>`" in context

@@ -27,7 +27,7 @@ description: >
 
 `session-sync` pushes raw Copilot session data from `~/.copilot` to a
 configurable **target**, under a `{machine}/` subpath, so any consumer sees
-the same layout. Configuration lives at `~/.agent-logger/config.yaml`
+the same layout. Configuration lives at `~/.agent-logger/config.yaml` <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 (override the home dir with `$AGENT_LOGGER_HOME`).
 
 > **Keep the home dir out of any cloud-synced folder.** `~/.agent-logger`
@@ -38,17 +38,39 @@ the same layout. Configuration lives at `~/.agent-logger/config.yaml`
 
 | Target | Use case | Required options |
 |--------|----------|------------------|
-| `local` (default) | Self-serve one machine; zero dependencies | `path` (optional; default `~/.agent-logger/sessions`) |
+| `local` (default) | Self-serve one machine; zero dependencies | `path` (optional; default `~/.agent-logger/sessions`) <!-- marketplace-isolation: allow deployed-runtime-diagnostics --> |
 | `onedrive` | Fleet hub without a NAS -- many machines sync to one OneDrive folder, one machine crunches | `subfolder` (default `Apps/agent-logger/sessions`) |
 | `ssh` | Push to an arbitrary host you control | `host`, `remote_path`; optional `proxy_jump` |
 | `ssh-tunnel` | Same as `ssh`, routed through a jump host | `host`, `remote_path`, `tunnel_host` |
 | `ingest` | Push to a processing service's rsync-daemon sink | `url` (`rsync://...` or `host::module/path`); optional `password_file`, `notify_url` |
 
-`ssh`, `ssh-tunnel`, and `ingest` require `rsync` (and `ssh`) on PATH.
+`ssh`, `ssh-tunnel`, and `ingest` require `rsync` (and, for `ssh`/`ssh-tunnel`,
+`ssh`) on `PATH`.
+
+> **Windows:** there is no native rsync distribution. When a working WSL
+> distro is reachable (`rsync` on its `PATH` for every target; `ssh` too for
+> `ssh`/`ssh-tunnel`), these targets automatically run the whole rsync
+> invocation wrapped in `wsl.exe -e` (direct exec, not `--`, which silently
+> drops positional arguments when re-shelled through the default distro
+> shell), converting the local source path through WSL's own `wslpath`. An
+> `ingest` `password_file` is **staged as a fresh, owner-only-permission copy
+> inside WSL's own filesystem** rather than just path-converted: a Windows
+> file reached through DrvFS (the `/mnt/c/...` bridge) is normally exposed as
+> group/world-readable, which rsync refuses for `--password-file`. This is
+> preferred over a native MSYS2/Cygwin `rsync.exe` on `PATH`, which hits
+> cross-runtime bugs (see `targets/base.py`'s `wsl_rsync_available()`
+> docstring) -- that native path remains only as a fallback when no WSL
+> distro is usable. **WSL has its own user, `~/.ssh` config, and SSH agent,
+> separate from Windows' own OpenSSH** -- an `ssh`/`ssh-tunnel` host alias
+> and key must be set up *inside* WSL (`wsl -- ssh <host>` should succeed
+> non-interactively) for this to work, not just in the Windows OpenSSH
+> config. Run `<agent-logger catalog "session-sync" argv[0]> doctor` to see
+> which runtime (WSL or native) was selected and whether rsync/ssh were
+> actually found there.
 
 ## Configure
 
-Edit `~/.agent-logger/config.yaml`. Copy the full annotated example showing
+Edit `~/.agent-logger/config.yaml`. Copy the full annotated example showing <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 every target, [`references/config.yaml`](references/config.yaml), and keep the
 one block you need. The local default at a glance:
 
@@ -74,21 +96,75 @@ Optional sync controls:
   cannot be classified instead of keeping metadata-less sessions.
 - `sync.harness_repos` — repo names used to stamp each session's `origin.json`
   sidecar for downstream chronicle routing.
+- `sync.require_repo_opt_in` — an additional, opt-in activation gate (default
+  `false`, fully backward compatible). When `true`, a session only syncs if
+  the repo it was matched against (or that repo's bound knowledge repo, see
+  below) *also* durably declares itself in — mirroring the `agent-index`
+  repo-owned activation convention, so being `enabledPlugins`-enabled on a
+  machine never by itself causes sessions to sync.
 - `sync.notify` — target-independent best-effort HTTP `POST` after any
   successful push (`url`, optional `bearer_token_file`, `timeout`). Notify
   failures are logged only in verbose runs and do not fail the sync.
+
+### Repo-owned sync opt-in (`sync.require_repo_opt_in`)
+
+With `sync.require_repo_opt_in: true` set in `~/.agent-logger/config.yaml`, a <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
+repo commits its own activation declaration at
+`.copilot-extensions/agent-logger/config.yaml` (legacy:
+`.agent-logger/config.yaml`):
+
+```yaml
+sync:
+  opt_in: true    # or false, to explicitly stay out
+```
+
+Resolution per matched session, filesystem-backed against the session's own
+recorded `git_root`/`cwd` (never guessed):
+
+1. The matched repo's own config wins when present and it states an opinion
+   (`opt_in: true` or `false`).
+2. A repo with **no** opinion (no config, or a config silent on `opt_in`)
+   that requires external state (bound to a knowledge repo, per
+   `agent-worktrees`) forwards the check to that knowledge repo's own config.
+3. Anything still unresolved — no config anywhere in the chain, no bound
+   knowledge repo, or the recorded path no longer exists on this machine —
+   **fails closed** (excluded). Being enabled everywhere never implies
+   syncing; only an explicit, checked-in `opt_in: true` does.
+
+This is an *additional* requirement layered on top of
+`repo_allowlist`/`repo_denylist`, not a replacement — both still apply.
+
+> **Enabling the gate does not retroactively purge prior compaction
+> archives.** `sync.compact` (below) already applies this same gate to which
+> *new* cold sessions it selects, but sessions compacted into
+> `sync.compact.archive_root` **before** the gate was turned on (or while an
+> opted-out repo's cutover was still pending) remain on disk and are still
+> shipped wholesale by `compact-hub`. If you enable `require_repo_opt_in`
+> after compaction has already run, manually prune
+> `sync.compact.archive_root` for any repo that stays opted out, or clear it
+> and let compaction rebuild it under the new policy.
+
+> **`rescue-push` fails closed entirely when this gate is on.** A rescued
+> session (see [Provider rescue ingestion](#provider-rescue-ingestion) below)
+> carries only a provider-reported repo *name*, never a resolvable local
+> path -- there is nothing on disk for the opt-in check to read. Rather than
+> silently ignore `require_repo_opt_in` for rescue publication, it is
+> intentionally treated as unresolvable and every rescued session is
+> rejected while the gate is enabled, regardless of `repo_allowlist`.
 
 ## Repo-local log organization
 
 Session-sync is machine-local, but log organization can be repo-local. A
 repository may commit `.agent-logger.yaml` (or `.agent-logger.yml`,
 `.config/agent-logger.yaml`, `.config/agent-logger.yml`) at its git root with
-only a `log:` block. The catalog's `prepare-session-log` command with `--json`
-layers that block over the
-machine-local config and passes it through the manifest:
+a `log:` block, plus (as of schema v3) a single `sync.local_path`. The
+catalog's `prepare-session-log` command with `--json` layers that block over
+the machine-local config and passes it through the manifest:
 
 ```yaml
-schema_version: 1
+schema_version: 3
+sync:
+  local_path: /mnt/nas/Lake/Copilot/sessions
 log:
   root: .
   path_template: "logs/{year}/{month}.{day} {title}.md"
@@ -119,12 +195,36 @@ log:
   closing_remark: "End with one concise takeaway."
 ```
 
-Repo-local config cannot change `sync:` targets; those remain in
-`~/.agent-logger/config.yaml`. Only `root`, `path_template`, `timezone`,
-`note_marker`, `template`, `narration_style`, `exemplars`, and
-`closing_remark` are accepted under `log:`. Invalid YAML, unknown
-fields/placeholders, unsupported schema versions, unsafe paths, and invalid
-timezones fail explicitly. Run
+Repo-local config cannot change which `sync:` target is active, credentials,
+or machine identity -- those remain in `~/.agent-logger/config.yaml`. The <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
+one exception, `sync.local_path` (schema v3+), exists because that value is
+genuinely the same absolute path for every machine in the fleet (a shared NAS
+mount) rather than a per-machine choice. Under `log:`, only `root`,
+`path_template`, `timezone`, `note_marker`, `template`, `narration_style`,
+`exemplars`, and `closing_remark` are accepted. Invalid YAML, unknown
+fields/placeholders, unsupported schema versions, and invalid timezones fail
+explicitly.
+
+**Platform-neutral syntax (non-empty, no `~`, absolute on *some* platform's
+syntax, no `..`) still fails explicitly for `sync.local_path` on every
+target.** Only the final *host-native* absoluteness check -- whether the
+value is absolute on *this specific* platform -- is deferred until a
+machine's own resolved `sync.target` is known: a mixed Windows/POSIX fleet
+has no single `local_path` string that's a native absolute path on every
+platform. On a machine targeting `local`, a value that's foreign to this
+platform (valid syntax elsewhere, but not here) still fails the config load
+exactly as before; on any other target (`ssh`, `onedrive`, `ingest`, ...) a
+foreign-but-otherwise-valid value is inapplicable there and is silently
+dropped back to whatever `sync.targets.local.path` that machine's own
+`~/.agent-logger/config.yaml` set (or the default), rather than failing the
+whole load over a value it never consumes.
+
+Repo-local config of any kind is honored only for a checkout that is both a
+project registered with `agent-worktrees` and currently on that project's
+registered default branch -- an unregistered clone or a feature/PR branch
+gets no repo-local config at all, silently. See
+`plugins/agent-logger/docs/manifest-contract.md`'s trust-gate section for the
+full mechanics. Run
 `<agent-logger catalog "agent-logger" argv[0]> organization` to inspect the
 manifest-ready result.
 
@@ -241,6 +341,72 @@ installed runtime.
 Both `compact` and `compact-hub` are idempotent and take the sync lock, so they
 never race the scheduled push. Add `--dry-run` to preview.
 
+## Change tracking (incremental sync)
+
+A large corpus (thousands of sessions) makes every scheduled push expensive if
+it has to re-walk/re-diff the whole tree through a slow transport bridge (e.g.
+WSL's DrvFS view of a Windows path) -- expensive enough to exceed the engine's
+own rsync subprocess timeout. **Change tracking is on by default** to fix
+this: a local, stat-only SQLite record (`<home>/sync-state.db`, or
+per-tenant `sync-state-<tenant_id>.db`) remembers each session's last-synced
+content signature, so a routine run only pushes sessions that actually
+changed -- and skips the push entirely when nothing did.
+
+```yaml
+sync:
+  change_tracking:
+    enabled: true                  # false restores pre-feature behavior
+    full_sync_interval_hours: 24   # periodic full reconciliation cadence
+    batch_size: 100                # sessions per push call during a full pass
+    db_path: null                  # null => <home>/sync-state.db
+```
+
+A **full reconciliation** pass (first run ever, the periodic cadence, or an
+explicit `run --full`) still happens, but **segmented**: sessions are pushed
+in `batch_size`-sized groups so one invocation never has to walk the entire
+corpus, and each batch's signatures are recorded as it lands. Every
+tracker-driven push (incremental or segmented-full) passes `batch_mode=True`
+to the target whenever the repo scope itself is unfiltered -- this still
+transfers the global `session-store.db` index and defers (rather than
+hard-fails on) a locked in-use file, exactly like a legacy unfiltered push
+would, even though any one call only carries a transport-size slice of
+sessions. A genuine repo-allowlist/denylist filter is unaffected: it still
+goes through the atomic rescue/replace path with the index excluded.
+
+> **Known tradeoff: `--delete-excluded` no longer fires.** A full/segmented
+> pass always narrows to an explicit (even if complete) set of session ids --
+> it never passes `include_sessions=None` to the target. `--delete-excluded`
+> only applies when `include_sessions is None`, so it is no longer triggered
+> by any `run` invocation once change tracking is enabled (the default).
+> Plain `--delete` still cleans up content within directories rsync actually
+> visits; what's lost is the narrower case of previously-synced detritus that
+> became newly excluded by a repo-scope change. Destination-side cleanup of
+> sessions that no longer exist locally at all is unaffected -- that's
+> `Target.prune`'s job (age-based, run via `run --prune`), not deletion
+> semantics on the push itself.
+
+**Doctor / drift realignment.** The tracker is a local optimization, never a
+second source of truth -- the destination is always authoritative. If the
+local db ever drifts (corrupted, stale after manual destination surgery, or
+just suspect), realign it from scratch:
+
+```
+<agent-logger catalog "session-sync" argv[0]> run --full
+```
+
+This forces a full, segmented reconciliation against the real destination
+regardless of the periodic cadence and rebuilds every signature from what
+that reconciliation actually pushed. There is no separate `reset` CLI verb;
+deleting the tracker db file (`sync-state*.db`) and re-running `run --full`
+achieves the same from-scratch rebuild if the db itself is suspect.
+
+A full reconciliation also triggers **automatically**, regardless of
+cadence, the first time a changed `sync.target`/path or machine name is
+detected -- the tracker binds its signatures to the effective
+source/destination/machine identity, so pointing the same db at a different
+destination forces one full reconciliation rather than silently
+reusing stale "already synced" state from the old one.
+
 ## Troubleshoot
 
 - **Runtime not ready:** run
@@ -256,7 +422,7 @@ never race the scheduled push. Add `--dry-run` to preview.
   `pwsh -File plugins\agent-logger\scripts\install.ps1 status` or
   `bash plugins/agent-logger/scripts/install.sh status`. On Windows the task is
   `Agent Logger Session Sync`; on Linux/WSL inspect
-  `systemctl --user status agent-logger-sync.timer agent-logger-sync.service`.
+  `systemctl --user status agent-logger-sync.timer agent-logger-sync.service`. <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 - **Expected fail-loud behavior:** a missing source or failed push returns exit
   code 1 and writes the reason to stderr. A held sync lock exits successfully
   with "another sync holds the lock; skipping". HTTP notify failures are

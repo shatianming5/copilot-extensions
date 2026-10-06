@@ -8,11 +8,25 @@ classification (from pr-consent), plus the binding-absent = no-op invariant.
 from __future__ import annotations
 
 from agent_worktrees import pr_contract as pc
+from agent_worktrees.pr_occupancy import occupancy_from_readiness, occupancy_from_state
 
 
-def _rev(rid, state, user="reviewer", commit_id="head", dismissed=False):
-    return pc.Review(id=rid, state=state, user=user, commit_id=commit_id,
-                     dismissed=dismissed)
+def _rev(
+    rid,
+    state,
+    user="reviewer",
+    commit_id="head",
+    dismissed=False,
+    submitted_at="",
+):
+    return pc.Review(
+        id=rid,
+        state=state,
+        user=user,
+        commit_id=commit_id,
+        dismissed=dismissed,
+        submitted_at=submitted_at,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +58,58 @@ class TestCursor:
         import pytest
         with pytest.raises(ValueError):
             pc.Baseline.from_cursor("rXYZ")
+
+    def test_roundtrip_head_sha(self):
+        b = pc.Baseline(max_review_id=13, head_sha="abc123")
+        cursor = b.to_cursor()
+        assert cursor == "r13..habc123"
+        parsed = pc.Baseline.from_cursor(cursor)
+        assert parsed.max_review_id == 13
+        assert parsed.head_sha == "abc123"
+        assert parsed.merged is False and parsed.closed is False
+
+    def test_roundtrip_flags_and_head_sha_together(self):
+        b = pc.Baseline(max_review_id=5, merged=True, head_sha="deadbeef")
+        cursor = b.to_cursor()
+        assert cursor == "r5.m.hdeadbeef"
+        parsed = pc.Baseline.from_cursor(cursor)
+        assert parsed.max_review_id == 5
+        assert parsed.merged is True
+        assert parsed.head_sha == "deadbeef"
+
+    def test_pre_pushed_cursors_without_head_sha_still_parse(self):
+        """A cursor minted before the `pushed` transition existed is a valid
+        1- or 2-segment cursor; from_cursor must still parse it (reads by
+        position, not by sniffing segment content)."""
+        assert pc.Baseline.from_cursor("r13").head_sha == ""
+        assert pc.Baseline.from_cursor("r1246.mc").head_sha == ""
+
+    def test_roundtrip_checks_state(self):
+        b = pc.Baseline(max_review_id=13, head_sha="abc123", checks_state="success")
+        cursor = b.to_cursor()
+        assert cursor == "r13..habc123.ksuccess"
+        parsed = pc.Baseline.from_cursor(cursor)
+        assert parsed.max_review_id == 13
+        assert parsed.head_sha == "abc123"
+        assert parsed.checks_state == "success"
+
+    def test_pre_checks_state_cursors_still_parse(self):
+        """A cursor minted before checks_state was encoded is a valid
+        shorter cursor; from_cursor must still parse it (reads by position)."""
+        assert pc.Baseline.from_cursor("r13").checks_state == ""
+        assert pc.Baseline.from_cursor("r1246.mc").checks_state == ""
+        assert pc.Baseline.from_cursor("r5.m.hdeadbeef").checks_state == ""
+
+    def test_roundtrip_checks_state_carries_a_known_baseline_across_re_arm(self):
+        """The real motivating case: a `--since <cursor>` re-arm that carries
+        a KNOWN checks_state (not the unknown ``""``) lets the next poll fire
+        `checks_succeeded`/`checks_failed` immediately instead of silently
+        adopting an already-changed value as a fresh "unknown" baseline."""
+        b = pc.Baseline(max_review_id=1, checks_state="pending")
+        parsed = pc.Baseline.from_cursor(b.to_cursor())
+        snap = pc.PRSnapshot(pr_state="open", checks_state="success")
+        events = pc.compute_events(parsed, snap, ("any",))
+        assert [e["event"] for e in events] == ["checks_succeeded"]
 
     def test_from_snapshot_high_water(self):
         snap = pc.PRSnapshot(
@@ -121,6 +187,39 @@ class TestComputeEvents:
         events = pc.compute_events(pc.Baseline(), snap, pc.DEFAULT_UNTIL)
         assert [e["event"] for e in events] == ["closed"]
 
+    # --- "pushed" (a reviewer-side hibernation follow-up) --
+
+    def test_pushed_fires_on_new_head_sha(self):
+        base = pc.Baseline(head_sha="abc123")
+        snap = pc.PRSnapshot(pr_state="open", head_sha="def456")
+        events = pc.compute_events(base, snap, pc.REVIEWER_DEFAULT_UNTIL)
+        assert [e["event"] for e in events] == ["pushed"]
+        assert events[0]["head_sha"] == "def456"
+
+    def test_pushed_does_not_fire_on_unchanged_head(self):
+        base = pc.Baseline(head_sha="abc123")
+        snap = pc.PRSnapshot(pr_state="open", head_sha="abc123")
+        assert pc.compute_events(base, snap, pc.REVIEWER_DEFAULT_UNTIL) == []
+
+    def test_pushed_not_adopted_when_baseline_head_sha_unknown(self):
+        """An unknown baseline (`""`, e.g. a cursor minted before the
+        `pushed` transition existed) is adopted without firing -- same
+        convention as the `mergeable`/`checks_state` unknown-baseline case."""
+        base = pc.Baseline(head_sha="")
+        snap = pc.PRSnapshot(pr_state="open", head_sha="def456")
+        assert pc.compute_events(base, snap, pc.REVIEWER_DEFAULT_UNTIL) == []
+
+    def test_pushed_excluded_unless_requested(self):
+        base = pc.Baseline(head_sha="abc123")
+        snap = pc.PRSnapshot(pr_state="open", head_sha="def456")
+        assert pc.compute_events(base, snap, pc.DEFAULT_UNTIL) == []
+
+    def test_pushed_included_under_any(self):
+        base = pc.Baseline(head_sha="abc123")
+        snap = pc.PRSnapshot(pr_state="open", head_sha="def456")
+        events = pc.compute_events(base, snap, ("any",))
+        assert [e["event"] for e in events] == ["pushed"]
+
     # --- CI checks + approval dismissal regressions (#225) -----------------
 
     def test_checks_failed_fires_on_transition_to_failure(self):
@@ -146,6 +245,38 @@ class TestComputeEvents:
         snap = pc.PRSnapshot(pr_state="closed", merged=True, checks_state="failure")
         assert "checks_failed" not in [
             e["event"] for e in pc.compute_events(base, snap, pc.DEFAULT_UNTIL)]
+
+    def test_checks_succeeded_fires_on_transition_to_success(self):
+        base = pc.Baseline(checks_state="pending")
+        snap = pc.PRSnapshot(pr_state="open", checks_state="success")
+        events = pc.compute_events(base, snap, ("any",))
+        assert [e["event"] for e in events] == ["checks_succeeded"]
+        assert events[0]["checks_state"] == "success"
+
+    def test_checks_succeeded_excluded_from_default_until(self):
+        # Not actionable on its own under the default (attention-needing)
+        # vocabulary -- a real review may still be expected. Selectable
+        # explicitly or via "any".
+        base = pc.Baseline(checks_state="pending")
+        snap = pc.PRSnapshot(pr_state="open", checks_state="success")
+        assert pc.compute_events(base, snap, pc.DEFAULT_UNTIL) == []
+
+    def test_checks_succeeded_not_refired_when_already_success(self):
+        base = pc.Baseline(checks_state="success")
+        snap = pc.PRSnapshot(pr_state="open", checks_state="success")
+        assert pc.compute_events(base, snap, ("any",)) == []
+
+    def test_checks_succeeded_unknown_baseline_does_not_fire(self):
+        # "" == not-yet-known: adopted by the caller, never fired here.
+        base = pc.Baseline(checks_state="")
+        snap = pc.PRSnapshot(pr_state="open", checks_state="success")
+        assert pc.compute_events(base, snap, ("any",)) == []
+
+    def test_checks_succeeded_not_fired_after_merge(self):
+        base = pc.Baseline(checks_state="pending")
+        snap = pc.PRSnapshot(pr_state="closed", merged=True, checks_state="success")
+        assert "checks_succeeded" not in [
+            e["event"] for e in pc.compute_events(base, snap, ("any",))]
 
     def test_approval_dismissed_fires_on_dismissed_approval(self):
         # Dismissal flips an existing (already-seen) review's flag, so baseline it.
@@ -191,6 +322,133 @@ class TestEffectiveVerdict:
         reviews = (_rev(1, "APPROVED", commit_id="old"),)
         assert pc.effective_verdict(reviews, "new", "author") == ""
 
+    def test_stale_approval_denied_when_dismiss_policy_unknown(self):
+        """``dismiss_stale_reviews`` unset (``None``) keeps the pre-existing
+        conservative deny: no policy evidence either way, so a raw head
+        movement still invalidates the approval -- unchanged default
+        behavior for providers/repos we have no policy read for. This is
+        the fail-closed baseline ``allow_stale_approval`` narrowly
+        overrides with proof, never a default this gate assumes open."""
+        reviews = (_rev(1, "APPROVED", commit_id="old"),)
+        assert pc.effective_verdict(
+            reviews, "new", "author", dismiss_stale_reviews=None,
+        ) == ""
+
+    def test_stale_approval_denied_when_dismiss_policy_confirmed_true(self):
+        reviews = (_rev(1, "APPROVED", commit_id="old"),)
+        assert pc.effective_verdict(
+            reviews, "new", "author", dismiss_stale_reviews=True,
+        ) == ""
+
+    def test_stale_approval_survives_when_dismiss_policy_confirmed_false(self):
+        """copilot-extensions#2060: a repo whose branch protection does NOT
+        dismiss stale reviews must not have its approval invalidated by a
+        raw commit-SHA mismatch alone (e.g. a clean rebase with no content
+        change) -- only the provider's own ``review.dismissed`` signal
+        (already filtered upstream by ``_latest_verdict``) should govern."""
+        reviews = (_rev(1, "APPROVED", commit_id="old"),)
+        assert pc.effective_verdict(
+            reviews, "new", "author", dismiss_stale_reviews=False,
+        ) == "APPROVED"
+
+    def test_dismiss_policy_confirmed_false_still_honors_provider_dismissed_flag(self):
+        """A confirmed non-dismissing policy only skips the raw-SHA deny; a
+        review the provider itself marked ``dismissed`` is still excluded."""
+        reviews = (_rev(1, "APPROVED", commit_id="old", dismissed=True),)
+        assert pc.effective_verdict(
+            reviews, "new", "author", dismiss_stale_reviews=False,
+        ) == ""
+
+    def test_stale_approval_can_be_retained_by_policy(self):
+        reviews = (
+            _rev(
+                1,
+                "APPROVED",
+                commit_id="old",
+                submitted_at="2026-01-01T00:02:00Z",
+            ),
+        )
+        assert pc.effective_verdict(
+            reviews,
+            "new",
+            "author",
+            allow_stale_approval=True,
+            stale_approval_head_sha="new",
+            stale_approval_head_observed_at="2026-01-01T00:01:00Z",
+        ) == "APPROVED"
+
+    def test_stale_approval_before_current_head_is_not_retained(self):
+        reviews = (
+            _rev(
+                1,
+                "APPROVED",
+                commit_id="old",
+                submitted_at="2026-01-01T00:01:00Z",
+            ),
+        )
+        assert pc.effective_verdict(
+            reviews,
+            "new",
+            "author",
+            allow_stale_approval=True,
+            stale_approval_head_sha="new",
+            stale_approval_head_observed_at="2026-01-01T00:02:00Z",
+        ) == ""
+
+    def test_same_second_observation_fails_closed(self):
+        reviews = (
+            _rev(
+                1,
+                "APPROVED",
+                commit_id="old",
+                submitted_at="2026-01-01T00:01:00Z",
+            ),
+        )
+        assert pc.effective_verdict(
+            reviews,
+            "new",
+            "author",
+            allow_stale_approval=True,
+            stale_approval_head_sha="new",
+            stale_approval_head_observed_at="2026-01-01T00:01:00Z",
+        ) == ""
+
+    def test_fractional_same_second_observation_fails_closed(self):
+        reviews = (
+            _rev(
+                1,
+                "APPROVED",
+                commit_id="old",
+                submitted_at="2026-01-01T00:01:00.500Z",
+            ),
+        )
+        assert pc.effective_verdict(
+            reviews,
+            "new",
+            "author",
+            allow_stale_approval=True,
+            stale_approval_head_sha="new",
+            stale_approval_head_observed_at="2026-01-01T00:01:00Z",
+        ) == ""
+
+    def test_stale_approval_without_matching_publication_evidence_is_not_retained(self):
+        reviews = (
+            _rev(
+                1,
+                "APPROVED",
+                commit_id="old",
+                submitted_at="2026-01-01T00:02:00Z",
+            ),
+        )
+        assert pc.effective_verdict(
+            reviews,
+            "new",
+            "author",
+            allow_stale_approval=True,
+            stale_approval_head_sha="different",
+            stale_approval_head_observed_at="2026-01-01T00:01:00Z",
+        ) == ""
+
     def test_approval_at_current_head_counts(self):
         reviews = (_rev(1, "APPROVED", commit_id="head"),)
         assert pc.effective_verdict(reviews, "head", "author") == "APPROVED"
@@ -209,6 +467,30 @@ class TestEffectiveVerdict:
     def test_request_changes_variant_normalizes(self):
         reviews = (_rev(1, "REQUEST_CHANGES"),)
         assert pc.effective_verdict(reviews, "head", "author") == "CHANGES_REQUESTED"
+
+    def test_comment_becomes_verdict_when_review_blocking_false(self):
+        reviews = (_rev(1, "COMMENT"),)
+        assert pc.effective_verdict(
+            reviews, "head", "author", review_blocking=False,
+        ) == "COMMENTED"
+
+    def test_comment_still_not_a_verdict_when_review_blocking_true(self):
+        reviews = (_rev(1, "COMMENT"),)
+        assert pc.effective_verdict(
+            reviews, "head", "author", review_blocking=True,
+        ) == ""
+
+    def test_approved_still_wins_over_comment_when_review_blocking_false(self):
+        reviews = (_rev(1, "COMMENT"), _rev(2, "APPROVED", commit_id="head"))
+        assert pc.effective_verdict(
+            reviews, "head", "author", review_blocking=False,
+        ) == "APPROVED"
+
+    def test_author_own_comment_ignored_when_review_blocking_false(self):
+        reviews = (_rev(1, "COMMENT", user="alice"),)
+        assert pc.effective_verdict(
+            reviews, "head", "alice", review_blocking=False,
+        ) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +643,19 @@ class TestClassifyState:
         assert st.held == ()
         assert st.wip is False
 
+    def test_review_blocking_false_reports_comment_as_verdict(self):
+        snap = _approved(reviews=(_rev(1, "COMMENT"),))
+        st = pc.classify_state(snap, review_blocking=False, **_BINDING)
+        assert st.verdict == "COMMENTED"
+        # Still not an approval -- consent stays gated by approval_required.
+        assert st.consent_action == "skip"
+        assert st.reason == "not yet approved"
+
+    def test_review_blocking_true_default_ignores_comment(self):
+        snap = _approved(reviews=(_rev(1, "COMMENT"),))
+        st = pc.classify_state(snap, **_BINDING)
+        assert st.verdict == ""
+
 
 # ---------------------------------------------------------------------------
 # merge_readiness -- the caller-facing "what to do next" summary
@@ -375,6 +670,7 @@ class TestMergeReadiness:
         assert m["consent_present"] is False
         assert m["consent_label"] == "auto-merge"
         assert m["verdict"] == "APPROVED"
+        assert m["occupancy"] == "needs-consent"
 
     def test_consent_already_present(self):
         m = pc.merge_readiness(_approved(labels=("auto-merge",)), **_BINDING)
@@ -396,6 +692,27 @@ class TestMergeReadiness:
         assert m["clear_to_merge"] is False
         assert m["consent_label"] == ""
         assert "no auto-merge label" in m["reason"]
+
+    def test_review_blocking_false_reports_comment_verdict(self):
+        snap = _approved(reviews=(_rev(1, "COMMENT"),))
+        m = pc.merge_readiness(snap, review_blocking=False, **_BINDING)
+        assert m["verdict"] == "COMMENTED"
+
+
+class TestDefaultUntil:
+    def test_blocking_true_is_default_until(self):
+        assert pc.default_until(True) == pc.DEFAULT_UNTIL
+
+    def test_blocking_false_swaps_verdict_events_for_commented(self):
+        until = pc.default_until(False)
+        assert until == pc.NONBLOCKING_DEFAULT_UNTIL
+        assert "commented" in until
+        assert "approved" not in until
+        assert "changes_requested" not in until
+        # Everything else (merge-state/lifecycle) is preserved unchanged.
+        for name in ("conflict", "mergeable", "checks_failed",
+                     "approval_dismissed", "merged", "closed"):
+            assert name in until
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +741,7 @@ class TestClassifyPRFlow:
         assert f.applies("pr-merge") is True
         assert f.applies("pr-watch") is True
         assert f.applies("pr-complete") is True
+        assert f.applies("pr-nudge") is True
         assert "auto-merge" in f.summary
 
     def test_human_merge_when_enabled_but_no_label(self):
@@ -438,6 +756,7 @@ class TestClassifyPRFlow:
         assert f.applies("pr-watch") is True
         assert f.applies("pr-status") is True
         assert f.applies("pr-complete") is True
+        assert f.applies("pr-nudge") is True
         assert "human" in f.summary.lower()
         assert "pr-merge does not apply" in f.summary
 
@@ -458,6 +777,7 @@ class TestClassifyPRFlow:
         # pr-merge applies here (the --now direct-merge path).
         assert f.applies("pr-merge") is True
         assert f.applies("create-pr") is True
+        assert f.applies("pr-nudge") is True
         assert f.reviewer == "copilot"
         assert f.review_latency_hint == "~2m"
         assert f.self_approve is True
@@ -468,6 +788,23 @@ class TestClassifyPRFlow:
             merge_actor="submitter-direct",
         )
         assert f.profile == pc.PROFILE_PR_SELF_MERGE
+
+    def test_notes_flow_through_to_profile_for_every_shape(self):
+        for kwargs in (
+            dict(enabled=False),
+            dict(enabled=True, required=True, automerge_label=""),
+            dict(enabled=True, required=True, automerge_label="",
+                 merge_actor="submitter-direct"),
+            dict(enabled=True, required=True, automerge_label="auto-merge"),
+        ):
+            f = pc.classify_pr_flow(notes="why this repo's flow is shaped this way",
+                                     **kwargs)
+            assert f.notes == "why this repo's flow is shaped this way"
+
+    def test_notes_default_to_empty(self):
+        f = pc.classify_pr_flow(enabled=True, required=True,
+                                 merge_actor="submitter-direct")
+        assert f.notes == ""
 
     def test_agent_merge_wins_over_self_approve(self):
         # An explicit consent label keeps the agent-consent shape even if
@@ -554,6 +891,66 @@ class TestDerivePolicyMatrix:
         # All-None settings speak to nothing -> no keys emitted (defaults apply).
         assert pc.derive_policy_matrix(pc.RepoPolicy()) == {}
 
+    def test_dismiss_stale_reviews_mirrors_confirmed_setting(self):
+        assert pc.derive_policy_matrix(
+            pc.RepoPolicy(dismiss_stale_reviews=True)
+        )["dismiss_stale_reviews"] is True
+        assert pc.derive_policy_matrix(
+            pc.RepoPolicy(dismiss_stale_reviews=False)
+        )["dismiss_stale_reviews"] is False
+
+    def test_dismiss_stale_reviews_omitted_when_unknown(self):
+        assert "dismiss_stale_reviews" not in pc.derive_policy_matrix(
+            pc.RepoPolicy(dismiss_stale_reviews=None)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Live per-identity merge authority (actor_merge_authority) -- general repo
+# comprehension: config selects a repo's PR *flow*; this classifies whether
+# the ACTING identity actually holds the access that flow assumes.
+# ---------------------------------------------------------------------------
+
+class TestActorMergeAuthority:
+    def test_write_or_above_is_authorized(self):
+        for level in ("admin", "maintain", "write"):
+            assert pc.actor_merge_authority(level) is True
+
+    def test_read_or_none_is_denied(self):
+        for level in ("triage", "read", "none"):
+            assert pc.actor_merge_authority(level) is False
+
+    def test_empty_is_unknown(self):
+        assert pc.actor_merge_authority("") is None
+
+    def test_case_and_whitespace_insensitive(self):
+        assert pc.actor_merge_authority("  WRITE  ") is True
+        assert pc.actor_merge_authority("Read") is False
+
+    def test_unrecognized_token_fails_open_to_unknown(self):
+        # A future/unmapped token must never be read as a confident denial.
+        assert pc.actor_merge_authority("some-new-provider-level") is None
+
+
+class TestPrReminderNoActorAuthority:
+    def test_points_at_contributor_path_not_at_now_again(self):
+        flow = pc.classify_pr_flow(
+            enabled=True, required=True, provider="github",
+            automerge_label="", self_approve=True, reviewer="copilot",
+        )
+        rem = pc.pr_reminder_no_actor_authority(
+            flow, reason="acting identity lacks write access",
+        )
+        assert rem.ok is False
+        assert rem.headline == "acting identity lacks write access"
+        # Must NOT recommend retrying the very verb that was just refused for
+        # lacking permission -- that's the "you forgot --now" guidance meant
+        # for an already-authorized submitter, not a confirmed denial.
+        assert "pr-merge --now" not in rem.use_instead
+        assert "pr-watch" in rem.use_instead
+        assert "maintainer" in rem.next_step
+        assert "pr-merge --now" not in rem.text()
+
 
 # ---------------------------------------------------------------------------
 # PR-flow reminders (pr_reminder) -- state-aware, stay-on-the-rails guidance
@@ -575,14 +972,52 @@ def _self_merge_flow(**kw):
 
 
 class TestPRReminder:
-    def test_create_pr_self_merge_points_at_pr_merge_now(self):
-        flow = _self_merge_flow()
+    def test_create_pr_self_merge_blocking_review_does_not_infer_approval(self):
+        # review_blocking=True can come from a required status check alone
+        # (derive_policy_matrix), with no distinct "approval required"
+        # signal available -- the GitHub can't-self-approve caveat is no
+        # longer inferred from an unrelated `reviewer` field; the neutral
+        # "required checks/reviews" phrasing is used instead.
+        flow = _self_merge_flow(review_blocking=True)
         r = pc.pr_reminder(flow, "create-pr")
         assert r.ok is True
         assert "pr-merge" in r.next_step and "--now" in r.next_step
         assert "self-approve" not in r.next_step
-        assert "cannot approve their own" in r.next_step
+        assert "cannot approve their own" not in r.next_step
+        assert "required checks/reviews" in r.next_step
         assert r.waiting_on  # waits on the copilot review
+
+    def test_create_pr_self_merge_non_blocking_review_needs_no_approval(self):
+        # review_blocking=False (this repo's own copilot-extensions config,
+        # e.g. an advisory-only Copilot review): only the tooling/provider
+        # gate is waived -- the reminder must say so without implying the
+        # repo's own review-verdict policy can be ignored (that was the
+        # misleading behavior this test guards against).
+        flow = _self_merge_flow(review_blocking=False)
+        r = pc.pr_reminder(flow, "create-pr")
+        assert r.ok is True
+        assert "pr-merge" in r.next_step and "--now" in r.next_step
+        assert "self-approve" not in r.next_step
+        assert "cannot approve their own" not in r.next_step
+        assert "tooling needs no" in r.next_step
+        assert "wait for a clean review verdict" in r.next_step
+
+    def test_notes_surface_as_a_caution_line_in_reminder_text(self):
+        flow = _self_merge_flow(notes="ask the on-call before merging on Fridays")
+        r = pc.pr_reminder(flow, "create-pr")
+        assert "ask the on-call before merging on Fridays" in r.cautions
+        assert "Note: ask the on-call before merging on Fridays" in r.text()
+
+    def test_no_notes_line_when_notes_is_empty(self):
+        flow = _self_merge_flow()
+        r = pc.pr_reminder(flow, "create-pr")
+        assert "" not in r.cautions
+
+    def test_notes_surface_for_direct_profile_reminder_too(self):
+        flow = pc.classify_pr_flow(enabled=False, notes="commit small, commit often")
+        r = pc.pr_reminder(flow, "push-changes")
+        assert "commit small, commit often" in r.cautions
+        assert "Note: commit small, commit often" in r.text()
 
     def test_github_submitter_direct_waits_for_blocking_review(self):
         flow = _self_merge_flow(
@@ -598,10 +1033,31 @@ class TestPRReminder:
         assert r.waiting_on
 
     def test_non_github_explicit_self_approval_uses_neutral_gating(self):
-        flow = _self_merge_flow(provider="azure-devops")
+        # review_blocking=True: an approval genuinely gates the merge, so the
+        # phrasing should stay neutral (no GitHub-specific wording) for a
+        # non-GitHub provider.
+        flow = _self_merge_flow(provider="azure-devops", review_blocking=True)
         r = pc.pr_reminder(flow, "create-pr")
         assert "required checks/reviews" in r.next_step
         assert "self-approve" not in r.next_step
+
+    def test_non_blocking_self_approval_needs_no_approval_regardless_of_provider(self):
+        # review_blocking=False: nothing gates the merge, so the "no approval
+        # required" phrasing applies the same way on every provider, not just
+        # GitHub.
+        flow = _self_merge_flow(provider="azure-devops", review_blocking=False)
+        r = pc.pr_reminder(flow, "create-pr")
+        assert "tooling needs no" in r.next_step
+        assert "self-approve" not in r.next_step
+
+    def test_non_blocking_no_reviewer_does_not_mention_a_verdict(self):
+        # review_blocking=False AND no reviewer configured at all: there is
+        # no verdict to wait for, so the reminder must not tell the
+        # submitter to wait for one that will never exist.
+        flow = _self_merge_flow(reviewer="", review_blocking=False)
+        r = pc.pr_reminder(flow, "create-pr")
+        assert "tooling needs no" in r.next_step
+        assert "wait for a clean review verdict" not in r.next_step
 
     def test_blocking_self_merge_reminder_waits_on_approval(self):
         flow = _self_merge_flow(review_blocking=True)
@@ -666,6 +1122,21 @@ class TestPRReminder:
         flow = _self_merge_flow(conflict_retriggers_review=True)
         r = pc.pr_reminder(flow, "pr-watch")
         assert any("re-triggers review" in c for c in r.cautions)
+
+    def test_pr_watch_reason_overrides_the_generic_headline(self):
+        """Regression guard (ThomasMichon/copilot-extensions#3638): a
+        caller-supplied self-merge-bypass note must override pr-watch's own
+        generic 'watching the PR' headline the same way the catch-all
+        pr-status branch already does -- otherwise pr-watch stays the one
+        verb that silently drops this note even when a caller threads it
+        through."""
+        flow = _self_merge_flow()
+        note = "No verdict yet, but this identity holds Maintainer bypass rights."
+        r = pc.pr_reminder(flow, "pr-watch", reason=note)
+        assert r.headline == note
+        # Absent a reason, the original generic headline is unchanged.
+        r_default = pc.pr_reminder(flow, "pr-watch")
+        assert r_default.headline == "watching the PR"
 
     def test_policy_caution_surfaced_at_point_of_action(self):
         # #225: the repo's update/merge policy is surfaced in the reminder so an
@@ -743,6 +1214,11 @@ class TestPRReminder:
                         assert bad.lower() not in blob, (
                             f"reminder for {flow.profile}/{verb} ok={ok} "
                             f"leaked bypass token {bad!r}: {blob}")
+        # Same scan for the dedicated no-actor-authority reminder.
+        r = pc.pr_reminder_no_actor_authority(_self_merge_flow(), reason="blocked")
+        blob = (r.text() + " " + repr(r.as_dict())).lower()
+        for bad in _FORBIDDEN:
+            assert bad.lower() not in blob
 
 
 # ---------------------------------------------------------------------------
@@ -761,6 +1237,12 @@ class TestApprovalRequired:
         st = pc.classify_state(snap, automerge_label="auto-complete",
                                approval_required=False)
         assert st.consent_action == "apply"
+        assert occupancy_from_state(st) == "needs-consent"
+        assert occupancy_from_readiness(
+            pc.merge_readiness(
+                snap, automerge_label="auto-complete", approval_required=False
+            )
+        )["occupancy"] == "needs-consent"
 
     def test_changes_requested_still_blocks_without_approval(self):
         snap = pc.PRSnapshot(pr_state="open", mergeable=True,
@@ -775,6 +1257,113 @@ class TestApprovalRequired:
                              reviews=(_rev(1, "APPROVED"),))
         st = pc.classify_state(snap, automerge_label="auto-complete")
         assert st.consent_action == "apply"
+
+    def test_stale_approval_is_visible_but_blocked_by_default(self):
+        snap = pc.PRSnapshot(
+            pr_state="open",
+            mergeable=True,
+            head_sha="new",
+            updated_at="2026-01-01T00:01:59Z",
+            reviews=(_rev(1, "APPROVED", commit_id="old"),),
+        )
+        st = pc.classify_state(snap, automerge_label="auto-complete")
+        assert st.verdict == ""
+        assert st.approval_stale is True
+        assert st.consent_action == "skip"
+        assert occupancy_from_readiness(
+            pc.merge_readiness(snap, automerge_label="auto-complete")
+        )["occupancy"] == "needs-review"
+
+    def test_occupancy_needs_consent_when_approved_at_head(self):
+        snap = pc.PRSnapshot(
+            pr_state="open",
+            mergeable=True,
+            head_sha="h1",
+            reviews=(_rev(1, "APPROVED", commit_id="h1"),),
+        )
+        readiness = occupancy_from_readiness(
+            pc.merge_readiness(snap, automerge_label="auto-complete")
+        )
+        assert readiness["occupancy"] == "needs-consent"
+
+    def test_occupancy_merged_snapshot_is_terminal(self):
+        snap = pc.PRSnapshot(
+            pr_state="merged",
+            merged=True,
+            mergeable=True,
+            head_sha="h1",
+            reviews=(_rev(1, "APPROVED", commit_id="h1"),),
+        )
+        assert occupancy_from_readiness(
+            pc.merge_readiness(snap, automerge_label="auto-complete")
+        )["occupancy"] == "merged"
+
+    def test_occupancy_needs_merge_when_consent_present(self):
+        snap = pc.PRSnapshot(
+            pr_state="open",
+            mergeable=True,
+            head_sha="h1",
+            labels=("auto-complete",),
+            reviews=(_rev(1, "APPROVED", commit_id="h1"),),
+        )
+        assert occupancy_from_readiness(
+            pc.merge_readiness(snap, automerge_label="auto-complete")
+        )["occupancy"] == "needs-merge"
+
+    def test_stale_approval_can_authorize_merge_when_policy_permits(self):
+        snap = pc.PRSnapshot(
+            pr_state="open",
+            mergeable=True,
+            head_sha="new",
+            updated_at="2026-01-01T00:01:59Z",
+            reviews=(
+                _rev(
+                    1,
+                    "APPROVED",
+                    commit_id="old",
+                    submitted_at="2026-01-01T00:02:00Z",
+                ),
+            ),
+        )
+        readiness = pc.merge_readiness(
+            snap,
+            automerge_label="auto-complete",
+            allow_stale_approval=True,
+            stale_approval_head_sha="new",
+            stale_approval_head_observed_at="2026-01-01T00:01:00Z",
+        )
+        assert readiness["verdict"] == "APPROVED"
+        assert readiness["approval_stale"] is True
+        assert readiness["approval_stale_authorized"] is True
+        assert readiness["consent_action"] == "apply"
+        assert readiness["clear_to_merge"] is True
+        assert "after current head" in readiness["reason"]
+
+    def test_post_approval_push_remains_unapproved(self):
+        snap = pc.PRSnapshot(
+            pr_state="open",
+            mergeable=True,
+            head_sha="new",
+            reviews=(
+                _rev(
+                    1,
+                    "APPROVED",
+                    commit_id="old",
+                    submitted_at="2026-01-01T00:01:00Z",
+                ),
+            ),
+        )
+        readiness = pc.merge_readiness(
+            snap,
+            automerge_label="auto-complete",
+            allow_stale_approval=True,
+            stale_approval_head_sha="new",
+            stale_approval_head_observed_at="2026-01-01T00:02:00Z",
+        )
+        assert readiness["verdict"] == ""
+        assert readiness["approval_stale"] is True
+        assert readiness["approval_stale_authorized"] is False
+        assert readiness["consent_action"] == "skip"
 
 
 class TestThreadTypes:

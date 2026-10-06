@@ -80,8 +80,18 @@ def declaration_to_spec(decl: ProfileDeclaration) -> dict:
             spec["headless_labels"] = list(decl.body.headless_labels)
     elif decl.body.cli_labels:
         spec["cli_labels"] = list(decl.body.cli_labels)
+    if decl.body.disposable_cli_labels:
+        spec["disposable_cli_labels"] = list(decl.body.disposable_cli_labels)
+    if decl.body.idle_nudge_exempt_labels:
+        spec["idle_nudge_exempt_labels"] = list(decl.body.idle_nudge_exempt_labels)
+    if decl.body.steering_disallowed_labels:
+        spec["steering_disallowed_labels"] = list(decl.body.steering_disallowed_labels)
+    if decl.body.no_pair:
+        spec["no_pair"] = True
     if decl.body.type == "headless" or decl.body.headless_labels or decl.fleet.headless:
         spec["headless_agent"] = decl.body.agent
+    if decl.body.charter:
+        spec["charter"] = decl.body.charter
     if decl.verify_timeout:
         spec["verify_timeout"] = decl.verify_timeout
     if decl.evaluator:
@@ -99,7 +109,7 @@ def declaration_to_registration(
         else RegistrationKind.EVALUATOR if decl.evaluator
         else RegistrationKind.SUPERVISED_LANE
     )
-    return {
+    registration = {
         "id": declared_registration_id(decl),
         "logical_id": decl.name,
         "kind": kind,
@@ -110,6 +120,27 @@ def declaration_to_registration(
         "source": DECLARED_ID_PREFIX,
         "owner": decl.owner,
     }
+    if decl.kind == RegistrationKind.PLUGIN_COMPANION:
+        if decl.transition_group:
+            registration["transition_group"] = decl.transition_group
+        registration["plugin"] = {
+            "root": decl.plugin_root,
+            "source_path": decl.source_path,
+            "version": decl.plugin_version,
+            "activation_scopes": list(decl.activation_scopes),
+        }
+        registration["runtime_revision"] = {
+            "plugin_root": decl.plugin_root,
+            "plugin_owner": decl.owner,
+            "plugin_source_path": decl.source_path,
+            "plugin_version": decl.plugin_version,
+            "activation_scopes": list(decl.activation_scopes),
+        }
+        if decl.transition_group:
+            registration["runtime_revision"]["transition_group"] = decl.transition_group
+        if managed_runtime := decl.spec.get("managed_runtime"):
+            registration["runtime_revision"]["managed_runtime"] = managed_runtime
+    return registration
 
 
 def _constrains_machine(decl: ProfileDeclaration) -> bool:
@@ -137,7 +168,7 @@ def runs_on_machine(decl: ProfileDeclaration, machine: str | None) -> bool:
     unidentified host must not run a machine-pinned pool it cannot confirm it is a
     permitted member of. (The prior behavior ran *everything* on an unidentified
     host, so a host with a registrar pointer would run cross-machine declarations
-    it should skip -- see aperture-labs #5001.) A **machine-agnostic** declaration
+    it should skip -- see the downstream tracker.) A **machine-agnostic** declaration
     (no ``machine`` permit/reject) still runs anywhere, including on an
     unidentified host.
     """

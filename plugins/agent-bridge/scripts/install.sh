@@ -166,7 +166,41 @@ fi
 # is the authoritative TOTAL bound, this just shortens single-request stalls.
 if [[ -z "${UV_HTTP_TIMEOUT:-}" ]]; then export UV_HTTP_TIMEOUT=60; fi
 
-INSTALL_DIR="$HOME/.agent-bridge"
+_scoped_identity_suffix() {
+    local normalized="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$normalized" | sha256sum | awk '{print substr($1,1,12)}'
+        return 0
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+        printf '%s' "$normalized" | shasum -a 256 | awk '{print substr($1,1,12)}'
+        return 0
+    fi
+    printf '%s' "$normalized" | cksum | awk '{printf "%012x\n", $1}'
+}
+
+_normalize_install_dir() {
+    local raw="$1" py
+    for py in python3 python; do
+        if command -v "$py" >/dev/null 2>&1; then
+            "$py" -c 'import os, sys; print(os.path.normpath(os.path.abspath(os.path.expanduser(sys.argv[1]))))' "$raw"
+            return 0
+        fi
+    done
+    if [[ "$raw" == "~" ]]; then
+        raw="$HOME"
+    elif [[ "$raw" == "~/"* ]]; then
+        raw="$HOME/${raw#~/}"
+    fi
+    case "$raw" in
+        /*) ;;
+        *) raw="$PWD/$raw" ;;
+    esac
+    printf '%s\n' "$raw"
+}
+
+LEGACY_INSTALL_DIR="$HOME/.agent-bridge"
+INSTALL_DIR="$LEGACY_INSTALL_DIR"
 VENV_DIR="$INSTALL_DIR/venv"
 LOCAL_BIN="$HOME/.local/bin"
 BINSTUB="$LOCAL_BIN/agent-bridge"
@@ -227,6 +261,7 @@ ACTION="${1:-status}"
 shift || true
 
 PURGE=false
+DRY_RUN=false
 # Bypass the downgrade guard (#1790). Env var lets the marketplace/ZDD paths
 # opt in without threading a flag; the CLI flag is the interactive escape hatch.
 FORCE="${AGENT_BRIDGE_ALLOW_DOWNGRADE:-false}"
@@ -236,9 +271,62 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --purge) PURGE=true; shift ;;
         --force) FORCE=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        --install-dir)
+            [[ $# -ge 2 ]] || { echo "[FAIL] Missing value for --install-dir" >&2; exit 1; }
+            INSTALL_DIR="$2"
+            shift 2
+            ;;
         *)       echo "[FAIL] Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+INSTALL_DIR="$(_normalize_install_dir "$INSTALL_DIR")"
+
+PUBLISH_GLOBAL_BINSTUBS=true
+SERVICE_SUFFIX=""
+if [[ "$INSTALL_DIR" != "$LEGACY_INSTALL_DIR" ]]; then
+    PUBLISH_GLOBAL_BINSTUBS=false
+    SERVICE_SUFFIX="$(_scoped_identity_suffix "$INSTALL_DIR")"
+    SYSTEMD_UNIT="agent-bridge-${SERVICE_SUFFIX}.service"
+fi
+
+export AGENT_BRIDGE_INSTALL_DIR="$INSTALL_DIR"
+export AGENT_BRIDGE_CONFIG_DIR="$INSTALL_DIR"
+export AGENT_BRIDGE_CONNECT_LOG="$INSTALL_DIR/logs/connect.log"
+PID_FILE="$INSTALL_DIR/agent-bridge.pid"
+_cfg_yaml="$INSTALL_DIR/config.yaml"
+PORT=""
+if [[ -f "$_cfg_yaml" ]]; then
+    PORT="$(sed -n 's/^[[:space:]]*port:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$_cfg_yaml" | head -1)"
+fi
+if [[ -z "$PORT" ]]; then
+    if [[ -n "${WSL_DISTRO_NAME:-}" ]] || grep -qiE 'microsoft|wsl' /proc/sys/kernel/osrelease 2>/dev/null; then
+        PORT=9281
+    else
+        PORT=9280
+    fi
+fi
+LINK_DIR="$INSTALL_DIR/venv"
+VENV_DIR="$INSTALL_DIR/versions/$SRC_VERSION"
+
+# Stable, documented contract (ThomasMichon/copilot-extensions#5066): a file
+# containing a single epoch-seconds expiry, present for the duration of a
+# live-service update/cutover lifecycle (do_update/do_start) -- any downstream
+# consumer (a local liveness watchdog, a diagnostic tool) can check
+# `[[ -f "$INSTALL_DIR/update-in-progress" ]] && (( $(cat ...) > $(date +%s) ))`
+# without needing any plugin-specific caller-side wrapping.
+UPDATE_MARKER="${INSTALL_DIR}/update-in-progress"
+UPDATE_MARKER_TTL_DEFAULT=1200  # 20 min -- generous past any observed real cutover
+UPDATE_MARKER_REFCOUNT="${UPDATE_MARKER}.refcount"
+UPDATE_MARKER_REFCOUNT_LOCK="${UPDATE_MARKER}.refcount.lock"
+# Process-local: true once THIS invocation holds a refcount slot (see
+# _write_update_marker). Lets a nested call -- do_update calls do_start
+# internally via _update_lifecycle_start, both wanting to manage the SAME
+# marker within the SAME process -- extend the outer scope's existing
+# lifecycle instead of acquiring (and later releasing) a second slot for
+# what is really one logical holder.
+_UPDATE_MARKER_HELD=false
 
 # -- Helpers -----------------------------------------------------------------
 
@@ -247,6 +335,131 @@ _skip() { echo "  [SKIP] $*"; }
 _fail() { echo "  [FAIL] $*" >&2; }
 _step() { echo "  ...    $*"; }
 _warn() { echo "  [WARN] $*" >&2; }
+
+# Reference-counted, not single-owner: do_update holding the marker for a
+# long cutover and a separate, brief do_start both legitimately want it
+# live at once, and a single-owner/last-writer-wins scheme would let the
+# SHORT invocation's own exit delete the marker while the LONG one is
+# still mid-transition (review finding) -- the marker must stay present
+# until every concurrent holder has released its own slot, not just the
+# most recent one. The refcount file + its own dedicated flock (fd 9,
+# separate from the main install lock so a brief do_start never needs to
+# content for -- or risk reentering -- that longer-held lock) make
+# increment/decrement atomic across processes.
+#
+# `mkdir -p` first: on a fresh or deleted install root, $INSTALL_DIR itself
+# may not exist yet at the point either live-service lifecycle starts (its
+# own provisioning step is what would normally create it) -- the marker
+# must not fail BEFORE that provisioning ever gets a chance to run.
+_write_update_marker() {
+    if [[ "$_UPDATE_MARKER_HELD" == true ]]; then
+        return 0
+    fi
+    local ttl="${1:-${UPDATE_MARKER_TTL_DEFAULT}}"
+    mkdir -p "$(dirname "${UPDATE_MARKER}")"
+    exec 9>"${UPDATE_MARKER_REFCOUNT_LOCK}"
+    flock -w 10 9 || true   # best-effort: proceed even if briefly uncontended-but-slow
+    local count tmp
+    count="$(cat "${UPDATE_MARKER_REFCOUNT}" 2>/dev/null || echo 0)"
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    if (( count == 0 )); then
+        # First holder: stamp a fresh marker. A later joiner deliberately
+        # does NOT refresh the expiry -- the TTL is a safety-net backstop,
+        # not a per-holder renewal lease.
+        tmp="$(mktemp "${UPDATE_MARKER}.XXXXXX")"
+        echo "$(( $(date +%s) + ttl ))" > "${tmp}"
+        mv -f "${tmp}" "${UPDATE_MARKER}"
+    fi
+    tmp="$(mktemp "${UPDATE_MARKER_REFCOUNT}.XXXXXX")"
+    echo "$(( count + 1 ))" > "${tmp}"
+    mv -f "${tmp}" "${UPDATE_MARKER_REFCOUNT}"
+    exec 9>&-
+    _UPDATE_MARKER_HELD=true
+}
+# Releases this invocation's own refcount slot; only the holder that takes
+# the count to zero actually removes the marker file, so it stays present
+# for the full duration of whichever concurrent transition runs longest.
+# Best-effort: a read/write race here is never fatal to the caller's own
+# exit (the TTL remains the backstop if the refcount file itself is ever
+# lost or corrupted).
+_clear_update_marker() {
+    [[ "$_UPDATE_MARKER_HELD" == true ]] || return 0
+    _UPDATE_MARKER_HELD=false
+    exec 9>"${UPDATE_MARKER_REFCOUNT_LOCK}" 2>/dev/null || return 0
+    flock -w 10 9 || true
+    local count tmp
+    count="$(cat "${UPDATE_MARKER_REFCOUNT}" 2>/dev/null || echo 0)"
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    (( count > 0 )) && (( count-- ))
+    if (( count <= 0 )); then
+        rm -f "${UPDATE_MARKER}" "${UPDATE_MARKER_REFCOUNT}"
+    else
+        tmp="$(mktemp "${UPDATE_MARKER_REFCOUNT}.XXXXXX")"
+        echo "${count}" > "${tmp}"
+        mv -f "${tmp}" "${UPDATE_MARKER_REFCOUNT}"
+    fi
+    exec 9>&-
+}
+
+. "$SCRIPT_DIR/installer-engine.sh"
+
+_scrub_payload_build_artifacts() {
+    local extra_dir="${1:-}"
+    rm -rf "$PLUGIN_DIR/build" "$PLUGIN_DIR"/*.egg-info            "$PLUGIN_DIR"/src/*.egg-info 2>/dev/null || true
+    local lib_dir
+    for lib_dir in "$PLUGIN_DIR"/libs/*/; do
+        [[ -d "$lib_dir" ]] || continue
+        rm -rf "${lib_dir}build" "${lib_dir}"*.egg-info                "${lib_dir}"src/*.egg-info 2>/dev/null || true
+    done
+    if [[ -n "$extra_dir" && "$extra_dir" != "$PLUGIN_DIR" ]]; then
+        rm -rf "$extra_dir/build" "$extra_dir"/*.egg-info                "$extra_dir"/src/*.egg-info 2>/dev/null || true
+    fi
+}
+
+_uv_pip_install_resilient() {
+    local scrub_dir="$1"; shift
+    local out delay
+    _scrub_payload_build_artifacts "$scrub_dir"
+    if out="$(uv pip install "$@" 2>&1)"; then
+        _scrub_payload_build_artifacts "$scrub_dir"
+        printf '%s\n' "$out"
+        return 0
+    fi
+    for delay in 3 6 10; do
+        if ! test_is_sre_module_mismatch "$out"; then
+            break
+        fi
+        _warn "uv build hit a transient SRE module mismatch (shared Python cache race, #6785) -- retrying in ${delay}s"
+        sleep "$delay"
+        _scrub_payload_build_artifacts "$scrub_dir"
+        if out="$(uv pip install "$@" 2>&1)"; then
+            _scrub_payload_build_artifacts "$scrub_dir"
+            printf '%s\n' "$out"
+            return 0
+        fi
+    done
+    printf '%s\n' "$out" >&2
+    return 1
+}
+
+# A venv is only healthy when BOTH its python binary and pyvenv.cfg exist --
+# checking the binary alone treats a #6852-corrupted slot (python present,
+# pyvenv.cfg missing) as already healthy and never rebuilds it.
+_venv_healthy() {
+    [[ -x "$1/bin/python" && -f "$1/pyvenv.cfg" ]]
+}
+
+_uv_venv_resilient() {
+    local venv_dir="$1"; shift
+    local out rc
+    out="$(invoke_uv_venv_resilient uv "$venv_dir" "$@")"; rc=$?
+    if [[ $rc -eq 0 ]]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    printf '%s\n' "$out" >&2
+    return "$rc"
+}
 
 # === install-contract:v3 versioned-venv helpers (agent-bridge) ===
 _versioned_activate() {
@@ -435,6 +648,137 @@ if p > 0:
 else:
     sys.exit(1)
 PYEOF
+}
+
+_active_is_forward() {
+    # Whether the routing table points at a host bridge this machine only
+    # forwards to (a venue launcher wrote it): marked "forwarded", or the older
+    # launcher form with a port but no bind/daemon pid/generation. Never start a
+    # local daemon over it -- it would take the route over from the host.
+    # Fails closed: a routing table no interpreter can read counts as a forward.
+    local aj="$INSTALL_DIR/active.json" py=""
+    [[ -f "$aj" ]] || return 1
+    py="$(_route_python)" || return 0
+    "$py" - "$aj" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    a = json.load(open(sys.argv[1])).get("active") or {}
+    port = int(a.get("port") or 0)
+except Exception:
+    sys.exit(1)
+fwd = (
+    a.get("forwarded") is True
+    or (a.get("pid") is None and "generation" not in a and "bind" not in a)
+)
+sys.exit(0 if port > 0 and fwd else 1)
+PYEOF
+}
+
+_route_python() {
+    # An interpreter that can read active.json, resolved like the rest of this
+    # installer: the managed runtime (_rt_python), then the current venv link
+    # or PATH python (_bootstrap_python), then PATH directly. These guards run
+    # before this run's slot exists, so $VENV_DIR alone is not enough.
+    local py=""
+    py="$(_rt_python 2>/dev/null)" && [[ -x "$py" ]] && { printf '%s' "$py"; return 0; }
+    py="$(_bootstrap_python 2>/dev/null)" && [[ -n "$py" ]] && { printf '%s' "$py"; return 0; }
+    py="$(command -v python3 || command -v python || true)"
+    [[ -n "$py" ]] || return 1
+    printf '%s' "$py"
+}
+
+_active_signature() {
+    local aj="$INSTALL_DIR/active.json" py=""
+    [[ -f "$aj" ]] || return 1
+    py="$(_route_python)" || return 1
+    "$py" - "$aj" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    a = json.load(open(sys.argv[1])).get("active") or {}
+    port = int(a.get("port") or 0)
+except Exception:
+    sys.exit(1)
+is_forward = a.get("forwarded") is True or (
+    a.get("pid") is None and "generation" not in a and "bind" not in a
+)
+if port <= 0 or is_forward:
+    sys.exit(1)
+print(json.dumps({
+    "bind": a.get("bind"),
+    "port": port,
+    "pid": a.get("pid"),
+    "generation": a.get("generation"),
+}, sort_keys=True, separators=(",", ":")))
+PYEOF
+}
+
+_update_lifecycle_still_targets_predecessor() {
+    # $2 == allow-absent: after this update stopped the pinned predecessor, its
+    # graceful shutdown clears its own route, so an absent route still means "ours".
+    local pinned="${1:-}" allow_absent="${2:-}" current=""
+    if _active_is_forward; then
+        _step "Forwarded host bridge route appeared during update -- skipping drain/stop/start"
+        return 1
+    fi
+    # An empty pin is the legacy fixed-port predecessor with no route: it must
+    # stay empty. allow-absent relaxes only a pinned predecessor that exited.
+    current="$(_active_signature 2>/dev/null || true)"
+    if [[ "$allow_absent" == allow-absent && -n "$pinned" && -z "$current" ]]; then
+        return 0
+    fi
+    if [[ "$current" != "$pinned" ]]; then
+        _step "Active route changed during update -- skipping drain/stop/start"
+        return 1
+    fi
+    return 0
+}
+
+_pinned_base_url() {
+    # The validated predecessor's own endpoint (its _active_signature JSON; empty =
+    # the fixed $PORT daemon), so the drain targets exactly it and never follows a
+    # route rewritten after validation -- e.g. to a venue forward.
+    local pinned="${1:-}" py=""
+    if [[ -z "$pinned" ]]; then
+        [[ -n "${PORT:-}" ]] || return 1
+        echo "http://127.0.0.1:${PORT}"
+        return 0
+    fi
+    py="$(_route_python)" || return 1
+    "$py" -c 'import json, sys
+a = json.loads(sys.argv[1])
+port = int(a["port"])
+bind = a.get("bind") or "127.0.0.1"
+bind = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(bind, bind)
+print(("http://[%s]:%d" if ":" in bind else "http://%s:%d") % (bind, port))' "$pinned" 2>/dev/null
+}
+
+_update_lifecycle_drain_stop() {
+    local pinned="${1:-}" timeout="${2:-120}" base=""
+    if ! _update_lifecycle_still_targets_predecessor "$pinned"; then
+        return 1
+    fi
+    if base="$(_pinned_base_url "$pinned")" && [[ -n "$base" ]]; then
+        # AGENT_BRIDGE_BASE_URL overrides the routing table for the drain client.
+        ( export AGENT_BRIDGE_BASE_URL="$base"; _drain_service "$timeout" )
+    else
+        _warn "Cannot pin the drain to the validated bridge -- skipping drain"
+    fi
+    # The drain can block for its full timeout; a venue forward may publish or
+    # bind meanwhile. Re-check right before stopping so the stop's last-resort
+    # $PORT cleanup never kills it.
+    if ! _update_lifecycle_still_targets_predecessor "$pinned" allow-absent; then
+        return 1
+    fi
+    do_stop
+}
+
+_update_lifecycle_start() {
+    local pinned="${1:-}" message="${2:-Starting service...}"
+    if ! _update_lifecycle_still_targets_predecessor "$pinned" allow-absent; then
+        return 1
+    fi
+    _step "$message"
+    do_start
 }
 
 _active_host() {
@@ -702,66 +1046,9 @@ _source_kind() {
 }
 # === end install-contract:v4 source-kind ===
 
-# Unified schema_version 3 manifest writer. Self-contained per plugin (no shared
-# module -- plugins are pulled independently from the marketplace). Records the
-# source footprint (local vs marketplace) and is written atomically (temp+move).
-_write_deploy_manifest_for() {
-    local service="$1" plugin="$2" install_path="$3" plugin_path="$4" venv_path="$5"
-    local manifest="$install_path/deploy-manifest.json"
-    local kind
-    kind="$(_source_kind "$plugin_path")"
-
-    local ver="0.0.0"
-    if [[ -f "$plugin_path/pyproject.toml" ]]; then
-        ver=$(grep -m1 '^version' "$plugin_path/pyproject.toml" | sed 's/.*"\(.*\)".*/\1/' || echo "0.0.0")
-    fi
-
-    # Git provenance only applies to a local checkout.
-    local commit="null" branch="null" dirty="false"
-    if [[ "$kind" == "local" ]]; then
-        local repo_root c b d
-        repo_root="$(cd "$plugin_path/.." && pwd)"
-        read -r c b d <<< "$(_git_info "$repo_root")"
-        commit="\"$c\""; branch="\"$b\""; dirty="$d"
-    fi
-
-    # Content identity (#776): a payload fingerprint so the manifest records WHAT
-    # content is deployed, not just the (reusable) version label -- populated even
-    # for a marketplace copy where "commit" is null.
-    local content_hash
-    content_hash="$(_payload_hash)"
-
-    local tmp="$manifest.tmp"
-    cat > "$tmp" << EOF
-{
-  "schema_version": 3,
-  "service": "$service",
-  "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "deployed_by": "$(hostname)-$(uname -s | tr '[:upper:]' '[:lower:]')",
-  "source": {
-    "kind": "$kind",
-    "path": "$plugin_path",
-    "repo": "copilot-extensions",
-    "plugin": "$plugin",
-    "version": "$ver",
-    "commit": $commit,
-    "branch": $branch,
-    "dirty": $dirty,
-    "content_hash": "$content_hash"
-  },
-  "venv": "$venv_path",
-  "runtime": "python"
-}
-EOF
-    mv -f "$tmp" "$manifest"
-    _ok "Deploy manifest written (source: $kind)"
-}
-
 _write_deploy_manifest() {
-    # The manifest `venv` field records the active versioned slot ($VENV_DIR);
-    # the `venv` link is retired (marker-only, uniform-runtime-resolution #765).
-    _write_deploy_manifest_for "agent-bridge" "agent-bridge" \
-        "$INSTALL_DIR" "$PLUGIN_DIR" "$VENV_DIR"
+    local source_path="${COPILOT_PLUGIN_STAGED_FROM:-$PLUGIN_DIR}"
+    write_deploy_manifest "agent-bridge" "agent-bridge" "$INSTALL_DIR" "$PLUGIN_DIR" "$VENV_DIR" "" "$source_path" "$SRC_VERSION"
 }
 
 _install_systemd_unit() {
@@ -800,6 +1087,9 @@ ExecStopPost=/bin/sleep 2
 Restart=on-failure
 RestartSec=5
 WorkingDirectory=$INSTALL_DIR
+Environment=AGENT_BRIDGE_INSTALL_DIR=$INSTALL_DIR
+Environment=AGENT_BRIDGE_CONFIG_DIR=$INSTALL_DIR
+Environment=AGENT_BRIDGE_CONNECT_LOG=$INSTALL_DIR/logs/connect.log
 Environment=PYTHONUTF8=1
 
 [Install]
@@ -842,25 +1132,9 @@ _migration_check() {
 # Vendor a standalone uv into the runtime tool dir when uv is absent (pristine or
 # governed box) instead of dead-ending; add it to PATH for this run.
 _ensure_uv() {
-    command -v uv &>/dev/null && return 0
-    local tooldir="$INSTALL_DIR/tool"
-    if [[ -x "$tooldir/uv" ]]; then export PATH="$tooldir:$PATH"; return 0; fi
-    _step "uv not found -- vendoring a standalone uv into $tooldir"
-    mkdir -p "$tooldir"
-    local url="https://astral.sh/uv/install.sh" script="$tooldir/uv-install.sh" got=""
-    if command -v curl &>/dev/null; then curl -LsSf "$url" -o "$script" 2>/dev/null && got=1; fi
-    if [[ -z "$got" ]] && command -v wget &>/dev/null; then wget -qO "$script" "$url" 2>/dev/null && got=1; fi
-    if [[ -z "$got" ]] && command -v python3 &>/dev/null; then
-        python3 - "$url" "$script" <<'PY' 2>/dev/null && got=1
-import sys, urllib.request
-urllib.request.urlretrieve(sys.argv[1], sys.argv[2])
-PY
+    if ensure_uv "$INSTALL_DIR" tool 1 >/dev/null; then
+        return 0
     fi
-    if [[ -n "$got" && -s "$script" ]]; then
-        env UV_INSTALL_DIR="$tooldir" UV_UNMANAGED_INSTALL="$tooldir" INSTALLER_NO_MODIFY_PATH=1 sh "$script" >/dev/null 2>&1 || true
-    fi
-    [[ -x "$tooldir/bin/uv" && ! -x "$tooldir/uv" ]] && ln -sf "$tooldir/bin/uv" "$tooldir/uv" 2>/dev/null || true
-    if [[ -x "$tooldir/uv" ]]; then export PATH="$tooldir:$PATH"; _ok "Vendored uv into $tooldir"; return 0; fi
     _fail "uv is required but not found, and vendoring failed (no reachable uv installer). Install uv, then retry."
     return 1
 }
@@ -890,12 +1164,20 @@ _ensure_uv_index() {
 # line + a machine-readable ::agent-provisioning:: signal so a caller can extend
 # its timeout), lock-serialized, fail-fast. Replaces the old thin exec stub.
 deploy_binstub() {
-    mkdir -p "$LOCAL_BIN" "$INSTALL_DIR/bin"
+    mkdir -p "$INSTALL_DIR/bin"
+    if $PUBLISH_GLOBAL_BINSTUBS; then
+        mkdir -p "$LOCAL_BIN"
+    fi
     # Co-deploy the canonical marker-only resolver so the binstub resolves the
     # interpreter the ONE uniform way (uniform-runtime-resolution, #765).
     for r in resolve-runtime.sh resolve-runtime.ps1; do
         [ -f "$SCRIPT_DIR/$r" ] && cp -f "$SCRIPT_DIR/$r" "$INSTALL_DIR/bin/$r"
     done
+    if ! $PUBLISH_GLOBAL_BINSTUBS; then
+        _ok "Scoped install keeps the global compatibility binstub unchanged"
+        return 0
+    fi
+
     cat > "$BINSTUB" << 'STUB'
 #!/usr/bin/env bash
 # agent-bridge binstub -- self-provisioning (install-on-first-use).
@@ -958,10 +1240,17 @@ STUB
 # binstub -- NO venv, NO uv. The runtime builds itself on the binstub's first use.
 do_stamp() {
     echo ""; echo "=== agent-bridge stamp (defer runtime to first use) ==="; echo ""
-    mkdir -p "$INSTALL_DIR" "$LOCAL_BIN"
+    mkdir -p "$INSTALL_DIR"
+    if $PUBLISH_GLOBAL_BINSTUBS; then
+        mkdir -p "$LOCAL_BIN"
+    fi
     printf '%s\n' "${COPILOT_PLUGIN_STAGED_FROM:-$PLUGIN_DIR}" > "$INSTALL_DIR/payload-dir"
     deploy_binstub
-    _ok "Stamped: binstub on PATH; runtime provisions on first use."
+    if $PUBLISH_GLOBAL_BINSTUBS; then
+        _ok "Stamped: binstub on PATH; runtime provisions on first use."
+    else
+        _ok "Stamped: scoped runtime metadata recorded; payload-local commands provision on first use."
+    fi
 }
 
 # Cross-process install serialization (ce#776/#777 follow-up; ce#802 review): a
@@ -1003,7 +1292,10 @@ do_install() {
         return 0
     fi
 
-    mkdir -p "$INSTALL_DIR" "$LOCAL_BIN"
+    mkdir -p "$INSTALL_DIR"
+    if $PUBLISH_GLOBAL_BINSTUBS; then
+        mkdir -p "$LOCAL_BIN"
+    fi
 
     # #935: toss an INCOMPLETE prior slot first so we never `uv venv
     # --allow-existing` over a half-built corpse (the current/active slot is
@@ -1011,10 +1303,14 @@ do_install() {
     _versioned_slot_clean
 
     # Create venv via uv
-    if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    if ! _venv_healthy "$VENV_DIR"; then
+        if [[ -x "$VENV_DIR/bin/python" ]]; then
+            _warn "Existing venv python present but pyvenv.cfg is missing at $VENV_DIR/pyvenv.cfg (shared interpreter race, #6852) -- rebuilding"
+            rm -rf "$VENV_DIR"
+        fi
         _step "Creating venv via uv..."
-        if ! uv venv "$VENV_DIR" --python 3.10 --allow-existing; then
-            if ! uv venv "$VENV_DIR" --allow-existing; then
+        if ! _uv_venv_resilient "$VENV_DIR" --python 3.10 --allow-existing; then
+            if ! _uv_venv_resilient "$VENV_DIR" --allow-existing; then
                 _fail "Failed to create venv at $VENV_DIR"
                 exit 1
             fi
@@ -1028,7 +1324,9 @@ do_install() {
     _step "Installing agent-bridge package..."
     local ssh_manager_dir
     if ssh_manager_dir="$(_resolve_ssh_manager)"; then
-        if ! uv pip install --python "$VENV_DIR/bin/python" "$ssh_manager_dir" --quiet; then
+        if ! _uv_pip_install_resilient "$ssh_manager_dir" --python "$VENV_DIR/bin/python" \
+                --reinstall-package agent-ssh-manager --refresh-package agent-ssh-manager \
+                "$ssh_manager_dir" --quiet; then
             _fail "ssh-manager install failed"
             exit 1
         fi
@@ -1041,7 +1339,9 @@ do_install() {
     # credential-relay (the relay framework agent-bridge runs in its daemon).
     local cred_relay_dir
     if cred_relay_dir="$(_resolve_credential_relay)"; then
-        if ! uv pip install --python "$VENV_DIR/bin/python" "$cred_relay_dir" --quiet; then
+        if ! _uv_pip_install_resilient "$cred_relay_dir" --python "$VENV_DIR/bin/python" \
+                --reinstall-package agent-credential-relay --refresh-package agent-credential-relay \
+                "$cred_relay_dir" --quiet; then
             _fail "credential-relay install failed"
             exit 1
         fi
@@ -1054,7 +1354,9 @@ do_install() {
     # zdd (zero-downtime cutover primitives: routing table + orchestrator).
     local zdd_dir
     if zdd_dir="$(_resolve_zdd)"; then
-        if ! uv pip install --python "$VENV_DIR/bin/python" "$zdd_dir" --quiet; then
+        if ! _uv_pip_install_resilient "$zdd_dir" --python "$VENV_DIR/bin/python" \
+                --reinstall-package agent-zdd --refresh-package agent-zdd \
+                "$zdd_dir" --quiet; then
             _fail "zdd install failed"
             exit 1
         fi
@@ -1067,7 +1369,7 @@ do_install() {
     # single-instance-lease (one active daemon per host: lease + self-retire + reaper).
     local sil_dir
     if sil_dir="$(_resolve_single_instance_lease)"; then
-        if ! uv pip install --python "$VENV_DIR/bin/python" --reinstall-package agent-single-instance-lease --refresh-package agent-single-instance-lease "$sil_dir" --quiet; then
+        if ! _uv_pip_install_resilient "$sil_dir" --python "$VENV_DIR/bin/python" --reinstall-package agent-single-instance-lease --refresh-package agent-single-instance-lease "$sil_dir" --quiet; then
             _fail "single-instance-lease install failed"
             exit 1
         fi
@@ -1080,7 +1382,9 @@ do_install() {
     # config-migrate (config schema versioning + migration).
     local cfg_migrate_dir
     if cfg_migrate_dir="$(_resolve_config_migrate)"; then
-        if ! uv pip install --python "$VENV_DIR/bin/python" "$cfg_migrate_dir" --quiet; then
+        if ! _uv_pip_install_resilient "$cfg_migrate_dir" --python "$VENV_DIR/bin/python" \
+                --reinstall-package agent-config-migrate --refresh-package agent-config-migrate \
+                "$cfg_migrate_dir" --quiet; then
             _fail "config-migrate install failed"
             exit 1
         fi
@@ -1090,7 +1394,28 @@ do_install() {
         _fail "Cannot locate config-migrate library. Reinstall the agent-bridge plugin from the marketplace (copilot plugin install agent-bridge@copilot-extensions), then rerun this installer."
         exit 1
     fi
-    if ! uv pip install --python "$VENV_DIR/bin/python" "$PLUGIN_DIR" --quiet; then
+    # --refresh-package agent-procutil / agent-plugin-resolve /
+    # agent-dropin-registry / agent-plugin-activation / agent-remote-login-shell:
+    # none of these has a
+    # dedicated install call of its own (all resolved transitively while
+    # installing agent-bridge below), so they never get an explicit
+    # cache-bust anywhere else. uv's local-path build cache is keyed by
+    # source path, not source content -- a stale wheel from a prior build can
+    # silently be served instead of a fresh one. This is the confirmed root
+    # cause behind ThomasMichon/copilot-extensions#2863 (agent-dispatch's
+    # identical exposure) and directly implicated in a live LAUNCH_ACP
+    # "session host exited early" incident on the same host during the same
+    # outage window -- session_host/launcher.py imports agent_procutil at
+    # module level, so a stale build there crashes every headless-spawn
+    # session host launch.
+    if ! _uv_pip_install_resilient "" --python "$VENV_DIR/bin/python" \
+            --reinstall-package agent-bridge --refresh-package agent-bridge \
+            --reinstall-package agent-procutil --refresh-package agent-procutil \
+            --reinstall-package agent-plugin-resolve --refresh-package agent-plugin-resolve \
+            --reinstall-package agent-dropin-registry --refresh-package agent-dropin-registry \
+            --reinstall-package agent-plugin-activation --refresh-package agent-plugin-activation \
+            --reinstall-package agent-remote-login-shell --refresh-package agent-remote-login-shell \
+            "$PLUGIN_DIR" --quiet; then
         _fail "Package install failed"
         exit 1
     fi
@@ -1138,7 +1463,11 @@ do_install() {
     echo ""
     _ok "agent-bridge installed"
     echo "  Install dir: $INSTALL_DIR"
-    echo "  Binstub:     $BINSTUB"
+    if $PUBLISH_GLOBAL_BINSTUBS; then
+        echo "  Binstub:     $BINSTUB"
+    else
+        echo "  Binstub:     global compatibility wrapper unchanged (scoped install)"
+    fi
     echo "  Config:      agent-bridge config show"
     echo "  API:         http://127.0.0.1:$PORT"
 
@@ -1151,43 +1480,81 @@ do_install() {
 do_uninstall() {
     echo ""
     echo "=== agent-bridge uninstall ==="
+    $DRY_RUN && echo "(dry run -- nothing will be changed)"
     echo ""
 
-    do_stop
-
-    # Remove systemd unit
-    if command -v systemctl &>/dev/null; then
-        systemctl --user disable "$SYSTEMD_UNIT" 2>/dev/null || true
-        rm -f "$HOME/.config/systemd/user/$SYSTEMD_UNIT"
-        systemctl --user daemon-reload 2>/dev/null || true
-        _ok "systemd unit removed"
+    if $DRY_RUN; then
+        if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+            echo "[dry-run] would stop agent-bridge (pid=$(cat "$PID_FILE"))"
+        else
+            _skip "agent-bridge not running"
+        fi
+    else
+        do_stop
     fi
 
-    rm -f "$BINSTUB"
-    _ok "Binstub removed"
+    # systemd unit
+    if command -v systemctl &>/dev/null; then
+        if $DRY_RUN; then
+            echo "[dry-run] would disable + remove systemd unit: $SYSTEMD_UNIT"
+        else
+            systemctl --user disable "$SYSTEMD_UNIT" 2>/dev/null || true
+            rm -f "$HOME/.config/systemd/user/$SYSTEMD_UNIT"
+            systemctl --user daemon-reload 2>/dev/null || true
+            _ok "systemd unit removed"
+        fi
+    fi
 
-    _remove_sibling_binstubs
+    if $PUBLISH_GLOBAL_BINSTUBS; then
+        if $DRY_RUN; then
+            echo "[dry-run] would remove binstub: $BINSTUB"
+        else
+            rm -f "$BINSTUB"
+            _ok "Binstub removed"
+        fi
+    else
+        _ok "Scoped install left the legacy global binstub unchanged"
+    fi
+
+    $DRY_RUN || _remove_sibling_binstubs
 
     # Remove the runtime venv. In the versioned layout this means the `venv`
     # symlink AND the whole versions/ tree; otherwise the single real venv dir.
     if [[ "$VERSIONED_RUNTIME" == 1 ]]; then
-        [[ -L "$LINK_DIR" ]] && rm -f "$LINK_DIR"
-        [[ -d "$LINK_DIR" && ! -L "$LINK_DIR" ]] && rm -rf "$LINK_DIR"
-        [[ -d "$INSTALL_DIR/versions" ]] && rm -rf "$INSTALL_DIR/versions"
-        _ok "Venv removed"
+        if $DRY_RUN; then
+            [[ -L "$LINK_DIR" || -d "$LINK_DIR" ]] && echo "[dry-run] would remove: $LINK_DIR"
+            [[ -d "$INSTALL_DIR/versions" ]] && echo "[dry-run] would remove: $INSTALL_DIR/versions"
+        else
+            [[ -L "$LINK_DIR" ]] && rm -f "$LINK_DIR"
+            [[ -d "$LINK_DIR" && ! -L "$LINK_DIR" ]] && rm -rf "$LINK_DIR"
+            [[ -d "$INSTALL_DIR/versions" ]] && rm -rf "$INSTALL_DIR/versions"
+            _ok "Venv removed"
+        fi
     elif [[ -d "$VENV_DIR" ]]; then
-        rm -rf "$VENV_DIR"
-        _ok "Venv removed"
+        if $DRY_RUN; then
+            echo "[dry-run] would remove venv: $VENV_DIR"
+        else
+            rm -rf "$VENV_DIR"
+            _ok "Venv removed"
+        fi
     fi
 
     if $PURGE; then
-        _warn "Purging config, DB, and auth"
-        rm -rf "$INSTALL_DIR"
+        if $DRY_RUN; then
+            echo "[dry-run] would PURGE config/DB/auth at: $INSTALL_DIR"
+        else
+            _warn "Purging config, DB, and auth"
+            rm -rf "$INSTALL_DIR"
+        fi
     else
         _skip "Preserved config/DB at $INSTALL_DIR (use --purge to remove)"
     fi
 
-    _ok "agent-bridge uninstalled"
+    if $DRY_RUN; then
+        echo "agent-bridge uninstall dry run complete -- nothing was changed"
+    else
+        _ok "agent-bridge uninstalled"
+    fi
 }
 
 do_start() {
@@ -1226,11 +1593,23 @@ do_start() {
         fi
     fi
 
+    if _active_is_forward; then
+        _skip "this machine reaches a host bridge through a forward (active.json); not starting a local daemon"
+        return 0
+    fi
+
     local rt_py
     if ! rt_py="$(_rt_python)"; then
         _fail "agent-bridge not installed. Run: install.sh install"
         exit 1
     fi
+
+    # Mark the live-service start lifecycle as in-progress (ce#5066), past
+    # every "nothing to do" early return above -- a local liveness watchdog
+    # should only ever see this during an actual start attempt, never while
+    # an already-healthy daemon or a forward route is correctly left alone.
+    _write_update_marker
+    trap _clear_update_marker EXIT
 
     _step "Starting agent-bridge..."
 
@@ -1363,7 +1742,9 @@ do_status() {
     if command -v systemctl &>/dev/null && [[ -f "$HOME/.config/systemd/user/$SYSTEMD_UNIT" ]]; then
         local state
         state=$(systemctl --user is-enabled "$SYSTEMD_UNIT" 2>/dev/null || echo "not found")
-        _ok "systemd unit: $state"
+        _ok "systemd unit: $state ($SYSTEMD_UNIT)"
+    elif ! $PUBLISH_GLOBAL_BINSTUBS; then
+        _step "No scoped systemd unit registered"
     fi
 
     # Exit non-zero when not installed (used by module update orchestrator)
@@ -1484,23 +1865,27 @@ _update_core() {
     # slot (never the running daemon's), so an absent slot is normal -- always
     # build it. Legacy layout: repair the single venv in place if python is gone.
     if [[ "$VERSIONED_RUNTIME" == 1 ]]; then
-        if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+        if [[ -x "$VENV_DIR/bin/python" && ! -f "$VENV_DIR/pyvenv.cfg" ]]; then
+            _warn "Runtime slot python present but pyvenv.cfg is missing at $VENV_DIR/pyvenv.cfg (shared interpreter race, #6852) -- rebuilding"
+            rm -rf "$VENV_DIR"
+        fi
+        if ! _venv_healthy "$VENV_DIR"; then
             _step "Building runtime slot versions/$SRC_VERSION..."
             _versioned_slot_clean
-            if ! uv venv "$VENV_DIR" --python 3.10 --allow-existing; then
-                uv venv "$VENV_DIR" --allow-existing || { _fail "Venv build failed (versions/$SRC_VERSION)"; return 1; }
+            if ! _uv_venv_resilient "$VENV_DIR" --python 3.10 --allow-existing; then
+                _uv_venv_resilient "$VENV_DIR" --allow-existing || { _fail "Venv build failed (versions/$SRC_VERSION)"; return 1; }
             fi
             _ok "Built runtime slot versions/$SRC_VERSION"
         fi
-    elif [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    elif ! _venv_healthy "$VENV_DIR"; then
         if [[ -d "$VENV_DIR" ]]; then
-            _step "Repairing venv (python binary missing)..."
+            _step "Repairing venv (python binary or pyvenv.cfg missing)..."
         else
             _fail "agent-bridge not installed. Run: install.sh install"
             return 1
         fi
-        if ! uv venv "$VENV_DIR" --python 3.10 --allow-existing; then
-            uv venv "$VENV_DIR" --allow-existing || { _fail "Venv repair failed"; return 1; }
+        if ! _uv_venv_resilient "$VENV_DIR" --python 3.10 --allow-existing; then
+            _uv_venv_resilient "$VENV_DIR" --allow-existing || { _fail "Venv repair failed"; return 1; }
         fi
         _ok "Venv repaired"
     fi
@@ -1508,7 +1893,7 @@ _update_core() {
     _step "Updating agent-bridge package..."
     local ssh_manager_dir
     if ssh_manager_dir="$(_resolve_ssh_manager)"; then
-        if ! uv pip install --python "$VENV_DIR/bin/python" --reinstall-package agent-ssh-manager \
+        if ! _uv_pip_install_resilient "$ssh_manager_dir" --python "$VENV_DIR/bin/python" --reinstall-package agent-ssh-manager --refresh-package agent-ssh-manager \
                 "$ssh_manager_dir" --quiet; then
             _fail "ssh-manager update failed"
             return 1
@@ -1523,7 +1908,7 @@ _update_core() {
     # without a version bump (uv otherwise skips a same-version path dep).
     local cred_relay_dir
     if cred_relay_dir="$(_resolve_credential_relay)"; then
-        if ! uv pip install --python "$VENV_DIR/bin/python" --reinstall-package agent-credential-relay \
+        if ! _uv_pip_install_resilient "$cred_relay_dir" --python "$VENV_DIR/bin/python" --reinstall-package agent-credential-relay --refresh-package agent-credential-relay \
                 "$cred_relay_dir" --quiet; then
             _fail "credential-relay update failed"
             return 1
@@ -1538,7 +1923,7 @@ _update_core() {
     # version bump (uv otherwise skips a same-version path dep).
     local zdd_dir
     if zdd_dir="$(_resolve_zdd)"; then
-        if ! uv pip install --python "$VENV_DIR/bin/python" --reinstall-package agent-zdd \
+        if ! _uv_pip_install_resilient "$zdd_dir" --python "$VENV_DIR/bin/python" --reinstall-package agent-zdd --refresh-package agent-zdd \
                 "$zdd_dir" --quiet; then
             _fail "zdd update failed"
             return 1
@@ -1552,7 +1937,7 @@ _update_core() {
     # single-instance-lease: force-reinstall so a local code change propagates.
     local sil_dir
     if sil_dir="$(_resolve_single_instance_lease)"; then
-        if ! uv pip install --python "$VENV_DIR/bin/python" --reinstall-package agent-single-instance-lease --refresh-package agent-single-instance-lease \
+        if ! _uv_pip_install_resilient "$sil_dir" --python "$VENV_DIR/bin/python" --reinstall-package agent-single-instance-lease --refresh-package agent-single-instance-lease \
                 "$sil_dir" --quiet; then
             _fail "single-instance-lease update failed"
             return 1
@@ -1566,7 +1951,7 @@ _update_core() {
     # config-migrate: force-reinstall so a local code change propagates.
     local cfg_migrate_dir
     if cfg_migrate_dir="$(_resolve_config_migrate)"; then
-        if ! uv pip install --python "$VENV_DIR/bin/python" --reinstall-package agent-config-migrate \
+        if ! _uv_pip_install_resilient "$cfg_migrate_dir" --python "$VENV_DIR/bin/python" --reinstall-package agent-config-migrate --refresh-package agent-config-migrate \
                 "$cfg_migrate_dir" --quiet; then
             _fail "config-migrate update failed"
             return 1
@@ -1577,7 +1962,20 @@ _update_core() {
         _fail "Cannot locate config-migrate library. Reinstall the agent-bridge plugin from the marketplace (copilot plugin install agent-bridge@copilot-extensions), then rerun this installer."
         return 1
     fi
-    if ! uv pip install --python "$VENV_DIR/bin/python" --reinstall-package agent-bridge \
+    # --refresh-package agent-procutil / agent-plugin-resolve /
+    # agent-dropin-registry / agent-plugin-activation / agent-remote-login-shell:
+    # see the matching
+    # comment in the initial-install path above -- none has a dedicated
+    # install call, all are only ever resolved transitively here, and
+    # agent-procutil was directly implicated in a live LAUNCH_ACP "session
+    # host exited early" incident (#2863's sibling defect class) caused by
+    # exactly this gap.
+    if ! _uv_pip_install_resilient "" --python "$VENV_DIR/bin/python" --reinstall-package agent-bridge --refresh-package agent-bridge \
+            --reinstall-package agent-procutil --refresh-package agent-procutil \
+            --reinstall-package agent-plugin-resolve --refresh-package agent-plugin-resolve \
+            --reinstall-package agent-dropin-registry --refresh-package agent-dropin-registry \
+            --reinstall-package agent-plugin-activation --refresh-package agent-plugin-activation \
+            --reinstall-package agent-remote-login-shell --refresh-package agent-remote-login-shell \
             "$PLUGIN_DIR" --quiet; then
         _fail "Package update failed"
         return 1
@@ -1620,9 +2018,34 @@ do_update() {
         return 0
     fi
 
+    local active_forward=false
+    if _active_is_forward; then
+        active_forward=true
+        _step "Forwarded host bridge route detected -- updating runtime files without draining/stopping/starting a local daemon"
+    fi
+
+    # Mark the live-service update lifecycle as in-progress (ce#5066) so a
+    # local liveness watchdog never force-restarts a daemon that is
+    # legitimately, briefly down for drain/stop/stage/start or a zero-downtime
+    # cutover -- ONLY when a local daemon transition can actually happen.
+    # The forwarded-route branch above never drains/stops/starts anything
+    # local, so marking it would advertise a live transition where none
+    # occurs. The EXIT trap covers every path below uniformly -- success,
+    # a cutover-then-fallback, a failed update's rollback, or an unhandled
+    # error under `set -euo pipefail`.
+    if [[ "$active_forward" != true ]]; then
+        _write_update_marker
+        trap _clear_update_marker EXIT
+    fi
+
+    local predecessor_signature=""
+    if [[ "$active_forward" != true ]]; then
+        predecessor_signature="$(_active_signature 2>/dev/null || true)"
+    fi
+
     # Is the service currently running?
     local was_running=false
-    if pid=$(_get_pid) || (command -v systemctl &>/dev/null && systemctl --user is-active "$SYSTEMD_UNIT" &>/dev/null); then
+    if [[ "$active_forward" != true ]] && { pid=$(_get_pid) || (command -v systemctl &>/dev/null && systemctl --user is-active "$SYSTEMD_UNIT" &>/dev/null); }; then
         was_running=true
     fi
 
@@ -1663,7 +2086,7 @@ do_update() {
     # longer needs the (new) venv to pre-exist -- gate only on "running".
     local cutover=false
     if [[ "$VERSIONED_RUNTIME" == 1 ]]; then
-        if [[ "$was_running" == true ]]; then
+        if [[ "$was_running" == true && "$active_forward" != true ]]; then
             cutover=true
             # Cutover onto the same slot is impossible; downgrade to stop-and-rebuild.
             if [[ "$SRC_VERSION" == "$prev_version" ]]; then
@@ -1671,7 +2094,7 @@ do_update() {
                 cutover=false
             fi
         fi
-    elif [[ "$was_running" == true && -x "$VENV_DIR/bin/agent-bridge" ]]; then
+    elif [[ "$was_running" == true && "$active_forward" != true && -x "$VENV_DIR/bin/agent-bridge" ]]; then
         cutover=true
     fi
 
@@ -1679,8 +2102,9 @@ do_update() {
     # doing a cutover (which keeps the old daemon up and retires it afterward).
     # Either way, drain first so in-flight turns get a chance to settle.
     if [[ "$was_running" == true && "$cutover" == false ]]; then
-        _drain_service "${AGENT_BRIDGE_DRAIN_TIMEOUT:-120}"
-        do_stop
+        if ! _update_lifecycle_drain_stop "$predecessor_signature" "${AGENT_BRIDGE_DRAIN_TIMEOUT:-120}"; then
+            was_running=false
+        fi
     fi
 
     # Run the protected update; on any failure, roll back to the snapshot.
@@ -1694,9 +2118,8 @@ do_update() {
             if [[ -n "$SRC_VERSION" && "$SRC_VERSION" != "$prev_version" ]]; then
                 rm -rf "$INSTALL_DIR/versions/$SRC_VERSION"
             fi
-            if [[ "$was_running" == true && "$cutover" == false ]]; then
-                _step "Restarting the previous version..."
-                do_start
+            if [[ "$was_running" == true && "$cutover" == false && "$active_forward" != true ]]; then
+                _update_lifecycle_start "$predecessor_signature" "Restarting the previous version..." || was_running=false
             fi
             _warn "Update failed; kept the previous runtime (venv -> versions/${prev_version:-<previous>})."
         elif [[ "$have_backup" == true ]]; then
@@ -1705,9 +2128,8 @@ do_update() {
                 _ok "Previous venv restored"
                 # Only restart in the default path -- in cutover mode the old
                 # daemon was never stopped, so it is still serving.
-                if [[ "$was_running" == true && "$cutover" == false ]]; then
-                    _step "Restarting the previous service..."
-                    do_start
+                if [[ "$was_running" == true && "$cutover" == false && "$active_forward" != true ]]; then
+                    _update_lifecycle_start "$predecessor_signature" "Restarting the previous service..." || was_running=false
                 fi
             else
                 _fail "Rollback failed -- run install.sh install to rebuild the runtime"
@@ -1742,20 +2164,21 @@ do_update() {
     _write_deploy_manifest
 
     # Bring the new version into service, via the resolved slot interpreter.
-    if [[ "$cutover" == true ]]; then
+    if [[ "$active_forward" == true ]]; then
+        _step "Forwarded host bridge route still active -- not starting a local daemon"
+    elif [[ "$cutover" == true ]]; then
         _step "Zero-downtime cutover (agent-bridge deploy)..."
         if _bridge_cli deploy \
                 --drain-timeout "${AGENT_BRIDGE_DRAIN_TIMEOUT:-300}"; then
             _ok "Cutover complete -- new daemon active, old retired"
         else
             _warn "Cutover failed -- falling back to drain/stop/start"
-            _drain_service 30
-            do_stop
-            do_start
+            if _update_lifecycle_drain_stop "$predecessor_signature" 30; then
+                _update_lifecycle_start "$predecessor_signature" "Starting service..." || true
+            fi
         fi
     else
-        _step "Starting service..."
-        do_start
+        _update_lifecycle_start "$predecessor_signature" "Starting service..." || true
     fi
 
     # Versioned layout: prune old version slots now that the new one is healthy

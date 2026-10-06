@@ -59,7 +59,7 @@ class ModelProfile:
     systemd_unit: str | None = None
     # How the indexer brings this model's engine up when it isn't already
     # reachable:
-    #   "subprocess" -- spawn ``python -m agent_index.engine.app`` as a detached
+    #   "subprocess" -- spawn ``python -m agent_index_engine.app`` as a detached
     #                   child process (needs torch in the service venv),
     #   "systemd"    -- start a systemd unit (Linux system deployments),
     #   "external"   -- never manage it; a durable, externally-owned daemon owns
@@ -156,6 +156,31 @@ def _default_indexer_nice() -> int:
         return 10
 
 
+def _default_engine_nice() -> int:
+    """POSIX nice increment for the embedding engine daemon (host good citizen).
+
+    The index-worker's own ``indexer_nice`` throttle (above) does not touch the
+    separate, durable embedding-engine process: on a CPU-only host, that engine
+    is the actual CPU-bound consumer during a large reindex (continuous model
+    inference), and an un-niced engine can starve unrelated lightweight host
+    activity even though the worker that triggered the work is already niced
+    down (observed in production: a plain CLI status check took 50+ seconds,
+    and once, 30+ minutes, under a concurrent full reindex on a CPU device).
+
+    ``AGENT_INDEX_ENGINE_NICE`` (default 5 -- gentler than the worker's 10,
+    since this process ALSO serves live interactive search embeddings, not
+    only background reindexing) is the POSIX nice increment the engine applies
+    to itself at startup, before loading any model. 0 (or a negative value)
+    disables the throttle. Like ``indexer_nice``, this only bites under actual
+    CPU contention -- an idle box runs the engine at full speed regardless.
+    """
+    try:
+        return int(os.environ.get("AGENT_INDEX_ENGINE_NICE", "5"))
+    except ValueError:
+        return 5
+
+
+
 def _default_stream_batch_size() -> int:
     """Chunks per embed+store batch, capability-aware (#115).
 
@@ -181,6 +206,48 @@ def _default_stream_batch_size() -> int:
     return 500 if device.startswith("cuda") else 64
 
 
+def _default_backup_dir() -> Path:
+    override = os.environ.get("AGENT_INDEX_BACKUP_DIR")
+    if override:
+        return Path(override).expanduser()
+    _default_home = "~/.agent-index"  # marketplace-isolation: allow legacy-compatibility
+    install_root = Path(
+        os.environ.get("AGENT_INDEX_HOME", _default_home)
+    ).expanduser()
+    return install_root / "backups"
+
+
+def _default_data_dir() -> Path:
+    """Durable data directory for index state and task queues.
+
+    Precedence: ``AGENT_INDEX_DATA_DIR`` / ``AGENT_INDEX_STATE_DIR`` (explicit,
+    most specific overrides) -- then ``AGENT_INDEX_HOME`` (the overall runtime
+    root override, same variable every OTHER sibling default in this module
+    honors: see ``_default_backup_dir`` above and ``agent_index.config``'s own
+    ``data_dir()``/``install_dir()``) -- then the hardcoded default. Before this
+    fix, this default_factory skipped ``AGENT_INDEX_HOME`` entirely and went
+    straight to the hardcoded path, silently ignoring it where every other
+    "where does agent-index keep its stuff" resolver in this package DOES
+    honor it. That's not just a latent inconsistency: it means setting
+    ``AGENT_INDEX_HOME`` to relocate the whole data store (a documented,
+    reasonable use -- e.g. in a test, or to point at a different drive) had NO
+    EFFECT on any code path using ``IndexConfig().data_dir`` (which is most of
+    the indexing/task-queue code), while still correctly redirecting backups
+    and the corpus-config home -- a correctness gap with real operational
+    impact, confirmed to have silently pointed test-isolated task-queue writes
+    at the REAL production data directory instead of a test's intended
+    sandbox.
+    """
+    override = os.environ.get("AGENT_INDEX_DATA_DIR") or os.environ.get(
+        "AGENT_INDEX_STATE_DIR"
+    )
+    if override:
+        return Path(override).expanduser()
+    _default_home = "~/.agent-index"  # marketplace-isolation: allow legacy-compatibility
+    home = Path(os.environ.get("AGENT_INDEX_HOME", _default_home)).expanduser()
+    return home / "data"
+
+
 # -- Main config -------------------------------------------------------------
 
 
@@ -189,11 +256,7 @@ class IndexConfig:
     """Immutable configuration for the agent-index core."""
 
     # Paths
-    data_dir: Path = field(
-        default_factory=lambda: Path(
-            os.environ.get("AGENT_INDEX_DATA_DIR", "~/.agent-index/data")
-        ).expanduser()
-    )
+    data_dir: Path = field(default_factory=_default_data_dir)
 
     # Primary embedding model (single-model compatibility; use model_profiles
     # for multi-model indexing).
@@ -266,16 +329,20 @@ class IndexConfig:
     # fresh worker subprocess), not bound once at import.
     indexer_nice: int = field(default_factory=_default_indexer_nice)
 
+    # Same host politeness, for the separate embedding-ENGINE daemon (see
+    # _default_engine_nice docstring) -- the actual CPU-bound consumer on a
+    # CPU-only device during a large reindex, not covered by indexer_nice.
+    engine_nice: int = field(default_factory=_default_engine_nice)
+
     # Engine subprocess defaults.
     host: str = os.environ.get("AGENT_INDEX_HOST", "127.0.0.1")
     port: int = int(os.environ.get("AGENT_INDEX_PORT", "8420"))
 
     # Optional backup target for fast recovery snapshots.
     backup_dir: Path = field(
-        default_factory=lambda: Path(
-            os.environ.get("AGENT_INDEX_BACKUP_DIR", "~/.agent-index/backups")
-        ).expanduser()
+        default_factory=_default_backup_dir
     )
+
 
     @property
     def lance_dir(self) -> Path:

@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 from .base import ProviderError, PRScope, PullResult, run_cli
 
 if TYPE_CHECKING:
-    from ..pr_contract import PRSnapshot, ThreadsResult
+    from ..pr_contract import PRDiff, PRSnapshot, ThreadsResult
 
 #: Canonical consent marker Azure DevOps emits in a snapshot's ``labels`` when
 #: the PR has native auto-complete set. A repo on this provider binds
@@ -75,6 +75,9 @@ class AzureDevOpsProvider:
     """Open + query pull requests on Azure DevOps via the ``az`` CLI."""
 
     name = "azure-devops"
+
+    def authority_endpoint(self, api_base: str = "") -> str:
+        return (api_base or "").rstrip("/")
 
     def _env(self, token: str | None) -> dict[str, str]:
         return {"AZURE_DEVOPS_EXT_PAT": token} if token else {}
@@ -154,12 +157,75 @@ class AzureDevOpsProvider:
         status = str(data.get("status", "active")).lower()
         merged = (status == "completed")
         state = {"completed": "merged", "abandoned": "closed"}.get(status, "open")
+        merge_source = data.get("lastMergeSourceCommit")
+        head_sha = (
+            str(merge_source.get("commitId", "") or "")
+            if isinstance(merge_source, dict) else ""
+        )
         return PullResult(
             url=self._web_url(api_base, project, name, number),
             number=number,
             state=state,
             merged=merged,
+            head_sha=head_sha,
         )
+
+    def observe_head(
+        self, repo: str, number: int, *, api_base: str = "", token: str | None = None
+    ) -> PullResult:
+        """Azure DevOps has no server-clock head observation implementation.
+
+        Unlike GitHub's HTTP ``Date`` header or Gitea's server timestamp,
+        there is no authoritative provider-clock value to attach here --
+        returning ``get_pull()``'s result without one would silently violate
+        the ``observe_head`` contract (``observed_at`` required) that generic
+        callers such as ``pr_ops.py``'s post-push observation rely on to
+        confirm a live read. Stay explicitly unsupported; merged-head repair
+        instead uses ``get_pull()``'s own ``head_sha`` directly (see
+        ``finalize_open_pr_gate.py``).
+        """
+        _ = (repo, number, api_base, token)
+        raise ProviderError(
+            "Azure DevOps does not support authoritative PR-head observation."
+        )
+
+    def publish_source_marker(
+        self,
+        repo: str,
+        number: int,
+        marker: str,
+        *,
+        api_base: str = "",
+        token: str | None = None,
+    ) -> str:
+        if not api_base:
+            return "Azure DevOps provider needs the org URL (api_base)."
+        auth_header, auth_error = self._auth_header(token)
+        if auth_error:
+            return auth_error
+        status, response = self._rest_call(
+            "POST",
+            f"{self._rest_base(api_base, repo, number)}/threads?api-version=7.1",
+            auth_header,
+            json.dumps(
+                {
+                    "comments": [
+                        {
+                            "parentCommentId": 0,
+                            "content": marker,
+                            "commentType": 1,
+                        }
+                    ],
+                    "status": 1,
+                }
+            ),
+        )
+        if status not in (200, 201):
+            return (
+                f"Azure DevOps PR #{number} source comment failed "
+                f"(HTTP {status}): {response[:300]}"
+            )
+        return ""
 
     def remove_label(
         self, repo: str, number: int, label: str, *, api_base: str = "",
@@ -250,6 +316,7 @@ class AzureDevOpsProvider:
             merged=merged,
             head_sha=head_sha,
             base_ref=base_ref,
+            updated_at=str(data.get("closedDate", "") or ""),
             reviews=self._reviews_from_show(data),
             author=author,
             mergeable=mergeable,
@@ -335,19 +402,43 @@ class AzureDevOpsProvider:
     def merge_pull(
         self, repo: str, number: int, *, squash: bool = True, admin: bool = False,
         api_base: str = "", token: str | None = None,
+        delete_source_branch: bool = True, expected_head_sha: str = "",
     ) -> str:
         """Not implemented: direct merge (pr-merge --now) is GitHub-only today."""
         from .base import _unsupported_merge
-        _ = (repo, number, squash, admin, api_base, token)
+        _ = (repo, number, squash, admin, api_base, token, delete_source_branch,
+             expected_head_sha)
         return _unsupported_merge(self.name)
+
+    def close_pull(
+        self, repo: str, number: int, *, api_base: str = "", token: str | None = None,
+        comment: str = "",
+    ) -> str:
+        """Not implemented: pr-abandon is GitHub-only today (tracked follow-up:
+        Azure DevOps PRs have a native ``abandoned`` status that fits this
+        primitive well -- see the `pr-abandon-flow` effort's Phase 2 note)."""
+        from .base import _unsupported_close
+        _ = (repo, number, api_base, token, comment)
+        return _unsupported_close(self.name)
+
+    def request_review(
+        self, repo: str, number: int, *, reviewer: str = "", api_base: str = "",
+        token: str | None = None,
+    ):
+        """Not implemented: no automated PR-reviewer bot mapped for ADO today."""
+        from .base import _unsupported_review_request
+        _ = (repo, number, api_base, token)
+        return _unsupported_review_request(self.name, reviewer)
 
     def enable_auto_merge(
         self, repo: str, number: int, *, squash: bool = True,
         api_base: str = "", token: str | None = None,
+        delete_source_branch: bool = True, expected_head_sha: str = "",
     ) -> str:
         """Not implemented: ADO uses native auto-complete via request_auto_complete."""
         from .base import _unsupported_auto_merge
-        _ = (repo, number, squash, api_base, token)
+        _ = (repo, number, squash, api_base, token, delete_source_branch,
+             expected_head_sha)
         return _unsupported_auto_merge(self.name)
 
     def get_repo_policy(
@@ -365,6 +456,20 @@ class AzureDevOpsProvider:
     ) -> bool | None:
         """Not implemented: the zombie-PR containment probe is Gitea-only today."""
         _ = (repo, base, head_sha, api_base, token)
+        return None
+
+    def ensure_fork(
+        self, repo: str, *, api_base: str = "", token: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Not implemented: fork-mode publishing is GitHub-only today."""
+        _ = (repo, api_base, token)
+        return None
+
+    def resolve_fork_owner(
+        self, *, api_base: str = "", token: str | None = None,
+    ) -> str | None:
+        """Not implemented: fork-mode publishing is GitHub-only today."""
+        _ = (api_base, token)
         return None
 
     def add_label(
@@ -410,6 +515,53 @@ class AzureDevOpsProvider:
         return tuple(
             int(p["pullRequestId"]) for p in data
             if isinstance(p, dict) and p.get("pullRequestId") is not None
+        )
+
+    def find_pull_by_head(
+        self, repo: str, head: str, *, api_base: str = "", token: str | None = None
+    ) -> PullResult | None:
+        """Resolve a PR by its source branch across every status (#2146).
+
+        Heals a tracked record whose active PR has no ``number``. ``az repos
+        pr list --source-branch`` filters server-side by the exact ref;
+        ``--status all`` covers active/completed/abandoned so a since-merged
+        PR heals too. Returns ``None`` when nothing matches.
+        """
+        if not api_base:
+            raise ProviderError("Azure DevOps provider needs the org URL (api_base).")
+        project, name = self._split_repo(repo)
+        proc = run_cli(
+            [
+                "az", "repos", "pr", "list",
+                "--organization", api_base,
+                "--project", project,
+                "--repository", name,
+                "--source-branch", head,
+                "--status", "all",
+                "--output", "json",
+            ],
+            env=self._env(token),
+        )
+        if proc.returncode != 0:
+            raise ProviderError(
+                f"az repos pr list --source-branch {head} failed for {repo}: "
+                f"{proc.stderr.strip()}"
+            )
+        try:
+            data = json.loads(proc.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            raise ProviderError(f"az returned non-JSON PR list: {exc}") from exc
+        if not isinstance(data, list) or not data:
+            return None
+        p = data[0]
+        status = str(p.get("status", "active")).lower()
+        merged = (status == "completed")
+        state = {"completed": "merged", "abandoned": "closed"}.get(status, "open")
+        return PullResult(
+            url=self._web_url(api_base, project, name, int(p["pullRequestId"])),
+            number=int(p["pullRequestId"]),
+            state=state,
+            merged=merged,
         )
 
     # ── First-class comment threads (ADO REST; AAD bearer or PAT Basic) ────
@@ -552,3 +704,101 @@ class AzureDevOpsProvider:
             if status not in (200, 201):
                 errors.append(f"#{tid}: HTTP {status} {body[:120]}")
         return "; ".join(errors)
+
+    def get_diff(
+        self, repo: str, number: int, *, api_base: str = "", token: str | None = None
+    ) -> "PRDiff":
+        """Azure DevOps has no single REST/CLI call that returns a unified
+        diff text (it exposes structured per-iteration ``changes``, not a
+        patch-format body) -- stay explicitly unsupported, matching other
+        structurally-unavailable reads on this provider (e.g.
+        :meth:`observe_head`)."""
+        from ..pr_contract import PRDiff
+
+        _ = (repo, number, api_base, token)
+        return PRDiff(
+            supported=False,
+            error="Azure DevOps does not expose a unified-diff read "
+                  "(only structured per-iteration changes).",
+        )
+
+    def post_comment(
+        self, repo: str, number: int, body: str, *, api_base: str = "",
+        token: str | None = None,
+    ) -> str:
+        """Post a general PR comment as a new (status-1 "active") thread."""
+        if not api_base:
+            return "Azure DevOps provider needs the org URL (api_base)."
+        auth_header, auth_error = self._auth_header(token)
+        if auth_error:
+            return auth_error
+        status, response = self._rest_call(
+            "POST",
+            f"{self._rest_base(api_base, repo, number)}/threads?api-version=7.1",
+            auth_header,
+            json.dumps(
+                {
+                    "comments": [
+                        {"parentCommentId": 0, "content": body, "commentType": 1}
+                    ],
+                    "status": 1,
+                }
+            ),
+        )
+        if status not in (200, 201):
+            return (
+                f"Azure DevOps PR #{number} comment failed "
+                f"(HTTP {status}): {response[:300]}"
+            )
+        return ""
+
+    #: Canonical event -> ``az repos pr set-vote --vote`` value. ADO's vote
+    #: model has no "comment only, no verdict" vote -- ``COMMENTED`` posts the
+    #: body as a plain comment and casts no vote at all, same as a reviewer who
+    #: leaves feedback without approving or blocking.
+    _REVIEW_EVENT_VOTE = {
+        "APPROVED": "approve",
+        "CHANGES_REQUESTED": "reject",
+    }
+
+    def submit_review(
+        self, repo: str, number: int, *, event: str, body: str = "",
+        api_base: str = "", token: str | None = None,
+    ) -> str:
+        """Publish a review verdict: ``az repos pr set-vote`` for the vote
+        (``APPROVED``/``CHANGES_REQUESTED``), plus ``body`` as a comment
+        thread when given (ADO votes carry no free text of their own).
+        ``COMMENTED`` casts no vote -- it only posts ``body``.
+        """
+        canonical = event.upper()
+        if canonical not in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
+            return (
+                f"azure-devops: unknown review event {event!r} (expected one "
+                "of 'APPROVED', 'CHANGES_REQUESTED', 'COMMENTED')."
+            )
+        if body:
+            comment_err = self.post_comment(
+                repo, number, body, api_base=api_base, token=token
+            )
+            if comment_err:
+                return comment_err
+        vote = self._REVIEW_EVENT_VOTE.get(canonical)
+        if vote is None:
+            return ""  # COMMENTED: body (if any) already posted; no vote to cast.
+        if not api_base:
+            return "Azure DevOps provider needs the org URL (api_base)."
+        proc = run_cli(
+            [
+                "az", "repos", "pr", "set-vote",
+                "--organization", api_base,
+                "--id", str(number),
+                "--vote", vote,
+            ],
+            env=self._env(token),
+        )
+        if proc.returncode != 0:
+            return (
+                f"az repos pr set-vote failed for {repo}#{number}: "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        return ""

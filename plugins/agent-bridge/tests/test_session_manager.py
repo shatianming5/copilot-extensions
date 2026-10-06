@@ -3,22 +3,33 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
+import os
+import signal
+import subprocess
+import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent_bridge.connect import ConnectTracker
 from agent_bridge.db import Database
 from agent_bridge.events import EventLog
 from agent_bridge.models import SessionStatus
 from agent_bridge.protocol import FAILED_ACP_HANDSHAKE_FAULT
+from agent_bridge.routes.sessions import _session_info
 from agent_bridge.session_host.host_index import HostRecord
+from agent_bridge.session_host.endpoints import CredentialRelayReadinessError
 from agent_bridge.session_manager import (
     _STALL_AFTER_S,
     RemoteHostRecoveryPendingError,
     Session,
     SessionManager,
+    _container_remote_child_argv,
     _default_cwd,
     _venue_workspace_cwd,
 )
@@ -38,6 +49,64 @@ def test_venue_workspace_cwd():
     assert _venue_workspace_cwd(
         SpawnTarget(type="command", venue={"workspace_folder": "  "})
     ) is None
+
+
+def test_running_session_projects_at_rest_from_terminal_event_tail() -> None:
+    session = Session(
+        "sid",
+        "name",
+        SpawnTarget(type="local", cwd="/tmp/x"),
+    )
+    session.status = SessionStatus.RUNNING
+    session.event_log = EventLog()
+    session.event_log.append("user_message", {"content": "work"})
+    assert session.is_at_rest() is False
+    session.event_log.append("turn_complete", {"stop_reason": "end_turn"})
+    assert session.is_at_rest() is True
+    info = _session_info(session)
+    assert info.status == SessionStatus.IDLE
+    assert info.at_rest is True
+    assert info.liveness is None
+    session.event_log.append("user_message", {"content": "more work"})
+    assert session.is_at_rest() is False
+    info = _session_info(session)
+    assert info.status == SessionStatus.RUNNING
+    assert info.at_rest is False
+
+
+def test_active_tool_prevents_at_rest_projection() -> None:
+    session = Session(
+        "sid",
+        "name",
+        SpawnTarget(type="local", cwd="/tmp/x"),
+    )
+    session.status = SessionStatus.RUNNING
+    session.event_log = EventLog()
+    session.event_log.append("turn_complete", {"stop_reason": "end_turn"})
+    session.event_log.append(
+        "tool_call_start", {"tool_call_id": "tool-1", "name": "shell"}
+    )
+    assert session.is_at_rest() is False
+
+
+def test_nested_tool_does_not_prevent_at_rest_projection() -> None:
+    session = Session(
+        "sid",
+        "name",
+        SpawnTarget(type="local", cwd="/tmp/x"),
+    )
+    session.status = SessionStatus.RUNNING
+    session.event_log = EventLog()
+    session.event_log.append("turn_complete", {"stop_reason": "end_turn"})
+    session.event_log.append(
+        "tool_call_start",
+        {
+            "tool_call_id": "tool-1",
+            "name": "nested",
+            "agent_id": "sub-1",
+        },
+    )
+    assert session.is_at_rest() is True
 
 
 def _mock_agent_proc():
@@ -221,6 +290,250 @@ class TestStartSession:
 
             session = await session_manager.start_session(spawn_target)
             assert session.status == SessionStatus.FAILED
+            assert any(
+                event.event == "session_state_changed"
+                and event.data["status"] == SessionStatus.FAILED.value
+                for event in session.event_log.get_events()
+            )
+
+
+class TestLocalCacheRefreshWiring:
+    """local-cache-delivery-primacy Phase 2: a ``target.type == "local"``
+    spawn refreshes this worktree's gitignored ``*.local.instructions.md``
+    siblings before the Copilot CLI process is launched -- the one
+    remaining local-spawn path ``agent_worktrees``' own create/resume/
+    ``sessionStart`` refresh doesn't already cover. See
+    ``local_cache_refresh.py`` and ``efforts/active/local-cache-delivery-
+    primacy`` Phase 2's Plan.
+
+    The refresh call lives inside ``_connect_via_session_host`` itself
+    (``session_host_connection.py``), right after ``resolve_local_launch``
+    resolves the authoritative ``work_dir`` -- NOT at ``start_session``'s
+    own ``target.type == "local"`` entry, where a project-backed target's
+    real directory isn't known yet. These tests therefore drive the real
+    Session-Host-mode path end to end (a real
+    ``LocalSpawner`` + a tiny fake ACP agent subprocess, matching
+    ``test_session_host.py``'s own established pattern for this exact
+    boundary) rather than the lighter ``_connect_via_session_host``-stub
+    fixture other ``TestStartSession`` tests use, since that stub would
+    skip the very code path under test here."""
+
+    _FAKE_AGENT_SRC = (
+        "import asyncio, acp\n"
+        "from acp.schema import InitializeResponse, NewSessionResponse, "
+        "AgentCapabilities\n"
+        "class Agent:\n"
+        "    async def initialize(self, protocol_version, **kw):\n"
+        "        return InitializeResponse(protocol_version=protocol_version, "
+        "agent_capabilities=AgentCapabilities())\n"
+        "    async def new_session(self, cwd, **kw):\n"
+        "        return NewSessionResponse(session_id='host-mode-sess')\n"
+        "    def __getattr__(self, name):\n"
+        "        if name.startswith('_') or name == 'on_connect':\n"
+        "            raise AttributeError(name)\n"
+        "        async def _noop(*a, **k):\n"
+        "            return None\n"
+        "        return _noop\n"
+        "asyncio.run(acp.run_agent(Agent()))\n"
+    )
+
+    def _fake_agent_argv(self, tmp_path: Path) -> list[str]:
+        agent_script = tmp_path / "fake_agent.py"
+        agent_script.write_text(self._FAKE_AGENT_SRC)
+        return [sys.executable, str(agent_script)]
+
+    async def _kill(self, mgr, session) -> None:
+        """Reap both the host and the real child process the Session-Host
+        machinery spawns -- captured BEFORE ``shutdown()``, which
+        deliberately detaches in host mode (leaving both processes alive)
+        rather than reaping them; reading ``session.pid`` afterward
+        always returns ``None`` (``Session.pid`` is only populated while
+        ``client.is_running``), so a naive post-shutdown read is a no-op
+        that leaks a detached host/agent pair on every successful test."""
+        host_pid: int | None = None
+        child_pid: int | None = None
+        with contextlib.suppress(Exception):
+            if mgr._host_index is not None:
+                records = mgr._host_index.all()
+                if records:
+                    host_pid, child_pid = records[0].host_pid, records[0].child_pid
+        with contextlib.suppress(Exception):
+            await session.client.shutdown()
+        for pid in (host_pid, child_pid):
+            if not pid:
+                continue
+            with contextlib.suppress(Exception):
+                if sys.platform == "win32":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                else:
+                    os.kill(pid, signal.SIGKILL)
+
+    @pytest.mark.asyncio
+    async def test_direct_cwd_target_refreshes_using_that_directory(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        fake_argv = self._fake_agent_argv(tmp_path)
+
+        async def _fake_resolve(target, *, tracker=None, session_id=""):
+            return fake_argv, str(tmp_path), dict(os.environ)
+
+        monkeypatch.setattr(
+            "agent_bridge.transport.resolve_local_launch", _fake_resolve
+        )
+        mock_refresh = AsyncMock()
+        monkeypatch.setattr(
+            "agent_bridge.local_cache_refresh.refresh_local_cache", mock_refresh
+        )
+
+        db = Database(tmp_path / "s.db")
+        mgr = SessionManager(db, session_host_state_dir=str(tmp_path / "hosts"))
+        session = None
+        try:
+            session = await asyncio.wait_for(
+                mgr.start_session(SpawnTarget(type="local", cwd=str(tmp_path))),
+                timeout=30,
+            )
+            mock_refresh.assert_awaited_once_with(str(tmp_path))
+        finally:
+            if session is not None:
+                await self._kill(mgr, session)
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_project_backed_target_with_no_cwd_refreshes_the_resolved_worktree(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A project-backed target (``cwd=None``) has NO authoritative
+        directory until ``resolve_local_launch`` resolves one -- the
+        refresh must use that resolved ``work_dir``, never skip because
+        ``target.cwd`` was unset at ``start_session``'s own entry."""
+        resolved_dir = tmp_path / "resolved-worktree"
+        resolved_dir.mkdir()
+        fake_argv = self._fake_agent_argv(tmp_path)
+
+        async def _fake_resolve(target, *, tracker=None, session_id=""):
+            return fake_argv, str(resolved_dir), dict(os.environ)
+
+        monkeypatch.setattr(
+            "agent_bridge.transport.resolve_local_launch", _fake_resolve
+        )
+        mock_refresh = AsyncMock()
+        monkeypatch.setattr(
+            "agent_bridge.local_cache_refresh.refresh_local_cache", mock_refresh
+        )
+
+        db = Database(tmp_path / "s.db")
+        mgr = SessionManager(db, session_host_state_dir=str(tmp_path / "hosts"))
+        session = None
+        try:
+            session = await asyncio.wait_for(
+                mgr.start_session(
+                    SpawnTarget(type="local", project="some-project", cwd=None)
+                ),
+                timeout=30,
+            )
+            mock_refresh.assert_awaited_once_with(str(resolved_dir))
+        finally:
+            if session is not None:
+                await self._kill(mgr, session)
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_refresh_failure_never_fails_the_spawn(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """``refresh_local_cache`` is itself fully best-effort and never
+        raises in real use -- this proves the call site also doesn't
+        depend on that contract never being violated (defense in depth):
+        even a callee that raises must never fail the spawn."""
+        fake_argv = self._fake_agent_argv(tmp_path)
+
+        async def _fake_resolve(target, *, tracker=None, session_id=""):
+            return fake_argv, str(tmp_path), dict(os.environ)
+
+        monkeypatch.setattr(
+            "agent_bridge.transport.resolve_local_launch", _fake_resolve
+        )
+
+        async def _boom(*a, **k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            "agent_bridge.local_cache_refresh.refresh_local_cache", _boom
+        )
+
+        db = Database(tmp_path / "s.db")
+        mgr = SessionManager(db, session_host_state_dir=str(tmp_path / "hosts"))
+        session = None
+        try:
+            session = await asyncio.wait_for(
+                mgr.start_session(SpawnTarget(type="local", cwd=str(tmp_path))),
+                timeout=30,
+            )
+            assert session.status == SessionStatus.IDLE
+        finally:
+            if session is not None:
+                await self._kill(mgr, session)
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_remote_boundary_call_never_invokes_resolve_local_launch_or_refresh(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A remote-boundary call (``remote_child_argv`` set -- the
+        CodeSpace/mesh shape) has no local worktree to resolve at all
+        (see ``session_host_connection.py``'s own ``if remote_child_argv
+        is not None`` branch): it must never reach ``resolve_local_launch``
+        or the refresh, which this proves directly against the real
+        ``_connect_via_session_host`` method -- not inferred from the
+        ``if``/``else`` structure alone."""
+
+        async def _unexpected_resolve(*a, **k):
+            raise AssertionError(
+                "resolve_local_launch must never be called on the remote-"
+                "boundary branch"
+            )
+
+        monkeypatch.setattr(
+            "agent_bridge.transport.resolve_local_launch", _unexpected_resolve
+        )
+        mock_refresh = AsyncMock()
+        monkeypatch.setattr(
+            "agent_bridge.local_cache_refresh.refresh_local_cache", mock_refresh
+        )
+
+        class _SentinelStop(Exception):
+            pass
+
+        class _StubSpawner:
+            boundary = "codespace"
+
+            async def spawn(self, *a, **k):
+                raise _SentinelStop
+
+        db = Database(tmp_path / "s.db")
+        mgr = SessionManager(db, session_host_state_dir=str(tmp_path / "hosts"))
+        try:
+            from agent_bridge.connect import ConnectError
+
+            with pytest.raises(ConnectError) as excinfo:
+                await mgr._connect_via_session_host(
+                    SpawnTarget(type="command", cwd="/workspaces/repo"),
+                    tracker=ConnectTracker(lambda *a, **k: None, session_id="sid"),
+                    session_id="sid",
+                    on_acp_event=lambda *a, **k: None,
+                    permission_callback=None,
+                    spawner=_StubSpawner(),
+                    remote_child_argv=["codespace-agent"],
+                    remote_cwd="/workspaces/repo",
+                )
+            assert isinstance(excinfo.value.__cause__, _SentinelStop)
+        finally:
+            db.close()
+        mock_refresh.assert_not_awaited()
 
 
 class TestConcurrencyGuard:
@@ -626,7 +939,7 @@ async def test_codespace_handshake_failure_releases_claim(
     released = []
     monkeypatch.setattr(
         "agent_bridge.session_manager._claim_codespace",
-        lambda *_args: (True, ""),
+        lambda *_args, **_kwargs: ("ok", ""),
     )
     monkeypatch.setattr(
         "agent_bridge.session_manager._release_codespace_claim",
@@ -775,6 +1088,71 @@ async def test_container_state_probe_failure_retains_remote_authority(
     assert recovered == 0
     assert manager._host_index.removed == []
     assert session.session_id in manager._remote_recovery_inconclusive
+
+
+@pytest.mark.asyncio
+async def test_confirmed_absent_remote_host_drops_stale_authority(
+    tmp_db,
+    monkeypatch,
+) -> None:
+    """A confirmed-absent authority file must be pruned like a dead transport.
+
+    ``recover_record`` returning ``None`` means the far side confirmed the
+    authority file does not exist (not merely unreachable). A stale HostIndex
+    record must not survive that confirmation forever -- otherwise a genuinely
+    dead Host can never fall through to fresh-spawn recovery.
+    """
+
+    class FakeSpawner:
+        boundary = "container"
+
+        async def can_inspect_without_wake(self):
+            return True
+
+        async def recover_record(self, session_id):
+            return None
+
+    class FakeIndex:
+        def __init__(self):
+            self.removed = []
+            self.existing = SimpleNamespace(
+                extra={"remote_authority_v2": True},
+                resume_on_reattach=False,
+            )
+
+        def get(self, session_id):
+            return self.existing
+
+        def remove(self, session_id):
+            self.removed.append(session_id)
+
+        def register(self, record):
+            raise AssertionError("confirmed-absent record must not be registered")
+
+    monkeypatch.setattr(
+        "agent_bridge.session_host.container_transport."
+        "build_container_spawner",
+        lambda *args, **kwargs: FakeSpawner(),
+    )
+    manager = SessionManager(tmp_db)
+    manager._host_index = FakeIndex()
+    target = SpawnTarget(
+        type="command",
+        container={
+            "name": "odsp-web-1",
+            "ssh": {"host_alias": "agent-container-odsp-web-1-a1b2c3d4e5f6"},
+            "provider_command": ["agent-containers"],
+        },
+    )
+    session = Session("session-1", "container", target)
+    session.acp_session_id = "acp-1"
+    manager._sessions[session.session_id] = session
+
+    recovered = await manager._recover_remote_host_records(allow_wake=True)
+
+    assert recovered == 0
+    assert manager._host_index.removed == ["session-1"]
+    assert session.session_id not in manager._remote_recovery_inconclusive
 
 
 @pytest.mark.asyncio
@@ -1461,6 +1839,105 @@ async def test_end_with_recovered_live_host_deletes_after_confirmed_reap(
 
 
 @pytest.mark.asyncio
+async def test_end_session_codespace_boundary_awaits_confirmed_reap(
+    tmp_db,
+    monkeypatch,
+) -> None:
+    """A CodeSpace-boundary end_session must AWAIT and VERIFY the far-side
+    kill like the container-boundary path does -- not fire-and-forget it via
+    _reap_host_record's own _schedule_remote_reap, which never joins the
+    background task and can leave a real CodeSpace Session Host + child alive
+    if the caller (e.g. a short-lived test event loop) moves on first."""
+    target = SpawnTarget(type="codespace")
+    session = Session("session-1", "codespace", target)
+    session.status = SessionStatus.IDLE
+    manager = SessionManager(tmp_db)
+    manager._sessions[session.session_id] = session
+    tmp_db.create_session(
+        session_id=session.session_id,
+        name=session.name,
+        agent_name=None,
+        caller_id=None,
+        target_dir=None,
+        target_type="codespace",
+        status=SessionStatus.IDLE.value,
+        now=1,
+        target_json=target.to_json(),
+    )
+    manager._host_index.register(HostRecord(
+        session_id=session.session_id,
+        port=5000,
+        host_pid=300,
+        child_pid=123,
+        boundary="codespace",
+        endpoint={"kind": "codespace"},
+    ))
+
+    reap_called_with = []
+
+    async def confirmed_reap(rec, endpoint):
+        reap_called_with.append((rec.session_id, endpoint))
+        return True
+
+    monkeypatch.setattr(manager, "_remote_reap", confirmed_reap)
+
+    await manager.end_session(session.session_id, force=True)
+
+    # The real assertion: end_session awaited _remote_reap itself (not just
+    # scheduled it) -- it ran synchronously within this call, confirmed dead,
+    # and only then dropped the index record.
+    assert reap_called_with == [(session.session_id, {"kind": "codespace"})]
+    assert manager._host_index.get(session.session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_end_session_codespace_boundary_raises_on_inconclusive_reap(
+    tmp_db,
+    monkeypatch,
+) -> None:
+    """An inconclusive far-side kill must retain the session/index record and
+    surface RemoteHostRecoveryPendingError -- the same contract the
+    container-boundary path already gets -- rather than silently reporting
+    success while the real CodeSpace Session Host may still be alive."""
+    target = SpawnTarget(type="codespace")
+    session = Session("session-1", "codespace", target)
+    session.status = SessionStatus.IDLE
+    manager = SessionManager(tmp_db)
+    manager._sessions[session.session_id] = session
+    tmp_db.create_session(
+        session_id=session.session_id,
+        name=session.name,
+        agent_name=None,
+        caller_id=None,
+        target_dir=None,
+        target_type="codespace",
+        status=SessionStatus.IDLE.value,
+        now=1,
+        target_json=target.to_json(),
+    )
+    manager._host_index.register(HostRecord(
+        session_id=session.session_id,
+        port=5000,
+        host_pid=300,
+        child_pid=123,
+        boundary="codespace",
+        endpoint={"kind": "codespace"},
+    ))
+
+    monkeypatch.setattr(
+        manager,
+        "_remote_reap",
+        AsyncMock(return_value=False),
+    )
+
+    with pytest.raises(RemoteHostRecoveryPendingError, match="inconclusive"):
+        await manager.end_session(session.session_id, force=True)
+
+    assert session.status == SessionStatus.FAILED
+    assert manager._host_index.get(session.session_id) is not None
+
+
+@pytest.mark.asyncio
 async def test_container_recreate_post_removal_failure_marks_predecessor_failed(
     tmp_db,
     monkeypatch,
@@ -1774,6 +2251,149 @@ class TestRemoteForwardRelaySupervision:
         assert manager._relays["s1"] == [self._Relay.instances[-1]]
 
     @pytest.mark.asyncio
+    async def test_stopped_container_refreshes_relay_to_current_host_port(
+        self, tmp_db, tmp_path, monkeypatch,
+    ):
+        from agent_bridge import relay_state
+        from agent_bridge.session_host import endpoints as endpoints_mod
+
+        manager = SessionManager(
+            tmp_db, session_host_state_dir=str(tmp_path),
+        )
+        endpoint = self._endpoint(["9857:127.0.0.1:60000"])
+        endpoint["kind"] = "container"
+        rec = SimpleNamespace(
+            session_id="s1",
+            boundary="container",
+            endpoint=endpoint,
+        )
+        forward = self._Forward(None, 51000)
+        prior_relay = self._Relay(None, 9857)
+        prior_relay.is_alive = True
+        manager._forwards["s1"] = forward
+        manager._relays["s1"] = [prior_relay]
+
+        async def ready_probe():
+            return True
+
+        monkeypatch.setattr(relay_state, "get_live_relay_port", lambda: 62000)
+        monkeypatch.setattr(
+            endpoints_mod,
+            "endpoint_serving_probe_factory",
+            lambda _endpoint, fail_open=True: lambda _port: ready_probe,
+        )
+
+        await manager._ensure_forward(
+            rec,
+            refresh_relays=True,
+            require_relay_ready=True,
+        )
+
+        current = self._Relay.instances[-1]
+        assert prior_relay.stopped == 1
+        assert current is not prior_relay
+        assert current.kw["host_port_resolver"]() == 62000
+        assert current.started == 1
+        assert manager._relays["s1"] == [current]
+
+    @pytest.mark.asyncio
+    async def test_stopped_container_relay_failure_is_explicit(
+        self, tmp_db, tmp_path, monkeypatch,
+    ):
+        from agent_bridge.session_host import endpoints as endpoints_mod
+
+        manager = SessionManager(
+            tmp_db, session_host_state_dir=str(tmp_path),
+        )
+        endpoint = self._endpoint(["9857:127.0.0.1:60000"])
+        endpoint["kind"] = "container"
+        rec = SimpleNamespace(
+            session_id="s1",
+            boundary="container",
+            endpoint=endpoint,
+        )
+        prior_relay = self._Relay(None, 9857)
+        prior_relay.is_alive = True
+        manager._relays["s1"] = [prior_relay]
+
+        async def failed_start(_relay):
+            raise RuntimeError("reverse-forward failed")
+
+        monkeypatch.setattr(self._Relay, "start", failed_start)
+        monkeypatch.setattr(
+            endpoints_mod,
+            "endpoint_serving_probe_factory",
+            lambda _endpoint, fail_open=True: lambda _port: AsyncMock(
+                return_value=True
+            ),
+        )
+
+        with pytest.raises(
+            CredentialRelayReadinessError,
+            match="before stopped session",
+        ):
+            await manager._ensure_forward(
+                rec,
+                refresh_relays=True,
+                require_relay_ready=True,
+            )
+
+        assert prior_relay.stopped == 1
+        assert "s1" not in manager._relays
+
+    @pytest.mark.asyncio
+    async def test_stopped_container_missing_relay_declaration_is_explicit(
+        self, tmp_db, tmp_path,
+    ):
+        manager = SessionManager(
+            tmp_db, session_host_state_dir=str(tmp_path),
+        )
+        endpoint = self._endpoint()
+        endpoint["kind"] = "container"
+        rec = SimpleNamespace(
+            session_id="s1",
+            boundary="container",
+            endpoint=endpoint,
+        )
+
+        with pytest.raises(
+            CredentialRelayReadinessError,
+            match="no recoverable reverse-forward declaration",
+        ):
+            await manager._ensure_forward(
+                rec,
+                refresh_relays=True,
+                require_relay_ready=True,
+            )
+
+        assert "s1" not in manager._relays
+        assert self._Relay.instances == []
+
+    @pytest.mark.asyncio
+    async def test_stopped_container_relay_disabled_skips_readiness_gate(
+        self, tmp_db, tmp_path,
+    ):
+        manager = SessionManager(
+            tmp_db, session_host_state_dir=str(tmp_path),
+        )
+        endpoint = self._endpoint()
+        endpoint["kind"] = "container"
+        rec = SimpleNamespace(
+            session_id="s1",
+            boundary="container",
+            endpoint=endpoint,
+        )
+
+        await manager._ensure_forward(
+            rec,
+            refresh_relays=False,
+            require_relay_ready=False,
+        )
+
+        assert "s1" not in manager._relays
+        assert self._Relay.instances == []
+
+    @pytest.mark.asyncio
     async def test_drop_forward_stops_relay_and_l_forward(self, tmp_db, tmp_path):
         manager = SessionManager(
             tmp_db, session_host_state_dir=str(tmp_path),
@@ -1854,6 +2474,981 @@ async def test_startup_reattach_leaves_prior_idle_session_idle(
 
     assert await manager.reattach_session_hosts(remote_recovery_timeout=1.0) == 1
     assert attach.await_args.kwargs["send_resume"] is False
+
+
+@pytest.mark.asyncio
+async def test_startup_reattach_skips_session_with_inflight_lifecycle_op(
+    tmp_db, tmp_path, monkeypatch,
+) -> None:
+    """The startup reattach pass must not race a concurrent resume_session().
+
+    resume_session() holds `session._lifecycle_lock` for its whole
+    reattach-or-respawn decision. If the background startup reattach pass
+    (reattach_session_hosts) drove the same session concurrently, both paths
+    could read/recover the same far-side authority and establish competing
+    forwards. When the lock is already held, the startup pass must skip that
+    session for this pass (leaving it to the in-flight operation) instead of
+    calling `_reattach_one` for it.
+    """
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    session = Session("session-1", "agent", SpawnTarget(type="local", cwd=str(tmp_path)))
+    session.status = SessionStatus.STOPPED
+    session.acp_session_id = "acp-1"
+    manager._sessions[session.session_id] = session
+    rec = SimpleNamespace(
+        session_id=session.session_id,
+        protocol_version=1,
+        host_version="test",
+        host_pid=123,
+        child_pid=456,
+        created_at=time.time(),
+        resume_on_reattach=False,
+        boundary="local",
+    )
+    attach = AsyncMock(return_value=True)
+    monkeypatch.setattr(manager, "_recover_remote_host_records", AsyncMock(return_value=0))
+    monkeypatch.setattr(manager, "_prune_dead_hosts", lambda: None)
+    monkeypatch.setattr(manager, "_live_host_records", lambda: [rec])
+    monkeypatch.setattr(manager, "_rec_child_alive", lambda _rec: True)
+    monkeypatch.setattr(manager, "_reattach_one", attach)
+
+    await session._lifecycle_lock.acquire()
+    try:
+        assert await manager.reattach_session_hosts(remote_recovery_timeout=1.0) == 0
+    finally:
+        session._lifecycle_lock.release()
+
+    attach.assert_not_awaited()
+    assert session.session_id in manager._remote_recovery_inconclusive
+
+
+@pytest.mark.asyncio
+async def test_explicit_stop_stays_dormant_until_explicit_resume(
+    tmp_db, tmp_path, monkeypatch,
+) -> None:
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    target = SpawnTarget(type="local", cwd=str(tmp_path))
+    session = Session("session-1", "agent", target)
+    session.status = SessionStatus.IDLE
+    session.acp_session_id = "acp-1"
+    manager._sessions[session.session_id] = session
+    now = time.time()
+    tmp_db.create_session(
+        session_id=session.session_id,
+        name=session.name,
+        agent_name=session.agent_name,
+        caller_id=session.caller_id,
+        target_dir=target.cwd,
+        target_type=target.type,
+        status=SessionStatus.IDLE.value,
+        now=now,
+        target_json=target.to_json(),
+    )
+    tmp_db.update_session_acp_id(session.session_id, session.acp_session_id)
+
+    await manager.stop_session(session.session_id)
+    assert tmp_db.get_session(session.session_id)["background_recovery_enabled"] == 0
+
+    restarted = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    reattach = AsyncMock(return_value=True)
+    rec = SimpleNamespace(
+        session_id=session.session_id,
+        protocol_version=1,
+        host_version="test",
+        host_pid=123,
+        child_pid=456,
+        created_at=time.time(),
+        resume_on_reattach=False,
+        boundary="local",
+    )
+    monkeypatch.setattr(restarted, "_prune_dead_hosts", lambda: None)
+    monkeypatch.setattr(restarted, "_live_host_records", lambda: [rec])
+    monkeypatch.setattr(restarted, "_rec_child_alive", lambda _rec: True)
+    monkeypatch.setattr(restarted, "_reattach_one", reattach)
+
+    assert await restarted.reattach_session_hosts(remote_recovery_timeout=1.0) == 0
+    reattach.assert_not_awaited()
+
+    resumed_session = restarted.get_session(session.session_id)
+
+    async def reattach_live(session_arg):
+        assert session_arg.background_recovery_enabled is True
+        session_arg.status = SessionStatus.IDLE
+        return True
+
+    monkeypatch.setattr(restarted, "_try_reattach_live_host", reattach_live)
+
+    resumed = await restarted.resume_session(session.session_id)
+
+    assert resumed is resumed_session
+    assert tmp_db.get_session(session.session_id)["background_recovery_enabled"] == 1
+
+
+@pytest.mark.asyncio
+async def test_recover_disconnected_hosts_skips_session_with_inflight_lifecycle_op(
+    tmp_db, tmp_path, monkeypatch,
+) -> None:
+    """The in-session liveness reattach driver must not race resume_session()
+    either -- same lock-held check as the startup path above."""
+    from agent_bridge.session_host.protocol import PROTOCOL_VERSION
+
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    session = Session("session-1", "agent", SpawnTarget(type="local", cwd=str(tmp_path)))
+    session.status = SessionStatus.IDLE
+    session.acp_session_id = "acp-1"
+    session.client = None
+    manager._sessions[session.session_id] = session
+    rec = SimpleNamespace(
+        session_id=session.session_id,
+        protocol_version=PROTOCOL_VERSION,
+        host_version="test",
+        host_pid=123,
+        child_pid=456,
+        created_at=time.time(),
+        resume_on_reattach=False,
+        boundary="local",
+    )
+    attach = AsyncMock(return_value=True)
+    monkeypatch.setattr(manager, "_live_host_records", lambda: [rec])
+    monkeypatch.setattr(manager, "_rec_child_alive", lambda _rec: True)
+    monkeypatch.setattr(manager, "_reattach_one", attach)
+
+    await session._lifecycle_lock.acquire()
+    try:
+        assert await manager.recover_disconnected_hosts() == 0
+    finally:
+        session._lifecycle_lock.release()
+
+    attach.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_disconnected_hosts_escalates_after_repeated_failures(
+    tmp_db, tmp_path, monkeypatch,
+) -> None:
+    """A remote host that keeps failing reattach with no error surfacing the
+    child's actual death (#2998) must not be retried forever. After
+    _DISCONNECTED_REATTACH_ESCALATE_AFTER consecutive failures, an
+    authoritative liveness check (_recover_remote_host_records) must run
+    instead of blindly retrying _reattach_one again.
+    """
+    from agent_bridge.session_host.protocol import PROTOCOL_VERSION
+    from agent_bridge.session_manager import _DISCONNECTED_REATTACH_ESCALATE_AFTER
+    import agent_bridge.session_manager as sm
+
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    session = Session("session-1", "agent", SpawnTarget(type="local", cwd=str(tmp_path)))
+    session.status = SessionStatus.IDLE
+    session.acp_session_id = "acp-1"
+    session.client = None
+    manager._sessions[session.session_id] = session
+    now = time.time()
+    monkeypatch.setattr(sm.time, "time", lambda: now)
+    rec = SimpleNamespace(
+        session_id=session.session_id,
+        protocol_version=PROTOCOL_VERSION,
+        host_version="test",
+        host_pid=123,
+        child_pid=456,
+        created_at=now,
+        resume_on_reattach=False,
+        boundary="codespace",
+    )
+    manager._host_index.register(
+        HostRecord(
+            session_id=session.session_id,
+            port=49555,
+            host_pid=123,
+            child_pid=456,
+        )
+    )
+    attach = AsyncMock(return_value=False)
+    authoritative_check = AsyncMock(return_value=0)
+    monkeypatch.setattr(manager, "_live_host_records", lambda: [rec])
+    monkeypatch.setattr(manager, "_rec_child_alive", lambda _rec: True)
+    monkeypatch.setattr(manager, "_reattach_one", attach)
+    monkeypatch.setattr(manager, "_recover_remote_host_records", authoritative_check)
+    monkeypatch.setattr(
+        manager, "_codespace_host_available", AsyncMock(return_value=True),
+    )
+
+    # Fewer than the threshold: no escalation yet, just a failed reattach.
+    for _ in range(_DISCONNECTED_REATTACH_ESCALATE_AFTER - 1):
+        assert await manager.recover_disconnected_hosts() == 0
+        now = manager._disconnected_reattach_retry_at[session.session_id]
+    authoritative_check.assert_not_awaited()
+    assert (
+        manager._disconnected_reattach_failures[session.session_id]
+        == _DISCONNECTED_REATTACH_ESCALATE_AFTER - 1
+    )
+
+    # The threshold-th failure escalates to the authoritative check instead of
+    # just incrementing the counter again.
+    assert await manager.recover_disconnected_hosts() == 0
+    authoritative_check.assert_awaited_once_with(
+        allow_wake=True, session_ids={session.session_id},
+    )
+    assert (
+        manager._disconnected_reattach_failures[session.session_id]
+        == _DISCONNECTED_REATTACH_ESCALATE_AFTER
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_disconnected_hosts_backs_off_exponentially(
+    tmp_db, tmp_path, monkeypatch,
+) -> None:
+    import agent_bridge.session_manager as sm
+
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    session = Session("session-1", "agent", SpawnTarget(type="local", cwd=str(tmp_path)))
+    session.status = SessionStatus.IDLE
+    session.acp_session_id = "acp-1"
+    session.client = None
+    manager._sessions[session.session_id] = session
+    rec = SimpleNamespace(
+        session_id=session.session_id,
+        protocol_version=1,
+        host_version="test",
+        host_pid=123,
+        child_pid=456,
+        created_at=1000.0,
+        resume_on_reattach=False,
+        boundary="local",
+    )
+    manager._host_index.register(
+        HostRecord(
+            session_id=session.session_id,
+            port=49555,
+            host_pid=123,
+            child_pid=456,
+        )
+    )
+    now = 1000.0
+    monkeypatch.setattr(sm.time, "time", lambda: now)
+    monkeypatch.setattr(manager, "_live_host_records", lambda: [rec])
+    monkeypatch.setattr(manager, "_rec_child_alive", lambda _rec: True)
+    monkeypatch.setattr(manager, "_recover_remote_host_records", AsyncMock(return_value=0))
+    attach = AsyncMock(return_value=False)
+    monkeypatch.setattr(manager, "_reattach_one", attach)
+
+    assert await manager.recover_disconnected_hosts() == 0
+    assert manager._disconnected_reattach_retry_at[session.session_id] == 1030.0
+
+    now = 1015.0
+    assert await manager.recover_disconnected_hosts() == 0
+    assert attach.await_count == 1
+
+    now = 1030.0
+    assert await manager.recover_disconnected_hosts() == 0
+    assert attach.await_count == 2
+    assert manager._disconnected_reattach_retry_at[session.session_id] == 1090.0
+
+
+def test_background_recovery_backoff_caps() -> None:
+    from agent_bridge.session_manager import _background_recovery_backoff_seconds
+
+    assert [
+        _background_recovery_backoff_seconds(n)
+        for n in range(1, 7)
+    ] == [30.0, 60.0, 120.0, 240.0, 300.0, 300.0]
+
+
+@pytest.mark.asyncio
+async def test_recover_disconnected_hosts_clears_failure_count_on_success(
+    tmp_db, tmp_path, monkeypatch,
+) -> None:
+    """A successful reattach must clear any accrued failure count -- a
+    transient blip that then recovers should not carry stale state toward a
+    future escalation."""
+    from agent_bridge.session_host.protocol import PROTOCOL_VERSION
+
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    session = Session("session-1", "agent", SpawnTarget(type="local", cwd=str(tmp_path)))
+    session.status = SessionStatus.IDLE
+    session.acp_session_id = "acp-1"
+    session.client = None
+    manager._sessions[session.session_id] = session
+    rec = SimpleNamespace(
+        session_id=session.session_id,
+        protocol_version=PROTOCOL_VERSION,
+        host_version="test",
+        host_pid=123,
+        child_pid=456,
+        created_at=time.time(),
+        resume_on_reattach=False,
+        boundary="local",
+    )
+    manager._disconnected_reattach_failures[session.session_id] = 2
+    monkeypatch.setattr(manager, "_live_host_records", lambda: [rec])
+    monkeypatch.setattr(manager, "_rec_child_alive", lambda _rec: True)
+    monkeypatch.setattr(manager, "_reattach_one", AsyncMock(return_value=True))
+
+    assert await manager.recover_disconnected_hosts() == 1
+    assert session.session_id not in manager._disconnected_reattach_failures
+
+
+@pytest.mark.asyncio
+async def test_idle_unwatched_session_goes_dormant_after_repeated_recovery_failures(
+    tmp_db, tmp_path, monkeypatch,
+) -> None:
+    import agent_bridge.session_manager as sm
+    from agent_bridge.session_manager import _BACKGROUND_RECOVERY_IDLE_DORMANCY_AFTER
+
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    session = Session("session-1", "agent", SpawnTarget(type="local", cwd=str(tmp_path)))
+    session.status = SessionStatus.IDLE
+    session.acp_session_id = "acp-1"
+    session.client = None
+    manager._sessions[session.session_id] = session
+    rec = SimpleNamespace(
+        session_id=session.session_id,
+        protocol_version=1,
+        host_version="test",
+        host_pid=123,
+        child_pid=456,
+        created_at=1000.0,
+        resume_on_reattach=False,
+        boundary="local",
+    )
+    manager._host_index.register(
+        HostRecord(
+            session_id=session.session_id,
+            port=49555,
+            host_pid=123,
+            child_pid=456,
+        )
+    )
+    now = 1000.0
+    monkeypatch.setattr(sm.time, "time", lambda: now)
+    monkeypatch.setattr(manager, "_live_host_records", lambda: [rec])
+    monkeypatch.setattr(manager, "_rec_child_alive", lambda _rec: True)
+    monkeypatch.setattr(manager, "_recover_remote_host_records", AsyncMock(return_value=0))
+    attach = AsyncMock(return_value=False)
+    monkeypatch.setattr(manager, "_reattach_one", attach)
+
+    for _ in range(_BACKGROUND_RECOVERY_IDLE_DORMANCY_AFTER):
+        assert await manager.recover_disconnected_hosts() == 0
+        now = manager._disconnected_reattach_retry_at.get(session.session_id, now)
+
+    assert attach.await_count == _BACKGROUND_RECOVERY_IDLE_DORMANCY_AFTER
+    assert session.status is SessionStatus.STOPPED
+    assert session.background_recovery_enabled is False
+
+    now += 1000.0
+    assert await manager.recover_disconnected_hosts() == 0
+    assert attach.await_count == _BACKGROUND_RECOVERY_IDLE_DORMANCY_AFTER
+
+
+@pytest.mark.asyncio
+async def test_recoverable_stopped_session_also_reaches_idle_dormancy(
+    tmp_db, tmp_path, monkeypatch,
+) -> None:
+    """A daemon restart rehydrates every formerly RUNNING/IDLE/STARTING
+    session as STOPPED (still recoverable, unless explicitly stopped). Such a
+    session must still reach idle auto-dormancy after repeated failures
+    (review of #3058) -- excluding STOPPED here would let an unwatched
+    post-restart session retry forever under backoff, never truly dormant."""
+    import agent_bridge.session_manager as sm
+    from agent_bridge.session_manager import _BACKGROUND_RECOVERY_IDLE_DORMANCY_AFTER
+
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    session = Session("session-1", "agent", SpawnTarget(type="local", cwd=str(tmp_path)))
+    session.status = SessionStatus.STOPPED  # as rehydrate() would leave it
+    session.acp_session_id = "acp-1"
+    session.client = None
+    session.background_recovery_enabled = True  # not an explicit stop
+    manager._sessions[session.session_id] = session
+    rec = SimpleNamespace(
+        session_id=session.session_id,
+        protocol_version=1,
+        host_version="test",
+        host_pid=123,
+        child_pid=456,
+        created_at=1000.0,
+        resume_on_reattach=False,
+        boundary="local",
+    )
+    manager._host_index.register(
+        HostRecord(
+            session_id=session.session_id,
+            port=49555,
+            host_pid=123,
+            child_pid=456,
+        )
+    )
+    now = 1000.0
+    monkeypatch.setattr(sm.time, "time", lambda: now)
+    monkeypatch.setattr(manager, "_live_host_records", lambda: [rec])
+    monkeypatch.setattr(manager, "_rec_child_alive", lambda _rec: True)
+    monkeypatch.setattr(manager, "_recover_remote_host_records", AsyncMock(return_value=0))
+    attach = AsyncMock(return_value=False)
+    monkeypatch.setattr(manager, "_reattach_one", attach)
+
+    for _ in range(_BACKGROUND_RECOVERY_IDLE_DORMANCY_AFTER):
+        assert await manager.recover_disconnected_hosts() == 0
+        now = manager._disconnected_reattach_retry_at.get(session.session_id, now)
+
+    assert attach.await_count == _BACKGROUND_RECOVERY_IDLE_DORMANCY_AFTER
+    assert session.background_recovery_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_stop_serializes_with_inflight_reattach(
+    tmp_db, tmp_path, monkeypatch,
+) -> None:
+    """An explicit stop overlapping an in-flight background reattach must not
+    let the reattach's later success revive the session after stop already
+    persisted dormancy (review finding on #3058): stop must serialize with
+    the same lifecycle lock a reattach holds across its await, not race it.
+    """
+    from agent_bridge.session_host.protocol import PROTOCOL_VERSION
+
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    session = Session("session-1", "agent", SpawnTarget(type="local", cwd=str(tmp_path)))
+    session.status = SessionStatus.IDLE
+    session.acp_session_id = "acp-1"
+    session.client = None
+    manager._sessions[session.session_id] = session
+    now = time.time()
+    tmp_db.create_session(
+        session_id=session.session_id,
+        name=session.name,
+        agent_name=session.agent_name,
+        caller_id=session.caller_id,
+        target_dir=session.target.cwd,
+        target_type=session.target.type,
+        status=SessionStatus.IDLE.value,
+        now=now,
+        target_json=session.target.to_json(),
+    )
+    tmp_db.update_session_acp_id(session.session_id, session.acp_session_id)
+    rec = SimpleNamespace(
+        session_id=session.session_id,
+        protocol_version=PROTOCOL_VERSION,
+        host_version="test",
+        host_pid=123,
+        child_pid=456,
+        created_at=now,
+        resume_on_reattach=False,
+        boundary="local",
+    )
+
+    reattach_started = asyncio.Event()
+    release_reattach = asyncio.Event()
+
+    async def slow_reattach_one(rec_arg, session_arg, **kwargs):
+        reattach_started.set()
+        await release_reattach.wait()
+        # A successful reattach establishes a live client and lands IDLE --
+        # exactly what must not survive a stop that raced it.
+        session_arg.client = object()
+        session_arg.status = SessionStatus.IDLE
+        return True
+
+    monkeypatch.setattr(manager, "_live_host_records", lambda: [rec])
+    monkeypatch.setattr(manager, "_rec_child_alive", lambda _rec: True)
+    monkeypatch.setattr(manager, "_reattach_one", slow_reattach_one)
+
+    reattach_task = asyncio.create_task(manager.recover_disconnected_hosts())
+    await reattach_started.wait()
+
+    stop_task = asyncio.create_task(manager.stop_session(session.session_id))
+    await asyncio.sleep(0)  # let stop_session start waiting on the lock
+    assert not stop_task.done()
+
+    release_reattach.set()
+    await reattach_task
+    await stop_task
+
+    # Stop must win: the session ends dormant, not silently revived by the
+    # reattach that raced it.
+    assert session.status is SessionStatus.STOPPED
+    assert session.client is None
+    assert session.background_recovery_enabled is False
+    assert tmp_db.get_session(session.session_id)["background_recovery_enabled"] == 0
+
+
+@pytest.mark.asyncio
+async def test_recover_disconnected_hosts_skips_failed_session(
+    tmp_db, tmp_path, monkeypatch,
+) -> None:
+    """A FAILED session with a surviving HostRecord (partial/inconclusive
+    cleanup) must wait for explicit recovery (#2379), the same terminal-state
+    guard the startup reattach path already applies."""
+    from agent_bridge.session_host.protocol import PROTOCOL_VERSION
+
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    session = Session("session-1", "agent", SpawnTarget(type="local", cwd=str(tmp_path)))
+    session.status = SessionStatus.FAILED
+    session.acp_session_id = "acp-1"
+    session.client = None
+    manager._sessions[session.session_id] = session
+    rec = SimpleNamespace(
+        session_id=session.session_id,
+        protocol_version=PROTOCOL_VERSION,
+        host_version="test",
+        host_pid=123,
+        child_pid=456,
+        created_at=time.time(),
+        resume_on_reattach=False,
+        boundary="local",
+    )
+    attach = AsyncMock(return_value=True)
+    monkeypatch.setattr(manager, "_live_host_records", lambda: [rec])
+    monkeypatch.setattr(manager, "_rec_child_alive", lambda _rec: True)
+    monkeypatch.setattr(manager, "_reattach_one", attach)
+
+    assert await manager.recover_disconnected_hosts() == 0
+    attach.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_disconnected_hosts_feeds_codespace_unavailable_into_backoff(
+    tmp_db, tmp_path, monkeypatch,
+) -> None:
+    """An unavailable CodeSpace venue must feed the same backoff/dormancy
+    bookkeeping as a failed reattach (#2378/#2379), not bypass it via a bare
+    ``continue`` -- otherwise a persistently unavailable target is probed on
+    every heartbeat and never reaches idle dormancy."""
+    import agent_bridge.session_manager as sm
+    from agent_bridge.session_manager import _BACKGROUND_RECOVERY_IDLE_DORMANCY_AFTER
+
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    session = Session("session-1", "agent", SpawnTarget(type="local", cwd=str(tmp_path)))
+    session.status = SessionStatus.IDLE
+    session.acp_session_id = "acp-1"
+    session.client = None
+    manager._sessions[session.session_id] = session
+    rec = SimpleNamespace(
+        session_id=session.session_id,
+        protocol_version=1,
+        host_version="test",
+        host_pid=123,
+        child_pid=456,
+        created_at=1000.0,
+        resume_on_reattach=False,
+        boundary="codespace",
+    )
+    manager._host_index.register(
+        HostRecord(
+            session_id=session.session_id,
+            port=49555,
+            host_pid=123,
+            child_pid=456,
+        )
+    )
+    now = 1000.0
+    monkeypatch.setattr(sm.time, "time", lambda: now)
+    monkeypatch.setattr(manager, "_live_host_records", lambda: [rec])
+    monkeypatch.setattr(manager, "_rec_child_alive", lambda _rec: True)
+    monkeypatch.setattr(manager, "_recover_remote_host_records", AsyncMock(return_value=0))
+    reattach = AsyncMock(return_value=True)
+    monkeypatch.setattr(manager, "_reattach_one", reattach)
+    monkeypatch.setattr(
+        manager, "_codespace_host_available", AsyncMock(return_value=False),
+    )
+
+    for _ in range(_BACKGROUND_RECOVERY_IDLE_DORMANCY_AFTER):
+        assert await manager.recover_disconnected_hosts() == 0
+        now = manager._disconnected_reattach_retry_at.get(session.session_id, now)
+
+    # An unavailable venue never even attempts a reattach...
+    reattach.assert_not_awaited()
+    # ...but still accrues failures and reaches idle dormancy exactly like a
+    # failed reattach would.
+    assert session.status is SessionStatus.STOPPED
+    assert session.background_recovery_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_stop_persists_status_and_dormancy_atomically(
+    tmp_db, tmp_path,
+) -> None:
+    """Status and the dormancy gate must land in one write (review of #3058)
+    -- two separate writes could leave a row 'stopped' but still recovery-
+    enabled if the daemon were interrupted between them."""
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    target = SpawnTarget(type="local", cwd=str(tmp_path))
+    session = Session("session-1", "agent", target)
+    session.status = SessionStatus.IDLE
+    session.acp_session_id = "acp-1"
+    manager._sessions[session.session_id] = session
+    now = time.time()
+    tmp_db.create_session(
+        session_id=session.session_id, name=session.name,
+        agent_name=session.agent_name, caller_id=session.caller_id,
+        target_dir=target.cwd, target_type=target.type,
+        status=SessionStatus.IDLE.value, now=now, target_json=target.to_json(),
+    )
+    tmp_db.update_session_acp_id(session.session_id, session.acp_session_id)
+
+    await manager.stop_session(session.session_id)
+
+    row = tmp_db.get_session(session.session_id)
+    assert row["status"] == SessionStatus.STOPPED.value
+    assert row["background_recovery_enabled"] == 0
+
+
+@pytest.mark.asyncio
+async def test_codespace_unavailable_never_escalates_to_authoritative_check(
+    tmp_db, tmp_path, monkeypatch,
+) -> None:
+    """An unavailable-venue failure (apply_backoff=False) must never trigger
+    the authoritative-check escalation (review of #3058) -- that would
+    contact the provider and defeat the whole point of a no-wake check."""
+    import agent_bridge.session_manager as sm
+    from agent_bridge.session_manager import _DISCONNECTED_REATTACH_ESCALATE_AFTER
+
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    session = Session("session-1", "agent", SpawnTarget(type="local", cwd=str(tmp_path)))
+    session.status = SessionStatus.IDLE
+    session.acp_session_id = "acp-1"
+    session.client = None
+    manager._sessions[session.session_id] = session
+    rec = SimpleNamespace(
+        session_id=session.session_id,
+        protocol_version=1,
+        host_version="test",
+        host_pid=123,
+        child_pid=456,
+        created_at=1000.0,
+        resume_on_reattach=False,
+        boundary="codespace",
+    )
+    manager._host_index.register(
+        HostRecord(
+            session_id=session.session_id,
+            port=49555,
+            host_pid=123,
+            child_pid=456,
+        )
+    )
+    now = 1000.0
+    monkeypatch.setattr(sm.time, "time", lambda: now)
+    monkeypatch.setattr(manager, "_live_host_records", lambda: [rec])
+    monkeypatch.setattr(manager, "_rec_child_alive", lambda _rec: True)
+    authoritative_check = AsyncMock(return_value=0)
+    monkeypatch.setattr(manager, "_recover_remote_host_records", authoritative_check)
+    monkeypatch.setattr(
+        manager, "_codespace_host_available", AsyncMock(return_value=False),
+    )
+
+    for _ in range(_DISCONNECTED_REATTACH_ESCALATE_AFTER):
+        assert await manager.recover_disconnected_hosts() == 0
+
+    authoritative_check.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_prompt_admission_arms_recovery_for_stopped_session(
+    tmp_db, tmp_path,
+) -> None:
+    """Prompt admission for a STOPPED session about to be kicked must arm
+    ``background_recovery_enabled`` immediately (review of #3058) -- not wait
+    for the later async ``_kick_pending_drain()``/``resume_session()`` call,
+    so an explicit stop racing right after admission cannot leave the
+    session dormant despite a queued prompt already committed to running."""
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    target = SpawnTarget(type="local", cwd=str(tmp_path))
+    session = Session("session-1", "agent", target)
+    session.status = SessionStatus.STOPPED
+    session.acp_session_id = "acp-1"
+    session.background_recovery_enabled = False
+    manager._sessions[session.session_id] = session
+    now = time.time()
+    tmp_db.create_session(
+        session_id=session.session_id, name=session.name,
+        agent_name=session.agent_name, caller_id=session.caller_id,
+        target_dir=target.cwd, target_type=target.type,
+        status=SessionStatus.STOPPED.value, now=now, target_json=target.to_json(),
+    )
+    tmp_db.update_session_background_recovery(session.session_id, False)
+    # Simulate a queue that already outlived the stop (queue_nonempty=True is
+    # what makes a fresh submit to a STOPPED session take the queue+kick path
+    # rather than submit_prompt's own immediate auto-resume).
+    tmp_db.enqueue_prompt(session.session_id, "earlier", now)
+
+    result, kick_session = await manager._submit_or_queue_prompt_locked(
+        session, "hello",
+    )
+
+    assert result["queued"] is True
+    assert kick_session is session
+    assert session.background_recovery_enabled is True
+    assert tmp_db.get_session(session.session_id)["background_recovery_enabled"] == 1
+
+
+def test_ensure_columns_backfills_background_recovery_for_stopped_rows(
+    tmp_path,
+) -> None:
+    """A sessions table stamped at the current schema_version but missing
+    ``background_recovery_enabled`` (the #815 elevated-DB shape) must not
+    just add the column with its blanket ``DEFAULT 1`` -- existing ``stopped``
+    rows must land dormant (0), same as the v19 migration's own backfill,
+    or the safety net would silently re-enable background recovery for
+    already-dormant sessions."""
+    import sqlite3
+
+    from agent_bridge.db import SCHEMA_VERSION, Database
+
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        f"""
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES ({SCHEMA_VERSION});
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            agent_name TEXT,
+            caller_id TEXT,
+            target_dir TEXT,
+            target_type TEXT NOT NULL DEFAULT 'local',
+            target_json TEXT,
+            status TEXT NOT NULL DEFAULT 'created',
+            pid INTEGER,
+            acp_session_id TEXT,
+            config_json TEXT,
+            predecessor_id TEXT,
+            successor_id TEXT,
+            handoff_at REAL,
+            created_at REAL NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL DEFAULT 0
+        );
+        INSERT INTO sessions (id, name, status, created_at, updated_at)
+        VALUES ('stopped-1', 'agent', 'stopped', 0, 0);
+        INSERT INTO sessions (id, name, status, created_at, updated_at)
+        VALUES ('idle-1', 'agent', 'idle', 0, 0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    # Opening the Database runs _init_schema -> _ensure_columns.
+    Database(str(path))
+
+    check = sqlite3.connect(str(path))
+    rows = {
+        r[0]: r[1]
+        for r in check.execute(
+            "SELECT id, background_recovery_enabled FROM sessions"
+        )
+    }
+    check.close()
+    assert rows == {"stopped-1": 0, "idle-1": 1}
+
+
+@pytest.mark.asyncio
+async def test_stopped_container_resume_reattaches_without_refresh(
+    tmp_db, tmp_path, monkeypatch,
+) -> None:
+    """A surviving container Host is reattached using the persisted target.
+
+    Reattach dials the far side using whatever is already persisted on the
+    session -- it needs no refreshed provider data -- so a successful reattach
+    must never require (or wait on) a provider-target refresh first. Mirrors
+    the codespace contract in
+    ``test_resume_does_not_refresh_surviving_provider_host``.
+    """
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    session = Session(
+        "session-1",
+        "agent",
+        SpawnTarget(
+            type="command",
+            container={
+                "name": "container-1",
+                "ssh": {"host_alias": "persisted-generation"},
+            },
+            venue={
+                "_agent_bridge_request_overrides": {
+                    "env": {},
+                    "copilot_args": [],
+                },
+            },
+        ),
+        "container:container-1",
+    )
+    session.status = SessionStatus.STOPPED
+    session.acp_session_id = "acp-1"
+    manager._sessions[session.session_id] = session
+
+    class Resolver:
+        async def resolve_async(self, _name):
+            raise AssertionError(
+                "resolve_async must not be awaited when reattach succeeds"
+            )
+
+    manager.set_resolver(Resolver())
+
+    async def reattach(session_arg):
+        assert (
+            session_arg.target.container["ssh"]["host_alias"]
+            == "persisted-generation"
+        )
+        session_arg.status = SessionStatus.IDLE
+        return True
+
+    monkeypatch.setattr(manager, "_try_reattach_live_host", reattach)
+
+    resumed = await manager.resume_session(session.session_id)
+
+    assert resumed is session
+    assert session.status is SessionStatus.IDLE
+
+
+@pytest.mark.asyncio
+async def test_stopped_legacy_container_resume_reattaches_despite_missing_overrides(
+    tmp_db, tmp_path, monkeypatch,
+) -> None:
+    """A legacy container session (no request-override provenance) still
+    reattaches to its surviving Host.
+
+    Regression test: resume previously called ``_refresh_provider_target``
+    unconditionally before attempting reattach for a container-backed
+    session, which raised ``ProviderTargetRefreshError`` for any session
+    predating override provenance (or when the resolver could not yet
+    resolve the agent, e.g. immediately after a daemon restart) -- aborting
+    resume outright and permanently blocking reattach even though a live
+    Session Host was reachable on the other end.
+    """
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    session = Session(
+        "session-1",
+        "agent",
+        SpawnTarget(
+            type="command",
+            container={"name": "container-1"},
+            # No `_agent_bridge_request_overrides` key -- the legacy shape.
+        ),
+        "container:container-1",
+    )
+    session.status = SessionStatus.STOPPED
+    session.acp_session_id = "acp-1"
+    manager._sessions[session.session_id] = session
+
+    class Resolver:
+        async def resolve_async(self, _name):
+            raise KeyError("Agent 'container:container-1' not found in registry")
+
+    manager.set_resolver(Resolver())
+
+    async def reattach(session_arg):
+        session_arg.status = SessionStatus.IDLE
+        return True
+
+    monkeypatch.setattr(manager, "_try_reattach_live_host", reattach)
+
+    resumed = await manager.resume_session(session.session_id)
+
+    assert resumed is session
+    assert session.status is SessionStatus.IDLE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("container", "relay_required"),
+    [
+        ({"name": "container-1", "relay_remote_port": 9857}, True),
+        ({"name": "container-1"}, False),
+    ],
+)
+async def test_stopped_container_live_host_applies_current_relay_policy(
+    tmp_db, tmp_path, monkeypatch, container, relay_required,
+) -> None:
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    session = Session(
+        "session-1",
+        "agent",
+        SpawnTarget(
+            type="command",
+            container=container,
+        ),
+        "container:container-1",
+    )
+    session.status = SessionStatus.STOPPED
+    session.acp_session_id = "acp-1"
+    manager._sessions[session.session_id] = session
+    rec = HostRecord(
+        session_id=session.session_id,
+        port=49555,
+        host_pid=123,
+        child_pid=456,
+        host_version="test",
+        protocol_version=1,
+        state_file="/tmp/host.json",
+        created_at=time.time(),
+        nonce="nonce",
+        boundary="container",
+        endpoint={
+            "kind": "container",
+            "remote_port": 51000,
+            "local_port": 49555,
+            "reverse_forwards": ["9857:127.0.0.1:60000"],
+            "ssh": {"host_alias": "container-1"},
+        },
+        extra={},
+    )
+    manager._host_index.register(rec)
+    monkeypatch.setattr(manager, "_rec_host_alive", lambda _rec: True)
+    monkeypatch.setattr(manager, "_rec_child_alive", lambda _rec: True)
+    reattach = AsyncMock(return_value=True)
+    monkeypatch.setattr(manager, "_reattach_one", reattach)
+
+    assert await manager._try_reattach_live_host(session) is True
+
+    assert reattach.await_args.kwargs["refresh_relays"] is relay_required
+    assert reattach.await_args.kwargs["require_relay_ready"] is relay_required
+
+
+@pytest.mark.asyncio
+async def test_stopped_container_relay_failure_prevents_prompt_admission(
+    tmp_db, tmp_path, monkeypatch,
+) -> None:
+    manager = SessionManager(tmp_db, session_host_state_dir=str(tmp_path))
+    session = Session(
+        "session-1",
+        "agent",
+        SpawnTarget(
+            type="command",
+            container={"name": "container-1"},
+        ),
+        "container:container-1",
+    )
+    session.status = SessionStatus.STOPPED
+    session.acp_session_id = "acp-1"
+    manager._sessions[session.session_id] = session
+    monkeypatch.setattr(
+        manager,
+        "_refresh_provider_target",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_try_reattach_live_host",
+        AsyncMock(
+            side_effect=CredentialRelayReadinessError(
+                "credential relay readiness could not be proved"
+            )
+        ),
+    )
+    fresh_host = AsyncMock()
+    monkeypatch.setattr(manager, "_resume_via_new_remote_host", fresh_host)
+    run_prompt = AsyncMock()
+    monkeypatch.setattr(manager, "_run_prompt", run_prompt)
+
+    with pytest.raises(
+        CredentialRelayReadinessError,
+        match="could not be proved",
+    ):
+        await manager.submit_prompt(session.session_id, "do work")
+
+    assert session.status is SessionStatus.STOPPED
+    assert session.turn_count == 0
+    assert tmp_db.get_turns(session.session_id) == []
+    fresh_host.assert_not_awaited()
+    run_prompt.assert_not_awaited()
 
 
 class TestSubmitPrompt:
@@ -1994,6 +3589,108 @@ class TestEndSession:
         assert session_manager.get_session(sid) is None
 
     @pytest.mark.asyncio
+    async def test_end_if_idle_removes_idle_session(
+        self, session_manager, spawn_target, _patch_spawn, _patch_acp
+    ) -> None:
+        session = await session_manager.start_session(spawn_target)
+
+        await session_manager.end_session_if_idle(session.session_id)
+
+        assert session_manager.get_session(session.session_id) is None
+
+    @pytest.mark.asyncio
+    async def test_end_if_idle_removes_stopped_session(
+        self, session_manager, spawn_target, _patch_spawn, _patch_acp
+    ) -> None:
+        session = await session_manager.start_session(spawn_target)
+        await session_manager.stop_session(session.session_id)
+
+        await session_manager.end_session_if_idle(session.session_id)
+
+        assert session_manager.get_session(session.session_id) is None
+
+    @pytest.mark.asyncio
+    async def test_end_if_idle_preserves_running_session(
+        self, session_manager, spawn_target, _patch_spawn, _patch_acp
+    ) -> None:
+        session = await session_manager.start_session(spawn_target)
+        session.status = SessionStatus.RUNNING
+
+        with pytest.raises(ValueError, match="is not idle"):
+            await session_manager.end_session_if_idle(session.session_id)
+
+        assert session_manager.get_session(session.session_id) is session
+
+    @pytest.mark.asyncio
+    async def test_end_if_idle_preserves_queued_prompts(
+        self, session_manager, spawn_target, _patch_spawn, _patch_acp
+    ) -> None:
+        session = await session_manager.start_session(spawn_target)
+        session_manager._db.enqueue_prompt(
+            session.session_id,
+            "continue later",
+            session.updated_at,
+        )
+
+        with pytest.raises(ValueError, match="has queued prompts"):
+            await session_manager.end_session_if_idle(session.session_id)
+
+        assert session_manager.get_session(session.session_id) is session
+
+    @pytest.mark.asyncio
+    async def test_end_if_idle_excludes_concurrent_prompt_admission(
+        self, session_manager, spawn_target, _patch_spawn, _patch_acp
+    ) -> None:
+        session = await session_manager.start_session(spawn_target)
+        ending = asyncio.Event()
+        release_end = asyncio.Event()
+        original_end = session_manager.end_session
+
+        async def delayed_end(session_id: str, *, force: bool = False) -> None:
+            ending.set()
+            await release_end.wait()
+            await original_end(session_id, force=force)
+
+        session_manager.end_session = delayed_end
+        end_task = asyncio.create_task(
+            session_manager.end_session_if_idle(session.session_id)
+        )
+        await ending.wait()
+
+        submit_task = asyncio.create_task(
+            session_manager.submit_or_queue_prompt(
+                session.session_id,
+                "do not discard",
+            )
+        )
+        await asyncio.sleep(0)
+        assert not submit_task.done()
+
+        release_end.set()
+        await end_task
+        with pytest.raises(KeyError, match="not found"):
+            await submit_task
+        assert session_manager._db.count_pending_prompts(session.session_id) == 0
+
+    @pytest.mark.asyncio
+    async def test_end_if_idle_revalidates_after_waiting_for_lock(
+        self, session_manager, spawn_target, _patch_spawn, _patch_acp
+    ) -> None:
+        session = await session_manager.start_session(spawn_target)
+        await session._turn_start_lock.acquire()
+        end_task = asyncio.create_task(
+            session_manager.end_session_if_idle(session.session_id)
+        )
+        await asyncio.sleep(0)
+        assert not end_task.done()
+
+        await session_manager.end_session(session.session_id)
+        session._turn_start_lock.release()
+
+        with pytest.raises(KeyError, match="not found"):
+            await end_task
+
+    @pytest.mark.asyncio
     async def test_end_succeeds_when_shutdown_raises(
         self, session_manager, spawn_target, _patch_spawn, _patch_acp, mock_acp_client
     ) -> None:
@@ -2084,6 +3781,34 @@ class TestBackgroundTaskGate:
         assert session.client is None
 
     @pytest.mark.asyncio
+    async def test_reaping_stop_retires_owned_session_host(
+        self,
+        session_manager,
+        spawn_target,
+        _patch_spawn,
+        _patch_acp,
+        monkeypatch,
+    ) -> None:
+        session = await session_manager.start_session(spawn_target)
+        record = HostRecord(
+            session_id=session.session_id,
+            port=49555,
+            host_pid=123,
+            child_pid=456,
+        )
+        session_manager._host_index.register(record)
+        reap = MagicMock()
+        monkeypatch.setattr(session_manager, "_reap_host_record", reap)
+
+        await session_manager.stop_session(
+            session.session_id,
+            reap_host=True,
+        )
+
+        reap.assert_called_once_with(record, "idle reap (#1826)")
+        assert session.status == SessionStatus.STOPPED
+
+    @pytest.mark.asyncio
     async def test_force_end_overrides_background_tasks(
         self, session_manager, spawn_target, _patch_spawn, _patch_acp, mock_acp_client
     ) -> None:
@@ -2098,6 +3823,34 @@ class TestBackgroundTaskGate:
 
 class TestResumeSession:
     """Session resume from STOPPED state."""
+
+    @pytest.mark.asyncio
+    async def test_start_session_preserves_existing_provider_override_provenance(
+        self, session_manager, _patch_spawn, _patch_acp
+    ) -> None:
+        target = SpawnTarget(
+            type="local",
+            cwd="/workspaces/example",
+            env={"REQUEST_OVERRIDE": "kept"},
+            copilot_args=["--request-flag"],
+            venue={
+                "kind": "provider",
+                "_agent_bridge_request_overrides": {
+                    "env": {"REQUEST_OVERRIDE": "kept"},
+                    "copilot_args": ["--request-flag"],
+                },
+            },
+        )
+
+        session = await session_manager.start_session(
+            target,
+            agent_name="provider:example",
+        )
+
+        assert session.target.venue["_agent_bridge_request_overrides"] == {
+            "env": {"REQUEST_OVERRIDE": "kept"},
+            "copilot_args": ["--request-flag"],
+        }
 
     @pytest.mark.asyncio
     async def test_resume_stopped_session(
@@ -2138,6 +3891,207 @@ class TestResumeSession:
         assert resumed.status == SessionStatus.IDLE
         # Reattach path: the running child is adopted, so no fresh-child replay.
         mock_acp_client.load_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resume_refreshes_stopped_provider_target(
+        self, session_manager, spawn_target, _patch_spawn, _patch_acp
+    ) -> None:
+        session = await session_manager.start_session(
+            spawn_target,
+            agent_name="codespace:example",
+        )
+        await session_manager.stop_session(session.session_id)
+        session.target = SpawnTarget(
+            type="command",
+            cwd="/workspaces/example",
+            project="example",
+            worktree_id="wt-1",
+            caller_worktree="caller-wt",
+            caller_owner_ref="owner/ref",
+            env={
+                "PROVIDER_DEFAULT": "old",
+                "REQUEST_OVERRIDE": "kept",
+            },
+            copilot_args=[
+                "--additional-mcp-config",
+                "@old-provider.json",
+                "--additional-mcp-config",
+                "@request.json",
+            ],
+            codespace={"name": "old", "repo": "example"},
+            venue={
+                "kind": "codespace",
+                "revision": "old",
+                "_agent_bridge_request_overrides": {
+                    "env": {"REQUEST_OVERRIDE": "kept"},
+                    "copilot_args": [
+                        "--additional-mcp-config",
+                        "@request.json",
+                    ],
+                },
+            },
+        )
+        session_manager._db.update_session_target(
+            session.session_id,
+            session.target.to_json(),
+            session.target.cwd,
+        )
+        refreshed = SpawnTarget(
+            type="ssh",
+            host="new-host",
+            cwd="/provider/default",
+            project="provider-project",
+            env={"PROVIDER_DEFAULT": "new"},
+            copilot_args=[
+                "--additional-mcp-config",
+                "@new-provider.json",
+            ],
+            venue={"kind": "codespace", "revision": "new"},
+        )
+        resolver = MagicMock()
+        resolver.resolve_async = AsyncMock(return_value=refreshed)
+        session_manager.set_resolver(resolver)
+
+        with patch.object(
+            session_manager,
+            "_try_reattach_live_host",
+            AsyncMock(return_value=False),
+        ):
+            resumed = await session_manager.resume_session(session.session_id)
+
+        resolver.resolve_async.assert_awaited_once_with("codespace:example")
+        assert resumed.target.type == "ssh"
+        assert resumed.target.host == "new-host"
+        assert resumed.target.venue == {
+            "kind": "codespace",
+            "revision": "new",
+            "_agent_bridge_request_overrides": {
+                "env": {"REQUEST_OVERRIDE": "kept"},
+                "copilot_args": [
+                    "--additional-mcp-config",
+                    "@request.json",
+                ],
+            },
+        }
+        assert resumed.target.cwd == "/workspaces/example"
+        assert resumed.target.project == "example"
+        assert resumed.target.worktree_id == "wt-1"
+        assert resumed.target.caller_worktree == "caller-wt"
+        assert resumed.target.caller_owner_ref == "owner/ref"
+        assert resumed.target.env == {
+            "PROVIDER_DEFAULT": "new",
+            "REQUEST_OVERRIDE": "kept",
+        }
+        assert resumed.target.copilot_args == [
+            "--additional-mcp-config",
+            "@new-provider.json",
+            "--additional-mcp-config",
+            "@request.json",
+        ]
+        persisted = SpawnTarget.from_json(
+            session_manager._db.get_session(session.session_id)["target_json"]
+        )
+        assert persisted.host == "new-host"
+        assert persisted.venue == resumed.target.venue
+
+    @pytest.mark.asyncio
+    async def test_resume_does_not_refresh_surviving_provider_host(
+        self, session_manager, spawn_target, _patch_spawn, _patch_acp, mock_acp_client
+    ) -> None:
+        session = await session_manager.start_session(
+            spawn_target,
+            agent_name="codespace:example",
+        )
+        await session_manager.stop_session(session.session_id)
+        session.target = SpawnTarget(
+            type="command",
+            codespace={"name": "existing", "repo": "example"},
+        )
+        resolver = MagicMock()
+        resolver.resolve_async = AsyncMock()
+        session_manager.set_resolver(resolver)
+
+        async def _fake_reattach(sess):
+            sess.client = mock_acp_client
+            sess.status = SessionStatus.IDLE
+            return True
+
+        with patch.object(
+            session_manager,
+            "_try_reattach_live_host",
+            AsyncMock(side_effect=_fake_reattach),
+        ):
+            await session_manager.resume_session(session.session_id)
+
+        resolver.resolve_async.assert_not_awaited()
+        assert session.target.codespace["name"] == "existing"
+
+    @pytest.mark.asyncio
+    async def test_resume_provider_refresh_failure_keeps_session_stopped(
+        self, session_manager, spawn_target, _patch_spawn, _patch_acp
+    ) -> None:
+        session = await session_manager.start_session(
+            spawn_target,
+            agent_name="codespace:example",
+        )
+        await session_manager.stop_session(session.session_id)
+        session.target = SpawnTarget(
+            type="command",
+            codespace={"name": "stale", "repo": "example"},
+            venue={
+                "_agent_bridge_request_overrides": {
+                    "env": {},
+                    "copilot_args": [],
+                },
+            },
+        )
+        resolver = MagicMock()
+        resolver.resolve_async = AsyncMock(
+            side_effect=RuntimeError("provider unavailable")
+        )
+        session_manager.set_resolver(resolver)
+
+        with patch.object(
+            session_manager,
+            "_try_reattach_live_host",
+            AsyncMock(return_value=False),
+        ):
+            with pytest.raises(
+                RuntimeError,
+                match="Current provider target could not be resolved",
+            ):
+                await session_manager.resume_session(session.session_id)
+
+        assert session.status == SessionStatus.STOPPED
+        assert session.target.codespace["name"] == "stale"
+
+    @pytest.mark.asyncio
+    async def test_resume_legacy_provider_target_requires_recreate(
+        self, session_manager, spawn_target, _patch_spawn, _patch_acp
+    ) -> None:
+        session = await session_manager.start_session(
+            spawn_target,
+            agent_name="codespace:example",
+        )
+        await session_manager.stop_session(session.session_id)
+        session.target = SpawnTarget(
+            type="command",
+            codespace={"name": "legacy", "repo": "example"},
+        )
+        resolver = MagicMock()
+        resolver.resolve_async = AsyncMock()
+        session_manager.set_resolver(resolver)
+
+        with patch.object(
+            session_manager,
+            "_try_reattach_live_host",
+            AsyncMock(return_value=False),
+        ):
+            with pytest.raises(RuntimeError, match="recreate the session"):
+                await session_manager.resume_session(session.session_id)
+
+        resolver.resolve_async.assert_not_awaited()
+        assert session.status == SessionStatus.STOPPED
 
     @pytest.mark.asyncio
     async def test_resume_rejects_non_stopped(
@@ -2259,7 +4213,7 @@ class TestResyncSession:
             client.shutdown = AsyncMock()
             client.cancel_prompt = AsyncMock()
 
-            async def _load(cwd, session_id, suppress_replay=True):
+            async def _load(cwd, session_id, suppress_replay=True, mcp_servers=None):
                 if not suppress_replay and on_event:
                     for etype, data in replay_events:
                         on_event(etype, data)
@@ -2395,7 +4349,7 @@ class TestReconcileWedged:
             client.shutdown = AsyncMock()
             client.cancel_prompt = AsyncMock()
 
-            async def _load(cwd, session_id, suppress_replay=True):
+            async def _load(cwd, session_id, suppress_replay=True, mcp_servers=None):
                 if not suppress_replay and on_event:
                     for etype, data in replay:
                         on_event(etype, data)
@@ -2414,14 +4368,28 @@ class TestReconcileWedged:
         session.status = SessionStatus.RUNNING
         session._prompt_task = None
         session.last_output_at = time.time() - 10_000  # stalled
+        session.mcp_servers = [{"name": "gitea-mcp"}]
+
+        created_clients = []
+        factory = self._replay_factory([("agent_message", {"text": "x"})])
+
+        def _capturing_factory(*args, **kwargs):
+            client = factory(*args, **kwargs)
+            created_clients.append(client)
+            return client
 
         with patch("agent_bridge.session_manager.AcpClient",
-                   side_effect=self._replay_factory([("agent_message", {"text": "x"})])):
+                   side_effect=_capturing_factory):
             healed = await session_manager.reconcile_wedged_running()
 
         assert healed == 1
         assert session.status == SessionStatus.IDLE
         assert session.event_log.get_events()[-1].data.get("resynced") is True
+        # Regression guard (issue #7239): resync must re-mount the session's
+        # declared MCP servers via load_session, matching the resume ladder.
+        load_kwargs = created_clients[-1].load_session.await_args.kwargs
+        assert load_kwargs.get("mcp_servers") == session.mcp_servers
+
 
     @pytest.mark.asyncio
     async def test_leaves_stalled_no_live_turn_within_threshold(
@@ -2816,6 +4784,40 @@ class TestRehydrate:
         assert session.status == SessionStatus.STOPPED
         assert session.acp_session_id == "acp-456"
 
+    def test_rehydrate_restores_mcp_servers_from_config_json(
+        self, tmp_db: Database
+    ) -> None:
+        """A session's declared per-session MCP toolset must survive a daemon
+        restart, not just an in-process resume -- regression for a reviewer
+        task permanently losing its dedicated credential-bound tools after
+        any restart (the downstream tracker)."""
+        now = time.time()
+        tmp_db.create_session(
+            "s1", "test", None, ".", "local", "idle", now,
+            config_json=json.dumps(
+                {"mcp_servers": [{"name": "gitea-mcp", "type": "stdio"}]}
+            ),
+        )
+
+        mgr = SessionManager(tmp_db)
+        session = mgr.get_session("s1")
+        assert session is not None
+        assert session.mcp_servers == [{"name": "gitea-mcp", "type": "stdio"}]
+
+    def test_rehydrate_tolerates_missing_or_malformed_config_json(
+        self, tmp_db: Database
+    ) -> None:
+        now = time.time()
+        tmp_db.create_session("s1", "test", None, ".", "local", "idle", now)
+        tmp_db.create_session(
+            "s2", "test", None, ".", "local", "idle", now,
+            config_json="not json",
+        )
+
+        mgr = SessionManager(tmp_db)
+        assert mgr.get_session("s1").mcp_servers == []
+        assert mgr.get_session("s2").mcp_servers == []
+
 
 class TestTeardownDuringDrain:
     """Teardown (stop/end) must stay permitted while draining (#1755).
@@ -2972,6 +4974,41 @@ class TestDurablePromptQueue:
         assert session_manager._db.count_pending_prompts(sid) == 0
 
     @pytest.mark.asyncio
+    async def test_queue_drain_excludes_conditional_teardown(
+        self, session_manager, spawn_target, _patch_spawn, _patch_acp
+    ) -> None:
+        session = await session_manager.start_session(spawn_target)
+        sid = session.session_id
+        session_manager._db.enqueue_prompt(sid, "next", session.updated_at)
+        submitting = asyncio.Event()
+        release_submit = asyncio.Event()
+
+        async def delayed_submit(session_id: str, prompt: str) -> int:
+            submitting.set()
+            await release_submit.wait()
+            session.status = SessionStatus.RUNNING
+            return 0
+
+        session_manager._submit_prompt_locked = delayed_submit
+        drain_task = asyncio.create_task(
+            session_manager._drain_pending_prompts(session)
+        )
+        await submitting.wait()
+
+        end_task = asyncio.create_task(
+            session_manager.end_session_if_idle(sid)
+        )
+        await asyncio.sleep(0)
+        assert not end_task.done()
+
+        release_submit.set()
+        await drain_task
+        with pytest.raises(ValueError, match="is not idle"):
+            await end_task
+        assert session_manager.get_session(sid) is session
+        assert session.status == SessionStatus.RUNNING
+
+    @pytest.mark.asyncio
     async def test_interrupt_clears_queue(
         self, session_manager, spawn_target, _patch_spawn, _patch_acp
     ) -> None:
@@ -3026,12 +5063,16 @@ class TestCodespaceExclusiveClaim:
     """
 
     @staticmethod
-    def _cs_target(caller_worktree: str | None = None) -> SpawnTarget:
+    def _cs_target(
+        caller_worktree: str | None = None,
+        caller_owner_ref: str | None = None,
+    ) -> SpawnTarget:
         acp = "cd /workspaces/example && copilot --acp --stdio --allow-all-tools"
         return SpawnTarget(
             type="command",
             cwd="/workspaces/example",
             caller_worktree=caller_worktree,
+            caller_owner_ref=caller_owner_ref,
             codespace={
                 "name": "example-codespace",
                 "repo": "example/repo",
@@ -3040,8 +5081,16 @@ class TestCodespaceExclusiveClaim:
             },
         )
 
-    async def _start(self, tmp_db, monkeypatch, *, claim_result, caller_worktree,
-                     caller_id=None):
+    async def _start(
+        self,
+        tmp_db,
+        monkeypatch,
+        *,
+        claim_result,
+        caller_worktree,
+        caller_id=None,
+        caller_owner_ref=None,
+    ):
         monkeypatch.setattr(
             "agent_bridge.session_host.codespace_transport.build_codespace_spawner",
             lambda *a, **k: SimpleNamespace(transport=object()),
@@ -3050,10 +5099,10 @@ class TestCodespaceExclusiveClaim:
             "agent_bridge.session_manager._resolve_remote_ai_plugin_dirs",
             AsyncMock(return_value=[]),
         )
-        claim_calls: list[tuple[str, str]] = []
+        claim_calls: list[tuple[str, str, str | None]] = []
 
-        def fake_claim(name, owner):
-            claim_calls.append((name, owner))
+        def fake_claim(name, owner, *, holder_ref=None):
+            claim_calls.append((name, owner, holder_ref))
             return claim_result
 
         monkeypatch.setattr(
@@ -3071,7 +5120,7 @@ class TestCodespaceExclusiveClaim:
         )
         manager = SessionManager(tmp_db)
         session = await manager.start_session(
-            self._cs_target(caller_worktree),
+            self._cs_target(caller_worktree, caller_owner_ref),
             agent_name="codespace:example",
             caller_id=caller_id,
         )
@@ -3085,10 +5134,12 @@ class TestCodespaceExclusiveClaim:
         comes up IDLE."""
         _, session, claim_calls = await self._start(
             tmp_db, monkeypatch,
-            claim_result=(True, ""),
+            claim_result=("ok", ""),
             caller_worktree="/wt/dispatcher-a",
         )
-        assert claim_calls == [("example-codespace", "/wt/dispatcher-a")]
+        assert claim_calls == [
+            ("example-codespace", "/wt/dispatcher-a", None)
+        ]
         assert session.status == SessionStatus.IDLE
 
     @pytest.mark.asyncio
@@ -3099,11 +5150,33 @@ class TestCodespaceExclusiveClaim:
         (bound onto the target as caller_worktree earlier in start_session)."""
         _, _session, claim_calls = await self._start(
             tmp_db, monkeypatch,
-            claim_result=(True, ""),
+            claim_result=("ok", ""),
             caller_worktree=None,
             caller_id="/wt/dispatcher-b",
         )
-        assert claim_calls == [("example-codespace", "/wt/dispatcher-b")]
+        assert claim_calls == [
+            ("example-codespace", "/wt/dispatcher-b", None)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_claim_forwards_caller_owner_ref(
+        self, tmp_db, monkeypatch
+    ) -> None:
+        _, session, claim_calls = await self._start(
+            tmp_db,
+            monkeypatch,
+            claim_result=("ok", ""),
+            caller_worktree="/wt/dispatcher-a",
+            caller_owner_ref="machine/project/worktree",
+        )
+        assert claim_calls == [
+            (
+                "example-codespace",
+                "/wt/dispatcher-a",
+                "machine/project/worktree",
+            )
+        ]
+        assert session.status == SessionStatus.IDLE
 
     @pytest.mark.asyncio
     async def test_conflict_bounces_session_failed(
@@ -3114,12 +5187,30 @@ class TestCodespaceExclusiveClaim:
         transport error."""
         _, session, _calls = await self._start(
             tmp_db, monkeypatch,
-            claim_result=(False, "[BUSY] held by /wt/other"),
+            claim_result=("conflict", "[BUSY] held by /wt/other"),
             caller_worktree="/wt/dispatcher-a",
         )
         assert session.status == SessionStatus.FAILED
         types = [e.event for e in session.event_log.get_events()]
         assert "codespace_claim_conflict" in types
+
+    @pytest.mark.asyncio
+    async def test_coordination_rejection_blocks_transport(
+        self, tmp_db, monkeypatch
+    ) -> None:
+        _, session, _calls = await self._start(
+            tmp_db,
+            monkeypatch,
+            claim_result=(
+                "coordination-rejected",
+                "[BLOCKED] knowledge_binding_required",
+            ),
+            caller_worktree="/wt/dispatcher-a",
+            caller_owner_ref="machine/project/worktree",
+        )
+        assert session.status == SessionStatus.FAILED
+        types = [e.event for e in session.event_log.get_events()]
+        assert "codespace_coordination_rejected" in types
 
     @pytest.mark.asyncio
     async def test_end_session_releases_claim(
@@ -3134,7 +5225,7 @@ class TestCodespaceExclusiveClaim:
         )
         manager, session, _calls = await self._start(
             tmp_db, monkeypatch,
-            claim_result=(True, ""),
+            claim_result=("ok", ""),
             caller_worktree="/wt/dispatcher-a",
         )
         await manager.end_session(session.session_id, force=True)
@@ -3154,8 +5245,8 @@ class TestClaimCodespaceHelper:
             sm.subprocess, "run",
             lambda *a, **k: SimpleNamespace(returncode=75, stdout="", stderr="[BUSY] x"),
         )
-        ok, detail = sm._claim_codespace("cs", "/wt/a")
-        assert ok is False
+        status, detail = sm._claim_codespace("cs", "/wt/a")
+        assert status == "conflict"
         assert "BUSY" in detail
 
     def test_success_on_zero_exit(self, monkeypatch) -> None:
@@ -3167,7 +5258,7 @@ class TestClaimCodespaceHelper:
             sm.subprocess, "run",
             lambda *a, **k: SimpleNamespace(returncode=0, stdout="[OK]", stderr=""),
         )
-        assert sm._claim_codespace("cs", "/wt/a") == (True, "")
+        assert sm._claim_codespace("cs", "/wt/a") == ("ok", "")
 
     def test_other_nonzero_is_degrade_safe(self, monkeypatch) -> None:
         from agent_bridge import session_manager as sm
@@ -3178,7 +5269,34 @@ class TestClaimCodespaceHelper:
             sm.subprocess, "run",
             lambda *a, **k: SimpleNamespace(returncode=2, stdout="", stderr="boom"),
         )
-        assert sm._claim_codespace("cs", "/wt/a") == (True, "")
+        assert sm._claim_codespace("cs", "/wt/a") == ("ok", "")
+
+    def test_coordination_rejection_is_blocking(self, monkeypatch) -> None:
+        from agent_bridge import session_manager as sm
+
+        monkeypatch.delenv("AGENT_CODESPACES_DISABLE_CLAIM", raising=False)
+        monkeypatch.setattr(sm.shutil, "which", lambda _: "/usr/bin/agent-codespaces")
+        seen = {}
+
+        def run(command, **kwargs):
+            seen["command"] = command
+            return SimpleNamespace(
+                returncode=78,
+                stdout="",
+                stderr="[BLOCKED] knowledge_binding_required",
+            )
+
+        monkeypatch.setattr(sm.subprocess, "run", run)
+        result = sm._claim_codespace(
+            "cs",
+            "/wt/a",
+            holder_ref="machine/project/worktree",
+        )
+        assert result[0] == "coordination-rejected"
+        assert seen["command"][-2:] == [
+            "--holder-ref",
+            "machine/project/worktree",
+        ]
 
     def test_no_owner_is_skip(self, monkeypatch) -> None:
         from agent_bridge import session_manager as sm
@@ -3190,7 +5308,7 @@ class TestClaimCodespaceHelper:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(sm.subprocess, "run", _run)
-        assert sm._claim_codespace("cs", "") == (True, "")
+        assert sm._claim_codespace("cs", "") == ("ok", "")
         assert called["ran"] is False
 
     def test_missing_binstub_is_skip(self, monkeypatch) -> None:
@@ -3198,7 +5316,7 @@ class TestClaimCodespaceHelper:
 
         monkeypatch.delenv("AGENT_CODESPACES_DISABLE_CLAIM", raising=False)
         monkeypatch.setattr(sm.shutil, "which", lambda _: None)
-        assert sm._claim_codespace("cs", "/wt/a") == (True, "")
+        assert sm._claim_codespace("cs", "/wt/a") == ("ok", "")
 
     def test_disabled_env_is_skip(self, monkeypatch) -> None:
         from agent_bridge import session_manager as sm
@@ -3211,8 +5329,35 @@ class TestClaimCodespaceHelper:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(sm.subprocess, "run", _run)
-        assert sm._claim_codespace("cs", "/wt/a") == (True, "")
+        assert sm._claim_codespace("cs", "/wt/a") == ("ok", "")
         assert called["ran"] is False
+
+    def test_disabled_env_with_holder_ref_still_preflights(
+        self, monkeypatch
+    ) -> None:
+        from agent_bridge import session_manager as sm
+
+        monkeypatch.setenv("AGENT_CODESPACES_DISABLE_CLAIM", "1")
+        monkeypatch.setattr(sm.shutil, "which", lambda _: "/usr/bin/agent-codespaces")
+        seen = {}
+
+        def run(command, **kwargs):
+            seen["command"] = command
+            return SimpleNamespace(
+                returncode=78,
+                stdout="",
+                stderr="[BLOCKED] knowledge_binding_required",
+            )
+
+        monkeypatch.setattr(sm.subprocess, "run", run)
+        status, detail = sm._claim_codespace(
+            "cs",
+            "/wt/a",
+            holder_ref="machine/project/worktree",
+        )
+        assert status == "coordination-rejected"
+        assert "knowledge_binding_required" in detail
+        assert "--holder-ref" in seen["command"]
 
 
 class TestReleaseCodespaceClaimHelper:
@@ -3259,3 +5404,181 @@ class TestCodespaceClaimKey:
 
         t = SpawnTarget(type="local", cwd="/tmp", caller_worktree="/wt/a")
         assert sm._codespace_claim_key(t) is None
+
+
+class TestClaimContainerHelper:
+    """``_claim_container`` shells ``agent-containers borrow`` and maps its
+    exit code the same way ``_claim_codespace`` does: 75 -> conflict
+    (bounce), 0/other -> proceed (degrade-safe). No coordination-rejected
+    leg exists here (containers have no cross-machine coordination)."""
+
+    def test_conflict_on_busy_exit(self, monkeypatch) -> None:
+        from agent_bridge import session_manager as sm
+
+        monkeypatch.delenv("AGENT_CONTAINERS_DISABLE_CLAIM", raising=False)
+        monkeypatch.setattr(sm.shutil, "which", lambda _: "/usr/bin/agent-containers")
+        monkeypatch.setattr(
+            sm.subprocess, "run",
+            lambda *a, **k: SimpleNamespace(returncode=75, stdout="", stderr="[BUSY] x"),
+        )
+        status, detail = sm._claim_container("box", "/wt/a")
+        assert status == "conflict"
+        assert "BUSY" in detail
+
+    def test_success_on_zero_exit(self, monkeypatch) -> None:
+        from agent_bridge import session_manager as sm
+
+        monkeypatch.delenv("AGENT_CONTAINERS_DISABLE_CLAIM", raising=False)
+        monkeypatch.setattr(sm.shutil, "which", lambda _: "/usr/bin/agent-containers")
+        seen = {}
+
+        def run(command, **kwargs):
+            seen["command"] = command
+            return SimpleNamespace(returncode=0, stdout="box", stderr="")
+
+        monkeypatch.setattr(sm.subprocess, "run", run)
+        assert sm._claim_container("box", "/wt/a") == ("ok", "")
+        assert seen["command"] == [
+            "/usr/bin/agent-containers", "borrow", "/wt/a",
+            "--container", "box",
+        ]
+
+    def test_other_nonzero_is_degrade_safe(self, monkeypatch) -> None:
+        from agent_bridge import session_manager as sm
+
+        monkeypatch.delenv("AGENT_CONTAINERS_DISABLE_CLAIM", raising=False)
+        monkeypatch.setattr(sm.shutil, "which", lambda _: "/usr/bin/agent-containers")
+        monkeypatch.setattr(
+            sm.subprocess, "run",
+            lambda *a, **k: SimpleNamespace(returncode=2, stdout="", stderr="boom"),
+        )
+        assert sm._claim_container("box", "/wt/a") == ("ok", "")
+
+    def test_no_owner_is_skip(self, monkeypatch) -> None:
+        from agent_bridge import session_manager as sm
+
+        called = {"ran": False}
+
+        def _run(*a, **k):
+            called["ran"] = True
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(sm.subprocess, "run", _run)
+        assert sm._claim_container("box", "") == ("ok", "")
+        assert called["ran"] is False
+
+    def test_missing_binstub_is_skip(self, monkeypatch) -> None:
+        from agent_bridge import session_manager as sm
+
+        monkeypatch.delenv("AGENT_CONTAINERS_DISABLE_CLAIM", raising=False)
+        monkeypatch.setattr(sm.shutil, "which", lambda _: None)
+        assert sm._claim_container("box", "/wt/a") == ("ok", "")
+
+    def test_disabled_env_is_skip(self, monkeypatch) -> None:
+        from agent_bridge import session_manager as sm
+
+        monkeypatch.setenv("AGENT_CONTAINERS_DISABLE_CLAIM", "1")
+        called = {"ran": False}
+
+        def _run(*a, **k):
+            called["ran"] = True
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(sm.subprocess, "run", _run)
+        assert sm._claim_container("box", "/wt/a") == ("ok", "")
+        assert called["ran"] is False
+
+
+class TestReleaseContainerClaimHelper:
+    def test_missing_binstub_is_not_confirmed(self, monkeypatch) -> None:
+        from agent_bridge import session_manager as sm
+
+        monkeypatch.delenv("AGENT_CONTAINERS_DISABLE_CLAIM", raising=False)
+        monkeypatch.setattr(sm.shutil, "which", lambda _: None)
+        assert sm._release_container_claim("box", "/wt/a") is False
+
+    def test_disabled_claim_needs_no_release(self, monkeypatch) -> None:
+        from agent_bridge import session_manager as sm
+
+        monkeypatch.setenv("AGENT_CONTAINERS_DISABLE_CLAIM", "1")
+        assert sm._release_container_claim("box", "/wt/a") is True
+
+    def test_success_shells_release(self, monkeypatch) -> None:
+        from agent_bridge import session_manager as sm
+
+        monkeypatch.delenv("AGENT_CONTAINERS_DISABLE_CLAIM", raising=False)
+        monkeypatch.setattr(sm.shutil, "which", lambda _: "/usr/bin/agent-containers")
+        seen = {}
+
+        def run(command, **kwargs):
+            seen["command"] = command
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(sm.subprocess, "run", run)
+        assert sm._release_container_claim("box", "/wt/a") is True
+        assert seen["command"] == ["/usr/bin/agent-containers", "release", "box"]
+
+
+class TestContainerClaimKey:
+    """``_container_claim_key`` resolves (name, owner) from a target for the
+    end-session release -- the container counterpart to
+    ``_codespace_claim_key``."""
+
+    def test_structured_container_dict(self) -> None:
+        from agent_bridge import session_manager as sm
+
+        t = SpawnTarget(
+            type="command", cwd="/workspaces/x", caller_worktree="/wt/a",
+            container={"name": "box-1"},
+        )
+        assert sm._container_claim_key(t) == ("box-1", "/wt/a")
+
+    def test_no_owner_returns_none(self) -> None:
+        from agent_bridge import session_manager as sm
+
+        t = SpawnTarget(
+            type="command", cwd="/workspaces/x", container={"name": "box-1"},
+        )
+        assert sm._container_claim_key(t) is None
+
+    def test_non_container_returns_none(self) -> None:
+        from agent_bridge import session_manager as sm
+
+        t = SpawnTarget(type="local", cwd="/tmp", caller_worktree="/wt/a")
+        assert sm._container_claim_key(t) is None
+
+
+
+class TestContainerRemoteChildArgv:
+    """Tests for _container_remote_child_argv's copilot_args forwarding
+    (the trusted/SSH container route's own charter-overlay support --
+    separate from the restricted/docker-exec route's own, in
+    agent_containers.resolver._append_copilot_args)."""
+
+    def test_no_copilot_args_is_unchanged(self):
+        argv = _container_remote_child_argv(
+            {"acp_command": "copilot --acp --stdio"}, {}, [],
+        )
+        assert argv == ["bash", "-lc", "copilot --acp --stdio"]
+
+    def test_copilot_args_are_quoted_and_appended(self):
+        argv = _container_remote_child_argv(
+            {"acp_command": "copilot --acp --stdio"},
+            {},
+            [],
+            copilot_args=["--agent", "some charter"],
+        )
+        assert argv == [
+            "bash", "-lc",
+            "copilot --acp --stdio --agent 'some charter'",
+        ]
+
+    def test_copilot_args_apply_after_remote_env_sourcing(self):
+        argv = _container_remote_child_argv(
+            {"acp_command": "copilot --acp --stdio"},
+            {"remote_env": "/tmp/env.sh"},
+            [],
+            copilot_args=["--agent", "some-charter"],
+        )
+        assert argv[-1].endswith("copilot --acp --stdio --agent some-charter")
+        assert argv[-1].startswith(". /tmp/env.sh; rm -f /tmp/env.sh;")

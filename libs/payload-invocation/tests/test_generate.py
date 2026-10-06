@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -69,6 +70,74 @@ def _multi_manifest(tmp_path: Path) -> Path:
     return path
 
 
+def _required_context_manifest(tmp_path: Path) -> Path:
+    path = _manifest(tmp_path)
+    scripts = path.parent / "scripts"
+    (scripts / "invoke-payload-runtime.sh").write_text(
+        "#!/usr/bin/env bash\n", encoding="utf-8"
+    )
+    (scripts / "invoke-payload-runtime.ps1").write_text(
+        "# generated fixture\n", encoding="utf-8"
+    )
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.update(
+        {
+            "version": 2,
+            "command": "agent-machines",
+            "module": "agent_machines",
+            "legacyRuntimeRoot": data.pop("runtimeRoot"),
+            "installationContext": "required",
+            "payloadRootEnv": "AGENT_MACHINES_PAYLOAD_ROOT",
+            "payloadDispatcher": {
+                "posix": "scripts/invoke-payload-runtime.sh",
+                "windows": "scripts/invoke-payload-runtime.ps1",
+            },
+        }
+    )
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def _required_context_multi_manifest(tmp_path: Path) -> Path:
+    path = _required_context_manifest(tmp_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    primary = {
+        field: data.pop(field) for field in ("command", "module", "purpose")
+    }
+    data["plugin"] = "agent-machines"
+    data["commands"] = [
+        primary,
+        {
+            "command": "agent-machines-helper",
+            "module": "agent_machines.helper",
+            "purpose": "Exercise an example helper",
+        },
+    ]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def _write_runtime_completion(slot: Path, version: str) -> None:
+    (slot / ".install-complete.json").write_text(
+        json.dumps(
+            {
+                "version": version,
+                "completed_at": "2026-01-01T00:00:00Z",
+                "pid": 123,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _read_jsonl(path: Path) -> list[dict[str, object]]:
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 def test_generates_three_payload_local_shims(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
     assert generator.process_manifest(manifest, check=False) == []
@@ -89,6 +158,33 @@ def test_generates_three_payload_local_shims(tmp_path: Path) -> None:
         assert (
             manifest.parent / "scripts" / "emit-command-catalog.sh"
         ).stat().st_mode & 0o100
+
+
+def test_accepts_non_agent_runtime_plugin_identity(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["command"] = "budget-guidance"
+    data["module"] = "budget_guidance"
+    data["runtimeRoot"] = ".budget-guidance"
+    data["noSelfProvisionEnv"] = "BUDGET_GUIDANCE_NO_SELFPROVISION"
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+
+    loaded = generator.load_manifest(manifest)
+
+    assert loaded["plugin"] == "budget-guidance"
+
+
+def test_shell_catalog_mode_is_python_independent(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["posixCatalogMode"] = "shell"
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+
+    generated = generator.expected_files(manifest)
+    catalog = generated[manifest.parent / "scripts" / "emit-command-catalog.sh"]
+
+    assert "command -v python" not in catalog
+    assert "json_escape" in catalog
 
 
 def test_payload_root_env_is_opt_in_and_preserves_defaults(tmp_path: Path) -> None:
@@ -118,6 +214,70 @@ def test_payload_root_env_is_opt_in_and_preserves_defaults(tmp_path: Path) -> No
     assert "} finally {" in generated[powershell_path]
 
 
+def test_boot_trace_log_file_defaults_and_can_be_overridden(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    baseline = generator.expected_files(manifest)
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["bootTraceLogFile"] = "logs/activity.jsonl"
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    generated = generator.expected_files(manifest)
+
+    posix_path = manifest.parent / "bin" / "agent-example"
+    powershell_path = manifest.parent / "bin" / "agent-example.ps1"
+    assert "logs/boot-trace.jsonl" in baseline[posix_path]
+    assert "logs\\boot-trace.jsonl" in baseline[powershell_path]
+    assert "logs/activity.jsonl" in generated[posix_path]
+    assert "logs\\activity.jsonl" in generated[powershell_path]
+
+
+@pytest.mark.parametrize(
+    "boot_trace_log_file",
+    [
+        123,
+        True,
+        None,
+        "",
+        "logs//boot.jsonl",
+        "/logs/boot.jsonl",
+        "logs/boot.jsonl/",
+        "../logs/boot.jsonl",
+        "logs/../boot.jsonl",
+        "logs/..",
+    ],
+)
+def test_boot_trace_log_file_rejects_unsafe_values(
+    tmp_path: Path,
+    boot_trace_log_file: object,
+) -> None:
+    """Regression (Copilot review, PR #3310): non-string values, `..`
+    traversal, and empty path components (a leading/trailing/doubled `/`)
+    must all be rejected -- an empty component would silently break the
+    writer's directory-creation logic at runtime, and `..` would let a
+    plugin manifest point the durable log outside its own runtime root."""
+    manifest = _manifest(tmp_path)
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["bootTraceLogFile"] = boot_trace_log_file
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid bootTraceLogFile"):
+        generator.load_manifest(manifest)
+
+
+def test_session_start_bootstrap_defaults_true_and_requires_boolean(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path)
+    assert generator.load_manifest(manifest)["sessionStartBootstrap"] is True
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["sessionStartBootstrap"] = False
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    assert generator.load_manifest(manifest)["sessionStartBootstrap"] is False
+    data["sessionStartBootstrap"] = "false"
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="sessionStartBootstrap"):
+        generator.load_manifest(manifest)
+
+
 def test_payload_dispatcher_delegates_both_platform_shims(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
     scripts = manifest.parent / "scripts"
@@ -137,9 +297,13 @@ def test_payload_dispatcher_delegates_both_platform_shims(tmp_path: Path) -> Non
     powershell = generated[manifest.parent / "bin" / "agent-example.ps1"]
     assert 'exec "$_payload_root/scripts/runtime-gate.sh" "$@"' in posix
     assert 'export AGENT_EXAMPLE_PAYLOAD_ROOT="$_payload_root"' in posix
+    assert "COPILOT_EXTENSIONS_BOOT_TRACE_PLUGIN" in posix
+    assert "_boot_trace shim-start" in posix
     assert "$_payloadDispatcher = Join-Path $_payloadRoot 'scripts\\runtime-gate.ps1'" in powershell
     assert "$env:AGENT_EXAMPLE_PAYLOAD_ROOT = $_payloadRoot" in powershell
     assert "& $_payloadDispatcher @args" in powershell
+    assert "COPILOT_EXTENSIONS_BOOT_TRACE_PLUGIN" in powershell
+    assert "Write-BootTrace 'shim-start'" in powershell
     assert "_resolve_runtime" not in posix
     assert "Resolve-PayloadRuntime" not in powershell
 
@@ -154,6 +318,1405 @@ def test_payload_dispatcher_requires_platform_parity(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="must declare both"):
         generator.load_manifest(manifest)
+
+
+def test_catalog_gate_is_root_relative_and_rendered_on_both_platforms(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path)
+    gate = manifest.parent / "scripts" / "catalog_gate.py"
+    gate.write_text("raise SystemExit(0)\n", encoding="utf-8")
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["catalogGate"] = "scripts/catalog_gate.py"
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+
+    generated = generator.expected_files(manifest)
+
+    posix = generated[manifest.parent / "scripts" / "emit-command-catalog.sh"]
+    powershell = generated[
+        manifest.parent / "scripts" / "emit-command-catalog.ps1"
+    ]
+    assert 'catalog_gate="$self_root/scripts/catalog_gate.py"' in posix
+    assert '"$py" -E -X utf8 "$catalog_gate" --check --cwd "$PWD"' in posix
+    assert "$catalogGate = Join-Path $selfRoot 'scripts\\catalog_gate.py'" in powershell
+    assert "-E -X utf8 $catalogGate --check" in powershell
+
+    data["catalogGate"] = "../escape.py"
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="catalogGate"):
+        generator.load_manifest(manifest)
+
+
+def test_required_installation_context_uses_fixed_dispatchers(tmp_path: Path) -> None:
+    manifest = _required_context_manifest(tmp_path)
+
+    data = generator.load_manifest(manifest)
+    generated = generator.expected_files(manifest)
+
+    assert data["installationContext"] == "required"
+    assert data["runtimeRoot"] == ".agent-example"
+    posix = generated[manifest.parent / "bin" / "agent-machines"]
+    powershell = generated[manifest.parent / "bin" / "agent-machines.ps1"]
+    assert "if ! command -v bash >/dev/null 2>&1; then" in posix
+    assert "[agent-machines] required payload dispatcher needs bash." in posix
+    assert 'exec bash "$_payload_root/scripts/invoke-payload-runtime.sh" "$@"' in posix
+    assert "COPILOT_EXTENSIONS_BOOT_TRACE_PLUGIN" in posix
+    assert "$env:AGENT_MACHINES_PAYLOAD_ROOT = $_payloadRoot" in powershell
+    assert "COPILOT_EXTENSIONS_BOOT_TRACE_PLUGIN" in powershell
+    assert "Resolve-PayloadRuntime" not in powershell
+
+
+def test_required_multi_command_dispatchers_export_command_metadata(
+    tmp_path: Path,
+) -> None:
+    manifest = _required_context_multi_manifest(tmp_path)
+
+    generated = generator.expected_files(manifest)
+
+    posix = generated[manifest.parent / "bin" / "agent-machines-helper"]
+    powershell = generated[
+        manifest.parent / "bin" / "agent-machines-helper.ps1"
+    ]
+    assert (
+        'export COPILOT_EXTENSIONS_PAYLOAD_COMMAND="$_command"' in posix
+    )
+    assert (
+        'export COPILOT_EXTENSIONS_PAYLOAD_MODULE="agent_machines.helper"' in posix
+    )
+    assert (
+        "$env:COPILOT_EXTENSIONS_PAYLOAD_COMMAND = $_command" in powershell
+    )
+    assert (
+        "$env:COPILOT_EXTENSIONS_PAYLOAD_MODULE = 'agent_machines.helper'"
+        in powershell
+    )
+
+
+@pytest.mark.parametrize("version", [True, False])
+def test_manifest_version_rejects_json_booleans(
+    tmp_path: Path,
+    version: bool,
+) -> None:
+    manifest = _manifest(tmp_path)
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["version"] = version
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="version 1 or 2"):
+        generator.load_manifest(manifest)
+
+
+@pytest.mark.parametrize("plugin", ["agent-unrelated", "context-handoff"])
+def test_required_installation_context_rejects_ineligible_plugin(
+    tmp_path: Path,
+    plugin: str,
+) -> None:
+    manifest = _required_context_manifest(tmp_path)
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["command"] = plugin
+    data["plugin"] = plugin
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="runtime-bearing core suite plugin identities|invalid plugin",
+    ):
+        generator.load_manifest(manifest)
+
+
+@pytest.mark.parametrize("catalog", [None, "{\n"])
+def test_required_installation_context_requires_valid_canonical_roster(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    catalog: str | None,
+) -> None:
+    manifest = _required_context_manifest(tmp_path)
+    repo = tmp_path / "isolated-repo"
+    if catalog is not None:
+        marketplace = repo / ".github" / "plugin" / "marketplace.json"
+        marketplace.parent.mkdir(parents=True)
+        marketplace.write_text(catalog, encoding="utf-8")
+    monkeypatch.setattr(generator, "REPO", repo)
+
+    with pytest.raises(ValueError, match="cannot load canonical marketplace roster"):
+        generator.load_manifest(manifest)
+
+
+def test_v1_rejects_installation_context_fields_without_changing_defaults(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path)
+    baseline = generator.expected_files(manifest)
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["installationContext"] = "required"
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="version 1 cannot declare"):
+        generator.load_manifest(manifest)
+
+    data.pop("installationContext")
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    assert generator.expected_files(manifest) == baseline
+
+
+def _copied_agent_machines_payload(tmp_path: Path) -> Path:
+    payload = tmp_path / "agent-machines"
+    shutil.copytree(
+        REPO / "plugins" / "agent-machines",
+        payload,
+        ignore=shutil.ignore_patterns(
+            ".pytest_cache",
+            ".ruff_cache",
+            "__pycache__",
+            "*.pyc",
+            "*.egg-info",
+        ),
+    )
+    return payload
+
+
+def _agent_procutil_src(payload: Path) -> Path:
+    local = payload / "libs" / "agent-procutil" / "src"
+    if local.is_dir():
+        return local
+    return REPO / "libs" / "agent-procutil" / "src"
+
+
+def _directory_marketplace_agent_machines_payload(tmp_path: Path) -> Path:
+    marketplace = tmp_path / "marketplace"
+    payload = marketplace / "plugins" / "agent-machines"
+    shutil.copytree(
+        REPO / "plugins" / "agent-machines",
+        payload,
+        ignore=shutil.ignore_patterns(
+            ".pytest_cache",
+            ".ruff_cache",
+            "__pycache__",
+            "*.pyc",
+            "*.egg-info",
+        ),
+    )
+    write_json = {
+        "name": "example",
+        "owner": {"name": "Example"},
+        "metadata": {"version": "1.0.0"},
+        "plugins": [
+            {
+                "name": "agent-machines",
+                "description": "Synthetic directory marketplace fixture",
+                "version": json.loads(
+                    (payload / "plugin.json").read_text(encoding="utf-8")
+                )["version"],
+                "source": "plugins/agent-machines",
+            }
+        ],
+    }
+    catalog = marketplace / ".github" / "plugin" / "marketplace.json"
+    catalog.parent.mkdir(parents=True)
+    catalog.write_text(json.dumps(write_json), encoding="utf-8")
+    return payload
+
+
+def _stamp_agent_machines_context(
+    tmp_path: Path,
+    payload: Path,
+    pwsh: str,
+    *,
+    explicit_source: bool = True,
+    durable_home: Path | None = None,
+) -> Path:
+    version = json.loads(
+        (payload / "plugin.json").read_text(encoding="utf-8")
+    )["version"]
+    arguments = [
+        pwsh,
+        "-NoProfile",
+        "-File",
+        str(REPO / "libs" / "installation-context" / "installation-context.ps1"),
+        "stamp",
+    ]
+    if explicit_source:
+        arguments.extend(
+            [
+                "-SourceJson",
+                '{"source":"github","repo":"example-org/example-marketplace"}',
+                "-MarketplaceKey",
+                "example",
+            ]
+        )
+    arguments.extend(
+        [
+            "-PluginId",
+            "agent-machines",
+            "-PayloadRoot",
+            str(payload),
+            "-PayloadVersion",
+            version,
+            "-PayloadOrigin",
+            "explicit",
+            "-ExpectedNamespaceGeneration",
+            "0",
+            "-ExpectedInstallGeneration",
+            "0",
+            "-DurableHome",
+            str(durable_home or tmp_path / "durable"),
+        ]
+    )
+    result = subprocess.run(
+        arguments,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return Path(json.loads(result.stdout)["installReceipt"])
+
+
+def _activate_agent_machines_context(
+    tmp_path: Path,
+    home: Path,
+    context: Path,
+    pwsh: str,
+    *,
+    durable_home: Path | None = None,
+) -> Path:
+    install = json.loads(context.read_text(encoding="utf-8"))
+    namespace = json.loads(
+        Path(install["namespaceReceipt"]).read_text(encoding="utf-8")
+    )
+    policy = home / ".copilot-extensions" / "installation-mode.json"
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text(
+        json.dumps(
+            {
+                "schema": "copilot-extensions.installation-mode",
+                "version": 1,
+                "installationMode": {"enabled": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment.update({"HOME": str(home), "USERPROFILE": str(home)})
+    result = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(REPO / "libs" / "installation-context" / "installation-context.ps1"),
+            "activation-cas",
+            "-Context",
+            str(context),
+            "-ExpectedMarketplaceId",
+            install["marketplaceId"],
+            "-ExpectedPluginId",
+            "agent-machines",
+            "-ExpectedNamespaceGeneration",
+            str(namespace["generation"]),
+            "-ExpectedInstallGeneration",
+            str(install["generation"]),
+            "-ExpectedActivationGeneration",
+            "0",
+            "-ActivationMode",
+            "namespaced",
+            "-ActivationState",
+            "active",
+            "-LegacyDisposition",
+            "absent",
+            "-LegacyProbeJson",
+            '{"declared":true,"result":"absent","checkedAt":"2026-01-01T00:00:00Z"}',
+            "-LegacyRoot",
+            str(home / ".agent-machines"),
+            "-DurableHome",
+            str(durable_home or tmp_path / "durable"),
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    json.loads(result.stdout)
+    return context.parent
+
+
+def _copied_agent_worktrees_payload(tmp_path: Path) -> Path:
+    payload = tmp_path / "agent-worktrees"
+    shutil.copytree(
+        REPO / "plugins" / "agent-worktrees",
+        payload,
+        ignore=shutil.ignore_patterns(
+            ".pytest_cache",
+            ".ruff_cache",
+            "__pycache__",
+            "*.pyc",
+            "*.egg-info",
+        ),
+    )
+    return payload
+
+
+def _stamp_agent_worktrees_context(
+    tmp_path: Path,
+    payload: Path,
+    pwsh: str,
+) -> Path:
+    version = json.loads(
+        (payload / "plugin.json").read_text(encoding="utf-8")
+    )["version"]
+    result = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(REPO / "libs" / "installation-context" / "installation-context.ps1"),
+            "stamp",
+            "-SourceJson",
+            '{"source":"github","repo":"example-org/example-marketplace"}',
+            "-MarketplaceKey",
+            "example",
+            "-PluginId",
+            "agent-worktrees",
+            "-PayloadRoot",
+            str(payload),
+            "-PayloadVersion",
+            version,
+            "-PayloadOrigin",
+            "explicit",
+            "-ExpectedNamespaceGeneration",
+            "0",
+            "-ExpectedInstallGeneration",
+            "0",
+            "-DurableHome",
+            str(tmp_path / "durable"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return Path(json.loads(result.stdout)["installReceipt"])
+
+
+def _activate_agent_worktrees_context(
+    tmp_path: Path,
+    home: Path,
+    context: Path,
+    pwsh: str,
+) -> Path:
+    install = json.loads(context.read_text(encoding="utf-8"))
+    namespace = json.loads(
+        Path(install["namespaceReceipt"]).read_text(encoding="utf-8")
+    )
+    policy = home / ".copilot-extensions" / "installation-mode.json"
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text(
+        json.dumps(
+            {
+                "schema": "copilot-extensions.installation-mode",
+                "version": 1,
+                "installationMode": {"enabled": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment.update({"HOME": str(home), "USERPROFILE": str(home)})
+    result = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(REPO / "libs" / "installation-context" / "installation-context.ps1"),
+            "activation-cas",
+            "-Context",
+            str(context),
+            "-ExpectedMarketplaceId",
+            install["marketplaceId"],
+            "-ExpectedPluginId",
+            "agent-worktrees",
+            "-ExpectedNamespaceGeneration",
+            str(namespace["generation"]),
+            "-ExpectedInstallGeneration",
+            str(install["generation"]),
+            "-ExpectedActivationGeneration",
+            "0",
+            "-ActivationMode",
+            "namespaced",
+            "-ActivationState",
+            "active",
+            "-LegacyDisposition",
+            "absent",
+            "-LegacyProbeJson",
+            '{"declared":true,"result":"absent","checkedAt":"2026-01-01T00:00:00Z"}',
+            "-LegacyRoot",
+            str(home / ".agent-worktrees"),
+            "-DurableHome",
+            str(tmp_path / "durable"),
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    json.loads(result.stdout)
+    return context.parent
+
+
+def _agent_worktrees_test_environment(
+    home: Path,
+    payload: Path,
+) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "COPILOT_PLUGIN_ROOT": str(payload),
+            "PYTHONPATH": os.pathsep.join(
+                [
+                    str(payload / "src"),
+                    str(payload / "libs" / "config-migrate" / "src"),
+                    str(payload / "libs" / "plugin-resolve" / "src"),
+                    str(_agent_procutil_src(payload)),
+                    str(payload / "libs" / "dropin-registry" / "src"),
+                    str(payload / "libs" / "plugin-activation" / "src"),
+                ]
+            ),
+            "TEST_PYTHON": sys.executable,
+        }
+    )
+    return environment
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or shutil.which("pwsh") is None,
+    reason="canonical Windows profile semantics require native Windows",
+)
+@pytest.mark.parametrize("policy_state", ["absent", "explicit-false"])
+def test_agent_worktrees_required_context_preserves_legacy_default(
+    tmp_path: Path,
+    policy_state: str,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh
+    payload = _copied_agent_worktrees_payload(tmp_path)
+    (payload / "scripts" / "resolve-runtime.ps1").write_text(
+        "$AgentRtPy = $env:TEST_PYTHON\n",
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    if policy_state == "explicit-false":
+        policy = home / ".copilot-extensions" / "installation-mode.json"
+        policy.parent.mkdir(parents=True)
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema": "copilot-extensions.installation-mode",
+                    "version": 1,
+                    "installationMode": {"enabled": False},
+                }
+            ),
+            encoding="utf-8",
+        )
+    environment = _agent_worktrees_test_environment(home, payload)
+    environment.pop("COPILOT_EXTENSIONS_CONTEXT", None)
+
+    result = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(payload / "bin" / "payload" / "agent-worktrees.ps1"),
+            "--version",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("agent-worktrees ")
+    assert not (home / ".agent-worktrees").exists()
+    if policy_state == "absent":
+        assert not (home / ".copilot-extensions").exists()
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is not installed")
+def test_agent_worktrees_requested_context_never_falls_back_to_legacy(
+    tmp_path: Path,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh
+    payload = _copied_agent_worktrees_payload(tmp_path)
+    context = _stamp_agent_worktrees_context(tmp_path, payload, pwsh)
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = _agent_worktrees_test_environment(home, payload)
+    environment.update(
+        {
+            "COPILOT_EXTENSIONS_CONTEXT": str(context),
+            "AGENT_WORKTREES_NO_SELFPROVISION": "1",
+        }
+    )
+
+    result = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(payload / "bin" / "payload" / "agent-worktrees.ps1"),
+            "--version",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 126
+    assert "requested installation context is not active" in result.stderr
+    assert not (home / ".agent-worktrees").exists()
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or shutil.which("pwsh") is None,
+    reason="canonical Windows profile semantics require native Windows",
+)
+def test_agent_worktrees_active_context_selects_only_its_cell_root(
+    tmp_path: Path,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh
+    payload = _copied_agent_worktrees_payload(tmp_path)
+    context = _stamp_agent_worktrees_context(tmp_path, payload, pwsh)
+    home = tmp_path / "home"
+    home.mkdir()
+    plugin_root = _activate_agent_worktrees_context(tmp_path, home, context, pwsh)
+    root_record = tmp_path / "selected-root.txt"
+    (payload / "scripts" / "resolve-runtime.ps1").write_text(
+        "[IO.File]::WriteAllText($env:TEST_ROOT_RECORD, $env:AGENT_RT_ROOT)\n"
+        "$AgentRtPy = $env:TEST_PYTHON\n",
+        encoding="utf-8",
+    )
+    environment = _agent_worktrees_test_environment(home, payload)
+    environment.update(
+        {
+            "COPILOT_EXTENSIONS_CONTEXT": str(context),
+            "TEST_ROOT_RECORD": str(root_record),
+        }
+    )
+
+    result = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(payload / "bin" / "payload" / "agent-worktrees.ps1"),
+            "--version",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert root_record.read_text(encoding="utf-8") == str(plugin_root)
+    assert not (home / ".agent-worktrees").exists()
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or shutil.which("pwsh") is None,
+    reason="canonical Windows profile semantics require native Windows",
+)
+def test_agent_worktrees_active_context_provisions_only_its_cell_root(
+    tmp_path: Path,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh
+    payload = _copied_agent_worktrees_payload(tmp_path)
+    context = _stamp_agent_worktrees_context(tmp_path, payload, pwsh)
+    home = tmp_path / "home"
+    home.mkdir()
+    plugin_root = _activate_agent_worktrees_context(tmp_path, home, context, pwsh)
+    install_record = tmp_path / "install-record.txt"
+    (payload / "scripts" / "resolve-runtime.ps1").write_text(
+        "$AgentRtPy = $null\n",
+        encoding="utf-8",
+    )
+    (payload / "scripts" / "install.ps1").write_text(
+        "param([Parameter(Position=0)][string]$Action, [string]$InstallDir)\n"
+        "[IO.File]::WriteAllText(\n"
+        "  $env:TEST_INSTALL_RECORD,\n"
+        "  ($Action + '|' + $InstallDir + '|' + $env:COPILOT_EXTENSIONS_CONTEXT)\n"
+        ")\n"
+        "$resolver = Join-Path $PSScriptRoot 'resolve-runtime.ps1'\n"
+        "[IO.File]::WriteAllText($resolver, '$AgentRtPy = $env:TEST_PYTHON' + [Environment]::NewLine)\n",
+        encoding="utf-8",
+    )
+    environment = _agent_worktrees_test_environment(home, payload)
+    environment.update(
+        {
+            "COPILOT_EXTENSIONS_CONTEXT": str(context),
+            "TEST_INSTALL_RECORD": str(install_record),
+        }
+    )
+
+    result = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(payload / "bin" / "payload" / "agent-worktrees.ps1"),
+            "--version",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert install_record.read_text(encoding="utf-8") == (
+        f"install|{plugin_root}|{context}"
+    )
+    assert not (home / ".agent-worktrees").exists()
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or shutil.which("pwsh") is None,
+    reason="Windows file-lock serialization",
+)
+def test_agent_worktrees_namespaced_first_use_is_single_flight(
+    tmp_path: Path,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh
+    payload = _copied_agent_worktrees_payload(tmp_path)
+    context = _stamp_agent_worktrees_context(tmp_path, payload, pwsh)
+    home = tmp_path / "home"
+    home.mkdir()
+    _activate_agent_worktrees_context(tmp_path, home, context, pwsh)
+    install_record = tmp_path / "install-record.txt"
+    (payload / "scripts" / "resolve-runtime.ps1").write_text(
+        "$AgentRtPy = $null\n",
+        encoding="utf-8",
+    )
+    (payload / "scripts" / "install.ps1").write_text(
+        "param([Parameter(Position=0)][string]$Action, [string]$InstallDir)\n"
+        "Add-Content -LiteralPath $env:TEST_INSTALL_RECORD -Value $PID\n"
+        "Start-Sleep -Seconds 1\n"
+        "$resolver = Join-Path $PSScriptRoot 'resolve-runtime.ps1'\n"
+        "[IO.File]::WriteAllText($resolver, '$AgentRtPy = $env:TEST_PYTHON' + [Environment]::NewLine)\n",
+        encoding="utf-8",
+    )
+    environment = _agent_worktrees_test_environment(home, payload)
+    environment.update(
+        {
+            "COPILOT_EXTENSIONS_CONTEXT": str(context),
+            "TEST_INSTALL_RECORD": str(install_record),
+        }
+    )
+    command = [
+        pwsh,
+        "-NoProfile",
+        "-File",
+        str(payload / "bin" / "payload" / "agent-worktrees.ps1"),
+        "--version",
+    ]
+
+    first = subprocess.Popen(
+        command,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    second = subprocess.Popen(
+        command,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    first_stdout, first_stderr = first.communicate(timeout=90)
+    second_stdout, second_stderr = second.communicate(timeout=90)
+
+    assert first.returncode == 0, first_stderr
+    assert second.returncode == 0, second_stderr
+    assert first_stdout.startswith("agent-worktrees ")
+    assert second_stdout.startswith("agent-worktrees ")
+    assert len(install_record.read_text(encoding="utf-8").splitlines()) == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX payload dispatcher semantics")
+def test_agent_worktrees_posix_requested_context_never_uses_legacy(
+    tmp_path: Path,
+) -> None:
+    payload = _copied_agent_worktrees_payload(tmp_path)
+    mode_runner = payload / "scripts" / "installation-context" / "installation-context.sh"
+    mode_runner.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' "
+        "'{\"status\":\"ready\",\"reason\":\"policy-default-false\","
+        "\"actualMode\":\"legacy\",\"desiredMode\":\"legacy\"}'\n",
+        encoding="utf-8",
+    )
+    mode_runner.chmod(0o755)
+    (payload / "scripts" / "resolve-runtime.sh").write_text(
+        'AGENT_RT_PY="$TEST_PYTHON"\n',
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = _agent_worktrees_test_environment(home, payload)
+    environment.update(
+        {
+            "COPILOT_EXTENSIONS_CONTEXT": str(tmp_path / "requested" / "install.json"),
+            "AGENT_WORKTREES_NO_SELFPROVISION": "1",
+        }
+    )
+
+    result = subprocess.run(
+        [str(payload / "bin" / "payload" / "agent-worktrees"), "--version"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 126
+    assert "requested installation context is not active" in result.stderr
+    assert not (home / ".agent-worktrees").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX policy parsing semantics")
+@pytest.mark.parametrize(
+    ("policy_text", "expected_code"),
+    [
+        (
+            json.dumps(
+                {
+                    "schema": "copilot-extensions.installation-mode",
+                    "version": 1,
+                    "installationMode": {"enabled": False},
+                }
+            ),
+            0,
+        ),
+        ("{\n", 126),
+    ],
+)
+def test_agent_worktrees_posix_simple_legacy_requires_readable_policy(
+    tmp_path: Path,
+    policy_text: str,
+    expected_code: int,
+) -> None:
+    payload = _copied_agent_worktrees_payload(tmp_path)
+    mode_runner = payload / "scripts" / "installation-context" / "installation-context.sh"
+    mode_runner.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' "
+        "'{\"status\":\"provenance-blocked\",\"reason\":\"source-unresolved\","
+        "\"actualMode\":\"legacy\",\"desiredMode\":\"legacy\","
+        "\"policy\":{\"state\":\"valid\",\"enabled\":false},"
+        "\"legacy\":{\"tombstone\":null,\"disposition\":\"active\"}}'\n",
+        encoding="utf-8",
+    )
+    mode_runner.chmod(0o755)
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(0o755)
+    (payload / "scripts" / "resolve-runtime.sh").write_text(
+        'AGENT_RT_PY="$TEST_PYTHON"\n',
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    policy = home / ".copilot-extensions" / "installation-mode.json"
+    policy.parent.mkdir(parents=True)
+    policy.write_text(policy_text, encoding="utf-8")
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    (fake_bin / "id").write_text(
+        "#!/bin/sh\n[ \"${1:-}\" = -u ] && { printf 123; exit 0; }\nexit 1\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "getent").write_text(
+        f"#!/bin/sh\nprintf 'user:x:123:123::%s:/bin/sh\\n' {shlex.quote(str(home))}\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "id").chmod(0o755)
+    (fake_bin / "getent").chmod(0o755)
+    environment = _agent_worktrees_test_environment(home, payload)
+    environment.update(
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
+            "TEST_PYTHON": str(fake_python),
+        }
+    )
+    environment.pop("COPILOT_EXTENSIONS_CONTEXT", None)
+
+    result = subprocess.run(
+        [str(payload / "bin" / "payload" / "agent-worktrees"), "--version"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == expected_code, result.stderr
+    if expected_code:
+        assert "installation context blocks invocation" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX payload dispatcher semantics")
+def test_agent_worktrees_posix_active_context_selects_cell_root(
+    tmp_path: Path,
+) -> None:
+    payload = _copied_agent_worktrees_payload(tmp_path)
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(0o755)
+    plugin_root = tmp_path / "durable" / "marketplaces" / "example" / "plugins" / "agent-worktrees"
+    context = plugin_root / "install.json"
+    context.parent.mkdir(parents=True)
+    context.write_text("{}\n", encoding="utf-8")
+    mode_runner = payload / "scripts" / "installation-context" / "installation-context.sh"
+    mode_runner.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' "
+        f"'{{\"status\":\"ready\",\"reason\":\"namespaced-active\","
+        f"\"actualMode\":\"namespaced\",\"desiredMode\":\"namespaced\","
+        f"\"runtimeRoot\":\"{plugin_root}\",\"context\":\"{context}\"}}'\n",
+        encoding="utf-8",
+    )
+    mode_runner.chmod(0o755)
+    root_record = tmp_path / "selected-root.txt"
+    (payload / "scripts" / "resolve-runtime.sh").write_text(
+        'printf "%s" "$AGENT_RT_ROOT" >"$TEST_ROOT_RECORD"\n'
+        'AGENT_RT_PY="$TEST_PYTHON"\n',
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = _agent_worktrees_test_environment(home, payload)
+    environment.update(
+        {
+            "COPILOT_EXTENSIONS_CONTEXT": str(context),
+            "TEST_ROOT_RECORD": str(root_record),
+            "TEST_PYTHON": str(fake_python),
+        }
+    )
+
+    result = subprocess.run(
+        [str(payload / "bin" / "payload" / "agent-worktrees"), "--version"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert root_record.read_text(encoding="utf-8") == str(plugin_root)
+    assert not (home / ".agent-worktrees").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
+def test_agent_worktrees_posix_interrupt_reaps_provisioner_before_unlock(
+    tmp_path: Path,
+) -> None:
+    payload = _copied_agent_worktrees_payload(tmp_path)
+    plugin_root = tmp_path / "cell-runtime"
+    context = plugin_root / "install.json"
+    context.parent.mkdir(parents=True)
+    context.write_text("{}\n", encoding="utf-8")
+    mode_runner = payload / "scripts" / "installation-context" / "installation-context.sh"
+    mode_runner.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' "
+        f"'{{\"status\":\"ready\",\"reason\":\"namespaced-active\","
+        f"\"actualMode\":\"namespaced\",\"desiredMode\":\"namespaced\","
+        f"\"runtimeRoot\":\"{plugin_root}\",\"context\":\"{context}\"}}'\n",
+        encoding="utf-8",
+    )
+    mode_runner.chmod(0o755)
+    (payload / "scripts" / "resolve-runtime.sh").write_text(
+        'AGENT_RT_PY=""\n',
+        encoding="utf-8",
+    )
+    child_pid_record = tmp_path / "child-pid.txt"
+    (payload / "scripts" / "install.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        "set -m\n"
+        "(\n"
+        "  trap 'exit 143' INT TERM\n"
+        "  printf '%s' \"$BASHPID\" >\"$TEST_CHILD_PID_RECORD\"\n"
+        "  sleep 30\n"
+        ") &\n"
+        "child=$!\n"
+        "set +m\n"
+        "stop_child() {\n"
+        "  kill -- -\"$child\" 2>/dev/null || kill \"$child\" 2>/dev/null || true\n"
+        "  wait \"$child\" 2>/dev/null || true\n"
+        "  exit 143\n"
+        "}\n"
+        "trap stop_child INT TERM\n"
+        "wait \"$child\"\n",
+        encoding="utf-8",
+    )
+    (payload / "scripts" / "install.sh").chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = _agent_worktrees_test_environment(home, payload)
+    environment.update(
+        {
+            "COPILOT_EXTENSIONS_CONTEXT": str(context),
+            "COPILOT_EXT_NO_FLOCK": "1",
+            "TEST_CHILD_PID_RECORD": str(child_pid_record),
+        }
+    )
+    process = subprocess.Popen(
+        [str(payload / "bin" / "payload" / "agent-worktrees"), "--version"],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    for _ in range(100):
+        if child_pid_record.exists():
+            break
+        import time
+
+        time.sleep(0.05)
+    assert child_pid_record.exists()
+    child_pid = int(child_pid_record.read_text(encoding="utf-8"))
+
+    process.terminate()
+    process.communicate(timeout=10)
+
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+    assert not (plugin_root / ".provision.lock.pid").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX governance revalidation")
+def test_agent_worktrees_posix_revalidates_after_provisioning(
+    tmp_path: Path,
+) -> None:
+    payload = _copied_agent_worktrees_payload(tmp_path)
+    plugin_root = tmp_path / "cell-runtime"
+    context = plugin_root / "install.json"
+    context.parent.mkdir(parents=True)
+    context.write_text("{}\n", encoding="utf-8")
+    status_count = tmp_path / "status-count.txt"
+    mode_runner = payload / "scripts" / "installation-context" / "installation-context.sh"
+    mode_runner.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [ \"${1:-}\" = validate ]; then\n"
+        "  printf '%s\\n' '{\"namespaceGeneration\":1,\"generation\":1}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "count=0\n"
+        "[ ! -f \"$TEST_STATUS_COUNT\" ] || count=$(cat \"$TEST_STATUS_COUNT\")\n"
+        "count=$((count + 1))\n"
+        "printf '%s' \"$count\" >\"$TEST_STATUS_COUNT\"\n"
+        "if [ \"$count\" -le 2 ]; then\n"
+        "  printf '%s\\n' "
+        f"'{{\"status\":\"ready\",\"reason\":\"namespaced-active\","
+        f"\"actualMode\":\"namespaced\",\"desiredMode\":\"namespaced\","
+        f"\"runtimeRoot\":\"{plugin_root}\",\"context\":\"{context}\","
+        f"\"activationGeneration\":1,\"installGeneration\":1}}'\n"
+        "else\n"
+        "  printf '%s\\n' "
+        "'{\"status\":\"maintenance\",\"reason\":\"plugin-maintenance\","
+        "\"actualMode\":\"namespaced\",\"desiredMode\":\"namespaced\"}'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    mode_runner.chmod(0o755)
+    (payload / "scripts" / "resolve-runtime.sh").write_text(
+        'AGENT_RT_PY=""\n',
+        encoding="utf-8",
+    )
+    install_record = tmp_path / "install-record.txt"
+    runtime_record = tmp_path / "runtime-record.txt"
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text(
+        "#!/bin/sh\nprintf invoked >\"$TEST_RUNTIME_RECORD\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    (payload / "scripts" / "install.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        "printf installed >\"$TEST_INSTALL_RECORD\"\n"
+        "cat >\"$(dirname \"$0\")/resolve-runtime.sh\" <<'EOF'\n"
+        'AGENT_RT_PY=\"$TEST_PYTHON\"\n'
+        "EOF\n",
+        encoding="utf-8",
+    )
+    (payload / "scripts" / "install.sh").chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = _agent_worktrees_test_environment(home, payload)
+    environment.update(
+        {
+            "COPILOT_EXTENSIONS_CONTEXT": str(context),
+            "TEST_STATUS_COUNT": str(status_count),
+            "TEST_INSTALL_RECORD": str(install_record),
+            "TEST_RUNTIME_RECORD": str(runtime_record),
+            "TEST_PYTHON": str(fake_python),
+        }
+    )
+
+    result = subprocess.run(
+        [str(payload / "bin" / "payload" / "agent-worktrees"), "--version"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 126
+    assert "governance changed during provisioning" in result.stderr
+    assert install_record.read_text(encoding="utf-8") == "installed"
+    assert not runtime_record.exists()
+    assert status_count.read_text(encoding="utf-8") == "3"
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or shutil.which("pwsh") is None,
+    reason="canonical Windows profile semantics require native Windows",
+)
+@pytest.mark.parametrize("policy_state", ["absent", "explicit-false"])
+def test_agent_machines_required_context_preserves_absent_policy_legacy_use(
+    tmp_path: Path,
+    policy_state: str,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh
+    payload = _copied_agent_machines_payload(tmp_path)
+    (payload / "scripts" / "resolve-runtime.ps1").write_text(
+        "$AgentRtPy = $env:TEST_PYTHON\n",
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    if policy_state == "explicit-false":
+        policy = home / ".copilot-extensions" / "installation-mode.json"
+        policy.parent.mkdir(parents=True)
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema": "copilot-extensions.installation-mode",
+                    "version": 1,
+                    "installationMode": {"enabled": False},
+                }
+            ),
+            encoding="utf-8",
+        )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "COPILOT_PLUGIN_ROOT": str(payload),
+            "PYTHONPATH": os.pathsep.join(
+                [
+                    str(payload / "src"),
+                    str(payload / "libs" / "plugin-resolve" / "src"),
+                    str(_agent_procutil_src(payload)),
+                ]
+            ),
+            "TEST_PYTHON": sys.executable,
+        }
+    )
+    environment.pop("COPILOT_EXTENSIONS_CONTEXT", None)
+
+    result = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(payload / "bin" / "agent-machines.ps1"),
+            "--version",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads((payload / "plugin.json").read_text())["version"] in result.stdout
+    assert not (home / ".agent-machines").exists()
+    if policy_state == "absent":
+        assert not (home / ".copilot-extensions").exists()
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is not installed")
+def test_agent_machines_requested_context_never_falls_back_to_legacy(
+    tmp_path: Path,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh
+    payload = _copied_agent_machines_payload(tmp_path)
+    context = _stamp_agent_machines_context(tmp_path, payload, pwsh)
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "COPILOT_PLUGIN_ROOT": str(payload),
+            "COPILOT_EXTENSIONS_CONTEXT": str(context),
+            "AGENT_MACHINES_NO_SELFPROVISION": "1",
+        }
+    )
+
+    result = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(payload / "bin" / "agent-machines.ps1"),
+            "--version",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 126
+    assert "requested installation context is not active" in result.stderr
+    assert not (home / ".agent-machines").exists()
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is not installed")
+def test_agent_machines_active_context_selects_only_its_cell_root(
+    tmp_path: Path,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh
+    payload = _copied_agent_machines_payload(tmp_path)
+    context = _stamp_agent_machines_context(tmp_path, payload, pwsh)
+    home = tmp_path / "home"
+    home.mkdir()
+    plugin_root = _activate_agent_machines_context(tmp_path, home, context, pwsh)
+    root_record = tmp_path / "selected-root.txt"
+    (payload / "scripts" / "resolve-runtime.ps1").write_text(
+        "[IO.File]::WriteAllText($env:TEST_ROOT_RECORD, $env:AGENT_RT_ROOT)\n"
+        "$AgentRtPy = $env:TEST_PYTHON\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "COPILOT_PLUGIN_ROOT": str(payload),
+            "COPILOT_EXTENSIONS_CONTEXT": str(context),
+            "PYTHONPATH": os.pathsep.join(
+                [
+                    str(payload / "src"),
+                    str(payload / "libs" / "plugin-resolve" / "src"),
+                    str(_agent_procutil_src(payload)),
+                ]
+            ),
+            "TEST_PYTHON": sys.executable,
+            "TEST_ROOT_RECORD": str(root_record),
+        }
+    )
+
+    result = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(payload / "bin" / "agent-machines.ps1"),
+            "--version",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert root_record.read_text(encoding="utf-8") == str(plugin_root)
+    assert not (home / ".agent-machines").exists()
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or shutil.which("pwsh") is None,
+    reason="canonical Windows profile semantics require native Windows",
+)
+def test_agent_machines_blocked_context_states_never_run_legacy(
+    tmp_path: Path,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh
+    payload = _copied_agent_machines_payload(tmp_path)
+    context = _stamp_agent_machines_context(tmp_path, payload, pwsh)
+    home = tmp_path / "home"
+    home.mkdir()
+    plugin_root = _activate_agent_machines_context(tmp_path, home, context, pwsh)
+    root_record = tmp_path / "selected-root.txt"
+    (payload / "scripts" / "resolve-runtime.ps1").write_text(
+        "[IO.File]::WriteAllText($env:TEST_ROOT_RECORD, $env:AGENT_RT_ROOT)\n"
+        "$AgentRtPy = $env:TEST_PYTHON\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "COPILOT_PLUGIN_ROOT": str(payload),
+            "COPILOT_EXTENSIONS_CONTEXT": str(context),
+            "PYTHONPATH": os.pathsep.join(
+                [
+                    str(payload / "src"),
+                    str(payload / "libs" / "plugin-resolve" / "src"),
+                    str(_agent_procutil_src(payload)),
+                ]
+            ),
+            "TEST_PYTHON": sys.executable,
+            "TEST_ROOT_RECORD": str(root_record),
+        }
+    )
+
+    def invoke_blocked(label: str) -> None:
+        root_record.unlink(missing_ok=True)
+        result = subprocess.run(
+            [
+                pwsh,
+                "-NoProfile",
+                "-File",
+                str(payload / "bin" / "agent-machines.ps1"),
+                "--version",
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 126, f"{label}: {result.stderr}"
+        assert "blocks invocation" in result.stderr
+        assert not root_record.exists(), label
+
+    policy = home / ".copilot-extensions" / "installation-mode.json"
+    original_policy = policy.read_bytes()
+    policy.write_text("{\n", encoding="utf-8")
+    invoke_blocked("malformed policy")
+    policy.write_bytes(original_policy)
+
+    maintenance = plugin_root / "maintenance"
+    maintenance.write_text("maintenance\n", encoding="utf-8")
+    invoke_blocked("maintenance")
+    maintenance.unlink()
+
+    activation = plugin_root / "installation-activation.json"
+    original_activation = json.loads(activation.read_text(encoding="utf-8"))
+    foreign_activation = dict(original_activation)
+    foreign_activation["environment"] = dict(original_activation["environment"])
+    foreign_activation["environment"]["platform"] = "posix"
+    activation.write_text(json.dumps(foreign_activation), encoding="utf-8")
+    invoke_blocked("foreign activation")
+    activation.unlink()
+
+    legacy = home / ".agent-machines"
+    legacy.mkdir()
+    (legacy / ".installation-ownership.json").write_text(
+        json.dumps(
+            {
+                "schema": "copilot-extensions.legacy-installation-ownership",
+                "version": 1,
+                "marketplaceId": original_activation["marketplaceId"],
+                "pluginId": "agent-machines",
+                "activation": {
+                    "path": str(plugin_root / "missing-activation.json"),
+                    "generation": 1,
+                },
+                "environment": original_activation["environment"],
+                "transferredAt": "2026-01-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    invoke_blocked("orphaned transfer")
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is not installed")
+def test_agent_machines_removed_policy_keeps_active_cell_authoritative(
+    tmp_path: Path,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh
+    payload = _directory_marketplace_agent_machines_payload(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    durable_home = home / ".copilot-extensions"
+    context = _stamp_agent_machines_context(
+        tmp_path,
+        payload,
+        pwsh,
+        explicit_source=False,
+        durable_home=durable_home,
+    )
+    plugin_root = _activate_agent_machines_context(
+        tmp_path,
+        home,
+        context,
+        pwsh,
+        durable_home=durable_home,
+    )
+    (home / ".copilot-extensions" / "installation-mode.json").unlink()
+    root_record = tmp_path / "selected-root.txt"
+    (payload / "scripts" / "resolve-runtime.ps1").write_text(
+        "[IO.File]::WriteAllText($env:TEST_ROOT_RECORD, $env:AGENT_RT_ROOT)\n"
+        "$AgentRtPy = $env:TEST_PYTHON\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "COPILOT_PLUGIN_ROOT": str(payload),
+            "PYTHONPATH": os.pathsep.join(
+                [
+                    str(payload / "src"),
+                    str(payload / "libs" / "plugin-resolve" / "src"),
+                    str(_agent_procutil_src(payload)),
+                ]
+            ),
+            "TEST_PYTHON": sys.executable,
+            "TEST_ROOT_RECORD": str(root_record),
+        }
+    )
+    environment.pop("COPILOT_EXTENSIONS_CONTEXT", None)
+
+    result = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(payload / "bin" / "agent-machines.ps1"),
+            "--version",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert root_record.read_text(encoding="utf-8") == str(plugin_root)
+    assert not (home / ".agent-machines").exists()
 
 
 def test_generates_multiple_commands_and_one_catalog(tmp_path: Path) -> None:
@@ -214,6 +1777,26 @@ def test_manifest_can_select_cmd_for_windows_catalog(tmp_path: Path) -> None:
     assert 'set "_PSHOST=%%I"' in cmd
     assert r"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" in cmd
     assert '"%_PSHOST%" -NoProfile' in cmd
+
+
+def test_a_cmd_catalog_warns_that_a_newline_ends_the_command(tmp_path: Path) -> None:
+    """cmd.exe ends a command at a newline, so a multi-line argument to a .cmd
+    shim is silently cut off: the catalog an agent reads says so -- in the
+    single-command and the `commands` manifest forms alike. A PowerShell shim
+    passes arguments intact and carries no such note."""
+    for build in (_manifest, _multi_manifest):
+        root = tmp_path / build.__name__
+        root.mkdir()
+        manifest = build(root)
+        catalog_path = manifest.parent / "scripts" / "emit-command-catalog.ps1"
+        plain = generator.expected_files(manifest)[catalog_path]
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        data["windowsCatalogShim"] = "cmd"
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+        cmd_catalog = generator.expected_files(manifest)[catalog_path]
+        assert "cut off" not in plain, build.__name__
+        assert "`cmd.exe` ends the command at a newline" in cmd_catalog, build.__name__
+        assert "stdin or a file option" in cmd_catalog, build.__name__
 
 
 def test_manifest_rejects_unknown_windows_catalog_shim(tmp_path: Path) -> None:
@@ -468,11 +2051,47 @@ def test_payload_catalog_adopters_publish_payload_catalogs(plugin: str) -> None:
     hooks = json.loads((plugin_root / "hooks.json").read_text(encoding="utf-8"))
     session_hooks = hooks["hooks"]["sessionStart"]
     for shell in ("bash", "powershell"):
-        catalog_hooks = [
+        direct_hooks = [
             hook for hook in session_hooks if "emit-command-catalog" in hook[shell]
         ]
-        assert len(catalog_hooks) == 1
-        assert "COPILOT_PLUGIN_ROOT" in catalog_hooks[0][shell]
+        if direct_hooks:
+            # Legacy direct-output wiring: the sessionStart hook itself invokes
+            # emit-command-catalog.
+            assert len(direct_hooks) == 1
+            assert "COPILOT_PLUGIN_ROOT" in direct_hooks[0][shell]
+            continue
+        # Exact-session-writer wiring: the sessionStart hook invokes a writer
+        # (write-session-guidance.* or hook_client.py) that composes
+        # emit-command-catalog internally rather than emitting it directly.
+        writer_hooks = [
+            hook
+            for hook in session_hooks
+            if "write-session-guidance." in hook[shell]
+            or "hook_client.py" in hook[shell]
+        ]
+        assert len(writer_hooks) == 1, (
+            f"{plugin} ({shell}): no direct emit-command-catalog hook and no "
+            "write-session-guidance/hook_client.py writer hook found"
+        )
+        assert "COPILOT_PLUGIN_ROOT" in writer_hooks[0][shell]
+        for writer_name in (
+            "write_session_guidance.py",
+            "hook_client.py",
+        ):
+            writer_path = plugin_root / "scripts" / writer_name
+            if writer_path.is_file():
+                assert "emit-command-catalog" in writer_path.read_text(
+                    encoding="utf-8"
+                ), (
+                    f"{plugin}: {writer_name} no longer composes "
+                    "emit-command-catalog"
+                )
+                break
+        else:
+            pytest.fail(
+                f"{plugin}: no write_session_guidance.py or hook_client.py "
+                "found to compose emit-command-catalog"
+            )
 
 
 def test_skill_catalog_references_name_payload_adopters() -> None:
@@ -521,11 +2140,38 @@ def test_skill_catalog_references_name_payload_adopters() -> None:
             continue
         hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
         session_hooks = hooks.get("hooks", {}).get("sessionStart", [])
-        if not any(
+        direct_wired = any(
             "emit-command-catalog" in hook.get("bash", "")
             and "emit-command-catalog" in hook.get("powershell", "")
             for hook in session_hooks
-        ):
+        )
+        writer_wired = False
+        if not direct_wired:
+            plugin_root = REPO / "plugins" / plugin
+            has_writer_hook = any(
+                (
+                    "write-session-guidance." in hook.get("bash", "")
+                    or "hook_client.py" in hook.get("bash", "")
+                )
+                and (
+                    "write-session-guidance." in hook.get("powershell", "")
+                    or "hook_client.py" in hook.get("powershell", "")
+                )
+                for hook in session_hooks
+            )
+            composes_catalog = any(
+                (plugin_root / "scripts" / writer_name).is_file()
+                and "emit-command-catalog"
+                in (plugin_root / "scripts" / writer_name).read_text(
+                    encoding="utf-8"
+                )
+                for writer_name in (
+                    "write_session_guidance.py",
+                    "hook_client.py",
+                )
+            )
+            writer_wired = has_writer_hook and composes_catalog
+        if not (direct_wired or writer_wired):
             missing_hooks[plugin] = paths
     assert missing_hooks == {}
 
@@ -600,6 +2246,224 @@ def test_posix_shim_preserves_args_exit_and_project_cwd(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX shim test")
+def test_posix_shim_boot_trace_is_durable_by_default_and_stderr_is_still_opt_in(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path)
+    generator.process_manifest(manifest, check=False)
+    plugin = manifest.parent
+    (plugin / "plugin.json").write_text('{"name":"agent-example"}\n', encoding="utf-8")
+    scripts = plugin / "scripts"
+    canonical_resolver = (
+        REPO / "libs" / "versioned-runtime" / "resolve-runtime.sh"
+    ).read_text(encoding="utf-8")
+    (scripts / "resolve-runtime.sh").write_text(canonical_resolver, encoding="utf-8")
+
+    home = tmp_path / "home"
+    runtime_root = home / ".agent-example"
+    version = "1.2.3"
+    slot = runtime_root / "versions" / version
+    fake_python = slot / "bin" / "python"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.write_text(
+        f'#!/bin/sh\nexec "{sys.executable}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    _write_runtime_completion(slot, version)
+    (runtime_root / "current-version").write_text(f"{version}\n", encoding="utf-8")
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    (module_dir / "agent_example.py").write_text(
+        "import sys\n"
+        "print('stdout:' + '|'.join(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "COPILOT_PLUGIN_ROOT": str(plugin),
+            "PYTHONPATH": str(module_dir),
+        }
+    )
+    command = [str(plugin / "bin" / "agent-example"), "alpha", "beta"]
+
+    baseline = subprocess.run(
+        command,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert baseline.stdout.strip() == "stdout:alpha|beta"
+    assert baseline.stderr == ""
+    durable = _read_jsonl(runtime_root / "logs" / "boot-trace.jsonl")
+    assert [rec["phase"] for rec in durable] == [
+        "shim-start",
+        "resolver-marker-start",
+        "resolver-marker-result",
+        "resolver-slot-result",
+        "resolver-loaded",
+        "dispatch",
+    ]
+    assert [rec["source"] for rec in durable] == [
+        "shim",
+        "resolver",
+        "resolver",
+        "resolver",
+        "shim",
+        "shim",
+    ]
+    assert [int(rec["t_ms"]) for rec in durable] == sorted(
+        int(rec["t_ms"]) for rec in durable
+    )
+    assert durable[1]["resolution_source"] == "current-version"
+    assert durable[2]["result"] == "hit"
+    assert durable[2]["version"] == version
+    assert durable[-1]["path"] == "fast"
+
+    traced = subprocess.run(
+        command,
+        env={**env, "COPILOT_EXTENSIONS_BOOT_TRACE": "1"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert traced.stdout == baseline.stdout
+    assert traced.stderr
+    phases = [
+        match.group(1)
+        for match in re.finditer(r"phase=([a-z-]+)", traced.stderr)
+    ]
+    assert phases == [
+        "shim-start",
+        "resolver-marker-start",
+        "resolver-marker-result",
+        "resolver-slot-result",
+        "resolver-loaded",
+        "dispatch",
+    ]
+    assert "::boot-trace:: plugin=agent-example" in traced.stderr
+    assert "stdout:" not in traced.stderr
+    assert len(_read_jsonl(runtime_root / "logs" / "boot-trace.jsonl")) == 12
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shim test")
+def test_posix_shim_boot_trace_survives_first_use_before_runtime_root_exists(
+    tmp_path: Path,
+) -> None:
+    """Regression: the earliest phases (``shim-start``, the resolver's own
+    marker/slot phases) fire before ``_runtime_root``/``$_rt_root`` has ever
+    been created on this machine -- that is the entire first-use case this
+    always-on facility exists to observe. An earlier revision gated the
+    durable-log append on ``[ -d "$_runtime_root" ]``/``[ -d "$_rt_root" ]``,
+    which returned before the very ``mkdir -p`` that would have created it,
+    silently dropping every phase from a real first launch (Copilot review,
+    PR #3310)."""
+    manifest = _manifest(tmp_path)
+    generator.process_manifest(manifest, check=False)
+    plugin = manifest.parent
+    (plugin / "plugin.json").write_text('{"name":"agent-example"}\n', encoding="utf-8")
+    scripts = plugin / "scripts"
+    canonical_resolver = (
+        REPO / "libs" / "versioned-runtime" / "resolve-runtime.sh"
+    ).read_text(encoding="utf-8")
+    (scripts / "resolve-runtime.sh").write_text(canonical_resolver, encoding="utf-8")
+
+    home = tmp_path / "home"
+    home.mkdir()
+    runtime_root = home / ".agent-example"
+    assert not runtime_root.exists()  # the exact first-use precondition
+
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    (module_dir / "agent_example.py").write_text(
+        "import sys\nprint('stdout:' + '|'.join(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "COPILOT_PLUGIN_ROOT": str(plugin),
+            "PYTHONPATH": str(module_dir),
+            "AGENT_EXAMPLE_NO_SELFPROVISION": "1",
+        }
+    )
+    command = [str(plugin / "bin" / "agent-example"), "alpha"]
+
+    # No installed runtime and self-provisioning disabled -> the shim exits
+    # non-zero, but the durable phases up to that failure must still have
+    # been recorded, proving the log append never depended on the runtime
+    # root already existing.
+    result = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert result.returncode != 0
+
+    log_path = runtime_root / "logs" / "boot-trace.jsonl"
+    assert log_path.exists(), "runtime root + log dir must be created on demand"
+    durable = _read_jsonl(log_path)
+    phases = [rec["phase"] for rec in durable]
+    assert "shim-start" in phases
+    assert "resolver-marker-start" in phases
+    assert "resolver-marker-result" in phases
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shim test")
+def test_posix_shim_boot_trace_write_failures_are_non_fatal(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    generator.process_manifest(manifest, check=False)
+    plugin = manifest.parent
+    (plugin / "plugin.json").write_text('{"name":"agent-example"}\n', encoding="utf-8")
+    scripts = plugin / "scripts"
+    canonical_resolver = (
+        REPO / "libs" / "versioned-runtime" / "resolve-runtime.sh"
+    ).read_text(encoding="utf-8")
+    (scripts / "resolve-runtime.sh").write_text(canonical_resolver, encoding="utf-8")
+
+    home = tmp_path / "home"
+    runtime_root = home / ".agent-example"
+    version = "1.2.3"
+    slot = runtime_root / "versions" / version
+    fake_python = slot / "bin" / "python"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.write_text(
+        f'#!/bin/sh\nexec "{sys.executable}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    _write_runtime_completion(slot, version)
+    (runtime_root / "current-version").write_text(f"{version}\n", encoding="utf-8")
+    (runtime_root / "logs").write_text("not-a-directory\n", encoding="utf-8")
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    (module_dir / "agent_example.py").write_text(
+        "print('ok')\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "COPILOT_PLUGIN_ROOT": str(plugin),
+            "PYTHONPATH": str(module_dir),
+        }
+    )
+
+    result = subprocess.run(
+        [str(plugin / "bin" / "agent-example")],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "ok"
+    assert result.stderr == ""
+    assert (runtime_root / "logs").is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shim test")
 def test_multi_command_shim_dispatches_its_own_module(tmp_path: Path) -> None:
     manifest = _multi_manifest(tmp_path)
     generator.process_manifest(manifest, check=False)
@@ -635,8 +2499,30 @@ def test_multi_command_shim_dispatches_its_own_module(tmp_path: Path) -> None:
     assert result.stdout.strip() == "-m agent_example.helper two words"
 
 
+def test_multi_command_traces_use_manifest_plugin_identity(tmp_path: Path) -> None:
+    manifest = _multi_manifest(tmp_path)
+
+    generated = generator.expected_files(manifest)
+
+    posix = generated[manifest.parent / "bin" / "example-helper"]
+    powershell = generated[manifest.parent / "bin" / "example-helper.ps1"]
+    assert '_plugin="agent-example"' in posix
+    assert 'COPILOT_EXTENSIONS_BOOT_TRACE_PLUGIN="$_plugin"' in posix
+    assert "$_plugin = 'agent-example'" in powershell
+    assert "$env:COPILOT_EXTENSIONS_BOOT_TRACE_PLUGIN = $_plugin" in powershell
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX shim test")
-def test_posix_shim_rejects_conflicting_payload_context(tmp_path: Path) -> None:
+def test_posix_shim_ignores_a_different_plugins_copilot_plugin_root(
+    tmp_path: Path,
+) -> None:
+    """A caller plugin's own ``COPILOT_PLUGIN_ROOT`` must never block a
+    cross-plugin subprocess invocation of a *different* plugin's shim -- e.g.
+    a picker running under one plugin shelling out to another's CLI. The shim
+    derives its payload strictly from its own file location and no longer
+    consults ``COPILOT_PLUGIN_ROOT`` at all (copilot-extensions #2650 fallout:
+    that check produced a false-positive "payload context mismatch" for every
+    such legitimate cross-plugin call)."""
     manifest = _manifest(tmp_path)
     generator.process_manifest(manifest, check=False)
     plugin = manifest.parent
@@ -652,8 +2538,7 @@ def test_posix_shim_rejects_conflicting_payload_context(tmp_path: Path) -> None:
         text=True,
         check=False,
     )
-    assert result.returncode == 126
-    assert "payload context mismatch" in result.stderr
+    assert "payload context mismatch" not in result.stderr
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX shim test")
@@ -730,6 +2615,18 @@ def test_first_use_provision_is_serialized(tmp_path: Path) -> None:
     assert not shadow_marker.exists()
 
 
+def test_agent_machines_dispatchers_share_the_legacy_installer_lock() -> None:
+    scripts = REPO / "plugins" / "agent-machines" / "scripts"
+    posix = (scripts / "invoke-payload-runtime.sh").read_text(encoding="utf-8")
+    powershell = (scripts / "invoke-payload-runtime.ps1").read_text(encoding="utf-8")
+
+    assert '$RUNTIME_ROOT/.provision.lock"' in posix
+    assert '$RUNTIME_ROOT/.provision.lock.pid"' in posix
+    assert "Join-Path $runtimeRoot '.provision.lock'" in powershell
+    assert ".payload-provision.lock" not in posix
+    assert ".payload-provision.lock" not in powershell
+
+
 def test_windows_templates_preserve_context_and_release_payload_cwd(
     tmp_path: Path,
 ) -> None:
@@ -738,13 +2635,9 @@ def test_windows_templates_preserve_context_and_release_payload_cwd(
     powershell = next(
         content for path, content in generated.items() if path.suffix == ".ps1"
     )
-    cmd = next(
-        content for path, content in generated.items() if path.suffix == ".cmd"
-    )
     assert "[IO.Directory]::SetCurrentDirectory($_outside)" in powershell
     assert "StartsWith($_payloadPrefix" in powershell
     assert "[IO.FileShare]::None" in powershell
-    assert "if not defined COPILOT_PLUGIN_ROOT" in cmd
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is not installed")
@@ -810,3 +2703,347 @@ def test_powershell_shim_preserves_sibling_cwd_and_leaves_payload(
     assert payload_result.stdout.strip() == (
         f"{project}|status"
     )
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or shutil.which("pwsh") is None,
+    reason="native Windows PowerShell shim test",
+)
+def test_required_dispatcher_shim_defers_boot_trace_to_the_inner_dispatcher(
+    tmp_path: Path,
+) -> None:
+    """Regression (Copilot review, PR #3310): the outer dispatcher shim's
+    own `$_runtimeRoot`/`$_runtime_root` is ALWAYS the legacy root -- an
+    installationContext=required plugin's active root may actually be a
+    resolved namespaced context only the inner, installation-context-aware
+    dispatcher knows how to determine. The outer shim must therefore never
+    itself write shim-start/dispatch durably (that would either lose the
+    record or misroute it into a stale legacy log); it must instead forward
+    `shim-start`'s own timestamp via `COPILOT_EXTENSIONS_BOOT_TRACE_SHIM_
+    START_MS` and let the inner dispatcher log both phases once it has
+    resolved the genuinely active root."""
+    pwsh = shutil.which("pwsh")
+    assert pwsh
+    manifest = _required_context_manifest(tmp_path)
+    generator.process_manifest(manifest, check=False)
+    plugin = manifest.parent
+    (plugin / "plugin.json").write_text('{"name":"agent-machines"}\n', encoding="utf-8")
+    scripts = plugin / "scripts"
+    # A fake inner dispatcher standing in for a real installation-context-
+    # aware one (e.g. agent-worktrees' own invoke-payload-runtime.ps1) --
+    # this one does NOT itself consume the forwarded env var, so this test
+    # asserts what the OUTER shim's own contract guarantees regardless of
+    # whether any given inner dispatcher has adopted forwarding yet.
+    (scripts / "invoke-payload-runtime.ps1").write_text(
+        "Write-Output ('stdout:' + ($args -join '|'))\n"
+        "Write-Output ('shim_start_ms=' + $env:COPILOT_EXTENSIONS_BOOT_TRACE_SHIM_START_MS)\n",
+        encoding="utf-8",
+    )
+
+    home = tmp_path / "home"
+    (home / ".agent-example").mkdir(parents=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "COPILOT_PLUGIN_ROOT": str(plugin),
+        }
+    )
+    command = [
+        pwsh,
+        "-NoProfile",
+        "-File",
+        str(plugin / "bin" / "agent-machines.ps1"),
+        "alpha",
+        "beta",
+    ]
+
+    baseline = subprocess.run(
+        command,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    stdout_lines = baseline.stdout.strip().splitlines()
+    assert stdout_lines[0] == "stdout:alpha|beta"
+    # The outer shim forwarded a real, non-empty timestamp to the inner
+    # dispatcher via the env var -- proving the forwarding contract works,
+    # even though this fake inner dispatcher doesn't itself log it.
+    assert stdout_lines[1].startswith("shim_start_ms=")
+    forwarded_ms = stdout_lines[1].removeprefix("shim_start_ms=")
+    assert forwarded_ms.isdigit()
+    assert baseline.stderr == ""
+    # The outer shim must NEVER itself write a durable record for these two
+    # phases -- only the inner dispatcher may, once it has resolved the
+    # genuinely active root. This fake inner dispatcher doesn't, so no
+    # boot-trace.jsonl should exist at all.
+    assert not (home / ".agent-example" / "logs" / "boot-trace.jsonl").exists()
+
+    traced = subprocess.run(
+        command,
+        env={**env, "COPILOT_EXTENSIONS_BOOT_TRACE": "1"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    traced_lines = traced.stdout.strip().splitlines()
+    assert traced_lines[0] == "stdout:alpha|beta"
+    assert traced_lines[1].startswith("shim_start_ms=")
+    assert [
+        match.group(1)
+        for match in re.finditer(r"phase=([a-z-]+)", traced.stderr)
+    ] == ["shim-start", "dispatch"]
+    # Still no durable write, opt-in stderr trace or not.
+    assert not (home / ".agent-example" / "logs" / "boot-trace.jsonl").exists()
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or shutil.which("pwsh") is None,
+    reason="native Windows PowerShell shim test",
+)
+def test_powershell_shim_boot_trace_is_opt_in_and_stderr_only(
+    tmp_path: Path,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh
+    manifest = _manifest(tmp_path)
+    generator.process_manifest(manifest, check=False)
+    plugin = manifest.parent
+    (plugin / "plugin.json").write_text('{"name":"agent-example"}\n', encoding="utf-8")
+    scripts = plugin / "scripts"
+    canonical_resolver = (
+        REPO / "libs" / "versioned-runtime" / "resolve-runtime.ps1"
+    ).read_text(encoding="utf-8")
+    (scripts / "resolve-runtime.ps1").write_text(canonical_resolver, encoding="utf-8")
+
+    home = tmp_path / "home"
+    runtime_root = home / ".agent-example"
+    version = "2.3.4"
+    slot = runtime_root / "versions" / version
+    fake_python = slot / "Scripts" / "python.exe"
+    fake_python.parent.mkdir(parents=True)
+    shutil.copy2(sys.executable, fake_python)
+    _write_runtime_completion(slot, version)
+    (runtime_root / "current-version").write_text(f"{version}\n", encoding="utf-8")
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    (module_dir / "agent_example.py").write_text(
+        "import sys\n"
+        "print('stdout:' + '|'.join(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "COPILOT_PLUGIN_ROOT": str(plugin),
+            "PYTHONPATH": str(module_dir),
+        }
+    )
+    command = [
+        pwsh,
+        "-NoProfile",
+        "-File",
+        str(plugin / "bin" / "agent-example.ps1"),
+        "alpha",
+        "beta",
+    ]
+
+    baseline = subprocess.run(
+        command,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert baseline.stdout.strip() == "stdout:alpha|beta"
+    assert baseline.stderr == ""
+    durable = _read_jsonl(runtime_root / "logs" / "boot-trace.jsonl")
+    assert [rec["phase"] for rec in durable] == [
+        "shim-start",
+        "resolver-marker-start",
+        "resolver-marker-result",
+        "resolver-slot-result",
+        "resolver-loaded",
+        "dispatch",
+    ]
+    assert [rec["source"] for rec in durable] == [
+        "shim",
+        "resolver",
+        "resolver",
+        "resolver",
+        "shim",
+        "shim",
+    ]
+    assert [int(rec["t_ms"]) for rec in durable] == sorted(
+        int(rec["t_ms"]) for rec in durable
+    )
+    assert durable[1]["resolution_source"] == "current-version"
+    assert durable[2]["result"] == "hit"
+    assert durable[2]["version"] == version
+    assert durable[-1]["path"] == "fast"
+
+    traced = subprocess.run(
+        command,
+        env={**env, "COPILOT_EXTENSIONS_BOOT_TRACE": "1"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert traced.stdout == baseline.stdout
+    assert traced.stderr
+    phases = [
+        match.group(1)
+        for match in re.finditer(r"phase=([a-z-]+)", traced.stderr)
+    ]
+    assert phases == [
+        "shim-start",
+        "resolver-marker-start",
+        "resolver-marker-result",
+        "resolver-slot-result",
+        "resolver-loaded",
+        "dispatch",
+    ]
+    assert "::boot-trace:: plugin=agent-example" in traced.stderr
+    assert "stdout:" not in traced.stderr
+    assert len(_read_jsonl(runtime_root / "logs" / "boot-trace.jsonl")) == 12
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or shutil.which("pwsh") is None,
+    reason="native Windows PowerShell shim test",
+)
+def test_powershell_shim_boot_trace_write_failures_are_non_fatal(
+    tmp_path: Path,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh
+    manifest = _manifest(tmp_path)
+    generator.process_manifest(manifest, check=False)
+    plugin = manifest.parent
+    (plugin / "plugin.json").write_text('{"name":"agent-example"}\n', encoding="utf-8")
+    scripts = plugin / "scripts"
+    canonical_resolver = (
+        REPO / "libs" / "versioned-runtime" / "resolve-runtime.ps1"
+    ).read_text(encoding="utf-8")
+    (scripts / "resolve-runtime.ps1").write_text(canonical_resolver, encoding="utf-8")
+
+    home = tmp_path / "home"
+    runtime_root = home / ".agent-example"
+    version = "2.3.4"
+    slot = runtime_root / "versions" / version
+    fake_python = slot / "Scripts" / "python.exe"
+    fake_python.parent.mkdir(parents=True)
+    shutil.copy2(sys.executable, fake_python)
+    _write_runtime_completion(slot, version)
+    (runtime_root / "current-version").write_text(f"{version}\n", encoding="utf-8")
+    (runtime_root / "logs").write_text("not-a-directory\n", encoding="utf-8")
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    (module_dir / "agent_example.py").write_text("print('ok')\n", encoding="utf-8")
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "COPILOT_PLUGIN_ROOT": str(plugin),
+            "PYTHONPATH": str(module_dir),
+        }
+    )
+
+    result = subprocess.run(
+        [pwsh, "-NoProfile", "-File", str(plugin / "bin" / "agent-example.ps1")],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "ok"
+    assert result.stderr == ""
+    assert (runtime_root / "logs").is_file()
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or shutil.which("pwsh") is None,
+    reason="native Windows PowerShell shim test",
+)
+def test_powershell_shim_boot_trace_lines_survive_concurrent_invocations(
+    tmp_path: Path,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh
+    manifest = _manifest(tmp_path)
+    generator.process_manifest(manifest, check=False)
+    plugin = manifest.parent
+    (plugin / "plugin.json").write_text('{"name":"agent-example"}\n', encoding="utf-8")
+    scripts = plugin / "scripts"
+    canonical_resolver = (
+        REPO / "libs" / "versioned-runtime" / "resolve-runtime.ps1"
+    ).read_text(encoding="utf-8")
+    (scripts / "resolve-runtime.ps1").write_text(canonical_resolver, encoding="utf-8")
+
+    home = tmp_path / "home"
+    runtime_root = home / ".agent-example"
+    version = "2.3.4"
+    slot = runtime_root / "versions" / version
+    fake_python = slot / "Scripts" / "python.exe"
+    fake_python.parent.mkdir(parents=True)
+    shutil.copy2(sys.executable, fake_python)
+    _write_runtime_completion(slot, version)
+    (runtime_root / "current-version").write_text(f"{version}\n", encoding="utf-8")
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    (module_dir / "agent_example.py").write_text("print('ok')\n", encoding="utf-8")
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "COPILOT_PLUGIN_ROOT": str(plugin),
+            "PYTHONPATH": str(module_dir),
+        }
+    )
+    command = [pwsh, "-NoProfile", "-File", str(plugin / "bin" / "agent-example.ps1")]
+
+    procs = [
+        subprocess.Popen(
+            command,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(3)
+    ]
+    for proc in procs:
+        out, err = proc.communicate(timeout=15)
+        assert proc.returncode == 0, err
+        assert out.strip() == "ok"
+        assert err == ""
+
+    records = _read_jsonl(runtime_root / "logs" / "boot-trace.jsonl")
+    assert len(records) >= 9
+    by_pid: dict[int, list[dict[str, object]]] = {}
+    for rec in records:
+        by_pid.setdefault(int(rec["pid"]), []).append(rec)
+    assert len(by_pid) == 3
+    for pid_records in by_pid.values():
+        phases = [str(rec["phase"]) for rec in pid_records]
+        expected = [
+            "shim-start",
+            "resolver-marker-start",
+            "resolver-marker-result",
+            "resolver-slot-result",
+            "resolver-loaded",
+            "dispatch",
+        ]
+        cursor = 0
+        for phase in phases:
+            while cursor < len(expected) and expected[cursor] != phase:
+                cursor += 1
+            assert cursor < len(expected), phases
+            cursor += 1

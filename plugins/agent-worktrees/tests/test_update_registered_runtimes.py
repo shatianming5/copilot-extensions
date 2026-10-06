@@ -20,6 +20,65 @@ import pytest
 from agent_worktrees import __main__ as m
 from agent_worktrees import config as cfg
 from agent_worktrees import reconcile
+from agent_worktrees import update_runtime
+
+
+# ---------------------------------------------------------------------------
+# describe_copilot_spawn_error -- accurate diagnostics for a failed spawn
+# ---------------------------------------------------------------------------
+
+def test_describe_copilot_spawn_error_file_not_found():
+    exc = FileNotFoundError(2, "No such file or directory")
+    message = update_runtime.describe_copilot_spawn_error(exc)
+    assert "not found on PATH" in message
+    assert "No such file or directory" in message
+
+
+def test_describe_copilot_spawn_error_self_lock_windows():
+    """The reproduced bug: running an update from inside a live Copilot CLI
+    session on Windows fails to re-spawn copilot.exe with winerror 1920
+    ('The file cannot be accessed by the system'). This must NOT be reported
+    as 'not found' -- copilot is right there, running this very command.
+
+    ``winerror`` is only populated by the ``OSError`` constructor's fourth
+    positional argument on native Windows Python; setting it directly as an
+    attribute afterward simulates the same shape portably on any platform
+    (including this suite's Linux CI leg), since ``describe_copilot_spawn_error``
+    only ever reads ``exc.winerror`` via ``getattr``.
+    """
+    exc = OSError(22, "The file cannot be accessed by the system")
+    exc.winerror = 1920
+    message = update_runtime.describe_copilot_spawn_error(exc)
+    assert "not found" not in message
+    assert "currently running as this very session" in message
+    assert "The file cannot be accessed by the system" in message
+
+
+def test_describe_copilot_spawn_error_generic_oserror_includes_detail():
+    exc = PermissionError(13, "Permission denied")
+    message = update_runtime.describe_copilot_spawn_error(exc)
+    assert "not found or not executable" in message
+    assert "Permission denied" in message
+
+
+def test_describe_copilot_spawn_error_distinguishes_missing_cwd():
+    """A ``FileNotFoundError`` whose ``filename`` matches the caller's own
+    ``cwd`` (a stale project/registered-plugin context) means the failure has
+    nothing to do with copilot -- must not be reported as copilot missing."""
+    stale_cwd = "/some/stale/project/path"
+    exc = FileNotFoundError(2, "No such file or directory", stale_cwd)
+    message = update_runtime.describe_copilot_spawn_error(exc, cwd=stale_cwd)
+    assert "not found on PATH" not in message
+    assert "working directory does not exist" in message
+    assert stale_cwd in message
+
+
+def test_describe_copilot_spawn_error_missing_executable_with_unrelated_cwd():
+    """A ``FileNotFoundError`` whose ``filename`` does NOT match ``cwd`` (or
+    is unset) still reports the executable as missing, cwd context or not."""
+    exc = FileNotFoundError(2, "No such file or directory")
+    message = update_runtime.describe_copilot_spawn_error(exc, cwd="/some/real/cwd")
+    assert "not found on PATH" in message
 
 
 @pytest.fixture(autouse=True)
@@ -30,6 +89,7 @@ def _pin_copilot(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def _isolate_enabled_plugin_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reconcile, "read_user_enabled_plugins", lambda: [])
+    monkeypatch.setattr(reconcile, "read_installed_plugins", lambda: [])
     monkeypatch.setattr(m, "_INVOCATION_CWD", Path("/missing/invocation"))
     monkeypatch.delenv(m._UPDATE_CONTEXT_ENV, raising=False)
 
@@ -127,7 +187,10 @@ def test_version_drift_triggers_runtime_install(monkeypatch):
     assert "agent-codespaces" in _installed_names(calls)
 
 
-def test_runtime_install_strips_caller_payload_environment(monkeypatch):
+def test_runtime_install_strips_caller_payload_environment(
+    monkeypatch,
+    tmp_path,
+):
     _install_config(monkeypatch)
     _stub_reconcile(
         monkeypatch,
@@ -138,10 +201,22 @@ def test_runtime_install_strips_caller_payload_environment(monkeypatch):
     )
     monkeypatch.setenv("COPILOT_PLUGIN_ROOT", "/caller/payload")
     monkeypatch.setenv("PYTHONPATH", "/caller/python")
+    inherited_context = tmp_path / "foreign-install.json"
+    inherited_context.write_text(
+        json.dumps(
+            {
+                "marketplaceId": "foreign--0000000000000000",
+                "pluginId": "agent-codespaces",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", str(inherited_context))
     monkeypatch.setenv("RECONCILE_KEEP", "present")
     captured: dict = {}
 
     def fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
         captured["env"] = kwargs["env"]
         return _ok()
 
@@ -157,7 +232,132 @@ def test_runtime_install_strips_caller_payload_environment(monkeypatch):
 
     assert "COPILOT_PLUGIN_ROOT" not in captured["env"]
     assert "PYTHONPATH" not in captured["env"]
+    assert "COPILOT_EXTENSIONS_CONTEXT" not in captured["env"]
     assert captured["env"]["RECONCILE_KEEP"] == "present"
+
+
+def test_runtime_install_uses_matching_validated_context(
+    monkeypatch,
+    tmp_path,
+):
+    plugin_name = "agent-machines"
+    _install_config(monkeypatch)
+    payload = tmp_path / plugin_name
+    (payload / "scripts").mkdir(parents=True)
+    (payload / "scripts" / "init.sh").write_text(
+        "#!/usr/bin/env bash\n",
+        encoding="utf-8",
+    )
+    (payload / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": plugin_name,
+                "version": "0.2.0",
+                "runtimeScope": "universal",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(reconcile, "read_enabled_plugins", lambda repo_dir: [plugin_name])
+    monkeypatch.setattr(reconcile, "core_installed_payload_dir", lambda name: payload)
+    monkeypatch.setattr(reconcile, "manifest_runtime_scope", lambda pdir: "universal")
+    monkeypatch.setattr(reconcile, "payload_version", lambda pdir: "0.2.0")
+    monkeypatch.setattr(reconcile.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        reconcile,
+        "runtime_deployed_version",
+        lambda name, *args, **kwargs: "0.1.0",
+    )
+    receipt = Path.cwd() / "cells" / plugin_name / "install.json"
+    monkeypatch.setattr(
+        reconcile,
+        "resolve_runtime_installation",
+        lambda name, pdir, **kwargs: reconcile.RuntimeInstallationResolution(
+            runtime_root=receipt.parent,
+            context=receipt,
+            actual_mode="namespaced",
+            desired_mode="namespaced",
+            status="ready",
+            reason="namespaced-active",
+        ),
+    )
+    monkeypatch.setenv(
+        "COPILOT_EXTENSIONS_CONTEXT",
+        str(Path.cwd() / "foreign" / "install.json"),
+    )
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["env"] = kwargs["env"]
+        return _ok()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    m._reconcile_registered_runtimes(Path("/plugin/dir"), "linux", force=False)
+
+    assert captured["env"]["COPILOT_EXTENSIONS_CONTEXT"] == str(receipt)
+    assert captured["argv"][2] == "cell-provision"
+
+
+def test_namespaced_runtime_without_transaction_is_not_invoked(
+    monkeypatch,
+    tmp_path,
+):
+    plugin_name = "agent-index"
+    _install_config(monkeypatch)
+    payload = tmp_path / plugin_name
+    (payload / "scripts").mkdir(parents=True)
+    (payload / "scripts" / "install.sh").write_text(
+        "#!/usr/bin/env bash\n",
+        encoding="utf-8",
+    )
+    (payload / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": plugin_name,
+                "version": "0.2.0",
+                "runtimeScope": "universal",
+            }
+        ),
+        encoding="utf-8",
+    )
+    receipt = Path.cwd() / "cells" / plugin_name / "install.json"
+    monkeypatch.setattr(reconcile, "read_enabled_plugins", lambda repo_dir: [plugin_name])
+    monkeypatch.setattr(reconcile, "core_installed_payload_dir", lambda name: payload)
+    monkeypatch.setattr(reconcile, "manifest_runtime_scope", lambda pdir: "universal")
+    monkeypatch.setattr(reconcile, "payload_version", lambda pdir: "0.2.0")
+    monkeypatch.setattr(
+        reconcile,
+        "runtime_deployed_version",
+        lambda name, *args, **kwargs: "0.1.0",
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "resolve_runtime_installation",
+        lambda name, pdir, **kwargs: reconcile.RuntimeInstallationResolution(
+            runtime_root=receipt.parent,
+            context=receipt,
+            actual_mode="namespaced",
+            desired_mode="namespaced",
+            status="ready",
+            reason="namespaced-active",
+        ),
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda argv, **kwargs: calls.append(list(argv)) or _ok(),
+    )
+
+    m._reconcile_registered_runtimes(
+        Path("/plugin/dir"),
+        "linux",
+        force=True,
+    )
+
+    assert calls == []
 
 
 def test_current_runtime_is_skipped_without_force(monkeypatch):
@@ -174,6 +374,32 @@ def test_current_runtime_is_skipped_without_force(monkeypatch):
     assert "agent-codespaces" not in _installed_names(calls)
 
 
+def test_current_cell_runtime_still_requires_receipt(monkeypatch):
+    _install_config(monkeypatch)
+    _stub_reconcile(
+        monkeypatch,
+        enabled=["agent-index"],
+        scopes={"agent-index": "universal"},
+        deployed={"agent-index": "0.2.0"},
+        payload={"agent-index": "0.2.0"},
+    )
+    calls = _capture_installers(monkeypatch)
+    monkeypatch.setattr(
+        reconcile,
+        "resolve_runtime_installation",
+        lambda name, pdir, **kwargs: (_ for _ in ()).throw(
+            ValueError("active installation receipt is missing")
+        ),
+    )
+
+    result = m._reconcile_one_runtime("agent-index", "linux", force=False)
+
+    assert result == (
+        "installation context invalid: active installation receipt is missing"
+    )
+    assert calls == []
+
+
 def test_force_reinstalls_even_when_current(monkeypatch):
     _install_config(monkeypatch)
     _stub_reconcile(
@@ -188,7 +414,7 @@ def test_force_reinstalls_even_when_current(monkeypatch):
     assert "agent-codespaces" in _installed_names(calls)
 
 
-def test_selected_context_never_runs_legacy_installer(monkeypatch):
+def test_invalid_context_never_runs_installer(monkeypatch):
     _install_config(monkeypatch)
     _stub_reconcile(
         monkeypatch,
@@ -199,8 +425,10 @@ def test_selected_context_never_runs_legacy_installer(monkeypatch):
     )
     monkeypatch.setattr(
         reconcile,
-        "_selected_runtime_root",
-        lambda name, pdir: (Path("/cell/plugins") / name, True),
+        "resolve_runtime_installation",
+        lambda name, pdir, **kwargs: (_ for _ in ()).throw(
+            ValueError("invalid receipt")
+        ),
     )
     calls = _capture_installers(monkeypatch)
 
@@ -223,6 +451,54 @@ def test_payload_only_plugin_is_skipped(monkeypatch):
     calls = _capture_installers(monkeypatch)
     m._reconcile_registered_runtimes(Path("/plugin/dir"), "linux", force=True)
     assert _installed_names(calls) == set()
+
+
+def test_inactive_inventory_runtime_is_not_reconciled(monkeypatch):
+    _install_config(monkeypatch)
+    _stub_reconcile(
+        monkeypatch,
+        enabled=[],
+        scopes={"agent-codespaces": "universal"},
+        deployed={"agent-codespaces": "0.3.4-dev62"},
+        payload={"agent-codespaces": "0.3.4-dev102"},
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "read_installed_plugins",
+        lambda: ["agent-codespaces"],
+    )
+    calls = _capture_installers(monkeypatch)
+
+    m._reconcile_registered_runtimes(Path("/plugin/dir"), "linux", force=True)
+
+    assert _installed_names(calls) == set()
+
+
+def test_activation_unknown_inventory_runtime_is_reconciled(monkeypatch):
+    _install_config(monkeypatch)
+    _stub_reconcile(
+        monkeypatch,
+        enabled=[],
+        scopes={"agent-codespaces": "universal"},
+        deployed={"agent-codespaces": "0.3.4-dev62"},
+        payload={"agent-codespaces": "0.3.4-dev102"},
+    )
+    calls = _capture_installers(monkeypatch)
+    targets = {
+        "agent-codespaces": m._RegisteredPluginTarget(
+            context=None,
+            activation=m._PluginActivation.UNKNOWN,
+        )
+    }
+
+    m._reconcile_registered_runtimes(
+        Path("/plugin/dir"),
+        "linux",
+        force=True,
+        targets=targets,
+    )
+
+    assert _installed_names(calls) == {"agent-codespaces"}
 
 
 def test_module_and_self_runtimes_are_excluded(monkeypatch, tmp_path):
@@ -305,8 +581,77 @@ def test_failure_is_best_effort(monkeypatch):
         lambda self: True if str(self).endswith("install.sh") else real_exists(self),
     )
     # Must not raise despite agent-aaa failing; both attempted.
-    m._reconcile_registered_runtimes(Path("/plugin/dir"), "linux", force=True)
+    assert (
+        m._reconcile_registered_runtimes(
+            Path("/plugin/dir"),
+            "linux",
+            force=True,
+        )
+        is False
+    )
     assert attempted == ["agent-aaa", "agent-bbb"]
+
+
+def test_forced_namespaced_runtime_fails_without_claiming_repair(
+    monkeypatch,
+    tmp_path,
+):
+    plugin_name = "agent-machines"
+    _install_config(monkeypatch)
+    payload = tmp_path / plugin_name
+    (payload / "scripts").mkdir(parents=True)
+    (payload / "scripts" / "init.sh").write_text(
+        "#!/usr/bin/env bash\n",
+        encoding="utf-8",
+    )
+    (payload / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": plugin_name,
+                "version": "0.2.0",
+                "runtimeScope": "universal",
+            }
+        ),
+        encoding="utf-8",
+    )
+    receipt = Path.cwd() / "cells" / plugin_name / "install.json"
+    monkeypatch.setattr(reconcile, "read_enabled_plugins", lambda repo_dir: [plugin_name])
+    monkeypatch.setattr(reconcile, "core_installed_payload_dir", lambda name: payload)
+    monkeypatch.setattr(reconcile, "manifest_runtime_scope", lambda pdir: "universal")
+    monkeypatch.setattr(reconcile, "payload_version", lambda pdir: "0.2.0")
+    monkeypatch.setattr(
+        reconcile,
+        "runtime_deployed_version",
+        lambda name, *args, **kwargs: "0.2.0",
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "resolve_runtime_installation",
+        lambda name, pdir, **kwargs: reconcile.RuntimeInstallationResolution(
+            runtime_root=receipt.parent,
+            context=receipt,
+            actual_mode="namespaced",
+            desired_mode="namespaced",
+            status="ready",
+            reason="namespaced-active",
+        ),
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda argv, **kwargs: calls.append(list(argv)) or _ok(),
+    )
+
+    assert (
+        m._reconcile_registered_runtimes(
+            Path("/plugin/dir"),
+            "linux",
+            force=True,
+        )
+        is False
+    )
+    assert calls == []
 
 
 def test_no_config_is_noop(monkeypatch):
@@ -399,6 +744,65 @@ def test_init_only_plugin_falls_back_to_init_sh(monkeypatch):
     assert "--force" not in argv
 
 
+def test_init_only_plugin_needs_no_receipt_and_strips_caller_context(
+    monkeypatch,
+    tmp_path,
+):
+    """A legacy bootstrap runs receipt-free with inherited ownership removed."""
+    _install_config(monkeypatch)
+    _stub_reconcile(
+        monkeypatch,
+        enabled=["agent-machines"],
+        scopes={"agent-machines": "machine-gated"},
+        deployed={"agent-machines": "0.1.0-dev18"},
+        payload={"agent-machines": "0.1.0-dev24"},
+    )
+    foreign_context = tmp_path / "foreign" / "install.json"
+    foreign_context.parent.mkdir(parents=True)
+    foreign_context.write_text(
+        json.dumps(
+            {
+                "marketplaceId": "foreign--0000000000000000",
+                "pluginId": "agent-machines",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", str(foreign_context))
+    monkeypatch.setenv("COPILOT_PLUGIN_INSTALL_STAGED", "1")
+    monkeypatch.setenv("COPILOT_PLUGIN_ROOT", "/caller/payload")
+    monkeypatch.setenv("COPILOT_PLUGIN_STAGED_FROM", "/caller/staged-payload")
+    monkeypatch.setenv("RECONCILE_KEEP", "present")
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["env"] = kwargs["env"]
+        return _ok()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    real_exists = Path.exists
+
+    def fake_exists(self):
+        value = str(self)
+        if value.endswith("install.sh"):
+            return False
+        if value.endswith("init.sh"):
+            return True
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", fake_exists)
+
+    m._reconcile_registered_runtimes(Path("/plugin/dir"), "linux", force=False)
+
+    assert captured["argv"][-1].endswith("scripts/init.sh")
+    assert "COPILOT_EXTENSIONS_CONTEXT" not in captured["env"]
+    assert "COPILOT_PLUGIN_INSTALL_STAGED" not in captured["env"]
+    assert "COPILOT_PLUGIN_ROOT" not in captured["env"]
+    assert "COPILOT_PLUGIN_STAGED_FROM" not in captured["env"]
+    assert captured["env"]["RECONCILE_KEEP"] == "present"
+
+
 def test_init_only_plugin_forced_passes_force_flag(monkeypatch):
     """A forced reconcile of an init-only runtime passes --force to the bootstrap."""
     _install_config(monkeypatch)
@@ -418,6 +822,32 @@ def test_init_only_plugin_forced_passes_force_flag(monkeypatch):
     assert argv[-1] == "--force"
     assert argv[-2].endswith("scripts/init.sh")
     assert "update" not in argv
+
+
+def test_current_init_only_plugin_skips_without_receipt(monkeypatch):
+    _install_config(monkeypatch)
+    _stub_reconcile(
+        monkeypatch,
+        enabled=["agent-machines"],
+        scopes={"agent-machines": "machine-gated"},
+        deployed={"agent-machines": "0.1.0-dev24"},
+        payload={"agent-machines": "0.1.0-dev24"},
+    )
+    calls = _capture_init_installers(monkeypatch)
+    monkeypatch.setattr(
+        reconcile,
+        "runtime_installation_candidate",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("init-only runtime must not request a receipt")
+        ),
+    )
+
+    result = m._reconcile_one_runtime(
+        "agent-machines", "linux", force=False
+    )
+
+    assert result == "SKIPPED (current)"
+    assert calls == []
 
 
 def test_module_names_reads_manifest(tmp_path):

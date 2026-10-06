@@ -5,7 +5,7 @@
   local services on a user's machine.
 - **Scope:** branch (links cross-cutting and per-plugin child visions)
 - **Status:** Active
-- **Last revised:** 2026-08-25
+- **Last revised:** 2026-10-04
 - **Reality docs:** [`docs/architecture.md`](../../docs/architecture.md) ·
   [`docs/install-contract.md`](../../docs/install-contract.md) · each plugin's
   `docs/architecture.md`
@@ -36,6 +36,16 @@ vision exists to abolish is the manual deconfliction of shared machine resources
 service owns which address" bookkeeping — that turns adding or moving a service
 into a coordination problem.
 
+A third force sits alongside those two, guarding against a different failure
+mode: **process count must never scale with agent activity.** A user running
+one Copilot session and a user running ten concurrent sessions across as many
+worktrees see the **same** set of long-lived service daemons on their machine —
+never a process, console, or subprocess tree that multiplies per session, per
+worktree, or per hook/extension invocation. Every session-lifecycle hook and
+extension callback is **transient by contract**: it resolves identity, reaches
+the one live daemon it needs, and exits — it is never itself the long-running
+thing, and it never spawns one just to be sure.
+
 ## Concepts & Components
 
 - **Plugin runtime** — the self-contained versioned runtime and invocation
@@ -47,6 +57,38 @@ into a coordination problem.
   config fragments without importing across runtimes or editing one shared file.
   Presence is only a discovery candidate: the consumer validates provenance,
   current eligibility, and the referenced target before activating it.
+- **Plugin-stack tier** — every plugin in the suite has one position in an
+  ordered, one-way dependency stack (lowest first): agent-machines, agent-ssh,
+  agent-worktrees, agent-mcp, agent-logger (optional), agent-vault (optional),
+  agent-bridge, agent-codespaces/agent-containers, agent-dispatch, agent-index
+  (highest). A plugin may call **downward** to a lower tier, with graceful
+  degradation if that tier is absent — never **upward**, directly, to a higher
+  tier. Functionality a higher tier owns is exposed to a lower tier only
+  through a drop-in contribution registry the *lower* tier itself owns (the
+  higher tier contributes into it), never by the lower tier importing or
+  shelling out to the higher tier's own CLI.
+- **Claim provider** — a plugin-stack instance of the drop-in contribution
+  registry, scoped to "things a worktree can claim" (a dispatch task, a
+  CodeSpace, a container). agent-worktrees owns the claims ledger and the
+  claim-provider registry itself; a higher-tier plugin that introduces a new
+  kind of claimable resource registers its claim **namespace** and a
+  **status-check callback** into that registry, mirroring agent-bridge's own
+  bridge-provider pattern for namespace resolution. agent-worktrees resolves
+  the provider for a namespaced claim's prefix and asks it for status — it
+  never hardcodes a call to a specific higher-tier sibling's CLI. A missing
+  provider degrades only that claim's status resolution, never agent-
+  worktrees' own claims commands.
+- **Entity-relationship diagnosability** — the suite's durable entities
+  (worktree, session, task, machine, agent, repo, project, bridge, container,
+  codespace) and the claim refs that link them are each owned by exactly one
+  plugin tier, but an operator or agent diagnosing a problem routinely needs to
+  traverse *across* owners (a session's worktree, a worktree's handoff chain, a
+  task's bridge state). That traversal must be answerable by composing a small,
+  documented set of CLI commands — never by an ad-hoc script reading another
+  plugin's private database file directly. A plugin that introduces a new
+  cross-entity traversal question either points to the existing command(s) that
+  answer it or adds the missing one; it is never left to bit-rot as tribal
+  knowledge. See the `entity-relationship-model` pattern.
 - **Service-bearing plugin** — a plugin whose runtime includes a **long-lived
   local service** (an always-on daemon), as distinct from an on-demand CLI or a
   payload-only (skills/extension) plugin.
@@ -56,9 +98,16 @@ into a coordination problem.
 - **Endpoint discovery (rendezvous)** — how a client finds the *current*
   endpoint of a service without a human-managed constant. Discovery is the seam
   that makes endpoints collision-free and relocatable.
-- **Lifecycle supervision** — the platform-native mechanism that starts, keeps
-  alive, and restarts a service (a per-user OS service), so a service's presence
-  does not depend on an interactive session.
+- **Lifecycle supervision** — the platform-native mechanism that realizes a
+  service's declared availability contract, from user-session auto-run through
+  restart-on-failure and pre-login operation.
+- **Lifecycle tier** — the least-privileged supervision class that satisfies a
+  service's actual availability needs: user-mode ensure/auto-run, scheduled
+  activation, an installed system service, or a container whose orchestrator
+  owns lifecycle. Moving upward is an explicit escalation, not the default.
+- **Stable lifecycle launcher** — the durable invocation boundary registered
+  with a supervisor once. It remains at one stable location while resolving the
+  currently selected immutable runtime generation behind that boundary.
 - **Single-instance lease** — the host-local claim that makes "**one active
   daemon per service per host**" an *asserted, repairable* property rather than a
   hope: a process becomes the active endpoint only by holding the lease, and a
@@ -71,6 +120,24 @@ into a coordination problem.
   daemon (consolidating the warm runtime and shared upstream, never the callers'
   isolated state), instead of each caller spawning its own worker. A convenience
   over the always-correct inline path, never a dependency.
+- **Transient hook / extension callback** — the code Copilot CLI itself invokes
+  at a session-lifecycle point (session start, a tool call, an agent-host
+  event) or through an injected extension. It is host-launched per invocation
+  and by nature short-lived; the service model requires it to **stay** that way
+  — resolve identity, reach the live daemon it needs, hand off, exit — rather
+  than becoming, or spawning, a long-running process of its own.
+- **Name-resolved repo/agent identity** — a repository, worktree-managed
+  project, or agent is referenced everywhere in the suite by its **registered
+  name** (or, for a not-yet-registered remote, its **remote URL**) — never by a
+  filesystem path copied into a second store. Exactly **one** canonical
+  registry per identity kind owns the current path for that name (e.g. a repo's
+  `repos.yaml`/`projects.yaml`); every other component — a supervised-work
+  pointer, a registered task's repo binding, a scheduled-task action, a drop-in
+  declaration — carries the **name** and resolves today's path through that
+  owner's own lookup at the moment it is needed, never by persisting a copy of
+  the path into its own state. A worktree checkout's own directory name is a
+  **per-session, per-machine identifier**, never a stable identity a downstream
+  system may adopt as if it were the repo's name.
 - **Install contract** — the uniform deploy/version/footprint agreement every
   runtime plugin follows, so services deploy, update, and are audited the same
   way. See [`docs/install-contract.md`](../../docs/install-contract.md).
@@ -118,13 +185,29 @@ fully functional; adding or removing a plugin never breaks an unrelated one and
 never requires reconfiguring the survivors.
 
 ### platform-native-lifecycle
-A service is supervised by the host OS's own per-user service facility, giving
-auto-start, keep-alive, and restart-on-failure on every supported platform
-(Windows and Linux/WSL) through one coherent contract. This supervision is the
-plugin's **own** — a plugin brings up, keeps alive, and restarts **its own
-daemon** with **no installer/configurator control-plane in the loop**; the
-optional control-plane may *observe* and *true-up* daemons across the set, but a
-daemon's existence and liveness never depend on it running.
+A service's declared availability is realized by the host's native lifecycle
+facility through one coherent cross-platform contract. A user-session service
+starts with that user; a managed user service adds restart and logout-survival
+where declared; a system service adds pre-login or system-identity availability.
+For standalone host installation this supervision is the plugin's **own** — a
+plugin brings up and keeps alive **its own daemon** with **no
+installer/configurator control-plane in the loop**. An optional control-plane
+may observe and true-up daemons across the set, but a daemon's standalone
+existence and liveness never depend on it running.
+
+### least-privilege-lifecycle-tier
+Every service uses the **lowest lifecycle tier that satisfies its availability
+contract**. User-mode ensure/auto-run is the default because starting and
+keeping the process healthy needs no elevation; scheduled activation is an
+opt-in next step when login/startup triggers are required; an installed system
+service is reserved for system-wide or pre-login availability; and a container
+is used only when an external orchestrator explicitly owns lifecycle. The same
+platform facility may realize different tiers when its privilege and
+availability properties differ. Installation does not escalate merely because
+a more privileged mechanism is available, and routine updates never introduce a
+new privilege boundary. Container management is a consumer-selected deployment
+of the same portable service contract, not a dependency of the plugin's
+standalone host installation.
 
 ### self-provisioning-runtime
 **Enabling** a runtime plugin is the whole action a user takes — its runtime
@@ -156,6 +239,40 @@ control-plane being present: it is a **convenience that can update the whole set
 and true-up alignment**, but a plugin **provisions and reconciles itself — and
 supervises its own daemon (see *platform-native-lifecycle*) — with that app
 entirely absent**.
+
+**Narrow, operator-invoked exception (bootstrap-killswitch):** an explicit,
+resettable, host-local switch lets an operator or agent pause this automatic
+reconcile for the **default (non-namespaced) installation only**, for the
+duration of a hand diagnosis of a venv/install path that a background reconcile
+would otherwise race. It is deliberately narrow: scoped to one shared state
+file outside every installation cell's own ownership boundary, so it never
+reaches into or is reachable from a namespaced marketplace cell's own
+independent reconcile (see the
+[Marketplace Installation Cells](installation-cells/README.md) child vision);
+fails open to
+"reconcile proceeds normally" on a missing or corrupt switch; and carries no
+automatic expiry, so turning it back off is the operator's own responsibility.
+It changes *when* self-reconcile is allowed to run, never *whether* an enabled
+runtime's payload-vs-deployed drift is itself detected or resolved once
+reconcile resumes.
+
+### delegated-heavy-companion-runtime
+The self-provisioning contract has one narrow exception: an explicitly
+configured **optional companion capability** whose dependency footprint is too
+heavy or invasive for ordinary plugin first-use and session-start paths may
+delegate runtime materialization to an already-running trusted supervisor. The
+plugin contributes an attributed declarative contract; it does not contribute
+an arbitrary installer command, package-manager flags, credentials, or physical
+runtime placement. The supervisor alone builds, validates, atomically publishes,
+selects, rolls back, and retires immutable companion runtime generations.
+
+This exception never becomes an ambient dependency of the plugin. Without
+explicit capability configuration and the owning supervisor, the contribution
+is inert and the capability is honestly unavailable; an agent-facing command
+cannot install it as a fallback. The plugin's remaining lightweight surfaces
+continue to work independently where meaningful. A normal runtime plugin or
+service still follows `self-provisioning-runtime`; delegation is an explicit
+capability boundary, not a way to centralize routine plugin installation.
 
 ### graceful-composition
 When multiple services are present they discover and use one another's optional
@@ -211,7 +328,18 @@ correctness**. The suite is correct **while** skewed.
 ### uniform-deploy-contract
 All service-bearing plugins share one deploy/update/version footprint (the
 install contract), so a user — or an automated fleet — reasons about, audits, and
-upgrades every plugin service the same way.
+upgrades every plugin service the same way. That uniformity is guaranteed **by
+construction, not by convention**: a single shared, vendored template realizes
+the install/update entrypoint's actual mechanics identically for every adopting
+plugin, rather than each plugin hand-maintaining its own copy that merely
+resembles its siblings. A plugin expresses its own install/update behavior only
+through the template's defined configuration points — what runtime to
+provision, what to check, what to register — never by forking the template's
+control flow or re-deriving its mechanics in a bespoke script. A fix or
+hardening to the shared mechanics (an atomicity guarantee, a concurrency-safety
+fix, a new validation step) reaches every adopter the same way the template
+itself is kept in sync, rather than depending on each plugin separately
+noticing and re-deriving it.
 
 ### install-adopt-boundary
 Two lifecycle verbs, two scopes, never crossed. **Install/update** touches only
@@ -226,6 +354,21 @@ part of each command's contract: a repo-bootstrap command may write repo and
 machine-local wiring, while a projection command may only read published repo
 state and update user-level configuration. The verb name alone never grants
 repo-write authority.
+
+### entity-relationship-diagnosability
+Every entity the suite tracks (worktree, session, task, machine, repo,
+project, bridge, container, codespace — nine durable, plus the transient
+**agent** identity actively driving a session) is owned by exactly one plugin
+tier, and every cross-entity traversal an operator or agent actually needs
+(a session's worktree, a worktree's full session/handoff history, a task's
+current bridge/liveness state, a session's rendered conversation + usage stats,
+and each direction's reverse lookup) resolves through a **documented,
+composable CLI command** — never by an ad-hoc script reading a sibling
+plugin's private on-disk database directly. A newly introduced entity or claim
+namespace ships with its position in the relationship model and either points
+to the existing command(s) answering each traversal question or adds the
+missing one, so the model never bit-rots into tribal knowledge scattered across
+session transcripts.
 
 ## Behaviors
 
@@ -325,6 +468,25 @@ request, double-runs a scheduled job, or opens a window with no live service.
 *How* the routing record and drain are implemented (a shared cutover primitive) is
 spec-level, not fixed here.
 
+### register-once-cutover-on-update
+A lifecycle supervisor is bound **once** to a stable launcher and remains
+unchanged across ordinary version updates. The launcher resolves the selected
+immutable runtime generation dynamically; an update installs the new generation
+beside the old one and uses *zero-downtime-cutover* to move work before retiring
+the predecessor. A routine version bump therefore requires neither
+re-registration nor renewed elevation, and changing runtime configuration does
+not rewrite the supervisor definition.
+
+### payload-remains-replaceable
+The marketplace payload remains replaceable while services and launchers are
+running. No long-lived **service, daemon, installer, or service launcher** may
+retain the payload directory as its working directory or depend on mutable files
+there for steady-state service execution. Runtime processes operate from their
+installed generation and durable state locations, so refreshing or replacing
+the payload cannot be blocked by a process the previous payload launched.
+Copilot CLI's own session-scoped loading of skills, hooks, and extensions from
+the payload remains outside this service-runtime guarantee.
+
 ### single-instance-lease
 At most **one live daemon owns a given service within one marketplace
 installation cell on a host at a time**, and that ownership is **explicit and
@@ -357,6 +519,90 @@ one shape: **consolidate the warm runtime and shared upstream, never the callers
 isolated state, and only across callers that share the same identity and
 credentials.** Guarded by the *single-instance-lease*, cut over by
 *zero-downtime-cutover*, discovered by rendezvous.
+
+### process-count-scales-with-services-not-sessions
+The number of long-lived processes a host is running scales with the number of
+**distinct services** installed and active on it, and **never** with the number
+of active Copilot sessions, worktrees, hooks, or extension invocations. A host
+running five, or fifty, concurrent agent sessions has the **same** count of
+long-lived service daemons as a host running one — each service's
+*single-instance-lease* still bounds it to one live daemon per installation
+cell regardless of how many sessions ask it for work. A hook or extension
+callback that fires once per session, once per tool call, or once per worktree
+is exactly the caller shape the *work-coalescing-singleton* and
+*single-instance-lease* exist to absorb, never a trigger for a new daemon (or
+a new console/subprocess tree under one) per invocation.
+
+### hooks-and-callbacks-are-transient
+A **transient hook / extension callback** is not itself a long-lived process
+and never becomes one. Its entire job is: resolve its own session/worktree
+identity, locate the live daemon for the service it needs (through
+discovery/rendezvous — never by **spawning one to make sure**), post its
+packet, optionally read back follow-up guidance, and **exit**. Any actual
+long-running work it wants performed is *registered* with an already-running
+daemon (see *work-coalescing-singleton*) rather than carried out inline by a
+process the hook keeps alive or supervises. When no daemon is reachable, the
+hook degrades to inline/no-op behavior consistent with *degrade-gracefully* —
+it does not block waiting for one to appear, and it does not promote itself
+into the missing daemon.
+
+This transience is not special to Copilot-invoked hooks — it is the general
+shape every **repeated, on-demand caller** of a *work-coalescing singleton*
+follows, hook or not. An ordinary CLI invocation that repeatedly recomputes the
+same expensive, shareable answer (a status reduction, a classification pass) is
+the identical caller shape: it should reach the singleton as a thin,
+ref-counted subscriber — boot one on demand if none is reachable, wait for it
+to publish its address, read the answer, exit — rather than compute its own
+competing copy inline every time. Direct in-process computation remains the
+correct, always-available degrade path when no daemon is reachable or reachable
+in time; it is the *steady-state* default this behavior argues against, not the
+fallback.
+
+### identity-resolves-by-name-not-path
+The **only** place a repository's (or other named, registered identity's)
+*current* filesystem path is ever recorded is the one canonical registry its
+owning plugin maintains for that purpose (e.g. `repos.yaml`/`projects.yaml`).
+Every other component that needs to act on a named repo or agent — a
+supervised-work pointer, a registered task's repo binding, a scheduled-task
+action, a drop-in declaration, a cross-plugin reference of any kind — stores
+and passes the **name** (or, pre-registration, a remote URL), and resolves
+today's path through that registry's own lookup **at the moment it is
+needed**, never by copying the path into its own persistent state. A path is a
+**derived, disposable fact**; a name is the durable identity. This closes the
+exact failure class #2417 found: a component that derives a stable-looking
+identity (an "owner", a pointer name) from a raw filesystem path silently
+adopts whatever ephemeral thing happens to be at that path — a worktree
+checkout's own per-session directory name — as if it were the repo's name,
+producing a fresh, non-reconciling identity every time a new ephemeral
+checkout hits that code path.
+
+### refuse-not-silently-misidentify
+When a component cannot verify a path against a name it recognizes as that
+identity's registered anchor — or the path structurally matches an ephemeral
+worktree-checkout convention rather than a stable anchor — it refuses loudly
+with an actionable message, rather than silently deriving and persisting an
+identity from the raw path. Silence here is the failure mode: a bad identity
+recorded once keeps reproducing bad behavior (spawned work, mismatched
+registrations) every time it is read back, often long after the original
+mistake and its causing process are gone.
+
+### registered-tasks-target-by-name
+A registered or supervised task's stored declaration references at most an
+**agent name** or a **repo name** — never an absolute or worktree-scoped
+filesystem path. Resolving a name to its current live location is the
+*runtime's* job, done fresh each time the registration is acted on, never
+baked in as a snapshot at registration time. This is what keeps a
+registration meaningful across the registered repo's own moves, worktree
+churn, and reinstalls — the registration's identity never goes stale because
+it never held a path to begin with.
+
+### traversal-questions-stay-answerable
+The known cross-entity traversal questions (see
+`entity-relationship-diagnosability`) each resolve through at least one current
+CLI command, or the gap is a **named, tracked** issue — never a silent absence
+an agent rediscovers by trial and error each session. Adding a new entity kind
+or claim namespace without updating the traversal-question table is treated as
+an incomplete change, the same way an undocumented behavior change is.
 
 ## Non-Goals / Boundaries
 
@@ -393,6 +639,24 @@ credentials.** Guarded by the *single-instance-lease*, cut over by
 
 ## Provenance
 
+- **2026-09-09** — Generalized *hooks-and-callbacks-are-transient* beyond
+  Copilot-invoked hooks: any repeated, on-demand caller of a
+  *work-coalescing-singleton* (an ordinary CLI invocation recomputing an
+  expensive shareable answer, not only a session-lifecycle hook) should reach
+  it as a thin, ref-counted subscriber rather than compute its own competing
+  copy. Direct in-process computation stays the correct degrade path, not the
+  steady-state default. Paired with the same-day agent-worktrees vision
+  revision this generalizes into a concrete plugin instance.
+- **2026-09-03** — Added the **lifecycle tier** and **stable lifecycle launcher**
+  concepts, the **least-privilege-lifecycle-tier** feature, and the
+  **register-once-cutover-on-update** and **payload-remains-replaceable**
+  behaviors. Mined from repeated Windows update failures in which long-lived
+  plugin processes retained the marketplace payload as their working directory,
+  plus the existing stable-launcher and graceful-cutover mechanisms. The intent
+  generalizes the fixes tracked by #621, #622, and #1550: select the least
+  privileged sufficient supervisor, register its stable boundary once, move
+  versions behind it without renewed elevation, and keep the distributable
+  payload disposable.
 - **2026-08-25** — Added the
   [Marketplace Installation Cells](installation-cells/README.md) child vision.
   It generalizes the requirement that independently versioned marketplaces can
@@ -542,3 +806,27 @@ credentials.** Guarded by the *single-instance-lease*, cut over by
   primitive beside `zdd`/rendezvous, and the coalescing tier stays strictly
   optional with an always-correct inline fallback. Realized by the
   *plugin-process-hygiene* effort.
+
+- **2026-09-04** — Added **delegated-heavy-companion-runtime** as a narrow
+  exception to ordinary plugin self-provisioning. An explicitly configured
+  optional capability may keep heavyweight dependencies out of plugin and
+  session paths by contributing a declarative runtime contract to an
+  already-running trusted supervisor. The supervisor owns package installation,
+  immutable publication, rollback, and retention; the plugin has no fallback
+  installer authority and remains inert when the capability or supervisor is
+  absent. This preserves the default independent-plugin contract while giving
+  genuinely heavyweight companions one explicit ownership boundary.
+
+- **2026-10-02** — Added a second, narrow exception to
+  **self-provisioning-runtime**: the **bootstrap-killswitch**. Unlike
+  *delegated-heavy-companion-runtime* (which changes *who* provisions), this
+  changes *when* an already-provisioning plugin's own self-reconcile is allowed
+  to run -- an operator/agent can pause it host-wide, for the default
+  (non-namespaced) installation only, for the duration of a hand diagnosis that
+  a background reconcile would otherwise race. Deliberately scoped outside
+  every installation cell's own ownership boundary (see *Marketplace
+  Installation Cells*) so the switch can never cross into or be reached from a
+  namespaced marketplace cell's independent reconcile; fails open on a missing
+  or corrupt switch; no automatic expiry. Realized by the
+  `libs/bootstrap-killswitch/` mechanism (vendored per-plugin guard +
+  `agent-machines bootstrap-killswitch` CLI).

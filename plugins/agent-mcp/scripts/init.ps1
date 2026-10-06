@@ -26,6 +26,29 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+# === install-contract:test-persistent-environment -- keep byte-identical across installers ===
+function Get-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    return [Environment]::GetEnvironmentVariable($Name, $effectiveTarget)
+}
+
+function Set-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [AllowNull()][string]$Value,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    [Environment]::SetEnvironmentVariable($Name, $Value, $effectiveTarget)
+}
+# === end install-contract:test-persistent-environment ===
+
 # === install-contract:v4 self-stage -- keep byte-identical across plugins ===
 # dotfiles #935: a plugin installer reads its own payload (src/, libs/,
 # pyproject.toml) to build the venv, so while it runs -- especially if it wedges
@@ -287,7 +310,7 @@ function Get-BootstrapPython {
         if ($d) { $p = Join-Path $d 'Scripts\python.exe'; if (Test-Path $p) { return $p } }
     }
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        $exe = (& py -3 -c 'import sys; print(sys.executable)' 2>$null | Out-String).Trim()
+        $exe = (Invoke-Hidden py -3 -c 'import sys; print(sys.executable)' | Out-String).Trim()
         if ($LASTEXITCODE -eq 0 -and $exe -and (Test-Path $exe)) { return $exe }
     }
     foreach ($cand in 'python3', 'python') {
@@ -325,8 +348,8 @@ function Invoke-VersionedSlotClean {
     $vr = Join-Path $PSScriptRoot 'versioned_runtime.py'
     $py = Get-BootstrapPython
     if (-not $py) { return }
-    & $py $vr --root $InstallDir --link-name (Split-Path -Leaf $LinkDir) slot $SrcVersion --clean-incomplete 2>&1 |
-        ForEach-Object { Write-Host "  ...    $_" }
+    (Invoke-Hidden $py $vr --root $InstallDir --link-name (Split-Path -Leaf $LinkDir) slot $SrcVersion --clean-incomplete) -split "`r?`n" |
+        ForEach-Object { if ($_) { Write-Host "  ...    $_" } }
 }
 
 function Invoke-VersionedMarkComplete {
@@ -492,6 +515,37 @@ function Invoke-Stamp {
 
 if ($Action -eq 'stamp') { Invoke-Stamp; exit 0 }
 
+# -- Windowless spawn helper --------------------------------------------
+# This script is frequently invoked headlessly (no console of its own --
+# spawned via CREATE_NO_WINDOW from the Python-side bridge launcher). A
+# plain `&`-invoked console-subsystem child (python.exe, uv.exe) in that
+# situation gets a FRESH console window allocated by Windows, which flashes
+# on screen once per spawn during provisioning. Route provisioning spawns
+# through this helper (native CreateNoWindow=true) instead, so the child
+# never gets a window regardless of this script's own console state.
+# Preserves stdout capture + $LASTEXITCODE so call sites need only replace
+# `& $exe @args` with `Invoke-Hidden $exe @args`.
+function Invoke-Hidden {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(ValueFromRemainingArguments = $true)][string[]]$ArgList
+    )
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    foreach ($a in $ArgList) { [void]$psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $stderr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+    $global:LASTEXITCODE = $proc.ExitCode
+    if ($stderr) { $stderr -split "`r?`n" | Where-Object { $_ } | ForEach-Object { Write-Verbose $_ } }
+    return $stdout
+}
+
 # -- Preflight checks --------------------------------------------------
 
 Write-Host ''
@@ -539,7 +593,7 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
         $ErrorActionPreference = 'Continue'
         & winget install --id astral-sh.uv --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
         $ErrorActionPreference = $prevEAP
-        $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+        $env:PATH = (Get-CopilotPersistentEnvironmentVariable -Name 'PATH' -Target 'Machine') + ';' + (Get-CopilotPersistentEnvironmentVariable -Name 'PATH' -Target 'User')
         if (Get-Command uv -ErrorAction SilentlyContinue) { Write-Ok 'uv installed' }
     }
 }
@@ -564,7 +618,7 @@ if ($Force -or -not (Test-Path $VenvPython)) {
     $signedBase = $null
     if ($env:OS -eq 'Windows_NT' -and (Get-Command py -ErrorAction SilentlyContinue)) {
         foreach ($v in '3.13', '3.12', '3.11') {
-            $cand = (& py "-$v" -c "import sys;print(sys.executable)" 2>$null | Out-String).Trim()
+            $cand = (Invoke-Hidden py "-$v" -c "import sys;print(sys.executable)" | Out-String).Trim()
             if ($LASTEXITCODE -eq 0 -and $cand -and (Test-Path $cand)) {
                 try { if ((Get-AuthenticodeSignature $cand).Status -eq 'Valid') { $signedBase = $cand; break } } catch {}
             }
@@ -574,20 +628,20 @@ if ($Force -or -not (Test-Path $VenvPython)) {
         try { if ((Get-AuthenticodeSignature $VenvPython).Status -ne 'Valid') { Remove-Item -Recurse -Force $VenvDir -ErrorAction Stop } } catch {}
     }
     if ($signedBase -and -not (Test-Path $VenvPython)) {
-        & $signedBase -m venv --copies $VenvDir 2>&1 | Out-Null
+        Invoke-Hidden $signedBase -m venv --copies $VenvDir | Out-Null
     }
     if (-not (Test-Path $VenvPython)) {
         if (Get-Command uv -ErrorAction SilentlyContinue) {
             Write-Step 'Creating venv via uv...'
             Invoke-VersionedSlotClean
-            & uv venv $VenvDir --allow-existing 2>&1 | Out-Null
+            Invoke-Hidden uv venv $VenvDir --allow-existing | Out-Null
             if ($LASTEXITCODE -ne 0) {
                 Write-Step 'uv venv failed -- falling back to python -m venv'
-                & $pythonCmd -m venv $VenvDir 2>&1 | Out-Null
+                Invoke-Hidden $pythonCmd -m venv $VenvDir | Out-Null
             }
         } else {
             Write-Step 'Creating venv via python -m venv...'
-            & $pythonCmd -m venv $VenvDir 2>&1 | Out-Null
+            Invoke-Hidden $pythonCmd -m venv $VenvDir | Out-Null
         }
     }
     $ErrorActionPreference = $prevEAP
@@ -606,10 +660,41 @@ $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 # Pre-strip any locked console-script trampoline so uv can overwrite it (os err 5).
 Remove-ConsoleTrampolines -VenvDir $VenvDir
+
+# -- 2b. Preinstall workspace path deps (non-uv fallback) --------------
+# `agent-credential-relay`/`agent-procutil`/`agent-single-instance-lease`
+# are `uv`-editable canonical references (vendor-pointer-generalization
+# effort, Phase 1: no local copy in a dev checkout at all); `agent-zdd` is
+# a real local copy. All 4 are `[tool.uv.sources]` workspace path deps, so
+# when `uv` is unavailable the fallback below (bare `python -m pip
+# install`) cannot resolve any of them without this explicit preinstall.
+foreach ($lib in @(
+    @{ Dir = 'credential-relay'; Pkg = 'agent-credential-relay' },
+    @{ Dir = 'agent-procutil'; Pkg = 'agent-procutil' },
+    @{ Dir = 'single-instance-lease'; Pkg = 'agent-single-instance-lease' },
+    @{ Dir = 'zdd'; Pkg = 'agent-zdd' }
+)) {
+    $libDir = Join-Path $PluginDir "libs\$($lib.Dir)"
+    if (-not (Test-Path (Join-Path $libDir 'pyproject.toml'))) {
+        $libDir = Join-Path $PluginDir "..\..\libs\$($lib.Dir)"
+    }
+    if (Test-Path (Join-Path $libDir 'pyproject.toml')) {
+        if (Get-Command uv -ErrorAction SilentlyContinue) {
+            Invoke-Hidden uv pip install --python $VenvPython --reinstall-package $lib.Pkg "$libDir" --quiet | Out-Null
+        } else {
+            Invoke-Hidden $VenvPython -m pip install --quiet "$libDir" | Out-Null
+        }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail "$($lib.Dir) library install failed"
+            exit 1
+        }
+    }
+}
+
 if (Get-Command uv -ErrorAction SilentlyContinue) {
-    & uv pip install --python $VenvPython "$PluginDir" --quiet 2>&1 | Out-Null
+    Invoke-Hidden uv pip install --python $VenvPython "$PluginDir" --quiet | Out-Null
 } else {
-    & $VenvPython -m pip install --quiet "$PluginDir" 2>&1 | Out-Null
+    Invoke-Hidden $VenvPython -m pip install --quiet "$PluginDir" | Out-Null
 }
 $pkgResult = $LASTEXITCODE
 $ErrorActionPreference = $prevEAP
@@ -632,13 +717,13 @@ if ($VersionedRuntime) {
     # Health-gate (#935): never swap the stable .venv link onto a slot whose
     # package does not import -- a broken build must not become the live runtime.
     # The marker is written only after this gate passes (so "marked" == healthy).
-    & $VenvPython -c 'import agent_mcp' 2>$null
+    Invoke-Hidden $VenvPython -c 'import agent_mcp' | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Fail "Fresh runtime slot failed its health gate (versions/$SrcVersion) -- not activating"
         exit 1
     }
     Invoke-VersionedMarkComplete
-    & $VenvPython $VrScript --root $InstallDir --link-name '.venv' activate $SrcVersion --no-link 2>&1 | Out-Null
+    Invoke-Hidden $VenvPython $VrScript --root $InstallDir --link-name '.venv' activate $SrcVersion --no-link | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Fail "Failed to activate versioned venv (.venv -> versions/$SrcVersion)"
         exit 1
@@ -646,6 +731,56 @@ if ($VersionedRuntime) {
     Write-Ok "Runtime version $SrcVersion active (.venv -> versions/$SrcVersion)"
 }
 # === end install-contract:v3 versioned-venv activate ===
+
+# agent-mcp-specific (Phase 2, agent-mcp-graceful-cutover): before the hard
+# reap below, give a live `serve` daemon on a stale (non-current) version a
+# graceful zero-downtime handoff instead of just killing it. `--require-live`
+# makes this call safe to run unconditionally on every activation: it never
+# starts a resident daemon where none was running (serve is optional,
+# on-demand warmth, not a registered service), and no-ops if the live daemon
+# is already on this exact version. Only a genuinely live, differently-
+# versioned daemon actually cuts over here; the reap step right after this
+# still runs unchanged as the safety net for anything cutover didn't handle
+# (a pre-feature daemon with no control channel, a failed cutover, or a
+# leaked/orphaned bridge tree that was never a `serve` daemon at all).
+# Best-effort: never fails the install. Opt out with AGENT_MCP_NO_CUTOVER.
+# The CLI's own defaults (60s health / 300s drain) are tuned for a human
+# operator explicitly watching a manual `agent-mcp cutover`; an unattended
+# activation pass must not silently block for up to ~6 minutes on a lightly-
+# used bridge, so this uses much shorter install-appropriate defaults
+# (still overridable, e.g. for a host with slow-starting upstream MCP
+# servers) via AGENT_MCP_CUTOVER_HEALTH_TIMEOUT / AGENT_MCP_CUTOVER_DRAIN_TIMEOUT.
+if ($VersionedRuntime -and -not $env:AGENT_MCP_NO_CUTOVER) {
+    $cutoverHealthTimeout = if ($env:AGENT_MCP_CUTOVER_HEALTH_TIMEOUT) { $env:AGENT_MCP_CUTOVER_HEALTH_TIMEOUT } else { '15' }
+    $cutoverDrainTimeout = if ($env:AGENT_MCP_CUTOVER_DRAIN_TIMEOUT) { $env:AGENT_MCP_CUTOVER_DRAIN_TIMEOUT } else { '30' }
+    try {
+        # `-ArgList` is passed explicitly (as an array) rather than as bare
+        # positional tokens: `Invoke-Hidden`'s `param()` block uses
+        # `[Parameter(...)]` attributes, which implicitly makes it an
+        # advanced function and enables PowerShell's common parameters
+        # (`-InformationAction`/`-InformationVariable`/etc.). A bare `-I`
+        # token (Python's isolated-mode flag) is ambiguous against those two
+        # common-parameter names and PowerShell throws instead of treating
+        # it as a remaining argument. Binding the whole array to `-ArgList`
+        # by name sidesteps that re-parsing entirely.
+        $cutoverArgs = @(
+            '-I', '-X', 'utf8', '-m', 'agent_mcp', 'cutover', '--require-live', '--force', '--json',
+            '--health-timeout', $cutoverHealthTimeout, '--drain-timeout', $cutoverDrainTimeout
+        )
+        $cutoverJson = Invoke-Hidden -FilePath $VenvPython -ArgList $cutoverArgs
+        $cutoverArg = (($cutoverJson | Out-String).Trim())
+        if ($cutoverArg) {
+            $cutoverResult = $cutoverArg | ConvertFrom-Json
+            if ($cutoverResult.skipped) {
+                Write-Skip "Cutover skipped: $($cutoverResult.skipped)"
+            } elseif ($cutoverResult.ok) {
+                Write-Ok "Cut over the live serve daemon to the new version (routing flipped; old drained + retired)"
+            } else {
+                Write-Warn "Cutover attempted -- $($cutoverResult.error)"
+            }
+        }
+    } catch { Write-Skip "Cutover skipped ($($_.Exception.Message))" }
+}
 
 # agent-mcp-specific (NOT part of the byte-identical activate block above): reap
 # processes still running from a now-stale (non-current) slot -- leaked/orphaned
@@ -659,7 +794,7 @@ if ($VersionedRuntime -and -not $env:AGENT_MCP_NO_VERSION_REAP) {
         # Use the plain (one 'version:pid' per line) output, not --json: under this
         # script's Set-StrictMode 2.0, an empty ConvertFrom-Json array collapses so
         # a later .Count throws. @(...) of the lines is always a countable array.
-        $reapLines = & $VenvPython $ReapScript --root $InstallDir --link-name '.venv' 2>$null
+        $reapLines = (Invoke-Hidden $VenvPython $ReapScript --root $InstallDir --link-name '.venv') -split "`r?`n"
         $reaped = @($reapLines | Where-Object { $_ -and $_.ToString().Trim() })
         if ($reaped.Count -gt 0) {
             $stale = ($reaped | ForEach-Object { ($_ -split ':', 2)[0] } | Sort-Object -Unique) -join ', '
@@ -751,9 +886,9 @@ $pathDirs = $env:PATH -split ';'
 if ($pathDirs -contains $LocalBin) {
     Write-Ok "PATH: $LocalBin is on PATH"
 } else {
-    $currentUserPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+    $currentUserPath = Get-CopilotPersistentEnvironmentVariable -Name 'PATH' -Target 'User'
     if (-not ($currentUserPath -split ';' | Where-Object { $_ -eq $LocalBin })) {
-        [System.Environment]::SetEnvironmentVariable('PATH', "$LocalBin;$currentUserPath", 'User')
+        Set-CopilotPersistentEnvironmentVariable -Name 'PATH' -Value "$LocalBin;$currentUserPath" -Target 'User'
         $env:PATH = "$LocalBin;$env:PATH"
         Write-Ok "PATH: Added $LocalBin to User PATH"
     }

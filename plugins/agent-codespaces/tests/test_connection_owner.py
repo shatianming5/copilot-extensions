@@ -8,6 +8,7 @@ semantics, TTL-based tenant reclamation, pin stickiness, and persistence.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import types
@@ -354,6 +355,9 @@ class _FakeOwner:
     def active_codespaces(self):
         return set()
 
+    def idle_limit(self, idle):
+        return idle
+
 
 async def test_run_owner_daemon_reconciles_until_stopped(store):
     fake = _FakeOwner(stop_after=3)
@@ -369,6 +373,204 @@ async def test_run_owner_daemon_survives_a_failing_cycle(store):
     await owner.run_owner_daemon(fake, interval=0, stop_event=fake.stop_event)
     assert fake.reconciles >= 2
     assert fake.shutdowns == 1
+
+
+async def test_an_owner_that_finds_another_owners_beacon_stands_down(store, monkeypatch):
+    """Two Owners (a beacon that lapsed during a slow cycle let a second one
+    start) must not both keep forwards into every CodeSpace: the one that finds
+    the other's fresh beacon yields, and leaves that beacon in place."""
+    fake = _FakeOwner(stop_after=1000)
+    other = {"pid": 424242, "host": "h", "interval": 15.0, "active": [], "bridge_forwards": []}
+
+    async def reconcile():
+        fake.reconciles += 1
+        if fake.reconciles == 2:  # another Owner took the machine over meanwhile
+            owner.LIVE_FILE.write_text(json.dumps({**other, "heartbeat_at": time.time()}), "utf-8")
+
+    fake.reconcile = reconcile
+    monkeypatch.setattr(owner, "_pid_alive", lambda pid: None)  # as on Windows: freshness only
+    await asyncio.wait_for(owner.run_owner_daemon(fake, interval=0), timeout=5)
+    assert fake.reconciles == 2 and fake.shutdowns == 1
+    assert json.loads(owner.LIVE_FILE.read_text("utf-8"))["pid"] == 424242  # not erased
+
+
+async def test_a_cycle_that_blocks_the_loop_keeps_the_beacon_fresh(store):
+    """A cycle can block the event loop for minutes (SSH probes, synchronous
+    gh calls). The beacon must not age meanwhile, or the next tenant spawns a
+    second Owner."""
+    fake = _FakeOwner(stop_after=1000)
+    seen = {}
+
+    async def reconcile():
+        fake.reconciles += 1
+        if fake.reconciles == 1:
+            before = json.loads(owner.LIVE_FILE.read_text("utf-8"))["heartbeat_at"]
+            time.sleep(2.5)  # blocks the loop, as a synchronous gh call would
+            seen["advanced"] = json.loads(owner.LIVE_FILE.read_text("utf-8"))["heartbeat_at"] - before
+            fake.stop_event.set()
+
+    fake.reconcile = reconcile
+    await asyncio.wait_for(owner.run_owner_daemon(fake, interval=0, stop_event=fake.stop_event), timeout=10)
+    assert seen["advanced"] >= 1.0  # refreshed by the keeper thread while the loop was blocked
+    assert not owner.LIVE_FILE.exists()
+
+
+def test_clear_liveness_leaves_another_owners_beacon(store):
+    owner.LIVE_FILE.write_text(json.dumps({"pid": 424242, "heartbeat_at": time.time()}), "utf-8")
+    owner._clear_liveness()
+    assert owner.LIVE_FILE.exists()
+
+
+async def test_run_owner_daemon_idle_shutdown_exits_with_no_holds(store):
+    """No holds at all -> the loop exits itself once idle past the threshold,
+    without anything setting stop_event externally (agent-bridge-cli-mode-
+    sessions Phase 4 prerequisite: never forced to stay resident forever)."""
+    fake = _FakeOwner(stop_after=10**9)  # never stops via reconcile count
+    await owner.run_owner_daemon(
+        fake, interval=0.01, stop_event=fake.stop_event, idle_shutdown_after=0.05,
+    )
+    assert fake.shutdowns == 1
+    assert not owner.LIVE_FILE.exists()
+
+
+async def test_run_owner_daemon_idle_shutdown_resets_on_new_hold(store):
+    """A hold placed mid-run resets the idle clock -- it must not exit while
+    something (bridge-controlled or direct-driven) still needs it."""
+    fake = _FakeOwner(stop_after=10**9)
+
+    real_reconcile = fake.reconcile
+    calls = {"n": 0}
+
+    async def reconcile_then_hold():
+        calls["n"] += 1
+        if calls["n"] == 2:
+            owner.hold("cs-busy", "tenant-a")
+        return await real_reconcile()
+
+    fake.reconcile = reconcile_then_hold
+    # idle_shutdown_after is short enough that, without the reset, the daemon
+    # would exit well before this bounded run ends.
+    task = asyncio.create_task(
+        owner.run_owner_daemon(
+            fake, interval=0.01, stop_event=fake.stop_event,
+            idle_shutdown_after=0.05,
+        )
+    )
+    await asyncio.sleep(0.12)
+    assert not task.done()  # still running: the hold reset the idle clock
+    owner.release("cs-busy", "tenant-a")
+    fake.stop_event.set()
+    await task
+    assert fake.shutdowns == 1
+
+
+async def test_an_owed_transcript_push_keeps_an_idle_owner_up_until_it_lands(store):
+    """No holds, but a mirror push is still owed: the Owner stays to retry it
+    (bounded by the grace), then idles out as usual once it has landed."""
+    fake = _FakeOwner(stop_after=10**9)
+    owed = {"grace": 60.0}
+    fake.idle_limit = lambda idle: max(idle, owed["grace"])
+    task = asyncio.create_task(owner.run_owner_daemon(
+        fake, interval=0.01, stop_event=fake.stop_event, idle_shutdown_after=0.05,
+    ))
+    await asyncio.sleep(0.2)
+    assert not task.done()  # well past the idle threshold: the owed push holds it
+    owed["grace"] = 0.0  # the push landed
+    await asyncio.wait_for(task, timeout=5)
+    assert fake.shutdowns == 1
+
+
+def test_the_idle_limit_grows_only_while_a_transcript_push_is_owed():
+    class _Sessions:
+        grace = 0.0
+
+        def owed_grace(self):
+            return self.grace
+
+    sessions = _Sessions()
+    o = owner.ConnectionOwner(lambda cs: None, sessions=sessions)
+    assert o.idle_limit(300.0) == 300.0
+    sessions.grace = 3600.0
+    assert o.idle_limit(300.0) == 3600.0
+    assert owner.ConnectionOwner(lambda cs: None).idle_limit(300.0) == 300.0
+
+
+async def test_run_owner_daemon_idle_shutdown_disabled_by_none(store):
+    """idle_shutdown_after=None runs until externally stopped -- the escape
+    hatch for an operator who wants the old always-resident behavior."""
+    fake = _FakeOwner(stop_after=3)
+    await owner.run_owner_daemon(
+        fake, interval=0, stop_event=fake.stop_event, idle_shutdown_after=None,
+    )
+    assert fake.reconciles >= 3  # stopped by the reconcile count, not idling out
+    assert fake.shutdowns == 1
+
+
+def test_ensure_owner_running_is_noop_when_already_live(store, monkeypatch):
+    monkeypatch.setattr(owner, "is_owner_live", lambda now=None: True)
+    spawned = {"called": False}
+    monkeypatch.setattr(
+        "subprocess.Popen", lambda *a, **k: spawned.__setitem__("called", True)
+    )
+    assert owner.ensure_owner_running(types.SimpleNamespace()) is True
+    assert spawned["called"] is False  # already live -- never spawns
+
+
+def test_ensure_owner_running_spawns_and_waits_for_liveness(store, monkeypatch):
+    calls = {"popen": 0}
+    live_after_spawn = {"value": False}
+    seen_kwargs: dict = {}
+
+    def fake_popen(argv, **kwargs):
+        calls["popen"] += 1
+        live_after_spawn["value"] = True
+        seen_kwargs.update(kwargs)
+
+        class _Proc:
+            pass
+
+        return _Proc()
+
+    def fake_is_owner_live(now=None):
+        return live_after_spawn["value"]
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(owner, "is_owner_live", fake_is_owner_live)
+    monkeypatch.setattr(owner.time, "sleep", lambda _s: None)
+    assert owner.ensure_owner_running(types.SimpleNamespace(), spawn_timeout=1.0) is True
+    assert calls["popen"] == 1
+    # Never the caller's ambient cwd -- this is a permanent-ish background
+    # daemon rooted at HOME instead.
+    assert seen_kwargs.get("cwd") == os.path.expanduser("~")
+
+
+def test_ensure_owner_running_returns_false_on_spawn_failure(store, monkeypatch):
+    def fake_popen(argv, **kwargs):
+        raise OSError("no python found")
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(owner, "is_owner_live", lambda now=None: False)
+    assert owner.ensure_owner_running(types.SimpleNamespace()) is False
+
+
+def test_should_defer_to_owner_spins_up_on_demand(store, monkeypatch):
+    """Enabled + not yet live: defers by spinning the daemon up itself, rather
+    than requiring it to already be a permanently-running background service."""
+    cfg = types.SimpleNamespace(
+        connection_owner=types.SimpleNamespace(enabled=True)
+    )
+    monkeypatch.setattr(owner, "is_owner_live", lambda now=None: False)
+    monkeypatch.setattr(owner, "ensure_owner_running", lambda _cfg: True)
+    assert owner.should_defer_to_owner(cfg) is True
+
+
+def test_should_defer_to_owner_falls_back_when_spin_up_fails(store, monkeypatch):
+    cfg = types.SimpleNamespace(
+        connection_owner=types.SimpleNamespace(enabled=True)
+    )
+    monkeypatch.setattr(owner, "is_owner_live", lambda now=None: False)
+    monkeypatch.setattr(owner, "ensure_owner_running", lambda _cfg: False)
+    assert owner.should_defer_to_owner(cfg) is False
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +589,33 @@ def test_write_and_read_liveness_roundtrip(store):
     assert live is not None
     assert live.pid == os.getpid()
     assert live.interval == 15.0
+    assert live.process_identity  # this process's OS birth identity
+    assert owner.is_owner_live() is True
+
+
+@pytest.mark.parametrize("now_at_pid", ["dead", "reused"])
+def test_a_fresh_beacon_from_a_gone_writer_is_not_live(store, monkeypatch, now_at_pid):
+    """Windows never probes the pid (unknown liveness) and pids get reused: the
+    beacon's OS birth identity must still match the process now at its pid."""
+    from agent_codespaces import owner_identity
+
+    owner._write_liveness(15.0)
+    monkeypatch.setattr(owner, "_pid_alive", lambda _pid: None)  # as on Windows
+    monkeypatch.setattr(owner_identity, "owner_process_identity",
+                        lambda _pid: None if now_at_pid == "dead" else "another-process")
+    monkeypatch.setattr(owner_identity, "_pid_gone", lambda _pid: now_at_pid == "dead")
+    assert owner.read_liveness() is not None  # still fresh
+    assert owner.is_owner_live() is False
+
+
+def test_a_beacon_without_an_identity_keeps_freshness_only(store, monkeypatch):
+    import json
+
+    owner._write_liveness(15.0)
+    raw = json.loads(owner.LIVE_FILE.read_text(encoding="utf-8"))
+    raw.pop("process_identity")  # an older Owner's beacon
+    owner.LIVE_FILE.write_text(json.dumps(raw), encoding="utf-8")
+    monkeypatch.setattr(owner, "_pid_alive", lambda _pid: None)
     assert owner.is_owner_live() is True
 
 
@@ -615,3 +844,9 @@ async def test_await_owner_relay_becomes_served(store):
     result = await owner.await_owner_relay("cs-a", timeout=1.0, poll=0.01)
     await task
     assert result is True
+
+
+def test_the_beacon_says_what_this_owner_heals(store):
+    """Consumers (a board deciding whether to wait before relaunching) read it."""
+    owner._write_liveness(15.0)
+    assert set(json.loads(owner.LIVE_FILE.read_text("utf-8"))["heals"]) >= {"bridge-serving", "single-owner"}

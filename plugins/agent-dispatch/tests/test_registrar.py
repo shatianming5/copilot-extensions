@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from agent_dispatch.registrar import (
@@ -12,7 +14,7 @@ from agent_dispatch.registrar import (
     declaration_from_env,
     load_declaration,
 )
-
+from agent_dispatch.registrar_discovery import read_declaration_file
 
 # -- Loading + validation ----------------------------------------------------
 
@@ -25,9 +27,13 @@ def test_minimal_declaration_defaults():
     assert d.interval == 30.0
     assert d.max_attempts == 3
     assert d.heartbeat is True
-    assert d.reactive is True
+    assert d.reactive is False
     assert d.body == Body()  # embody / task-worker
     assert d.fleet == Fleet()
+
+
+def test_reactive_compatibility_value_is_normalized_off():
+    assert load_declaration({"name": "general", "reactive": True}).reactive is False
 
 
 def test_full_general_pool_declaration():
@@ -70,6 +76,54 @@ def test_periodic_emitter_declaration():
     assert "--spec" in args
 
 
+def test_plugin_companion_accepts_runtime_generation_override():
+    declaration = load_declaration(
+        {
+            "name": "engine",
+            "kind": "plugin-companion",
+            "runtime_generation": "engine-v1",
+            "transition_group": "engine-runtime",
+            "spec": {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "engine",
+                            "version": "engine-v1",
+                            "profile": "host",
+                            "python_env": "ENGINE_PYTHON",
+                            "projects": [{"path": ".", "extras": ["engine"]}],
+                            "identity_paths": ["src/engine"],
+                            "imports": ["example.engine"],
+                        }
+                    ],
+                },
+            },
+        },
+        allow_plugin_companion=True,
+    )
+    assert declaration.runtime_generation == "engine-v1"
+    assert declaration.transition_group == "engine-runtime"
+
+
+@pytest.mark.parametrize("field", ["runtime_generation", "transition_group"])
+def test_plugin_companion_only_fields_are_rejected_outside_plugin_companions(field):
+    with pytest.raises(RegistrarError, match=field):
+        load_declaration(
+            {
+                "name": "general",
+                "kind": "emitter",
+                field: "engine-v1",
+                "spec": {
+                    "id": "review-inbox",
+                    "command": ["review-emitter", "tick"],
+                    "interval_seconds": 3600,
+                },
+            }
+        )
+
+
 def test_non_lane_declaration_rejects_lane_fields():
     with pytest.raises(RegistrarError, match="does not accept lane fields"):
         load_declaration(
@@ -104,6 +158,93 @@ def test_unknown_body_key_rejected():
 def test_bad_body_type_rejected():
     with pytest.raises(RegistrarError, match="body.type"):
         load_declaration({"name": "x", "body": {"type": "sidecar"}})
+
+
+def test_charter_rejected_for_embody_body_type():
+    with pytest.raises(RegistrarError, match="body.charter"):
+        load_declaration(
+            {"name": "x", "body": {"type": "embody", "charter": "cab-charter"}}
+        )
+
+
+def test_charter_rejected_with_cli_labels():
+    with pytest.raises(RegistrarError, match="body.charter"):
+        load_declaration(
+            {
+                "name": "x",
+                "labels": ["a"],
+                "body": {"charter": "cab-charter", "cli_labels": ["a"]},
+            }
+        )
+
+
+def test_charter_allowed_for_embody_body_type_with_headless_fleet():
+    """body.type: embody paired with fleet.headless: true maps to a headless
+    fleet lane (per to_supervise_args), not CLI -- charter must be accepted."""
+    decl = load_declaration(
+        {
+            "name": "x",
+            "labels": ["a"],
+            "body": {"type": "embody", "charter": "cab-charter"},
+            "fleet": {"pool": ["host-a"], "origin": "here", "headless": True},
+        }
+    )
+    assert decl.body.charter == "cab-charter"
+    args = decl.to_supervise_args()
+    assert "--headless" in args
+    assert "--charter" in args and "cab-charter" in args
+
+
+def test_disposable_cli_label_must_be_watched_and_local():
+    with pytest.raises(RegistrarError, match="not in labels"):
+        load_declaration(
+            {
+                "name": "x",
+                "labels": ["review"],
+                "body": {
+                    "type": "embody",
+                    "disposable_cli_labels": ["other"],
+                },
+            }
+        )
+    declaration = load_declaration(
+        {
+            "name": "x",
+            "labels": ["review"],
+            "body": {
+                "type": "headless",
+                "disposable_cli_labels": ["review"],
+            },
+        }
+    )
+    assert declaration.body.disposable_cli_labels == ("review",)
+    with pytest.raises(RegistrarError, match="only for local"):
+        load_declaration(
+            {
+                "name": "x",
+                "labels": ["review"],
+                "fleet": {"pool": ["host-a"]},
+                "body": {
+                    "type": "embody",
+                    "disposable_cli_labels": ["review"],
+                },
+            }
+        )
+
+
+def test_no_pair_supported_only_for_local_bodies():
+    with pytest.raises(RegistrarError, match="only for local"):
+        load_declaration(
+            {
+                "name": "x",
+                "labels": ["review"],
+                "fleet": {"pool": ["host-a"]},
+                "body": {
+                    "type": "embody",
+                    "no_pair": True,
+                },
+            }
+        )
 
 
 def test_concurrency_must_be_positive():
@@ -187,6 +328,43 @@ def test_supervise_args_embody_body_has_no_headless_label():
     assert _flag_val(args, "--embody-backend") == "cli"
     assert "--headless-label" not in args
     assert "--headless-agent" not in args
+
+
+def test_supervise_args_emit_disposable_cli_label():
+    declaration = load_declaration(
+        {
+            "name": "reviewers",
+            "labels": ["review"],
+            "body": {
+                "type": "embody",
+                "disposable_cli_labels": ["review"],
+            },
+        }
+    )
+    args = declaration.to_supervise_args()
+    assert _flag_val(args, "--disposable-cli-label") == "review"
+
+
+def test_supervise_args_emit_no_pair():
+    declaration = load_declaration(
+        {
+            "name": "portable-pool",
+            "labels": ["review"],
+            "body": {"type": "embody", "no_pair": True},
+        }
+    )
+    args = declaration.to_supervise_args()
+    assert "--no-pair" in args
+    assert declaration.body.no_pair is True
+
+
+def test_supervise_args_omit_no_pair_by_default():
+    declaration = load_declaration(
+        {"name": "reviewers", "labels": ["review"], "body": {"type": "embody"}}
+    )
+    args = declaration.to_supervise_args()
+    assert "--no-pair" not in args
+    assert declaration.body.no_pair is False
 
 
 def test_supervise_args_lane_scoped():
@@ -412,6 +590,43 @@ def test_explicit_filters_win_over_shorthand():
     assert not d.permits({"task-type": "general"})
 
 
+def test_filter_vocabulary_aggregates_permit_values_across_declarations():
+    from agent_dispatch.registrar import filter_vocabulary
+
+    a = load_declaration({"name": "review", "labels": ["review", "docs"]})
+    b = load_declaration(
+        {
+            "name": "worker",
+            "repos": "lane-a",
+            "filters": {"permit": {"role": ["worker"], "capabilities": ["checkout"]}},
+        }
+    )
+    vocab = filter_vocabulary([a, b])
+    assert vocab["task-type"] == ["docs", "review", "worker"]
+    assert vocab["repo"] == ["lane-a"]
+    assert vocab["role"] == ["worker"]
+    assert vocab["capabilities"] == ["checkout"]
+
+
+def test_filter_vocabulary_omits_unconstrained_dims_and_reject_only_values():
+    from agent_dispatch.registrar import filter_vocabulary
+
+    d = load_declaration(
+        {"name": "general", "repos": "all", "filters": {"reject": {"env": ["prod"]}}}
+    )
+    vocab = filter_vocabulary([d])
+    # "general" names its own task-type shorthand (always-on permit); "env" is
+    # reject-only (steer away from, never a target) and "repos: all" leaves
+    # "repo" unconstrained -- neither should appear.
+    assert vocab == {"task-type": ["general"]}
+
+
+def test_filter_vocabulary_empty_declarations_is_empty():
+    from agent_dispatch.registrar import filter_vocabulary
+
+    assert filter_vocabulary([]) == {}
+
+
 def test_permits_rejects_bad_attrs_shape():
     d = load_declaration({"name": "x"})
     with pytest.raises(RegistrarError, match="task attributes"):
@@ -424,6 +639,41 @@ def test_filters_dont_affect_supervise_args():
         {"name": "general", "labels": ["general"], "filters": {"permit": {"role": ["worker"]}}}
     )
     assert "--role" not in d.to_supervise_args()
+
+
+def test_plugin_companion_requires_attributed_discovery():
+    data = {
+        "name": "index-service",
+        "kind": "plugin-companion",
+        "spec": {
+            "command": ["bin/serve"],
+            "stop_command": ["bin/stop"],
+            "health_probe": ["bin/health"],
+        },
+    }
+    with pytest.raises(RegistrarError, match="attributed plugin discovery"):
+        load_declaration(data)
+    assert load_declaration(data, allow_plugin_companion=True).kind == "plugin-companion"
+
+
+def test_trusted_declaration_file_rejects_plugin_companion(tmp_path):
+    path = tmp_path / "companion.json"
+    path.write_text(
+        json.dumps(
+            {
+                "name": "index-service",
+                "kind": "plugin-companion",
+                "spec": {
+                    "command": ["bin/serve"],
+                    "stop_command": ["bin/stop"],
+                    "health_probe": ["bin/health"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RegistrarError, match="attributed plugin discovery"):
+        read_declaration_file(path)
 
 
 # -- helpers -----------------------------------------------------------------

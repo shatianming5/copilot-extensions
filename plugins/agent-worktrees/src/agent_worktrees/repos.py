@@ -11,6 +11,13 @@ the multi-machine system interacts with its local checkout:
 - **worktree** -- full agent-worktrees lifecycle; concurrent-flow safe,
   with edits/stages/commits isolated in per-task worktrees until push.
   These are also adopted as ``projects.yaml`` projects.
+- **knowledge** -- same worktree-capable mechanics as ``worktree`` (eligible
+  for the ``-k`` paired-knowledge carve, see ``__main__._carve_paired_
+  knowledge``), but exists only to be carved as another project's paired
+  knowledge companion, never driven directly (no standalone ``create``, no
+  binstub, hidden from the Picker's top-level project list -- enforced via
+  the repo's own committed ``RepoConfig.knowledge_only`` flag in
+  ``config.py``; set both together).
 
 The registry also stores per-platform source roots (``srcroot``) so that
 adopt, WSL provision, and clone operations know where to put repos.
@@ -26,32 +33,49 @@ import platform
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import yaml
 
-from . import output
+from . import git_ops, output, registry_paths
 
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
 
-# A repo's management class -- how the multi-machine system interacts with its checkout:
-#
-#   reference  Read-only.  Tracked only for path resolution, cloning, and
-#              indexing (e.g. VEI).  Never edited locally.  (= external-repos
-#              relationship "consumer".)
-#   singleton  Editable as a single anchor checkout, with no worktree
-#              isolation.  Use when only one flow edits at a time, or when
-#              worktrees are overkill or unsupported.
-#   worktree   Full agent-worktrees lifecycle: concurrent-flow safe; edits,
-#              stages, and commits stay isolated in per-task worktrees until
-#              the final push.  (= an adopted agent-worktrees "project".)
-VALID_CLASSES = ("reference", "singleton", "worktree")
+# See the module docstring above for what each management class means.
+VALID_CLASSES = ("reference", "singleton", "worktree", "knowledge")
 
 # Legacy ``type`` values mapped onto the new class taxonomy.
 _LEGACY_TYPE_MAP = {"project": "worktree", "repo": "reference"}
+
+# Audience-exposure tiers a repo's own content is visible to, least to most
+# exposed. Backs the identifier-blocklist sweep (see
+# ``identifier_blocklist.py``): a repo declares its own exposure here
+# (machine-local, like every other registry fact), and any *other*
+# registered repo's ``.identifier-blocklist/block-for-<tier>.yaml`` applies to
+# it whenever its own visibility is at or above that tier's exposure.
+VALID_VISIBILITY = ("private", "internal", "public")
+# Exposure ordering, least to most visible. An unset/unknown visibility is
+# treated as the *most* exposed tier at consumption time (fail toward
+# enforcing more blocklists, never fewer) -- see
+# ``identifier_blocklist.resolve_visibility_rank``.
+VISIBILITY_RANK = {name: rank for rank, name in enumerate(VALID_VISIBILITY)}
+
+
+def normalize_visibility(value: str | None) -> str:
+    """Coerce a raw visibility string to a valid tier, or ``""`` if unset.
+
+    Unlike :func:`normalize_class`, an unrecognized/absent value stays
+    ``""`` (distinguishable from a real tier) rather than silently
+    defaulting -- callers that need a fail-safe default (sweep enforcement)
+    apply one explicitly at the point of use.
+    """
+    if not value:
+        return ""
+    v = str(value).strip().lower()
+    return v if v in VALID_VISIBILITY else ""
 
 
 def normalize_class(value: str | None) -> str:
@@ -85,10 +109,27 @@ class RepoEntry:
     # explicit value overrides the derived owner (an EMU account can span orgs,
     # so owner != account isn't guaranteed). See :func:`resolve_account`.
     account: str = ""
+    # Optional preferred Copilot CLI identity (a login already cached in
+    # Copilot's own credential store, distinct from ``account`` above) for
+    # this repo. Repo-keyed rather than owner-keyed: unlike ``account``/
+    # ``account_map`` (github-owner-derived), this must also work for repos
+    # with no GitHub owner at all (e.g. a personal repo on a private Gitea
+    # instance) where Copilot's own inference identity still needs to be
+    # pinned. Absent => falls back to the machine's ``default_copilot_account``
+    # (see ``config.Config.default_copilot_account``), then to no preference
+    # (ambient Copilot login, today's behavior). See
+    # :func:`resolve_copilot_account` / :func:`copilot_account_for` and
+    # ThomasMichon/copilot-extensions#3296.
+    copilot_account: str = ""
     # Whether this repo backs a same-machine agent in agent-bridge. Defaults
     # ON for worktree/singleton repos (you adopt them to work in them); OFF for
     # reference repos (read-only). `register`/`add --no-agent` forces it off.
     agent: bool = True
+    # Audience-exposure tier ("private"/"internal"/"public") -- see
+    # ``VALID_VISIBILITY`` above. Empty string means unset; resolve a
+    # fail-safe default via ``identifier_blocklist.resolve_visibility_rank``
+    # rather than assuming a bare empty string means "private".
+    visibility: str = ""
     paths: dict[str, str] = field(default_factory=dict)
     # paths keys: "windows", "wsl", "linux"
 
@@ -137,11 +178,9 @@ def _current_platform() -> str:
         return "wsl"
     return "linux"
 
-
 def _repos_yaml_path() -> Path:
     """Path to the repos registry file."""
-    home = Path.home()
-    return home / ".agent-worktrees" / "repos.yaml"
+    return registry_paths.registry_path("repos.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +244,9 @@ def read_registry() -> ReposRegistry:
                     tags=tags,
                     contributing=entry.get("contributing", ""),
                     account=str(entry.get("account", "") or ""),
+                    copilot_account=str(entry.get("copilot_account", "") or ""),
                     agent=agent,
+                    visibility=normalize_visibility(entry.get("visibility")),
                     paths=paths,
                 )
 
@@ -219,8 +260,9 @@ def write_registry(registry: ReposRegistry) -> None:
     path = _repos_yaml_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    _rhdr = "# ~/.agent-worktrees/repos.yaml"  # marketplace-isolation: allow legacy
     lines = [
-        "# ~/.agent-worktrees/repos.yaml",
+        _rhdr,
         "# Registry of known repositories and source roots.",
         "",
     ]
@@ -256,6 +298,8 @@ def write_registry(registry: ReposRegistry) -> None:
                 lines.append(f"    remote: {_quote(entry.remote)}")
             if entry.account:
                 lines.append(f"    account: {_quote(entry.account)}")
+            if entry.copilot_account:
+                lines.append(f"    copilot_account: {_quote(entry.copilot_account)}")
             if entry.default_branch:
                 lines.append(f"    default_branch: {_quote(entry.default_branch)}")
             if entry.tags:
@@ -263,6 +307,8 @@ def write_registry(registry: ReposRegistry) -> None:
                 lines.append(f"    tags: [{rendered}]")
             if entry.contributing:
                 lines.append(f"    contributing: {_quote(entry.contributing)}")
+            if entry.visibility:
+                lines.append(f"    visibility: {entry.visibility}")
             for plat in ("windows", "wsl", "linux"):
                 if plat in entry.paths:
                     lines.append(f"    {plat}: {_quote(entry.paths[plat])}")
@@ -319,6 +365,29 @@ def find_repo(name: str) -> RepoEntry | None:
     return registry.repos.get(name)
 
 
+def inrepo_declared_default_branch(path: str) -> str:
+    """Return the branch a checked-out repo declares as its own via its
+    in-repo ``.agent-worktrees/config.yaml`` (or legacy equivalents), or
+    ``""`` when it declares none / the path is unusable.
+
+    A repo's own ``default_branch`` (e.g. copilot-extensions' ``dev`` --
+    a contribution/integration branch distinct from a GitHub-side release
+    branch) is authoritative over anything a machine's ``repos.yaml`` or an
+    external manifest separately records for it (see ``config.py``'s
+    ``_resolve_adoption_defaults_from_registry``, which already treats the
+    registry value as a mere fallback for repos that declare none). Callers
+    use this to keep clone/add/sync self-deriving that value instead of
+    requiring an operator to duplicate it by hand. Never raises.
+    """
+    try:
+        from .config import _load_inrepo_config
+
+        value = _load_inrepo_config(path).get("default_branch")
+        return str(value) if value else ""
+    except Exception:
+        return ""
+
+
 # ---------------------------------------------------------------------------
 # Account resolution (repo -> preferred GitHub identity)
 # ---------------------------------------------------------------------------
@@ -334,16 +403,85 @@ def github_owner(remote: str) -> str | None:
     """Extract the owner from a github.com remote URL (https or ssh form).
 
     Returns None for non-GitHub remotes (so ADO/gitea derive no account).
+    Host matching is boundary-aware: the host must actually *be*
+    ``github.com`` (optionally ``www.``, optionally with userinfo on HTTPS),
+    not merely contain that substring -- a remote on ``notgithub.com`` or
+    ``evilgithub.com`` must not be mistaken for GitHub.
     """
     if not remote:
         return None
     url = remote.strip()
-    m = re.match(r"https?://[^/]*github\.com/([^/]+)/", url)
+    m = re.match(r"https?://(?:[^@/]+@)?(?:www\.)?github\.com/([^/]+)/", url)
     if m:
         return m.group(1)
-    m = re.match(r"(?:ssh://)?git@[^:/]*github\.com[:/]([^/]+)/", url)
+    m = re.match(r"(?:ssh://)?git@github\.com[:/]([^/]+)/", url)
     if m:
         return m.group(1)
+    return None
+
+
+def is_https_remote(remote: str) -> bool:
+    """True when ``remote`` is specifically an ``https://`` URL.
+
+    Both the persisted credential pin (:func:`git_ops.pin_git_credential`,
+    which only ever writes ``credential.https://<host>.*``) and the
+    clone-time auth override (:func:`git_ops._auth_config_args_for_url`,
+    which only ever produces an ``http.extraheader``) affect HTTPS
+    transport exclusively. An SSH remote (``ssh://``/``git@host:owner/repo``)
+    uses the ambient SSH key instead and is untouched by either. A plain
+    ``http://`` remote is excluded too, for the same reason: git's
+    credential config is scheme-specific (``credential.https://...`` never
+    matches an ``http://`` fetch), and injecting the OAuth bearer token as an
+    ``http.extraheader`` onto plaintext HTTP would additionally send it over
+    an unencrypted connection. Treating either as "pinned"/"authed" would be
+    a false positive that reports success while changing nothing (or
+    changing the wrong thing).
+    """
+    return remote.strip().lower().startswith("https://")
+
+
+def derive_https_host(remote: str) -> str | None:
+    """Extract the exact hostname from an ``https://`` remote, or None.
+
+    Git's credential store is host-specific (``credential.https://<host>``
+    matches by literal hostname), so a checkout on ``www.github.com`` needs
+    ``credential.https://www.github.com`` -- a pin hardcoded to
+    ``github.com`` never matches it, even though :func:`github_owner`
+    accepts the ``www.`` form when *resolving the account*. Callers should
+    pass this (falling back to ``pin_git_credential``'s ``"github.com"``
+    default only when it returns ``None``) so the pinned host always
+    matches the checkout's actual remote.
+    """
+    if not is_https_remote(remote):
+        return None
+    m = re.match(r"https://(?:[^@/]+@)?([^/:]+)", remote.strip())
+    return m.group(1) if m else None
+
+
+def github_slug(remote: str) -> str | None:
+    """Extract the ``owner/name`` slug from a github.com remote URL.
+
+    Unlike the registry key used to name a repo entry (which can be an
+    arbitrary alias, e.g. ``ce`` for ``github.com/example-org/proj``), this is
+    the canonical slug `gh`/the GitHub API actually expect as a repo target
+    (e.g. for ``repos gh <target> -- ...``). Returns None for a non-GitHub or
+    unparseable remote. Same host-boundary-aware matching as
+    :func:`github_owner` -- see its docstring.
+    """
+    if not remote:
+        return None
+    url = remote.strip()
+    m = re.match(
+        r"https?://(?:[^@/]+@)?(?:www\.)?github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$",
+        url,
+    )
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    m = re.match(
+        r"(?:ssh://)?git@github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$", url
+    )
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
     return None
 
 
@@ -368,13 +506,8 @@ def account_from_map(owner: str | None) -> str | None:
 
 
 def resolve_account(entry: RepoEntry | None) -> str | None:
-    """Resolve the preferred GitHub account for a repo entry.
-
-    Order: explicit ``account:`` -> ``account_map`` (owner->login) -> owner
-    derived from a github.com remote -> None.  None means "no account
-    preference" -- git/gh operations use the ambient ``gh`` account exactly as
-    before (additive + safe).
-    """
+    """Resolve the preferred GitHub account for a repo entry: explicit
+    ``account:`` -> ``account_map`` -> remote owner -> None (ambient)."""
     if entry is None:
         return None
     if entry.account:
@@ -384,6 +517,75 @@ def resolve_account(entry: RepoEntry | None) -> str | None:
     if mapped:
         return mapped
     return owner
+
+
+def resolve_copilot_account(entry: RepoEntry | None) -> str | None:
+    """Resolve this repo's explicit Copilot identity override, or None. See
+    :func:`copilot_account_for` for the full chain."""
+    return (entry.copilot_account or None) if entry else None
+
+
+def copilot_account_for(name: str) -> str | None:
+    """Resolve the Copilot CLI login: ``copilot_account:`` -> default -> None. See #3296."""
+    entry = find_repo(name)
+    explicit = resolve_copilot_account(entry)
+    if explicit:
+        return explicit
+    try:
+        from . import config as _config
+        return _config.load_config().default_copilot_account or None
+    except Exception:
+        return no_project_top_level_defaults(name)[0] or None
+
+
+def no_project_top_level_defaults(project: str | None = None) -> tuple[str, bool]:
+    """Read account/switch defaults from global + machine-local config tiers
+    (plus config.d drop-ins) directly, bypassing repo resolution
+    (``load_config()`` raises for a no-project command). Pass the caller's
+    known ``--repo`` as ``project`` so ``project_dir(project)`` can resolve."""
+    from . import config as _config
+    try:
+        global_raw = _config._load_yaml_safe(_config.global_config_path())
+    except Exception:
+        return "", False
+    try:
+        mdir = _config.project_dir(project)
+        machine_raw = _config._load_yaml_safe(mdir / "config.yaml")
+        dropins = _config._load_config_d(mdir / "config.d", project_name=project or "")
+        if dropins:
+            machine_raw = _config._deep_merge(dropins, machine_raw)
+    except Exception:
+        machine_raw = {}
+    account = str(machine_raw.get("default_copilot_account", global_raw.get("default_copilot_account", "")) or "")
+    enabled = bool(machine_raw.get("copilot_identity_switch_enabled", global_raw.get("copilot_identity_switch_enabled", False)))
+    return account, enabled
+
+
+def set_copilot_account(name: str, login: str) -> bool:
+    """Set the explicit ``copilot_account:`` override for a registered repo.
+
+    Returns False (no-op) if ``name`` isn't a registered repo.
+    """
+    registry = read_registry()
+    entry = registry.repos.get(name)
+    if entry is None:
+        return False
+    registry.repos[name] = replace(entry, copilot_account=login)
+    write_registry(registry)
+    output.ok(f"{name}: copilot_account -> {login}")
+    return True
+
+
+def unset_copilot_account(name: str) -> bool:
+    """Remove a registered repo's explicit ``copilot_account:`` override."""
+    registry = read_registry()
+    entry = registry.repos.get(name)
+    if entry is None or not entry.copilot_account:
+        return False
+    registry.repos[name] = replace(entry, copilot_account="")
+    write_registry(registry)
+    output.ok(f"{name}: copilot_account removed")
+    return True
 
 
 def account_for_github_owner(owner: str | None) -> str | None:
@@ -422,11 +624,66 @@ def account_for_github_owner(owner: str | None) -> str | None:
     return owner
 
 
+def resolve_slug_owner(target: str | None) -> str | None:
+    """Resolve the github ``owner`` a *target* (owner, ``owner/name`` slug, or
+    bare **registered repo name**) actually refers to.
+
+    A bare name is ambiguous with a bare owner: resolve it through the same
+    registry -> remote -> owner chain ``repos find`` uses, instead of treating
+    the literal string as the owner (silently minted under the wrong identity
+    -- see #3032). Falls back to the literal string only when it isn't a
+    registered repo name, so a bare personal/org owner keeps resolving as
+    before. None when a registered repo's remote has no derivable owner.
+    """
+    if not target:
+        return None
+    if "/" in target:
+        return target.split("/", 1)[0]
+    entry = find_repo(target)
+    if entry is not None:
+        return github_owner(entry.remote)
+    return target
+
+
+def is_unresolved_registered_target(target: str | None) -> bool:
+    """True when *target* names a **registered** repo that has no resolvable
+    account: no explicit per-repo ``account:`` override, and no derivable
+    github owner (e.g. a non-github/Azure DevOps remote) either.
+
+    This is the identity-known-but-unresolvable case #3032 flags as a hazard:
+    a caller explicitly named a repo this tool knows about, so silently
+    falling back to ambient ``gh`` auth would still risk acting under the
+    wrong account. Distinct from an unregistered/ambiguous bare name, where no
+    preference exists and ambient auth remains the documented, safe default.
+    """
+    if not target or "/" in target:
+        return False
+    entry = find_repo(target)
+    if entry is None:
+        return False
+    return resolve_account(entry) is None
+
+
 def account_for_github_slug(slug: str | None) -> str | None:
-    """Resolve the effective account for a github ``owner/name`` slug."""
+    """Resolve the effective account for a github ``owner/name`` slug, a bare
+    ``owner``, or a bare registered repo *name*.
+
+    A bare registered repo name resolves via its own matched entry's
+    :func:`resolve_account` (explicit ``account:`` -> ``account_map[owner]`` ->
+    the remote owner itself -> None) -- never by handing the owner alone to
+    the owner-*wide* resolver (:func:`account_for_github_owner`), which scans
+    every registered repo and can return a *different, sibling* repo's
+    explicit account for the same owner (see #3032 follow-up: with `proj-a`
+    unoverridden and `proj-b` -> `account-b` under the same owner,
+    `account-for proj-a` must not resolve to `account-b`).
+    """
     if not slug:
         return None
-    owner = slug.split("/", 1)[0] if "/" in slug else slug
+    if "/" not in slug:
+        entry = find_repo(slug)
+        if entry is not None:
+            return resolve_account(entry)
+    owner = resolve_slug_owner(slug)
     return account_for_github_owner(owner)
 
 
@@ -536,6 +793,7 @@ def add_repo(
     contributing: str = "",
     account: str = "",
     agent: bool | None = None,
+    visibility: str = "",
     plat: str | None = None,
 ) -> RepoEntry:
     """Register a repo at a known path.  Merges with existing entry."""
@@ -563,6 +821,8 @@ def add_repo(
             existing.account = account
         if agent is not None:
             existing.agent = agent
+        if visibility:
+            existing.visibility = normalize_visibility(visibility)
         entry = existing
     else:
         entry = RepoEntry(
@@ -574,6 +834,7 @@ def add_repo(
             contributing=contributing,
             account=account,
             agent=agent if agent is not None else (repo_class != "reference"),
+            visibility=normalize_visibility(visibility),
             paths={plat: path},
         )
         registry.repos[name] = entry
@@ -583,7 +844,42 @@ def add_repo(
     output.ok(
         f"Repo '{name}' registered at {path} ({plat}) [{entry.repo_class}{agent_note}]"
     )
+    _best_effort_pin_credential(entry, plat)
     return entry
+
+
+def _best_effort_pin_credential(entry: RepoEntry, plat: str) -> None:
+    """Pin the repo-local git credential for ``entry`` if the account already
+    resolves unambiguously (never prompts, never raises).
+
+    Called from every ``add_repo`` caller -- ``repos add``, ``repos clone``,
+    plugin install/adoption, project-entry registration -- so the pin is a
+    default outcome of *any* registration path, not only the CLI ``add``/
+    ``clone`` commands that separately call ``_clarify_registration_account``
+    (which additionally prompts to resolve an org-owned remote's ambiguous
+    account; once it does, it re-pins with the newly chosen login).
+
+    Uses ``entry.local_path(plat)`` (not a raw caller-supplied path) so a
+    home-relative registration (e.g. ``~/src/repo``) still resolves to a real
+    directory -- ``Path("~/src/repo").is_dir()`` is always False, which would
+    otherwise make ``pin_git_credential`` silently no-op. Skips SSH remotes
+    (see :func:`is_https_remote`): the pin only ever writes
+    ``credential.https://<host>.*``, which an SSH transport never consults.
+    """
+    if not is_https_remote(entry.remote):
+        return
+    try:
+        res = resolve_registration_account(entry.remote, entry.account)
+        if res.needs_clarify or not res.login or not res.owner:
+            return
+        path = entry.local_path(plat)
+        if not path:
+            return
+        from . import git_ops
+        host = derive_https_host(entry.remote) or "github.com"
+        git_ops.pin_git_credential(path, res.login, host=host)
+    except Exception:
+        pass
 
 
 def remove_repo(name: str) -> bool:
@@ -632,23 +928,94 @@ def clone_repo(
         # Still register it
         return add_repo(name, target, remote=remote)
 
-    # Clone
+    # Clone. A private repo owned by a different account than gh's currently
+    # active one would otherwise 403/404 on this very first fetch -- the
+    # repo-local credential pin add_repo installs below only exists *after*
+    # a successful clone, so inject the same one-shot cross-account auth
+    # override the fetch/push paths use, resolved directly from the clone
+    # URL (there is no checked-out remote yet to resolve a name against).
+    # HTTPS-only: the override is an http.extraheader, which an SSH
+    # transport (git@host:owner/repo, ssh://...) never consults -- for an
+    # SSH remote the ambient SSH key is what actually authenticates, so
+    # injecting this would be a no-op that falsely implies auth was handled.
+    from . import git_ops
+    extra_args: list[str] = []
+    if is_https_remote(remote):
+        try:
+            extra_args = git_ops._auth_config_args_for_url(remote)
+        except Exception:
+            extra_args = []
+    argv = ["git", *extra_args, "clone", remote, str(target_path)]
+
+    def _redact(text: str) -> str:
+        # Git itself can echo the injected -c argument (e.g. with tracing
+        # enabled) into stdout/stderr, and some exceptions (subprocess.
+        # TimeoutExpired) embed the full argv in their own __str__ -- strip
+        # the token wherever it could surface, not only in our own messages.
+        for arg in extra_args:
+            if arg.startswith("http.extraheader="):
+                text = text.replace(arg, "http.extraheader=<redacted>")
+        # With GIT_TRACE_CURL/GIT_CURL_VERBOSE set in the ambient
+        # environment, git can additionally echo the resolved request
+        # header itself (e.g. "=> Send header: Authorization: Basic
+        # <base64>") straight into stderr, independent of the -c argv
+        # form above -- redact that pattern too.
+        text = re.sub(
+            r"(Authorization:\s*(?:Basic|Bearer)\s+)\S+", r"\1<redacted>",
+            text, flags=re.IGNORECASE,
+        )
+        # A remote URL with embedded userinfo (https://user:token@host/...)
+        # is a second, independent credential surface -- e.g. a caller that
+        # named such a URL as `remote`. Strip it wherever a URL appears,
+        # including inside the argv this function also redacts.
+        text = re.sub(r"(https?://)[^/@\s]+@", r"\1<redacted>@", text)
+        return text
+
     try:
         result = subprocess.run(
-            ["git", "clone", remote, str(target_path)],
+            argv,
             capture_output=True,
             text=True,
             timeout=300,
         )
         if result.returncode != 0:
-            output.err(f"git clone failed: {result.stderr.strip()}")
+            output.err(f"git clone failed: {_redact(result.stderr.strip())}")
             return None
     except Exception as e:
-        output.err(f"Clone failed: {e}")
+        redacted_argv = _redact(str(git_ops._redact_args(argv)))
+        output.err(f"Clone failed running {redacted_argv}: {_redact(str(e))}")
         return None
 
     output.ok(f"Cloned {remote} to {target}")
-    return add_repo(name, target, remote=remote)
+
+    # A repo that declares its own default_branch (e.g. copilot-extensions'
+    # `dev` -- a contribution branch distinct from GitHub's advertised HEAD,
+    # which is what a plain `git clone` always checks out) is authoritative:
+    # switch the fresh checkout onto it now, and register that value instead
+    # of requiring an operator to separately know and pass --default-branch.
+    declared_branch = inrepo_declared_default_branch(str(target_path))
+    if declared_branch:
+        try:
+            current = subprocess.run(
+                ["git", "-C", str(target_path), "branch", "--show-current"],
+                capture_output=True, text=True, timeout=30,
+            ).stdout.strip()
+            if current != declared_branch:
+                checkout = subprocess.run(
+                    ["git", "-C", str(target_path), "checkout", declared_branch],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if checkout.returncode == 0:
+                    output.ok(f"Checked out declared default branch '{declared_branch}'")
+                else:
+                    output.warn(
+                        f"Could not check out declared default branch "
+                        f"'{declared_branch}': {_redact(checkout.stderr.strip())}"
+                    )
+        except Exception:
+            pass
+
+    return add_repo(name, target, remote=remote, default_branch=declared_branch)
 
 
 def _name_from_remote(remote: str) -> str | None:
@@ -689,6 +1056,116 @@ def resolve_path(name: str, plat: str | None = None) -> str | None:
     return None
 
 
+@dataclass
+class CredentialPinResult:
+    """Outcome of one repo's credential-pin backfill attempt."""
+
+    name: str
+    # "pinned" | "skipped" | "needs_clarify" | "no_path" | "not_github"
+    # | "not_registered" | "ssh_remote" | "not_https"
+    status: str
+    login: str | None
+    detail: str
+
+
+def backfill_credential_pins(
+    name: str | None = None, *, plat: str | None = None,
+) -> list[CredentialPinResult]:
+    """Retrofit the repo-local git credential pin onto already-registered repos.
+
+    New registrations (``repos add``/``repos clone``/adopt) pin automatically
+    at registration time (see ``_clarify_registration_account`` in
+    ``__main__``); this covers repos registered *before* that existed, or
+    whose checkout predates a machine's account_map entry.
+
+    Restricts to ``name`` when given, else every registered repo -- an
+    unrecognized ``name`` reports a single ``not_registered`` result rather
+    than silently falling back to "every repo" (a typo must never expand
+    scope). Skips (rather than errors) a repo with no resolvable local path,
+    a non-GitHub remote, or an account that still needs interactive
+    clarification (an org-owned remote with no account_map/explicit
+    override) -- those cases require ``repos account set``/an operator
+    choice, not a silent guess.
+    """
+    from . import git_ops
+
+    registry = read_registry()
+    if name is not None:
+        if name not in registry.repos:
+            return [
+                CredentialPinResult(name, "not_registered", None, "no such repo in the registry")
+            ]
+        entries = [registry.repos[name]]
+    else:
+        entries = list(registry.repos.values())
+    results: list[CredentialPinResult] = []
+    for entry in entries:
+        if not entry.remote:
+            results.append(
+                CredentialPinResult(entry.name, "not_github", None, "no remote configured")
+            )
+            continue
+        if not is_https_remote(entry.remote):
+            # An SSH remote (git@host:owner/repo, ssh://...) and a plain
+            # http:// remote both fail is_https_remote (see its docstring),
+            # but for different reasons -- distinguish them so the report
+            # never claims "SSH remote" for a checkout that is, in fact,
+            # unencrypted HTTP.
+            is_ssh = bool(re.match(r"^(?:ssh://|git@)", entry.remote.strip(), re.IGNORECASE))
+            if is_ssh:
+                results.append(
+                    CredentialPinResult(
+                        entry.name, "ssh_remote", None,
+                        "SSH remote -- the pin only affects HTTPS transport",
+                    )
+                )
+            else:
+                results.append(
+                    CredentialPinResult(
+                        entry.name, "not_https", None,
+                        "non-HTTPS remote -- the pin only affects HTTPS transport",
+                    )
+                )
+            continue
+        path = entry.local_path(plat or _current_platform())
+        if not path or not Path(path).is_dir():
+            results.append(
+                CredentialPinResult(
+                    entry.name, "no_path", None, "no local checkout on this machine"
+                )
+            )
+            continue
+        res = resolve_registration_account(entry.remote, entry.account)
+        if res.owner is None:
+            results.append(
+                CredentialPinResult(entry.name, "not_github", None, "non-GitHub remote")
+            )
+            continue
+        if res.needs_clarify or not res.login:
+            results.append(
+                CredentialPinResult(
+                    entry.name, "needs_clarify", res.login,
+                    f"owner '{res.owner}' has no resolvable account -- "
+                    f"run: repos account set {res.owner} <login>",
+                )
+            )
+            continue
+        host = derive_https_host(entry.remote) or "github.com"
+        if git_ops.pin_git_credential(path, res.login, host=host):
+            results.append(
+                CredentialPinResult(entry.name, "pinned", res.login, f"pinned to {res.login}")
+            )
+        else:
+            results.append(
+                CredentialPinResult(
+                    entry.name, "skipped", res.login,
+                    "pin not applied (already the active gh account, gh "
+                    "unavailable, or not a git checkout)",
+                )
+            )
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Migration from the legacy ~/.git-repos registry
 # ---------------------------------------------------------------------------
@@ -701,9 +1178,9 @@ def _git_repos_path() -> Path:
 def _adopted_project_names() -> set[str]:
     """Names of repos adopted as agent-worktrees projects (projects.yaml).
 
-    Used by migration to classify adopted projects as ``worktree``.
+    Used by migration classification and cross-project tracking lookup.
     """
-    projects_path = Path.home() / ".agent-worktrees" / "projects.yaml"
+    projects_path = registry_paths.registry_path("projects.yaml")
     if not projects_path.exists():
         return set()
     try:
@@ -879,12 +1356,15 @@ def _filter_repos(
     *,
     tag: str | None,
     class_filter: str | None,
+    names: tuple[str, ...] | None = None,
 ) -> list[RepoEntry]:
     if class_filter:
         wanted = normalize_class(class_filter)
         entries = [e for e in entries if e.repo_class == wanted]
     if tag:
         entries = [e for e in entries if tag in e.tags]
+    if names:
+        entries = [e for e in entries if e.name in set(names)]
     return entries
 
 
@@ -907,14 +1387,20 @@ def sync_repo(entry: RepoEntry, plat: str | None = None) -> tuple[str, str]:
     """Fetch and fast-forward one repo's default branch.
 
     Returns ``(state, detail)`` where state is one of: ``synced``,
-    ``skipped``, ``missing``, ``error``.  Dirty trees and detached/
-    non-default branches are skipped (never force-updated).
+    ``skipped``, ``missing``, ``error``.  Dirty trees and detached HEADs are
+    skipped (never force-updated). A repo's own in-repo-declared
+    ``default_branch`` (via ``inrepo_declared_default_branch``) is
+    authoritative over the registry's ``entry.default_branch`` -- when the
+    checkout is clean but sitting on a *different* branch than the declared
+    one (e.g. a stale clone left on GitHub's advertised HEAD instead of the
+    repo's actual contribution branch), this switches it back rather than
+    permanently skipping every future sync.
     """
     plat = plat or _current_platform()
     path = entry.local_path(plat)
     if not path or not (Path(path) / ".git").exists():
         return ("missing", "not checked out")
-    branch = entry.default_branch
+    branch = inrepo_declared_default_branch(path) or entry.default_branch
     try:
         if _git(path, "status", "--porcelain").stdout.strip():
             return ("skipped", "working tree dirty")
@@ -924,17 +1410,30 @@ def sync_repo(entry: RepoEntry, plat: str | None = None) -> tuple[str, str]:
             # never fast-forward it.
             return ("skipped", "detached HEAD")
         if branch and current != branch:
-            return ("skipped", f"on '{current}', not '{branch}'")
+            checkout = _git(path, "checkout", branch)
+            if checkout.returncode != 0:
+                return (
+                    "skipped",
+                    f"on '{current}', not declared default '{branch}' "
+                    f"(checkout failed: {checkout.stderr.strip() or 'unknown error'})",
+                )
+            current = branch
         target = branch or current
-        fetch = _git(path, "fetch", "origin", timeout=180)
-        if fetch.returncode != 0:
-            return ("error", fetch.stderr.strip() or "fetch failed")
+        # Use git_ops.fetch (not the plain local _git helper) so a cross-account
+        # remote authenticates the same way every other agent-worktrees git flow
+        # does -- resolving the repo's configured account and injecting a scoped
+        # credential override when it differs from the active `gh` account.
+        # `sync_repo`'s ambient-credential fetch previously bypassed that,
+        # failing private repos owned by a non-active account (dotfiles#2069).
+        git_ops.fetch("origin", cwd=path, timeout=180)
         if not target:
             return ("skipped", "no branch to fast-forward")
         ff = _git(path, "merge", "--ff-only", f"origin/{target}")
         if ff.returncode != 0:
             return ("skipped", "not fast-forwardable (diverged)")
         return ("synced", target)
+    except git_ops.GitError as e:
+        return ("error", e.stderr or str(e))
     except Exception as e:
         return ("error", str(e))
 
@@ -943,19 +1442,16 @@ def sync_all(
     *,
     tag: str | None = None,
     class_filter: str | None = None,
+    names: tuple[str, ...] | None = None,
     plat: str | None = None,
 ) -> list[tuple[str, str, str]]:
-    """Fetch + ff-merge all registered repos (optionally filtered).
-
-    Returns a list of ``(name, state, detail)`` tuples.
-    """
-    entries = _filter_repos(
-        list(read_registry().repos.values()),
-        tag=tag, class_filter=class_filter,
-    )
+    """Fetch + ff-merge registered repos, optionally filtered by ``names``
+    (an unregistered name reports its own not-registered result)."""
+    all_entries = list(read_registry().repos.values())
+    entries = _filter_repos(all_entries, tag=tag, class_filter=class_filter, names=names)
     entries.sort(key=lambda e: e.name)
-    results = []
-    for e in entries:
-        state, detail = sync_repo(e, plat)
-        results.append((e.name, state, detail))
+    results = [(e.name, *sync_repo(e, plat)) for e in entries]
+    if names:
+        known = {e.name for e in all_entries}
+        results += [(n, "error", "not registered") for n in sorted(set(names) - known)]
     return results

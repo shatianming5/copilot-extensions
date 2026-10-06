@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /*
- * ado/azure-auth-helper -- smart wrapper deployed by agent-codespaces.
+ * ado-auth-helper -- smart wrapper deployed by agent-codespaces.
  *
  * Relay-first: when the SSH credential relay is active (LC_GIT_CREDENTIAL_RELAY
  * set and live, a published port-mapping file points at a live channel, or the
@@ -25,10 +25,9 @@
  * window and then succeeds. On timeout we fail QUIETLY (git `get` -> `quit=1`)
  * so even the worst case can't trip an interactive prompt.
  *
- * Installed (by agent-codespaces, with the extension's node shebang) at both
- * ~/ado-auth-helper and ~/azure-auth-helper. The real auth-helper.js branches
- * on the invoked basename, which is preserved because this wrapper IS that
- * path -- so requiring it yields the correct ADO vs Azure behavior.
+ * Installed by agent-codespaces at ~/ado-auth-helper with the extension's node
+ * shebang. Azure CLI's ~/azure-auth-helper remains native and is never routed
+ * through this wrapper.
  *
  * marker: ado-auth-helper-relay  (used by the provisioner to detect our own
  * wrapper and avoid backing it up over the real native helper)
@@ -43,7 +42,8 @@ const path = require("path");
 const HOME = os.homedir();
 const DEFAULT_RELAY_PORT = 9857;
 const RELAY_CLIENT = path.join(HOME, ".local", "bin", "ado-auth-helper-relay");
-const RELAY_PORTS_DIR = path.join(HOME, ".agent-bridge", "relay-ports");
+const BRIDGE_DIR = ".agent-bridge"; // marketplace-isolation: allow registry
+const RELAY_PORTS_DIR = path.join(HOME, BRIDGE_DIR, "relay-ports");
 const EXT_PREFIX = "ms-codespaces-tools.ado-codespaces-auth";
 
 // When neither the relay nor the VS Code helper is available yet, callers like
@@ -115,7 +115,7 @@ function isCacheBackedAction() {
 // publishes under RELAY_PORTS_DIR: newest first, prefer a serving relay that
 // answers ping, otherwise adopt the first TCP-connectable candidate (older
 // relays do not answer ping), and prune only a dead channel's stale mapping.
-// Returns { port, token, adoHost } or null. Mirrors ado-auth-helper-relay so
+// Returns { port, token, adoHost, githubAccount } or null. Mirrors ado-auth-helper-relay so
 // the wrapper picks the relay path (vs the VS Code helper) whenever a live
 // channel exists even if this shell never inherited LC_GIT_CREDENTIAL_RELAY
 // (dotfiles #489/#187/#19).
@@ -146,6 +146,7 @@ function discoverFromMappings() {
       continue;
     }
     const found = { port: port, token: m.token || "", adoHost: m.ado_host || "" };
+    if (m.github_account) found.githubAccount = m.github_account;
     if (state === "pong") return found;
     if (!fallback) fallback = found;
   }
@@ -159,11 +160,15 @@ function discoverFromMappings() {
 function resolveRelay() {
   const env = process.env.LC_GIT_CREDENTIAL_RELAY;
   if (env && (isCacheBackedAction() || canConnect(env))) {
-    return {
+    const found = {
       port: env,
       token: process.env.LC_GIT_CREDENTIAL_RELAY_TOKEN || "",
       adoHost: process.env.LC_GIT_CREDENTIAL_RELAY_ADO_HOST || "",
     };
+    if (process.env.LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT) {
+      found.githubAccount = process.env.LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT;
+    }
+    return found;
   }
   const disc = discoverFromMappings();
   if (disc) return disc;
@@ -188,13 +193,15 @@ function resolveRelay() {
 function useRelay(r) {
   const env = Object.assign({}, process.env, {
     LC_GIT_CREDENTIAL_RELAY: r.port,
-    LC_GIT_CREDENTIAL_RELAY_HELPER: path.basename(process.argv[1] || ""),
   });
   if (r.token && !env.LC_GIT_CREDENTIAL_RELAY_TOKEN) {
     env.LC_GIT_CREDENTIAL_RELAY_TOKEN = r.token;
   }
   if (r.adoHost && !env.LC_GIT_CREDENTIAL_RELAY_ADO_HOST) {
     env.LC_GIT_CREDENTIAL_RELAY_ADO_HOST = r.adoHost;
+  }
+  if (r.githubAccount && !env.LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT) {
+    env.LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT = r.githubAccount;
   }
   const rr = cp.spawnSync(RELAY_CLIENT, process.argv.slice(2), {
     stdio: "inherit", env,
@@ -244,8 +251,8 @@ function findRealHelper() {
 function tryRealHelper() {
   const real = findRealHelper();
   if (!real) return false;
-  // process.argv[1] is this wrapper's path (~/ado-auth-helper or
-  // ~/azure-auth-helper), so the real helper sees the correct invoked name.
+  // process.argv[1] is this wrapper's ~/ado-auth-helper path, so the real
+  // helper sees the correct invoked name.
   require(real);
   return true;
 }

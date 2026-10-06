@@ -1,12 +1,12 @@
 {
   "version": 1,
   "hooks": {
-    "sessionStart": [
+    "preToolUse": [
       {
         "type": "command",
-        "powershell": "$r = $env:COPILOT_PLUGIN_ROOT; if (-not $r) { $r = $env:PLUGIN_ROOT }; if (-not $r) { $r = $env:CLAUDE_PLUGIN_ROOT }; if ($r) { try { [IO.Directory]::SetCurrentDirectory($env:USERPROFILE) } catch {}; $w = Join-Path (Join-Path $r 'scripts') 'invoke-context-contributor.ps1'; if (Test-Path -LiteralPath $w -PathType Leaf) { & $w 'copilot-extensions-harness@copilot-extensions' 'contribution-boundary' 'scripts/emit-contribution-boundary.ps1' } else { [Console]::Out.Write('{}') } } else { [Console]::Out.Write('{}') }",
-        "bash": "r=\"${COPILOT_PLUGIN_ROOT:-${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}}\"; w=\"$r/scripts/invoke-context-contributor.sh\"; if [ -n \"$r\" ] && [ -f \"$w\" ]; then bash \"$w\" copilot-extensions-harness@copilot-extensions contribution-boundary scripts/emit-contribution-boundary.sh; else printf '{}'; fi",
-        "timeoutSec": 30
+        "bash": "if [ -z \"${COPILOT_PLUGIN_ROOT:-}\" ]; then exit 0; fi; if command -v python3 >/dev/null 2>&1; then PY=python3; elif command -v python >/dev/null 2>&1; then PY=python; else exit 0; fi; \"$PY\" \"$COPILOT_PLUGIN_ROOT/scripts/copilot-mention-guard.py\"",
+        "powershell": "if (-not $env:COPILOT_PLUGIN_ROOT) { exit 0 }; $py = $null; foreach ($candidate in @('python3','python','py')) { $found = Get-Command $candidate -CommandType Application -All -ErrorAction SilentlyContinue | Where-Object { $_.Source -notmatch '\\\\WindowsApps\\\\' } | Select-Object -First 1; if ($found) { $py = $found; break } }; if (-not $py) { exit 0 }; & $py.Source (Join-Path $env:COPILOT_PLUGIN_ROOT 'scripts\\copilot-mention-guard.py')",
+        "timeoutSec": 15
       }
     ]
   }

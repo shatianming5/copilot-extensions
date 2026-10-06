@@ -18,6 +18,19 @@ A copilot-extensions plugin that provides:
 - **Agent-bridge provider** -- when agent-bridge is installed, a session-start
   hook drops a `providers.d` manifest so `codespace:<name>` agents resolve live
   over the agent-codespaces CLI boundary
+- **CLI-mode sessions** -- `copilot <name>` puts a real interactive Copilot
+  CLI session (tmux, inside the CodeSpace) into your terminal; `copilot <name>
+  --detach` starts it for an orchestrating agent instead (JSON handle; the
+  Connection Owner keeps its relay + host-bridge forwards alive), observable and
+  steerable through agent-bridge; if a new session registers but the seed
+  cannot be typed into the TTY prompt, the seed is delivered over that same
+  bridge message lane instead of stopping the session; `--ref-file <path>`
+  hands the worker a reference file (HAR trace, transcript, logs) without the
+  orchestrator reading it; `--reverse-forward VENUE:HOST` keeps a host port (e.g. a
+  browser's DevTools) reachable inside the venue; `--forward PORT[:VENUE]`
+  keeps a venue port (e.g. the worker's dev server) reachable on this host;
+  `--stop` ends it. See the
+  `codespaces-lifecycle` skill.
 - **Resource obligations** -- a borrowed CodeSpace is an accountable
   **obligation** on the borrowing worktree: `ssh` journals an `active`
   `codespace` claim onto its ledger, a clean disconnect settles it to `at-rest`
@@ -45,26 +58,30 @@ author.
 
 Add a **supplementary** config only when a repo deviates from convention (a
 split CodeSpaces-vs-product repo, a pinned devcontainer, an ADO host, a
-provision hook). It lives in the **adopting repo**, in the canonical in-repo
-location aligned with the sibling `agent-*` plugins:
+provision hook). It lives in the **adopting repo**, in the canonical
+`.copilot-extensions/<plugin>/` namespace:
 
 ```
-<repo>/.agent-codespaces/config.yaml
+<repo>/.copilot-extensions/agent-codespaces/config.yaml
 ```
 
 Scaffold and adopt it in one step from inside the repo:
 
 ```bash
-agent-codespaces config init      # writes .agent-codespaces/config.yaml (+ auto-adopts)
+agent-codespaces config init      # writes .copilot-extensions/agent-codespaces/config.yaml (+ auto-adopts)
 ```
+
+On Windows, the noninteractive workspace-discovery command used by `config init`
+runs with console-window suppression.
 
 Running a command inside a repo that carries the file **auto-discovers** it (no
 manual `config adopt`); adoption persists it for the detached daemon and for
-extra/multi-repo setups. A **legacy** repo-root `codespaces.yaml` is still read
-as a fallback -- relocate it with `agent-codespaces config migrate`.
+extra/multi-repo setups. Legacy `.agent-codespaces/config.yaml` and repo-root
+`codespaces.yaml` are still read as fallbacks -- relocate them with
+`agent-codespaces config migrate`.
 
 ```yaml
-# .agent-codespaces/config.yaml -- SUPPLEMENTARY, in-repo. Add ONLY what
+# .copilot-extensions/agent-codespaces/config.yaml -- SUPPLEMENTARY, in-repo. Add ONLY what
 # deviates from convention; everything omitted is derived.
 repos:
   org/my-app-codespaces:
@@ -74,45 +91,49 @@ repos:
 
 credentials:
   ado_host: my-org.visualstudio.com   # only for bare ADO get-access-token
+  identity_env: [GITHUB_USER]         # optional launch-time host identity alias
 ```
 
 > The service reads config live from the repo -- no generated intermediate
 > config. All org/account/URL values live in **your** repo, never in the plugin.
 
-### Repo provenance & the config-provider seam (harness plugins)
+For launch-time credential extras, `credentials.feed_token_env` exports fresh
+relay-minted Azure bearer tokens into named env vars, and
+`credentials.identity_env` exports the host Azure-login identity string those
+tokens represent. Ordinary user principals export the short alias (UPN local
+part); other principal types keep the reported identity string.
+
+### Repo provenance & the active-plugin config seam
 
 A repo's venue policy does **not** have to live in an adopted control-plane repo.
-A **`<repo>-harness`** plugin can ship the venue's **repo provenance** with itself
-and make it discoverable with **no control-plane repo** — the example-web-style
-golden path. Two convention-discovered seams, both honored here:
+A plugin can ship the venue's **repo provenance** with itself and make it
+discoverable with **no control-plane repo**. Two convention-discovered seams are
+honored here:
 
-- **Config-provider drop-in (`config.d`).** A harness plugin ships a supplementary
-  `.agent-codespaces/config.yaml` under its own `references/` and, from a
-  `sessionStart` hook, writes a schema-v1 JSON pointer into
-  `~/.agent-codespaces/config.d/<name>@<marketplace>.json`. The pointer records
-  its exact plugin source, canonical plugin root, and in-place target. The
-  registry activates it only when that source is effectively enabled in the
-  real user's global or registered-project settings and its target remains a
-  regular file contained by the identity-verified root. `AGENT_HOME` relocates
-  runtime state only; it never redirects this authorization lookup.
-- **Hygiene and compatibility.** Operator-owned `*.yaml` fragments remain
-  report-only, while the documented legacy `<name>-harness.conf` pointer remains
-  active with a `legacy-unattributed` advisory during migration. Invalid,
-  disabled, missing, duplicate, or transient entries are isolated from peers;
-  a complete scan reconciles removal, while indeterminate reads retain only their
+- **Config declaration (`codespaceConfig`).** The active plugin's `plugin.json`
+  names one string path relative to its payload root, for example
+  `"codespaceConfig": "references/agent-codespaces/config.yaml"`.
+  agent-codespaces resolves effectively active plugins, reads the declaration
+  from the identity-verified root, rejects path escapes and non-regular or
+  malformed targets, and parses the file as the normal supplementary config
+  shape. No `sessionStart` hook or user-level pointer is required.
+- **Hygiene and compatibility.** Legacy and operator-owned `config.d` inputs
+  remain supported and independently diagnosed. A pointer for an identity with
+  a valid active declaration is reported as superseded and cannot override or
+  reject the declaration. Invalid, disabled, missing, duplicate, or transient
+  contributions are isolated from peers; indeterminate reads retain only their
   own last-known contribution. Runtime warnings are bounded and deduplicated;
-  `agent-codespaces doctor` (or `doctor --json`) reports the exhaustive findings
-  and precise remediation without deleting any entry.
-- **Precedence.** `load_merged_config` consumes the classifier's selected
-  in-memory configs at the **lowest precedence** — a provider default any
-  adopted-repo/cwd config still overrides, with no copy to drift and no writeback
-  into any repo.
+  `agent-codespaces doctor` (or `doctor --json`) reports exhaustive findings and
+  precise remediation without deleting any entry.
+- **Precedence.** `load_merged_config` consumes provider configs at the **lowest
+  precedence** — adopted-repo/cwd config always wins. Active plugin declarations
+  precede compatibility `config.d` inputs.
 - **Repo provenance (`workspace_repo`).** The provider config's
   `repos.<vessel>.workspace_repo: <product>` is what makes
   `effective_acp_command_for(<vessel>)` launch the agent in `/workspaces/<product>`
   (the product checkout) rather than the vessel folder, and what
   `resolved_workspace_folder_for` publishes as the dispatched agent's ACP
-  `session/new` cwd (dotfiles#1274).
+  `session/new` cwd.
 - **In-venue plugins (`codespacePlugins`).** The harness plugin's `plugin.json`
   also declares which plugins to inject **into** the CodeSpace on connect (the
   `<product>-agent`), scoped by `forWorkspaceRepo` (see `codespace_plugins.py`).
@@ -146,18 +167,19 @@ agent-codespaces allocate <owner/repo> # Reuse/create/recycle/pressure decision
 agent-codespaces create <owner/repo>  # Create, guarded by reuse/budget checks
 agent-codespaces wait <name>          # Patiently wait for Available
 agent-codespaces stop <name>          # Recover sessions, then stop (preserve)
+agent-codespaces sync-sessions <name> # Non-destructive session capture (stays leased/running; never boots/stops/deletes; defers if held/unbound/mid-write)
 agent-codespaces finalize <name>      # Recover, stop, mark recovered/reusable
 agent-codespaces finalize <name> --delete  # Recover, verify off-box safety, delete
 agent-codespaces verify <name>        # Publish git-cleanliness safety verdict
 agent-codespaces delete <name>        # Delete a CodeSpace (--force to skip prompt)
-agent-codespaces config init          # Scaffold .agent-codespaces/config.yaml (+ auto-adopt)
+agent-codespaces config init          # Scaffold .copilot-extensions/agent-codespaces/config.yaml (+ auto-adopt)
 agent-codespaces config adopt         # Register a repo's config for the daemon
-agent-codespaces config migrate       # Relocate legacy codespaces.yaml -> .agent-codespaces/config.yaml
+agent-codespaces config migrate       # Relocate legacy config -> .copilot-extensions/agent-codespaces/config.yaml
 agent-codespaces config show          # Show resolved config
 agent-codespaces config validate      # Validate resolved config
 agent-codespaces cleanup              # Remove stale local state (SSH configs, sockets)
-agent-codespaces doctor               # Check gh auth + config.d hygiene
-agent-codespaces doctor --json        # Exhaustive structured auth/config.d report
+agent-codespaces doctor               # Check gh auth + config-provider hygiene
+agent-codespaces doctor --json        # Exhaustive structured auth/config report
 agent-codespaces status               # Runtime/config/gh/ssh overview
 agent-codespaces version              # Show version
 ```
@@ -166,6 +188,44 @@ There are also bridge-facing seams (`namespace-list`, `namespace-resolve`,
 `namespace-target-repo`, `namespace-ensure-ready`, `relay-profile`,
 `relay-launch-env`, `provision-command`, `acp-model-flags`). They are invoked by
 agent-bridge and are not the normal human/operator surface.
+
+### Periodic session capture (`sync-sessions`)
+
+This repo ships only the on-demand `sync-sessions` verb and its liveness gate
+-- it never schedules anything itself, exactly like `agent-containers`'
+`rescue-capture` (session-rescue-parity Phase 1's recorded decision: no
+existing repo-owned loop -- e.g. the Connection Owner daemon's
+`run_owner_daemon` -- covers every leased CodeSpace unconditionally, so
+scheduling stays a consumer concern). A downstream consumer that wants
+periodic evidence preservation for a long-lived, never-recycled CodeSpace
+wires its own external timer (cron, a systemd unit, a scheduled task) that
+periodically invokes:
+
+```bash
+agent-codespaces sync-sessions <name> --account <account> --json
+```
+
+The verb is safe to invoke on any schedule: it never boots a non-`Available`
+CodeSpace, defers (exit code `75`) whenever the box is held/unbound/mid-write
+or its own preflight fails (not found, account unauthenticatable, etc.), and
+is a no-op success when there are no sessions to capture. `75` covers every
+`deferred` case, not only transient contention -- **a consumer's timer must
+not blindly retry forever on `75`; always read the JSON `detail` field**, since
+a permanent configuration/identity problem (e.g. a missing account binding, an
+unmintable `gh` token) also returns `75` and will never resolve itself on a
+retry. Because account resolution is fail-closed (an explicit `--account` or
+an exact per-name binding only), a scheduled invocation should pass
+`--account` explicitly rather than rely on binding lookup succeeding
+unattended.
+
+`sync-sessions --json`'s result is `{ok, deferred, session_count, detail}` --
+`deferred` is the busy/held/not-ready/misconfigured case (exit `75`, `detail`
+explains which), `ok` is the capture/no-op-success signal otherwise, and
+`detail` always carries a human-readable reason. This is deliberately the
+same shape family as `rescue-capture`'s per-member result (`captured`/
+`rescues`/`deferred`, same busy exit code) scaled down to one target instead
+of a fleet, so a consumer already handling one provider's capture verb needs
+no new mental model for the other's.
 
 ### `create` options
 
@@ -180,7 +240,7 @@ agent-codespaces create <owner/repo> \
 ```
 
 Machine type and location default by convention (`largePremiumLinux` / `EastUs`)
-and can be overridden per-repo in `.agent-codespaces/config.yaml`. After the
+and can be overridden per-repo in `.copilot-extensions/agent-codespaces/config.yaml`. After the
 CodeSpace is Available, any `on_create` provisioning hooks from that config run
 automatically. Without `--force-create`, `create` first consults the pool
 planner: it reuses a suitable idle CodeSpace or refuses when the configured core
@@ -226,9 +286,11 @@ default would hide or `403`/`404` the other org's CodeSpaces entirely.
   mapped account plus the ambient one and merge, tagging each CodeSpace with its
   owning account. Per-CodeSpace ops (stop/delete/ssh) then pin `gh` to that
   account.
-- **Auth preflight** verifies each mapped account is logged in with the
-  `codespace` scope, surfacing the account's recorded `accounts.yaml` login flow
-  as the remedy.
+- **Auth preflight** verifies only the accounts that serve a CodeSpace -- bound
+  to a live CodeSpace, owning one, or configured for a repo -- plus the active
+  account when a CodeSpace uses ambient ownership. Each must be logged in with
+  the `codespace` scope; the remedy is the account's recorded `accounts.yaml`
+  login flow.
 - **Fully additive:** with no `account_map` configured, everything collapses to
   a single ambient `gh` call — today's behavior.
 
@@ -274,6 +336,29 @@ over the SSH tunnel, resolving them through the host's Git Credential Manager
 by agent-bridge; agent-codespaces contributes the CodeSpace policy/profile and
 sets up the SSH reverse-forward on connect.
 
+For `github.com`, each CodeSpace connection can pass its GitHub account as
+`username=<account>` before the request reaches non-interactive GCM. Bound
+CodeSpaces use their persisted account; ambient-owned CodeSpaces use the active
+`gh` account. That avoids GCM's account picker (`Cannot prompt because user
+interactivity has been disabled`) when several GitHub accounts are stored. The
+relay profile itself stays account-free, and a missing/ambiguous GitHub
+credential warns during launch rather than blocking the session; `doctor`
+continues to report it. If GCM still cannot serve the selected account, sign in
+to GitHub in GCM for that account; the relay never substitutes a `gh auth token`
+for git `get`/`fill`. The CodeSpace helper acknowledges git `store`/`erase`
+locally without contacting the relay, so they never change host GCM. The
+account is named only when the running relay advertises the
+`git-credential-username-cache` capability. An older bridge relay caches git
+credentials per host, so against one the helper sends the request without an
+account, as it did before.
+
+Provisioning installs the relay-first wrapper only as `~/ado-auth-helper`.
+It deliberately leaves `~/azure-auth-helper` to the native Azure tooling so
+interactive `az login` keeps working. Reconnecting with a newer
+agent-codespaces version repairs older installations that shadowed the Azure
+helper, restoring a preserved native helper when one exists and otherwise
+removing the stale relay wrapper.
+
 To avoid the failure mode where a missing/expired credential causes a CodeSpace
 `git fetch` to hang indefinitely on `git credential fill`:
 
@@ -292,7 +377,8 @@ To avoid the failure mode where a missing/expired credential causes a CodeSpace
 ## Local identifier guard
 
 This is a **public** repo, so internal org/account/repo names and personal
-aliases must never land in it. The generated `.agent-codespaces/config.yaml`
+aliases must never land in it. The generated
+`.copilot-extensions/agent-codespaces/config.yaml`
 scaffold is checked for such leaks by `tests/test_config_init.py`, and the whole
 working tree by [`tools/check-no-internal-identifiers.py`](../../tools/check-no-internal-identifiers.py)
 (wire it up as a git `pre-push` hook).

@@ -27,10 +27,10 @@ import os
 import shlex
 import shutil
 import subprocess
-from pathlib import Path
 
 from .config import producer_capability
-from .procutil import no_window_kwargs
+from .install_paths import install_dir
+from .procutil import run_ssh_command
 
 
 class RemoteDispatchUnavailable(RuntimeError):
@@ -66,10 +66,7 @@ def local_machine() -> str | None:
     host node name. Returns None only when none yield a name.
     """
     configured = os.environ.get("AGENT_DISPATCH_SUPERVISE_MACHINE")
-    root = Path(
-        os.environ.get("AGENT_DISPATCH_INSTALL_DIR")
-        or (Path.home() / ".agent-dispatch")
-    )
+    root = install_dir()
     if not configured:
         try:
             configured = (root / "machine").read_text(encoding="utf-8").strip()
@@ -89,9 +86,9 @@ def local_machine() -> str | None:
     if configured:
         return configured.strip().casefold()
 
-    from .identity import resolve_identity
+    from .identity import resolve_machine
 
-    machine = resolve_identity()[0]
+    machine = resolve_machine()
     if machine:
         return machine
     import platform
@@ -183,14 +180,18 @@ def build_remote_create_argv(
         argv += ["--target-repo", args.target_repo]
     if getattr(args, "evaluator_ref", None):
         argv += ["--evaluator-ref", args.evaluator_ref]
+    if getattr(args, "require_verification", False):
+        argv += ["--require-verification"]
     if getattr(args, "target_worktree", None):
         argv += ["--target-worktree", args.target_worktree]
+    if getattr(args, "exclusive_key", None):
+        argv += ["--exclusive-key", args.exclusive_key]
+    if getattr(args, "supersede_exclusive_key", False):
+        argv += ["--supersede-exclusive-key"]
     if getattr(args, "source", None):
         argv += ["--source", args.source]
     if getattr(args, "origin_ref", None):
         argv += ["--origin-ref", args.origin_ref]
-    if getattr(args, "evaluator_ref", None):
-        argv += ["--evaluator-ref", args.evaluator_ref]
     if getattr(args, "dedup_key", None):
         argv += ["--dedup-key", args.dedup_key]
     if getattr(args, "producer_id", None):
@@ -254,14 +255,10 @@ def dispatch_to_remote(
     # key fails fast instead of hanging on a password prompt. Lowercased so a
     # display-cased name still matches its lowercase `Host` block.
     cmd = [exe, "-o", "BatchMode=yes", _ssh_alias(machine), remote_cmd]
-    return subprocess.run(  # noqa: S603 -- fixed argv, exe resolved via shutil.which
+    return run_ssh_command(
         cmd,
         input=stdin,
-        check=False,
-        capture_output=True,
-        text=True,
         timeout=timeout,
-        **no_window_kwargs(),
     )
 
 
@@ -354,13 +351,9 @@ def browse_remote(
     remote_cmd = " ".join(shlex.quote(a) for a in argv)
     cmd = [exe, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
            _ssh_alias(machine), remote_cmd]
-    return subprocess.run(  # noqa: S603 -- fixed argv, exe resolved via shutil.which
+    return run_ssh_command(
         cmd,
-        check=False,
-        capture_output=True,
-        text=True,
         timeout=timeout,
-        **no_window_kwargs(),
     )
 
 

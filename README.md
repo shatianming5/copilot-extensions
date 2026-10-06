@@ -1,5 +1,17 @@
 # copilot-extensions
 
+> **⚠️ `main`'s git history was rewritten.** This repository's `main` branch
+> had its git **history** (not content) rewritten to purge ~150-300MB of
+> accumulated binary bloat (`.github/coverage-baselines/*`, committed before
+> the coverage-baseline design moved to GitHub Release assets — see
+> [PR #5078](https://github.com/ThomasMichon/copilot-extensions/pull/5078)).
+> Pre-rewrite tip: `b8e83826124674f16ecb200d4c2709c77b87dc0b`.
+> Post-rewrite tip: `3a9b9f90b7e02de4da49376323294b3474d483f6` (2026-10-04). If your
+> local clone tracks `main` directly, see
+> [`docs/pipelines.md`'s "If `main`'s history is force-rewritten"
+> section](docs/pipelines.md#if-mains-history-is-force-rewritten) for recovery. **`dev` was never affected.** Full
+> procedure and status: [`efforts/done/main-history-rewrite`](efforts/done/main-history-rewrite/README.md).
+
 <p align="center">
   <img src="docs/assets/worktree-picker.gif"
        alt="The Worktree Picker: an interactive terminal front door listing worktree-backed agents across machines and environments, with live state, sync tags, and per-worktree actions"
@@ -50,26 +62,29 @@ curl -fsSL https://raw.githubusercontent.com/ThomasMichon/copilot-extensions/mai
 | Plugin | Type | What it gives you |
 |--------|------|-------------------|
 | [agent-worktrees](plugins/agent-worktrees/) | Session tool | Each Copilot CLI session runs in its own git worktree — no branch conflicts, no stale state. Install this first. |
+| [agent-pull-requests](plugins/agent-pull-requests/) | Cross-repo PR CLI | Query and eventually drive pull requests by explicit `owner/repo`, even when no local checkout exists. This first runtime-backed slice ships a standalone `status` verb, deploys a real `~/.local/bin/agent-pull-requests` binstub, and stages the broader extraction from `agent-worktrees`. |
 | [agent-bridge](plugins/agent-bridge/) | Persistent service | Converse with and steer live agents across worktree, repository, machine, CodeSpace, and container boundaries. |
 | [agent-codespaces](plugins/agent-codespaces/) | CLI + relay | Create/manage GitHub Codespaces, address them as bridge agents (`codespace:<name>`), and forward git/GitHub/Azure credentials into them. |
 | [agent-containers](plugins/agent-containers/) | CLI + resolver | Manage a fleet of local Docker dev containers, borrow/release them per effort, and address them as bridge agents (`container:<name>`). |
 | [agent-mcp](plugins/agent-mcp/) | MCP bridge | Wrap an upstream MCP server (HTTP or stdio), inject host credentials, reshape its catalog, and materialize a bridge-equivalent fallback. Agent authoring policy remains in `customizing-copilot`. |
 | [agent-ssh](plugins/agent-ssh/) | SSH connectivity CLI | Emit and verify machine-name SSH profiles from a normalized registry, and define the public transport-provider contract for direct or tunnel transports. |
+| [agent-remote-driver](plugins/agent-remote-driver/) | SDK extension | User-global, launch-time SDK extension giving any `copilot` session baseline drivability (attach to its live event stream, send/steer, abort) over a loopback HTTP surface, independent of agent-bridge or any other coordination plugin being installed in that venue. Payload-only — no runtime to install. Not yet enabled by default (`cli-default-bridging` effort, pre-validation). |
 | [efforts](plugins/efforts/) | Planning skills | Plan a stretch of work as an **effort** — a folder with a README-as-shared-contract (premise + plan + journal) that humans and agents coordinate through. The executor plugins above bind its participant seam. |
 | [visions](plugins/visions/) | Planning skills | Keep a persistent **vision** — a north-star statement of what a system should ultimately be — and derive efforts from the delta between vision and reality. Payload-only — no runtime to install. |
 | [agent-logger](plugins/agent-logger/) | Session logging | Turn raw Copilot sessions into structured Markdown logs — a segmenter, a voice-neutral log-writer agent, and a `session-sync` step that pushes local or validated provider-rescued session data to a configurable target (local / OneDrive / SSH / ingest). Personality is injected by the host, never built in. |
 | [context-handoff](plugins/context-handoff/) | Ambient policy + extension + skill | Keep a continuity contract active through a concise session-start kernel, watch the context window via a session extension, and transfer unfinished objectives into successor sessions before compaction. Payload-only — no runtime to install. |
-| [agent-dispatch](plugins/agent-dispatch/) | Task queue + coordinator | Manage durable queued task loops with deduplication, atomic claims, routing, retries, supervision, and terminal task state. |
+| [agent-dispatch](plugins/agent-dispatch/) | Task queue + coordinator | Manage durable queued task loops with deduplication, atomic claims, routing, retries, supervision, terminal task state, and declarative repository review or issue loops. |
 | [agent-index](plugins/agent-index/) | Index/search service | Portable indexing and semantic-search engine for a harness repo and its immediate ecosystem. Phase 1 ships the service shell; indexing and retrieval arrive in later slices. |
-| [agent-machines](plugins/agent-machines/) | Machine-state reconciler | Portable restore-machinestate — converge a machine to desired state declared in in-repo requirement packages (Copilot settings first). Machine-scoped union restore, a seven-disposition model, and a detect-not-arbitrate conflict validator. The engine is generic; sensitive OS-mutating modules stay repo-local. |
+| [agent-machines](plugins/agent-machines/) | Machine-state reconciler | Portable restore-machinestate — converge a machine to desired state declared in in-repo requirement packages (Copilot settings first). Machine-scoped union restore, a seven-disposition model, and a detect-not-arbitrate conflict validator. Its self-update sweep now runs only the maintenance-safe restore subset (manage reconciliation, opted-in resources, pinned installed-package realignment, and runtime spot checks). |
 | [agent-vault](plugins/agent-vault/) | CLI + service | Local KeePassXC-backed secret store — a machine-local service caches the master password with a TTL and auto-prompts on lock; a CLI fetches API keys, SSH keys, and credentials on demand without hardcoding, committing, or env-exporting them. Ships a SUDO_ASKPASS helper for `sudo -A`. |
-| [customizing-copilot](plugins/customizing-copilot/) | Customizing the CLI | Teach an agent how to customize and extend the Copilot CLI — authoring skills, defining sub-agents, registering MCP servers, installing plugins, building a control-harness, reviewing customizations, and authoring `<repo>-harness` plugins. Seven focused skills. Payload-only — no runtime to install. |
+| [customizing-copilot](plugins/customizing-copilot/) | Customizing and diagnosing the CLI | Teach an agent how to customize, diagnose, and extend the Copilot CLI — authoring skills, defining sub-agents, registering MCP servers, installing plugins, building a control-harness, reviewing customizations, diagnosing startup hangs, authoring `<repo>-harness` plugins, and setting up an instruction-projection sync worker. Eleven focused skills. Payload-only — no runtime to install. |
 | [copilot-extensions-harness](plugins/copilot-extensions-harness/) | Operator harness | Portable owner-authored skills, the `clean-room-judge` evaluator agent, and an ambient pointer to the general-purpose, organization-neutral contribution boundary. Enable it in any control repo instead of hand-writing a per-repo narrative. Reference implementation of the `<repo>-harness` standard. Payload-only. |
 | [wsl-setup](plugins/wsl-setup/) | Environment setup | Set up and troubleshoot WSL2 as a reachable, persistent service host — pick the networking mode (NAT + localhostForwarding vs mirrored), diagnose corp-network egress + host↔WSL loopback failures, and keep a distro alive for a hosted listener (e.g. sshd behind a Dev Tunnel). Ships a windowless keepalive helper. |
 | [harness-knowledge](plugins/harness-knowledge/) | Binding skill | Bind a stateless control harness to its private **knowledge** repo, harness-first — ask for (or create) the knowledge repo, write the machine-local `knowledge_repo` pointer, and assemble a machine-local instructions fragment labeling the concrete harness/knowledge/product paths. Keeps the shareable harness tree generic + name-free. Payload-only. |
 | [ai-attribution](plugins/ai-attribution/) | Ambient policy + skills | Keep publication and AI-attribution safety active through a concise payload-cwd-gated session-start kernel, host-qualified operator policy, an idempotent static-fallback setup skill, and an on-demand publication workflow. Payload-only; no runtime, network call, or authentication. |
-| [delegation-guidance](plugins/delegation-guidance/) | Ambient policy + skill | Route broad separable research, comparisons, evaluations, domain-tool calls, and disjoint bulk edits into bounded sub-agent contexts while the coordinator retains synthesis, integration, cohesive implementation, and completion. Payload-only; no runtime or configuration. |
-| [context-injection](plugins/context-injection/) | Context aggregation hook | On affected Copilot CLI hosts, one exact source-qualified marketplace authority resolves the active plugin stack and emits one deterministic aggregate from complete authority-aware contributors. Payload-only. |
+| [delegation-guidance](plugins/delegation-guidance/) | **Deprecated** — no-op pointer | Migrated into `agent-conduct-guidance`'s delegation module. Kept installable so the name keeps resolving for existing adopters; ships no skills or projections of its own. |
+| [budget-guidance](plugins/budget-guidance/) | Budget posture CLI | Resolve strict offline allowance, consumption, reset, freshness, rate, and ceiling readings into one attributable posture with JSON and concise human status. |
+| [agent-conduct-guidance](plugins/agent-conduct-guidance/) | Ambient policy + skills | Consolidated, generally-good agent conduct guidance: one plugin hosting multiple independent ambient modules (instruction projection + paired skill each). Modules: process-spawn hygiene (spawn every ad hoc CMD/PowerShell/Python/Node/etc. child process headlessly, especially on Windows), coordinator-first delegation (route broad separable work into bounded sub-agent contexts while the coordinator retains synthesis and completion), and scratch-space hygiene (resolve a portable scratch root and a timestamped per-task subfolder before writing an ad hoc working file outside a repository). Payload-only; no runtime. |
 
 All support **Windows** and **Linux/WSL** (macOS planned).
 
@@ -77,13 +92,15 @@ All support **Windows** and **Linux/WSL** (macOS planned).
 
 ## Architecture at a glance
 
-21 plugins, one marketplace. **Eleven ship a runtime** (a `uv`-built venv under
-`~/.agent-*` + a `~/.local/bin` binstub, deployed by the plugin's own
-installer); **ten are payload-only** — `efforts` (skills), `visions` (skills),
+24 plugins, one marketplace. **Thirteen ship a runtime** (a `uv`-built venv under
+a plugin-owned runtime root such as `~/.agent-*` or `~/.budget-guidance`, plus a
+`~/.local/bin` binstub, deployed by the plugin's own installer); **eleven are
+payload-only** — `efforts` (skills), `visions` (skills),
 `context-handoff` (hook + session extension + skill), `customizing-copilot` (skills),
 `copilot-extensions-harness` (skills + contribution-boundary hook), `wsl-setup` (skills),
 `harness-knowledge` (skills), `ai-attribution` (hook + skill),
-`delegation-guidance` (hook + skill), and `context-injection` (aggregation hook)
+`delegation-guidance` (hook + skill), `agent-conduct-guidance`
+(instruction projection + skill), and `agent-remote-driver` (SDK extension)
 need no install beyond enabling the plugin.
 Everything installs **from the marketplace** and runs
 **from local install paths** — no git checkout required at runtime.
@@ -103,10 +120,11 @@ flowchart TB
       AI["agent-index<br/>index/search service"]
       AK["agent-machines<br/>machine-state reconciler CLI"]
       AV["agent-vault<br/>secret store CLI + service"]
-      PO["efforts · visions · context-handoff · customizing-copilot<br/>copilot-extensions-harness · wsl-setup · harness-knowledge · ai-attribution · delegation-guidance · context-injection<br/>(payload-only: skills / hooks / extension)"]
+      PO["efforts · visions · context-handoff · customizing-copilot<br/>copilot-extensions-harness · wsl-setup · harness-knowledge · ai-attribution · delegation-guidance (deprecated) · agent-conduct-guidance<br/>(payload-only: skills / hooks / extension)"]
     end
     subgraph RT["Local runtimes — ~/.* + ~/.local/bin"]
       RW["~/.agent-worktrees<br/>agent-worktrees"]
+      RPR["~/.agent-pull-requests<br/>agent-pull-requests"]
       RB["~/.agent-bridge<br/>service (OS-assigned port)"]
       RC["~/.agent-codespaces<br/>agent-codespaces"]
       RN["~/.agent-containers<br/>agent-containers"]
@@ -119,6 +137,7 @@ flowchart TB
       RV["~/.agent-vault<br/>secret store service"]
     end
     MP -->|copilot plugin install| AW
+    MP -->|copilot plugin install| APR["agent-pull-requests<br/>cross-repo PR CLI"]
     MP -->|copilot plugin install| AB
     MP -->|copilot plugin install| AC
     MP -->|copilot plugin install| AN
@@ -131,6 +150,7 @@ flowchart TB
     MP -->|copilot plugin install| AV
     MP -->|copilot plugin install| PO
     AW -->|init.ps1 / init.sh| RW
+    APR -->|install.ps1 / install.sh| RPR
     AB -->|install.ps1 / install.sh| RB
     AC -->|init.ps1 / init.sh| RC
     AN -->|init.ps1 / init.sh| RN
@@ -213,16 +233,15 @@ copilot plugin install efforts@copilot-extensions        # optional — planning
 copilot plugin install context-handoff@copilot-extensions # optional — context-window handoff (no runtime)
 copilot plugin install customizing-copilot@copilot-extensions # optional — how to customize the CLI (no runtime)
 copilot plugin install ai-attribution@copilot-extensions # optional — ambient publication safety (no runtime)
-copilot plugin install delegation-guidance@copilot-extensions # optional — coordinator-first task routing (no runtime)
-copilot plugin install context-injection@copilot-extensions # optional — deterministic session-start context aggregation
+copilot plugin install agent-conduct-guidance@copilot-extensions # optional — consolidated agent conduct guidance (no runtime)
 ```
 
 Each `copilot plugin install` only vendors the plugin's **payload** (source,
-skills, hooks, extensions). The eleven runtime plugins (every plugin except the
+skills, hooks, extensions). The thirteen runtime plugins (every plugin except the
 payload-only `efforts`, `visions`, `context-handoff`, `customizing-copilot`,
 `copilot-extensions-harness`, `wsl-setup`, `harness-knowledge`, and
-`ai-attribution`, `delegation-guidance`, and `context-injection`) then need their runtime deployed once — that's Step 2,
-which runs each installer to build a `uv` venv under `~/.agent-*` and drop a
+`ai-attribution`, `delegation-guidance`, and `agent-conduct-guidance`) then need their runtime deployed once — that's Step 2,
+which runs each installer to build a `uv` venv under its plugin-owned home and drop a
 binstub in `~/.local/bin`.
 
 > **Recommended: register at repo scope instead of globally.** Set
@@ -394,6 +413,7 @@ Your source repos and their `.worktrees` content are never touched.
 | [Control-Harness Runbook](docs/harness-runbook.md) | Opinionated, phase-by-phase procedure for building/extending/auditing an agent harness with these plugins |
 | [Plugin consolidation](docs/plans/plugin-consolidation.md) | Discussion: whether to collapse the multi-plugin suite into fewer plugins, with decision criteria |
 | [Architecture overview](docs/architecture.md) | How the plugins fit together: install topology, runtimes, ports, credential relay |
+| [CI/CD Pipelines](docs/pipelines.md) | PR gating layers, the full `.github/workflows/` reference, and the `dev` → `main` promotion pipeline |
 | [Rollout plan](docs/plans/rollout-readiness.md) | Onboarding-readiness plan and fixes |
 | [Fresh dev box validation](docs/plans/fresh-devbox-validation.md) | Step-by-step validation on a clean machine |
 
@@ -475,7 +495,7 @@ Your source repos and their `.worktrees` content are never touched.
 
 | Document | Description |
 |----------|-------------|
-| [README](plugins/customizing-copilot/README.md) | Plugin overview, the seven skills, no-install delivery |
+| [README](plugins/customizing-copilot/README.md) | Plugin overview, the eleven skills, no-install delivery |
 | [authoring-skills](plugins/customizing-copilot/skills/authoring-skills/SKILL.md) | SKILL.md format, folder convention, validation, hooks, custom instructions |
 | [defining-subagents](plugins/customizing-copilot/skills/defining-subagents/SKILL.md) | Custom agents: `.agent.md`, bounded execution, MCP ownership, Task-capable anti-recursion |
 | [registering-mcp-servers](plugins/customizing-copilot/skills/registering-mcp-servers/SKILL.md) | MCP registration hierarchy, config formats, writing a server |
@@ -483,6 +503,10 @@ Your source repos and their `.worktrees` content are never touched.
 | [building-harnesses](plugins/customizing-copilot/skills/building-harnesses/SKILL.md) | In-session entry to the Control-Harness Runbook (greenfield / brownfield / audit) |
 | [reviewing-customizations](plugins/customizing-copilot/skills/reviewing-customizations/SKILL.md) | Review a harness's skills, owned and enabled-plugin sub-agents, `AGENTS.md`, hooks, MCP configs |
 | [authoring-harness-plugins](plugins/customizing-copilot/skills/authoring-harness-plugins/SKILL.md) | The `<repo>-harness` standard: ship operator skills for a repo |
+| [diagnosing-copilot-cli-startup](plugins/customizing-copilot/skills/diagnosing-copilot-cli-startup/SKILL.md) | Diagnose interactive CLI `Loading` / `Resuming` hangs from mux, process, session-state, and plugin evidence |
+| [hoisting-plugin-agents](plugins/customizing-copilot/skills/hoisting-plugin-agents/SKILL.md) | Hoist a marketplace-enabled plugin agent into a repo-local `.github/agents/` fallback for delegated/nested sessions |
+| [componentizing-modules](plugins/customizing-copilot/skills/componentizing-modules/SKILL.md) | Decompose an oversized source or test module toward its size cap |
+| [setting-up-instruction-sync-worker](plugins/customizing-copilot/skills/setting-up-instruction-sync-worker/SKILL.md) | Scaffold the `projection-reflect` scheduled sync worker and review-gate bypass profile, gated on explicit committed opt-in |
 
 ### Agent Dispatch
 
@@ -510,7 +534,7 @@ Your source repos and their `.worktrees` content are never touched.
 
 | Document | Description |
 |----------|-------------|
-| [CONTRIBUTING](CONTRIBUTING.md) | Versioning, release workflow, deployment pipeline |
+| [CONTRIBUTING](CONTRIBUTING.md) | PR flow, review-verdict waiting loop, code style, deployment |
 | [AGENTS](AGENTS.md) | Repo development guide |
 
 ## License

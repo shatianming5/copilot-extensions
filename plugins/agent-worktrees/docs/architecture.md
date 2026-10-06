@@ -28,16 +28,53 @@ via init/install scripts (`init.ps1`/`init.sh` → `install.{ps1,sh}`), or via t
 global binstub's first-use `provision` fallback, and provides the
 `agent-worktrees` CLI, session launchers, and per-project binstubs.
 
+### Installation-cell runtime selection
+
+The payload-local `agent-worktrees` command resolves installation governance
+before selecting a runtime. Legacy/default/false policy keeps the established
+`~/.agent-worktrees` root. An explicitly active, validated installation context
+selects that cell's plugin root instead, and first use provisions the versioned
+runtime, markers, wrappers, and deploy manifest only beneath that root. Invalid,
+foreign, inactive, or governance-blocked context fails without falling back to
+the legacy runtime. The session-start bootstrap hook stands down whenever an
+explicit context is present so it cannot recreate legacy state before the
+payload command validates the selected cell.
+
+The global `config.yaml`, `projects.yaml`, and `repos.yaml` files form one
+coupled registry boundary. Legacy/default operation keeps all three beneath
+`~/.agent-worktrees`; an explicit context validates the exact agent-worktrees
+payload and selects the cell's plugin root for all three. Ambient runtime,
+home, plugin-root, or per-file override variables cannot independently select
+a cell, and invalid or foreign context never falls back to the legacy files.
+The same selected root owns runtime manifests, version slots, wrapper support,
+logs, pivots, monitor state, and other plugin-global mutable artifacts.
+
+Per-project config and agent-worktrees tracking/session records now follow the
+same installation boundary. Legacy/default operation preserves
+`~/.{project}`. A namespaced project resolves its registered remote to a stable
+repository ID, validates `<cell>/repos/<repository-id>/identity.json`, and uses
+that repository's `agent-worktrees/` child for `config.yaml`, worktree records,
+histories, and session bindings. Aliases for the same normalized remote share a
+repository ID, while the same repository in another cell remains isolated.
+
+Project binstubs remain global but route every invocation through their pinned
+payload before runtime or launcher selection. Their shared ownership receipts
+and locks remain beside the shared `~/.local/bin` command space and bind the
+validated marketplace installation identity, so independent cells cannot
+arbitrate the same command under separate locks. Leases, service identity, and
+the host-owned `~/.copilot/session-state` database remain separate later
+boundaries. Namespaced activation remains opt-in and clean-room-only during the
+migration.
+
 ## Installed Layout
 
 After full installation and project registration:
 
 ```
-~/.agent-worktrees/                 # Shared runtime (one per machine)
+~/.agent-worktrees/                 # Legacy/default runtime + registry root
   versions/<v>/                     #   Immutable per-version venv slots
   current-version                   #   Plain-text marker -> the active slot
   bin/                              #   Shell wrappers
-    launch-session.{ps1,cmd,sh}     #     Session launcher
     bootstrap-check.{ps1,sh}        #     Session-start health check
     provision-check.{ps1,sh}        #     Repo-enabled plugin runtime provision
     *guard.py                       #     preToolUse guard scripts
@@ -45,6 +82,18 @@ After full installation and project registration:
   repos.yaml                        #   Repos catalog + source roots
   pivots/                           #   Cross-plugin picker pivot manifests
   deploy-manifest.json              #   Provenance (commit, timestamp)
+
+~/.copilot-extensions/marketplaces/<id>/plugins/agent-worktrees/
+                                      # Namespaced runtime + registry root
+  config.yaml                         #   Machine-wide defaults
+  projects.yaml                       #   Registry of adopted projects
+  repos.yaml                          #   Repos catalog + source roots
+
+~/.copilot-extensions/marketplaces/<id>/repos/<repository-id>/
+  identity.json                       # Stable normalized-remote ownership
+  agent-worktrees/
+    config.yaml                       # Cell-local per-project config
+    worktrees/                        # Cell-local tracking/session records
 
 ~/.{project}/                       # Per-project config + state
   config.yaml                       #   Machine, repos, launch commands
@@ -166,10 +215,17 @@ The status core carries **two complementary registers**, deliberately kept in
 **separate homes** so they can never be faked from each other (the `agent-fabric`
 vision's *disposition-is-asserted / pulse-is-derived* behavior):
 
-1. **Durable disposition (asserted).** The `follow_up` / `summary` overlay on the
-   worktree **record** (above). High-signal, slow-moving: the agent *asserts* it
-   via `agent-worktrees status --follow-up|--resolved`. It is the single-writer
-   YAML, and it is the *only* register that feeds the prune verdict.
+1. **Durable disposition (asserted).** The `follow_up` / `summary` / `paused`
+   overlay on the worktree **record** (above). High-signal, slow-moving: the
+   agent *asserts* it via `agent-worktrees status
+   --follow-up|--resolved|--paused|--unpaused`. It is the single-writer YAML.
+   Only `follow_up` feeds the prune verdict; `paused` never gates pruning or
+   any other lifecycle gate. It is a scannable marker in the Picker's title
+   (a `⏸` glyph) and the `status --json`/`list --json` payload -- the plain
+   `status`/`list` **tables** still render the unmarked title, same as every
+   other JSON-only field. Setting it does stamp `status_note_at` like the
+   other two fields, so it affects nudge-freshness/glance-ordering the same
+   way a `--summary`/`--title` write would.
 2. **Live pulse (derived).** A per-session **sidecar** (`substatus.json` in the
    Copilot `session-state/{id}/` dir, beside context-handoff's `context.json`),
    written by the agent-worktrees **live-pulse extension**
@@ -223,8 +279,9 @@ Never block, and never leave a control that looks like it did nothing.
   **config** sections (`_run_config_section`) -- hands the blocking call to
   **`PickerScreen._run_bg(label, work, done, *, quiet=False)`**. `work()` runs on a
   daemon worker thread; the UI update `done(result)` is marshalled back onto the
-  event loop via Textual **`call_from_thread`** (so no widget is mutated
-  off-thread). The handler returns instantly; while it runs the **footer shows the
+  event loop via the screen's **`Inbox`** (`inbox.py`), never a raw
+  `app.call_from_thread` (see "The Inbox: the one sanctioned marshalling path"
+  below). The handler returns instantly; while it runs the **footer shows the
   shared animated spinner** (`SPINNER` braille, driven by `frame`) + the action
   label via `_busy_label` -- never a static line, so no action looks inert. Pass
   `quiet=True` when a *different* surface already shows the load state (see below).
@@ -252,13 +309,91 @@ Never block, and never leave a control that looks like it did nothing.
 
 **Enforcement / when you add a feature.** Any new key handler, action, or
 menu-open that reaches a subprocess or blocking IO must go through `_run_bg` (or a
-dedicated daemon worker), never call it inline -- and any load-gated *component*
-should open-first + spinner + refine rather than wait. Two regression tests gate a
-runtime/probe that blocks on an `Event`:
+dedicated daemon worker via `background.run_background`), never call it inline --
+and any load-gated *component* should open-first + spinner + refine rather than
+wait. Two regression tests gate a runtime/probe that blocks on an `Event`:
 `test_steer_submit_is_offloaded_off_the_render_flow` (Confirm returns without running
 the submit inline) and `test_actions_menu_liveness_verify_is_offloaded` (the Actions
 menu is open + `loading` immediately, then refines in place when the gate releases).
 If you add a blocking edge, add the equivalent offload + assertion.
+
+### The Inbox: the one sanctioned marshalling path
+
+Before `inbox.py` existed, two independent, hand-rolled marshalling
+mechanisms coexisted in the Picker: the data-plane's `LiveLoader.records()`
+snapshot pull (above), and a push-based `_run_bg`/`app.call_from_thread`
+pattern that several call sites (`_run_bg`, `_apply_from_worker`, the
+setup-reload worker, ...) each reimplemented slightly differently --
+subtly different thread-safety, error-handling, and cancellation bookkeeping
+in each. Textual gives no forced single-threaded runtime guarantee and no
+guaranteed non-blocking IO of its own; nothing prevented a new push-based
+call site from hand-rolling its own variant, each a fresh place to get it
+wrong (see the `#5220` setup-reload diagnosability bug for a concrete
+instance).
+
+**`Inbox` (`picker_tui/inbox.py`) is now the only sanctioned way for a
+background thread to hand a UI update back to the render flow.** Any
+producer that spawns a thread or otherwise runs off the event-loop thread
+must address its result into a named slot -- `inbox.post(slot, value)` --
+never call `app.call_from_thread` (or hand-roll an equivalent wake) itself.
+The owning `PickerScreen` drains its `Inbox` once per render opportunity
+(`_tick`, and immediately on the `InboxUpdated` message the first post in a
+batch queues) and applies everything pending in **one batched pass** --
+multiple posts to the same slot between two drains coalesce to the single
+latest value, so a fast-moving producer never queues one apply per post.
+
+- **Why `post_message`, not `call_from_thread`.** Textual's own
+  `App.call_from_thread` *raises* `RuntimeError` when called from the app's
+  own event-loop thread (or before the app is running) -- a real footgun for
+  a primitive meant to be callable from anywhere, including synchronously
+  from a producer that sometimes short-circuits inline, or a unit test with
+  no running event loop at all. `MessagePump.post_message` is
+  unconditionally thread-safe and never raises on the caller's thread
+  identity, which is why `Inbox` uses it as its wake mechanism instead.
+- **The home-thread shortcut.** `Inbox` remembers the thread that
+  constructed it (normally the render/event-loop thread). A post from that
+  same thread drains and applies **immediately** rather than merely queuing
+  a wake -- nothing else is going to pump an event loop that may not even be
+  running, and there is no cross-thread race to guard against since this IS
+  that thread. This is what lets an inline/synchronous producer (and a
+  synchronous unit test) observe its own post take effect without a real
+  Textual app running.
+- **The `bool` wake-success contract.** `inbox.post()` returns `True` unless
+  a *needed* wake failed to deliver -- checking `post_message`'s own return
+  value (`False` on an already-closing/closed pump), not just whether it
+  raised. The value itself is never lost either way -- it stays in the
+  inbox for whatever next drains it -- but a caller with its own
+  diagnosability contract for "this update must become visible" (the
+  setup-reload worker's `#5220` fix) can use a `False` return to fall back
+  to a direct, off-thread diagnostic write, mirroring the one
+  narrowly-scoped, already-documented exception for a producer with no app
+  to post into at all. A caller that takes its own fallback this way must
+  also `inbox.discard(slot)` the posted value first -- otherwise a later,
+  unrelated drain would still pick it up and re-apply it against state the
+  fallback has since torn down.
+- **`background.run_background(...)`** wraps the common "spawn a worker
+  thread, post its outcome into the Inbox" shape (busy label, quiet mode,
+  cancellation via `_bg_cancel`, thread tracking via `_bg_threads`) so
+  `_run_bg` and similar call sites don't hand-roll it themselves.
+
+**Static enforcement.** `tools/check-picker-inbox-discipline.py` (AST-based,
+modeled on `tools/check-headless-launch.py`) scans every `picker_tui/*.py`
+file (except `inbox.py` itself, which IS the primitive) for a raw
+`call_from_thread(` call and fails the build if one is found, with an inline
+`# inbox-guard: allow <why>` escape hatch for a genuinely-intentional
+exception. It runs in CI and in the local pre-push hook alongside
+`check-headless-launch.py`.
+
+**Known remaining gap.** `engine_pivot_actions.py`'s
+`_run_task_action_progress()` still mutates a shared `prog` dict's keys
+(`pct`, `msg`, `done`, `error`) directly from its worker thread and relies on
+polling + GIL safety rather than routing through the `Inbox` -- a real, if
+lower-priority, violation of this invariant that predates `Inbox` and has
+not yet been migrated. Threading it through `Inbox` safely (without
+regressing the live progress-bar UI) is a tracked follow-up
+(`ThomasMichon/copilot-extensions#5343`), not something the static guard
+currently catches (it flags raw `call_from_thread`, not unmarshalled
+shared-state mutation).
 
 ## Session Lifecycle
 
@@ -266,7 +401,11 @@ If you add a blocking edge, add the equivalent offload + assertion.
 {project}                         # launch binstub
   |
   v
-launch-session.{ps1,sh}           # pre-flight update, venv activation
+launch-session.{ps1,sh}           # Worktree Manager launcher: pre-flight
+                                   # update, venv activation (agent-worktrees'
+                                   # own cmd_launch resolves this install
+                                   # live, or falls back to a direct, non-mux
+                                   # launch when Worktree Manager is absent)
   |
   v
 agent-worktrees resolve           # picker UI, worktree creation
@@ -309,10 +448,25 @@ integers allocated under the record lock determine ordering:
   asserted act, never inferred from liveness.**
 - **`SessionEntry.successor` / `predecessor`** — the durable **two-way chain**, so
   the lineage of sessions in a worktree is traversable in both directions.
+- **`SessionEntry.relation_revision`** — the last lifecycle revision that
+  changed this session's own binding, conclusion, head role, or lineage. It lets
+  reciprocal session projections reject stale out-of-order writers without
+  rewriting every historical session whenever an unrelated relation changes.
 - **`handoffs[]` / `handoff_counter`** — an incrementing ledger of handoff
   intents. Each entry has a stable external token, one predecessor, and an
   eventual exact successor. A new session can claim only the token it was given;
-  it never adopts "the newest pending handoff."
+  it never adopts "the newest pending handoff." Each entry also carries
+  **`live_cutover`** (default `False`): whether the opener intends the resident
+  status-monitor to auto-spawn a successor pane and retire the predecessor for
+  it. Recording a handoff at all (so lineage is trackable, and a
+  manually-consuming successor can later be promoted to head via
+  `link-succession`) must never by itself risk an unwanted automatic spawn — the
+  monitor's own spawn-eligibility gate
+  (`status_monitor_runtime._monitor_pending_handoff_request`) requires this
+  field to be `True`, not merely the entry's existence (context-handoff's
+  `mode: manual-only` vs `auto` maps directly to this flag, not to whether the
+  entry gets recorded at all — see the `context-handoff` plugin's own `triggerHandoff`
+  for the caller side).
 - **`head_transitions[]` / `lifecycle_revision`** — the authoritative,
   replayable changes to the current session. `head_session` and `head_revision`
   are materialized caches repaired from the highest valid transition revision.
@@ -356,6 +510,171 @@ session id across projects, and closes the latest open activation interval. It
 does **not** conclude the session or move the head: an exited session remains
 resumable until an explicit lifecycle transition says otherwise.
 
+### Reciprocal bound and controller projections
+
+Each session with a changed bound relation receives a versioned
+`agent-worktrees.json` sidecar in its exact Copilot session-state directory.
+The sidecar is a **rebuildable projection**, not another lifecycle authority. It
+contains the project/worktree identity, per-session relation revision, asserted
+lifecycle state, head role/revision, and predecessor/successor lineage already
+owned by the worktree record.
+
+Lifecycle changes mark only the sessions whose relation changed. After the
+authoritative YAML record is persisted, `save_record` flushes those exact
+session IDs through a sidecar-scoped cross-process lock and atomic replacement.
+An unrelated historical session is not rewritten when another session starts
+or hands off, which keeps hook cost and synchronized-session churn bounded by
+the changed relations rather than by worktree age.
+
+Projection persistence is fail-open: a missing session directory, unsafe
+link/reparse target, restored rescue marker, corrupt path, lock failure, or I/O
+error cannot roll back the authoritative lifecycle operation. Corrupt
+same-version JSON can be rebuilt from the record; an unsupported newer schema
+is preserved untouched. The current reader release accepts schema v2
+completeness metadata and compact tombstones while continuing to emit schema
+v1; encountering v2 on a write path is an explicit blocked projection update,
+never a downgrade. Exact session-directory identity rejects case-folded
+or short-name aliases as well as link/reparse escapes while accepting canonical
+extended Windows paths. Reads are capped before allocation, writes are
+deterministic and skip semantic no-ops, POSIX files and runtime directories are
+private, and temporary staging lives outside synchronized session directories.
+Additive unknown fields survive same-version relation updates. The writer reports
+`written`, `current`, `blocked`, or `deferred`; only deferred relations remain
+dirty for a later save retry, while a newer unsupported schema is deliberately
+blocked without repeated write attempts.
+
+Schema v2 requires explicit `history_complete`, `overflow`,
+`omitted_relations`, `tombstone_overflow`, `tombstone_sequence`, and
+`relation_tombstones` fields. Overflow uses `omitted_relations: null`; complete
+relation sets use zero. V2 tombstones are opaque
+`{key_sha256, relation_revision, sequence}` records. `key_sha256` is SHA-256 of
+the UTF-8 compact JSON array `[project,worktree_id,role]`, encoded with
+`ensure_ascii=true`, separators `(",", ":")`, and no trailing newline.
+`tombstone_sequence` is at least the maximum retained tombstone sequence.
+Readers validate these fields and expose relation-set and tombstone-fence
+completeness separately.
+
+Controller identity is a separate, bounded authority on `WorktreeRecord`.
+`controllers[]` holds at most 32 typed relations; each carries a worktree or
+session kind, source (`owner-ref`, `caller-worktree`, `parent-session`, or
+`explicit`), canonical ClaimRef when available, exact controller session ID
+when known, active/ended state, created/ended timestamps, and a per-relation
+revision allocated from the monotonic `controller_revision` counter. Active
+relations are protected by the bound; older ended history is displaced first.
+An explicit repair may remove a relation, but the nonzero record revision keeps
+retained legacy creation fields from recreating it on the next load.
+Malformed or future declared controller state is preserved opaquely across
+ordinary saves. Valid relations remain readable, but controller mutation is
+refused until an explicit repair can replace the unsupported authority.
+
+New records derive initial controller identity from the creation metadata they
+already receive. A qualified `owner_ref` is preferred, a same-worktree
+`caller_worktree` enriches rather than duplicates it, and `parent_session`
+supplies the exact session or stands alone for a caller outside any worktree.
+Legacy records retain their existing creation fields without deriving or
+persisting controller relations during ordinary reads or saves; explicit
+`backfill-sessions` or `doctor --fix` owns that later migration under the
+record lock. The migration derives only from the existing `owner_ref`,
+`caller_worktree`, and `parent_session` authority, leaves opaque or invalid
+controller metadata report-only, and retains the legacy fields for older
+readers.
+An empty controller model emits no new YAML and therefore preserves the legacy
+common-case bytes.
+
+When an exact controller session is known, only that session is marked dirty.
+After the child record persists, the writer upserts a `role=controller`
+relation into that exact session's sidecar, or retracts the relation after an
+explicit authoritative removal. The projection key includes the role, so one
+session can be bound to its own worktree while controlling several child
+worktrees without either relation replacing another. Ending a controller
+projects terminal state rather than changing binding. Removal leaves a bounded
+per-key revision tombstone in the sidecar, preventing a delayed older upsert
+from resurrecting the relation.
+
+Controller mutation helpers acquire the worktree record lock, reload the full
+authoritative record, allocate the next revision, and save that fresh object.
+This serializes concurrent controller changes without rolling back unrelated
+newer worktree state. The `save=False` form exists only for callers that already
+hold the same record lock through the final save.
+
+Controller metadata is additive on worktree JSON rows, `head-session`, and a
+worktree-scoped `list-sessions` envelope. Picker normalization passes it through
+but does not consult it for ACTIVE classification, resume targeting, occupancy,
+liveness, or the asserted head. Those surfaces also carry derived
+`controller_findings`: an exact controller session follows only explicit
+successor and handoff links to a unique active terminal session. Forks, cycles,
+missing records or session trees, concluded controllers without successors,
+unsupported schemas, and remote controllers remain explicit findings rather
+than guessed targets. A restored projection is usable only as a read-only hint:
+its exact session ID, unique bound project/worktree identity, relation revision,
+head revision, and known bound fields must match the current authoritative
+record. Foreign, stale, newer, colliding, or multiply-bound restored state stays
+an explicit report-only finding.
+
+Worktree JSON additionally carries one normalized `reciprocal_relation`
+presentation object. Its `binding` and `control` members remain orthogonal, so a
+worktree can be both locally bound and controlled from elsewhere without
+turning the controller into its head. The top-level presentation `state`
+summarizes `bound-here`, `controlled-elsewhere`, `handed-off`, `terminal`, or
+`ambiguous` (`unbound` is the legacy/no-relation baseline). Controller
+navigation actions name an exact project/worktree/machine target only when one
+active target is unambiguous; restored, unsupported, incomplete, stale, or
+unknown findings are inspect-only. This object is advisory display data: it
+does not change classification, liveness, occupancy, cleanup, or resume
+authority.
+
+Two detail surfaces expose the same authority for graph and visualization
+consumers without enlarging the Picker's hot list payload:
+
+- `worktree-lineage --worktree <id> --json` renders one bounded authoritative
+  record as sessions, head transitions, handoffs, controller relations,
+  normalized reciprocal state, exact-session projection health, and a graph.
+  Explicit forks, cycles, missing referenced sessions, and concluded terminal
+  chains remain findings rather than guessed edges.
+- `session-lineage --session-id <id> --json` reads only that exact session's
+  `agent-worktrees.json`, validates each retained relation against its
+  authoritative worktree record, and preserves restored provenance, tombstones,
+  unsupported/invalid state, and projection overflow. An incomplete projection
+  is never presented as the session's complete controller set. Embedded
+  worktree summaries mark presentation unevaluated rather than reading any
+  other session projection or misclassifying missing evaluation as ambiguity.
+
+Neither command enumerates the live session-state root. Corpus-wide graphing
+continues to consume synchronized session archives or an index produced during
+synchronization.
+
+The explicit `backfill-sessions` and `doctor` paths also audit known bound and
+controller relations by exact session ID. A per-run projection budget bounds
+the work. Local missing, stale, or corrupt same-version projections can be
+rebuilt with `--fix`; restored trees remain read-only even when their hints
+validate. Unsupported newer schemas and incomplete/overflowed, ambiguous,
+foreign, colliding, or newer projection state are never rewritten.
+
+When `sessionStart` cannot establish an authoritative binding from the launch
+binding, payload cwd, or mux ancestry, the existing registration context
+producer reads only that exact session's projection. `session-recovery` exposes
+the same bounded machine-readable report. Each projected relation must match a
+current authoritative record and its role-specific revision vector before it
+can produce a pointer. The result distinguishes bound-here, bound-elsewhere,
+handed-off, local/remote controller, terminal controller, ambiguous, foreign,
+stale, newer, invalid, and unsupported states. Recovery context never binds or
+mutates: it tells the session what to verify and which explicit action is
+appropriate.
+
+The resident session reconciler repairs missed sidecar writes through a
+separate fixed-budget queue. It acts only after a fresh mux catalog proves the
+child worktree has no mux and exact session-lock reads prove no bound Copilot is
+live. Each repair takes nonblocking record and sidecar locks, reloads the record,
+and compares lifecycle, head, and controller revisions before writing. Verified
+revision triples are remembered in a bounded cache, so current or permanently
+blocked projections quiesce instead of consuming every later tick. Immediate
+lifecycle writes remain the primary path; Picker/list demand starts the same
+resident monitor before its derived data is needed, so there is no independent
+scheduled reconciler competing for ownership while the machine is otherwise
+idle. Operators that need a low-duty backstop can schedule the bounded
+`reconcile-sessions` one-shot; it shares the resident reconciler and exits after
+one configured record/session/projection budget.
+
 Beyond the head bookkeeping, `register_session` also **re-seeds this session's
 mux status-bar updater** (`_spawn_status_updater` → a detached
 `status-updater` for `wt-<id>`). This is a best-effort, off-mux-safe side
@@ -388,6 +707,56 @@ error here — a mutation must not silently no-op. The live cutover opens the
 numbered handoff when the brief is stored, then the successor claims that exact
 token through `bind-session`; `link-succession` remains the explicit form for a
 caller that already holds both ids.
+
+**Safe terminal worker interface — `conclude-disposable`.** A higher layer that
+explicitly owns a disposable CLI worker class can conclude the exact recorded
+allocation and optionally request exact-id managed teardown:
+
+```bash
+agent-worktrees conclude-disposable \
+    --worktree <exact-id> \
+    --session <exact-session-id> \
+    --policy disposable-cli \
+    --owner <allocator> \
+    --remove \
+    --json
+```
+
+The command accepts only an exact worktree id and the explicit
+`disposable-cli` policy. It first preserves any live mux or bound Copilot
+session. Once the worker is gone, it requires the supplied session to match the
+worktree's asserted lifecycle head when one exists. Preservation gates run
+before that exact session is concluded, so a skipped worktree remains fully
+resumable. The checkout is then inspected under the shared worktree lifecycle
+lock. The short acquisition wait is separate
+from the stale-lock age, so contention skips rather than breaking a healthy
+longer-running lifecycle operation. Pending handoffs, follow-ups, resource
+obligations, pairs, open pull requests, branch drift, arbitrary dirty paths,
+and local commits all produce structured skip reasons and remain untouched,
+including generated overlays. A clean branch with zero commits ahead of the
+configured upstream may remain behind without being rewritten.
+Repository resolution uses the record and the legacy/default fallback; a truly
+unknown repository is held. If the checkout directory is
+already absent, any surviving local branch is still compared with its configured
+upstream and preserved when it contains unique commits.
+
+A successful conclusion converts the record to a managed, final CLI worker.
+Without `--remove`, it returns for a later managed-GC pass. With `--remove`, it
+invokes that same managed-worktree sweep for only the exact id with zero idle
+grace. The sweep independently re-checks final/unused state, live
+session/mux/attachment, follow-up, activity knowledge, and idle grace. CLI
+embodiment and final managed removal share the repository lifecycle fence. The
+managed terminal record rejects late session registration, disposition changes,
+and new resource claims before removal; Picker reconciliation also leaves that
+terminal tombstone intact.
+The final decision holds the record lock only for its metadata recheck, then uses
+non-forced Git removal so a concurrently dirtied checkout is preserved. Lock
+wait diagnostics use stderr and therefore never corrupt JSON command output.
+Managed removal resolves each record's own repository, verifies the observed
+branch and HEAD before reconciliation, and deletes the final branch ref only
+with its expected old object id. It retains the tracking record if Git worktree
+or branch removal fails, so cleanup remains retryable rather than converting a
+failed removal into an invisible orphan.
 
 **Cross-layer read interface — `agent-worktrees head-session`.** Because a
 higher layer (agent-bridge, context-handoff) runs in its *own* venv and cannot
@@ -475,6 +844,14 @@ containers, bridge sessions) so finalizing never orphans unfinished work. (Effor
   cross-machine visibility — populated by the resource plugin at settle/release
   (agent-codespaces at clean disconnect → `at-rest`) and read back by the reclaim
   sweep.
+- **`session` claims are advisory, not gating (Phase 8, session-claim
+  lifecycle).** `register_session`/`deregister_session` journal a `kind ==
+  "session"` claim for the worktree's own live Copilot session, but this kind
+  is explicitly excluded from the hard-blocking `unsettled` computation in
+  `_assert_obligations_settled` — a live session never blocks finalize.
+  `validate_and_finalize` settles the invoking session's own claim to
+  `at-rest` before the gate runs, and `_advise_other_live_sessions` warns
+  (never blocks) about any OTHER live session claim in the same worktree.
 - **The gate is cheap + local + enforcing by default.** It reads only the owner's
   own `record.resources` for `is_unsettled` claims — O(claims), no traversal — and
   runs **before any destructive step**. `obligations.gate_mode()`
@@ -521,7 +898,188 @@ my-project --recovery   # Linux/WSL (also accepted on Windows)
 Skips vault credential loading for debugging broken bootstrap
 infrastructure.
 
+### Handoff cutover lifecycle: the 13-stage trace
+
+A handoff cutover (a worktree's Copilot session replaced by a successor
+without losing the operator's place) crosses `context-handoff` (arms the
+handoff), the resident status monitor (claims, spawns, and retires panes),
+and the mux/launcher layer -- three components, none of which alone can
+answer "what actually happened, in order, for this worktree?" (effort
+`handoff-cutover-lifecycle-journal`). `activity.py` defines a canonical
+13-stage vocabulary (`HANDOFF_STAGE_MAP`) layered on top of the existing wire
+event names, so no event was renamed:
+
+| # | Stage | Emitted by |
+|---|---|---|
+| 1 | `worktree_created` | `cmd_create` |
+| 2 | `mux_session_assigned` | `mux_attached` (launcher) / `mux_new_session`/`mux_new_window` (programmatic cutover) |
+| 3 | `copilot_invoked` | the setup launcher's final exec point, **or** `copilot_invocation_attempted` for config-driven/legacy setup paths that never reach that emitter (a coarser mark that does not itself prove Copilot was actually invoked) |
+| 4 | `session_start_bound` | `cmd_register_session` (sessionStart) |
+| 5 | `status_reported` | the first status-report write in a session |
+| 6 | `handoff_triggered` | context-handoff's `trigger_handoff` |
+| 7 | `handoff_host_acknowledged` | the status monitor's claim, gated to `outcome="acquired"` only |
+| 8 | `handoff_successor_spawn_started` | emitted before success/failure is known, so a killed spawn still leaves a trace; the terminal outcome stamps a distinct event name at the same stage -- `handoff_cutover_spawn` on success, `handoff_successor_spawn_failed` on failure |
+| 9 | `handoff_successor_session_start_bound` | the successor's own sessionStart |
+| 10 | `handoff_successor_claimed` | the successor declares itself new head |
+| 11 | `handoff_pickup_confirmed_predecessor_closing` | the predecessor retire path, gated to `outcome="gone"` only, **or** the successor-link path's own direct emission of this event name (ungated) |
+| 12 | `session_end_bound` | the predecessor's sessionEnd |
+| 13 | `handoff_complete` | the runner's final confirmation |
+
+Stage 7 is gated: `handoff_cutover_claim` only stamps `stage`/`stage_name`
+when `outcome="acquired"` -- a duplicate/failed claim attempt is recorded as
+its ordinary event but never misrepresented as that stage's success. Stage
+11 has two distinct emitters with different gating: `handoff_predecessor_retire`
+is gated to `outcome="gone"` only (a retire that left the pane running,
+`outcome="left-running"` or `"identity-mismatch"`, is recorded but not
+stamped as stage 11), while `handoff_pickup_confirmed_predecessor_closing`
+is a separate, ungated event emitted directly by the successor-link path
+and always stamps stage 11 when it fires.
+
+**Two stores, two lifetimes.** Every stage-mapped `log_event()` call writes
+to the machine-global rolling `activity.jsonl` (7-day retention, see
+`activity.py`); a record that actually gets stamped with `stage`/`stage_name`
+also write-throughs, best-effort, to `handoff_trace.py`'s durable,
+per-project/per-worktree, lock-guarded store at
+`~/.agent-worktrees/logs/handoff-traces/<project>/<worktree-id>.jsonl` --
+namespaced by project because worktree ids are only unique within one
+project. The write-through only fires when an active project and worktree
+id are resolvable at call time *and* the event was actually stamped -- a
+gated attempt (`handoff_cutover_claim` with `outcome != "acquired"`,
+`handoff_predecessor_retire` with `outcome != "gone"`) never carries a
+`stage` field, so it lands in `activity.jsonl` only and is lost once that
+rolling log rotates past it; an ambient context with no resolved project/
+worktree id likewise records `activity.jsonl` alone. The durable store is
+exempt from the rolling log's retention window for events that *do* reach
+it, so a slow-to-audit handoff's successful stages can still be re-traced
+after `activity.jsonl` has rotated past its stage-1 event -- but a gated
+failure/retry signal (already-claimed, left-running, identity-mismatch)
+is not among them. `remove_trace()` deletes a worktree's file when its
+tracking record
+is removed, so a reused worktree id never inherits a stale predecessor's
+trace.
+
+**Diagnosing a stuck cutover today.** `agent-worktrees handoff-trace
+<worktree-id|session-id> [--project <name>] [--token <handoff-token>]`
+now renders the ordered 13-stage sequence from the durable
+`handoff_trace.read_trace()` store, falls back to `activity.jsonl` for
+recent events, and visibly marks missing stages. It also surfaces
+`predecessor_session_id` / `successor_session_id` from the surviving
+session-state `handoff-request.json` records when those records still
+exist. The broader "write a full `handoff-trace.jsonl` into both session
+folders" archive embellishment remains deferred; the durable per-worktree
+trace is the archival source of truth today. Alongside it, these commands
+are safe to reach for immediately:
+
+- `agent-worktrees handoffs-check [--worktree-id <id>|--all] [--execute] [--json]`
+  -- diagnoses (and, with `--execute`, retires) an unretired handoff: a
+  spawn is recorded with no matching successful `handoff_predecessor_retire`
+  event (`_pending_handoff_retire_requests` accepts either
+  `handoff.successor` -- linked/authoritative -- or `handoff.candidate` --
+  sessionStart-associated but the handoff still pending -- so this also
+  catches one that should retire before the cutover is fully linked, not
+  only a fully confirmed one). **The read-only report does not itself check
+  whether the pane is still alive** (no `_mux_pane_alive()` call in the
+  finding path) -- it reports every unretired-per-the-log case as a
+  candidate, including one where the pane already exited or was removed
+  without that event ever being logged; `--execute` is what actually
+  attempts the live retirement (using the resident monitor's own
+  choreography, which does check liveness) and is the step that resolves
+  whether a reported finding was real. Read-only without `--execute`. **It
+  does not diagnose a host acknowledgement with no successor pane at all**
+  (no `handoff_cutover_spawn` was ever recorded for the token) -- that "ack
+  but no pane" case has no dedicated diagnostic yet.
+- `agent-bridge handoff-check [--worktree-id <id>|--all] [--execute] [--json]`
+  -- a thin passthrough that shells out to `agent-worktrees handoffs-check`,
+  forwarding `--execute` the same way; only usable when `agent-worktrees` is
+  also resolvable on `PATH` (it fails closed with a clear error otherwise --
+  `agent-bridge` alone does not implement the check/repair logic itself).
+  **No usable project-scoping path for a neutral-CWD caller.**
+  `agent-bridge`'s top-level parser rejects an *explicit* `--project` for
+  `handoff-check` outright (`_guard_project_scope`: only `agents`, `create`,
+  `machines`, and `send` consume that flag) unless it was injected by the
+  `<repo> <slug>` router; and even a router-injected value is never
+  forwarded to the child `agent-worktrees handoffs-check` invocation (which
+  does have its own global `--project`/`-p`, but only when it precedes the
+  subcommand on *that* command line). From a neutral daemon CWD unrelated to
+  the target project, invoke `agent-worktrees handoffs-check --project
+  <name> ...` directly instead -- `agent-bridge handoff-check` cannot be
+  scoped that way.
+- `health.find_orphaned_handoffs()` already flags "claimed but no live
+  successor pane" as a class of bug; feeding it from the durable trace so it
+  can name the *exact* stalled stage (rather than just flagging that one
+  exists) is also open follow-on work.
+
+## PR Attribution & Codenames
+
+**The problem.** A PR opened by an agent needs a way for its own author, or
+an unrelated maintainer, to trace it back to the worktree that produced it --
+useful for resuming a stalled PR, or diagnosing one that looks abandoned. But
+a public repo cannot publish raw machine names, worktree ids, or session ids
+in PR bodies or branch names -- that's facility-internal topology leaking into
+a shared codebase. The system resolves this tension with a **hidden PR
+marker** whose content is governed by the `pr.source_attribution` config key,
+plus a `codename` -- a random, public-safe label assigned to every worktree at
+creation time -- as the informationless-by-decoding handle that marker can
+safely carry.
+
+**Three modes**, set via `pr.source_attribution` (full field-level detail:
+`docs/config-reference.md`):
+
+- **`"codename"` (default, codename-attribution-by-default).** `create-pr`
+  embeds `<!-- agent-worktrees:source codename=<name> -->` and nothing else
+  -- no machine, worktree id, session id, or SHA. The marker decodes to
+  nothing on its own; it is only useful as a lookup key back into the
+  *originating* machine's own tracking store, via `resolve --codename` or
+  `embody --codename`. This is the right default for any repo whose PRs are
+  visible outside the facility.
+- **`true` (raw marker).** Embeds the full raw identifiers (worktree id,
+  machine, session, head SHA) directly in the hidden marker. Closed-circuit
+  systems only -- never a public repo.
+- **`false` (anonymous opt-out).** No marker at all.
+
+**Resolution path.** `resolve --codename <name>` and `embody --codename
+<name>` both resolve **locally first** (the codename is looked up in this
+machine's own tracking store), then fall back to an **automated
+cross-machine SSH scan** (effort `pr-attribution-codenames` Phase 3): every
+other known, SSH-reachable machine is asked over SSH whether its own
+tracking store recognizes that codename. A match on a different machine
+**fails closed** -- it reports which machine and worktree id own the
+codename rather than attempting a remote launch itself; resuming from there
+means SSHing to that machine directly (or, in the future, an agent-bridge
+dispatch).
+
+**Accepted threat-model tradeoff.** The codename mode is
+informationless-by-decoding, not unlinkable: the *same* codename recurring
+across multiple PRs from the same worktree is still a correlatable signal to
+an outside observer, even though no single marker decodes to anything on its
+own. This is a deliberate, accepted tradeoff for the coverage the mechanism
+buys -- not a gap to close.
+
+**Branch-name leak class.** The hidden marker isn't the only surface that can
+leak a private identifier -- the PR head's branch name is public too.
+Whenever `source_attribution` isn't exactly `true`, `create-pr` hard-blocks
+(never just warns) publishing a branch name that embeds the raw worktree id
+or machine name; `attribution-audit` checks a repo's configured
+`head_pattern` for this risk ahead of time. See `docs/config-reference.md`
+(`head_pattern`, `source_attribution`) and `docs/cli-reference.md`
+(`resolve`, `embody`, `create`, `list`) for the field- and flag-level
+detail -- this section only covers the mechanism's shape, not its full
+surface. The `worktree` skill's `references/pr-attribution.md` covers the
+consumer-facing how-to, including the maintainer/reviewer path for tracing
+an unfamiliar PR that isn't its own author.
+
 ## Terminal Integration
+
+The interactive mux launch scripts and their per-session terminal-integration
+scripts relocated to Worktree Manager's `bin/` in Phase 3b Sub-slice 2a Step 2
+(efforts/active/worktree-manager-control-plane/phase-3b-mux-relocation.md).
+agent-worktrees' **normal mux path** resolves that install live and no longer
+ships or deploys its own copies there; the only packaged exception is the
+Python-only non-editable fallback installer, whose release/preview payload
+materializes a small manifest-declared copy set under `plugins/agent-worktrees/bin/`
+so `deploy_wrappers()` stays self-contained when Worktree Manager is absent.
+A `tabby-template.yaml` profile is the only always-deployed file remaining
+here outside that packaged fallback.
 
 | File | Platform | Description |
 |------|----------|-------------|
@@ -529,7 +1087,7 @@ infrastructure.
 | `apply-mux-keybinds.sh` | Linux/WSL | **Opt-in** server-global tmux tuning (keystroke passthrough + `escape-time`); run by the user or a machine-restore flow |
 | `session-options.ps1` | Windows | Per-session psmux options the launcher stamps onto each session (status bar + behaviors); replaces a global `~/.psmux.conf` |
 | `apply-mux-keybinds.ps1` | Windows | **Opt-in** server-global psmux tuning (keystroke passthrough); run by the user or a machine-restore flow |
-| `tabby-template.yaml` | Linux | Tabby terminal profile template |
+| `tabby-template.yaml` | Linux | Tabby terminal profile template (still deployed by agent-worktrees) |
 
 The Windows installer generates **Windows Terminal fragments** at
 `%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\AgentWorktrees\`
@@ -559,7 +1117,34 @@ self-update and a plugin reconcile. This path is deliberately lightweight -- it
 only touches agent-worktrees -- so it is **not** relied on to fully update
 sibling plugins or modules.
 
-Skip with `--no-update` or `WORKTREE_NO_UPDATE=1`.
+Skip with `--no-update` or `WORKTREE_NO_UPDATE=1`. The Picker reports
+**Updates paused** for that launch and suppresses the refresh action, regardless
+of a shared staged-update status written by another launch.
+
+### Optional Machine Settings Reconciliation
+
+Before a fresh Copilot process starts, the launch wrapper opportunistically
+resolves the public `agent-machines` command. When available, it runs:
+
+```text
+agent-machines restore --all-projects --only copilot.settings --apply --json
+```
+
+This restores the machine-wide union of adopted Copilot settings immediately
+before Copilot reads them, including model, effort, and context preferences
+that the CLI may periodically clear. The sibling plugin remains optional:
+launch proceeds unchanged when `agent-machines` is not installed. A present
+provider that fails aborts launch rather than silently starting with drifted
+settings.
+
+Every resolved command is prefixed by an installed pre-exec wrapper, so
+explicit templates, legacy setup scripts, normalized launches, interactive
+sessions, and direct agent-bridge launches share the same seam. The normalized
+default setup also sources the helper for callers that invoke it directly. A
+process-scoped marker inherited by child processes prevents duplicate
+reconciliation. Reattaching to an existing mux session does not execute the
+command and therefore does not reconcile. Recovery mode bypasses
+reconciliation so a broken sibling provider cannot lock out repair sessions.
 
 During an interactive launch the join + apply prints a **status line at each
 waiting step** (joining the background download — the up-to-90s step most
@@ -600,6 +1185,9 @@ The in-plugin flow:
 
 1. Pulls the agent-worktrees marketplace payload.
 2. Refreshes **every** registered plugin payload (incl. payload-only plugins).
+   After an authoritative catalog refresh, it uninstalls inactive installed
+   identities that no longer exist in that marketplace. Active or
+   activation-unknown identities remain fail-closed and are never purged.
 3. Deploys the agent-worktrees runtime installer.
 4. Updates sibling modules listed in `modules.json` (`agent-bridge` today).
 5. Reconciles registered runtime plugins not covered by the module/self steps.
@@ -613,6 +1201,47 @@ unknown deployed version (no `deploy-manifest.json`) always re-deploys, so a
 stale runtime is never left behind. Pass `--force` to re-deploy every runtime
 unconditionally.
 
+### Version-cutover reap and live-launcher protection
+
+A version bump publishes a fresh `~/.agent-worktrees/versions/<v>` slot and
+calls `status-monitor-restart` (`_restart_status_monitor`) from that new
+slot's interpreter. Alongside reaping the singleton status-monitor's own
+known pid, this calls `stale_runtime_reap.reap()`, which terminates **every
+process on the machine** whose resolved executable is still under a
+superseded `versions/<old>` slot (`procs.terminate_processes_under_executable`).
+This exists to catch a one-shot CLI verb invocation (`list --json`, `status
+--json`, ...) that wedges on a lock/IPC call and never exits on its own
+(#4268 observed 18 such orphans for a single project over roughly two
+hours) -- there is no per-invocation self-check, only this cutover-time
+sweep.
+
+That sweep is unconditional and machine-wide, which also makes it a hazard
+for anything else still legitimately running under the outgoing slot at the
+wrong instant: a live worktree launcher (`launch-session.ps1`/`.sh`)
+repeatedly shells out to short-lived `agent_worktrees
+resolve`/`activity-log`/`get` subprocesses throughout an interactive
+session, and any one of those can be caught mid-flight by a cutover
+triggered by a completely different, concurrent launch's own self-update
+(#4454). `launch_registry` closes that gap: each launcher registers its own
+root pid (one provable-liveness lock file per `(worktree_id, pid)` pair,
+reusing `locks.py`'s pid + start-time token) as soon as it knows its
+worktree id, via `agent-worktrees register-launch` -- called synchronously,
+not the detached `activity-log` pattern, since the write must complete
+before any later subprocess call in this run could become a reap target.
+The reap forwards `launch_registry.active_launch_pids()` to
+`terminate_processes_under_executable` as `protect_ancestors`: a candidate
+descended from a registered, still-live root is skipped.
+
+Protection is **bounded, not indefinite**: `procs.process_age_seconds()`
+(via `GetProcessTimes`/`GetSystemTimeAsFileTime` on Windows, `/proc/<pid>/stat`
++ `/proc/uptime` on posix) gates the exclusion at
+`_PROTECT_ANCESTOR_GRACE_SECONDS` (120s). A descendant older than that reads
+as genuinely stuck -- the exact #4268 case -- and is reaped regardless of
+its ancestor, so this protection cannot reintroduce the orphan-accumulation
+bug it sits next to. An unmeasurable age fails closed (no protection):
+protection is the exception path, so failing to prove "still fresh" must
+never grant it.
+
 ### Version Checking
 
 All three version sources must agree:
@@ -623,7 +1252,7 @@ All three version sources must agree:
 | `pyproject.toml` | Runtime `--version` output |
 | `.github/plugin/marketplace.json` | GitHub-hosted marketplace catalog |
 
-See [CONTRIBUTING.md](../../../CONTRIBUTING.md) for versioning details.
+See [docs/pipelines.md](../../../docs/pipelines.md) for versioning details.
 
 ## Picker Pivot Registry (Cross-Plugin)
 
@@ -638,14 +1267,19 @@ setuptools entry-points do not cross venvs; a **filesystem manifest registry**
 does.
 
 ```
-~/.agent-worktrees/pivots/<name>.json     # one manifest per contributed pivot
+<plugin_root>/pivots/<name>.json          # the contributing plugin's own template
     { "label": "Tasks", "after": "Worktrees",
       "list": ["agent-dispatch", "inbox", "--machine", "{machine}"],
       "entry":   { "id": "id", "title": "title",
                    "worktree": "target_worktree", "badges": ["labels"] },
       "actions": [ { "label": "Abandon", "run": ["agent-dispatch", "abandon",
                      "{task_id}", "--permit"] }, ... ] }
+
+~/.agent-worktrees/pivots/<name>.json     # the materialized shared-registry pointer
+    { "schema_version": 3, "plugin": "agent-dispatch@copilot-extensions",
+      "plugin_root": "<plugin_root>", "template": "<name>.json" }
 ```
+
 
 - **Discovery and reconciliation** (`picker_tui/pivots.py`): one classifier
   scans the directory at startup (and on `r`-refresh), validates every external
@@ -657,15 +1291,27 @@ does.
 - **Attributed materialization** (`ensure_pivots`, #2180): before runtime
   discovery, agent-worktrees resolves plugins that are currently enabled
   globally or in an adopted project, verifies one current root, and reads each
-  root's shipped `pivots/*.json` template. It publishes a schema-v2 runtime
-  manifest containing `plugin`, `plugin_root`, and `template`, with command
-  targets resolved to canonical absolute paths. Cached installed payloads alone
-  are never authority. Publication is append-only and exclusive-create: an
-  existing file is never replaced, and a changed template gets a deterministic
-  fingerprinted sibling. Routine discovery never deletes registry files.
+  root's shipped `pivots/*.json` template. It publishes a schema-v3 **pointer**
+  runtime manifest containing only `schema_version`, `plugin`, `plugin_root`,
+  and `template` -- deliberately no baked `list`/`actions` content. Every scan
+  re-reads the template fresh from the identity-verified `plugin_root` and
+  re-resolves its commands to canonical absolute paths, so an ordinary
+  template-content or plugin-version-directory change needs no on-disk
+  rewrite of the pointer at all in the common case, and there is exactly
+  **one** file per plugin+template, never a fingerprint-suffixed duplicate.
+  Cached installed payloads alone are never authority. Publication is
+  exclusive-create when the slot is empty, or an atomic in-place refresh when
+  the existing file already self-identifies (via its own `schema_version`
+  and `plugin`/`template`) as our own prior artifact; an operator-authored
+  file, or one belonging to a different plugin/template, is never touched.
+  Routine discovery never deletes registry files. (Schema-v2, the superseded
+  fully-baked-manifest shape that this replaced, is still recognized
+  read-only as a migrating advisory entry so pre-existing on-disk files decay
+  gracefully instead of breaking outright.)
 - **Compatibility and diagnostics.** Known schema-v1 suite manifests remain
   active only while their contributing plugin is enabled and identity-verified,
-  with a `legacy-unattributed` advisory. Unknown schema-v1 manifests retain
+  with a `legacy-unattributed` advisory; schema-v2 (superseded fully-baked)
+  manifests are treated the same way. Unknown schema-v1 manifests retain
   compatibility as report-only unknown legacy entries; unversioned manifests
   are operator-owned. Operational warnings are capped and fingerprint-
   deduplicated. `agent-worktrees doctor [--json]` reports the same classifier's
@@ -682,6 +1328,13 @@ does.
   pulls id/title/subtitle/badges out of each. This is graceful-capability-scaling
   in practice: adopt more of the fabric, get more pivots; adopt less, and the
   picker is never burdened by a pivot for a layer you don't have.
+- **Configuration-gated visibility.** A list pivot may declare
+  `visible_when.state_root_file` with a safe relative path. The host resolves the
+  state root at most once per discovery pass, performs only a local file
+  existence check, and omits the pivot until that file exists. Ungated pivots do
+  not resolve the state root at all. This lets a plugin stay installed and
+  enabled while its specialized UI remains absent for operators who have not
+  configured it, without executing providers during tab discovery.
 - **Data + actions** (`picker_tui/tasks.py`): the validated `list` command is run
   as a **subprocess** on a background thread, cached per
   machine, and expected to print a JSON array. `actions` argv templates are run
@@ -1555,10 +2208,9 @@ tracked the manual `sel` cursor. NF5-5 replaces it with a genuine native
 `OptionList` -- built the same swap-behind-a-toggle way NF1-NF5 were, so it can be
 soaked before it becomes the default.
 
-- **Toggle.** `AGENT_WORKTREES_PICKER_NATIVE_LIST` (default OFF). `compose()` yields
-  `_PickerNativeData` (an `OptionList` subclass) in place of the text-line
-  `_PickerBodyData` for the `nf-body-data` region; default OFF keeps the text-line
-  body authoritative (golden byte-identical, full suite green).
+- **Historical toggle.** During the soak this shipped behind an opt-in
+  environment toggle, swapping `_PickerNativeData` (an `OptionList` subclass)
+  in place of the text-line `_PickerBodyData` for the `nf-body-data` region.
 - **Options from the same rows.** `_PickerNativeData` builds its options from a new
   `_build_data_vrows(width, sel)` (data-only -- it renders no chrome, so it never
   drives `build_chrome`/`tab_bar` before `setup()`), passing a *sentinel* sel so the
@@ -1585,9 +2237,8 @@ soaked before it becomes the default.
   soaked, later slices port sections/multiselect/pulse and flip the default.
 
 **NF5-5 slice 2 -- byte-identical grid parity + width fix.** A parity pass
-(`test_native_list_grid_parity`) captures the home screen with the native list OFF
-(text-line) and ON (OptionList) and asserts the normalized character grids are
-**identical** -- and equal to the golden. It surfaced one real bug: the native
+captured the home screen in both implementations and asserted the normalized
+character grids were **identical** -- and equal to the golden. It surfaced one real bug: the native
 options were first built at the `size.width or 100` *fallback* (the screen wasn't
 sized yet) and never rebuilt at the real width, so the full-width section rules were
 100 cols vs 118. Fixed by adding `size.width` to the rebuild **signature** and
@@ -1611,18 +2262,15 @@ native behaviours to weigh at the flip: single-click **activates**
 (native select) vs the text body's select-then-double-click, and arrow-up from the
 top data row stays in the list (Tab reaches the chrome) rather than crossing up. Per-row **checkboxes are now always shown** (`WorktreesView.build_data` no longer hides the glyph until multi-select is active) -- with mouse support the box is a discoverable, clickable multi-select affordance at rest; the golden was regenerated and parity holds (both bodies share `build_data`). In the native list those checkboxes are also **clickable** (#88 NF5-5): a mouse press in the 2-cell gutter toggles that row's multi-select (`_on_mouse_down`) and suppresses the ensuing activation, while a click on the row body activates -- so single-click still opens a row, and the gutter is the mouse multi-select affordance (`test_native_list_checkbox_click_toggles`).
 
-**NF5-5 flip -- native list is the default.** `_native_list_enabled()` now defaults
-**ON**: `PickerScreen` composes `_PickerNativeData` (native focus/cursor/scroll/click,
-sticky section header, clickable checkbox gutter) for the data region unless
-`AGENT_WORKTREES_PICKER_NATIVE_LIST` is falsey (the rollback hatch -> the legacy
-text-line `_PickerBodyData`). Because the native list was built to byte-identical grid
-parity, the flip is seamless: the full suite is green in the default (native) mode
-(1719). The forced-ON parity run surfaced the exact test migration -- eight tests: the
-text-line-specific NF3/NF4/compose tests pin `NATIVE_LIST=0` (they still validate the
-opt-out body), the tasks/registered tests gained an explicit `refresh()` (the native
-list rebuilds on refresh, where the text-line body always re-rendered) and the rebuild
-signature became pivot-aware (tasks/maintenance row counts), the "disabled by default"
-test became `test_native_list_default_with_opt_out`, and `on_option_list_option_highlighted`
-now ignores highlight events fired while the list isn't focused (so a modal close can't
-clobber a programmatic `sel`). The text-line body remains as the opt-out until it is
-retired.
+**NF5-5 flip -- native list became the default.** Once parity was proven, the
+native body became the standard render path: `_PickerNativeData` owns focus,
+cursor, scroll, sticky section headers, and clickable checkbox gutters. The
+temporary rollback hatch and the legacy text-line body were later retired when
+the Picker moved to `worktree-manager/`.
+
+> **Retirement note (Phase 6).** These NF sections remain as the design record
+> for the original bundled Picker implementation. The canonical Picker code now
+> lives in `worktree-manager/src/worktree_manager/production_picker/picker_tui/`,
+> and the bundled `plugins/agent-worktrees/src/agent_worktrees/picker_tui/`
+> package was deleted after parity landed. agent-worktrees now owns only the
+> engine boundary and the non-UI support primitives.

@@ -3,9 +3,9 @@
 Unlike :mod:`agent_dispatch.bridge` (which spawns a *headless* agent-bridge ACP
 worker), this spawns a durable, **CLI-backed autopilot** session in a fresh
 parallel worktree on the same machine via ``agent-worktrees embody``. The
-embodied Copilot launches with ``--allow-all-tools`` (tools auto-approved -- no
-per-tool confirmation prompts), claims and starts the task, works it
-autonomously, and marks the task ``completed`` **explicitly** only when it judges
+embodied Copilot launches with ``--allow-all --experimental`` (all prompts
+auto-approved, and SDK extensions allowed to load), claims and starts the task, works it
+autonomously, and marks the task ``submitted`` **explicitly** only when it judges
 the goal reached -- *deferred completion*, never stamped at spawn or pickup.
 
 agent-dispatch stays decoupled: it shells out to the ``agent-worktrees`` runtime
@@ -13,6 +13,12 @@ agent-dispatch stays decoupled: it shells out to the ``agent-worktrees`` runtime
 on PATH) and degrades gracefully (the caller falls back to the bridge backend,
 or leaves the task queued) when it is not -- so the plugin remains standalone on
 a host without agent-worktrees.
+
+The two autopilot seed-prompt builders (``autopilot_worker_prompt``,
+``fleet_autopilot_worker_prompt``) live in :mod:`agent_dispatch.embody_prompts`
+(componentization: this module was over the repo's module-size cap) and are
+re-exported here under their original names, so every existing call site is
+unaffected.
 """
 
 from __future__ import annotations
@@ -22,9 +28,32 @@ import shlex
 import shutil
 import subprocess
 
-from .procutil import agent_worktrees_launch_prefix, no_window_kwargs
+from . import bridge_remote, worktree_attribution
+from .embody_prompts import autopilot_worker_prompt, fleet_autopilot_worker_prompt
+from .procutil import (
+    agent_worktrees_environment,
+    agent_worktrees_launch_prefix,
+    no_window_kwargs,
+    run_ssh_command,
+)
 
 DEFAULT_DRIVER = "agent-dispatch"
+
+#: Tracking statuses meaning a worktree is done and cannot be reused.
+_TERMINAL_WORKTREE_STATUSES = frozenset(
+    {"finalizing", "finalized", "complete", "completed", "orphaned", "terminal"})
+
+
+class EmbodyUnavailable(RuntimeError):
+    """Raised when the ``agent-worktrees`` CLI is unavailable or indeterminate."""
+
+
+class WorktreeNotFound(EmbodyUnavailable):
+    """Raised when agent-worktrees positively confirms a worktree is absent."""
+
+
+class DisposableConclusionError(RuntimeError):
+    """Raised when safe terminal conclusion cannot be executed."""
 
 
 def project_for_task(task: dict) -> str | None:
@@ -77,14 +106,220 @@ def parse_handle(result: subprocess.CompletedProcess) -> dict[str, str | None]:
         or (data.get("worktree") if isinstance(data.get("worktree"), str) else None)
         or launch.get("worktree_id")
     )
-    handle["session"] = (
-        data.get("session_id") or data.get("session") or launch.get("session")
-    )
+    handle["session"] = data.get("session_id") or data.get("session") or launch.get("session")
     return handle
 
 
-class EmbodyUnavailable(RuntimeError):
-    """Raised when the ``agent-worktrees`` CLI is not available on this host."""
+def create_worktree(
+    *,
+    project: str | None = None,
+    interface: str = "cli",
+    task_id: str,
+    reservation_key: str,
+    attempt: int,
+    driver: str,
+    supervisor: str,
+    timeout: float | None = None,
+    agent: str | None = None,
+    no_pair: bool = False,
+) -> dict[str, str | None]:
+    """Create a worktree without launching Copilot and return its id/path.
+
+    This is the first half of create -> record -> spawn -> bind. Capturing the
+    worktree id before any Copilot/ACP setup means a failed or hung launch still
+    leaves the host with a durable worktree binding to retry or inspect.
+
+    ``no_pair`` opts THIS worker out of the paired-knowledge carve regardless
+    of origin -- for a registrar/pool declaration (``body.no_pair``) whose
+    workers have no bound knowledge repo to be given (see
+    ``agent-worktrees create --no-pair``).
+    """
+    exe_prefix = _agent_worktrees_launch_prefix()
+    if exe_prefix is None:
+        raise EmbodyUnavailable("agent-worktrees CLI not found on PATH")
+    cmd = list(exe_prefix)
+    if project:
+        cmd += ["--project", project]
+    # Keep the CLI interface required by disposable conclusion; delegated
+    # creation provenance alone hides this worker checkout from the Picker.
+    cmd += [
+        "create",
+        "--no-owner",
+        "--origin",
+        "delegate",
+        "--interface",
+        interface,
+        "--dispatch-task-id",
+        task_id,
+        "--dispatch-reservation-key",
+        reservation_key,
+        "--dispatch-attempt",
+        str(attempt),
+        "--dispatch-driver",
+        driver,
+        "--dispatch-supervisor",
+        supervisor,
+        "--json",
+    ]
+    if agent:
+        cmd += ["--agent", agent]
+    if no_pair:
+        cmd.append("--no-pair")
+    result = subprocess.run(  # noqa: S603 -- fixed argv, launcher resolved locally
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=agent_worktrees_environment(),
+        **no_window_kwargs(),
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise EmbodyUnavailable(detail or f"agent-worktrees create exited {result.returncode}")
+    handle = parse_handle(result)
+    try:
+        data = json.loads(result.stdout or "{}")
+    except (ValueError, TypeError):
+        data = {}
+    worktree = data.get("worktree") if isinstance(data, dict) else {}
+    if isinstance(worktree, dict):
+        handle["worktree"] = handle.get("worktree") or worktree.get("id")
+        handle["path"] = worktree.get("path")
+    if not handle.get("worktree"):
+        raise EmbodyUnavailable("agent-worktrees create returned no worktree id")
+    return handle
+
+
+def resolve_worktree(
+    worktree_id: str, *, project: str | None = None,
+    timeout: float | None = None, task_id: str | None = None,
+) -> dict[str, str | None]:
+    """Resolve a tracked worktree id to its current path. ``task_id``
+    additionally rejects a reassigned worktree (see :mod:`agent_dispatch.worktree_attribution`)."""
+    exe_prefix = _agent_worktrees_launch_prefix()
+    if exe_prefix is None:
+        raise EmbodyUnavailable("agent-worktrees CLI not found on PATH")
+    cmd = list(exe_prefix)
+    if project:
+        cmd += ["--project", project]
+    cmd += ["list", "--json", "--fresh"]
+    result = subprocess.run(  # noqa: S603 -- fixed argv, launcher resolved locally
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=agent_worktrees_environment(),
+        **no_window_kwargs(),
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise EmbodyUnavailable(detail or f"agent-worktrees list exited {result.returncode}")
+    try:
+        data = json.loads(result.stdout or "{}")
+    except (ValueError, TypeError) as exc:
+        raise EmbodyUnavailable("agent-worktrees list returned invalid JSON") from exc
+    worktrees = data.get("worktrees") if isinstance(data, dict) else None
+    if not isinstance(worktrees, list):
+        raise EmbodyUnavailable("agent-worktrees list returned no worktree list")
+    for row in worktrees:
+        if not isinstance(row, dict):
+            continue
+        if row.get("id") == worktree_id:
+            if row.get("status") in _TERMINAL_WORKTREE_STATUSES:
+                raise WorktreeNotFound(f"worktree is terminal and cannot be reused: {worktree_id}")
+            if task_id and (owner := worktree_attribution.foreign_task_id(row, task_id)):
+                raise WorktreeNotFound(f"worktree now owned by {owner!r}, not {task_id!r}")
+            return {"worktree": worktree_id, "path": row.get("path")}
+    raise WorktreeNotFound(f"worktree not found: {worktree_id}")
+
+
+def prepare_reusable_worktree(
+    task: dict,
+    reservation: dict,
+    *,
+    project: str | None = None,
+    interface: str,
+    driver: str,
+    supervisor: str,
+    timeout: float | None = None,
+    agent: str | None = None,
+    no_pair: bool = False,
+) -> dict[str, object]:
+    """Resolve or create the worktree carried by an exclusive reservation.
+    A successful lookup reuses the existing checkout. A positively missing
+    or reassigned-to-another-task carried id (see :func:`resolve_worktree`)
+    falls back to a fresh worktree. Any indeterminate failure propagates
+    without creating a replacement, so a possibly live binding is never overwritten."""
+    project = project or project_for_task(task)
+    carried = reservation.get("worktree")
+    if isinstance(carried, str) and carried:
+        try:
+            resolved = resolve_worktree(
+                carried,
+                project=project,
+                timeout=timeout,
+                task_id=str(task["id"]),
+            )
+        except WorktreeNotFound as exc:
+            created = create_worktree(
+                project=project,
+                interface=interface,
+                task_id=str(task["id"]),
+                reservation_key=str(reservation["key"]),
+                attempt=int(reservation["attempt"]),
+                driver=driver,
+                supervisor=supervisor,
+                timeout=timeout,
+                agent=agent,
+                no_pair=no_pair,
+            )
+            path = created.get("path")
+            if not isinstance(path, str) or not path:
+                raise EmbodyUnavailable(
+                    "agent-worktrees create returned no worktree path"
+                ) from exc
+            return {
+                "worktree": created["worktree"],
+                "path": path,
+                "created": True,
+                "replaced": True,
+                "ownership": "created",
+            }
+        path = resolved.get("path")
+        if not isinstance(path, str) or not path:
+            raise EmbodyUnavailable(f"agent-worktrees resolved {carried!r} without a path")
+        return {
+            "worktree": carried,
+            "path": path,
+            "created": False,
+            "replaced": False,
+            "ownership": reservation.get("worktree_ownership") or "reused",
+        }
+
+    created = create_worktree(
+        project=project,
+        interface=interface,
+        task_id=str(task["id"]),
+        reservation_key=str(reservation["key"]),
+        attempt=int(reservation["attempt"]),
+        driver=driver,
+        supervisor=supervisor,
+        timeout=timeout,
+        agent=agent,
+        no_pair=no_pair,
+    )
+    path = created.get("path")
+    if not isinstance(path, str) or not path:
+        raise EmbodyUnavailable("agent-worktrees create returned no worktree path")
+    return {
+        "worktree": created["worktree"],
+        "path": path,
+        "created": True,
+        "replaced": False,
+        "ownership": "created",
+    }
 
 
 def _agent_worktrees_launch_prefix() -> list[str] | None:
@@ -115,115 +350,109 @@ def embody_available() -> bool:
     return _agent_worktrees_launch_prefix() is not None
 
 
-def autopilot_worker_prompt(
-    task_id: str,
+def conclude_disposable_worker(
+    worktree: str,
+    session: str | None,
     *,
-    worker_id: str,
-    route: str = "",
-    repo: str | None = None,
-    all_repos: bool = False,
-) -> str:
-    """Build the autopilot seed handed to a dispatched, embodied CLI session.
+    owner: str = DEFAULT_DRIVER,
+    timeout: float = 30.0,
+) -> dict:
+    """Safely conclude and remove one exact terminal CLI worker.
 
-    A dispatch-flavored variant of :func:`agent_dispatch.bridge.worker_prompt`:
-    it frames the session as an autonomous autopilot worker and makes explicit
-    that **completing the task is its own deliberate signal that the work is
-    done** -- it must not complete before the goal is met.
-
-    The worker drives its whole lifecycle under its **worktree identity**
-    (owner-less ``claim``/``start``/``complete``/``yield``, which the coordinator
-    resolves to ``<machine>/<worktree>``). That keeps the task's owner equal to
-    its worktree, so agent-bridge live-session tracking can join the task to the
-    embodied session (see :mod:`agent_dispatch.tracking`) -- a dispatched CLI
-    body is then as trackable as a headless worker. ``worker_id`` names the
-    session in the seed for legibility only.
-
-    ``route`` is the coordinator **routing intent** to bake into the worker's
-    ``agent-dispatch`` commands, as a leading flag fragment (``""`` for the
-    default local coordinator, ``" --shared"``, or ``" --url <endpoint>"``).
-    The default (``""``) deliberately carries **no** endpoint so each command
-    rediscovers the live local coordinator -- that is what makes a zero-downtime
-    coordinator port cutover transparent to a long-running dispatcher. A stable
-    explicit target (``--url``) or the env-configured ``--shared`` endpoint is
-    preserved so a task created on a non-default coordinator is still reachable.
+    The local/remote ground layer receives the reservation's recorded worktree
+    and session identities verbatim. It owns both the disposable verdict and
+    exact-ID managed teardown; preservation skips never remove anything.
     """
-    ad = f"agent-dispatch{route}"
-    if repo and all_repos:
-        raise ValueError("autopilot claim scope cannot set repo and all_repos")
-    lane = " --all-repos" if all_repos else (f" --repo {repo}" if repo else "")
-    if route:
-        route_note = (
-            f"Use the `{ad}` CLI commands exactly as shown below so every command "
-            f"targets the same coordinator this task lives on. "
-        )
-    else:
-        route_note = (
-            "Use the payload-local `agent-dispatch` CLI commands exactly as shown "
-            "below, without `--url`; the CLI resolves the live local coordinator "
-            "endpoint for each command (transparent to a coordinator port change). "
-        )
-    return (
-        f"You are a dispatched agent-dispatch **autopilot** worker (worker id: "
-        f"{worker_id}), running in a fresh parallel worktree with tools "
-        f"auto-approved (--allow-all-tools). A task has been queued for you. "
-        f"{route_note}Work the task end-to-end, "
-        f"autonomously, without waiting for a human. Claim it under this "
-        f"worktree's own identity (no owner argument -- the coordinator resolves "
-        f"machine/worktree), which keeps the task trackable as your live "
-        f"session. This is a **contract-net evaluation**: you win an exclusive, "
-        f"tight-lease EVALUATION window first, decide whether the task is really "
-        f"yours to do, and only THEN commit to running it. Steps: "
-        f"(1) read it with `{ad} show {task_id}`; "
-        f"(2) claim it for evaluation with "
-        f"`{ad} claim --task {task_id} --evaluation{lane}` "
-        f"(add `--capability <cap>` for each capability the task requires) -- "
-        f"this takes a SHORT evaluation lease, not the full work lease; "
-        f"(3) **EVALUATE before committing** -- while you hold the evaluation "
-        f"window, assess: (a) DUPLICATE check -- sweep open tasks "
-        f"(`{ad} list{lane}`) and any active worktree charters for an "
-        f"equivalent already queued, claimed, or in progress; (b) FEASIBILITY -- "
-        f"is the task well-formed and doable from here; (c) IS-THIS-FOR-ME -- do "
-        f"your machine/worktree/capabilities actually fit it; "
-        f"(4a) on ACCEPT, `{ad} start {task_id}` (this extends the "
-        f"lease from the tight evaluation window to the full work lease), run "
-        f"`{ad} steer take {task_id} --all` and incorporate any pending "
-        f"operator guidance, then carry out the work as follows. FIRST re-read the task with "
-        f"`{ad} show {task_id}` and check whether it carries a durable "
-        f"**goal** and **done-criteria** (the `goal` / `done_criteria` fields) "
-        f"plus an accumulated **progress log** (the `progress_log` array). "
-        f"If it DOES, treat the task as a goal to PURSUE, and RESUME rather than "
-        f"restart: read the prior progress log to see what earlier passes already "
-        f"accomplished, then continue from there. LOOP: do one unit of work "
-        f"toward the goal -> record a progress beat with "
-        f"`{ad} progress {task_id} --phase <phase> --summary "
-        f"\"<one line>\"` (this now APPENDS to the durable progress log, so a "
-        f"replacement worker can resume) -> re-check the done-criteria -> repeat "
-        f"until they are genuinely met. If the task carries NO goal/done-criteria "
-        f"(a plain one-shot task), just carry out the work described in its "
-        f"prompt/payload to completion as usual; "
-        f"(4b) if the task is NOT FOR YOU or you hit a transient blocker, decline "
-        f"WITHOUT abandoning it: `{ad} yield {task_id} --exclude-self "
-        f"worktree --note <why>` returns it to the queue and appends a narrow "
-        f"'not me' exclusion so you are not re-offered it (widen to "
-        f"`--exclude-self machine` only when the mismatch is machine-wide); "
-        f"(4c) if it is a DUPLICATE or obsolete, retire it terminally with "
-        f"`{ad} abandon {task_id} --duplicate-of <ref>` (cite the "
-        f"existing task/PR/issue) so the dedup is recorded, never a silent drop; "
-        f"(5) ONLY once you judge an accepted task's goal genuinely reached (its "
-        f"done-criteria met, when it carries them), run "
-        f"`{ad} complete {task_id} --result-ref <ref>`. "
-        f"Do NOT mark it complete before the goal is met -- completing the task "
-        f"is your explicit signal that the work is done. "
-        f"**Report progress as you go** so the operator can watch the fleet at a "
-        f"glance and so a replacement worker can resume from your recorded "
-        f"progress: at each phase boundary (plan settled, implementation done, a "
-        f"PR opened, a blocker hit) and at each pass of a goal loop run "
-        f"`{ad} progress {task_id} --phase <phase> --summary "
-        f"\"<one line toward the goal>\"` (add `--pr <ref>` or `--blocker <why>` "
-        f"when relevant). Keep each summary to a single line -- it is a status "
-        f"beat, not a transcript; emit one at real transitions, never on a "
-        f"timer."
+    args = [
+        "conclude-disposable",
+        "--worktree",
+        worktree,
+        "--policy",
+        "disposable-cli",
+        "--owner",
+        owner,
+        "--remove",
+        "--json",
+    ]
+    if session:
+        args += ["--session", session]
+
+    prefix = _agent_worktrees_launch_prefix()
+    if prefix is None:
+        raise DisposableConclusionError("agent-worktrees CLI not found on this host")
+    result = subprocess.run(  # noqa: S603 -- fixed argv, launcher resolved locally
+        [*prefix, *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=agent_worktrees_environment(),
+        **no_window_kwargs(),
     )
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except (TypeError, ValueError) as exc:
+        raise DisposableConclusionError(
+            (result.stderr or "").strip()[:300]
+            or "agent-worktrees returned invalid terminal conclusion output"
+        ) from exc
+    if result.returncode != 0 or not isinstance(payload, dict) or payload.get("error"):
+        detail = payload.get("error") if isinstance(payload, dict) else None
+        raise DisposableConclusionError(
+            str(detail or (result.stderr or "").strip() or "terminal conclusion failed")[:300]
+        )
+    return payload
+
+
+def conclude_dispatch_attempt(
+    worktree: str,
+    session: str | None,
+    reservation_key: str,
+    *,
+    owner: str = DEFAULT_DRIVER,
+    timeout: float = 30.0,
+) -> dict:
+    """Safely conclude one provenance-verified dispatch-created worktree."""
+    args = [
+        "conclude-disposable",
+        "--worktree",
+        worktree,
+        "--policy",
+        "dispatch-attempt",
+        "--reservation",
+        reservation_key,
+        "--owner",
+        owner,
+        "--remove",
+        "--json",
+    ]
+    if session:
+        args += ["--session", session]
+    prefix = _agent_worktrees_launch_prefix()
+    if prefix is None:
+        raise DisposableConclusionError("agent-worktrees CLI not found on this host")
+    result = subprocess.run(  # noqa: S603 -- fixed argv, launcher resolved locally
+        [*prefix, *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=agent_worktrees_environment(),
+        **no_window_kwargs(),
+    )
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except (TypeError, ValueError) as exc:
+        raise DisposableConclusionError(
+            (result.stderr or "").strip()[:300]
+            or "agent-worktrees returned invalid dispatch conclusion output"
+        ) from exc
+    if result.returncode != 0 or not isinstance(payload, dict) or payload.get("error"):
+        detail = payload.get("error") if isinstance(payload, dict) else None
+        raise DisposableConclusionError(
+            str(detail or (result.stderr or "").strip() or "dispatch conclusion failed")[:300]
+        )
+    return payload
 
 
 def spawn_embodied_worker(
@@ -232,11 +461,14 @@ def spawn_embodied_worker(
     worker_id: str,
     driver: str = DEFAULT_DRIVER,
     project: str | None = None,
+    worktree_id: str | None = None,
     route: str = "",
     repo: str | None = None,
     all_repos: bool = False,
     verify_timeout: int = 0,
     timeout: float | None = None,
+    seed: str | None = None,
+    charter: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Spawn a CLI-backed autopilot worker via ``agent-worktrees embody``.
 
@@ -255,119 +487,58 @@ def spawn_embodied_worker(
 
     ``verify_timeout`` (seconds) optionally makes embody wait for the mux
     session to come up before returning (0 = don't wait).
+
+    ``seed`` overrides the default autopilot seed with a caller-supplied prompt
+    -- used by :mod:`agent_dispatch.interactive_embody` (Phase 1 item 3) to
+    launch the SAME CLI-backed session mechanism with a deliberately lighter,
+    non-railroaded ``--interactive`` seed instead of the autopilot one. Every
+    existing call site (which never passes ``seed``) is unaffected.
+
+    ``charter`` is accepted for interface parity but raises: ``agent-worktrees
+    embody`` has no charter flag, so it never silently launches unscoped.
     """
+    if charter:
+        raise EmbodyUnavailable(
+            "spawn_embodied_worker: --charter unsupported for CLI-embodied "
+            "workers; use a headless pool"
+        )
     exe_prefix = _agent_worktrees_launch_prefix()
     if exe_prefix is None:
         raise EmbodyUnavailable("agent-worktrees CLI not found on PATH")
-    seed = autopilot_worker_prompt(
-        task_id,
-        worker_id=worker_id,
-        route=route,
-        repo=repo,
-        all_repos=all_repos,
-    )
+    if seed is None:
+        seed = autopilot_worker_prompt(
+            task_id,
+            worker_id=worker_id,
+            route=route,
+            repo=repo,
+            all_repos=all_repos,
+        )
     cmd = list(exe_prefix)
     if project:
         # `--project` is an agent-worktrees GLOBAL option -- it precedes the
         # `embody` subcommand. It lets a CWD-neutral caller name the target
         # project instead of relying on git-like CWD discovery.
         cmd += ["--project", project]
-    cmd += ["embody", "--new", "--seed", seed, "--driver", driver, "--json"]
+    cmd += ["embody"]
+    if worktree_id:
+        cmd += ["--worktree-id", worktree_id]
+    else:
+        cmd += ["--new"]
+    cmd += ["--seed", seed, "--driver", driver, "--json"]
     if verify_timeout:
         cmd += ["--verify-timeout", str(verify_timeout)]
     return subprocess.run(  # noqa: S603 -- fixed argv, launcher resolved locally
-        cmd, check=False, capture_output=True, text=True, timeout=timeout,
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=agent_worktrees_environment(),
         **no_window_kwargs(),
     )
 
 
 # -- Fleet dispatch (Model C): a remote body that drives the ORIGIN task -------
-
-
-def fleet_autopilot_worker_prompt(
-    task_id: str,
-    *,
-    origin: str,
-    owner: str,
-    worker_id: str,
-    repo: str | None = None,
-    all_repos: bool = False,
-) -> str:
-    """Build the autopilot seed for a **fleet-dispatched, remote** embody body.
-
-    Model C: the reservation and the task lease live on the **origin**
-    coordinator (fleet-wide at-most-once), and this body -- running on a *pool*
-    host, not the origin -- drives the origin task's whole lifecycle back over the
-    existing bidirectional SSH mesh, by prefixing every ``agent-dispatch`` verb
-    with ``ssh <origin>``. That runs the verb **on** the origin against its own
-    local coordinator, so there is **no new network bind** on the origin (its
-    control API never leaves loopback).
-
-    Two differences from the local :func:`autopilot_worker_prompt`:
-
-    - **Reach the origin over SSH.** Lifecycle verbs run as
-      ``ssh <origin> agent-dispatch <verb> ...`` (the origin is an SSH
-      alias, never a raw IP).
-    - **Carry an explicit owner.** The CWD-based owner resolution can't work over
-      ``ssh <origin>`` (that shell lands in the origin's home dir, not this body's
-      worktree), so the body passes the supervisor-assigned **synthetic owner**
-      (``{owner}``) on every lease-holding verb. It is an opaque lease-holder id,
-      stable for this attempt.
-    """
-    if repo and all_repos:
-        raise ValueError("fleet claim scope cannot set repo and all_repos")
-    lane = " --all-repos" if all_repos else (f" --repo {repo}" if repo else "")
-    return (
-        f"You are a fleet-dispatched agent-dispatch **autopilot** worker (worker "
-        f"id: {worker_id}), running detached in a fresh parallel worktree on this "
-        f"pool host with tools auto-approved (--allow-all-tools). Your task was "
-        f"scheduled on a DIFFERENT machine -- the origin coordinator on host "
-        f"'{origin}'. Drive the task there by running EVERY agent-dispatch "
-        f"lifecycle verb over SSH against the origin, ALWAYS passing your explicit "
-        f"owner id '{owner}' (your working directory here cannot identify you to "
-        f"the origin, so the owner is not optional). Work the task end-to-end, "
-        f"autonomously, without waiting for a human. This is a **contract-net "
-        f"evaluation**: you win an exclusive, tight-lease EVALUATION window "
-        f"first, decide whether the task is really yours to do, and only THEN "
-        f"commit to running it. Steps: "
-        f"(1) read it: `ssh {origin} agent-dispatch show {task_id}`; "
-        f"(2) claim it for evaluation: `ssh {origin} agent-dispatch claim --task "
-        f"{task_id} --worker {owner} --evaluation{lane}` (add `--capability <cap>` for each "
-        f"capability the task requires) -- this takes a SHORT evaluation lease, "
-        f"not the full work lease; "
-        f"(3) **EVALUATE before committing** -- while you hold the evaluation "
-        f"window, assess: (a) DUPLICATE check -- sweep the origin's open tasks "
-        f"(`ssh {origin} agent-dispatch list`) for an equivalent already queued, "
-        f"claimed, or in progress; (b) FEASIBILITY -- is the task well-formed and "
-        f"doable from this pool host; (c) IS-THIS-FOR-ME -- do this host's "
-        f"resources/capabilities actually fit it; "
-        f"(4a) on ACCEPT, `ssh {origin} agent-dispatch start {task_id} {owner}` "
-        f"(this extends the lease from the tight evaluation window to the full "
-        f"work lease), run `ssh {origin} agent-dispatch steer take {task_id} "
-        f"{owner} --all` and incorporate any pending operator guidance, then carry "
-        f"out the work described in the task's "
-        f"prompt/payload to completion; "
-        f"(4b) if the task is NOT FOR YOU or you hit a transient blocker, decline "
-        f"WITHOUT abandoning it: `ssh {origin} agent-dispatch yield {task_id} "
-        f"{owner} --exclude-self machine --note <why>` returns it to the origin's queue "
-        f"and appends a 'not me' exclusion so this host is not re-offered it; "
-        f"(4c) if it is a DUPLICATE or obsolete, retire it terminally with "
-        f"`ssh {origin} agent-dispatch abandon {task_id} --worker-id {owner} "
-        f"--duplicate-of <ref>` (cite the existing task/PR/issue) so the dedup is "
-        f"recorded, never a silent drop; "
-        f"(5) ONLY once you judge an accepted task's goal genuinely reached, run "
-        f"`ssh {origin} agent-dispatch complete {task_id} {owner} --result-ref "
-        f"<ref>`. Do NOT mark it complete before the goal is met -- completing the "
-        f"task is your explicit signal that the work is done. "
-        f"**Report progress as you go** so the operator can watch the fleet at a "
-        f"glance: at each phase boundary (plan settled, implementation done, a PR "
-        f"opened, a blocker hit) run "
-        f"`ssh {origin} agent-dispatch progress {task_id} {owner} --phase <phase> "
-        f"--summary \"<one line toward the goal>\"` (add `--pr <ref>` or "
-        f"`--blocker <why>` when relevant). Keep each summary to a single line -- "
-        f"it is a status beat, not a transcript; emit one only at real "
-        f"transitions, never on a timer."
-    )
 
 
 def spawn_fleet_embodied_worker(
@@ -419,8 +590,13 @@ def spawn_fleet_embodied_worker(
     if project:
         remote_argv += ["--project", project]
     remote_argv += [
-        "embody", "--new",
-        "--seed", seed, "--driver", driver, "--json",
+        "embody",
+        "--new",
+        "--seed",
+        seed,
+        "--driver",
+        driver,
+        "--json",
     ]
     if verify_timeout:
         remote_argv += ["--verify-timeout", str(verify_timeout)]
@@ -428,10 +604,7 @@ def spawn_fleet_embodied_worker(
     # `host` is the SSH alias (never a raw IP). BatchMode so a missing key
     # fails fast instead of hanging on a password prompt.
     cmd = [exe, "-o", "BatchMode=yes", host.strip().lower(), remote_cmd]
-    return subprocess.run(  # noqa: S603 -- fixed argv, exe resolved via shutil.which
-        cmd, check=False, capture_output=True, text=True, timeout=timeout,
-        **no_window_kwargs(),
-    )
+    return run_ssh_command(cmd, timeout=timeout)
 
 
 DEFAULT_HEADLESS_AGENT = "task-worker"
@@ -445,16 +618,18 @@ def spawn_fleet_headless_worker(
     owner: str,
     worker_id: str,
     agent: str = DEFAULT_HEADLESS_AGENT,
+    charter: str | None = None,
     repo: str | None = None,
     all_repos: bool = False,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess:
-    """Spawn a **headless agent-bridge ACP** body on a remote pool ``host`` via SSH.
+    """Spawn a **headless agent-bridge ACP** body on a remote pool ``host``.
 
     The headless-fleet embodiment (Model C, headless variant). Runs
     ``agent-bridge create <agent> "<fleet seed>" --no-wait`` **on** ``host`` (its
-    SSH alias) over the SSH mesh -- spawning a headless ACP session in
-    that host's own persistent agent-bridge service, seeded
+    SSH alias) through the local Bridge carrier, with bounded SSH fallback only
+    when that capability is absent. This spawns a headless ACP session in that
+    host's own persistent agent-bridge service, seeded
     (:func:`fleet_autopilot_worker_prompt`) to drive the ``task_id`` lease back to
     the ``origin`` coordinator over SSH under the supervisor-assigned synthetic
     ``owner``. The seed is **identical** to the CLI fleet body's
@@ -471,15 +646,13 @@ def spawn_fleet_headless_worker(
     Unlike the CLI body, a headless body is **not a parallel worktree**, so no
     worktree handle is recovered (the caller records ``worktree=None``); the
     ``--no-wait`` create returns once the ACP session is spawned into the host's
-    bridge daemon, which owns it independently of this SSH invocation.
+    bridge daemon, which owns it independently of the command transport.
 
-    Raises :class:`EmbodyUnavailable` if ``ssh`` is not on PATH here; a remote host
-    lacking ``agent-bridge`` surfaces as a non-zero exit (the caller fails the
-    reservation).
+    If carrier capability is absent, missing local ``ssh`` raises
+    :class:`EmbodyUnavailable`; a fallback host lacking ``agent-bridge`` surfaces
+    as a non-zero exit (the caller fails the reservation).
     """
-    exe = shutil.which("ssh")
-    if exe is None:
-        raise EmbodyUnavailable("ssh CLI not found on PATH (needed for fleet dispatch)")
+    host = bridge_remote.normalize_host(host)
     seed = fleet_autopilot_worker_prompt(
         task_id,
         origin=origin,
@@ -488,19 +661,68 @@ def spawn_fleet_headless_worker(
         repo=repo,
         all_repos=all_repos,
     )
+    try:
+        created = bridge_remote.LocalBridgeRemoteClient().create_session(
+            host,
+            agent=agent,
+            charter=charter,
+            prompt=seed,
+            caller_id=owner,
+            timeout=timeout if timeout is not None else 120.0,
+        )
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(created),
+            stderr="",
+        )
+    except bridge_remote.RemoteBridgeUnavailable:
+        pass
+    except bridge_remote.RemoteBridgeOperationError as exc:
+        # A far-side carrier still on the old REMOTE_OPERATION_VERSION (2)
+        # rejects a chartered request with 426 unsupported_version even when
+        # the LOCAL daemon already passed its own capability gate above --
+        # treat that specific carrier-skew case as unavailable too, so it
+        # falls through to the SSH `create --charter` fallback below instead
+        # of failing the spawn outright.
+        if not (charter and exc.status == 426 and exc.code == "unsupported_version"):
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr=str(exc),
+            )
+
+    exe = shutil.which("ssh")
+    if exe is None:
+        raise EmbodyUnavailable("ssh CLI not found on PATH (needed for fleet dispatch)")
     # `--json` (a global flag, before the subcommand) makes `create --no-wait`
     # emit the created session_id as JSON, so the caller can record a recovery
     # handle (the pool host's agent-bridge session id) for liveness-gated
     # re-embody -- see parse_fleet_body_session / fleet_body_verdict.
-    remote_argv = ["agent-bridge", "--json", "create", agent, seed, "--no-wait"]
+    # `--caller owner` mirrors the primary LocalBridgeRemoteClient path above
+    # (copilot-extensions#2202): without it, the remote agent-bridge has no
+    # caller identity to stamp onto the spawned target, so the fleet body's
+    # worktree (if any) resolves to origin=user instead of delegate and shows
+    # up Picker-visible on the pool host, indistinguishable from a worktree a
+    # human started there.
+    remote_argv = [
+        "agent-bridge",
+        "--json",
+        "create",
+        agent,
+        seed,
+        "--no-wait",
+        "--caller",
+        owner,
+    ]
+    if charter:
+        remote_argv += ["--charter", charter]
     remote_cmd = " ".join(shlex.quote(a) for a in remote_argv)
     # `host` is the SSH alias (never a raw IP). BatchMode so a missing key
     # fails fast instead of hanging on a password prompt.
     cmd = [exe, "-o", "BatchMode=yes", host.strip().lower(), remote_cmd]
-    return subprocess.run(  # noqa: S603 -- fixed argv, exe resolved via shutil.which
-        cmd, check=False, capture_output=True, text=True, timeout=timeout,
-        **no_window_kwargs(),
-    )
+    return run_ssh_command(cmd, timeout=timeout)
 
 
 def remote_registered_agent_names(host: str, *, timeout: float = 15.0) -> set[str] | None:
@@ -524,10 +746,7 @@ def remote_registered_agent_names(host: str, *, timeout: float = 15.0) -> set[st
     # fast instead of hanging on a password prompt.
     cmd = [exe, "-o", "BatchMode=yes", host.strip().lower(), remote_cmd]
     try:
-        proc = subprocess.run(  # noqa: S603 -- fixed argv, exe resolved via shutil.which
-            cmd, check=False, capture_output=True, text=True, timeout=timeout,
-            **no_window_kwargs(),
-        )
+        proc = run_ssh_command(cmd, timeout=timeout)
     except (subprocess.SubprocessError, OSError):
         return None
     if proc.returncode != 0:
@@ -535,6 +754,79 @@ def remote_registered_agent_names(host: str, *, timeout: float = 15.0) -> set[st
     from .bridge import parse_agent_names
 
     return parse_agent_names(proc.stdout)
+
+
+def remote_registered_agent_record(
+    host: str,
+    agent: str,
+    *,
+    timeout: float = 15.0,
+) -> dict | object | None:
+    """Best-effort single-agent metadata probe on a remote pool host.
+
+    Mirrors :func:`agent_dispatch.bridge._resolve_agent_record`'s purpose for a
+    fleet host reached only over SSH. The fast path uses ``agent-show
+    --include-unaddressable`` so worktree-bound charter profiles remain
+    resolvable for preflight even after ordinary ``agents`` / ``agent-show``
+    listings hide them as non-addressable targets. A namespaced target, or an
+    older remote bridge that lacks this flag/subcommand, falls back to the full
+    ``agents`` JSON listing.
+    """
+    from . import bridge
+
+    exe = shutil.which("ssh")
+    if exe is None:
+        return None
+
+    def _run(remote_argv: list[str]) -> subprocess.CompletedProcess | None:
+        remote_cmd = " ".join(shlex.quote(a) for a in remote_argv)
+        cmd = [exe, "-o", "BatchMode=yes", host.strip().lower(), remote_cmd]
+        try:
+            return run_ssh_command(cmd, timeout=timeout)
+        except (subprocess.SubprocessError, OSError):
+            return None
+
+    if ":" not in agent:
+        proc = _run(
+            [
+                "agent-bridge",
+                "--json",
+                "agent-show",
+                agent,
+                "--include-unaddressable",
+            ]
+        )
+        if proc is None:
+            return None
+        stderr = proc.stderr or ""
+        if proc.returncode == 1:
+            return bridge._AGENT_NOT_FOUND
+        if proc.returncode == 0:
+            try:
+                data = json.loads((proc.stdout or "").strip() or "null")
+            except (ValueError, TypeError):
+                return None
+            if data is None:
+                return bridge._AGENT_NOT_FOUND
+            return data if isinstance(data, dict) else None
+        if proc.returncode != 2 or (
+            "agent-show" not in stderr and "--include-unaddressable" not in stderr
+        ):
+            return None
+
+    proc = _run(["agent-bridge", "--json", "agents"])
+    if proc is None or proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or "[]")
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, list):
+        return None
+    for row in data:
+        if isinstance(row, dict) and row.get("name") == agent:
+            return row
+    return bridge._AGENT_NOT_FOUND
 
 
 def parse_fleet_body_session(result: subprocess.CompletedProcess) -> str | None:
@@ -566,16 +858,35 @@ def parse_fleet_body_session(result: subprocess.CompletedProcess) -> str | None:
 #: agent-bridge session statuses that mean the body's ACP session has ended --
 #: a **positive** "the body is gone" signal (the vision's
 #: eventual-terminal-reconciliation lands a killed/finished child here).
-_FLEET_BODY_TERMINAL = frozenset({
-    "stopped", "completed", "failed", "ended", "error",
-    "cancelled", "canceled", "closed", "gone", "dead",
-})
+_FLEET_BODY_TERMINAL = frozenset(
+    {
+        "stopped",
+        "completed",
+        "failed",
+        "ended",
+        "error",
+        "cancelled",
+        "canceled",
+        "closed",
+        "gone",
+        "dead",
+    }
+)
 #: statuses that mean the body's session is still alive (working or idle between
 #: turns). An idle body is ALIVE -- never recovered.
-_FLEET_BODY_ALIVE = frozenset({
-    "running", "starting", "connecting", "idle", "active", "ready",
-    "live", "working", "busy",
-})
+_FLEET_BODY_ALIVE = frozenset(
+    {
+        "running",
+        "starting",
+        "connecting",
+        "idle",
+        "active",
+        "ready",
+        "live",
+        "working",
+        "busy",
+    }
+)
 
 
 def _classify_body_status(proc: subprocess.CompletedProcess) -> str:
@@ -614,13 +925,12 @@ def _classify_body_status(proc: subprocess.CompletedProcess) -> str:
     return tracking.UNKNOWN  # unrecognized/lagging -> never recover on ignorance
 
 
-def fleet_body_verdict(
-    host: str, session_id: str, *, timeout: float | None = None
-) -> str:
+def fleet_body_verdict(host: str, session_id: str, *, timeout: float | None = None) -> str:
     """Tri-state liveness of a **headless fleet body** via the pool host's bridge.
 
-    Runs ``ssh <host> agent-bridge --json status <session_id>`` and classifies
-    (see :func:`_classify_body_status`):
+    Queries the local Bridge carrier first, with bounded SSH fallback only when
+    that capability is absent, and classifies (see
+    :func:`_classify_body_status`):
 
     - **GONE** -- the bridge answers that the session is **absent** (not found,
       non-zero exit) or in a **terminal** status (:data:`_FLEET_BODY_TERMINAL`),
@@ -628,82 +938,135 @@ def fleet_body_verdict(
       non-terminal origin task means it died before completing -> re-embody.
     - **LIVE** -- the session is present in a known-alive status
       (:data:`_FLEET_BODY_ALIVE`).
-    - **UNKNOWN** -- ssh/bridge unreachable, timeout, unparseable output, or an
-      unrecognized status (a possibly-lagging reconcile). Left alone.
+    - **UNKNOWN** -- carrier/bridge ambiguity, fallback SSH failure, timeout,
+      unparseable output, or an unrecognized status (a possibly-lagging
+      reconcile). Left alone.
 
     Returns the string verdict (values match ``tracking.LIVE/GONE/UNKNOWN``).
     Never raises.
     """
     from . import tracking
 
+    if not host or not session_id:
+        return tracking.UNKNOWN
+    host = bridge_remote.normalize_host(host)
+    effective_timeout = timeout if timeout is not None else 8.0
+    try:
+        status = bridge_remote.LocalBridgeRemoteClient().session_status(
+            host,
+            session_id,
+            caller_id="agent-dispatch-fleet",
+            timeout=effective_timeout,
+        )
+        return _classify_body_status(
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=json.dumps(status),
+                stderr="",
+            )
+        )
+    except bridge_remote.RemoteBridgeUnavailable:
+        pass
+    except bridge_remote.RemoteBridgeOperationError as exc:
+        if exc.code == "session_not_found" or exc.status == 404:
+            return tracking.GONE
+        return tracking.UNKNOWN
+
     ssh = shutil.which("ssh")
-    if ssh is None or not host or not session_id:
+    if ssh is None:
         return tracking.UNKNOWN
     remote = f"agent-bridge --json status {shlex.quote(session_id)}"
     cmd = [
-        ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
-        host.strip().lower(), remote,
+        ssh,
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=3",
+        host.strip().lower(),
+        remote,
     ]
     try:
-        proc = subprocess.run(  # noqa: S603 -- fixed argv, exe via shutil.which
-            cmd, check=False, capture_output=True, text=True,
-            timeout=timeout if timeout is not None else 8.0,
-            **no_window_kwargs(),
-        )
+        proc = run_ssh_command(cmd, timeout=effective_timeout)
     except (subprocess.TimeoutExpired, OSError):
         return tracking.UNKNOWN
     return _classify_body_status(proc)
 
 
-def stop_fleet_body(
-    host: str, session_id: str, *, timeout: float | None = 20.0
-) -> bool:
+def stop_fleet_body(host: str, session_id: str, *, timeout: float | None = 20.0) -> bool:
     """End one remote fleet body so its process is fully reclaimed."""
+    host = bridge_remote.normalize_host(host)
+    effective_timeout = timeout if timeout is not None else 20.0
+    try:
+        bridge_remote.LocalBridgeRemoteClient().end_session(
+            host,
+            session_id,
+            timeout=effective_timeout,
+        )
+        return True
+    except bridge_remote.RemoteBridgeUnavailable:
+        pass
+    except bridge_remote.RemoteBridgeOperationError:
+        return False
     ssh = shutil.which("ssh")
     if ssh is None:
         return False
     remote = f"agent-bridge end {shlex.quote(session_id)}"
-    completed = subprocess.run(  # noqa: S603 -- fixed argv + SSH alias
-        [
-            ssh,
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=3",
-            host.strip().lower(),
-            remote,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        **no_window_kwargs(),
-    )
+    try:
+        completed = run_ssh_command(
+            [
+                ssh,
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=3",
+                host.strip().lower(),
+                remote,
+            ],
+            timeout=effective_timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
     return completed.returncode == 0
 
 
-def fleet_body_activity(
-    host: str, session_id: str, *, timeout: float | None = None
-) -> str | None:
+def fleet_body_activity(host: str, session_id: str, *, timeout: float | None = None) -> str | None:
     """Exact ACTIVE/STALLED state for a remote headless fleet body."""
     from . import tracking
 
+    if not host or not session_id:
+        return None
+    host = bridge_remote.normalize_host(host)
+    effective_timeout = timeout if timeout is not None else 8.0
+    try:
+        session = bridge_remote.LocalBridgeRemoteClient().session_status(
+            host,
+            session_id,
+            caller_id="agent-dispatch-fleet",
+            timeout=effective_timeout,
+        )
+        return tracking.session_activity(session)
+    except bridge_remote.RemoteBridgeUnavailable:
+        pass
+    except bridge_remote.RemoteBridgeOperationError:
+        return None
     ssh = shutil.which("ssh")
-    if ssh is None or not host or not session_id:
+    if ssh is None:
         return None
     remote = f"agent-bridge --json status {shlex.quote(session_id)}"
     cmd = [
-        ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
-        host.strip().lower(), remote,
+        ssh,
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=3",
+        host.strip().lower(),
+        remote,
     ]
     try:
-        proc = subprocess.run(  # noqa: S603 -- fixed argv, exe via shutil.which
+        proc = run_ssh_command(
             cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout if timeout is not None else 8.0,
-            **no_window_kwargs(),
+            timeout=effective_timeout,
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -738,7 +1101,10 @@ def local_body_verdict(session_id: str, *, timeout: float | None = None) -> str:
     cmd = [*exe, "--json", "status", session_id]
     try:
         proc = subprocess.run(  # noqa: S603 -- fixed argv, exe resolved above
-            cmd, check=False, capture_output=True, text=True,
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
             timeout=timeout if timeout is not None else 8.0,
             **no_window_kwargs(),
         )

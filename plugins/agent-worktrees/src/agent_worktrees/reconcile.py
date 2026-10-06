@@ -24,10 +24,12 @@ nature via a ``runtimeScope`` field in its ``plugin.json``:
 Runtime reconciliation is **local and version-keyed**: it compares the
 installed payload version (``plugin.json``) against the deployed runtime
 version (normally ``~/.<plugin>/deploy-manifest.json`` -> ``source.version``)
-and only acts on drift, so a re-launch with no version change does ~no work. An
-explicit, validated installation context may redirect this inspection to a
-namespaced plugin root, but that path remains read-only until activation
-governance and context-aware installers land. The marketplace **payload**
+and only acts on drift, so a re-launch with no version change does ~no work.
+For installation-cell-aware plugins, reconciliation asks the vendored
+installation-context helper which mode is authoritative. An authorized legacy
+runtime remains receipt-free; namespaced operation requires the helper's exact
+validated plugin-specific receipt/root, which is then supplied to the installer.
+The marketplace **payload**
 install/refresh (``copilot plugin install/update``, a network pull that also
 holds the Windows payload dir open) is **off by default** and emitted only when
 a caller opts in via ``include_payload_refresh`` -- the Picker/operator "update
@@ -53,12 +55,14 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from . import config as cfg
+from .installer_capabilities import posix_zero_downtime_flag_supported
 
 MARKETPLACE = "copilot-extensions"
 _CORE_SOURCE_FIELDS = (
@@ -78,6 +82,21 @@ CORE_MARKETPLACE_ID = (
 SELF_PLUGIN = "agent-worktrees"
 CACHE_NAME = "plugin-reconcile-cache.json"
 VALID_SCOPES = ("universal", "machine-gated", "none")
+_RUNTIME_ENV_UNSET = (
+    "COPILOT_EXTENSIONS_CONTEXT",
+    "COPILOT_PLUGIN_INSTALL_STAGED",
+    "COPILOT_PLUGIN_ROOT",
+    "COPILOT_PLUGIN_STAGED_FROM",
+    "PYTHONPATH",
+)
+_INSTALLATION_RESOLUTION_SCHEMA = "copilot-extensions.installation-resolution"
+_CORE_SOURCE_JSON = json.dumps(
+    {
+        "source": "github",
+        "repo": "ThomasMichon/copilot-extensions",
+    },
+    separators=(",", ":"),
+)
 
 # Candidate locations for the Copilot CLI executable when a bare ``copilot`` is
 # not resolvable on PATH. We never *install* Copilot: on WSL the Windows Copilot
@@ -154,9 +173,28 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build one JSON object while rejecting duplicate or case-conflicting keys."""
+    result: dict[str, Any] = {}
+    normalized: set[str] = set()
+    for key, value in pairs:
+        folded = key.casefold()
+        if key in result or folded in normalized:
+            raise ValueError(f"duplicate or case-conflicting JSON key: {key}")
+        result[key] = value
+        normalized.add(folded)
+    return result
+
+
 def _home() -> Path:
     """Home directory (indirection point for tests)."""
     return Path.home()
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.realpath(left)) == os.path.normcase(
+        os.path.realpath(right)
+    )
 
 
 def _copilot_home() -> Path:
@@ -236,6 +274,40 @@ def _ce_plugin_names(enabled: dict[str, bool]) -> set[str]:
     return names
 
 
+def _read_enabled_plugin_settings(
+    base: Path,
+    rels: Sequence[tuple[str, ...]],
+) -> list[str]:
+    """Read activation settings strictly so callers can fail closed."""
+    enabled: dict[str, bool] = {}
+    for rel in rels:
+        path = base.joinpath(*rel)
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError) as error:
+            raise ValueError(f"cannot read plugin settings {path}: {error}") from error
+        try:
+            data = json.loads(raw, object_pairs_hook=_strict_json_object)
+        except (json.JSONDecodeError, ValueError) as error:
+            raise ValueError(f"invalid plugin settings {path}: {error}") from error
+        if not isinstance(data, dict):
+            raise ValueError(f"plugin settings must contain an object: {path}")
+        raw_enabled = data.get("enabledPlugins")
+        if raw_enabled is None:
+            continue
+        if not isinstance(raw_enabled, dict):
+            raise ValueError(f"enabledPlugins must be an object: {path}")
+        for source, value in raw_enabled.items():
+            if not isinstance(source, str) or not isinstance(value, bool):
+                raise ValueError(
+                    f"enabledPlugins entries must be string/boolean pairs: {path}"
+                )
+            enabled[source] = value
+    return sorted(_ce_plugin_names(enabled))
+
+
 def read_enabled_plugins(repo_dir: Path) -> list[str]:
     """Return copilot-extensions plugin names enabled in repo settings.
 
@@ -246,9 +318,9 @@ def read_enabled_plugins(repo_dir: Path) -> list[str]:
     the local file overriding per key and native winning over Claude on a key
     conflict. Excludes ``agent-worktrees`` itself (managed by the self-update path).
     """
-    from plugin_resolve import read_repo_settings
+    from plugin_resolve import SETTINGS_RELS
 
-    return sorted(_ce_plugin_names(read_repo_settings(repo_dir).enabled))
+    return _read_enabled_plugin_settings(repo_dir, SETTINGS_RELS)
 
 
 def read_user_enabled_plugins() -> list[str]:
@@ -261,26 +333,14 @@ def read_user_enabled_plugins() -> list[str]:
     ``.github/copilot/settings.json``), so a plugin enabled **only** user-global
     would otherwise never be refreshed by ``update`` and would silently go stale
     (#653). Same marketplace filter + ``agent-worktrees`` self-exclusion.
-    Fail-safe -> ``[]``.
+    Missing files produce ``[]``; unreadable or malformed files raise so update
+    can keep installed inventory required instead of treating unknown activation
+    as inactive.
     """
-    home = _copilot_home()
-    enabled: dict[str, bool] = {}
-    for fname in ("settings.json", "settings.local.json"):  # local overrides base
-        p = home / fname
-        try:
-            if not p.is_file():
-                continue
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if not isinstance(data, dict):
-            continue
-        en = data.get("enabledPlugins")
-        if isinstance(en, dict):
-            for k, v in en.items():
-                if isinstance(k, str):
-                    enabled[k] = bool(v)
-    return sorted(_ce_plugin_names(enabled))
+    return _read_enabled_plugin_settings(
+        _copilot_home(),
+        (("settings.json",), ("settings.local.json",)),
+    )
 
 
 def read_installed_plugins() -> list[str]:
@@ -405,21 +465,10 @@ def _explicit_context_receipt() -> tuple[Path, dict[str, Any]] | None:
     if not pointer.is_absolute():
         raise ValueError("COPILOT_EXTENSIONS_CONTEXT must be an absolute path")
 
-    def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        normalized: set[str] = set()
-        for key, value in pairs:
-            folded = key.casefold()
-            if key in result or folded in normalized:
-                raise ValueError(f"duplicate or case-conflicting JSON key: {key}")
-            result[key] = value
-            normalized.add(folded)
-        return result
-
     try:
         receipt = json.loads(
             pointer.read_text(encoding="utf-8"),
-            object_pairs_hook=_strict_object,
+            object_pairs_hook=_strict_json_object,
         )
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError(
@@ -526,18 +575,17 @@ def _selected_runtime_root(
     self_dir = core_installed_payload_dir(SELF_PLUGIN)
     if self_dir is not None and self_dir not in helper_candidates:
         helper_candidates.append(self_dir)
+    helper_name = (
+        "installation-context.ps1"
+        if os.name == "nt"
+        else "installation_context.py"
+    )
     helper = next(
         (
-            candidate
-            / "scripts"
-            / "installation-context"
-            / "installation_context.py"
+            candidate / "scripts" / "installation-context" / helper_name
             for candidate in helper_candidates
             if (
-                candidate
-                / "scripts"
-                / "installation-context"
-                / "installation_context.py"
+                candidate / "scripts" / "installation-context" / helper_name
             ).is_file()
         ),
         None,
@@ -554,21 +602,38 @@ def _selected_runtime_root(
             f"COPILOT_EXTENSIONS_CONTEXT is not in the durable receipt layout: "
             f"{pointer}"
         ) from error
-    command = [
-        sys.executable,
-        str(helper),
-        "resolve",
-        "--context",
-        str(pointer),
-        "--plugin-id",
-        target_name,
-        "--durable-home",
-        str(durable_home),
-    ]
-    if target_name == name:
-        command.extend(["--payload-root", str(plugin_dir)])
+    if os.name == "nt":
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if shell is None:
+            raise ValueError(
+                "PowerShell is required to validate installation context"
+            )
+        command = [
+            shell, "-NoProfile", "-File", str(helper), "resolve",
+            "-Context", str(pointer),
+            "-PluginId", target_name,
+            "-DurableHome", str(durable_home),
+        ]
+        if target_name == name:
+            command.extend(["-PayloadRoot", str(plugin_dir)])
+        else:
+            command.extend(["-ExpectedCellRoot", str(expected_cell_root)])
     else:
-        command.extend(["--expected-cell-root", str(expected_cell_root)])
+        command = [
+            sys.executable,
+            str(helper),
+            "resolve",
+            "--context",
+            str(pointer),
+            "--plugin-id",
+            target_name,
+            "--durable-home",
+            str(durable_home),
+        ]
+        if target_name == name:
+            command.extend(["--payload-root", str(plugin_dir)])
+        else:
+            command.extend(["--expected-cell-root", str(expected_cell_root)])
     child_environment = os.environ.copy()
     child_environment.pop("COPILOT_PLUGIN_ROOT", None)
     child_environment.pop("PYTHONPATH", None)
@@ -608,6 +673,463 @@ def _selected_runtime_root(
     return root, True
 
 
+def runtime_installation_context(
+    plugin_name: str,
+    plugin_dir: Path,
+) -> tuple[Path, Path] | None:
+    """Return the validated active namespaced receipt and plugin root, if any."""
+    resolution = resolve_runtime_installation(plugin_name, plugin_dir)
+    if resolution.context is None:
+        return None
+    return resolution.context, resolution.runtime_root
+
+
+@dataclass(frozen=True)
+class RuntimeInstallationResolution:
+    """One helper-authorized runtime root for reconciliation."""
+
+    runtime_root: Path
+    context: Path | None
+    actual_mode: str
+    desired_mode: str
+    status: str
+    reason: str
+
+
+def _legacy_runtime_resolution(
+    plugin_name: str,
+    *,
+    home: Path | None = None,
+    reason: str = "legacy-helper-absent",
+) -> RuntimeInstallationResolution:
+    return RuntimeInstallationResolution(
+        runtime_root=runtime_dir(plugin_name, home),
+        context=None,
+        actual_mode="legacy",
+        desired_mode="legacy",
+        status="ready",
+        reason=reason,
+    )
+
+
+def _installation_context_helper(
+    plugin_name: str,
+    plugin_dir: Path,
+) -> Path | None:
+    helper_dir = plugin_dir / "scripts" / "installation-context"
+    helper_py = helper_dir / "installation_context.py"
+    helper_ps1 = helper_dir / "installation-context.ps1"
+    if not helper_py.is_file() and not helper_ps1.is_file():
+        return None
+    required = helper_ps1 if os.name == "nt" else helper_py
+    if not required.is_file():
+        raise ValueError(
+            f"platform installation-context helper is missing for {plugin_name}"
+        )
+    return required
+
+
+def _run_installation_mode_helper(
+    plugin_name: str,
+    plugin_dir: Path,
+    helper: Path,
+    legacy_root: Path,
+    *,
+    context: Path | None,
+) -> dict[str, Any]:
+    durable_home = _home() / ".copilot-extensions"
+    common = {
+        "source_json": _CORE_SOURCE_JSON,
+        "marketplace_key": MARKETPLACE,
+        "plugin_id": plugin_name,
+        "payload_root": str(plugin_dir),
+        "copilot_home": str(_copilot_home()),
+        "durable_home": str(durable_home),
+        "legacy_root": str(legacy_root),
+        "expected_marketplace_id": CORE_MARKETPLACE_ID,
+        "expected_plugin_id": plugin_name,
+        "expected_payload_root": str(plugin_dir),
+    }
+    if os.name == "nt":
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if shell is None:
+            raise ValueError(
+                f"PowerShell is required to resolve installation mode for {plugin_name}"
+            )
+        command = [
+            shell,
+            "-NoProfile",
+            "-File",
+            str(helper),
+            "probe-legacy",
+            "-SourceJson",
+            common["source_json"],
+            "-MarketplaceKey",
+            common["marketplace_key"],
+            "-PluginId",
+            common["plugin_id"],
+            "-PayloadRoot",
+            common["payload_root"],
+            "-CopilotHome",
+            common["copilot_home"],
+            "-DurableHome",
+            common["durable_home"],
+            "-LegacyRoot",
+            common["legacy_root"],
+            "-ExpectedMarketplaceId",
+            common["expected_marketplace_id"],
+            "-ExpectedPluginId",
+            common["expected_plugin_id"],
+            "-ExpectedPayloadRoot",
+            common["expected_payload_root"],
+        ]
+        if context is not None:
+            command.extend(["-Context", str(context)])
+    else:
+        command = [
+            sys.executable,
+            str(helper),
+            "probe-legacy",
+            "--source-json",
+            common["source_json"],
+            "--marketplace-key",
+            common["marketplace_key"],
+            "--plugin-id",
+            common["plugin_id"],
+            "--payload-root",
+            common["payload_root"],
+            "--copilot-home",
+            common["copilot_home"],
+            "--durable-home",
+            common["durable_home"],
+            "--legacy-root",
+            common["legacy_root"],
+            "--expected-marketplace-id",
+            common["expected_marketplace_id"],
+            "--expected-plugin-id",
+            common["expected_plugin_id"],
+            "--expected-payload-root",
+            common["expected_payload_root"],
+        ]
+        if context is not None:
+            command.extend(["--context", str(context)])
+
+    child_environment = os.environ.copy()
+    for key in _RUNTIME_ENV_UNSET:
+        child_environment.pop(key, None)
+    try:
+        process = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=child_environment,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(
+            f"installation-mode resolution timed out for {plugin_name}"
+        ) from error
+    except OSError as error:
+        raise ValueError(
+            f"installation-mode resolver could not run for {plugin_name}: {error}"
+        ) from error
+    if process.returncode not in {0, 3}:
+        detail = " ".join(
+            (process.stderr.strip() or process.stdout.strip()).split()
+        )[:240]
+        suffix = f": {detail}" if detail else ""
+        raise ValueError(
+            f"installation-mode resolver failed for {plugin_name} "
+            f"(exit {process.returncode}){suffix}"
+        )
+    try:
+        result = json.loads(
+            process.stdout,
+            object_pairs_hook=_strict_json_object,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"installation-mode resolver returned invalid JSON for {plugin_name}"
+        ) from error
+    if not isinstance(result, dict):
+        raise ValueError(
+            f"installation-mode resolver returned a non-object for {plugin_name}"
+        )
+    allow_mutation = result.get("allowMutation")
+    if (
+        (process.returncode == 0 and allow_mutation is not True)
+        or (process.returncode == 3 and allow_mutation is not False)
+    ):
+        raise ValueError(
+            f"installation-mode resolver returned inconsistent mutation status "
+            f"for {plugin_name}"
+        )
+    return result
+
+
+def _path_field(
+    result: dict[str, Any],
+    field: str,
+    plugin_name: str,
+    *,
+    required: bool,
+) -> Path | None:
+    value = result.get(field)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError(
+            f"installation-mode resolver returned invalid {field} for {plugin_name}"
+        )
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError(
+            f"installation-mode resolver returned relative {field} for {plugin_name}"
+        )
+    return path
+
+
+def _select_runtime_installation(
+    plugin_name: str,
+    result: dict[str, Any],
+    *,
+    home: Path | None = None,
+) -> RuntimeInstallationResolution:
+    if (
+        result.get("schema") != _INSTALLATION_RESOLUTION_SCHEMA
+        or result.get("version") != 1
+    ):
+        raise ValueError(
+            f"installation-mode resolver returned an unsupported schema for {plugin_name}"
+        )
+    if result.get("pluginId") != plugin_name:
+        raise ValueError(
+            f"installation-mode resolver selected another plugin for {plugin_name}"
+        )
+
+    marketplace_id = result.get("marketplaceId")
+    status = result.get("status")
+    reason = result.get("reason")
+    actual_mode = result.get("actualMode")
+    desired_mode = result.get("desiredMode")
+    allow_mutation = result.get("allowMutation")
+    if status not in {
+        "ready",
+        "maintenance-blocked",
+        "foreign-environment",
+        "orphaned-transfer",
+        "revalidation-required",
+        "migration-required",
+        "deactivation-required",
+        "provenance-blocked",
+        "invalid",
+    }:
+        raise ValueError(
+            f"installation-mode resolver returned invalid status for {plugin_name}"
+        )
+    if not isinstance(reason, str) or not reason:
+        raise ValueError(
+            f"installation-mode resolver returned invalid reason for {plugin_name}"
+        )
+    if actual_mode not in {"legacy", "namespaced", None}:
+        raise ValueError(
+            f"installation-mode resolver returned invalid actualMode for {plugin_name}"
+        )
+    if desired_mode not in {"legacy", "namespaced", None}:
+        raise ValueError(
+            f"installation-mode resolver returned invalid desiredMode for {plugin_name}"
+        )
+    if not isinstance(allow_mutation, bool):
+        raise ValueError(
+            f"installation-mode resolver returned invalid allowMutation for {plugin_name}"
+        )
+
+    runtime_root = _path_field(
+        result,
+        "runtimeRoot",
+        plugin_name,
+        required=actual_mode is not None,
+    )
+    context = _path_field(
+        result,
+        "context",
+        plugin_name,
+        required=actual_mode == "namespaced",
+    )
+    legacy_root = runtime_dir(plugin_name, home)
+
+    legacy_allowed = (
+        actual_mode == "legacy"
+        and allow_mutation
+        and marketplace_id == CORE_MARKETPLACE_ID
+        and (
+            (status == "ready" and desired_mode == "legacy")
+            or status == "migration-required"
+        )
+    )
+    if legacy_allowed:
+        if runtime_root is None or not _same_path(runtime_root, legacy_root):
+            raise ValueError(
+                f"installation-mode resolver selected an unexpected legacy root "
+                f"for {plugin_name}"
+            )
+        return RuntimeInstallationResolution(
+            runtime_root=legacy_root,
+            context=None,
+            actual_mode=actual_mode,
+            desired_mode=desired_mode,
+            status=status,
+            reason=reason,
+        )
+
+    namespaced_allowed = (
+        actual_mode == "namespaced"
+        and status in {"ready", "deactivation-required"}
+    )
+    if namespaced_allowed:
+        if marketplace_id != CORE_MARKETPLACE_ID:
+            raise ValueError(
+                f"installation-mode resolver selected another marketplace for "
+                f"{plugin_name}"
+            )
+        expected_context = (
+            (home or _home())
+            / ".copilot-extensions"
+            / "marketplaces"
+            / CORE_MARKETPLACE_ID
+            / "plugins"
+            / plugin_name
+            / "install.json"
+        )
+        expected_root = expected_context.parent
+        if (
+            context is None
+            or runtime_root is None
+            or not _same_path(context, expected_context)
+            or not _same_path(runtime_root, expected_root)
+            or not context.is_file()
+            or not runtime_root.is_dir()
+        ):
+            raise ValueError(
+                f"installation-mode resolver selected an unexpected namespaced "
+                f"receipt or root for {plugin_name}"
+            )
+        return RuntimeInstallationResolution(
+            runtime_root=expected_root,
+            context=expected_context,
+            actual_mode=actual_mode,
+            desired_mode=desired_mode,
+            status=status,
+            reason=reason,
+        )
+
+    raise ValueError(
+        f"installation mode blocks runtime reconciliation for {plugin_name}: "
+        f"status={status}, reason={reason}"
+    )
+
+
+def resolve_runtime_installation(
+    plugin_name: str,
+    plugin_dir: Path,
+    *,
+    home: Path | None = None,
+) -> RuntimeInstallationResolution:
+    """Resolve the authoritative runtime root without activating any mode.
+
+    Plugins without installation-cell support keep their conventional legacy
+    root. Cell-aware plugins delegate desired/actual mode and mutation
+    authorization to their vendored installation-context helper. Legacy mode
+    requires no ``install.json`` receipt; namespaced mode requires the helper's
+    validated, exact receipt and root.
+    """
+    explicit = (
+        _explicit_context_target()
+        if plugin_name.startswith("agent-")
+        else None
+    )
+    eligibility = installation_cell_eligibility(plugin_name, plugin_dir)
+    if eligibility is False:
+        if explicit is not None and explicit[1].startswith("agent-"):
+            raise ValueError(
+                f"exact core installation context cannot authorize non-cell "
+                f"runtime {plugin_name}"
+            )
+        return _legacy_runtime_resolution(plugin_name, home=home)
+    if eligibility is None:
+        raise ValueError(
+            f"installation-cell eligibility is indeterminate for {plugin_name}"
+        )
+
+    helper = _installation_context_helper(plugin_name, plugin_dir)
+    if helper is None:
+        if explicit is not None and explicit[1].startswith("agent-"):
+            raise ValueError(
+                f"no trusted installation-context validator is available for "
+                f"{plugin_name}"
+            )
+        return _legacy_runtime_resolution(plugin_name, home=home)
+
+    context: Path | None = None
+    if explicit is not None:
+        pointer, target_name = explicit
+        if target_name == plugin_name:
+            context = pointer
+        else:
+            # Validate an exact core context before removing it from this
+            # plugin's helper invocation. A context for another plugin must not
+            # capture this plugin, but malformed core evidence still fails closed.
+            _selected_runtime_root(plugin_name, plugin_dir, home=home)
+
+    result = _run_installation_mode_helper(
+        plugin_name,
+        plugin_dir,
+        helper,
+        runtime_dir(plugin_name, home),
+        context=context,
+    )
+    return _select_runtime_installation(plugin_name, result, home=home)
+
+
+def runtime_installation_candidate(
+    plugin_name: str,
+    plugin_dir: Path,
+) -> tuple[Path, Path] | None:
+    """Return the helper-authorized namespaced receipt/root, if active."""
+    return runtime_installation_context(plugin_name, plugin_dir)
+
+
+def clean_runtime_installer_environment(
+    *,
+    base: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Return an installer environment without inherited runtime ownership."""
+    child_environment = dict(os.environ if base is None else base)
+    for key in _RUNTIME_ENV_UNSET:
+        child_environment.pop(key, None)
+    return child_environment
+
+
+def runtime_installer_environment(
+    plugin_name: str,
+    plugin_dir: Path,
+    *,
+    base: dict[str, str] | None = None,
+    home: Path | None = None,
+) -> tuple[dict[str, str], Path]:
+    """Build a clean installer environment and return the selected runtime root."""
+    child_environment = clean_runtime_installer_environment(base=base)
+    resolution = resolve_runtime_installation(
+        plugin_name,
+        plugin_dir,
+        home=home,
+    )
+    if resolution.context is not None:
+        child_environment["COPILOT_EXTENSIONS_CONTEXT"] = str(resolution.context)
+    return child_environment, resolution.runtime_root
+
+
 # Hook shims deployed to ``~/.agent-worktrees/bin/`` by install.ps1's
 # ``Deploy-Wrappers`` (and install.sh). These deploy INDEPENDENTLY of the
 # runtime version: a payload can add a new shim (e.g. ``resolve-runtime.ps1``,
@@ -623,9 +1145,10 @@ HOOK_SHIM_FILES = (
     "register-session.ps1", "register-session.sh",
     "deregister-session.ps1", "deregister-session.sh",
     "anchor-hygiene-check.ps1", "anchor-hygiene-check.sh",
-    "marketplace-overrides.ps1", "marketplace-overrides.sh",
     "provision-check.ps1", "provision-check.sh",
     "statelessness_guard.py", "cross_repo_guard.py", "anchor_write_guard.py",
+    "pr_supersede_guard.py",
+    "registry_root.py",
 )
 
 
@@ -706,7 +1229,12 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def runtime_running_version(name: str, home: Path | None = None) -> str | None:
+def runtime_running_version(
+    name: str,
+    home: Path | None = None,
+    *,
+    root: Path | None = None,
+) -> str | None:
     """Version the *running* runtime reported on boot, if its pid is still alive.
 
     Reads ``~/.<plugin>/running-version.json`` (``{version, pid, started_at}``),
@@ -716,7 +1244,8 @@ def runtime_running_version(name: str, home: Path | None = None) -> str | None:
     the truthful "what is actually serving" signal -- a live daemon can lag its
     installed plugin while the on-disk manifest already matches (dotfiles #533).
     """
-    data = _read_json(runtime_dir(name, home) / "running-version.json")
+    selected_root = root or runtime_dir(name, home)
+    data = _read_json(selected_root / "running-version.json")
     if not data:
         return None
     ver = data.get("version")
@@ -765,8 +1294,6 @@ def running_version_lag(repo_dir: Path) -> list[dict[str, Any]]:
         except Exception:
             continue
     return lags
-
-
 def _zero_downtime_update(plugin_dir: Path) -> bool:
     """Whether the plugin supports a zero-downtime in-place update (#533 Part B).
 
@@ -776,9 +1303,11 @@ def _zero_downtime_update(plugin_dir: Path) -> bool:
     """
     data = _read_json(plugin_dir / "plugin.json") or {}
     return bool(data.get("zeroDowntimeUpdate"))
-
-
-def runtime_installer_argv(plugin_dir: Path) -> tuple[str, list[str]] | None:
+def runtime_installer_argv(
+    plugin_dir: Path,
+    *,
+    context: Path | None = None,
+) -> tuple[str, list[str]] | None:
     """Build the (display, argv) to deploy/update a plugin's runtime.
 
     Prefers ``scripts/install.{sh,ps1} update``; falls back to
@@ -787,12 +1316,67 @@ def runtime_installer_argv(plugin_dir: Path) -> tuple[str, list[str]] | None:
 
     A plugin that supports a zero-downtime redeploy declares
     ``"zeroDowntimeUpdate": true`` in its plugin.json; the reconcile-driven
-    ``install.ps1 update`` then carries ``-ZeroDowntime`` so a routine version
-    bump updates in place and hands off via the ZDD cutover (`agent-bridge
-    deploy`) rather than a stop-and-swap (#533 Part B). An operator's manual
-    ``update`` never passes the flag, so its behavior is unchanged.
+    installer update then carries the platform's compatibility flag
+    (``-ZeroDowntime`` on PowerShell, ``--zero-downtime`` on POSIX). The flag
+    is now a deprecated no-op because the installer auto-detects and performs
+    the live cutover whenever it can, but reconcile still passes it so older
+    shipped installers keep their historical contract.
     """
     scripts = plugin_dir / "scripts"
+    if context is not None:
+        manifest = _read_json(plugin_dir / "plugin.json") or {}
+        plugin_name = manifest.get("name")
+        if plugin_name != "agent-machines":
+            raise ValueError(
+                f"namespaced runtime transaction is unavailable for "
+                f"{plugin_name or plugin_dir.name}"
+            )
+        try:
+            durable_home = context.parents[4]
+        except IndexError as error:
+            raise ValueError(
+                f"installation context is outside the durable receipt layout: "
+                f"{context}"
+            ) from error
+        if platform.system() == "Windows":
+            installer = scripts / "init.ps1"
+            if not installer.is_file():
+                return None
+            shell = shutil.which("pwsh") or shutil.which("powershell")
+            if shell is None:
+                raise ValueError(
+                    "PowerShell is required for namespaced runtime provisioning"
+                )
+            argv = [
+                shell,
+                "-File",
+                str(installer),
+                "-Action",
+                "cell-provision",
+                "-Context",
+                str(context),
+                "-ExpectedMarketplaceId",
+                CORE_MARKETPLACE_ID,
+                "-DurableHome",
+                str(durable_home),
+            ]
+        else:
+            installer = scripts / "init.sh"
+            if not installer.is_file():
+                return None
+            argv = [
+                "bash",
+                str(installer),
+                "cell-provision",
+                "--context",
+                str(context),
+                "--expected-marketplace-id",
+                CORE_MARKETPLACE_ID,
+                "--durable-home",
+                str(durable_home),
+            ]
+        return " ".join(argv), argv
+
     zero_downtime = _zero_downtime_update(plugin_dir)
     if platform.system() == "Windows":
         order = (("install.ps1", True), ("init.ps1", False))
@@ -800,8 +1384,7 @@ def runtime_installer_argv(plugin_dir: Path) -> tuple[str, list[str]] | None:
             p = scripts / fname
             if p.is_file():
                 argv = ["pwsh", "-File", str(p)] + (["update"] if has_update else [])
-                if has_update and zero_downtime:
-                    argv.append("-ZeroDowntime")
+                if has_update and zero_downtime: argv.append("-ZeroDowntime")
                 return " ".join(argv), argv
         return None
     order = (("install.sh", True), ("init.sh", False))
@@ -809,8 +1392,332 @@ def runtime_installer_argv(plugin_dir: Path) -> tuple[str, list[str]] | None:
         p = scripts / fname
         if p.is_file():
             argv = ["bash", str(p)] + (["update"] if has_update else [])
+            if has_update and zero_downtime and posix_zero_downtime_flag_supported(plugin_dir):
+                argv.append("--zero-downtime")
             return " ".join(argv), argv
     return None
+
+def runtime_uninstall_argv(
+    plugin_dir: Path, *, dry_run: bool = False
+) -> tuple[str, list[str]] | None:
+    """Build the (display, argv) to remove a plugin's deployed runtime.
+
+    Unlike :func:`runtime_installer_argv`, this **never** falls back to
+    ``init.{sh,ps1}`` -- an idempotent bootstrap script, not an uninstaller.
+    Invoking it with an unsupported ``uninstall`` action would misfire. Only
+    ``scripts/install.{sh,ps1} uninstall`` is a recognized uninstall action;
+    a plugin whose runtime deploys only via ``init.*`` has none, and the
+    caller (:func:`build_uninstall_plan`) surfaces that as a diagnostic
+    rather than silently skipping it.
+
+    No purge/remove-config flag is ever appended: every plugin's own
+    ``uninstall`` action already preserves its durable state/history/DB by
+    default (only an explicit ``-Purge``/``--purge`` opt-in deletes that), so
+    the default sweep only removes executables, autorun registrations, and
+    recomputable runtime state -- matching the harness's "guaranteed, legible
+    teardown" intent (visions/stateless-harness/plugins).
+
+    ``dry_run=True`` appends each installer's own real preview switch
+    (``-DryRun`` on PowerShell, ``--dry-run`` on bash) -- not a guess: every
+    uninstall-capable plugin's ``uninstall`` action supports it, walking the
+    same code paths and reporting what it would remove/preserve without
+    touching anything, so this is safe to actually execute for a validated
+    preview rather than merely displaying the argv.
+    """
+    scripts = plugin_dir / "scripts"
+    if platform.system() == "Windows":
+        p = scripts / "install.ps1"
+        if p.is_file():
+            argv = ["pwsh", "-File", str(p), "uninstall"]
+            if dry_run:
+                argv.append("-DryRun")
+            return " ".join(argv), argv
+        return None
+    p = scripts / "install.sh"
+    if p.is_file():
+        argv = ["bash", str(p), "uninstall"]
+        if dry_run:
+            argv.append("--dry-run")
+        return " ".join(argv), argv
+    return None
+
+
+def dtssh_host_uninstall_argv(
+    agent_ssh_dir: Path, *, dry_run: bool = False
+) -> tuple[str, list[str]] | None:
+    """Build the (display, argv) to remove the dtssh Startup-folder host listener.
+
+    ``agent-ssh``'s own ``scripts/install.{sh,ps1} uninstall`` removes only the
+    core agent-ssh runtime; it does NOT cascade into the separate dtssh
+    transport's ``transports/dtssh/scripts/install-host.{ps1,sh}``, which is
+    what actually creates the ``agent-ssh-dtssh-host.lnk`` Startup-folder
+    autorun (or the POSIX host launcher). Both scripts' own ``uninstall``
+    action is idempotent/``Test-Path``-guarded, so it is safe to invoke even
+    when the dtssh host was never installed. Returns ``None`` only when the
+    script itself is missing from the payload (nothing to cascade to).
+
+    ``dry_run=True`` appends the same real preview switch as
+    :func:`runtime_uninstall_argv` (see there for why executing it is safe).
+    """
+    host_scripts = agent_ssh_dir / "transports" / "dtssh" / "scripts"
+    if platform.system() == "Windows":
+        p = host_scripts / "install-host.ps1"
+        if p.is_file():
+            argv = ["pwsh", "-File", str(p), "uninstall"]
+            if dry_run:
+                argv.append("-DryRun")
+            return " ".join(argv), argv
+        return None
+    p = host_scripts / "install-host.sh"
+    if p.is_file():
+        argv = ["bash", str(p), "uninstall"]
+        if dry_run:
+            argv.append("--dry-run")
+        return " ".join(argv), argv
+    return None
+
+
+def discover_core_payload_dirs() -> list[tuple[str, Path]]:
+    """List every installed core copilot-extensions marketplace plugin payload.
+
+    Unlike :func:`read_enabled_plugins`, this is **not** scoped to any repo's
+    ``enabledPlugins`` -- an uninstall sweep must find a plugin whose runtime a
+    repo has since stopped enabling too (disabling a plugin does not, by
+    itself, remove its already-deployed runtime/autorun state). Excludes
+    ``agent-worktrees`` itself, which has its own top-level ``uninstall`` verb
+    (:func:`cmd_uninstall` in ``__main__``).
+    """
+    base = _copilot_home() / "installed-plugins" / MARKETPLACE
+    if not base.is_dir():
+        return []
+    out: list[tuple[str, Path]] = []
+    for d in sorted(base.iterdir()):
+        if not d.is_dir() or d.name == SELF_PLUGIN:
+            continue
+        if (d / "plugin.json").is_file():
+            out.append((d.name, d))
+    return out
+
+
+def build_uninstall_plan(
+    *, home: Path | None = None, dry_run: bool = False
+) -> dict[str, Any]:
+    """Return a sweep plan to remove every deployed core plugin runtime.
+
+    Symmetric counterpart to :func:`build_plan`, but for teardown rather than
+    reconciliation: it discovers every core-marketplace plugin payload
+    actually installed on this machine (:func:`discover_core_payload_dirs`)
+    and, for each with evidence of a deployed runtime (a
+    ``deploy-manifest.json``), builds the ``argv`` to invoke that plugin's own
+    ``uninstall`` action. The discovery predicate is deliberately **not**
+    gated on ``runtimeScope`` -- that field governs whether the reconciler
+    proactively installs/updates a runtime, not whether one is deployed.
+    Several plugins (``agent-ssh``, historically) declare ``runtimeScope:
+    "none"`` (self-provisioned lazily / not reconciler-managed) yet still
+    deploy a real runtime that needs the same teardown; gating discovery on
+    scope would silently skip them.
+
+    A plugin whose runtime deploys only via an idempotent ``init.*`` bootstrap
+    script (no ``install.{sh,ps1}``, e.g. ``agent-containers``, ``agent-mcp``,
+    ``agent-machines``) has no supported uninstall action; it is surfaced as a
+    ``diagnostics`` entry (reason ``uninstall-unsupported``), never silently
+    skipped -- callers asked for an inventory, and a sweep that quietly leaves
+    a known runtime behind is the exact failure this exists to prevent.
+
+    ``agent-ssh`` gets one additional cascaded step: its own ``uninstall``
+    does not remove the separate dtssh transport's Startup-folder host
+    listener (see :func:`dtssh_host_uninstall_argv`), so that step is appended
+    whenever agent-ssh's runtime is in the plan.
+
+    Known gap (deliberately out of scope for this sweep, not silently
+    dropped): ``wsl-setup``'s ``WSL-Keepalive-Ubuntu`` scheduled task is
+    installed via ``skills/setting-up-wsl/references/wsl-keepalive.ps1``, not
+    the ``install.{sh,ps1}``/``deploy-manifest.json`` convention this sweep is
+    built on, so it never appears in ``discover_core_payload_dirs``'
+    deploy-manifest evidence; it is reported as a ``diagnostics`` entry
+    (reason ``manual-cleanup-required``) pointing at that script's own
+    ``uninstall`` action.
+
+    ``dry_run=True`` builds every step's argv with each installer's own real
+    ``-DryRun``/``--dry-run`` preview switch appended (see
+    :func:`runtime_uninstall_argv`) -- safe to actually execute, since every
+    covered plugin's uninstall action walks the same code paths under that
+    switch without touching the filesystem, scheduled tasks, or services.
+    """
+    updates: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+
+    for name, pdir in discover_core_payload_dirs():
+        if runtime_deployed_version(name, home=home) is None:
+            continue
+        try:
+            runtime_env, _selected_runtime_root = runtime_installer_environment(
+                name, pdir, home=home
+            )
+        except ValueError as error:
+            diagnostics.append({
+                "service": name,
+                "phase": "uninstall",
+                "reason": "installation-context-invalid",
+                "message": str(error),
+            })
+            continue
+        built = runtime_uninstall_argv(pdir, dry_run=dry_run)
+        if built is None:
+            diagnostics.append({
+                "service": name,
+                "phase": "uninstall",
+                "reason": "uninstall-unsupported",
+                "message": (
+                    f"{name}'s runtime deploys only via an init bootstrap "
+                    "script (no install.{sh,ps1} uninstall action available)"
+                ),
+            })
+            continue
+        cmd, argv = built
+        updates.append({
+            "service": name,
+            "phase": "uninstall",
+            "command": cmd,
+            "argv": argv,
+            "environment": {
+                key: runtime_env[key]
+                for key in ("COPILOT_EXTENSIONS_CONTEXT",)
+                if key in runtime_env
+            },
+            "unset_environment": list(_RUNTIME_ENV_UNSET),
+        })
+        if name == "agent-ssh":
+            extra = dtssh_host_uninstall_argv(pdir, dry_run=dry_run)
+            if extra is not None:
+                dcmd, dargv = extra
+                updates.append({
+                    "service": "agent-ssh:dtssh-host",
+                    "phase": "uninstall",
+                    "command": dcmd,
+                    "argv": dargv,
+                })
+            else:
+                diagnostics.append({
+                    "service": "agent-ssh:dtssh-host",
+                    "phase": "uninstall",
+                    "reason": "dtssh-host-script-missing",
+                    "message": (
+                        "agent-ssh's own uninstall does not remove the dtssh "
+                        "Startup-folder host listener, and "
+                        "transports/dtssh/scripts/install-host.{ps1,sh} was "
+                        "not found in this payload"
+                    ),
+                })
+
+    wsl_setup_dir = core_installed_payload_dir("wsl-setup")
+    if wsl_setup_dir is not None:
+        diagnostics.append({
+            "service": "wsl-setup",
+            "phase": "uninstall",
+            "reason": "manual-cleanup-required",
+            "message": (
+                "wsl-setup's WSL-Keepalive-Ubuntu scheduled task is installed "
+                "via skills/setting-up-wsl/references/wsl-keepalive.ps1, not "
+                "the install.{sh,ps1}/deploy-manifest.json convention this "
+                "sweep discovers; run that script's own 'uninstall' action "
+                "directly to remove it"
+            ),
+        })
+
+    result: dict[str, Any] = {
+        "action": "uninstall" if updates else "continue",
+        "updates": updates,
+    }
+    if diagnostics:
+        result["diagnostics"] = diagnostics
+    return result
+
+
+def apply_uninstall_plan(
+    *,
+    home: Path | None = None,
+    dry_run: bool = False,
+    log: Callable[[str], None] | None = None,
+    runner: Callable[[Sequence[str]], int] | None = None,
+) -> dict[str, Any]:
+    """Execute :func:`build_uninstall_plan` **in-process**.
+
+    Mirrors :func:`apply_plan`'s single-pass execution shape (a step failure
+    is logged and the sweep continues; nothing here raises for a bad step),
+    but for one pass only -- uninstall has no "freshly installed payload"
+    second-pass concern. Returns ``{"action": "uninstall"|"continue",
+    "executed": [...]}`` plus any ``diagnostics`` from the plan.
+
+    ``dry_run=True`` (the CLI's ``--verify`` mode) executes each covered
+    plugin's own real ``-DryRun``/``--dry-run`` preview instead of the actual
+    removal -- safe by construction (see :func:`build_uninstall_plan`), so
+    this validates the plan against live system state without mutating
+    anything. ``dry_run=False`` (the default -- the CLI's ``--apply``) is the
+    real, mutating uninstall.
+    """
+    _log = log or (lambda _m: None)
+
+    def _default_runner(argv: Sequence[str], update: dict[str, Any]) -> int:
+        child_environment = os.environ.copy()
+        for key in update.get("unset_environment", _RUNTIME_ENV_UNSET):
+            child_environment.pop(str(key), None)
+        for key, value in update.get("environment", {}).items():
+            child_environment[str(key)] = str(value)
+        proc = subprocess.run(  # noqa: S603 -- argv from our own plan builder
+            list(argv),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=child_environment,
+        )
+        if proc.stdout:
+            for line in proc.stdout.splitlines():
+                _log(f"    {line}")
+        return proc.returncode
+
+    plan = build_uninstall_plan(home=home, dry_run=dry_run)
+    for diagnostic in plan.get("diagnostics", []):
+        _log(
+            "uninstall: "
+            f"{diagnostic.get('service', '?')} "
+            f"[{diagnostic.get('reason', 'diagnostic')}] "
+            f"{diagnostic.get('message', '')}".rstrip()
+        )
+
+    executed: list[dict[str, Any]] = []
+    for upd in plan.get("updates", []):
+        service = upd.get("service", "?")
+        argv = list(upd.get("argv") or [])
+        if not argv:
+            continue
+        _log(f"uninstall: {service} -> {' '.join(argv)}")
+        try:
+            rc = runner(argv) if runner is not None else _default_runner(argv, upd)
+        except Exception as exc:  # never raise from a best-effort sweep
+            _log(f"uninstall: step FAILED for {service}: {exc}")
+            executed.append({
+                "service": service,
+                "argv": argv,
+                "ok": False,
+                "error": str(exc),
+            })
+            continue
+        ok = rc == 0
+        if not ok:
+            _log(f"uninstall: step for {service} exited {rc}")
+        executed.append({
+            "service": service,
+            "argv": argv,
+            "ok": ok,
+            "returncode": rc,
+        })
+
+    return {
+        "action": plan.get("action", "continue"),
+        "executed": executed,
+        "diagnostics": plan.get("diagnostics", []),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -1017,91 +1924,6 @@ def build_plan(
     gate_present = gate_manifest_present(repo_dir)
     updates: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
-    try:
-        explicit_context = _explicit_context_target()
-    except ValueError as error:
-        return {
-            "action": "continue",
-            "machine": machine,
-            "diagnostics": [{
-                "service": "*",
-                "phase": "runtime",
-                "reason": "installation-context-invalid",
-                "message": str(error),
-            }],
-        }
-    validated_context: tuple[str, Path] | None = None
-    if explicit_context is not None:
-        _pointer, target_name = explicit_context
-        if not target_name.startswith("agent-"):
-            explicit_context = None
-        else:
-            target_dir = core_installed_payload_dir(target_name)
-            if target_dir is None:
-                return {
-                    "action": "continue",
-                    "machine": machine,
-                    "diagnostics": [{
-                        "service": target_name,
-                        "phase": "runtime",
-                        "reason": "installation-context-payload-missing",
-                        "message": (
-                            "the explicitly selected context cannot be validated "
-                            "because its plugin payload is not installed"
-                        ),
-                    }],
-                }
-            target_eligibility = installation_cell_eligibility(
-                target_name,
-                target_dir,
-            )
-            if target_eligibility is False:
-                explicit_context = None
-            elif target_eligibility is None:
-                return {
-                    "action": "continue",
-                    "machine": machine,
-                    "diagnostics": [{
-                        "service": target_name,
-                        "phase": "runtime",
-                        "reason": "installation-context-invalid",
-                        "message": (
-                            "installation-cell eligibility is indeterminate "
-                            f"for {target_name}"
-                        ),
-                    }],
-                }
-    if explicit_context is not None:
-        target_name = explicit_context[1]
-        target_dir = core_installed_payload_dir(target_name)
-        assert target_dir is not None
-        try:
-            selected_root, context_selected = _selected_runtime_root(
-                target_name, target_dir
-            )
-        except ValueError as error:
-            return {
-                "action": "continue",
-                "machine": machine,
-                "diagnostics": [{
-                    "service": target_name,
-                    "phase": "runtime",
-                    "reason": "installation-context-invalid",
-                    "message": str(error),
-                }],
-            }
-        if not context_selected:
-            return {
-                "action": "continue",
-                "machine": machine,
-                "diagnostics": [{
-                    "service": target_name,
-                    "phase": "runtime",
-                    "reason": "installation-context-invalid",
-                    "message": "validated context did not select its named plugin",
-                }],
-            }
-        validated_context = (target_name, selected_root)
 
     for name in names:
         entry: dict[str, Any] = plugins_cache.setdefault(name, {})
@@ -1129,12 +1951,6 @@ def build_plan(
 
         pver = payload_version(pdir)
         entry["payload_version"] = pver
-        if validated_context is not None and validated_context[0] == name:
-            selected_root = validated_context[1]
-            context_selected = True
-        else:
-            selected_root = runtime_dir(name)
-            context_selected = False
 
         # Throttled payload refresh (network / MARKETPLACE PULL). Same rule as
         # payload-missing above: the Picker/operator update flow owns it; the
@@ -1159,39 +1975,26 @@ def build_plan(
         if scope != "none" and runtime_allowed(
             scope, name, machine, gate, gate_present=gate_present
         ):
-            rdep = runtime_deployed_version(
-                name,
-                root=selected_root if context_selected else None,
-            )
-            rrun = (
-                None
-                if context_selected
-                else runtime_running_version(name)
-            )
+            try:
+                runtime_env, selected_runtime_root = runtime_installer_environment(
+                    name, pdir
+                )
+            except ValueError as error:
+                diagnostics.append({
+                    "service": name,
+                    "phase": "runtime",
+                    "reason": "installation-context-invalid",
+                    "message": str(error),
+                })
+                continue
+            rdep = runtime_deployed_version(name, root=selected_runtime_root)
+            rrun = runtime_running_version(name, root=selected_runtime_root)
             # Prefer the *running* version when a live service reports one, so a
             # daemon that lags its installed plugin is healed even though the
             # on-disk manifest already matches the payload (dotfiles #533). No
             # running-version.json (or a dead pid) -> fall back to on-disk.
             rver = rrun if rrun is not None else rdep
             if pver is None or not _versions_equal(rver, pver):
-                if context_selected:
-                    diagnostics.append({
-                        "service": name,
-                        "phase": "runtime",
-                        "reason": (
-                            "context-runtime-missing"
-                            if rver is None
-                            else "context-runtime-version-drift"
-                        ),
-                        "from_version": rver,
-                        "to_version": pver,
-                        "runtime_root": str(selected_root),
-                        "message": (
-                            "namespaced runtime inspection is read-only until "
-                            "activation governance and context-aware installers land"
-                        ),
-                    })
-                    continue
                 # Monotonic guard (#1366): never redeploy a payload that is
                 # strictly OLDER than the running/deployed build -- doing so would
                 # REVERT a newer local `source: local` deploy toward a stale /
@@ -1200,7 +2003,23 @@ def build_plan(
                 # (rver is None) and forward/ambiguous cases still deploy.
                 if _version_lt(pver, rver):
                     continue
-                built = runtime_installer_argv(pdir)
+                try:
+                    built = runtime_installer_argv(
+                        pdir,
+                        context=(
+                            Path(runtime_env["COPILOT_EXTENSIONS_CONTEXT"])
+                            if "COPILOT_EXTENSIONS_CONTEXT" in runtime_env
+                            else None
+                        ),
+                    )
+                except ValueError as error:
+                    diagnostics.append({
+                        "service": name,
+                        "phase": "runtime",
+                        "reason": "installation-context-unsupported",
+                        "message": str(error),
+                    })
+                    continue
                 if built is not None:
                     cmd, argv = built
                     if rver is None:
@@ -1219,6 +2038,12 @@ def build_plan(
                         "scope": scope,
                         "command": cmd,
                         "argv": argv,
+                        "environment": {
+                            key: runtime_env[key]
+                            for key in ("COPILOT_EXTENSIONS_CONTEXT",)
+                            if key in runtime_env
+                        },
+                        "unset_environment": list(_RUNTIME_ENV_UNSET),
                     })
 
     if save:
@@ -1266,10 +2091,12 @@ def apply_plan(
     """
     _log = log or (lambda _m: None)
 
-    def _default_runner(argv: Sequence[str]) -> int:
+    def _default_runner(argv: Sequence[str], update: dict[str, Any]) -> int:
         child_environment = os.environ.copy()
-        child_environment.pop("COPILOT_PLUGIN_ROOT", None)
-        child_environment.pop("PYTHONPATH", None)
+        for key in update.get("unset_environment", _RUNTIME_ENV_UNSET):
+            child_environment.pop(str(key), None)
+        for key, value in update.get("environment", {}).items():
+            child_environment[str(key)] = str(value)
         proc = subprocess.run(  # noqa: S603 -- argv from our own plan builder
             list(argv),
             stdout=subprocess.PIPE,
@@ -1282,7 +2109,27 @@ def apply_plan(
                 _log(f"    {line}")
         return proc.returncode
 
-    run = runner or _default_runner
+    def _custom_runner(argv: Sequence[str], update: dict[str, Any]) -> int:
+        assert runner is not None
+        keys = {
+            str(key)
+            for key in update.get("unset_environment", _RUNTIME_ENV_UNSET)
+        }
+        keys.update(str(key) for key in update.get("environment", {}))
+        saved = {key: os.environ.get(key) for key in keys}
+        try:
+            for key in update.get("unset_environment", _RUNTIME_ENV_UNSET):
+                os.environ.pop(str(key), None)
+            for key, value in update.get("environment", {}).items():
+                os.environ[str(key)] = str(value)
+            return runner(argv)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     executed: list[dict[str, Any]] = []
     final_action = "continue"
 
@@ -1319,7 +2166,11 @@ def apply_plan(
                 argv[0] = copilot
             _log(f"provision: {service} [{upd.get('reason', '?')}] -> {' '.join(argv)}")
             try:
-                rc = run(argv)
+                rc = (
+                    _custom_runner(argv, upd)
+                    if runner is not None
+                    else _default_runner(argv, upd)
+                )
             except Exception as exc:  # never raise from a background provision
                 _log(f"provision: step FAILED for {service}: {exc}")
                 executed.append({

@@ -1,11 +1,19 @@
 import { readFileSync, watch } from "node:fs";
 import { dirname } from "node:path";
 import {
-  writeJsonAtomic, runCli, consumeFileHandoff, consumeDispatchHandoffTask,
+  writeJsonAtomic, runCli, consumeFileHandoff, consumeDispatchHandoffTask, describeCliError,
 } from "./handoff-core.mjs";
 import { prepareNativeGoal, acknowledgeNativeGoal, activateNativeGoal } from "./native-goal.mjs";
 import { readNativeGoal } from "./native-transport.mjs";
-import { retireHerdrPredecessor } from "./herdr.mjs";
+import { observationBrief } from "./native-observation.mjs";
+import { retireHerdrPredecessor, workerLifecycle, advertiseWorkerLifecycle } from "./herdr.mjs";
+
+export function describeNativeStartupError(error, checkpointPath) {
+  const detail = describeCliError(error);
+  return checkpointPath
+    ? `Native restoration failed: ${detail}. Predecessor preserved.`
+    : `Worker lifecycle registration failed: ${detail}. Managed worker launch is unavailable; no handoff restoration was attempted.`;
+}
 
 export function nativeCheckpoint(path, sessionId) {
   const record = JSON.parse(readFileSync(path, "utf8"));
@@ -69,7 +77,7 @@ export function bindNativeSuccessor(record, sessionId, execute = runCli) {
     "bind-session", "--session-id", sessionId,
     "--worktree-id", record.worktree, "--handoff-token", record.handoffId,
   ], { cwd: record.worktreeDir, timeout: 30000 }));
-  if (!bound.bound || bound.head_session !== sessionId || bound.session !== sessionId) {
+  if (!bound.bound || bound.head_session !== sessionId || bound.handoff_token !== record.handoffId) {
     throw new Error("Native successor is not the acknowledged worktree head; predecessor preserved.");
   }
 }
@@ -105,20 +113,24 @@ async function waitForNativeLaunch(path, sessionId) {
 
 export async function bootstrapNativeHandoff(session, env = process.env) {
   const path = env.CONTEXT_HANDOFF_NATIVE_CHECKPOINT;
-  if (!path) return null;
+  if (!path) {
+    advertiseWorkerLifecycle(session.sessionId, runCli);
+    return null;
+  }
   const candidate = JSON.parse(readFileSync(path, "utf8"));
   // Native --resume briefly opens an unused startup session before attaching
   // the requested identity. It is not a handoff consumer.
   if (candidate.nativeGoal?.successorSessionId !== session.sessionId) return null;
+  if (candidate.nativeGoal.workerLifecycle) advertiseWorkerLifecycle(session.sessionId, runCli);
   await waitForNativeLaunch(path, session.sessionId);
   const record = nativeCheckpoint(path, session.sessionId);
   const goal = record.nativeGoal;
+  await waitForNativeAgentSelection(session, goal);
+  await assertNativeProfile(session, goal);
   if (goal.admissionComplete) {
     retireNativePredecessor(path, session.sessionId);
     return { preparing: false, path };
   }
-  await waitForNativeAgentSelection(session, goal);
-  await assertNativeProfile(session, goal);
   const adapter = {
     goal, session,
     readState: () => readNativeGoal(session.sessionId),
@@ -140,12 +152,14 @@ export async function bootstrapNativeHandoff(session, env = process.env) {
   // Admission is deterministic. A model asked to "only consume" can still
   // execute the brief before ownership or budget admission has completed.
   await session.rpc.workspaces.createFile({
-    path: "context-handoff.md", content: record.promptText,
+    path: "context-handoff.md", content: observationBrief(record),
   });
-  const consumed = record.storage === "agent-dispatch"
-    ? consumeDispatchHandoffTask(goal.cwd, record.taskId || record.handoffId, session.sessionId, true)
-    : consumeFileHandoff(goal.cwd, session.sessionId, record.handoffId, record.handoffPath);
-  if (!consumed.ok) throw new Error(consumed.message);
+  if (goal.consumedBySession !== session.sessionId) {
+    const consumed = record.storage === "agent-dispatch"
+      ? consumeDispatchHandoffTask(goal.cwd, record.taskId || record.handoffId, session.sessionId, true)
+      : consumeFileHandoff(goal.cwd, session.sessionId, record.handoffId, record.handoffPath);
+    if (!consumed.ok) throw new Error(consumed.message);
+  }
   await continueNativeAfterAdmission(session, path);
   return { preparing: false, path };
 }
@@ -201,7 +215,7 @@ export async function continueNativeAfterAdmission(session, path, {
   if (!activation) return;
   goal = {
     ...goal, continuationRequested: true,
-    continuationPrompt: `${activation.prompt}\n\nHandoff continuation ${record.handoffId}:\n\n${record.promptText}`,
+    continuationPrompt: `${activation.prompt}\n\nHandoff continuation ${record.handoffId}:\n\n${observationBrief(record)}`,
   };
   saveNativeCheckpoint(path, session.sessionId, goal);
   const messageId = await session.send({
@@ -218,30 +232,36 @@ export async function continueNativeAfterAdmission(session, path, {
 export function retireNativePredecessor(path, sessionId) {
   const record = nativeCheckpoint(path, sessionId);
   const goal = record.nativeGoal;
-  if (goal.retired) return;
+  if (goal.retired) {
+    if (goal.workerLifecycle && !goal.workerLifecycleRetired) {
+      workerLifecycle(record, path, "handoff-retired", sessionId, runCli);
+      writeJsonAtomic(path, { ...record, nativeGoal: { ...goal, workerLifecycleRetired: true } });
+    }
+    return;
+  }
   if (!record.consumed || goal.hydratedBySession !== sessionId
     || (goal.intent === "running" && !goal.continuationObserved)) {
     throw new Error("Native handoff admission is incomplete; predecessor preserved.");
   }
+  if (goal.workerLifecycle) workerLifecycle(record, path, "handoff-commit", sessionId, runCli);
   writeJsonAtomic(path, { ...record, nativeGoal: { ...goal, admissionComplete: true } });
   if (record.predecessor?.transport === "herdr") {
-    const retired = retireHerdrPredecessor(record, sessionId, runCli);
-    writeJsonAtomic(path, { ...record, nativeGoal: { ...goal, admissionComplete: true, retired } });
-  } else if (goal.launchTransport === "mux") {
-    // This fork uses explicit token binding and retirement, not the upstream
-    // signal-only monitor. A candidate pane is never sufficient admission.
-    bindNativeSuccessor(record, sessionId);
-    const launch = goal.launch;
-    if (!launch?.old_pane || !launch.session) {
-      throw new Error("Native mux predecessor identity is unavailable; predecessor preserved.");
-    }
-    const retired = JSON.parse(runCli("agent-worktrees", [
-      "handoff-cutover", "--retire-pane", launch.old_pane,
-      "--session-id", record.sessionId, "--worktree-id", record.worktree,
-      "--mux-session", launch.session, "--require-mux-identity",
-      "--successor-verified", "--retire-reason", "native-handoff-admission",
-    ], { cwd: goal.cwd, timeout: 30000 }));
-    if (!retired.ok) throw new Error("Native mux predecessor retirement did not succeed.");
+    const retired = retireHerdrPredecessor(record, sessionId, runCli, path);
     writeJsonAtomic(path, { ...record, nativeGoal: { ...goal, admissionComplete: true, retired } });
   }
+  if (goal.workerLifecycle) {
+    const retired = nativeCheckpoint(path, sessionId);
+    workerLifecycle(retired, path, "handoff-retired", sessionId, runCli);
+    writeJsonAtomic(path, { ...retired, nativeGoal: { ...retired.nativeGoal, workerLifecycleRetired: true } });
+  }
+}
+
+export function recordNativeReceiverFailure(path, sessionId, error) {
+  const record = nativeCheckpoint(path, sessionId);
+  writeJsonAtomic(path, {
+    ...record, nativeGoal: {
+      ...record.nativeGoal,
+      receiverFailure: { message: error.message, phase: record.nativeGoal.phase, at: new Date().toISOString() },
+    },
+  });
 }

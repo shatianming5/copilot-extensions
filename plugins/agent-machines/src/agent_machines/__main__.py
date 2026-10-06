@@ -8,6 +8,11 @@ Verbs:
 * ``plan``     -- read-only restore plan (managed surfaces + drift key)
 * ``validate`` -- run the conflict validator over the package union
 * ``restore``  -- converge the machine (``--dry-run`` prints the plan; apply lands in #4006)
+* ``self-update`` -- run unattended watchdog / sweep tiers
+* ``fleet-update`` -- run the unattended daily worktree-manager update sweep
+* ``bootstrap-killswitch`` -- pause/resume every plugin's sessionStart
+  reconcile at once (for hand-diagnosing a venv/install)
+* ``provision-playwright-cli`` -- converge the machine-local Playwright CLI workspace
 * ``capture`` / ``prune`` -- harvest / GC verbs (issue #4006)
 """
 
@@ -18,18 +23,32 @@ import json
 import sys
 from pathlib import Path
 
-from . import __version__
+from . import cli_fleet_update
 from . import discover as _discover
+from . import identity as _identity
+from . import killswitch_cli
 from . import layout as _layout
+from . import playwright_cli as _playwright_cli
 from . import reconcile as _reconcile
+from . import resources as _resources
+from . import self_update as _self_update
+from . import self_update_state as _self_update_state
 from . import validator as _validator
 from .manifest import ManifestError, RequirementPackage
 from .surfaces._common import SurfaceStateError
 
 
-def _collect_all_packages(machine: str) -> list[RequirementPackage]:
+def _collect_all_packages(
+    machine: str,
+    accepted_machines: tuple[str, ...] | None = None,
+) -> list[RequirementPackage]:
     packages: list[RequirementPackage] = []
-    for repo in _discover.discover(machine):
+    repos = (
+        _discover.discover(machine, accepted_machines=accepted_machines)
+        if accepted_machines is not None
+        else _discover.discover(machine)
+    )
+    for repo in repos:
         packages.extend(repo.packages)
     return packages
 
@@ -37,19 +56,23 @@ def _collect_all_packages(machine: str) -> list[RequirementPackage]:
 def _collect_reconcile_packages(
     args: argparse.Namespace,
     machine: str,
+    accepted_machines: tuple[str, ...] | None = None,
 ) -> tuple[list[RequirementPackage], str]:
     """Select the package scope shared by plan, validate, and restore."""
     if getattr(args, "all_projects", False):
-        return _collect_all_packages(machine), "all-projects"
+        packages = (
+            _collect_all_packages(machine, accepted_machines)
+            if accepted_machines is not None
+            else _collect_all_packages(machine)
+        )
+        return packages, "all-projects"
     selector = getattr(args, "repo", None)
     if selector:
         candidate = _discover.resolve_registered_repo(selector)
         if candidate is not None:
             repo_name, repo_path = candidate
             if not repo_path.is_dir():
-                raise ManifestError(
-                    f"registered repo {repo_name!r} is unavailable at {repo_path}"
-                )
+                raise ManifestError(f"registered repo {repo_name!r} is unavailable at {repo_path}")
             repo_anchor = repo_path
         else:
             repo_path = Path(selector).expanduser()
@@ -60,9 +83,7 @@ def _collect_reconcile_packages(
             try:
                 repo_name, repo_path, repo_anchor = _layout.resolve_cwd_repo(repo_path)
             except _layout.NotGitRepositoryError as exc:
-                raise ManifestError(
-                    f"repo path {selector!r} is not a Git repository"
-                ) from exc
+                raise ManifestError(f"repo path {selector!r} is not a Git repository") from exc
     else:
         repo_name, repo_path, repo_anchor = _layout.resolve_cwd_repo()
         project_repos = _discover.project_scope_repos(
@@ -87,6 +108,7 @@ def _collect_reconcile_packages(
                         candidate.name,
                         machine,
                         source_anchor=repo_anchor if index == 0 else candidate.path,
+                        accepted_machines=accepted_machines,
                     )
                 )
             scope_kind = "project" if len(project_repos) > 1 else "repo"
@@ -97,19 +119,50 @@ def _collect_reconcile_packages(
             repo_name,
             machine,
             source_anchor=repo_anchor,
+            accepted_machines=accepted_machines,
         ),
         f"repo:{repo_name}",
     )
 
 
+def _resolve_machine_identity(args: argparse.Namespace) -> _identity.MachineIdentity:
+    topology_repos: list[Path] = []
+    selector = getattr(args, "repo", None)
+    if selector:
+        registered = _discover.resolve_registered_repo(selector)
+        if registered is not None:
+            topology_repos.append(registered[1])
+        else:
+            candidate = Path(selector).expanduser()
+            if candidate.is_dir():
+                topology_repos.append(candidate)
+    else:
+        topology_repos.extend(candidate.path for candidate in _discover.candidate_repos())
+        try:
+            topology_repos.append(_layout.resolve_cwd_repo()[1])
+        except _layout.NotGitRepositoryError:
+            pass
+    return _identity.resolve_machine(
+        getattr(args, "machine", None),
+        topology_repos=topology_repos,
+    )
+
+
+def _emit_identity_warnings(identity: _identity.MachineIdentity) -> None:
+    for warning in identity.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+
+
 def _cmd_version(_args: argparse.Namespace) -> int:
+    from . import __version__
+
     print(f"agent-machines {__version__}")
     return 0
 
 
 def _cmd_discover(args: argparse.Namespace) -> int:
+    identity = _resolve_machine_identity(args)
     if args.json:
-        machine = args.machine or _discover.current_machine()
         out = [
             {
                 "repo": r.name,
@@ -117,26 +170,60 @@ def _cmd_discover(args: argparse.Namespace) -> int:
                 "enabled": r.enabled,
                 "packages": [p.name for p in r.packages],
             }
-            for r in _discover.discover(machine)
+            for r in _discover.discover(
+                identity.canonical,
+                accepted_machines=identity.accepted,
+            )
         ]
-        print(json.dumps({"machine": machine, "repos": out}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "machine": identity.canonical,
+                    "machine_raw": identity.raw,
+                    "machine_aliases": list(identity.accepted),
+                    "machine_identity_warnings": list(identity.warnings),
+                    "repos": out,
+                },
+                indent=2,
+            )
+        )
         return 0
-    return _discover._main()
+    _emit_identity_warnings(identity)
+    return _discover._main(
+        machine=identity.canonical,
+        accepted_machines=identity.accepted,
+        raw_machine=identity.raw,
+    )
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
-    machine = args.machine or _discover.current_machine()
-    reports = _layout.inspect_layouts(machine, repo=args.repo)
+    identity = _resolve_machine_identity(args)
+    machine = identity.canonical
+    reports = _layout.inspect_layouts(
+        machine,
+        repo=args.repo,
+        accepted_machines=identity.accepted,
+    )
     ok = all(report.ok for report in reports)
     if args.json:
-        print(json.dumps({
-            "machine": machine,
-            "ok": ok,
-            "repos": [report.to_dict() for report in reports],
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "machine": machine,
+                    "machine_raw": identity.raw,
+                    "machine_aliases": list(identity.accepted),
+                    "machine_identity_warnings": list(identity.warnings),
+                    "ok": ok,
+                    "repos": [report.to_dict() for report in reports],
+                },
+                indent=2,
+            )
+        )
         return 0 if ok else 1
 
     print(f"doctor for {machine}")
+    for warning in identity.warnings:
+        print(f"  [advisory] machine-topology: {warning}")
     if not reports:
         print("  no adopted repos found")
         return 0
@@ -167,12 +254,25 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
 
 
 def _cmd_plan(args: argparse.Namespace) -> int:
-    machine = args.machine or _discover.current_machine()
-    packages, scope = _collect_reconcile_packages(args, machine)
-    plan = _reconcile.plan(packages, machine)
+    identity = _resolve_machine_identity(args)
+    _emit_identity_warnings(identity)
+    machine = identity.canonical
+    packages, scope = _collect_reconcile_packages(
+        args,
+        machine,
+        identity.accepted,
+    )
+    plan = _reconcile.plan(
+        packages,
+        machine,
+        accepted_machines=identity.accepted,
+    )
     if args.json:
         payload = _reconcile.plan_to_dict(plan)
         payload["scope"] = scope
+        payload["machine_raw"] = identity.raw
+        payload["machine_aliases"] = list(identity.accepted)
+        payload["machine_identity_warnings"] = list(identity.warnings)
         print(json.dumps(payload, indent=2))
         return 0
     print(f"plan for {machine} [{scope}]  (drift-key {plan.drift_key})")
@@ -186,17 +286,32 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         owners = ", ".join(removal["contributors"])
         print(f"    - enabledPlugins.{removal['item']}  <- {owners}")
     for mod in plan.modules:
-        print(f"  module  {mod['name']}  <- {mod['source_repo']}")
+        print(
+            f"  module  {mod['name']}  "
+            f"[authority {mod['authority']}; {mod['authority_mode']}]  "
+            f"<- {mod['source_repo']}:{mod['package']}"
+        )
     for res in plan.resources:
         owners = ", ".join(res.get("contributors", []))
         print(f"  resource {res['type']}:{res['id']}  [{res['summary']}]  <- {owners}")
+    _print_authority_decisions(plan.authority_decisions)
     return 0
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:
-    machine = args.machine or _discover.current_machine()
-    packages, scope = _collect_reconcile_packages(args, machine)
-    resolved = _reconcile.resolve_union(packages, machine)
+    identity = _resolve_machine_identity(args)
+    _emit_identity_warnings(identity)
+    machine = identity.canonical
+    packages, scope = _collect_reconcile_packages(
+        args,
+        machine,
+        identity.accepted,
+    )
+    resolved = _reconcile.resolve_union(
+        packages,
+        machine,
+        identity.accepted,
+    )
     findings = _validator.validate(resolved, machine)
     if args.json:
         print(json.dumps([f.__dict__ for f in findings], indent=2))
@@ -212,8 +327,13 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 def _cmd_installer_readiness(args: argparse.Namespace) -> int:
     from .installer_readiness import emit, evaluate
 
-    machine = args.machine or _discover.current_machine()
-    return emit(evaluate(_layout.inspect_layouts(machine)))
+    identity = _resolve_machine_identity(args)
+    _emit_identity_warnings(identity)
+    reports = _layout.inspect_layouts(
+        identity.canonical,
+        accepted_machines=identity.accepted,
+    )
+    return emit(evaluate(reports))
 
 
 def _fmt_val(v: object) -> str:
@@ -221,11 +341,42 @@ def _fmt_val(v: object) -> str:
     return s if len(s) <= 80 else s[:77] + "..."
 
 
+def _print_authority_decisions(decisions: list[dict[str, object]]) -> None:
+    for decision in decisions:
+        identity = decision["identity"]
+        if isinstance(identity, dict):
+            key = ":".join(
+                [str(identity.get("type", ""))] + [str(item) for item in identity.get("key", [])]
+            )
+            label = f"{key}.{identity.get('field', '')}"
+        else:
+            label = str(identity)
+        selected = ", ".join(
+            f"{item['source_repo']}:{item['package']}@{item['authority']}"
+            for item in decision.get("selected", [])
+        )
+        superseded = ", ".join(
+            f"{item['source_repo']}:{item['package']}@{item['authority']}"
+            for item in decision.get("superseded", [])
+        )
+        print(f"  authority {decision['domain']} {label}: {selected} supersedes {superseded}")
+
+
 def _cmd_restore(args: argparse.Namespace) -> int:
-    machine = args.machine or _discover.current_machine()
+    identity = _resolve_machine_identity(args)
+    _emit_identity_warnings(identity)
+    machine = identity.canonical
     dry_run = not args.apply
-    packages, scope = _collect_reconcile_packages(args, machine)
-    resolved = _reconcile.resolve_union(packages, machine)
+    packages, scope = _collect_reconcile_packages(
+        args,
+        machine,
+        identity.accepted,
+    )
+    resolved = _reconcile.resolve_union(
+        packages,
+        machine,
+        identity.accepted,
+    )
     findings = _validator.validate(resolved, machine)
     if _validator.has_errors(findings):
         print("restore refused: validator reported errors:", file=sys.stderr)
@@ -240,17 +391,23 @@ def _cmd_restore(args: argparse.Namespace) -> int:
             machine,
             dry_run=dry_run,
             only=args.only,
+            maintenance_safe=args.maintenance_safe,
+            accepted_machines=identity.accepted,
         )
-    except SurfaceStateError as exc:
+    except (_reconcile.RestoreValidationError, SurfaceStateError) as exc:
         print(f"restore refused: {exc}", file=sys.stderr)
         return 1
     if args.json:
         payload = _reconcile.restore_result_to_dict(result)
         payload["scope"] = scope
+        payload["machine_raw"] = identity.raw
+        payload["machine_aliases"] = list(identity.accepted)
+        payload["machine_identity_warnings"] = list(identity.warnings)
         print(json.dumps(payload, indent=2))
         return 0 if result.ok else 2
     header = "DRY-RUN (preview only; re-run with --apply to make changes)" if dry_run else "APPLY"
     print(f"restore [{header}] for {machine} [{scope}]  (drift-key {result.plan.drift_key})")
+    _print_authority_decisions(result.plan.authority_decisions)
 
     if not result.surface_results:
         print("  surfaces: none")
@@ -280,6 +437,10 @@ def _cmd_restore(args: argparse.Namespace) -> int:
         label = f"{r.type}:{r.id}"
         if r.status == "error":
             print(f"  resource {label}: ERROR {r.detail}", file=sys.stderr)
+        elif r.blocked_reason:
+            print(f"  resource {label}: BLOCKED ({r.blocked_reason})", file=sys.stderr)
+            if r.detail:
+                print(f"      {r.detail}", file=sys.stderr)
         elif r.deferred_reason:
             print(f"  resource {label}: deferred ({r.deferred_reason})")
             if r.detail:
@@ -307,15 +468,209 @@ def _cmd_restore(args: argparse.Namespace) -> int:
     for r in result.module_results:
         if r.ran:
             status = "ok" if r.returncode == 0 else f"FAILED rc={r.returncode}"
-            print(f"  module {r.name} <- {r.source_repo}: {status}")
+            owner = f"{r.source_repo}:{r.package}" if r.package else r.source_repo
+            print(
+                f"  module {r.name} <- {owner}: {status} "
+                f"[authority {r.authority}; {r.authority_mode}]"
+            )
             if show_output and r.stdout_tail:
                 for line in r.stdout_tail.rstrip().splitlines():
                     print(f"      {line}")
             if r.returncode not in (0, None) and r.stderr_tail:
                 print(f"      {r.stderr_tail.strip().splitlines()[-1]}", file=sys.stderr)
         else:
-            print(f"  module {r.name} <- {r.source_repo}: skipped ({r.skipped_reason})")
+            owner = f"{r.source_repo}:{r.package}" if r.package else r.source_repo
+            print(
+                f"  module {r.name} <- {owner}: skipped ({r.skipped_reason}) "
+                f"[authority {r.authority}; {r.authority_mode}]"
+            )
     return 0 if result.ok else 2
+
+
+def _self_update_packages(
+    machine: str,
+    accepted_machines: tuple[str, ...] | None = None,
+) -> list[RequirementPackage]:
+    return (
+        _collect_all_packages(machine, accepted_machines)
+        if accepted_machines is not None
+        else _collect_all_packages(machine)
+    )
+
+
+def _resolve_self_update_resources(
+    args: argparse.Namespace,
+) -> tuple[_identity.MachineIdentity, str, dict[str, object]] | None:
+    identity = _resolve_machine_identity(args)
+    _emit_identity_warnings(identity)
+    machine = identity.canonical
+    packages = _self_update_packages(machine, identity.accepted)
+    resolved = _reconcile.resolve_union(packages, machine, identity.accepted)
+    findings = _validator.validate(resolved, machine)
+    if _validator.has_errors(findings):
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "validator reported errors",
+                        "findings": [f.__dict__ for f in findings],
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print("self-update refused: validator reported errors:", file=sys.stderr)
+            for finding in findings:
+                if finding.level == "error":
+                    print(f"  {finding.code}: {finding.message}", file=sys.stderr)
+        return None
+    resolved_resources, _ = _resources.resolve_resources(
+        resolved,
+        machine,
+        _discover.current_platform(),
+    )
+    return (
+        identity,
+        machine,
+        _self_update_state.selected_tiers_from_resolved(resolved_resources),
+    )
+
+
+def _selected_self_update_tiers(args: argparse.Namespace) -> list[str]:
+    selected = getattr(args, "tier", None)
+    if not selected:
+        return sorted(_self_update.TIER_SPECS)
+    return list(dict.fromkeys(selected))
+
+
+def _cmd_self_update_run(args: argparse.Namespace) -> int:
+    resolved_state = _resolve_self_update_resources(args)
+    if resolved_state is None:
+        return 1
+    identity, machine, selected_resources = resolved_state
+    resource = selected_resources.get(args.tier)
+    result = _self_update.run_tier(
+        args.tier,
+        opted_in=_self_update_state.tier_enabled(resource),
+        machine=machine,
+        discovered_repos=(
+            _discover.discover(
+                machine,
+                accepted_machines=identity.accepted,
+            )
+            if args.tier == _self_update_state.SWEEP_TIER
+            else None
+        ),
+    )
+    if args.json:
+        print(json.dumps(result.to_dict(), indent=2))
+    else:
+        print(_self_update.format_result(result))
+    return 0 if result.ok else 2
+
+
+def _cmd_self_update_install(args: argparse.Namespace) -> int:
+    resolved_state = _resolve_self_update_resources(args)
+    if resolved_state is None:
+        return 1
+    _identity, _machine, selected_resources = resolved_state
+    results = []
+    for tier in _selected_self_update_tiers(args):
+        resource = selected_resources.get(tier)
+        if not _self_update_state.tier_enabled(resource):
+            results.append(
+                _self_update.ScheduledTaskReconcileResult(
+                    tier=tier,
+                    desired_state="absent",
+                    status="skipped",
+                    changed=False,
+                    detail=f"tier {tier!r} is not opted in",
+                )
+            )
+            continue
+        results.append(
+            _self_update.reconcile_scheduled_task(
+                tier,
+                desired_present=True,
+                machine=_machine,
+            )
+        )
+    if args.json:
+        payload = {
+            "ok": all(result.ok for result in results),
+            "tiers": [r.to_dict() for r in results],
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        for result in results:
+            print(f"{result.tier}: {result.status}")
+            print(f"  {result.detail}")
+    return 0 if all(result.ok or result.status == "skipped" for result in results) else 2
+
+
+def _cmd_self_update_status(args: argparse.Namespace) -> int:
+    resolved_state = _resolve_self_update_resources(args)
+    if resolved_state is None:
+        return 1
+    _identity, _machine, selected_resources = resolved_state
+    results = []
+    for tier in _selected_self_update_tiers(args):
+        resource = selected_resources.get(tier)
+        results.append(
+            _self_update.scheduled_task_status(
+                tier,
+                opted_in=_self_update_state.tier_enabled(resource),
+                machine=_machine,
+            )
+        )
+    if args.json:
+        print(
+            json.dumps(
+                {"ok": True, "tiers": [result.to_dict() for result in results]},
+                indent=2,
+            )
+        )
+    else:
+        for result in results:
+            print(
+                f"{result.tier}: opted-in={'yes' if result.opted_in else 'no'}; "
+                f"registered={'yes' if result.registered else 'no'}; "
+                f"matching={'yes' if result.matching else 'no'}"
+            )
+            print(f"  {result.detail}")
+            if result.last_attempt:
+                print(f"  last-attempt: {result.last_attempt}")
+            if result.last_success:
+                print(f"  last-success: {result.last_success}")
+    return 0
+
+
+def _cmd_self_update_uninstall(args: argparse.Namespace) -> int:
+    machine = _resolve_machine_identity(args).canonical
+    results = [
+        _self_update.reconcile_scheduled_task(
+            tier,
+            desired_present=False,
+            machine=machine,
+        )
+        for tier in _selected_self_update_tiers(args)
+    ]
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "ok": all(result.ok for result in results),
+                    "tiers": [r.to_dict() for r in results],
+                },
+                indent=2,
+            )
+        )
+    else:
+        for result in results:
+            print(f"{result.tier}: {result.status}")
+            print(f"  {result.detail}")
+    return 0 if all(result.ok or result.status == "skipped" for result in results) else 2
 
 
 def _cmd_todo(args: argparse.Namespace) -> int:
@@ -323,9 +678,63 @@ def _cmd_todo(args: argparse.Namespace) -> int:
     return 2
 
 
+def _cmd_provision_playwright_cli(args: argparse.Namespace) -> int:
+    result = _playwright_cli.provision_playwright_cli(apply=args.apply)
+    if args.json:
+        print(json.dumps(result.to_dict(), indent=2))
+        return 0 if result.ok else 2
+
+    label = "APPLY" if args.apply else "DRY-RUN"
+    print(f"provision-playwright-cli [{label}] in {result.home}")
+    for action in result.actions:
+        print(f"  {action.status}: {' '.join(action.argv)}")
+    if not result.actions and result.ok:
+        print("  up-to-date")
+    if result.error is not None:
+        print(f"provision-playwright-cli failed: {result.error}", file=sys.stderr)
+        for command in result.commands:
+            print(
+                f"  command (exit {command.returncode}): {' '.join(command.argv)}",
+                file=sys.stderr,
+            )
+            if command.stdout_tail:
+                print("  stdout:", file=sys.stderr)
+                print(command.stdout_tail, file=sys.stderr)
+            if command.stderr_tail:
+                print("  stderr:", file=sys.stderr)
+                print(command.stderr_tail, file=sys.stderr)
+        return 2
+    return 0
+
+
+class _LazyVersionAction(argparse.Action):
+    """Defer ``__version__`` resolution until ``--version`` is actually
+    passed, instead of eagerly formatting it into every parser build
+    (argparse's own ``action="version"`` requires the finished string up
+    front, forcing the ``importlib.metadata`` lookup on every invocation
+    regardless of subcommand)."""
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS,
+                 default=argparse.SUPPRESS, help=None):
+        super().__init__(
+            option_strings=option_strings, dest=dest, default=default,
+            nargs=0, help=help,
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        from . import __version__
+
+        parser._print_message(f"agent-machines {__version__}\n", sys.stdout)
+        parser.exit()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-machines", description=__doc__)
-    parser.add_argument("--version", action="version", version=f"agent-machines {__version__}")
+    parser.add_argument(
+        "--version",
+        action=_LazyVersionAction,
+        help="show program's version number and exit",
+    )
     sub = parser.add_subparsers(dest="command")
 
     def add(name: str, func) -> argparse.ArgumentParser:
@@ -361,8 +770,8 @@ def _build_parser() -> argparse.ArgumentParser:
         scope.add_argument(
             "--repo",
             help="reconcile exactly one registered repo name or repository path "
-                 "(default: adopted project containing CWD plus its required "
-                 "supplemental repositories)",
+            "(default: adopted project containing CWD plus its required "
+            "supplemental repositories)",
         )
         scope.add_argument(
             "--all-projects",
@@ -377,12 +786,86 @@ def _build_parser() -> argparse.ArgumentParser:
     add("installer-readiness", _cmd_installer_readiness)
     restore = add("restore", _cmd_restore)
     add_reconcile_scope(restore)
-    restore.add_argument("--apply", action="store_true",
-                         help="make changes (default is a dry-run preview)")
-    restore.add_argument("--only", action="append", metavar="NAME",
-                         help="restrict to named surfaces/modules (repeatable)")
-    restore.add_argument("--verbose", "-v", action="store_true",
-                         help="show each module's captured output (shown by default in a dry-run)")
+    restore.add_argument(
+        "--apply", action="store_true", help="make changes (default is a dry-run preview)"
+    )
+    restore.add_argument(
+        "--only",
+        action="append",
+        metavar="NAME",
+        help="restrict to named surfaces/modules (repeatable)",
+    )
+    restore.add_argument(
+        "--maintenance-safe",
+        action="store_true",
+        help="limit resources to maintenance-safe declarations and pinned version realignment",
+    )
+    restore.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="show each module's captured output (shown by default in a dry-run)",
+    )
+    self_update = sub.add_parser(
+        "self-update",
+        help="Run or manage unattended self-update tiers.",
+    )
+    self_update.add_argument("--machine", help="override the target machine name")
+    self_update.add_argument("--json", action="store_true", help="emit JSON")
+    self_update_sub = self_update.add_subparsers(dest="self_update_command")
+    self_update_run = self_update_sub.add_parser(
+        "run",
+        help="Run one unattended self-update tier now.",
+    )
+    self_update_run.add_argument(
+        "--tier",
+        required=True,
+        choices=sorted(_self_update.TIER_SPECS),
+        help="the unattended self-update tier to run",
+    )
+    self_update_run.add_argument("--machine", help="override the target machine name")
+    self_update_run.add_argument("--json", action="store_true", help="emit JSON")
+    self_update_run.set_defaults(func=_cmd_self_update_run)
+    for subcommand, func, help_text in (
+        (
+            "install",
+            _cmd_self_update_install,
+            "Register opted-in self-update Scheduled Tasks.",
+        ),
+        (
+            "status",
+            _cmd_self_update_status,
+            "Inspect self-update opt-in and Scheduled Task state.",
+        ),
+        ("uninstall", _cmd_self_update_uninstall, "Remove self-update Scheduled Tasks."),
+    ):
+        current = self_update_sub.add_parser(subcommand, help=help_text)
+        current.add_argument(
+            "--tier",
+            action="append",
+            choices=sorted(_self_update.TIER_SPECS),
+            help="restrict to one unattended self-update tier (repeatable)",
+        )
+        current.add_argument("--machine", help="override the target machine name")
+        current.add_argument("--json", action="store_true", help="emit JSON")
+        current.set_defaults(func=func)
+    cli_fleet_update.register_parser(sub)
+    killswitch_cli.register_parser(sub)
+    playwright = sub.add_parser("provision-playwright-cli")
+    playwright.add_argument("--json", action="store_true", help="emit JSON")
+    playwright_mode = playwright.add_mutually_exclusive_group()
+    playwright_mode.add_argument(
+        "--dry-run",
+        dest="apply",
+        action="store_false",
+        help="query registry latest and preview required package or skill changes (default)",
+    )
+    playwright_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="converge the latest package and bundled skill tree",
+    )
+    playwright.set_defaults(func=_cmd_provision_playwright_cli, apply=False)
     for verb in ("capture", "prune"):
         p = add(verb, _cmd_todo)
         p.set_defaults(verb=verb)

@@ -34,10 +34,13 @@ for ((__legacy_i = 1; __legacy_i < ${#__legacy_args[@]}; __legacy_i++)); do
     fi
 done
 if [[ "$__legacy_action" != status &&
+      "$__legacy_action" != cell-provision &&
+      "$__legacy_action" != cell-recover &&
       "$__legacy_action" != slot-provision &&
       "$__legacy_action" != slot-validate &&
       "$__legacy_action" != slot-complete &&
-      "$__legacy_action" != slot-completion-validate ]]; then
+      "$__legacy_action" != slot-completion-validate &&
+      "$__legacy_action" != slot-cutover ]]; then
     LEGACY_PROBE="$SCRIPT_DIR/installation-context/legacy-entrypoint-probe.sh"
     if [[ ! -f "$LEGACY_PROBE" ]]; then
         _fail 'Legacy mutation probe is unavailable'
@@ -60,17 +63,23 @@ fi
 # Status and dependency-light cell-slot actions do not enter the self-stage
 # block that creates and reaps legacy staging directories.
 __skip_self_stage=0
-if [[ "$__legacy_action" == slot-provision ||
+if [[ "$__legacy_action" == cell-provision ||
+      "$__legacy_action" == cell-recover ||
+      "$__legacy_action" == slot-provision ||
       "$__legacy_action" == slot-validate ||
       "$__legacy_action" == slot-complete ||
-      "$__legacy_action" == slot-completion-validate ]]; then
+      "$__legacy_action" == slot-completion-validate ||
+      "$__legacy_action" == slot-cutover ]]; then
     cd "$HOME"
 fi
 if [[ ("$__legacy_action" == status ||
+       "$__legacy_action" == cell-provision ||
+       "$__legacy_action" == cell-recover ||
        "$__legacy_action" == slot-provision ||
        "$__legacy_action" == slot-validate ||
        "$__legacy_action" == slot-complete ||
-       "$__legacy_action" == slot-completion-validate) &&
+       "$__legacy_action" == slot-completion-validate ||
+       "$__legacy_action" == slot-cutover) &&
       -z "${COPILOT_PLUGIN_INSTALL_STAGED:-}" ]]; then
     if [[ "$__legacy_action" == status ]]; then
         export COPILOT_PLUGIN_INSTALL_STAGED=read-only-status
@@ -224,10 +233,20 @@ shift || true
 
 NO_SERVICE=0
 PURGE=0
+DRY_RUN=0
 INSTALL_DIR=""
 CONTEXT=""
 EXPECTED_MARKETPLACE_ID=""
 DURABLE_HOME=""
+ORIGIN_PAYLOAD_ROOT=""
+EXPECTED_NAMESPACE_GENERATION=""
+EXPECTED_INSTALL_GENERATION=""
+EXPECTED_CURRENT_VERSION=""
+EXPECT_CURRENT_ABSENT=0
+TARGET_PAYLOAD_ROOT=""
+TARGET_PAYLOAD_VERSION=""
+TARGET_SNAPSHOT_ID=""
+TARGET_RUNTIME_VERSION=""
 FORCE="${AGENT_INDEX_ALLOW_DOWNGRADE:-0}"
 [[ "$FORCE" == "1" ]] && FORCE=1 || FORCE=0
 while [[ $# -gt 0 ]]; do
@@ -235,10 +254,20 @@ while [[ $# -gt 0 ]]; do
         --no-service) NO_SERVICE=1; shift ;;
         --purge) PURGE=1; shift ;;
         --force) FORCE=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
         --install-dir) INSTALL_DIR="$2"; shift 2 ;;
         --context) CONTEXT="${2:-}"; shift 2 ;;
         --expected-marketplace-id) EXPECTED_MARKETPLACE_ID="${2:-}"; shift 2 ;;
         --durable-home) DURABLE_HOME="${2:-}"; shift 2 ;;
+        --origin-payload-root) ORIGIN_PAYLOAD_ROOT="${2:-}"; shift 2 ;;
+        --expected-namespace-generation) EXPECTED_NAMESPACE_GENERATION="${2:-}"; shift 2 ;;
+        --expected-install-generation) EXPECTED_INSTALL_GENERATION="${2:-}"; shift 2 ;;
+        --expected-current-version) EXPECTED_CURRENT_VERSION="${2:-}"; shift 2 ;;
+        --expect-current-absent) EXPECT_CURRENT_ABSENT=1; shift ;;
+        --target-payload-root) TARGET_PAYLOAD_ROOT="${2:-}"; shift 2 ;;
+        --target-payload-version) TARGET_PAYLOAD_VERSION="${2:-}"; shift 2 ;;
+        --target-snapshot-id) TARGET_SNAPSHOT_ID="${2:-}"; shift 2 ;;
+        --target-runtime-version) TARGET_RUNTIME_VERSION="${2:-}"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -254,6 +283,7 @@ STUB="$LOCAL_BIN/agent-index"
 SYSTEMD_UNIT="agent-index.service"
 UNIT_DIR="$HOME/.config/systemd/user"
 ENV_FILE="$INSTALL_DIR/service.env"
+SERVICE_LAUNCHER="$INSTALL_DIR/service.sh"
 
 # === engine-daemon: durable, persistent embedding-engine runtime =============
 # The heavy embedding stack (torch + transformers + sentence-transformers) lives
@@ -268,6 +298,7 @@ ENGINE_VENV="$ENGINE_HOME/.venv"
 ENGINE_VENV_PYTHON="$ENGINE_VENV/bin/python"
 ENGINE_ENV_FILE="$ENGINE_HOME/engine.env"
 ENGINE_SYSTEMD_UNIT="agent-index-engine.service"
+ENGINE_LAUNCHER="$ENGINE_HOME/engine.sh"
 # === end engine-daemon ======================================================
 
 # === install-contract:v3 versioned-venv (agent-index: .venv-as-symlink) ===
@@ -293,6 +324,83 @@ VENV_PYTHON="$VENV_DIR/bin/python"
 # created). LINK_DIR is kept ONLY to derive `--link-name` so activate/gc can still
 # find and REMOVE any pre-existing `.venv` link.
 LINK_PYTHON="$VENV_PYTHON"
+
+if [[ "$ACTION" == "cell-provision" ||
+      "$ACTION" == "cell-recover" ||
+      "$ACTION" == "slot-cutover" ]]; then
+    [[ -n "$CONTEXT" ]] || {
+        _fail "$ACTION requires --context; ambient COPILOT_EXTENSIONS_CONTEXT is not authorization"
+        exit 2
+    }
+    [[ -n "$EXPECTED_MARKETPLACE_ID" ]] || {
+        _fail "$ACTION requires --expected-marketplace-id"
+        exit 2
+    }
+    CELL_RUNTIME="$SCRIPT_DIR/cell-runtime.py"
+    [[ -f "$CELL_RUNTIME" ]] || {
+        _fail 'Installation-cell runtime coordinator is unavailable'
+        exit 1
+    }
+    CELL_PYTHON=""
+    for _candidate in python3 python; do
+        if command -v "$_candidate" >/dev/null 2>&1; then
+            CELL_PYTHON="$(command -v "$_candidate")"
+            break
+        fi
+    done
+    [[ -n "$CELL_PYTHON" ]] || {
+        _fail 'Python 3.10+ is required for installation-cell lifecycle actions'
+        exit 1
+    }
+    CELL_ARGS=(
+        "$CELL_RUNTIME"
+        "$ACTION"
+        --context "$CONTEXT"
+        --expected-marketplace-id "$EXPECTED_MARKETPLACE_ID"
+    )
+    if [[ -n "$DURABLE_HOME" ]]; then
+        CELL_ARGS+=(--durable-home "$DURABLE_HOME")
+    fi
+    if [[ "$ACTION" == "cell-provision" ]]; then
+        if [[ -n "$ORIGIN_PAYLOAD_ROOT" ]]; then
+            CELL_ARGS+=(--origin-payload-root "$ORIGIN_PAYLOAD_ROOT")
+        fi
+    elif [[ "$ACTION" == "slot-cutover" ]]; then
+        [[ -n "$EXPECTED_NAMESPACE_GENERATION" &&
+           -n "$EXPECTED_INSTALL_GENERATION" ]] || {
+            _fail 'slot-cutover requires expected namespace and install generations'
+            exit 2
+        }
+        [[ -n "$TARGET_PAYLOAD_ROOT" &&
+           -n "$TARGET_PAYLOAD_VERSION" &&
+           -n "$TARGET_SNAPSHOT_ID" &&
+           -n "$TARGET_RUNTIME_VERSION" ]] || {
+            _fail 'slot-cutover requires explicit target payload, snapshot, and runtime identity'
+            exit 2
+        }
+        if [[ "$EXPECT_CURRENT_ABSENT" -eq 1 && -n "$EXPECTED_CURRENT_VERSION" ]] ||
+           [[ "$EXPECT_CURRENT_ABSENT" -eq 0 && -z "$EXPECTED_CURRENT_VERSION" ]]; then
+            _fail 'slot-cutover requires exactly one current-version expectation'
+            exit 2
+        fi
+        CELL_ARGS+=(
+            --expected-namespace-generation "$EXPECTED_NAMESPACE_GENERATION"
+            --expected-install-generation "$EXPECTED_INSTALL_GENERATION"
+            --target-payload-root "$TARGET_PAYLOAD_ROOT"
+            --target-payload-version "$TARGET_PAYLOAD_VERSION"
+            --target-snapshot-id "$TARGET_SNAPSHOT_ID"
+            --target-runtime-version "$TARGET_RUNTIME_VERSION"
+        )
+        if [[ "$EXPECT_CURRENT_ABSENT" -eq 1 ]]; then
+            CELL_ARGS+=(--expect-current-absent)
+        else
+            CELL_ARGS+=(--expected-current-version "$EXPECTED_CURRENT_VERSION")
+        fi
+    fi
+    unset PYTHONPATH PYTHONHOME
+    cd "$PLUGIN_DIR" || exit 1
+    exec "$CELL_PYTHON" -I -X utf8 "${CELL_ARGS[@]}"
+fi
 
 if [[ "$ACTION" == "slot-provision" ||
       "$ACTION" == "slot-validate" ||
@@ -352,7 +460,7 @@ _versioned_activate() {
         _fail "Refusing to activate incomplete runtime slot versions/$SRC_VERSION"
         return 1
     fi
-    if ! "$py" -c 'import agent_index' >/dev/null 2>&1; then
+    if ! _runtime_origin_under "$py" "$VENV_DIR"; then
         _fail "Refusing to activate runtime slot versions/$SRC_VERSION because agent_index is not importable"
         return 1
     fi
@@ -410,7 +518,7 @@ _payload_hash() {
         local __sha_kind __kernel __work __before_index __before_state
         local __after_index __after_state __records __path __relative
         local __encoded __kind __metadata __size __count __total __fd
-        local __descriptor __opened __opened_after __current __file_digest
+        local __opened __opened_after __current __file_digest
         local __digest __find_fd __find_pid
         local LC_ALL=C
         [[ -d "$PLUGIN_DIR" && ! -L "$PLUGIN_DIR" ]] || {
@@ -467,6 +575,60 @@ _payload_hash() {
             [[ "${1%%|*}" == "regular file" ||
                "${1%%|*}" == "regular empty file" ||
                "${1%%|*}" == "Regular File" ]]
+        }
+        __payload_fstat() {
+            # A real fstat(2) on an already-open file descriptor, bypassing
+            # the path-based /dev/fd (or /proc/<pid>/fd) lookup entirely. On
+            # Darwin, `stat -L` on the synthetic /dev/fd/<n> devfs node does
+            # NOT behave like fstat(2): devfs can report its own device
+            # number for that node rather than passing through the real
+            # underlying file's device -- confirmed by a direct probe (type,
+            # inode, size, mtime, and ctime all matched a pathname read;
+            # only the device field differed). That harmless-looking
+            # mismatch false-positived "payload content changed during
+            # hashing" for an untouched file on every macOS install. Simply
+            # dropping the device field from the comparison would silently
+            # remove real replacement-race protection (inode numbers are
+            # only unique within one device, so a cross-filesystem swap with
+            # a matching inode could then pass undetected). Instead, redirect
+            # the inherited descriptor to this helper's own stdin so Python's
+            # os.fstat(0) inspects the SAME open file description and
+            # returns its REAL device/inode -- identical to a pathname read
+            # of the same untouched file on every platform, with no
+            # devfs/procfs layer in between.
+            local __fd="$1" __py
+            __py="$(_bootstrap_python)" || {
+                _fail "Cannot locate a Python interpreter for descriptor fstat verification"
+                return 1
+            }
+            "$__py" -c '
+import os, stat, sys
+st = os.fstat(0)
+if stat.S_ISDIR(st.st_mode):
+    kind = "Directory"
+elif stat.S_ISREG(st.st_mode):
+    kind = "Regular File"
+else:
+    kind = "Other"
+print(f"{kind}|{st.st_dev}|{st.st_ino}|{st.st_size}|{int(st.st_mtime)}|{int(st.st_ctime)}")
+' <&"$__fd"
+        }
+        __payload_descriptor_stat() {
+            # Stat an already-open descriptor in the SAME tuple format
+            # __payload_stat uses for a pathname read, so the two remain
+            # directly comparable with a plain string equality -- the real
+            # identity/mutation proof this function relies on. Linux's
+            # /proc/<pid>/fd/<n> entry already passes fstat(2)-equivalent
+            # values through a path lookup correctly (the macOS false
+            # positive this guards against never reproduced there), so keep
+            # that cheaper path-stat on Linux and reserve the real-fstat
+            # helper for Darwin, where it does not.
+            local __fd="$1"
+            if [[ "$__kernel" == Darwin ]]; then
+                __payload_fstat "$__fd"
+            else
+                __payload_stat "/proc/$BASHPID/fd/$__fd" true
+            fi
         }
         __payload_size() {
             local __rest="${1#*|}"
@@ -605,9 +767,7 @@ _payload_hash() {
                 _fail "Cannot open payload content: $__relative"
                 exit 1
             }
-            __descriptor="/proc/$BASHPID/fd/$__fd"
-            [[ -e "$__descriptor" ]] || __descriptor="/dev/fd/$__fd"
-            __opened="$(__payload_stat "$__descriptor" true)" || {
+            __opened="$(__payload_descriptor_stat "$__fd")" || {
                 exec {__fd}<&-
                 _fail "Cannot inspect opened payload content: $__relative"
                 exit 1
@@ -622,7 +782,7 @@ _payload_hash() {
                 shasum) __file_digest="$(shasum -a 256 <&"$__fd" | awk '{print $1}')" ;;
                 openssl) __file_digest="$(openssl dgst -sha256 <&"$__fd" | awk '{print $NF}')" ;;
             esac
-            __opened_after="$(__payload_stat "$__descriptor" true)" || true
+            __opened_after="$(__payload_descriptor_stat "$__fd")" || true
             exec {__fd}<&-
             __current="$(__payload_stat "$__path")" || true
             [[ "$__opened_after" == "$__opened" &&
@@ -803,6 +963,24 @@ _version_lt() {
     [[ "$lower" == "$a" ]]
 }
 
+_runtime_origin_under() {
+    local py="$1" slot="$2" origin="" origin_dir="" origin_abs="" slot_abs=""
+    [[ -x "$py" && -d "$slot" ]] || return 1
+    origin="$(
+        cd "$slot" &&
+        "$py" -I -X utf8 -c \
+            'from pathlib import Path; import agent_index; print(Path(agent_index.__file__).resolve())'
+    2>/dev/null)" || return 1
+    [[ -n "$origin" && -f "$origin" ]] || return 1
+    origin_dir="$(dirname "$origin")"
+    origin_abs="$(cd "$origin_dir" && pwd -P)/$(basename "$origin")" || return 1
+    slot_abs="$(cd "$slot" && pwd -P)" || return 1
+    case "$origin_abs" in
+        "$slot_abs"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 _downgrade_guard() {
     local installed source
     installed="$(_installed_version)" || return 0
@@ -914,6 +1092,75 @@ do_stamp() {
     _ok "Stamped: binstub on PATH; runtime provisions after explicit setup."
 }
 
+_install_server_venv() {
+    # agent-index-server-venv-split: provision a sibling SERVER venv inside
+    # the current runtime slot ($VENV_DIR/server), installing the full
+    # agent-index[store,server] package -- so `spawn_passive` (and, once its
+    # own dispatcher retarget lands, `cmd_start`/`cmd_cell_start`) can run the
+    # FastAPI/uvicorn/pydantic service from a venv separate from the
+    # client/orchestrator's own, keeping a pure client's install footprint
+    # light. This is the exact sibling path `config.server_venv_python()`
+    # already resolves (a `server` subdirectory of whichever directory
+    # contains the current interpreter's own `Scripts`/`bin` folder) --
+    # provisioning here just makes that existing, previously-inert resolver
+    # find something.
+    #
+    # Host role only: a client never runs the service, so it never needs this
+    # second venv. Provisioning failures are WARN, never FAIL --
+    # `config.server_venv_python()` already falls back to `None` (in-process
+    # `serve()`, or the shared venv for `spawn_passive`) when no sibling
+    # exists, so a failure here must never block the primary client
+    # install/update.
+    local install_role="$1" py="$2"
+    if [[ "$install_role" != "host" ]]; then
+        _skip 'Server venv: skipped (client role never runs the service)'
+        return 0
+    fi
+
+    local server_venv_dir="$VENV_DIR/server"
+    local server_venv_python="$server_venv_dir/bin/python3"
+    local have_uv=0
+    command -v uv >/dev/null 2>&1 && have_uv=1
+
+    if [[ ! -x "$server_venv_python" ]]; then
+        if [[ "$have_uv" -eq 1 ]]; then
+            uv venv "$server_venv_dir" --allow-existing >/dev/null 2>&1 \
+                || "$py" -m venv "$server_venv_dir" >/dev/null 2>&1
+        else
+            "$py" -m venv "$server_venv_dir" >/dev/null 2>&1
+        fi
+        if [[ ! -x "$server_venv_python" ]]; then
+            _warn "Server venv creation failed -- $server_venv_python not found (spawn_passive falls back to the shared venv)"
+            return 0
+        fi
+    fi
+
+    local zdd_dir
+    if zdd_dir="$(_resolve_zdd)"; then
+        if [[ "$have_uv" -eq 1 ]]; then
+            uv pip install --python "$server_venv_python" "$zdd_dir" --reinstall-package agent-zdd --refresh-package agent-zdd --quiet >/dev/null 2>&1
+        else
+            "$server_venv_python" -m pip install "$zdd_dir" >/dev/null 2>&1
+        fi || {
+            _warn "Server venv zdd install failed -- spawn_passive falls back to the shared venv"
+            return 0
+        }
+    fi
+
+    local srv_out
+    if [[ "$have_uv" -eq 1 ]]; then
+        srv_out="$(uv pip install --python "$server_venv_python" "${PLUGIN_DIR}[store,server]" 2>&1)"
+    else
+        srv_out="$("$server_venv_python" -m pip install "${PLUGIN_DIR}[store,server]" 2>&1)"
+    fi
+    if [[ $? -ne 0 ]]; then
+        _warn 'Server venv package install failed -- spawn_passive falls back to the shared venv'
+        printf '%s\n' "$srv_out" >&2
+        return 0
+    fi
+    _ok "Server venv provisioned: $server_venv_dir"
+}
+
 _ensure_runtime() {
     if [[ ! -d "$PKG_SRC_DIR" ]]; then
         _fail "Package source not found at $PKG_SRC_DIR"
@@ -941,7 +1188,7 @@ _ensure_runtime() {
         [[ -x "$active_python" ]] || active_python="$INSTALL_DIR/versions/$active_version/Scripts/python.exe"
         if [[ -x "$active_python" ]] \
             && "$active_python" "$SCRIPT_DIR/versioned_runtime.py" --root "$INSTALL_DIR" --link-name ".venv" is-complete "$active_version" >/dev/null 2>&1 \
-            && "$active_python" -c 'import agent_index' >/dev/null 2>&1; then
+            && _runtime_origin_under "$active_python" "$INSTALL_DIR/versions/$active_version"; then
             active_ready=1
         fi
         if [[ "$active_ready" == 0 ]]; then
@@ -962,7 +1209,7 @@ _ensure_runtime() {
         local slot_ready=0 vr="$SCRIPT_DIR/versioned_runtime.py"
         if [[ -x "$VENV_PYTHON" ]] \
             && "$VENV_PYTHON" "$vr" --root "$INSTALL_DIR" --link-name ".venv" is-complete "$SRC_VERSION" >/dev/null 2>&1 \
-            && "$VENV_PYTHON" -c 'import agent_index' >/dev/null 2>&1; then
+            && _runtime_origin_under "$VENV_PYTHON" "$VENV_DIR"; then
             slot_ready=1
         fi
         if [[ "$slot_ready" == 0 || "${AGENT_INDEX_REBUILD_CURRENT:-0}" == 1 ]]; then
@@ -1017,13 +1264,41 @@ _ensure_runtime() {
         exit 1
     fi
 
+    # agent-procutil is a `uv`-editable canonical reference in a dev
+    # checkout (vendor-pointer-generalization effort: no local copy at
+    # all) and not on PyPI -- pre-install it the same way as zdd above, so
+    # the non-uv (bare-pip) fallback below can still resolve it.
+    local procutil_dir
+    if procutil_dir="$(_resolve_vendored_lib agent-procutil)"; then
+        if [[ "$have_uv" -eq 1 ]]; then
+            uv pip install --python "$VENV_PYTHON" "$procutil_dir" --reinstall-package agent-procutil --refresh-package agent-procutil --quiet
+        else
+            "$VENV_PYTHON" -m pip install "$procutil_dir" >/dev/null
+        fi || {
+            _fail "agent-procutil install failed"
+            exit 1
+        }
+    fi
+
     _pip_install() {
-        # A client delegates over SSH and runs NO local store/engine, so it
-        # installs only the light base package; the host adds the [store] extra
-        # (lancedb/pyarrow/tree-sitter/numpy) it needs to read/write the index.
-        # Those have no Windows-ARM64 wheels and are unneeded on a client.
+        # A host runs the local indexing/vector-store stack and the FastAPI/
+        # uvicorn server, so it needs the [store,server] extras (numpy,
+        # pyarrow, lancedb, tree-sitter*, mcp, fastapi, uvicorn, pydantic); a
+        # client stays on the light base deps only (see
+        # agent-index-server-venv-split, which will eventually move [server]
+        # into its own dedicated per-version venv instead of this shared one).
+        # This is distinct from -- and must never pull in -- the durable
+        # agent-index-engine program (torch), which is provisioned exclusively
+        # by `engine`/`engine-update` (see durable-vs-versioned-runtime.md).
+        # Resolve role BEFORE the package install so a host's versioned venv
+        # actually carries what its own service/search/index code imports.
+        # _activation_role falls back to _machine_role, so this is correct
+        # even before any per-repo role config exists.
+        local install_role
+        install_role="$(_activation_role)"
+        [[ "$install_role" == "unconfigured" ]] && install_role="$(_machine_role)"
         local pkg="$PLUGIN_DIR"
-        [[ "$(_install_role)" == "host" ]] && pkg="$PLUGIN_DIR[store]"
+        [[ "$install_role" == "host" ]] && pkg="${PLUGIN_DIR}[store,server]"
         if [[ "$have_uv" -eq 1 ]]; then
             uv pip install --python "$VENV_PYTHON" "$pkg"
         else
@@ -1035,14 +1310,22 @@ _ensure_runtime() {
         printf '%s\n' "$pkg_out" >&2
         exit 1
     fi
+    # _pip_install ran in a command-substitution subshell, so its own
+    # install_role assignment above didn't survive back to this scope --
+    # recompute it directly (cheap, side-effect-free) rather than trying to
+    # thread a subshell result back out.
+    install_role="$(_activation_role)"
+    [[ "$install_role" == "unconfigured" ]] && install_role="$(_machine_role)"
     _ok 'Package installed: agent-index'
+
+    _install_server_venv "$install_role" "$py"
 
     deploy_binstub
 
     local prev_version=""
     if [[ "$VERSIONED_RUNTIME" == 1 ]]; then
         prev_version="$(_versioned_current)"
-        if ! "$VENV_PYTHON" -c 'import agent_index' 2>/dev/null; then
+        if ! _runtime_origin_under "$VENV_PYTHON" "$VENV_DIR"; then
             _fail "Fresh runtime slot failed its health gate (versions/$SRC_VERSION) -- not activating"
             exit 1
         fi
@@ -1056,7 +1339,7 @@ _ensure_runtime() {
 
     _write_manifest
 
-    if "$LINK_PYTHON" -c 'import agent_index' 2>/dev/null; then
+    if _runtime_origin_under "$LINK_PYTHON" "$(dirname "$(dirname "$LINK_PYTHON")")"; then
         _ok 'Verification: module imports successfully'
     else
         _fail 'Verification: module import failed'
@@ -1148,6 +1431,9 @@ _activation_role() {
     [[ -n "$repo_root" ]] || repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
     if [[ -z "$repo_root" ]]; then _machine_role; return 0; fi
     repo_cfg="$repo_root/.agent-index/config.yaml"
+    if [[ ! -f "$repo_cfg" ]]; then
+        repo_cfg="$repo_root/.copilot-extensions/agent-index/config.yaml"
+    fi
     [[ -f "$repo_cfg" ]] || { printf 'unconfigured'; return 0; }
     me="$(printf '%s' "${AGENT_INDEX_MACHINE:-$(hostname -s)}" |
         tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
@@ -1158,17 +1444,8 @@ _activation_role() {
     case "$role" in host|client) printf '%s' "$role" ;; *) printf 'unconfigured' ;; esac
 }
 
-_install_role() {
-    # Preserve host/store dependencies whenever this machine explicitly owns a
-    # host runtime, even if invoked from a client/unconfigured repository.
-    local machine_role
-    machine_role="$(_machine_role)"
-    if [[ "$machine_role" == "host" ]]; then printf 'host'; return 0; fi
-    _activation_role
-}
-
 _install_engine() {
-    # Provision the DURABLE engine venv (agent-index[engine], the torch stack) at
+    # Provision the DURABLE engine venv (agent-index-engine, the torch stack) at
     # AGENT_INDEX_ENGINE_HOME. Built ONCE and skipped if present (idempotent);
     # never rebuilt by a service `update`. Non-fatal -- a failure here leaves the
     # light, torch-free service fully functional. With arg "upgrade", an existing
@@ -1212,11 +1489,34 @@ _install_engine() {
         fi
     fi
 
-    # agent-index[engine] -- the heavy embedding stack into the DURABLE venv only.
+    # agent-procutil is likewise a `uv`-editable canonical reference in a
+    # dev checkout (no local copy, not on PyPI) -- pre-install it the same
+    # way as zdd above. Unlike zdd's own silent `|| true`, a failed refresh
+    # here must fail the whole engine install: `agent-index` declares only
+    # an UNVERSIONED `agent-procutil` requirement, so the main-package
+    # install below could still "succeed" against a stale copy already
+    # present in a preserved engine venv, silently shipping old shared
+    # code (PR #4465 review).
+    local rc=0
+    local procutil_dir
+    if procutil_dir="$(_resolve_vendored_lib agent-procutil)"; then
+        if [[ "$have_uv" -eq 1 ]]; then
+            uv pip install --python "$ENGINE_VENV_PYTHON" "$procutil_dir" --reinstall-package agent-procutil --refresh-package agent-procutil --quiet >/dev/null 2>&1 || rc=$?
+        else
+            "$ENGINE_VENV_PYTHON" -m pip install "$procutil_dir" >/dev/null 2>&1 || rc=$?
+        fi
+    fi
+
+    # agent-index-engine (plugins/agent-index/server/) -- a SEPARATE, independently
+    # installable program that owns the heavy embedding stack, into the DURABLE
+    # venv only. It depends on the light `agent-index` base package (index_config,
+    # engine.generation, engine.client) -- installed first, exactly like the zdd
+    # pre-install above, since neither is on PyPI and a plain `pip install
+    # agent-index-engine` cannot resolve "agent-index" on its own.
     #
     # Torch install is TWO STEPS so a GPU host works even behind a managed/CFS
     # package feed:
-    #   1. Install agent-index[engine] from the DEFAULT feed (governed mirror or
+    #   1. Install agent-index-engine from the DEFAULT feed (governed mirror or
     #      public PyPI) -- CPU torch wheel + ALL of torch's pure-python deps
     #      (sympy, networkx, ...) + the rest of the engine stack.
     #   2. If AGENT_INDEX_TORCH_INDEX is set (a CUDA wheel index), SWAP the torch
@@ -1225,20 +1525,27 @@ _install_engine() {
     #      (often network-blocked), so we take deps from the reachable default feed
     #      (step 1) and only the reachable CUDA torch wheel here; --no-deps skips
     #      re-resolving the CUDA build's exact dep pins through the blocked host.
-    local rc=0
     local torch_idx="${AGENT_INDEX_TORCH_INDEX:-}"
-    if [[ "$have_uv" -eq 1 ]]; then
-        local uv_args=(pip install --python "$ENGINE_VENV_PYTHON" "$PLUGIN_DIR[store,engine]")
-        [[ "$upgrade" -eq 1 ]] && uv_args+=(--upgrade)
-        uv "${uv_args[@]}" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        :
+    elif [[ "$have_uv" -eq 1 ]]; then
+        uv pip install --python "$ENGINE_VENV_PYTHON" "$PLUGIN_DIR" || rc=$?
+        if [[ "$rc" -eq 0 ]]; then
+            local uv_args=(pip install --python "$ENGINE_VENV_PYTHON" "$PLUGIN_DIR/server")
+            [[ "$upgrade" -eq 1 ]] && uv_args+=(--upgrade)
+            uv "${uv_args[@]}" || rc=$?
+        fi
         if [[ "$rc" -eq 0 && -n "$torch_idx" ]]; then
             _step "Swapping in CUDA torch from the configured CUDA wheel index (wheel only, --no-deps)"
             uv pip install --python "$ENGINE_VENV_PYTHON" --index-url "$torch_idx" --no-deps --reinstall-package torch torch || rc=$?
         fi
     else
-        local pip_args=(-m pip install "$PLUGIN_DIR[store,engine]")
-        [[ "$upgrade" -eq 1 ]] && pip_args+=(--upgrade)
-        "$ENGINE_VENV_PYTHON" "${pip_args[@]}" || rc=$?
+        "$ENGINE_VENV_PYTHON" -m pip install "$PLUGIN_DIR" || rc=$?
+        if [[ "$rc" -eq 0 ]]; then
+            local pip_args=(-m pip install "$PLUGIN_DIR/server")
+            [[ "$upgrade" -eq 1 ]] && pip_args+=(--upgrade)
+            "$ENGINE_VENV_PYTHON" "${pip_args[@]}" || rc=$?
+        fi
         if [[ "$rc" -eq 0 && -n "$torch_idx" ]]; then
             _step "Swapping in CUDA torch from the configured CUDA wheel index (wheel only, --no-deps)"
             "$ENGINE_VENV_PYTHON" -m pip install --index-url "$torch_idx" --no-deps --force-reinstall torch || rc=$?
@@ -1280,18 +1587,7 @@ _restart_engine_daemon() {
     fi
 }
 
-_register_engine_daemon() {
-    # Register the persistent systemd --user unit that runs the warm engine from
-    # the durable venv. A warm engine is left untouched (never restarted) when it
-    # is already active.
-    if [[ "$NO_SERVICE" -eq 1 ]]; then
-        _skip "Engine daemon skipped (--no-service)"
-        return 0
-    fi
-    if [[ ! -x "$ENGINE_VENV_PYTHON" ]]; then
-        _skip "Engine runtime not provisioned -- daemon not registered"
-        return 0
-    fi
+_write_engine_files() {
     if [[ ! -f "$ENGINE_ENV_FILE" ]]; then
         cat > "$ENGINE_ENV_FILE" << 'ENVEOF'
 # agent-index engine daemon environment
@@ -1302,6 +1598,36 @@ ENVEOF
     else
         _skip "Engine env already exists: $ENGINE_ENV_FILE"
     fi
+    cat > "$ENGINE_LAUNCHER" << EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export PYTHONUTF8=1
+export AGENT_INDEX_ENGINE_HOME="$ENGINE_HOME"
+if [[ -f "$ENGINE_ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENGINE_ENV_FILE"
+    set +a
+fi
+cd "$ENGINE_HOME"
+exec "$ENGINE_VENV_PYTHON" -I -X utf8 -m agent_index engine run
+EOF
+    chmod +x "$ENGINE_LAUNCHER"
+}
+
+_register_engine_daemon() {
+    # Register the persistent systemd --user unit that runs the warm engine from
+    # the durable venv through a stable launcher. A warm engine is left untouched
+    # (never restarted) when it is already active.
+    if [[ "$NO_SERVICE" -eq 1 ]]; then
+        _skip "Engine daemon skipped (--no-service)"
+        return 0
+    fi
+    if [[ ! -x "$ENGINE_VENV_PYTHON" ]]; then
+        _skip "Engine runtime not provisioned -- daemon not registered"
+        return 0
+    fi
+    _write_engine_files
     if ! command -v systemctl >/dev/null 2>&1; then
         _skip "systemd not available -- run 'agent-index engine run' via your own supervisor on this host"
         return 0
@@ -1317,7 +1643,7 @@ Type=simple
 Environment=PYTHONUTF8=1
 Environment=AGENT_INDEX_ENGINE_HOME=$ENGINE_HOME
 EnvironmentFile=-$ENGINE_ENV_FILE
-ExecStart=$ENGINE_VENV_PYTHON -m agent_index engine run
+ExecStart=$ENGINE_LAUNCHER
 Restart=on-failure
 RestartSec=5
 WorkingDirectory=$ENGINE_HOME
@@ -1340,16 +1666,7 @@ EOF
     fi
 }
 
-_install_service() {
-    if [[ "$NO_SERVICE" -eq 1 ]]; then
-        _skip "Service skipped (--no-service)"
-        return 0
-    fi
-    if ! command -v systemctl >/dev/null 2>&1; then
-        _skip "systemd not available -- run 'agent-index start' manually if this host runs the service"
-        return 0
-    fi
-    mkdir -p "$UNIT_DIR"
+_write_service_files() {
     if [[ ! -f "$ENV_FILE" ]]; then
         cat > "$ENV_FILE" << 'ENVEOF'
 # agent-index service environment
@@ -1360,6 +1677,45 @@ ENVEOF
     else
         _skip "Service env already exists: $ENV_FILE"
     fi
+    cat > "$SERVICE_LAUNCHER" << EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export PYTHONUTF8=1
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+fi
+_root="$INSTALL_DIR"
+_resolver="\$_root/bin/resolve-runtime.sh"
+AGENT_RT_PY=""
+if [[ -f "\$_resolver" ]]; then
+    AGENT_RT_ROOT="\$_root"
+    # shellcheck disable=SC1090
+    . "\$_resolver"
+fi
+if [[ -z "\${AGENT_RT_PY:-}" ]]; then
+    printf '%s\n' '[agent-index] no complete, importable runtime slot is available.' >&2
+    exit 1
+fi
+cd "$INSTALL_DIR"
+exec "\$AGENT_RT_PY" -I -X utf8 -m agent_index start
+EOF
+    chmod +x "$SERVICE_LAUNCHER"
+}
+
+_install_service() {
+    if [[ "$NO_SERVICE" -eq 1 ]]; then
+        _skip "Service skipped (--no-service)"
+        return 0
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        _skip "systemd not available -- run 'agent-index start' manually if this host runs the service"
+        return 0
+    fi
+    mkdir -p "$UNIT_DIR"
+    _write_service_files
     cat > "$UNIT_DIR/$SYSTEMD_UNIT" << EOF
 [Unit]
 Description=agent-index -- portable indexing/search service shell
@@ -1369,7 +1725,7 @@ After=network.target
 Type=simple
 EnvironmentFile=-$ENV_FILE
 Environment=PYTHONUTF8=1
-ExecStart=$VENV_PYTHON -m agent_index start
+ExecStart=$SERVICE_LAUNCHER
 Restart=on-failure
 RestartSec=5
 WorkingDirectory=$INSTALL_DIR
@@ -1394,6 +1750,36 @@ EOF
     fi
 }
 
+_install_logon_autostart() {
+    # Default durable tier on POSIX: user-scoped systemd units around the same
+    # stable launchers. If systemd-user is unavailable we keep the tier-1
+    # ensure path only and report the degraded persistence contract.
+    if [[ "$NO_SERVICE" -eq 1 ]]; then
+        _skip "Durable auto-start skipped (--no-service)"
+        return 0
+    fi
+    local role
+    role="$(_activation_role)"
+    if [[ "$role" != "host" ]]; then
+        _skip "Durable auto-start skipped (role: $role)"
+        return 0
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        _skip "systemd not available -- keeping tier-1 ensure only"
+        return 0
+    fi
+    if [[ -x "$ENGINE_VENV_PYTHON" ]]; then
+        _register_engine_daemon
+    else
+        _skip "Engine durable auto-start skipped -- engine runtime not provisioned"
+    fi
+    if _service_healthy; then
+        _install_service --no-restart
+    else
+        _install_service
+    fi
+}
+
 _status() {
     bash "$SCRIPT_DIR/runtime-gate.sh" status
 }
@@ -1404,7 +1790,7 @@ _start() {
         _ok "Service started ($SYSTEMD_UNIT)"
     elif [[ -x "$LINK_PYTHON" ]]; then
         if _service_healthy; then _skip 'Service already running -- not starting a second daemon'; return 0; fi
-        nohup "$LINK_PYTHON" -m agent_index start >> "$INSTALL_DIR/service.log" 2>&1 &
+        nohup "$LINK_PYTHON" -I -X utf8 -m agent_index start >> "$INSTALL_DIR/service.log" 2>&1 &
         _ok "Service process started"
     else
         _fail 'Runtime not installed'
@@ -1414,7 +1800,16 @@ _start() {
 
 _stop() {
     if [[ -x "$LINK_PYTHON" ]]; then
-        "$LINK_PYTHON" -m agent_index stop || true
+        "$LINK_PYTHON" -I -X utf8 -m agent_index stop || true
+        # The durable engine daemon is a SEPARATE detached process from the
+        # light service stopped above (daemon.py, launched by 'engine start' /
+        # Ensure-Running, outliving any systemd unit that happens to exist for
+        # it). Stopping only the service leaves it running indefinitely --
+        # this is the "kill the detached child, not just the task" gotcha
+        # (service-lifecycle-supervision.md) applied to a plain process
+        # rather than a scheduled task/unit. `engine stop` is idempotent and a
+        # no-op when the engine was never started.
+        "$LINK_PYTHON" -I -X utf8 -m agent_index engine stop || true
     fi
     if command -v systemctl >/dev/null 2>&1 && [[ -f "$UNIT_DIR/$SYSTEMD_UNIT" ]]; then
         systemctl --user stop "$SYSTEMD_UNIT" 2>/dev/null || true
@@ -1423,6 +1818,21 @@ _stop() {
 }
 
 _uninstall() {
+    [[ "$DRY_RUN" -eq 1 ]] && echo '(dry run -- nothing will be changed)'
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[dry-run] would stop agent-index"
+        [[ -f "$UNIT_DIR/$SYSTEMD_UNIT" ]] && echo "[dry-run] would disable + remove: $SYSTEMD_UNIT"
+        [[ -f "$UNIT_DIR/$ENGINE_SYSTEMD_UNIT" ]] && echo "[dry-run] would stop + disable + remove: $ENGINE_SYSTEMD_UNIT"
+        [[ -e "$STUB" ]] && echo "[dry-run] would remove binstub: $STUB"
+        if [[ "$PURGE" -eq 1 ]]; then
+            [[ -d "$ENGINE_HOME" ]] && echo "[dry-run] would PURGE engine home: $ENGINE_HOME"
+            [[ -d "$INSTALL_DIR" ]] && echo "[dry-run] would PURGE: $INSTALL_DIR"
+        else
+            echo "[dry-run] engine home + install dir would be kept (--purge to delete)"
+        fi
+        echo "agent-index uninstall dry run complete -- nothing was changed"
+        return 0
+    fi
     _stop
     if command -v systemctl >/dev/null 2>&1 && [[ -f "$UNIT_DIR/$SYSTEMD_UNIT" ]]; then
         systemctl --user disable "$SYSTEMD_UNIT" 2>/dev/null || true
@@ -1510,7 +1920,7 @@ _ensure_engine_running() {
     if command -v systemctl >/dev/null 2>&1 && [[ -f "$UNIT_DIR/$ENGINE_SYSTEMD_UNIT" ]]; then
         systemctl --user start "$ENGINE_SYSTEMD_UNIT" 2>/dev/null || true
     else
-        "$ENGINE_VENV_PYTHON" -m agent_index engine start 2>/dev/null || true
+        "$ENGINE_VENV_PYTHON" -I -X utf8 -m agent_index engine start 2>/dev/null || true
     fi
     _ok 'Engine ensured (user-mode durable daemon)'
 }
@@ -1545,7 +1955,7 @@ _service_cutover() {
     # Cut over only a LIVE routed service; no live endpoint -> fall back.
     _service_healthy || return 1
     _step 'Graceful cutover: moving the live service to the new build (zdd active/passive flip)...'
-    if "$LINK_PYTHON" -m agent_index deploy >/dev/null 2>&1 && _service_healthy; then
+    if "$LINK_PYTHON" -I -X utf8 -m agent_index deploy >/dev/null 2>&1 && _service_healthy; then
         _ok 'Service cut over to the new build (routing flipped; old drained + retired; warm engine untouched)'
         return 0
     fi
@@ -1556,43 +1966,33 @@ _service_cutover() {
 case "$ACTION" in
     install)
         _ensure_runtime
-        _role="$(_activation_role)"
-        if [[ "$_role" == "host" ]]; then
-            _install_service
-            _install_engine || true
-            _register_engine_daemon
-        else
-            _skip "Service install skipped (role: $_role) -- no configured host activation"
-            _skip "Engine runtime skipped (role: $_role) -- set 'role: host' in $INSTALL_DIR/config.yaml or AGENT_INDEX_ROLE=host to host the durable engine"
-        fi
+        _service_cutover || _ensure_running
+        _install_logon_autostart
+        _skip 'Durable engine runtime unchanged; use engine / engine-update for the heavy stack'
         ;;
     update)                                                         # Thread B: installer-driven graceful zdd cutover (a version update must never kill in-flight work)
         _downgrade_guard
         _ensure_runtime
-        # Engine: warm-preserving OUTLIVE -- leave a serving engine untouched
-        # (fixed port 8421); only start one if it is down (host only), so the
-        # service cutover always has a reconnect target.
-        if [[ "$(_activation_role)" == "host" ]]; then _ensure_engine_running; fi
-        # Service: move a live (even healthy) routed service to the new slot via
-        # the zdd flip rather than leaving stale code serving; else fall back to
-        # _install_service's SIGTERM-graceful `systemctl restart`.
-        if _service_cutover; then
-            _install_service --no-restart
-        elif [[ "$(_activation_role)" == "host" ]]; then
-            _install_service
-        else
-            _skip "Service install skipped (role: $(_activation_role)) -- no configured host activation"
-        fi
+        _service_cutover || _ensure_running
+        _install_logon_autostart
+        _skip 'Durable engine runtime unchanged; use engine / engine-update for the heavy stack'
         ;;
-    ensure) _ensure_running ;;  # user-mode auto-run safety net (sessionStart hook) -- start if not already healthy
+    ensure)  # user-mode safety net + default durable auto-start registration; also
+             # stamps the binstub on a never-provisioned machine (fits a sessionStart
+             # hook's grace window -- no venv, no uv, no heavy runtime build here)
+        [ -x "$STUB" ] || {
+            mkdir -p "$INSTALL_DIR" "$LOCAL_BIN"
+            printf '%s\n' "${COPILOT_PLUGIN_STAGED_FROM:-$PLUGIN_DIR}" > "$INSTALL_DIR/payload-dir"
+            deploy_binstub
+        }
+        _ensure_running
+        _install_logon_autostart
+        ;;
     stamp) do_stamp ;;
     provision)
         _ensure_runtime
-        if [[ "$(_activation_role)" == "host" ]]; then
-            _install_service
-        else
-            _skip "Service install skipped (role: $(_activation_role)) -- no configured host activation"
-        fi
+        _service_cutover || _ensure_running
+        _skip 'Durable engine runtime unchanged; use engine / engine-update for the heavy stack'
         ;;
     engine) _install_engine || true; _register_engine_daemon ;;     # explicit host-side provisioning (role-independent)
     engine-update)                                                  # rebuild durable engine venv + restart daemon (decoupled from service update)

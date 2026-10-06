@@ -5,6 +5,8 @@ Subcommands:
   emit-profile   Render/write a managed SSH profile fragment.
   explore        Introspect a reachable SSH target (repos, runtimes, agents).
   mesh-status    Render the calling repo's SSH machine mesh from machines.yaml.
+  refresh-mesh   Re-discover live tunnel ids, re-emit the profile, and verify
+                 reachability to every machines.yaml dtssh alias.
   verify         Probe machine-name SSH reachability using the active profile.
   version        Show package version.
 """
@@ -13,15 +15,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
 from pathlib import Path
 
-from agent_procutil import no_window_flags
-
-from . import __version__, fragment_registry, ssh_profile
+from . import fragment_registry, host_restore, ssh_profile
 from . import explore as explore_mod
 from . import mesh as mesh_mod
+from . import mesh_refresh as mesh_refresh_mod
+from .probe import probe_alias
 
 
 def _cmd_emit_profile(args: argparse.Namespace) -> int:
@@ -69,10 +70,6 @@ def _cmd_emit_profile(args: argparse.Namespace) -> int:
     return 0
 
 
-def _creation_flags() -> int:
-    return no_window_flags()
-
-
 def _cmd_verify(args: argparse.Namespace) -> int:
     if not args.names:
         print("agent-ssh verify: at least one host name is required", file=sys.stderr)
@@ -87,24 +84,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
             )
             rc = 1
             continue
-        proc = subprocess.run(
-            [
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                f"ConnectTimeout={args.timeout}",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                name,
-                "true",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=_creation_flags(),
-            check=False,
-        )
-        if proc.returncode == 0:
+        if probe_alias(name, args.timeout):
             print(f"[OK]   {name} reachable")
         else:
             print(f"[FAIL] {name} unreachable")
@@ -160,18 +140,83 @@ def _cmd_mesh_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_refresh_mesh(args: argparse.Namespace) -> int:
+    result = mesh_refresh_mod.refresh_mesh(
+        machines_yaml=args.path,
+        config_d=args.config_d,
+        verify_timeout=args.timeout,
+    )
+    if args.json:
+        print(json.dumps(result.to_dict(), indent=2))
+        return 0 if result.ok else 1
+    print(f"agent-ssh refresh-mesh: {result.detail}")
+    for alias in result.aliases:
+        status = "OK" if alias.reachable else "FAIL"
+        print(f"  [{status}] {alias.alias}")
+    return 0 if result.ok else 1
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     report = fragment_registry.scan_fragment_registry(args.config_d)
+    shadow_findings = fragment_registry.find_shadowed_aliases(report, args.ssh_config)
     if args.json:
         print(
             json.dumps(
-                fragment_registry.doctor_payload(report, args.config_d),
+                fragment_registry.doctor_payload(
+                    report, args.config_d, ssh_config=args.ssh_config
+                ),
                 indent=2,
             )
         )
     else:
-        print(fragment_registry.format_doctor(report, args.config_d))
-    return 1 if report.findings else 0
+        print(
+            fragment_registry.format_doctor(
+                report, args.config_d, ssh_config=args.ssh_config
+            )
+        )
+    return 1 if (report.findings or shadow_findings) else 0
+
+
+def _cmd_restore_host(args: argparse.Namespace) -> int:
+    apply = False if args.dry_run else args.apply
+    result = host_restore.restore_host(
+        args.transport,
+        args.alias,
+        args.port,
+        apply=apply,
+    )
+    return host_restore.emit_result(result, json_output=args.json)
+
+
+def _cmd_copilot_config(args: argparse.Namespace) -> int:
+    from . import copilot_detach
+
+    if args.action == "set":
+        try:
+            path = copilot_detach.set_host_workspace(args.target, args.workspace)
+        except (ValueError, OSError) as exc:
+            print(f"[FAIL] {exc}", file=sys.stderr)
+            return 2
+        print(f"[OK] set {args.target} workspace to {args.workspace} in {path}")
+        return 0
+
+    try:
+        raw = copilot_detach._load_copilot_config()
+    except (copilot_detach.CopilotConfigError, OSError) as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 2
+    hosts = raw.get("hosts") if isinstance(raw, dict) else None
+    if args.json:
+        print(json.dumps({"hosts": hosts if isinstance(hosts, dict) else {}}, indent=2))
+    elif not isinstance(hosts, dict) or not hosts:
+        print("agent-ssh copilot-config: no host workspaces configured")
+    else:
+        for name in sorted(hosts):
+            entry = hosts.get(name)
+            workspace = entry.get("workspace") if isinstance(entry, dict) else None
+            if isinstance(workspace, str):
+                print(f"{name}\t{workspace}")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -249,6 +294,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mesh.set_defaults(func=_cmd_mesh_status)
 
+    refresh_mesh = sub.add_parser(
+        "refresh-mesh",
+        help="Re-discover live dtssh tunnel ids, re-emit the managed SSH profile, "
+        "and verify reachability to every machines.yaml dtssh alias.",
+    )
+    refresh_mesh.add_argument(
+        "--path",
+        type=Path,
+        default=None,
+        help="Path to a machines.yaml (default: resolve from the current repo).",
+    )
+    refresh_mesh.add_argument(
+        "--config-d", type=Path, default=None, help="Override ~/.ssh/config.d."
+    )
+    refresh_mesh.add_argument(
+        "--timeout",
+        type=int,
+        default=8,
+        help="SSH ConnectTimeout seconds for the post-refresh reachability probe.",
+    )
+    refresh_mesh.add_argument(
+        "--json", action="store_true", help="Emit the structured result as JSON."
+    )
+    refresh_mesh.set_defaults(func=_cmd_refresh_mesh)
+
     doctor = sub.add_parser(
         "doctor",
         help="Audit managed 50-agent-ssh-* OpenSSH fragments without changing them.",
@@ -259,7 +329,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit exhaustive structured managed-fragment findings.",
     )
     doctor.add_argument("--config-d", type=Path, default=None, help="Override ~/.ssh/config.d.")
+    doctor.add_argument(
+        "--ssh-config",
+        type=Path,
+        default=None,
+        help="Override ~/.ssh/config (used only to detect alias shadowing).",
+    )
     doctor.set_defaults(func=_cmd_doctor)
+
+    restore_host = sub.add_parser(
+        "restore-host",
+        help="Plan or apply transport-owned host restoration.",
+    )
+    restore_host.add_argument("--transport", required=True)
+    restore_host.add_argument("--alias", required=True)
+    restore_host.add_argument("--port", type=int, default=22)
+    mode = restore_host.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--apply", action="store_true")
+    restore_host.add_argument("--json", action="store_true")
+    restore_host.set_defaults(func=_cmd_restore_host)
+
+    copilot_config = sub.add_parser(
+        "copilot-config",
+        help="Manage per-host defaults for `agent-ssh copilot`.",
+    )
+    copilot_config_sub = copilot_config.add_subparsers(dest="action", required=True)
+    copilot_config_set = copilot_config_sub.add_parser(
+        "set",
+        help="Set the default remote workspace for one SSH host alias.",
+    )
+    copilot_config_set.add_argument("target", help="SSH host alias")
+    copilot_config_set.add_argument("--workspace", required=True, help="Absolute POSIX checkout path")
+    copilot_config_set.set_defaults(func=_cmd_copilot_config)
+    copilot_config_list = copilot_config_sub.add_parser(
+        "list",
+        help="List configured SSH copilot host workspaces.",
+    )
+    copilot_config_list.add_argument("--json", action="store_true")
+    copilot_config_list.set_defaults(func=_cmd_copilot_config)
+
+    from .copilot_detach import add_copilot_subparser, add_forward_keeper_subparser
+
+    add_copilot_subparser(sub)
+    add_forward_keeper_subparser(sub)
 
     sub.add_parser("version", help="Show version")
     return parser
@@ -269,6 +382,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.version or args.command == "version":
+        from . import __version__
+
         print(f"agent-ssh {__version__}")
         return 0
     if not hasattr(args, "func"):

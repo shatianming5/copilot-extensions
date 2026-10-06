@@ -1,0 +1,30 @@
+{
+  "captured_from": {
+    "commit": "cc0859a35f43b6a58fd87cd6f71f02a3b04e6a9c",
+    "plugin_version": "0.4.0-dev551",
+    "protocol_generation": 19,
+    "source_path": "plugins/agent-bridge/src/agent_bridge/routes/remote.py",
+    "source_git_blob": "4d52912f627bb286e74c9852cfac3a312a7a07c0",
+    "source_sha256": "0e402bba48d8fa4e76802354375b226dcab26db8281d563a912d309db478facf"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api/v1/remote/example-host/sessions",
+    "json": {
+      "agent": "task-worker",
+      "prompt": "Execute the assigned task.",
+      "caller_id": "fleet-task-123",
+      "timeout": 120.0,
+      "copilot_args": [
+        "--agent",
+        "cab-charter"
+      ]
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "json": {
+      "session_id": "session-123"
+    }
+  }
+}

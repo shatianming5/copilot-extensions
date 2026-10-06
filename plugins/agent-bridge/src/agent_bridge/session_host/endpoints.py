@@ -15,16 +15,56 @@ remote/local ports and a ``kind`` tag.
 from __future__ import annotations
 
 import asyncio
+import logging
 import shlex
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
+from remote_login_shell import wrap_login_shell
 from ssh_manager import (
     LocalForward,
     SSHConfig,
     SupervisedRelayForward,
     build_remote_exec_args,
 )
+from ssh_manager.process import terminate_ssh_process_tree
+from ssh_manager.proxy import create_ssh_subprocess
+
+log = logging.getLogger("agent-bridge.session-host.endpoints")
+
+
+class CredentialRelayReadinessError(RuntimeError):
+    """A required remote credential-relay listener could not be proven ready."""
+
+
+async def wait_for_relay_serving(
+    probe: Callable[[], Awaitable[bool]],
+    *,
+    timeout: float = 5.0,
+    interval: float = 0.25,
+) -> None:
+    """Wait briefly for a required far-side relay listener to accept."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout)
+    last_error: Exception | None = None
+    while True:
+        try:
+            if await probe():
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_error = exc
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(interval, remaining))
+    error = CredentialRelayReadinessError(
+        "credential relay reverse-forward did not become ready before timeout"
+    )
+    if last_error is not None:
+        raise error from last_error
+    raise error
 
 
 def endpoint_from_ssh_config(
@@ -152,42 +192,79 @@ def relay_forwards_from_endpoint(
     )
 
 
+def build_relay_ping_probe_command(relay_port: int) -> str:
+    """Build the remote command proving ``relay_port`` is a LIVE credential
+    relay, not merely a port that accepts a TCP connection.
+
+    A bare TCP-accept probe can pass while nothing valid is actually listening
+    end-to-end -- e.g. a stale, half-closed, or misrouted listener may still
+    complete a TCP handshake without ever answering the relay's own wire
+    protocol. This performs one real round-trip of that protocol: sends the
+    relay's built-in ``ping`` action (a lightweight, side-effect-free action
+    handled directly by ``CredentialRelayServer._handle_client`` before any
+    policy/token/source routing) and requires the exact ``pong`` reply the
+    relay sends back. Only that full protocol round-trip proves credentials
+    can actually be served through this forward.
+    """
+    script = (
+        f"exec 3<>/dev/tcp/127.0.0.1/{relay_port} && "
+        'printf "ping\\n\\n" >&3 && '
+        "IFS= read -r -t 3 reply <&3 && "
+        '[ "$reply" = "pong" ]'
+    )
+    return f"timeout 3 bash -c {shlex.quote(script)} && echo OK"
+
+
 def endpoint_serving_probe_factory(
     endpoint: dict[str, Any],
+    *,
+    fail_open: bool = True,
 ) -> Callable[[int], Callable[[], Awaitable[bool]]]:
     """Build a ``serving_probe_for_port`` factory for a persisted endpoint.
 
-    Each probe execs a one-shot far-side TCP-accept check on the CodeSpace-side
-    relay listen port over a **fresh** SSH connection (no live transport is
-    available on the daemon-restart reconstruction path). A ``False`` result
-    means the ``-R`` process is alive but the far side is not accepting -- e.g.
-    a remote bind that **silently failed** because a stale listener from the
-    pre-restart ``-R`` had not been released yet -- so the relay supervisor
-    re-establishes until the rebind takes (dotfiles #855). Transport failures
-    return ``True`` (a health hint, never a reason to churn a possibly-fine
-    relay on a transient SSH failure). Mirrors
+    Each probe execs a one-shot far-side relay-protocol round-trip check (see
+    :func:`build_relay_ping_probe_command`) on the CodeSpace-side relay listen
+    port over a **fresh** SSH connection through the shared SSH launcher (no live
+    transport is available on the daemon-restart reconstruction path). A ``False``
+    result means the ``-R``
+    process is alive but the far side is not actually answering as a live
+    relay -- e.g. a remote bind that **silently failed** because a stale
+    listener from the pre-restart ``-R`` had not been released yet (dotfiles
+    #855), or a listener that accepts but never speaks the relay protocol -- so
+    the relay supervisor re-establishes until a genuinely live relay answers.
+    Transport failures return ``True`` (a health hint, never a reason to churn
+    a possibly-fine relay on a transient SSH failure). Set ``fail_open=False``
+    for a launch or resume readiness gate where an inconclusive probe must
+    block ACP delivery. Failed or cancelled probes reap their owned SSH tree
+    before returning; cancellation is never a healthy hint. Mirrors
     ``spawner._serving_probe_for_port`` for the restart path.
     """
     config = ssh_config_from_endpoint(endpoint)
 
     def _for_port(relay_port: int) -> Callable[[], Awaitable[bool]]:
-        probe = (
-            f'timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/{relay_port}" '
-            "&& echo OK"
-        )
-        argv = build_remote_exec_args(config, f"bash -lc {shlex.quote(probe)}")
+        probe = build_relay_ping_probe_command(relay_port)
+        argv = build_remote_exec_args(config, wrap_login_shell(probe))
 
         async def _probe() -> bool:
+            proc = None
             try:
-                proc = await asyncio.create_subprocess_exec(
+                proc = await create_ssh_subprocess(
                     *argv,
+                    config=config,
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 out, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-            except Exception:
-                return True
+            except BaseException as exc:
+                if proc is not None:
+                    try:
+                        await asyncio.shield(terminate_ssh_process_tree(proc))
+                    except Exception:
+                        log.warning("SSH probe cleanup failed", exc_info=True)
+                if fail_open and isinstance(exc, Exception):
+                    return True
+                raise
             return proc.returncode == 0 and b"OK" in (out or b"")
 
         return _probe

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce that each plugin's version is identical across all files that carry it.
+"""Enforce that shipped package versions agree across all source surfaces.
 
 For every plugin ``<p>`` the version must agree across:
   1. ``plugins/<p>/plugin.json``            -> ``version``           (always)
@@ -11,6 +11,9 @@ For every plugin ``<p>`` the version must agree across:
   4. checked-in source fallbacks under ``plugins/<p>/src/``:
      ``_build_info.py`` ``__version__`` assignments and numeric development
      literals assigned to ``__version__`` or ``_FALLBACK_VERSION``
+
+The standalone ``worktree-manager`` package likewise keeps its
+``pyproject.toml`` version aligned with ``src/worktree_manager/__init__.py``.
 
 Why this guard exists: a version bump that touches only one file (e.g. #65
 bumped pyproject.toml to dev219 but left plugin.json/marketplace.json at dev218)
@@ -35,6 +38,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 PLUGINS_DIR = REPO / "plugins"
 MARKETPLACE = REPO / ".github" / "plugin" / "marketplace.json"
+WORKTREE_MANAGER = REPO / "worktree-manager"
 
 # [project].version = "x.y.z-devN" in a pyproject.toml. Matches the same simple
 # scheme the installer uses (scripts/install.ps1) rather than a full TOML parse
@@ -184,6 +188,72 @@ def _source_fallback_versions(
     return versions, errors
 
 
+def _worktree_manager_version_violations(manager_dir: Path) -> list[str]:
+    sources: dict[str, str] = {}
+    violations: list[str] = []
+    pyproject = manager_dir / "pyproject.toml"
+    pyproject_version = _pyproject_version(pyproject)
+    if pyproject_version:
+        sources["pyproject.toml"] = pyproject_version
+    else:
+        violations.append(
+            "worktree-manager: pyproject.toml has no [project].version"
+        )
+
+    init_path = manager_dir / "src" / "worktree_manager" / "__init__.py"
+    fallback_versions, fallback_errors = _source_fallback_versions(init_path)
+    for error in fallback_errors:
+        violations.append(f"worktree-manager: src/worktree_manager/__init__.py: {error}")
+    if not fallback_versions and not fallback_errors:
+        violations.append(
+            "worktree-manager: src/worktree_manager/__init__.py has no __version__"
+        )
+    for assignment, version in fallback_versions.items():
+        sources[f"src/worktree_manager/__init__.py:{assignment}"] = version
+
+    if len(set(sources.values())) > 1:
+        detail = ", ".join(f"{name}={version}" for name, version in sorted(sources.items()))
+        violations.append(f"worktree-manager: version mismatch ({detail})")
+    return violations
+
+
+def _registrar_declaration_violations(plugin_versions: dict[str, str]) -> list[str]:
+    """Check plugin-companion registrar declarations that mirror a plugin's version.
+
+    A ``managed_runtime`` registrar declaration (consumed by a *different*
+    plugin's supervisor, e.g. agent-dispatch's companion-service registrar)
+    checks in its target's version as a plain string -- there is no dynamic
+    resolution at declaration-load time, so it silently drifts whenever the
+    target plugin's own version bumps without this file being touched in the
+    same change. Keep this list in sync with any in-tree registrar declarations
+    that mirror another plugin's version.
+    """
+    mirrors: dict[Path, str] = {}
+    violations: list[str] = []
+    for path, target_plugin in mirrors.items():
+        data = _read_json(path)
+        if not isinstance(data, dict):
+            violations.append(f"{path.relative_to(REPO)}: cannot read registrar declaration")
+            continue
+        runtimes = (
+            data.get("spec", {}).get("managed_runtime", {}).get("runtimes")
+        )
+        if not isinstance(runtimes, list) or not runtimes:
+            violations.append(
+                f"{path.relative_to(REPO)}: no managed_runtime.runtimes entries"
+            )
+            continue
+        expected = plugin_versions.get(target_plugin)
+        for runtime in runtimes:
+            declared = isinstance(runtime, dict) and runtime.get("version")
+            if expected and declared and declared != expected:
+                violations.append(
+                    f"{path.relative_to(REPO)}: declares {target_plugin} version "
+                    f"{declared!r} but plugin.json is {expected!r}"
+                )
+    return violations
+
+
 def main() -> int:
     mkt = _read_json(MARKETPLACE)
     if not mkt or not isinstance(mkt.get("plugins"), list):
@@ -197,6 +267,7 @@ def main() -> int:
     }
 
     violations: list[str] = []
+    plugin_versions: dict[str, str] = {}
     for plugin_dir in sorted(p for p in PLUGINS_DIR.iterdir() if p.is_dir()):
         name = plugin_dir.name
         pj = _read_json(plugin_dir / "plugin.json")
@@ -208,6 +279,7 @@ def main() -> int:
         pj_ver = pj.get("version")
         if pj_ver:
             sources["plugin.json"] = pj_ver
+            plugin_versions[name] = pj_ver
 
         pyproj = plugin_dir / "pyproject.toml"
         if pyproj.exists():
@@ -247,6 +319,9 @@ def main() -> int:
             detail = ", ".join(f"{f}={v}" for f, v in sorted(sources.items()))
             violations.append(f"{name}: version mismatch ({detail})")
 
+    violations.extend(_worktree_manager_version_violations(WORKTREE_MANAGER))
+    violations.extend(_registrar_declaration_violations(plugin_versions))
+
     if violations:
         print("Version-consistency violations:", file=sys.stderr)
         for v in violations:
@@ -254,13 +329,14 @@ def main() -> int:
         print(
             "\nEvery plugin's version must agree across plugin.json, "
             "pyproject.toml (runtime plugins), marketplace.json entry, and any "
-            "checked-in numeric development-version fallback. "
-            "See CONTRIBUTING.md § 'Where the version lives'.",
+            "checked-in numeric development-version fallback; worktree-manager "
+            "must agree across pyproject.toml and its __version__. "
+            "See docs/pipelines.md § Where the mechanically-applied bump lands.",
             file=sys.stderr,
         )
         return 1
 
-    print("check-version-consistency: all plugin version surfaces agree.")
+    print("check-version-consistency: all package version surfaces agree.")
     return 0
 
 

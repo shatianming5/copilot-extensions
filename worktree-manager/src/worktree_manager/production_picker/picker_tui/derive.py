@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import datetime as _dt
 
+from rich.cells import cell_len
+
+from .. import prune
+from . import reciprocal
 from . import source_identity
 
 # The "now" derived ages are measured against. Data sources refresh this to the
@@ -36,9 +40,13 @@ def _pulse_level(w):
     'awaiting' -- the session is parked on a human (``live_rest`` ==
                   ``awaiting-operator``): the standout "this needs me" cue.
     'fresh'    -- a recent intent from an active turn (bright-dim live line).
-    'stale'    -- the intent has aged, or its session is idle/at-rest (greyed).
-    None       -- no intent text to show, OR (absent any graded ``live_rest``)
-                  an unparseable/missing timestamp leaves freshness unknown.
+    'stale'    -- the intent has aged, its session is idle/at-rest, or its
+                  freshness can no longer be graded (greyed either way).
+    None       -- no intent TEXT to show. This is the only case the line is
+                  absent -- see copilot-extensions#228 and its Picker-side
+                  follow-up (context-handoff bug #2): an intent that exists
+                  must never silently disappear merely because its freshness
+                  is unknown.
 
     copilot-extensions#228: the line does NOT expire on AGE -- a worktree that
     ever reported an intent keeps showing its last one (greyed) whenever the
@@ -46,8 +54,12 @@ def _pulse_level(w):
     pick fresh vs. stale, never None-on-age. The crisp ``live_rest``
     (busy/idle/awaiting-operator) is preferred for the colour and, when present,
     always yields a level; the intent's own age + idle flag are the coarse
-    fallback when no graded rest is present (and only there can a bad timestamp
-    still drop the line).
+    fallback when no graded rest is present. An unparseable/missing timestamp
+    (and no graded rest) used to drop the line entirely even though the intent
+    TEXT existed -- the operator-visible "ephemeral current task line" bug.
+    Grading is now degrade-to-'stale' (unknown freshness reads the same as
+    aged), never degrade-to-absent, so the text keeps showing per the class's
+    own contract above.
 
     The pulse is a *derived* signal (assistant.intent + the rest register); it is
     never conflated with the agent-asserted ``follow_up`` disposition.
@@ -64,13 +76,14 @@ def _pulse_level(w):
         return "stale"
     dt = _parse_pulse_ts(w.get("live_intent_at"))
     if dt is None:
-        return None
+        return "stale"
     age = (NOW - dt).total_seconds()
     if age < 0:
         age = 0
     if w.get("live_intent_idle") or age > _PULSE_FRESH_SECS:
         return "stale"
     return "fresh"
+
 
 
 def _parse_pulse_ts(ts):
@@ -132,13 +145,21 @@ def _pr(w):
     return f"#{n}{tag}"
 
 
-def _state(w):
+def _state(w, relation_label=""):
     """Display label aligned with the canonical git WorktreeState vocabulary.
 
     Prefers the ``state`` field from ``list --json --classify`` (computed where
     git access exists, incl. per remote machine). Falls back to an approximation
     from tracking fields when classification is absent.
-    """
+
+    ``relation_label`` -- the already-computed ``reciprocal.short_label()``
+    (#3307 Phase 5: the retired "R" column's HANDOFF value folds in here as a
+    genuine state, ranked right after the live-session check so a
+    handed-off-but-not-yet-resumed worktree reads as HANDOFF rather than
+    whatever its stale git/tracking state would otherwise show). Passed in
+    (not recomputed) so ``norm()`` and :func:`_state_style` -- which must
+    agree with whatever ``_state()`` actually returned -- share one
+    computation."""
     # A live process owns the worktree regardless of a cached or concurrently
     # derived git/tracking state. Check this before the explicit ``state`` field
     # so a first-paint WIP/FINAL cannot hide a live PID lock.
@@ -148,37 +169,342 @@ def _state(w):
     # bridge-lock means a live Copilot session.
     if (w.get("mux_session") or w.get("mux_attached")
             or w.get("session_lock_live") or w.get("session_bound_live")
-            or w.get("session_bridge_live") or w.get("session_bare_orphan")):
+            or w.get("session_bridge_live") or w.get("session_ahp_live")
+            or w.get("execution_leg_live")
+            or w.get("session_bare_orphan")):
         return "ACTIVE"
+    if relation_label == "HANDOFF":
+        return "HANDOFF"
     st = (w.get("state") or "").lower()
     if st:
         # Conversation-only refinement: an UNUSED worktree whose session held
         # turns is not idle -- it's CONVO.
         if st == "unused" and w.get("turn_count", 0) > 0:
             return "CONVO"
+        if st == "completed":
+            # worktree-finality-and-obligations Phase 5: mirror the PSMux/TMux
+            # status segment's FINAL vs MERGED split via the same canonical
+            # closure descriptor (`list --json --classify`'s additive
+            # ``closure`` field), instead of always collapsing COMPLETED to
+            # FINAL. Routed through ``prune.interpret_descriptor_payload`` for
+            # mixed-version fleet safety (a remote on an older/newer
+            # ``agent-worktrees`` never gets its raw ``closure.label`` trusted
+            # directly) -- degrades to MERGED (never FINAL) when the
+            # descriptor is absent or unsupported.
+            interpreted = prune.interpret_descriptor_payload(w.get("closure"))
+            if interpreted["supported"] and interpreted["label"] in ("FINAL", "MERGED"):
+                return interpreted["label"]
+            return "MERGED"
         return _STATE_LABEL.get(st, st.upper()[:6])
     pr = w.get("pr") or {}
     status = w.get("status")
-    if pr.get("state") == "merged":
-        return "FINAL"
-    if status == "finalized":
-        return "FINAL"
+    if pr.get("state") == "merged" or status == "finalized":
+        # The unclassified-legacy-row fallback (no canonical ``state`` field --
+        # an older remote or a pre-``--classify`` row) must be gated through
+        # the same descriptor check as the classified ``completed`` path
+        # above; otherwise an absent/unsupported descriptor could still
+        # render FINAL through this back door.
+        interpreted = prune.interpret_descriptor_payload(w.get("closure"))
+        if interpreted["supported"] and interpreted["label"] in ("FINAL", "MERGED"):
+            return interpreted["label"]
+        return "MERGED"
     if status == "active":
         return "WIP" if w.get("turn_count", 0) > 0 else "UNUSED"
     return (status or "?").upper()[:6]
 
 
+def _state_style(w, relation_label=""):
+    """The closure descriptor's validated ``style`` (e.g. ``merged-blocked``),
+    surfaced only when ``_state()`` itself actually resolved to FINAL/MERGED
+    through the descriptor. Reuses ``_state()``'s own resolution (rather than
+    re-deriving the same precedence) so a live mux/lock session -- which
+    ``_state()`` reports as ACTIVE regardless of a stale ``completed``/
+    ``finalized`` tracking field -- can never get a completed-descriptor style
+    here either. ``None`` for anything else (absent/unsupported descriptor, or
+    a state that never consults one), so a consumer that keys color purely off
+    ``rec["state"]`` remains correct with no ``state_style`` present.
+
+    ``relation_label`` -- threaded through to :func:`_state` so both agree on
+    whether the row actually resolved to HANDOFF (#3307 Phase 5).
+
+    Carried on the normalized record for a future renderer to key semantic
+    styling off of; the engine does not yet consume this field to recolor a
+    row -- it still colors by the plain ``state`` label alone.
+    """
+    if _state(w, relation_label) not in ("FINAL", "MERGED"):
+        return None
+    interpreted = prune.interpret_descriptor_payload(w.get("closure"))
+    if interpreted["supported"] and interpreted["label"] in ("FINAL", "MERGED"):
+        return interpreted["style"]
+    return None
+
+
+def _status_markers(w):
+    """The closure descriptor's per-fact freshness markers (worktree-finality-
+    and-obligations Phase 9), e.g. ``"C1 U* OC*"`` -- held-claim/follow-up
+    counts plus an unconfirmed upstream-containment/open-claims marker.
+    Everything in ``compact`` AFTER the base label, which is already rendered
+    separately via ``_state()``/the ``state`` column -- never duplicate the
+    label itself. Empty string when there's nothing to show (no descriptor,
+    an unsupported/mixed-version one, or a clean/confirmed one) rather than
+    repeating the bare label. Routed through
+    ``prune.interpret_descriptor_payload`` for the same mixed-version fleet
+    safety as ``_state()`` -- never reads the raw ``closure`` dict directly.
+    """
+    interpreted = prune.interpret_descriptor_payload(w.get("closure"))
+    if not interpreted["supported"]:
+        return ""
+    compact = interpreted["compact"]
+    label = interpreted["label"]
+    if not compact or not label or not compact.startswith(label):
+        return ""
+    return compact[len(label):].strip()
+
+
+def truncate_text(s, w):
+    """Truncate ``s`` to at most ``w`` display cells, ellipsizing when
+    clipped -- used when concatenating several variable-length segments onto
+    one detail line (the Worktree tile's status_markers/asset_hints run) so
+    no single segment can overflow the row and crowd out the ones after it.
+    Deliberately non-padding (unlike ``engine.py``'s column-fitting
+    ``_clip``, which always pads its result out to exactly ``w``): padding
+    mid-line here would insert unwanted blank space between segments instead
+    of just bounding this one's length. Uses Rich's ``cell_len`` throughout
+    (not ``len()``) so a wide/double-width character is measured by its
+    actual display width, not counted as one cell."""
+    s = str(s)
+    if cell_len(s) <= w:
+        return s
+    if w <= 0:
+        return ""
+    if w == 1:
+        # A double-width first character still exceeds a 1-cell budget even
+        # unclipped (e.g. a wide CJK glyph) -- degrade to the ellipsis
+        # (itself exactly 1 cell) rather than returning 2 cells' worth.
+        return s[0] if cell_len(s[0]) <= 1 else "…"
+    # Binary-search the longest prefix whose cell width leaves room for the
+    # ellipsis -- cheap and exact for the short strings this renders (marker
+    # phrases, asset-hint runs), unlike slicing by character count.
+    lo, hi = 0, len(s)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if cell_len(s[:mid]) <= w - 1:
+            lo = mid
+        else:
+            hi = mid - 1
+    return s[:lo] + "…"
+
+
+#: The raw ``status_markers`` tokens above (``C<N>``/``F<N>``/``U*``/``OC*``)
+#: are a closure-descriptor-internal wire shorthand -- meaningful to whoever
+#: wrote the descriptor, opaque to an operator glancing at the tile's second
+#: line. When the marker string is the ONLY content on that line (no asset
+#: hints, no live pulse), a bare "C1 U* OC*" reads as noise. This map/helper
+#: expands each token into a short human phrase for the picker's RENDER layer
+#: only -- ``status_markers`` itself stays the compact wire format other
+#: tests/consumers read.
+_STATUS_MARKER_TEXT = {
+    "U*": "merge unconfirmed",
+    "OC*": "claims unconfirmed",
+}
+
+
+def describe_status_marker(tok):
+    """Expand one ``status_markers`` token into ``(text, is_warning)``. An
+    unrecognized token (a future marker this helper doesn't know about yet)
+    degrades to itself verbatim, still flagged as a warning if it carries the
+    ``*`` unconfirmed-fact suffix, so a new marker never vanishes silently --
+    it just isn't prettied up yet.
+
+    ``compact`` (the source of these tokens) is only validated as a ``str``
+    by ``prune.interpret_descriptor_payload`` -- a malformed/remote descriptor
+    could hand this an absurdly long ``C``/``F`` digit run. No realistic
+    held-claim/follow-up count is more than a few digits, so the numeric
+    suffix is length-bounded BEFORE conversion (not just wrapped in a
+    ``try``/``except``): CPython 3.11+ raises ``ValueError`` past its
+    configured int-string-conversion digit limit, but an older interpreter
+    has no such limit and would otherwise happily (if slowly) convert an
+    arbitrarily long digit run. An over-length or unparseable suffix simply
+    degrades to the verbatim fallback below, same as any other unrecognized
+    token, instead of crashing (or stalling) the picker's render.
+    """
+    _MAX_MARKER_DIGITS = 12
+    if tok in _STATUS_MARKER_TEXT:
+        return _STATUS_MARKER_TEXT[tok], True
+    if (len(tok) > 1 and tok[0] in ("C", "F")
+            and 0 < len(tok) - 1 <= _MAX_MARKER_DIGITS and tok[1:].isdigit()):
+        try:
+            n = int(tok[1:])
+        except ValueError:
+            return tok, tok.endswith("*")
+        noun = "held claim" if tok[0] == "C" else "follow-up"
+        return f"{n} {noun}{'s' if n != 1 else ''}", False
+    return tok, tok.endswith("*")
+
+
+def status_marker_segments(markers, width):
+    """Expand a raw ``status_markers`` string into ``(text, is_warning)``
+    render segments (comma separators included as their own non-warning
+    segments), each already truncated so the whole run never exceeds
+    ``width`` cells -- the human-readable expansion is longer than the
+    compact wire tokens it replaces, so this segment must never be allowed to
+    crowd out whatever the picker's render layer appends after it (asset
+    hints, the live-pulse line). Cell-width measured throughout, matching
+    ``truncate_text``."""
+    segments = []
+    used = 0
+    for j, tok in enumerate(markers.split()):
+        prefix = ", " if j else ""
+        budget = max(0, width - used) - cell_len(prefix)
+        if budget <= 0:
+            break
+        if prefix:
+            segments.append((prefix, False))
+            used += cell_len(prefix)
+        text, is_warn = describe_status_marker(tok)
+        clipped = truncate_text(text, budget)
+        segments.append((clipped, is_warn))
+        used += cell_len(clipped)
+    return segments
+
+
+def status_line_segments(markers, asset_hints, overflow, width):
+    """Combine the ``status_markers`` expansion with the tile's asset-hint
+    text into one bounded run of ``(text, is_warning)`` segments -- the
+    picker's detail-line render layer just appends these in order. Asset
+    hints are already bounded (<=4 tokens + an overflow count) and take
+    priority: their width is reserved BEFORE budgeting the (unbounded-length)
+    readable marker text, so a long marker expansion can't crowd them out."""
+    asset_text = ""
+    if asset_hints:
+        asset_text = " ".join(asset_hints) + (f" +{overflow}" if overflow else "")
+    segments = []
+    if markers:
+        reserve = cell_len(asset_text) + 2 if asset_text else 0
+        segments = status_marker_segments(markers, max(0, width - reserve))
+    if asset_text:
+        prefix = "  " if segments else ""
+        used = sum(cell_len(t) for t, _ in segments)
+        segments.append((truncate_text(prefix + asset_text, max(0, width - used)), False))
+    return segments
+
+
+#: Bounded per-kind short codes for the tile asset-hint line (#6443/upstream
+#: #1979). Falls back to an upper-cased 4-char code for a kind this map
+#: doesn't recognize, so a future ``ResourceKind`` addition degrades safely
+#: instead of vanishing from the tile.
+_ASSET_CODES = {
+    "pr": "PR",
+    "worktree": "WT",
+    "codespace": "CS",
+    "container": "CTR",
+    "ssh": "SSH",
+    "workdir": "DIR",
+}
+
+#: Held-claim dispositions: a claim not yet released/abandoned still rides on
+#: the worktree, so it belongs in the tile's asset summary. An empty state is
+#: the legacy default and normalizes to "active" (held). Mirrors the
+#: ``resources`` ledger's own held-vs-released disposition convention
+#: (``active``/``at-rest`` = held; ``released``/``abandoned`` = not held).
+_HELD_CLAIM_STATES = ("", "active", "at-rest")
+
+
+def _asset_hints(w):
+    """Bounded type/count breakdown of the worktree's HELD outbound claims
+    (the ``resources`` ledger -- #6443/upstream #1979 Phase 6), e.g.
+    ``["PR", "WT×2"]`` -- distinct from ``status_markers``'s bare ``C<N>``
+    held-claims COUNT: this groups the same held claims by ``kind`` so a
+    cross-repo PR reads differently from a child worktree or a Codespace at a
+    glance. Bounded to 4 hint tokens (with an ``overflow`` count) so a
+    worktree carrying many claim kinds can never blow out the tile's width.
+    Also returns the full per-claim detail (kind/ref/note/state) for a
+    width-constrained consumer (the action menu) to render in full. Returns
+    ``{"hints": [...], "overflow": int, "details": [...]}`` -- empty lists
+    when the worktree holds no claims (never omitted, so a caller need not
+    guard for the key's absence).
+    """
+    raw = w.get("resources")
+    kind_counts: dict[str, int] = {}
+    details = []
+    if isinstance(raw, list):
+        for claim in raw:
+            if not isinstance(claim, dict):
+                continue
+            state = str(claim.get("state") or "").strip()
+            if state not in _HELD_CLAIM_STATES:
+                continue
+            kind = str(claim.get("kind") or "").strip() or "resource"
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+            details.append({
+                "kind": kind,
+                "ref": str(claim.get("ref") or "").strip(),
+                "note": str(claim.get("note") or "").strip(),
+                "state": state or "active",
+            })
+    # Count by the raw ``kind`` first (above), then resolve a display code
+    # only now -- never the reverse. Counting straight into the code would
+    # silently merge two DISTINCT kinds whose fallback 4-char codes happen to
+    # collide (e.g. "workspace" and "workflow" both -> "WORK"), understating
+    # the real per-kind breakdown the operator is reading. Aggregating by
+    # code here is still an explicit, intentional step -- multiple raw kinds
+    # sharing one code are summed into that code's token, but never silently
+    # dropped or conflated during counting itself.
+    code_counts: dict[str, int] = {}
+    for kind, n in kind_counts.items():
+        code = _ASSET_CODES.get(kind, kind.upper()[:4] or "RES")
+        code_counts[code] = code_counts.get(code, 0) + n
+    # Deterministic hint order (never insertion/dict order, which tracks
+    # arbitrary ``resources`` list order and would make the tile line and any
+    # snapshot/TUI test brittle): the curated ``_ASSET_CODES`` kinds first, in
+    # their declared (most-common-first) order, then any remaining
+    # unrecognized-kind fallback codes, alphabetically.
+    ordered_codes = [
+        c for c in _ASSET_CODES.values() if c in code_counts
+    ] + sorted(c for c in code_counts if c not in _ASSET_CODES.values())
+    hints = [
+        code if code_counts[code] == 1 else f"{code}×{code_counts[code]}"
+        for code in ordered_codes
+    ]
+    return {
+        "hints": hints[:4],
+        "overflow": max(0, len(hints) - 4),
+        "details": details,
+    }
+
+
 def _sess(w):
+    """LIVE column value (operator feedback, 2026-09-29): ``MUX``/``ACP``/
+    ``PROC``/``LOCK``/``-``, replacing the prior glyph set (``●N``/``○``).
+    ``MUX(n)`` carries the connected-client count, recovering the old
+    attached-vs-unattached split (``MUX(0)`` == the old bare ``○``). No
+    analogous ``ACP(n)`` count exists yet (deferred, not fabricated).
+    ``PROC`` (live, bound, but neither muxed nor ACP-hosted) stays distinct
+    -- a genuinely different hosting mechanism."""
     if w.get("mux_attached"):
-        return f"●{w.get('mux_clients', 1)}"
+        return f"MUX({w.get('mux_clients', 1)})"
     if w.get("mux_session"):
-        return "○"
+        return "MUX(0)"
     if (w.get("session_lock_live") or w.get("session_bound_live")
-            or w.get("session_bridge_live") or w.get("session_bare_orphan")):
-        return "PROC"
+            or w.get("session_bridge_live") or w.get("session_ahp_live")
+            or w.get("execution_leg_live")
+            or w.get("session_bare_orphan")):
+        # #3307 Phase 5: bridge-hosted -> ACP; everything else -> PROC.
+        return "ACP" if w.get("interface") == "acp" else "PROC"
     if w.get("session_lock_stale"):
         return "LOCK"
-    return "·"
+    return "-"
+
+
+def _length_display(w):
+    """LENGTH column (renamed from SESS/T, 2026-09-29): ``"<sc>s <tc>t"``,
+    e.g. ``"1s 25t"`` -- unit-suffixed so it never reads like a date (the
+    prior ``"1/25"``'s complaint). ``session_count`` renders ``"-"`` when
+    absent rather than fabricated."""
+    sc = w.get("session_count")
+    sc_display = sc if isinstance(sc, int) else "-"
+    return f"{sc_display}s {w.get('turn_count', 0)}t"
+
 
 
 def _age_secs(w):
@@ -190,6 +516,40 @@ def _age_secs(w):
         return (NOW - _dt.datetime.fromisoformat(ts)).total_seconds()
     except ValueError:
         return 1 << 40
+
+
+def _last_active_secs(w):
+    """Seconds since the worktree was last GENUINELY used, for the Recent
+    section's sort order (#3307 Phase 3) -- distinct from ``_age_secs``
+    (creation/status-transition age, still used for the displayed AGE
+    column). Prefers ``last_resumed_at`` (set on every real resume); a
+    worktree that has never been resumed since creation falls back to the
+    record's own already-computed ``age_secs`` (this function receives
+    NORMALIZED records -- ``norm()`` never emits a bare ``started_at`` key,
+    only the derived ``age``/``age_secs`` pair). A long-running but
+    recently-resumed worktree therefore sorts by when it was last touched,
+    not by how long ago it was first created."""
+    ts = w.get("last_resumed_at")
+    if not ts:
+        return w.get("age_secs", 1 << 40)
+    try:
+        return (NOW - _dt.datetime.fromisoformat(ts)).total_seconds()
+    except ValueError:
+        return w.get("age_secs", 1 << 40)
+
+
+def _last_active_display(w):
+    """Human-relative ``USED`` column string (#3307 follow-up): recency of
+    the worktree's last real interaction, distinct from AGE (how long the
+    worktree has EXISTED). Same signal sort order already prefers
+    (:func:`_last_active_secs`, Phase 3), now visible without opening the
+    row. Operates on the RAW dict, reaching ``started_at`` directly rather
+    than through the already-collapsed ``age_secs``."""
+    ts = w.get("last_resumed_at") or (
+        w.get("completed_at") if w.get("status") == "finalized"
+        else w.get("started_at")
+    )
+    return _age(ts)
 
 
 def _bucket_from_raw(w):
@@ -267,18 +627,14 @@ def _ff_from_raw(w):
 # in-use buckets are UNSAFE (never auto-pruned).
 BUCKET_DISPO = {
     "clean": "SAFE",
-    "unused": "REVIEW",
-    "conversation": "REVIEW",
+    "unused": "REVIEW", "conversation": "REVIEW",
     "follow-up": "REVIEW",
-    "closed-unmerged": "REVIEW",
-    "gone": "REVIEW",
-    "dirty": "UNSAFE",
-    "wip": "UNSAFE",
-    "unmerged": "UNSAFE",
-    "orphan": "UNSAFE",
+    "held-claims": "REVIEW", "held-claims-cross-machine": "REVIEW",
+    "closed-unmerged": "REVIEW", "gone": "REVIEW",
+    "dirty": "UNSAFE", "wip": "UNSAFE",
+    "unmerged": "UNSAFE", "orphan": "UNSAFE",
     "active": "UNSAFE",
-    "open-pr": "",
-    "unknown": "",
+    "open-pr": "", "unknown": "",
 }
 
 # Cleanup bucket -> short reason shown in the disposition chip.
@@ -287,6 +643,8 @@ BUCKET_REASON = {
     "unused": "idle · no commits/turns",
     "conversation": "chat history, no commits",
     "follow-up": "agent flagged follow-ups",
+    "held-claims": "resource claim(s) still held",
+    "held-claims-cross-machine": "claim(s) on a worktree hosted remotely",
     "closed-unmerged": "PR closed unmerged",
     "gone": "dir missing",
     "dirty": "uncommitted work",
@@ -314,9 +672,46 @@ def _sessionless(w):
         return False
     if (w.get("kind") or "session") in ("system", "bridge"):
         return False
-    if w.get("turn_count", 0) > 0 or w.get("mux_session") or w.get("mux_attached"):
+    if (w.get("turn_count", 0) > 0 or w.get("mux_session")
+            or w.get("mux_attached") or w.get("session_ahp_live")
+            or w.get("execution_leg_live")):
         return False
     return True
+
+
+#: (label, key_fn) pairs the Worktrees list's `s` cycles through (#2228
+#: Phase 4). "age" (default, index 0 so cycling always starts from the
+#: familiar order) is every section's own most-recently-used-first order
+#: (``_last_active_secs``, #3307 Phase 3) -- NOT raw creation age, since
+#: ``current_list_visible()`` applies this key unconditionally to every
+#: render (not just an operator-engaged "/" cycle), so it IS the section's
+#: at-rest order, and ``bucket()``'s own internal per-section sort is
+#: otherwise immediately overridden by it.
+WT_SORT_KEYS = [
+    ("age", _last_active_secs),
+    ("title", lambda w: (w.get("title") or "").casefold()),
+    ("state", lambda w: w.get("state") or ""),
+]
+
+
+def wt_row_always_visible(w):
+    """True for a worktree row the "/" command-bar filter must never hide
+    (#2228 Phase 4) -- the cross-effort record-shape-contract: a live or
+    bare-orphan worktree, or one classified ``ACTIVE``, stays visible
+    regardless of query match, since an operator mid-session on it (or one
+    the Active section itself vouches for) must never simply vanish from
+    the list. Mirrors EVERY live-session signal `_state()`/`_sess()` treat
+    as ACTIVE (``mux_live`` stands in for their raw ``mux_session``/
+    ``mux_attached`` -- this runs on the already-normalized record, where
+    those two are already folded into it), PLUS the normalized ``state``
+    itself: a row can classify ``ACTIVE`` (e.g. a canonical raw
+    ``state: "active"``) with none of those live-signal booleans set
+    (review finding -- the Active section's trustworthiness is this
+    contract's whole point, not just its literal live-signal subset)."""
+    return bool(w.get("state") == "ACTIVE" or w.get("mux_live")
+                or w.get("session_lock_live") or w.get("session_bound_live")
+                or w.get("session_bridge_live") or w.get("session_ahp_live")
+                or w.get("execution_leg_live") or w.get("session_bare_orphan"))
 
 
 def norm(
@@ -358,6 +753,7 @@ def norm(
     # after the title. ``state`` stays pure (bucket()/prune key off it); the
     # not-auto-prune-SAFE behavior comes from the ``follow-up`` cleanup bucket.
     follow_up = bool(w.get("follow_up"))
+    paused = bool(w.get("paused"))  # informational glyph; never fed to bucket()
     # #93: a bare (un-muxed) bound Copilot -- invisible to the mux fleet view.
     bare_orphan = bool(w.get("session_bare_orphan"))
     # copilot-extensions#228: the graded rest state's standout value -- the
@@ -373,17 +769,19 @@ def norm(
     pair_kind = w.get("pair_kind")
     is_paired = bool(pair_id)
     summary = (w.get("summary") or "").strip()
-    disp_title = title
-    if summary:
-        disp_title = (summary if title == "(untitled)"
-                      else f"{title} — {summary}")
+    activity = (w.get("activity") or "").strip()
+    # #3307 follow-up: title no longer appends "-- summary" (duplicated the
+    # second line's activity/live-pulse intent, see engine_views); summary
+    # still backstops a genuinely untitled row only.
+    disp_title = summary if (title == "(untitled)" and summary) else title
     if follow_up:
         disp_title = f"✚ {disp_title}"
-    # citadel pair marker: a link glyph (inner of the urgent ⚠/✚ markers) so a
-    # paired row is scannable without widening the state column. Gated on the
-    # pair id, so an unpaired worktree's title is untouched.
+    if paused:
+        disp_title = f"⏸ {disp_title}"
+    # citadel pair marker: names THIS row's own pair_role -- naming the
+    # SIBLING's repo needs a cross-project lookup not built yet (#3307).
     if is_paired:
-        disp_title = f"⚭ {disp_title}"
+        disp_title = f"⚭{pair_role or ''} {disp_title}"
     # copilot-extensions#228: the "needs me" marker rides just inside the orphan
     # marker -- a live session parked on the operator is an act-now signal, more
     # urgent than a paired/follow-up cue but not the structural orphan hazard.
@@ -397,7 +795,17 @@ def norm(
     source.update(source_metadata or {})
     capabilities = dict(source_capabilities or {})
     id4 = w["id"][-4:]
+    reciprocal_relation = reciprocal.normalize(
+        w.get("reciprocal_relation"),
+        has_bound_session=bool(w.get("last_session_id")),
+        has_controllers=bool(w.get("controllers") or w.get("controller_revision")),
+    )
+    # #3307 Phase 5: computed ONCE, threaded into both ``_state()`` and
+    # ``_state_style()`` (which must agree on whether HANDOFF actually won)
+    # and reused below rather than recomputed for the ``relation`` field.
+    relation_label = reciprocal.short_label(reciprocal_relation)
     return {
+        "id": w["id"],
         "id4": id4,
         "selection_id": f"{source_id}\x1f{w['id']}",
         "machine": machine,
@@ -414,7 +822,12 @@ def norm(
         "source_capabilities": capabilities,
         "title": disp_title,
         "follow_up": follow_up,
+        "paused": paused,
         "summary": summary,
+        # #3307 follow-up: agent-asserted CURRENT sub-task, the second
+        # line's fallback when no live-pulse intent is present.
+        "activity": activity,
+        "activity_at": w.get("activity_at"),
         # worktree-status-core live pulse: the derived agent-intent line + its
         # freshness ('awaiting'/'fresh'/'stale'/None). Rendered dim by the
         # engine; never the durable disposition. copilot-extensions#228: the
@@ -426,17 +839,39 @@ def norm(
         "awaiting_operator": awaiting_operator,
         "kind": kind,
         "tracking": w.get("status", ""),
-        "state": _state(w),
+        "state": _state(w, relation_label),
+        "state_style": _state_style(w, relation_label),
+        "status_markers": _status_markers(w),
+        "asset_hints": _asset_hints(w),
+        "relation": relation_label,
+        "reciprocal_relation": reciprocal_relation,
         "age": _age(
             w.get("completed_at") if w.get("status") == "finalized"
             else w.get("started_at")
         ),
         "age_secs": _age_secs(w),
+        # #3307 follow-up: recency of last interaction, distinct from AGE.
+        "used": _last_active_display(w),
         "sess": _sess(w),
         "turns": w.get("turn_count", 0),
         "session_count": w.get("session_count"),
+        # #3307 Phase 6, renamed LENGTH: see ``_length_display``'s docstring.
+        "sess_turns": _length_display(w),
         "sessionless": _sessionless(w),
         "pr": _pr(w),
+        # #3307 Phase 4: the engine's already-ranked claims summary (computed
+        # in ``agent_worktrees.__main__._worktree_to_dict`` via the shared
+        # ``claims_rank`` module -- see that call site's own docstring for
+        # why it is NOT computed here: the Manager/engine subprocess
+        # boundary this module deliberately never crosses). A hermetic
+        # string pass-through; "" when unclaimed/unresolvable.
+        "claims_summary": w.get("claims_summary") or "",
+        # #3307 follow-up: structured [{"label","url"}] list (same engine
+        # call site) for real hyperlink spans; None falls back to the plain
+        # string above.
+        "claims_links": w.get("claims_links"),
+        # #3307 Phase 3: raw pass-through of the worktree's last real resume
+        "last_resumed_at": w.get("last_resumed_at"),
         "cleanup_bucket": _bucket_from_raw(w),
         "ff_eligible": _ff_from_raw(w),
         "attached": bool(w.get("mux_attached")),
@@ -446,6 +881,9 @@ def norm(
         # sub-menu so the operator can ``/resume`` it), and whether a live
         # ``inuse.<pid>.lock`` binds a Copilot process right now (gates Reclaim).
         "last_session_id": w.get("last_session_id"),
+        # #3307 Phase 7 (dotfiles#1298): head wins (unchanged); flags a scan disagreement.
+        "session_head_mismatch": bool(w.get("session_head_mismatch")),
+        "session_head_mismatch_scanned_id": w.get("session_head_mismatch_scanned_id"),
         "session_lock_live": bool(w.get("session_lock_live")),
         # Stale-lock residue: an ``inuse.<pid>.lock`` file whose pid is no longer
         # a live Copilot (crashed/killed without cleanup). NOT a live binding, so
@@ -458,6 +896,13 @@ def norm(
         # bare-resumed session (cwd=home) in the Active section. Distinct from
         # mux_live; drives the classification-absent fast-pass ACTIVE.
         "session_bound_live": bool(w.get("session_bound_live")),
+        "session_ahp_live": bool(w.get("session_ahp_live")),
+        "execution_leg_live": bool(w.get("execution_leg_live")),
+        # Controller metadata is passed through for future presentation and
+        # recovery actions. It is deliberately absent from state/active/resume
+        # derivation: control is not binding.
+        "controllers": list(w.get("controllers") or []),
+        "controller_findings": list(w.get("controller_findings") or []),
         # #4272 bridge-lock: worktree hosts a live bridge-owned Copilot per the
         # file-first bridge.lock read. Distinct from mux_live/bound_live; drives
         # the classification-absent fast-pass ACTIVE for a bare/bridge session.
@@ -552,21 +997,28 @@ def annotate_pairs(rows):
 
 
 def bucket(wts):
-    """Split into (active, recent, completed), each most-recent-first.
+    """Split into (active, recent, completed).
 
     Sections key off the canonical *state*, not the tracking status:
 
     * **active**    -- in session (state ``ACTIVE``: a live Copilot/mux session
-      owns the worktree). NOT merely "status active / not finalized".
-    * **completed** -- finalized / merged (state ``FINAL``), regardless of age.
+      owns the worktree). NOT merely "status active / not finalized". Sorted
+      newest-started-first (``age_secs``).
+    * **completed** -- finalized or merged (state ``FINAL`` or ``MERGED`` --
+      see ``_state``'s Phase 5 closure-descriptor split), regardless of age.
+      Sorted newest-completed-first (``age_secs``).
     * **recent**    -- everything else (WIP / UNUSED / CONVO / DIRTY / ORPHAN /
-      GONE): not in session and not final.
+      GONE): not in session and not final. Sorted **most-recently-used**
+      first (``_last_active_secs``, #3307 Phase 3) rather than by creation
+      age, so a long-running worktree the operator just resumed doesn't sink
+      below one that is merely newer but untouched since it was created.
     """
     active = sorted((w for w in wts if w["state"] == "ACTIVE"),
                     key=lambda w: w["age_secs"])
-    completed = sorted((w for w in wts if w["state"] == "FINAL"),
+    completed = sorted((w for w in wts if w["state"] in ("FINAL", "MERGED")),
                        key=lambda w: w["age_secs"])
     recent = sorted(
-        (w for w in wts if w["state"] not in ("ACTIVE", "FINAL")),
-        key=lambda w: w["age_secs"])
+        (w for w in wts if w["state"] not in ("ACTIVE", "FINAL", "MERGED")),
+        key=_last_active_secs)
     return active, recent, completed
+

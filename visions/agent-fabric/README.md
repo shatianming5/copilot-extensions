@@ -5,7 +5,7 @@
   spanning worktrees, machines, CodeSpaces, and containers.
 - **Scope:** branch (links per-plugin child visions as they are authored)
 - **Status:** Active
-- **Last revised:** 2026-08-25
+- **Last revised:** 2026-09-18
 - **Reality docs:** [`docs/architecture.md`](../../docs/architecture.md) ·
   [`docs/harness-runbook.md`](../../docs/harness-runbook.md) · each plugin's
   `docs/architecture.md`
@@ -47,27 +47,24 @@ load-bearing properties bind the layers:
   rather than keeping a second copy. This is what keeps the layers'
   responsibilities separate as the stack grows.
 
-### agent-worktrees — the isolation & session ground layer
-Owns **agent-per-worktree isolation**, the Copilot **session process
-lifecycle**, and core **worktree + git** state. It is the foundation every other
-layer builds on. On its own it yields **passive, coarse legibility**: state
-discoverable through declarative hooks and on-demand reads of raw session state —
-an Active / Recent / Completed view of agents, process management, and basic
-remote-shell interop — with **no always-on service required**. Owning the
-worktree, it also owns each worktree's **disposition** — whether its work is
-genuinely *resolved and prune-able* or has *actionable follow-ups remaining* —
-which the agent working there **asserts**, because git and process reality alone
-cannot tell a done worktree from a finalized one that still owes follow-ups.
-Alongside that, the ground layer surfaces a **live, passively-derived sense of
-what each agent is currently doing**, needing no cooperation from the agent — the
-same derivation instinct that already separates conversation from idle.
-A per-plugin child vision refines it at
-[`visions/plugins/agent-worktrees/`](../plugins/agent-worktrees/README.md) — the
-session-tracking & live-state authority: a single-owner live store, an
-**extension-free polling backbone**, an optional losable warm-cache accelerator,
-and **optional, non-load-bearing** event producers (its own native-session-event
-extension — the crisp rest/idle source — and agent-bridge's ACP tool/message
-eventing), where no in-session extension is ever load-bearing for correctness.
+### agent-worktrees — the worktree-lifetime agency ground layer
+Owns repository and worktree identity, isolation, source-control lifecycle,
+claims, obligations, asserted disposition, execution relationships, and the
+durable head/succession record. A worktree is a persistent unit of agency, not a
+Copilot process: its responsibility survives terminals, applications, protocol
+hosts, and session generations. Execution providers contribute attributable
+observations without becoming a second owner of worktree truth.
+A per-plugin child vision refines this host-neutral boundary at
+[`visions/plugins/agent-worktrees/`](../plugins/agent-worktrees/README.md).
+
+### Copilot session hosting — the execution-provider layer
+Owns how an agent process is launched, presented, prompted, observed, reattached,
+handed off, and retired. Copilot CLI under TMux/PSMux, plain CLI, ACP/session
+hosts, SDK integrations, graphical applications, and third-party rigs are peer
+providers behind one capability-honest boundary. The provider owns execution
+mechanics; the worktree ground layer owns durable agency meaning. The
+cross-cutting [session-hosting](../session-hosting/README.md) vision refines this
+seam.
 
 ### agent-bridge — the coordination layer
 Adds **remote agent creation, inspection, and communication** over discoverable
@@ -182,24 +179,87 @@ running or parked — so a duplicate is a deliberate choice, not an accident.
 Work can be **stashed** for later pickup, **handed off** between agents, or
 **delegated** to a spun-off agent, with a shared record of the task and its
 outcome — so a fleet cooperates through durable artifacts, not just live chatter.
-The **launch** underneath (spin a session in a worktree) is a ground-layer
-**primitive**; the **orchestration** of a handoff — composing the continuation,
-minting the claimable delegation record, cutting a successor over, verifying it,
-and retiring the predecessor — belongs to the layers **above** the primitive,
-never baked into the ground layer.
+The **launch** underneath is supplied by the selected session-host provider.
+The **orchestration** of a handoff — composing the continuation, minting the
+claimable delegation record, requesting a successor, verifying it, moving
+durable agency authority, and authorizing predecessor retirement — belongs
+above both the worktree ledger and the host. No generic handoff component
+hard-codes one provider's process mechanics.
+
+### unreachable-machine-maintenance-handoff
+When every declared route to a machine is unavailable after bounded diagnosis,
+the fabric treats that result as a **routing boundary**, not a reason to retry
+indefinitely or bypass normal deployment. Repeatable updates and required state
+are first represented in the machine's declarative convergence packages or
+another explicitly declared auto-update system. Residual work that must execute
+locally is recorded in an explicitly identified user repository as a
+machine-scoped maintenance issue, while agent-dispatch supplies the optional
+single-claim execution lifecycle. Issue prose is advisory evidence, never an
+untrusted command stream: a target-local agent re-derives the action from
+trusted repository state, preserves confirmation gates, verifies the
+postcondition, and only then closes the item.
+
+### unattended-tiered-self-convergence
+A machine that is reachable and logged-in keeps itself current **without** a
+live interactive agent session and without an operator connecting in to ask
+for it. This complements, rather than duplicates,
+*unreachable-machine-maintenance-handoff*: that feature is the fallback for
+when a machine cannot be reached at all; this feature is the default posture
+for a machine that *can* be reached but simply has nothing driving it forward
+between sessions. Whether a machine registers this at all is **declared
+config, not an unconditional default**: an operator or mesh opts a machine
+into self-convergence the same way any other declarative resource is
+selected — a shared default may be declared once, with a more specific
+local declaration free to override it — and only a machine whose resolved
+config says "opted in" ever attempts registration. Self-convergence is
+driven by the **platform's own scheduler** (a genuine OS-level scheduled
+task, not a fabric daemon whose own liveness would just relocate the same
+problem one layer down), registered through a **one-time, explicit,
+operator-approved elevation** — the same convention already used to
+register a durable fabric service — so that afterward the platform's own
+restart/retry guarantees are the reliability backstop, not another
+long-lived process the fabric must also keep alive. Opting back out removes
+the registration through the fabric's own ordinary convergence, not a
+second bespoke uninstall path.
+
+Self-convergence work is **tiered by risk and cadence**, not run as a single
+undifferentiated job: a narrow, cheap, frequent tier watches only the small
+set of things known to silently fail between sessions (starting with the
+mesh transport's own reachability) and heals them; a broader, costlier,
+infrequent tier pulls declared state forward and reconciles it through the
+machine's existing declarative convergence surface. The two tiers never share
+a cadence or a lock — a slow broad sweep must never delay or block the narrow
+tier's own tick. Because the platform scheduler invokes each tick fresh with
+no long-lived process to serialize them, every tier guards its own
+reentrancy explicitly: a named, tier-scoped lock records its holder and a
+timestamp so a genuinely stale run is reclaimed while a still-live run is
+never double-driven. Every tick that mutates state respects the same
+live-session deferral boundary the rest of the fabric already honors — an
+unattended tick never interrupts or force-closes work a person is actively
+doing — and every fast-forward-only pull skips loudly, never force-resets, a
+diverged or dirty checkout. Whether self-convergence ran, and when it last
+succeeded, is observable from the fabric's own existing status surfaces
+without needing to reach the machine directly to check.
 
 ### legible-live-state
 What every agent is doing is **observable** — from a coarse Active / Recent /
 Completed floor with no service, up to granular live status surfaced into the
 worktree picker when the coordination layer is present. Legibility spans two
-complementary registers. A **durable disposition** the agent *asserts* —
-*resolved* vs. *has actionable follow-ups* — so a glance distinguishes a
-prune-able worktree from one still owed attention (a finalized worktree with an
-un-pushed change, an undeployed merge, or leftover temporary state is *not*
-done). And a **live activity pulse** *passively derived* from the agent's own
-intent signals, needing no cooperation, giving a rapid — if coarse — sense of
-current motion. The disposition is high-signal and slow; the pulse is low-signal
-and fast; neither is faked from the other.
+complementary registers. A **durable disposition** the agent *asserts* — a
+coarse *resolved* vs. *has actionable follow-ups* read for a glance — is the
+**reduction of a bounded collection of individually-addressable obligations**,
+each its own concise, actionable item with its own state and, where one
+applies, a reference to the claim, issue, pull request, effort, deployment, or
+external resource it concerns; a glance still reads the reduction, but a
+consumer that wants to settle one obligation without losing track of the
+others can address it directly. This distinguishes a prune-able worktree from
+one still owed attention (a finalized worktree with an un-pushed change, an
+undeployed merge, or leftover temporary state is *not* done — the itemized
+obligations name *which* of those it is). And a **live activity pulse**
+*passively derived* from the agent's own intent signals, needing no
+cooperation, giving a rapid — if coarse — sense of current motion. The
+disposition is high-signal and slow; the pulse is low-signal and fast; neither
+is faked from the other.
 
 ### legible-contribution-contract
 Landing work is **governed by rules that differ per repo** — whether a pull
@@ -333,6 +393,38 @@ out" means *safe*, not *deleted*. Three properties keep this honest and cheap:
   still owe?* and *which worktree is answerable for this resource?* — the
   legibility of `resource-claims` extended from "who holds what" to "who still owes
   what."
+- **Finalize is a live validation, never a one-way lock.** "Finalized" means
+  *safe to prune right now* — re-derived on every call, not a state a worktree
+  is latched into once and done. A direct resource the worktree still owns
+  (e.g. an open pull request) is live-reconciled against its true remote state
+  as part of the same finalize call that checks it, so a merge the worktree
+  hasn't separately observed yet never blocks finalize artificially. Adding a
+  claim, or resuming work, on an already-finalized worktree simply
+  **un-finalizes it** by the same local-balance check above — there is no
+  separate "locked" state finalize must be fought out of, and no risk of a
+  stale `FINAL` marker outliving new, genuinely unsettled work.
+- **Abandoning a resource is rare and salvage-first, never a substitute for
+  routine conflict resolution.** The generic `finalize --abandon
+  --handoff-to` escape hatch (and its PR-specific `pr-abandon` sibling) exist
+  for a resource that is genuinely, irrecoverably moot — never as a
+  convenience for a heavy rebase or a messy merge conflict, which is simply
+  resolved (rebase onto the current default branch, then force-push the SAME
+  branch/PR) rather than discarded and reopened. Even a resource whose
+  *driving* work is truly superseded is rarely worth abandoning wholesale: a
+  structural reduction to whatever slice of it still carries standalone
+  value (a doc fix, a test, an unrelated correction bundled into the same
+  change) and continuing to drive *that* to completion is the default;
+  outright abandonment is reserved for the rarer case where nothing
+  survives review. Because an attributed abandon path is easy to reach for
+  reflexively, every such verb layers a **friction gate** in front of the
+  action itself rather than trusting judgment alone: a first, unconfirmed
+  attempt always refuses with the concrete alternatives named above, and
+  mutates nothing; only a second, explicit confirmation — reached only after
+  that warning, never pre-empted — proceeds. This is deliberately a
+  procedural safeguard, not an invoker-identity/authorization primitive (that
+  remains tracked separately, ThomasMichon/copilot-extensions#4411) — it
+  raises the bar against casual or reflexive abandonment without depending on
+  infrastructure this layer does not have yet.
 
 ### externally-observable
 Beyond the fabric's own picker legibility, each layer's lifecycle is
@@ -472,15 +564,26 @@ behalf. Delegated and handed-off work leaves a durable, queryable result, not
 only a transcript.
 
 ### disposition-is-asserted-pulse-is-derived
-A worktree's **disposition** — *resolved* vs. *has actionable follow-ups* — is a
-**deliberate assertion** by the agent that worked it, never inferred from git or
-process state (which cannot tell *done* from *finalized-with-leftovers*). Its
-**live activity pulse**, by contrast, is **passively derived** from the agent's
-own activity with no cooperation required. The two never masquerade as each
+A worktree's **disposition** is a **deliberate assertion** by the agent that
+worked it, never inferred from git or process state (which cannot tell *done*
+from *finalized-with-leftovers*). The assertion is the **reduction of a
+bounded collection of individually-addressable obligations** — each with a
+stable identity, concise actionable text, an open/settled/transferred state,
+timestamps, provenance (which session asserted or settled it), and an
+optional typed reference to the authoritative claim, issue, pull request,
+effort, deployment, temporary resource, or external worktree it concerns —
+down to the coarse *resolved* vs. *has actionable follow-ups* signal a glance
+needs. The itemized obligations remain individually addressable: one can be
+settled, or transferred to a different tracked owner, without disturbing the
+others or collapsing the whole worktree's disposition prematurely. Its **live
+activity pulse**, by contrast, is **passively derived** from the agent's own
+activity with no cooperation required. The two never masquerade as each
 other: an **absent** assertion defaults to the safe, current behavior, and the
 derived pulse — being coarse and sometimes vague — **never** sets the durable
-disposition. Truly finishing a worktree and asserting it *resolved* are the same
-act; leaving a stopping point with work still owed is asserting *follow-ups*.
+disposition, nor does it settle or transfer an obligation. Truly finishing a
+worktree is settling or transferring every obligation and asserting the
+reduction *resolved*; leaving a stopping point with an obligation still open
+is asserting *follow-ups*.
 
 ### single-current-session-per-worktree
 A worktree has, at any moment, **one current session** — its head. An agent is a
@@ -506,18 +609,20 @@ for the exceptional case, but the safe default is that the fabric *refuses to
 duplicate* rather than quietly spawning a rival. This is the session-level
 expression of *discover-before-duplicate* and *derive-dont-duplicate*: the
 current-session pointer and the succession chain are **owned by the ground
-layer** (which owns session lifecycle), and higher layers **enforce and derive
-from** them rather than keeping a rival notion of "current."
+layer** (which owns durable execution lineage), and higher layers **enforce and
+derive from** them rather than keeping a rival notion of "current." The selected
+session host owns the process lifetime of each leg, not the meaning of the
+lineage.
 
-### handoff-orchestrated-above-primitives
-Session **launch** is a ground-layer **primitive** — "spin a Copilot session in
-worktree `<id>`." The **handoff** built on it — compose the continuation, mint a
-**claimable delegation record** (so a coordinator or the next session picks it
-up), cut a successor over, **verify it came up**, and retire the predecessor — is
-**orchestrated by the layers above** (the handoff extension driving the delegation
-layer), never absorbed into the ground layer. The ground layer offers the
-**mechanism**; a higher layer owns the **policy** — and a mux-less environment
-degrades to the same claimable record, not to a silent no-op.
+### handoff-orchestrated-across-ledger-and-host
+The handoff layer owns the continuation and transition policy; the worktree
+ground layer owns durable head, lineage, and responsibility; the selected
+session-host provider owns launch, prompt delivery, and retirement mechanics.
+A cutover is represented durably before a provider is notified. A provider's
+launch receipt remains provisional until the successor proves its session and
+opening context; only then does durable authority move and retirement become
+authorized. With no compatible provider, the same handoff remains recoverable
+for manual pickup rather than becoming a silent no-op.
 
 ### context-pressure-drives-handoff
 Context saturation is a legitimate **driver** of a handoff, but a driver held
@@ -531,9 +636,10 @@ off first and delivering that prompt to the successor**, rather than spending th
 last of the window on a degraded turn — so a minimal consumer that can only
 *send the next message* still advances. Like every other handoff this is
 **orchestrated above the primitive** (*handoff-orchestrated-above-primitives*):
-the ground layer never auto-rolls a session on its own, the policy and the
-pressure-reading live in the layers above, and the succession chain and
-current-session pointer it produces remain **owned by the ground layer**
+the worktree ground layer never auto-rolls a session on its own, the policy and
+pressure-reading live in the layers above, the selected host performs the
+execution transition, and the succession chain and current-session pointer
+remain **owned by the ground layer**
 (*single-current-session-per-worktree*). The signal is **fail-safe**: absent an
 opt-in, pressure changes nothing and the session behaves exactly as before.
 
@@ -550,6 +656,10 @@ opt-in, pressure changes nothing and the session behaves exactly as before.
 - **Not a replacement for the human's editor or terminal.** The fabric
   coordinates *agents*; it does not own the human's own interactive editing
   surface.
+- **Not one universal Copilot process manager.** Execution is supplied by
+  capability-honest session-host providers. The fabric does not force every
+  Copilot product or third-party rig through one terminal, multiplexer, or
+  protocol implementation.
 - **No second store of another layer's state.** A higher layer must not persist
   its own copy of state a lower layer owns — it derives and coordinates. (Stated
   as a boundary precisely so realizations don't smear one capability's state
@@ -572,6 +682,8 @@ opt-in, pressure changes nothing and the session behaves exactly as before.
   constructs: delegate the primitive, align vocabulary + layout, keep the durable
   value the CLI lacks, without regressing a capability or hard-depending on an
   unreleased construct.
+- Cross-cutting vision: [session-hosting](../session-hosting/README.md) —
+  provider-neutral ownership of Copilot execution and live cutover mechanics.
 - Child visions: [agent-ssh](../plugins/agent-ssh/README.md) — the connectivity /
   transport layer the fabric's cross-machine reach rides on;
   [agent-dispatch](../plugins/agent-dispatch/README.md) — the delegation layer's
@@ -582,9 +694,23 @@ opt-in, pressure changes nothing and the session behaves exactly as before.
   [venue-parity](../venue-parity/README.md) — the cross-cutting principle that the
   fabric's venue providers (agent-codespaces / agent-containers) are thin,
   symmetric SSH transports over one agent-bridge dispatch core, so a dispatched
-  agent is the same in a CodeSpace or a local container. Further per-plugin leaves
-  live under `visions/plugins/<name>/` as authored (e.g. a future
-  `visions/plugins/agent-bridge/`).
+  agent is the same in a CodeSpace or a local container;
+  [remote-interactive-sessions](../remote-interactive-sessions/README.md) — how a
+  human-attended, muxed session in a remote venue becomes a first-class peer of a
+  local one, bound through explicit worktree-keyed reservation rather than
+  ambient self-registration;
+  [host-resource-providers](../host-resource-providers/README.md) — how any plugin
+  registers a named, locally-reachable capability a coordinated session can
+  request, generalizing the credential relay's pluggable-source shape;
+  [venue-pivots-ux](../venue-pivots-ux/README.md) — overhauling the Picker's
+  already-registered Codespaces and Containers pivots for consistency with
+  each other and fidelity of the information each surfaces, a sibling of
+  `picker`. Further per-plugin leaves
+  live under `visions/plugins/<name>/` as authored (e.g.
+  [`visions/plugins/agent-bridge/`](../plugins/agent-bridge/README.md) and
+  [`visions/plugins/context-handoff/`](../plugins/context-handoff/README.md) —
+  the policy owner for continuing an agent's work across a context-window
+  boundary, host-agnostically).
 - Reality docs: [`docs/architecture.md`](../../docs/architecture.md) ·
   [`docs/harness-runbook.md`](../../docs/harness-runbook.md) · each plugin's
   `docs/`.
@@ -704,3 +830,49 @@ opt-in, pressure changes nothing and the session behaves exactly as before.
   identity before new claims or leases are created, with no fallback to the
   shared launch repository. Existing fenced ownership remains releasable during
   a later binding outage so fail-closed acquisition cannot wedge teardown.
+- **2026-09-04** — Split durable worktree-lifetime agency state from Copilot
+  execution hosting. agent-worktrees remains the host-neutral owner of worktree
+  identity, responsibility, claims, disposition, head, and succession, while
+  pluggable session hosts own launch, interaction, observation, reconnection,
+  prompt delivery, and retirement for CLI/mux, ACP, SDK, App, and third-party
+  rigs. Handoff now spans those authorities through durable requests and
+  verified takeover rather than treating one ground-layer launcher as universal.
+- **2026-09-18** — Extended §Features/`legible-live-state` and
+  §Behaviors/`disposition-is-asserted-pulse-is-derived`: the asserted
+  **disposition** is now the *reduction* of a bounded collection of
+  individually-addressable **obligations** (stable identity, concise text,
+  open/settled/transferred state, timestamps, provenance, optional typed
+  reference), rather than a single opaque boolean. Mined from operator
+  friction: a worktree can carry several independent unsettled concerns (an
+  un-pushed change, an open PR, a pending deployment, a held external claim),
+  and a binary assertion could not identify which, settle one while retaining
+  another, or connect the disposition to the claim/issue/PR it concerns. The
+  asserted-vs-derived separation and the ground layer's ownership are
+  unchanged — only the *shape* of the asserted side deepens from a flag to a
+  bounded collection whose reduction still answers the coarse question.
+- **2026-10-04** — Extended §Concepts/`resource-accountability` with
+  *finalize is a live validation, never a one-way lock*: re-derived on every
+  call (never latched), a direct resource live-reconciled against its true
+  remote state as part of the same call, and a new/resumed claim on an
+  already-finalized worktree simply un-finalizes it rather than fighting a
+  separate locked state. Mined from the `worktree-claims-transitive-
+  finalization` effort's own Phase 0: the shipped mechanism (bottom-up
+  settlement, live PR-reconcile-before-gate, non-sticky un-finalize) already
+  matched `resource-accountability`'s existing "settle incrementally, assert
+  locally" language in full by the time this effort started investigating
+  it — the one genuinely missing piece was this explicit "never a lock"
+  framing, not a graph-walk primitive the effort's own header had assumed
+  was needed (confirmed absent, not added).
+- **2026-10-05** — Extended §Concepts/`resource-accountability` with
+  *abandoning a resource is rare and salvage-first, never a substitute for
+  routine conflict resolution*: rebase+force-push (not abandon-and-reopen)
+  is the correct response to a heavy conflict; a structural reduction to
+  whatever slice of a superseded resource still has standalone value (not
+  wholesale discard) is the default even when the driving work is genuinely
+  moot; and every attributed abandon verb layers a friction gate (an
+  unconfirmed first attempt always refuses with the named alternatives and
+  mutates nothing) rather than trusting judgment alone. Landed alongside the
+  `pr-abandon` CLI verb (the `pr-merge-obligation-gate` effort's #4411
+  follow-up, implemented pragmatically as friction rather than waiting on
+  the deferred invoker-identity primitive) — see the `pr-abandon-flow`
+  effort.

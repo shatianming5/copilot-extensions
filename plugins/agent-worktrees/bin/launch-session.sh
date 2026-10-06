@@ -27,6 +27,14 @@ setup_log() {
     printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$msg" >> "$SETUP_LOG" 2>/dev/null || true
 }
 
+launch_trace() {
+    local event="$1" path="${AGENT_WORKTREES_LAUNCH_TRACE:-}"
+    [[ -n "$path" ]] || return 0
+    case "${path,,}" in 0|false|no|off) return 0 ;; esac
+    mkdir -p "$(dirname "$path")" 2>/dev/null || true
+    printf '%s\n' '{"timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","event":"'"$event"'","launch_id":"'"${AGENT_WORKTREES_LAUNCH_ID:-}"'","project":"'"${LAUNCH_PROJECT:-}"'"}' >>"$path" 2>/dev/null || true
+}
+
 # Launch-status line: always logged, and ALSO echoed to the terminal (stderr,
 # to stay clear of any stdout capture / ACP channel) during an interactive
 # launch so the operator understands what the otherwise-silent post-Picker /
@@ -54,13 +62,110 @@ chmod 600 "$SETUP_LOG" 2>/dev/null || true
 # shellcheck disable=SC2012
 ls -t "$_SETUP_LOG_DIR"/setup-*.log 2>/dev/null | tail -n +11 | xargs rm -f 2>/dev/null || true
 
+# --recovery: bypass worktree resolution entirely, go straight to setup script
+# --project: explicit project identity for CWD-neutral callers
+# --: everything after this separator is copilot passthrough args (e.g. --acp --stdio)
+LAUNCH_PROJECT=""
+RECOVERY_MODE=0
+FILTERED_ARGS=()
+COPILOT_PASSTHROUGH=()
+
+# _agent_host: which agent CLI (grok/claude/copilot) the session runs.
+# shellcheck source=../scripts/agent-host.sh
+. "${BASH_SOURCE[0]%/*}/../scripts/agent-host.sh"
+AGENT_HOST="$(_agent_host)"
+_SEEN_SEPARATOR=0
+while [[ $# -gt 0 ]]; do
+    arg="$1"
+    shift
+    if [[ $_SEEN_SEPARATOR -eq 1 ]]; then
+        COPILOT_PASSTHROUGH+=("$arg")
+    elif [[ "$arg" == "--" ]]; then
+        _SEEN_SEPARATOR=1
+    elif [[ "$arg" == "--project" ]]; then
+        if [[ -n "$LAUNCH_PROJECT" ]]; then
+            setup_log ERROR '--project may be specified only once'
+            echo "ERROR: --project may be specified only once." >&2
+            exit 2
+        fi
+        if [[ $# -eq 0 ]]; then
+            setup_log ERROR '--project requires a value'
+            echo "ERROR: --project requires a value." >&2
+            exit 2
+        fi
+        LAUNCH_PROJECT="$1"
+        shift
+        if [[ ! "$LAUNCH_PROJECT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+            setup_log ERROR "Invalid --project value: $LAUNCH_PROJECT"
+            echo "ERROR: Invalid --project value '$LAUNCH_PROJECT'." >&2
+            exit 2
+        fi
+    elif [[ "$arg" == "--recovery" || "$arg" == "-Recovery" || "$arg" == "recovery" ]]; then
+        RECOVERY_MODE=1
+        setup_log INFO 'Recovery mode requested via CLI arg'
+    else
+        FILTERED_ARGS+=("$arg")
+    fi
+done
+set -- "${FILTERED_ARGS[@]+"${FILTERED_ARGS[@]}"}"
+
 setup_log INFO 'launch-session.sh starting'
-LAUNCH_PROJECT="${WORKTREE_PROJECT:-}"
+launch_trace launcher_start
+if [[ ${#COPILOT_PASSTHROUGH[@]} -gt 0 ]]; then
+    setup_log INFO "Copilot passthrough args: ${COPILOT_PASSTHROUGH[*]}"
+fi
+
+# Recovery escape hatch resolves from explicit project identity or CWD.
+if [[ "$RECOVERY_MODE" == "1" ]]; then
+    CANDIDATES=()
+    if [[ -n "${COPILOT_EXTENSIONS_CONTEXT:-}" &&
+          -n "${AGENT_WORKTREES_LAUNCH_RECOVERY_ANCHOR:-}" ]]; then
+        CANDIDATES+=("$AGENT_WORKTREES_LAUNCH_RECOVERY_ANCHOR")
+    fi
+    if [[ -n "$LAUNCH_PROJECT" && -z "${COPILOT_EXTENSIONS_CONTEXT:-}" ]]; then
+        CONFIG="$HOME/.$LAUNCH_PROJECT/config.yaml"
+        if [[ -f "$CONFIG" ]]; then
+            CONFIG_ANCHOR=$(sed -nE 's/^[[:space:]]+anchor:[[:space:]]+["'"'"']?([^"'"'"']+)["'"'"']?[[:space:]]*$/\1/p' "$CONFIG" | head -n 1)
+            [[ -n "$CONFIG_ANCHOR" ]] && CANDIDATES+=("$CONFIG_ANCHOR")
+        fi
+    fi
+    GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    [[ -n "$GIT_ROOT" ]] && CANDIDATES+=("$GIT_ROOT")
+    CANDIDATES+=("$PWD")
+    for ANCHOR in "${CANDIDATES[@]}"; do
+        SETUP_SCRIPT="$ANCHOR/tools/setup/setup.sh"
+        if [[ -f "$SETUP_SCRIPT" ]]; then
+            RECOVERY_ARGS=(--recovery "$@")
+            if [[ ${#COPILOT_PASSTHROUGH[@]} -gt 0 ]]; then
+                RECOVERY_ARGS+=("${COPILOT_PASSTHROUGH[@]}")
+            fi
+            cd "$ANCHOR"
+            exec bash "$SETUP_SCRIPT" "${RECOVERY_ARGS[@]}"
+        fi
+    done
+    echo "ERROR: Cannot find a recovery setup script in the project anchor, Git root, or current directory." >&2
+    exit 1
+fi
 
 # Runtime resolution (junction-free, marker-only). Prefer the `current-version`
 # marker -> versions/<ver>/bin/python; fall back to the newest slot only -- the
 # `.venv` symlink is retired (#1106).
-RUNTIME_DIR="$HOME/.agent-worktrees"
+if [[ -n "${COPILOT_EXTENSIONS_CONTEXT:-}" ]]; then
+    RUNTIME_DIR="${AGENT_WORKTREES_LAUNCH_RUNTIME_ROOT:-}"
+    CONTEXT_ROOT="$(dirname -- "$COPILOT_EXTENSIONS_CONTEXT")"
+    [[ "$RUNTIME_DIR" == /* && -d "$RUNTIME_DIR" &&
+       "$(cd -P -- "$RUNTIME_DIR" && pwd)" == "$(cd -P -- "$CONTEXT_ROOT" && pwd)" ]] || {
+        setup_log ERROR 'Validated cell runtime root is unavailable'
+        echo "ERROR: Validated cell runtime root is unavailable." >&2
+        exit 1
+    }
+else
+    # Standard cross-plugin resolution: AGENT_RT_ROOT is the marketplace-
+    # specific install-folder override every plugin's own resolve-runtime.sh
+    # already honors (see below); default here too so this pre-check (which
+    # locates resolve-runtime.sh itself) stays consistent with it.
+    RUNTIME_DIR="${AGENT_RT_ROOT:-$HOME/.agent-worktrees}"
+fi
 AW_PY=""
 if [[ -f "$RUNTIME_DIR/bin/resolve-runtime.sh" ]]; then
     # shellcheck source=../scripts/resolve-runtime.sh
@@ -76,6 +181,54 @@ resolve_runtime_python() {
     printf '%s\n' "$AW_PY"
 }
 
+# Runs a best-effort `agent_worktrees` preflight subcommand (knowledge
+# composition, marketplace overrides, ...) with retry-and-reresolve.
+#
+# #stale-venv-preflight: a background plugin update can flip `current-version`
+# to a brand-new slot WHILE this launch is mid-flight, and observed evidence
+# (a real-world consuming harness's own tracker issue) shows the OLD,
+# still-"current"-at-the-time
+# slot can transiently fail to import its own package during that swap (e.g.
+# "No module named agent_worktrees") even though the interpreter itself still
+# resolves and the slot is intact a moment later. Re-resolving the interpreter
+# on every attempt and retrying rides out that window instead of trusting a
+# single, possibly-stale snapshot of $PYTHON.
+#
+# These preflights are best-effort enrichments -- their output is only logged,
+# never consumed downstream -- so persistent failure (not just a transient
+# race) degrades to a warning rather than exiting the whole launch. Killing
+# the process here previously took the entire terminal tab down with no
+# recovery path.
+#
+# Usage: run_runtime_preflight "<label>" arg1 arg2 ...
+run_runtime_preflight() {
+    local label="$1"; shift
+    local max_attempts=3
+    local retry_delay_s=0.4
+    local attempt py output rc
+    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+        py="$(resolve_runtime_python)" || py=""
+        [[ -n "$py" && -x "$py" ]] || py="$PYTHON"
+        if [[ -z "$py" || ! -x "$py" ]]; then
+            setup_log WARN "$label: runtime python unavailable on attempt $attempt/$max_attempts"
+        else
+            if output=$("$py" "$@" 2>&1); then
+                setup_log INFO "$label completed: $output"
+                return 0
+            fi
+            rc=$?
+            setup_log WARN "$label failed on attempt $attempt/$max_attempts (exit $rc): ${output:-no details}"
+        fi
+        if ((attempt < max_attempts)); then
+            sleep "$retry_delay_s"
+        fi
+    done
+    setup_log ERROR "$label failed after $max_attempts attempts -- continuing launch without it"
+    printf 'WARNING: %s failed after %s attempts -- continuing launch without it (see %s)\n' \
+        "$label" "$max_attempts" "${WORKTREE_SETUP_LOG:-the setup log}" >&2
+    return 1
+}
+
 if [[ -n "$PYTHON" && -x "$PYTHON" ]]; then
     setup_log INFO "Venv resolved: $RUNTIME_DIR"
 else
@@ -89,6 +242,19 @@ unset PYTHONHOME
 
 run_post_exit() {
     local worktree_id="$1"
+    # Re-resolve before use: post-exit runs after the interactive Copilot
+    # session ends, and the runtime may have been upgraded/pruned to a
+    # different version dir in the meantime, leaving the cached $PYTHON
+    # pointing at a now-deleted interpreter (#stale-venv).
+    local refreshed
+    if refreshed="$(resolve_runtime_python)" && [[ -n "$refreshed" && -x "$refreshed" ]]; then
+        PYTHON="$refreshed"
+    fi
+    if [[ -z "$PYTHON" || ! -x "$PYTHON" ]]; then
+        setup_log ERROR "Post-exit: runtime python unavailable (cached path stale and re-resolve failed)"
+        echo "WARNING: Post-exit finalization skipped: agent-worktrees runtime python not found. Run 'agent-worktrees finalize' to retry." >&2
+        return 1
+    fi
     local post_args=(-m agent_worktrees)
     [[ -n "$LAUNCH_PROJECT" ]] && post_args+=(--project "$LAUNCH_PROJECT")
     post_args+=(post-exit "$worktree_id")
@@ -101,6 +267,14 @@ run_post_exit() {
 activity_log() {
     local event="$1" wt="${2:-}"; shift 2 2>/dev/null || shift $# 
     [[ -z "$event" || -z "$wt" ]] && return 0
+    # Re-resolve before use: this can fire long after the interactive Copilot
+    # session ends, and the runtime may have been upgraded/pruned to a
+    # different version dir in the meantime (#stale-venv).
+    local refreshed
+    if refreshed="$(resolve_runtime_python)" && [[ -n "$refreshed" && -x "$refreshed" ]]; then
+        PYTHON="$refreshed"
+    fi
+    [[ -n "$PYTHON" && -x "$PYTHON" ]] || return 0
     local fields=()
     local kv
     for kv in "$@"; do
@@ -112,51 +286,32 @@ activity_log() {
         "${fields[@]+"${fields[@]}"}" >/dev/null 2>&1 & ) || true
 }
 
-# --recovery: skip vault credential loading (propagated via env var to setup.sh)
-# --: everything after this separator is copilot passthrough args (e.g. --acp --stdio)
-FILTERED_ARGS=()
-COPILOT_PASSTHROUGH=()
-
-# _agent_host: which agent CLI (grok/claude/copilot) the session runs.
-# shellcheck source=../scripts/agent-host.sh
-. "${BASH_SOURCE[0]%/*}/../scripts/agent-host.sh"
-AGENT_HOST="$(_agent_host)"
-_SEEN_SEPARATOR=0
-for arg in "$@"; do
-    if [[ $_SEEN_SEPARATOR -eq 1 ]]; then
-        COPILOT_PASSTHROUGH+=("$arg")
-    elif [[ "$arg" == "--" ]]; then
-        _SEEN_SEPARATOR=1
-    elif [[ "$arg" == "--recovery" || "$arg" == "recovery" ]]; then
-        export WORKTREE_RECOVERY=1
-        setup_log INFO 'Recovery mode requested via CLI arg'
+# ── Crash detector ──────────────────────────────────────────────────────────
+# A global ERR trap so `set -e` killing the script anywhere below this point
+# (a tmux create/attach failure not otherwise caught, or any other unguarded
+# command) is diagnosed and recorded instead of exiting silently with a bare
+# code (#4454, Windows counterpart of this gap in launch-session.ps1).
+# WORKTREE_ID/LAUNCH_PROJECT may still be unset if the crash happens early;
+# handled defensively so this never masks the real failure with a trap error.
+_aw_crash_trap() {
+    local exit_code=$? line_no=$1 cmd="$2"
+    setup_log ERROR "UNHANDLED: '$cmd' failed (exit $exit_code) at line $line_no"
+    if [[ -n "${WORKTREE_ID:-}" ]]; then
+        activity_log mux_failed "$WORKTREE_ID" mux=unknown reason=unhandled_exception "exit_code=$exit_code"
+    fi
+    local recovery_project="${LAUNCH_PROJECT:-agent-worktrees}"
+    local recovery_hint
+    if [[ -n "${WORKTREE_ID:-}" ]]; then
+        recovery_hint="Run '$recovery_project --worktree-id $WORKTREE_ID' to retry, or use --no-mux to request a direct session explicitly."
     else
-        FILTERED_ARGS+=("$arg")
+        recovery_hint="Run '$recovery_project' again to retry, or use --no-mux to request a direct session explicitly."
     fi
-done
-set -- "${FILTERED_ARGS[@]+"${FILTERED_ARGS[@]}"}"
-if [[ ${#COPILOT_PASSTHROUGH[@]} -gt 0 ]]; then
-    setup_log INFO "Copilot passthrough args: ${COPILOT_PASSTHROUGH[*]}"
-fi
-
-# Recovery escape hatch (broken venv)
-if [[ "${WORKTREE_RECOVERY:-}" == "1" ]] && [[ ! -x "$PYTHON" ]]; then
-    PROJECT="${WORKTREE_PROJECT:-}"
-    if [[ -z "$PROJECT" ]]; then
-        echo "ERROR: WORKTREE_PROJECT is not set. Set it or run from inside the anchor repo." >&2
-        exit 1
-    fi
-    CONFIG="$HOME/.$PROJECT/config.yaml"
-    if [[ -f "$CONFIG" ]]; then
-        ANCHOR=$(awk '/^    anchor:/ {print $2}' "$CONFIG")
-        if [[ -n "$ANCHOR" && -d "$ANCHOR" ]]; then
-            cd "$ANCHOR"
-            exec bash "$ANCHOR/tools/setup/setup.sh" --recovery "$@"
-        fi
-    fi
-    echo "ERROR: Cannot determine anchor path for recovery." >&2
-    exit 1
-fi
+    echo "" >&2
+    echo "Worktree launcher crashed unexpectedly ('$cmd' exited $exit_code)." >&2
+    echo "$recovery_hint" >&2
+    echo "Details logged to: $SETUP_LOG" >&2
+}
+trap '_aw_crash_trap "$LINENO" "$BASH_COMMAND"' ERR
 
 # ── Plugin auto-update ─────────────────────────────────────────────────────
 # If installed from the copilot-extensions marketplace plugin, check for
@@ -199,11 +354,11 @@ invoke_update_apply() {
     _UPDATE_APPLIED=1
 
     local status_file="$HOME/.agent-worktrees/updater-status.json"
-    local stage_done="" plugin_changed="" skipped="" plugin_dir="" runtime_apply_blocked=""
+    local stage_done="" plugin_changed="" skipped="" plugin_dir="" runtime_root="" runtime_apply_blocked=""
 
     _parse_stage_status() {
         [[ -f "$status_file" ]] || return 0
-        IFS=$'\t' read -r stage_done plugin_changed skipped plugin_dir runtime_apply_blocked < <(
+        IFS=$'\t' read -r stage_done plugin_changed skipped plugin_dir runtime_root runtime_apply_blocked < <(
             "$PYTHON" -c "
 import sys, json
 try:
@@ -215,6 +370,7 @@ print('\t'.join([
     str(d.get('plugin_changed', False)),
     str(d.get('skipped', '')),
     str(d.get('plugin_dir', '')),
+    str(d.get('runtime_root', '')),
     str(d.get('runtime_apply_blocked', '')),
 ]))
 " "$status_file" 2>/dev/null
@@ -245,40 +401,78 @@ print('\t'.join([
         # (1) Marketplace installer, iff the download changed the payload.
         #     NO re-exec: a launcher-script change applies on the next launch.
         if [[ "$plugin_changed" == "True" ]]; then
-            local _installer="$plugin_dir/scripts/install.sh"
-            if [[ -n "$plugin_dir" && -f "$_installer" ]]; then
-                local _inst_args=(update)
-                if [[ -n "${WORKTREE_PROJECT:-}" ]]; then
-                    _inst_args+=(--project-name "$WORKTREE_PROJECT")
-                fi
-                if [[ -n "${WORKTREE_BLOCKING_INSTALL:-}" ]]; then
-                    # Escape hatch (recovery/debug): apply synchronously.
-                    setup_status INFO 'A new plugin version was downloaded; installing the updated runtime...'
-                    if bash "$_installer" "${_inst_args[@]}" 2>&1 | while IFS= read -r _line; do
-                        setup_log INFO "installer: $_line"
-                    done; then
-                        setup_log INFO 'Installer update succeeded (launcher change, if any, applies next launch)'
+            local _stage_env_text=""
+            local _stage_env=()
+            if ! _stage_env_text=$("$PYTHON" -c "
+import sys, json
+status = json.load(open(sys.argv[1], encoding='utf-8'))
+unset = status.get('unset_environment', [])
+environment = status.get('environment', {})
+if (
+    not isinstance(unset, list)
+    or not all(isinstance(key, str) and key for key in unset)
+    or not isinstance(environment, dict)
+    or not all(
+        isinstance(key, str) and key and isinstance(value, str)
+        for key, value in environment.items()
+    )
+):
+    raise SystemExit(2)
+for key in unset:
+    print('-u')
+    print(key)
+for key, value in environment.items():
+    print(f'{key}={value}')
+" "$status_file" 2>/dev/null); then
+                setup_log WARN 'Plugin installer environment metadata is invalid -- skipping'
+                plugin_changed="False"
+            fi
+            while IFS= read -r _stage_env_entry; do
+                [[ -n "$_stage_env_entry" ]] && _stage_env+=("$_stage_env_entry")
+            done <<< "$_stage_env_text"
+
+            if [[ "$plugin_changed" == "True" ]]; then
+                local _installer="$plugin_dir/scripts/install.sh"
+                if [[ -n "$plugin_dir" && -f "$_installer" ]]; then
+                    local _inst_args=(
+                        update
+                        --install-dir "$runtime_root"
+                    )
+                    if [[ -n "$LAUNCH_PROJECT" ]]; then
+                        _inst_args+=(--project-name "$LAUNCH_PROJECT")
+                    fi
+                    if [[ -n "${WORKTREE_BLOCKING_INSTALL:-}" ]]; then
+                        # Escape hatch (recovery/debug): apply synchronously.
+                        setup_status INFO 'A new plugin version was downloaded; installing the updated runtime...'
+                        if env ${_stage_env[@]+"${_stage_env[@]}"} \
+                            bash "$_installer" "${_inst_args[@]}" 2>&1 | while IFS= read -r _line; do
+                            setup_log INFO "installer: $_line"
+                        done; then
+                            setup_log INFO 'Installer update succeeded (launcher change, if any, applies next launch)'
+                        else
+                            setup_log WARN "Installer update failed -- continuing with existing version"
+                        fi
                     else
-                        setup_log WARN "Installer update failed -- continuing with existing version"
+                        # Default: DETACH the install so the launch never blocks on the
+                        # (slow) venv rebuild. Immutable versioned slots make this safe
+                        # -- the installer builds a NEW versions/<v> slot and flips the
+                        # current-version marker atomically, never touching the slot
+                        # THIS session execs from. So launch on the active slot now; the
+                        # new version applies on the next launch (stage-next), the same
+                        # way the runtime reconcile already runs detached. The installer
+                        # carries its own single-instance lock, so a concurrent launch's
+                        # background install can't collide.
+                        setup_status INFO 'A new plugin version was downloaded; installing it in the background (applies on the next launch)...'
+                        local _ilog="${APERTURE_SETUP_LOG:-${WORKTREE_SETUP_LOG:-/dev/null}}"
+                        setsid env ${_stage_env[@]+"${_stage_env[@]}"} \
+                            bash "$_installer" "${_inst_args[@]}" \
+                            >>"$_ilog" 2>&1 </dev/null &
+                        disown 2>/dev/null || true
+                        setup_log INFO 'Background install started (new version applies on the next launch)'
                     fi
                 else
-                    # Default: DETACH the install so the launch never blocks on the
-                    # (slow) venv rebuild. Immutable versioned slots make this safe
-                    # -- the installer builds a NEW versions/<v> slot and flips the
-                    # current-version marker atomically, never touching the slot
-                    # THIS session execs from. So launch on the active slot now; the
-                    # new version applies on the next launch (stage-next), the same
-                    # way the runtime reconcile already runs detached. The installer
-                    # carries its own single-instance lock, so a concurrent launch's
-                    # background install can't collide.
-                    setup_status INFO 'A new plugin version was downloaded; installing it in the background (applies on the next launch)...'
-                    local _ilog="${APERTURE_SETUP_LOG:-${WORKTREE_SETUP_LOG:-/dev/null}}"
-                    setsid bash "$_installer" "${_inst_args[@]}" >>"$_ilog" 2>&1 </dev/null &
-                    disown 2>/dev/null || true
-                    setup_log INFO 'Background install started (new version applies on the next launch)'
+                    setup_log WARN "Plugin installer not found ($_installer) -- skipping"
                 fi
-            else
-                setup_log WARN "Plugin installer not found ($_installer) -- skipping"
             fi
         fi
 
@@ -312,11 +506,48 @@ for a in json.load(sys.stdin)['updates'][$i].get('argv', []):
     print(a)
 " <<< "$PRE_JSON" 2>/dev/null)
                 if [[ ${#UPDATE_ARGV[@]} -gt 0 ]]; then
+                    _UPDATE_ENV=()
+                    _UPDATE_ENV_TEXT=$("$PYTHON" -c "
+import sys, json
+update = json.load(sys.stdin)['updates'][$i]
+unset = update.get('unset_environment', [])
+environment = update.get('environment', {})
+if (
+    not isinstance(unset, list)
+    or not all(isinstance(key, str) and key for key in unset)
+    or not isinstance(environment, dict)
+    or not all(
+        isinstance(key, str) and key and isinstance(value, str)
+        for key, value in environment.items()
+    )
+):
+    raise SystemExit(2)
+for key in unset:
+    print('-u')
+    print(key)
+for key, value in environment.items():
+    print(f'{key}={value}')
+" <<< "$PRE_JSON" 2>/dev/null) || {
+                        setup_log WARN "Update environment invalid for $SVC_NAME; skipping"
+                        continue
+                    }
+                    while IFS= read -r _update_env; do
+                        [[ -n "$_update_env" ]] && _UPDATE_ENV+=("$_update_env")
+                    done <<< "$_UPDATE_ENV_TEXT"
                     setup_status INFO "Updating $SVC_NAME..."
                     setup_log INFO "  command: ${UPDATE_ARGV[*]}"
-                    "${UPDATE_ARGV[@]}" || setup_log WARN "Update failed for $SVC_NAME (exit $?)"
+                    env ${_UPDATE_ENV[@]+"${_UPDATE_ENV[@]}"} \
+                        "${UPDATE_ARGV[@]}" \
+                        || setup_log WARN "Update failed for $SVC_NAME (exit $?)"
                 fi
             done
+            # Re-resolve before the re-check: one of the updates just applied
+            # above (e.g. agent-worktrees) may have swapped the runtime venv
+            # slot out from under the cached $PYTHON, leaving it pointing at a
+            # now-deleted interpreter (#stale-venv).
+            if _refreshed_python="$(resolve_runtime_python)" && [[ -n "$_refreshed_python" && -x "$_refreshed_python" ]]; then
+                PYTHON="$_refreshed_python"
+            fi
             setup_log INFO 'Re-checking staleness after update'
             PRE_JSON=$("$PYTHON" -m agent_worktrees pre-launch 2>/dev/null) || PRE_JSON='{"action":"continue"}'
             _log_prelaunch_diagnostics "$PRE_JSON"
@@ -371,9 +602,32 @@ for a in json.load(sys.stdin)['updates'][$_ri].get('argv', []):
                     continue
                 fi
                 setup_log INFO "Plugin reconcile: $_RSVC -> ${_RARGV[*]}"
-                "${_RARGV[@]}" 2>&1 | while IFS= read -r _rl; do setup_log INFO "reconcile: $_rl"; done \
+                _RENV=()
+                _RENV_TEXT=$("$PYTHON" -c "
+import sys, json
+update = json.load(sys.stdin)['updates'][$_ri]
+for key in update.get('unset_environment', []):
+    print('-u')
+    print(key)
+for key, value in update.get('environment', {}).items():
+    print(f'{key}={value}')
+" <<< "$REC_JSON" 2>/dev/null) || {
+                    setup_log WARN "Plugin reconcile: invalid environment metadata for $_RSVC; skipping"
+                    continue
+                }
+                while IFS= read -r _reconcile_env; do
+                    [[ -n "$_reconcile_env" ]] && _RENV+=("$_reconcile_env")
+                done <<< "$_RENV_TEXT"
+                env ${_RENV[@]+"${_RENV[@]}"} "${_RARGV[@]}" 2>&1 | while IFS= read -r _rl; do setup_log INFO "reconcile: $_rl"; done \
                     || setup_log WARN "Plugin reconcile: step failed for $_RSVC"
             done
+            # Re-resolve before the next pass: this pass's reconcile actions
+            # (the runtime-gated pass in particular) may have swapped the
+            # runtime venv slot out from under the cached $PYTHON, leaving it
+            # pointing at a now-deleted interpreter (#stale-venv).
+            if _refreshed_python="$(resolve_runtime_python)" && [[ -n "$_refreshed_python" && -x "$_refreshed_python" ]]; then
+                PYTHON="$_refreshed_python"
+            fi
         done
     fi
 }
@@ -386,7 +640,7 @@ for a in json.load(sys.stdin)['updates'][$_ri].get('argv', []):
 # Subcommands that agent_worktrees's main() handles directly — these
 # must NOT fall through to the resolve→picker flow.  Keep in sync with
 # COMMAND_MAP in __main__.py, plus "services" and "agent-worktrees".
-_DIRECT_COMMANDS="services repos knowledge worktree agent-worktrees resolve post-exit finalize push-changes mark-complete status list create cleanup validate install register unregister uninstall update install-status deploy-instructions get pre-launch stage-update reconcile-plugins dev handoff-cutover register-session deregister-session backfill-sessions anchor-check activity activity-log"
+_DIRECT_COMMANDS="services repos knowledge worktree agent-worktrees resolve execution-leg post-exit finalize push-changes mark-complete status list create cleanup validate install register unregister uninstall update install-status deploy-instructions get pre-launch stage-update reconcile-plugins dev handoff-cutover register-session deregister-session backfill-sessions anchor-check activity activity-log"
 _IS_DIRECT=""
 if [[ $# -gt 0 ]]; then
     for _dc in $_DIRECT_COMMANDS; do
@@ -399,7 +653,10 @@ if [[ -n "$_IS_DIRECT" ]]; then
     # reconcile, matching historical direct-command behavior) before dispatch.
     start_update_stage
     invoke_update_apply 0
-    exec "$PYTHON" -m agent_worktrees "$@"
+    direct_args=(-m agent_worktrees)
+    [[ -n "$LAUNCH_PROJECT" ]] && direct_args+=(--project "$LAUNCH_PROJECT")
+    direct_args+=("$@")
+    exec "$PYTHON" "${direct_args[@]}"
 fi
 
 # ── Background update stage (#1430) ──────────────────────────────────────
@@ -411,7 +668,11 @@ start_update_stage
 # ── Resolve launch plan via Python ────────────────────────────────────────
 
 setup_log INFO 'Calling agent_worktrees resolve'
-JSON=$("$PYTHON" -m agent_worktrees resolve "$@")
+launch_trace resolve_start
+resolve_args=(-m agent_worktrees)
+[[ -n "$LAUNCH_PROJECT" ]] && resolve_args+=(--project "$LAUNCH_PROJECT")
+resolve_args+=(resolve "$@")
+JSON=$("$PYTHON" "${resolve_args[@]}")
 RC=$?
 if [[ $RC -ne 0 ]]; then
     setup_log ERROR "agent_worktrees resolve failed (exit $RC)"
@@ -427,6 +688,17 @@ fi
 JSON=$(printf '%s' "$JSON" | "$PYTHON" -c "import sys, json
 d = json.load(sys.stdin)
 print(json.dumps(d['launch'] if isinstance(d, dict) and 'launch' in d else d))")
+# The resolved plan's `project` is authoritative for the worktree this launch
+# actually targets -- it can legitimately differ from this script's own
+# ambient/starting project (e.g. an initial --project inherited from how this
+# launcher was invoked). Always prefer it over a stale ambient value so every
+# downstream direct call (execution-leg get, etc.) is scoped to the
+# project that really owns the resolved worktree, not wherever this script
+# happened to start (#2338).
+_PLAN_PROJECT=$(printf '%s' "$JSON" | "$PYTHON" -c "import sys,json; print(json.load(sys.stdin).get('project',''))")
+if [[ -n "$_PLAN_PROJECT" ]]; then
+    LAUNCH_PROJECT="$_PLAN_PROJECT"
+fi
 
 ACTION=$(echo "$JSON" | "$PYTHON" -c "import sys,json; print(json.load(sys.stdin).get('action','none'))")
 setup_log INFO "Plan resolved: action=$ACTION"
@@ -462,16 +734,29 @@ if [[ "$ACTION" == "refresh" ]]; then
     # stale (dotfiles#443). `update` is itself version-gated, so it stays quick
     # when everything is already current.
     if [[ "${WORKTREE_NO_UPDATE:-}" != "1" ]]; then
-        "$PYTHON" -m agent_worktrees update \
+        update_args=(-m agent_worktrees)
+        [[ -n "$LAUNCH_PROJECT" ]] && update_args+=(--project "$LAUNCH_PROJECT")
+        update_args+=(update)
+        "$PYTHON" "${update_args[@]}" \
             || setup_log WARN 'Full update returned non-zero -- continuing to reconcile/relaunch'
     fi
     invoke_update_apply 1 1
-    _RELAUNCH="$HOME/.agent-worktrees/bin/launch-session.sh"
-    if [[ -x "$_RELAUNCH" ]]; then
-        exec "$_RELAUNCH" "$@"
+    # Relaunch through the Python entry point rather than re-resolving a
+    # launcher path by hand here: `agent_worktrees`'s own cmd_launch already
+    # owns (and keeps current) the "where does the live Worktree Manager
+    # launcher now live" resolution -- a retired "$HOME/.agent-worktrees/bin/
+    # launch-session.sh" path was never updated for the phase-3b relocation
+    # and hasn't existed since (worktree-manager-control-plane/phase-3b-mux-
+    # relocation.md), so hand-rolling it here silently broke every Picker
+    # "refresh" relaunch. Delegating re-resolves fresh, post-update, exactly
+    # like the `update` call above.
+    relaunch_args=(-m agent_worktrees)
+    [[ -n "$LAUNCH_PROJECT" ]] && relaunch_args+=(--project "$LAUNCH_PROJECT")
+    relaunch_args+=("$@")
+    if [[ ${#COPILOT_PASSTHROUGH[@]} -gt 0 ]]; then
+        relaunch_args+=(-- "${COPILOT_PASSTHROUGH[@]}")
     fi
-    setup_log WARN 'Relaunch launcher missing after refresh; exiting'
-    exit 1
+    exec "$PYTHON" "${relaunch_args[@]}"
 fi
 
 # ── Fast re-attach: skip the update when JOINING an already-live session ──
@@ -512,7 +797,9 @@ if [[ "$ACTION" == "exec" ]]; then
     # changed the payload (no re-exec -- a launcher change applies next launch),
     # then the pre-launch self-update and plugin reconcile. Skipped entirely on
     # a fast re-attach to an already-live session (see above).
+    _JOINING_LIVE=0
     if aw_joining_live_session; then
+        _JOINING_LIVE=1
         setup_log INFO 'Joining an already-live mux session; skipping pre-launch update for a fast re-attach (update applies on the process next fresh start).'
     else
         invoke_update_apply 1 1
@@ -527,6 +814,22 @@ if [[ "$ACTION" == "exec" ]]; then
     POST_EXIT=$(echo "$JSON" | "$PYTHON" -c "import sys,json; d=json.load(sys.stdin); print('1' if d.get('post_exit') else '0')")
     WORKTREE_ID=$(echo "$JSON" | "$PYTHON" -c "import sys,json; d=json.load(sys.stdin); print(d.get('worktree_id') or '')")
     NO_MUX=$(echo "$JSON" | "$PYTHON" -c "import sys,json; d=json.load(sys.stdin); print('1' if d.get('no_mux') else '0')")
+
+    # Register this launcher's own root pid as a protected process root
+    # (#4454 follow-up: a version-cutover reap elsewhere on the machine
+    # unconditionally kills every process resolved under a superseded
+    # runtime slot -- including a short-lived `agent_worktrees
+    # resolve`/`activity-log`/`get` subprocess THIS launcher spawns later in
+    # its own run, if the cutover lands at the wrong instant). Synchronous,
+    # not backgrounded: the write must complete before any later subprocess
+    # call in this run could become a reap target. Best-effort -- a failure
+    # here only widens the pre-existing race back to today's behavior.
+    if [[ -n "$WORKTREE_ID" ]]; then
+        "$PYTHON" -m agent_worktrees register-launch \
+            --worktree-id "$WORKTREE_ID" --pid "$$" --launch-id "$LAUNCH_ID" \
+            >/dev/null 2>&1 \
+            || setup_log WARN "register-launch failed (exit $?)"
+    fi
 
     # Env var override takes precedence
     _NO_MUX="${WORKTREE_NO_MUX:-}"
@@ -567,9 +870,104 @@ d = json.load(sys.stdin)
 print(' '.join(shlex.quote(a) for a in d.get('cmd', [])))
 ") )"
 
+    SESSION_BACKEND_JSON=""
+    _AHP_RESUME_AVAILABLE=0
+    if [[ -n "$WORKTREE_ID" && "$_JOINING_LIVE" != "1" ]]; then
+        _BACKEND_BASE_ARGS=(-m agent_worktrees)
+        [[ -n "$LAUNCH_PROJECT" ]] \
+            && _BACKEND_BASE_ARGS+=(--project "$LAUNCH_PROJECT")
+        _EXECUTION_LEG_ARGS=(
+            "${_BACKEND_BASE_ARGS[@]}" execution-leg get
+            --worktree-id "$WORKTREE_ID" --json
+        )
+        if EXECUTION_LEG_JSON=$(
+            "$PYTHON" "${_EXECUTION_LEG_ARGS[@]}" 2>&1
+        ); then
+            :
+        else
+            _BACKEND_RC=$?
+            setup_log ERROR "Execution-leg get failed (exit $_BACKEND_RC): $EXECUTION_LEG_JSON"
+            printf 'ERROR: Execution-leg get failed: %s\n' \
+                "$EXECUTION_LEG_JSON" >&2
+            exit "$_BACKEND_RC"
+        fi
+        _AHP_STATE=$(printf '%s' "$EXECUTION_LEG_JSON" | "$PYTHON" -c "
+import json, sys
+d = json.load(sys.stdin)
+leg = d.get('execution_leg')
+print(str(leg.get('state', '')) if isinstance(leg, dict) and leg.get('provider') == 'ahp' else '')
+")
+        if [[ "$_AHP_STATE" == "active" || "$_AHP_STATE" == "unknown" ]]; then
+            _AHP_RESUME_AVAILABLE=1
+            _AHP_ACCOUNT=$(printf '%s' "$EXECUTION_LEG_JSON" | "$PYTHON" -c \
+                "import json,sys; leg=json.load(sys.stdin)['execution_leg']; print((leg.get('blob') or {}).get('auth_account',''))")
+            _AHP_ENDPOINT=$(printf '%s' "$EXECUTION_LEG_JSON" | "$PYTHON" -c \
+                "import json,sys; leg=json.load(sys.stdin)['execution_leg']; print((leg.get('blob') or {}).get('endpoint_url',''))")
+            _AHP_SESSION=$(printf '%s' "$EXECUTION_LEG_JSON" | "$PYTHON" -c \
+                "import json,sys; leg=json.load(sys.stdin)['execution_leg']; print((leg.get('blob') or {}).get('session_id',''))")
+            if [[ -z "$_AHP_ACCOUNT" || -z "$_AHP_ENDPOINT" || -z "$_AHP_SESSION" ]]; then
+                setup_log ERROR "Persisted AHP execution leg for $WORKTREE_ID is missing auth_account, endpoint_url, or session_id."
+                printf 'ERROR: Persisted AHP execution leg for %s is missing auth_account, endpoint_url, or session_id.\n' \
+                    "$WORKTREE_ID" >&2
+                exit 3
+            fi
+            if ! GH_TOKEN="$(gh auth token --user "$_AHP_ACCOUNT" 2>/dev/null)" \
+                || [[ -z "$GH_TOKEN" ]]; then
+                setup_log ERROR "Could not mint the AHP client token for account $_AHP_ACCOUNT."
+                printf 'ERROR: Could not mint the AHP client token for account %s.\n' \
+                    "$_AHP_ACCOUNT" >&2
+                exit 3
+            fi
+            export -n GH_TOKEN 2>/dev/null || true
+            if [[ ",${COPILOT_CLI_ENABLED_FEATURE_FLAGS:-}," != *",AHP_CLIENT,"* ]]; then
+                if [[ -n "${COPILOT_CLI_ENABLED_FEATURE_FLAGS:-}" ]]; then
+                    export COPILOT_CLI_ENABLED_FEATURE_FLAGS="${COPILOT_CLI_ENABLED_FEATURE_FLAGS},AHP_CLIENT"
+                else
+                    export COPILOT_CLI_ENABLED_FEATURE_FLAGS="AHP_CLIENT"
+                fi
+            fi
+            POST_EXIT=0
+            setup_log INFO "AHP client bound to session $_AHP_SESSION at $_AHP_ENDPOINT"
+        elif [[ "$_AHP_STATE" == "disposed" ]]; then
+            _AHP_WARNING="Persisted AHP execution leg for $WORKTREE_ID is disposed; launching direct. Establishing a new AHP session now requires launching via the Worktree Manager Picker."
+            setup_log WARN "$_AHP_WARNING"
+            printf 'WARNING: %s\n' "$_AHP_WARNING" >&2
+        fi
+    fi
+
     # Append copilot passthrough args (from after -- separator)
     if [[ ${#COPILOT_PASSTHROUGH[@]} -gt 0 ]]; then
         CMD_ARRAY+=("${COPILOT_PASSTHROUGH[@]}")
+    fi
+
+    if [[ "$_AHP_RESUME_AVAILABLE" == "1" ]]; then
+        _FILTERED_CMD=()
+        _SKIP_NEXT=0
+        _HAS_EXPERIMENTAL=0
+        for _ARG in "${CMD_ARRAY[@]}"; do
+            if [[ "$_SKIP_NEXT" == "1" ]]; then
+                _SKIP_NEXT=0
+                continue
+            fi
+            case "$_ARG" in
+                --ahp)
+                    _SKIP_NEXT=1
+                    ;;
+                --ahp=*|--resume=*)
+                    ;;
+                --experimental)
+                    _HAS_EXPERIMENTAL=1
+                    _FILTERED_CMD+=("$_ARG")
+                    ;;
+                *)
+                    _FILTERED_CMD+=("$_ARG")
+                    ;;
+            esac
+        done
+        CMD_ARRAY=("${_FILTERED_CMD[@]}")
+        [[ "$_HAS_EXPERIMENTAL" == "1" ]] \
+            || CMD_ARRAY+=(--experimental)
+        CMD_ARRAY+=(--ahp "$_AHP_ENDPOINT" "--resume=$_AHP_SESSION")
     fi
 
     # Identity vars are stripped from the CHILD Copilot process so the session
@@ -595,32 +993,35 @@ print(' '.join(shlex.quote(a) for a in d.get('cmd', [])))
     PYTHON="$_REFRESHED_PYTHON"
     setup_log INFO "Runtime refreshed before knowledge preflight: $PYTHON"
 
+    # Patch a stale `--runtime-python` embedded in CMD_ARRAY (#stale-venv).
+    # `resolve` (run BEFORE the update-apply above) bakes the interpreter that
+    # ran it (Python's `sys.executable`) into the plan's cmd as the literal
+    # `--runtime-python <path>` argument default-setup.sh will use. If
+    # stage-update swapped the runtime venv in between (installing a new
+    # version and pruning the old one's pyvenv.cfg / marker), that baked path
+    # now points at a partially-deleted venv -- rewrite it to the
+    # just-refreshed $PYTHON so the pane command always launches on a runtime
+    # that's actually still on disk.
+    for _i in "${!CMD_ARRAY[@]}"; do
+        if [[ "${CMD_ARRAY[$_i]}" == "--runtime-python" ]]; then
+            _next=$((_i + 1))
+            if [[ $_next -lt ${#CMD_ARRAY[@]} && "${CMD_ARRAY[$_next]}" != "$PYTHON" ]]; then
+                setup_log INFO "Patching stale --runtime-python in resolved plan: ${CMD_ARRAY[$_next]} -> $PYTHON"
+                CMD_ARRAY[$_next]="$PYTHON"
+            fi
+        fi
+    done
+
     _KNOWLEDGE_CWD="${STATUS_PATH:-${WORK_DIR:-$PWD}}"
     _KNOWLEDGE_ARGS=(-m agent_worktrees)
     [[ -n "$LAUNCH_PROJECT" ]] \
         && _KNOWLEDGE_ARGS+=(--project "$LAUNCH_PROJECT")
     _KNOWLEDGE_ARGS+=(knowledge compose-plugins --cwd "$_KNOWLEDGE_CWD" --json)
-    if _KNOWLEDGE_JSON=$("$PYTHON" "${_KNOWLEDGE_ARGS[@]}" 2>&1); then
-        setup_log INFO "Knowledge plugin preflight completed: $_KNOWLEDGE_JSON"
-    else
-        _KNOWLEDGE_RC=$?
-        setup_log ERROR "Knowledge plugin preflight failed (exit $_KNOWLEDGE_RC): ${_KNOWLEDGE_JSON:-no details}"
-        printf 'ERROR: Knowledge plugin preflight failed: %s\n' \
-            "${_KNOWLEDGE_JSON:-no details}" >&2
-        exit "$_KNOWLEDGE_RC"
-    fi
+    run_runtime_preflight "Knowledge plugin preflight" "${_KNOWLEDGE_ARGS[@]}" || true
 
     _MARKETPLACE_ARGS=(-m agent_worktrees reconcile-marketplaces
         --cwd "$_KNOWLEDGE_CWD" --ensure-ignored --json)
-    if _MARKETPLACE_JSON=$("$PYTHON" "${_MARKETPLACE_ARGS[@]}" 2>&1); then
-        setup_log INFO "Marketplace override preflight completed: $_MARKETPLACE_JSON"
-    else
-        _MARKETPLACE_RC=$?
-        setup_log ERROR "Marketplace override preflight failed (exit $_MARKETPLACE_RC): ${_MARKETPLACE_JSON:-no details}"
-        printf 'ERROR: Marketplace override preflight failed: %s\n' \
-            "${_MARKETPLACE_JSON:-no details}" >&2
-        exit "$_MARKETPLACE_RC"
-    fi
+    run_runtime_preflight "Marketplace override preflight" "${_MARKETPLACE_ARGS[@]}" || true
 
     if [[ "$NO_MUX" == "1" ]]; then
         setup_log INFO "Mux disabled; launching directly"
@@ -685,28 +1086,71 @@ print(' '.join(shlex.quote(a) for a in d.get('cmd', [])))
                 aw_apply_tmux_session_options "$1" "${WORKTREE_ID:-}" || true
             fi
         }
-        # Spawn the common, in-process Python status-updater (detached). It
-        # keeps this session's @aw_ctx/@aw_seg vars fresh OFF the render path,
-        # so the bar reads #{@aw_ctx}/#{@aw_seg} with zero spawn per repaint.
-        # Safe to call on every create/join/handoff: an @aw_updater token
-        # elects a single live updater and older ones self-retire. The updater
-        # self-terminates within one interval of the session ending.
-        _aw_spawn_status_updater() {
+        # Register the Manager-owned mux mapping and immediately publish a
+        # live observation into agent-worktrees. Once that cache entry exists,
+        # the resident status-monitor routes rendered @aw_* values through
+        # Worktree Manager's daemon instead of leaving a per-session
+        # status-updater loop behind.
+        _aw_publish_managed_mux_live() {
             local sess="$1"
-            local aw; aw="$(command -v agent-worktrees 2>/dev/null || true)"
-            [[ -x "$aw" ]] || aw="$HOME/.local/bin/agent-worktrees"
-            [[ -x "$aw" ]] || return 0
-            # Capture the worktree path BEFORE the subshell cd's away.
-            local spath="${STATUS_PATH:-${WORK_DIR:-$PWD}}"
-            # Root the detached loop at $HOME, never the caller's cwd: under the
-            # sessionStart reseed hook the cwd is the plugin payload dir, and a
-            # child holding it as its cwd blocks `copilot plugin update` from
-            # replacing the payload on Windows (os error 32). Uniform on POSIX
-            # (harmless: it locates its worktree via --path).
-            ( cd "$HOME" 2>/dev/null || cd / ;
-              setsid "$aw" status-updater --session "$sess" --mux tmux \
-                  --path "$spath" >/dev/null 2>&1 < /dev/null & )
-            disown 2>/dev/null || true
+            local spath="$2"
+            [[ -n "$sess" && -n "${LAUNCH_PROJECT:-}" && -n "${WORKTREE_ID:-}" ]] || return 0
+            command -v uv >/dev/null 2>&1 || return 0
+            local wm_root
+            wm_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P 2>/dev/null || true)"
+            [[ -n "$wm_root" ]] || return 0
+            # The real mux session's own stable identity (Copilot review
+            # finding on PR #3906): stored so a later teardown's own live
+            # probe of the SAME tmux session (pane-wrapper.sh) can be
+            # compared against it -- the display session name alone is not
+            # unique per launch incarnation. Cheap/local/synchronous (a
+            # single tmux IPC call), unlike the detached register dispatch
+            # below.
+            local incarnation=""
+            incarnation="$(tmux display-message -t "$sess" -p '#{session_id}:#{session_created}' 2>/dev/null || true)"
+            # Dispatch detached rather than blocking attach on this call
+            # (real-bug follow-up to #3825): the bundled register edge can
+            # spend tens of seconds (mux metadata probes, daemon boot-wait,
+            # status-monitor-restart) before it returns, plus `uv run`'s own
+            # resolve overhead -- never block create/join on it. Mirrors the
+            # existing background-subshell dispatch already used above for
+            # activity-log.
+            ( uv run --quiet --project "$wm_root" -m worktree_manager mux-daemon register \
+                --project="$LAUNCH_PROJECT" \
+                --worktree-id="$WORKTREE_ID" \
+                --worktree-path="$spath" \
+                --mux-session="$sess" \
+                --mux-bin=tmux \
+                ${incarnation:+--session-incarnation="$incarnation"} \
+                >/dev/null 2>&1 & ) || true
+        }
+
+        # Deliver a worktree's queued `pending_seed` (picker-new-session-
+        # prompt-and-composer Phase A) once this launcher has just created
+        # its FIRST live tmux session for it -- this launcher creates the
+        # pane directly (`tmux new-session` below), so nothing else ever
+        # triggers delivery for a Picker-originated creation.
+        # `agent-worktrees embody --worktree-id` already owns the whole
+        # contract: its "already embodies this worktree" resume branch (now
+        # true, since the session above just started existing) claims
+        # (clears) any pending seed under a race-safe write-guard and types
+        # it into the registry-identified Copilot pane via its own
+        # ready-poll/send-keys path -- this call needs no new
+        # pane-ready-detection logic of its own. A no-op (no pending seed)
+        # costs one cheap venv-python round trip. Dispatched detached
+        # (mirrors _aw_publish_managed_mux_live above): the ready-poll can
+        # legitimately take up to embody's own `--seed-ready-timeout`
+        # (default 180s) for a slow-loading MCP/skill-heavy session, and the
+        # operator's attach below must never wait on it.
+        _aw_deliver_pending_seed() {
+            local wtid="$1"
+            [[ -n "$wtid" ]] || return 0
+            [[ -n "$PYTHON" && -x "$PYTHON" ]] || return 0
+            local embody_args=(-m agent_worktrees)
+            [[ -n "${LAUNCH_PROJECT:-}" ]] && embody_args+=(--project "$LAUNCH_PROJECT")
+            embody_args+=(embody --worktree-id "$wtid" --json)
+            ( "$PYTHON" "${embody_args[@]}" >/dev/null 2>&1 & ) || \
+                setup_log WARN "seed-delivery embody dispatch failed"
         }
 
         # If a tmux session already exists for this worktree, join it.
@@ -717,7 +1161,7 @@ print(' '.join(shlex.quote(a) for a in d.get('cmd', [])))
             # Refresh per-session options on (re)connect so a long-lived
             # session picks up the current bar without us owning the global.
             _aw_apply_session_opts "$TMUX_SESS"
-            _aw_spawn_status_updater "$TMUX_SESS"
+            _aw_publish_managed_mux_live "$TMUX_SESS" "${STATUS_PATH:-${WORK_DIR:-$PWD}}"
             set +e
             if [[ -n "${TMUX:-}" ]]; then
                 tmux switch-client -t "=$TMUX_SESS"
@@ -770,20 +1214,78 @@ print(' '.join(shlex.quote(a) for a in d.get('cmd', [])))
             while IFS= read -r line; do
                 # Strip 'export ' prefix → KEY=VALUE
                 local_kv="${line#export }"
+                if [[ "$_AHP_RESUME_AVAILABLE" == "1" ]]; then
+                    case "$local_kv" in
+                        GH_TOKEN=*|GITHUB_TOKEN=*|AGENT_WORKTREES_AHP_AUTH_TOKEN=*)
+                            continue
+                            ;;
+                    esac
+                fi
                 TMUX_ENV_FLAGS+=(-e "$local_kv")
             done <<< "$ENV_EXPORTS"
+        fi
+        if [[ "$_AHP_RESUME_AVAILABLE" == "1" ]]; then
+            TMUX_ENV_FLAGS+=(
+                -e "COPILOT_CLI_ENABLED_FEATURE_FLAGS=$COPILOT_CLI_ENABLED_FEATURE_FLAGS"
+            )
         fi
 
         # Pane wrapper — catches exit codes, records the pane_exited activity
         # mark, shows diagnostics on crash, and always exits 0 so
         # remain-on-exit doesn't trap the pane. `--aw-wt` carries the worktree
         # id for the mark and is consumed by the wrapper (not forwarded).
-        PANE_WRAPPER="$HOME/.agent-worktrees/bin/pane-wrapper.sh"
+        SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+        PANE_WRAPPER="$SCRIPT_DIR/pane-wrapper.sh"
+        AHP_TOKEN_FILE=""
+        if [[ "$_AHP_RESUME_AVAILABLE" == "1" ]]; then
+            if [[ ! -r "$PANE_WRAPPER" ]]; then
+                setup_log ERROR "AHP tmux launch requires the pane wrapper at $PANE_WRAPPER"
+                echo "ERROR: AHP tmux launch requires the agent-worktrees pane wrapper." >&2
+                exit 3
+            fi
+            AHP_TOKEN_DIR=$(mktemp -d \
+                "${TMPDIR:-/tmp}/agent-worktrees-ahp.XXXXXX") || exit 3
+            if ! chmod 700 "$AHP_TOKEN_DIR"; then
+                rmdir "$AHP_TOKEN_DIR" 2>/dev/null || true
+                exit 3
+            fi
+            AHP_TOKEN_FILE="$AHP_TOKEN_DIR/token"
+            if ! (umask 077 && printf '%s' "$GH_TOKEN" > "$AHP_TOKEN_FILE"); then
+                rm -f -- "$AHP_TOKEN_FILE"
+                rmdir "$AHP_TOKEN_DIR" 2>/dev/null || true
+                exit 3
+            fi
+            trap '
+                [[ -z "${AHP_TOKEN_FILE:-}" ]] || rm -f -- "$AHP_TOKEN_FILE"
+                [[ -z "${AHP_TOKEN_DIR:-}" ]] || rmdir "$AHP_TOKEN_DIR" 2>/dev/null || true
+            ' EXIT
+        fi
         if [[ -r "$PANE_WRAPPER" ]]; then
-            PANE_CMD=("${CLEAN_ENV[@]}" bash "$PANE_WRAPPER" --aw-wt "${WORKTREE_ID:-}" "${CMD_ARRAY[@]}")
+            PANE_CONTROL=(--aw-wt "${WORKTREE_ID:-}")
+            if [[ -n "${LAUNCH_PROJECT:-}" ]]; then
+                PANE_CONTROL+=(--aw-project "$LAUNCH_PROJECT")
+            fi
+            if [[ -n "${TMUX_SESS:-}" ]]; then
+                PANE_CONTROL+=(--aw-mux-session "$TMUX_SESS")
+            fi
+            if [[ -n "$AHP_TOKEN_FILE" ]]; then
+                PANE_CONTROL+=(--aw-ahp-token-file "$AHP_TOKEN_FILE")
+            fi
+            PANE_CMD=(
+                "${CLEAN_ENV[@]}" bash "$PANE_WRAPPER"
+                "${PANE_CONTROL[@]}" "${CMD_ARRAY[@]}"
+            )
         else
             setup_log WARN "pane wrapper missing at $PANE_WRAPPER; using direct command"
             PANE_CMD=("${CLEAN_ENV[@]}" "${CMD_ARRAY[@]}")
+        fi
+        TMUX_COMMAND=(tmux)
+        if [[ "$_AHP_RESUME_AVAILABLE" == "1" ]]; then
+            TMUX_COMMAND=(
+                env -u GH_TOKEN -u GITHUB_TOKEN
+                -u AGENT_WORKTREES_AHP_AUTH_TOKEN
+                -u COPILOT_CLI_ENABLED_FEATURE_FLAGS tmux
+            )
         fi
 
         TMUX_CREATE_MAX_ATTEMPTS=3
@@ -800,7 +1302,8 @@ print(' '.join(shlex.quote(a) for a in d.get('cmd', [])))
                   TMUX_CREATE_ATTEMPT<=TMUX_CREATE_MAX_ATTEMPTS;
                   TMUX_CREATE_ATTEMPT++)); do
                 TMUX_CREATE_TOTAL_ATTEMPTS=$((TMUX_CREATE_TOTAL_ATTEMPTS + 1))
-                tmux new-session -d -s "$TMUX_SESS" -c "${WORK_DIR:-.}" \
+                "${TMUX_COMMAND[@]}" new-session -d -s "$TMUX_SESS" \
+                    -c "${WORK_DIR:-.}" \
                     "${TMUX_ENV_FLAGS[@]+"${TMUX_ENV_FLAGS[@]}"}" \
                     "${PANE_CMD[@]}"
                 TMUX_CREATE_EXIT=$?
@@ -828,7 +1331,7 @@ print(' '.join(shlex.quote(a) for a in d.get('cmd', [])))
         done
         if [[ "$TMUX_CREATE_EXIT" -ne 0 ]]; then
             set -e
-            RECOVERY_PROJECT="${WORKTREE_PROJECT:-agent-worktrees}"
+            RECOVERY_PROJECT="${LAUNCH_PROJECT:-agent-worktrees}"
             RECOVERY_COMMAND="$RECOVERY_PROJECT --worktree-id $WORKTREE_ID"
             PRESERVED_PATH="${STATUS_PATH:-${WORK_DIR:-.}}"
             setup_log ERROR "Failed to create tmux session $TMUX_SESS after $TMUX_CREATE_TOTAL_ATTEMPTS attempts (exit $TMUX_CREATE_EXIT). Worktree preserved at $PRESERVED_PATH; retry with: $RECOVERY_COMMAND"
@@ -842,7 +1345,8 @@ print(' '.join(shlex.quote(a) for a in d.get('cmd', [])))
             activity_log mux_attached "$WORKTREE_ID" mux=create \
                 "attempts=$TMUX_CREATE_TOTAL_ATTEMPTS"
             _aw_apply_session_opts "$TMUX_SESS"
-            _aw_spawn_status_updater "$TMUX_SESS"
+            _aw_publish_managed_mux_live "$TMUX_SESS" "${STATUS_PATH:-${WORK_DIR:-$PWD}}"
+            _aw_deliver_pending_seed "$WORKTREE_ID"
             if [[ -n "${TMUX:-}" ]]; then
                 tmux switch-client -t "=$TMUX_SESS"
             else
@@ -894,7 +1398,14 @@ print(' '.join(shlex.quote(a) for a in d.get('cmd', [])))
     echo ""
 
     set +e
-    "${CLEAN_ENV[@]}" "${CMD_ARRAY[@]}"
+    if [[ "$_AHP_RESUME_AVAILABLE" == "1" ]]; then
+        GH_TOKEN="$GH_TOKEN" \
+        COPILOT_CLI_ENABLED_FEATURE_FLAGS="$COPILOT_CLI_ENABLED_FEATURE_FLAGS" \
+            env -u GITHUB_TOKEN -u AGENT_WORKTREES_AHP_AUTH_TOKEN \
+            "${CLEAN_ENV[@]}" "${CMD_ARRAY[@]}"
+    else
+        "${CLEAN_ENV[@]}" "${CMD_ARRAY[@]}"
+    fi
     COPILOT_EXIT=$?
     set -e
     activity_log copilot_exited "$WORKTREE_ID" mux=none "exit_code=$COPILOT_EXIT"

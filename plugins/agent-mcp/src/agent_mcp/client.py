@@ -23,14 +23,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 
 from . import __version__
 from . import protocol as proto
 from .auth import build_injector
 from .config import BridgeConfig, ToolFilter
+from .decorators import build_decorators
 from .decorators._catalog import fetch_all_tools
 from .decorators.base import BridgeContext
-from .pipeline import UpstreamClient
+from .pipeline import Pipeline, UpstreamClient
 from .transports import Transport, build_transport
 
 log = logging.getLogger("agent-mcp.client")
@@ -92,22 +94,46 @@ class OneShotSession:
 
     A ``transport`` may be injected (tests, or a pre-built connection); otherwise
     it is constructed from ``cfg`` exactly as the bridge would.
+
+    ``on_stage``, when given, is called with a short stage name (``"auth"``,
+    ``"transport-connect"``, ``"handshake"``, ``"ready"``) as each connection
+    layer is *entered* -- not necessarily completed, since a failure inside a
+    layer raises before the next stage name is reached. :attr:`stage` always
+    holds the last-entered stage name, so a caller that catches an exception
+    from ``__aenter__`` can read ``session.stage`` to learn which connectivity
+    layer actually failed (used by ``agent-mcp diagnose``).
     """
 
-    def __init__(self, cfg: BridgeConfig, *, transport: Transport | None = None) -> None:
+    def __init__(
+        self,
+        cfg: BridgeConfig,
+        *,
+        transport: Transport | None = None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> None:
         self.cfg = cfg
         self._transport = transport
         self._client: UpstreamClient | None = None
         self._ctx: BridgeContext | None = None
+        self._pipeline: Pipeline | None = None
         self._server_info: dict = {}
         # Negotiated era: ``_modern`` True once we've settled on a per-request
         # metadata revision; ``_protocol_version`` is the concrete revision we
         # then stamp on / speak.
         self._modern: bool = False
         self._protocol_version: str = proto.LEGACY
+        self._on_stage = on_stage
+        self.stage: str = "init"
+
+    def _set_stage(self, name: str) -> None:
+        self.stage = name
+        if self._on_stage is not None:
+            self._on_stage(name)
 
     async def __aenter__(self) -> OneShotSession:
+        self._set_stage("auth")
         injector = build_injector(self.cfg)
+        self._set_stage("transport-connect")
         transport = self._transport or build_transport(self.cfg, injector)
         self._transport = transport
         client = UpstreamClient(transport)
@@ -116,14 +142,47 @@ class OneShotSession:
         client.on_unsolicited(lambda _msg: None)
         self._client = client
         self._ctx = BridgeContext(new_id=client.new_id, emit_to_client=lambda _m: None)
+        # `call_tool` routes through the SAME `decorators:` pipeline the
+        # long-lived bridge runs -- a one-shot (`agent-mcp call`, and the
+        # introspection step of `materialize`) must honor `gate`/`input_gate`/
+        # `transform`/etc. too, not just the legacy top-level `tools:` filter
+        # (still checked separately below). The pipeline's `core` is this same
+        # bounded `_request` + `_prepare`, so a decorator's own upstream calls
+        # (e.g. `gate`'s preflight) get the identical timeout/era handling as
+        # a direct call.
+        self._pipeline = Pipeline(
+            build_decorators(self.cfg, self._ctx),
+            core=self._pipeline_core,
+        )
 
-        await transport.start()
         try:
+            # ``_negotiate`` already bounds each individual JSON-RPC request via
+            # ``_request``'s ``cfg.timeout`` -- but ``transport.start()`` itself
+            # (subprocess spawn, auth-injector command, pipe setup) had no bound
+            # at all. A hung/slow spawn there (observed live: an upstream launch
+            # that never even forked a child) left __aenter__ suspended forever.
+            # Since a resident ``serve`` daemon opens sessions while holding a
+            # per-bridge lock (WarmPool), one such hang doesn't just fail one
+            # call -- it wedges every subsequent call to that bridge
+            # permanently, with no way to recover short of restarting the
+            # daemon (see the downstream tracker). Bound just this step under the
+            # same ``cfg.timeout`` already used for individual requests --
+            # deliberately *not* wrapping ``_negotiate()`` here too, since that
+            # would race the outer bound against the inner per-request bound
+            # ``_negotiate`` already applies and could swallow its more
+            # specific "did not respond" error under a generic one.
+            await asyncio.wait_for(transport.start(), timeout=self.cfg.timeout)
+            self._set_stage("handshake")
             await self._negotiate()
-        except BaseException:
+            self._set_stage("ready")
+        except BaseException as exc:
             # __aexit__ is not called when __aenter__ raises, so tear the
             # transport down here or a spawned upstream child would leak.
             await self._teardown()
+            if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+                raise UpstreamError(
+                    f"upstream transport did not start within {self.cfg.timeout}s"
+                ) from exc
             raise
         return self
 
@@ -131,7 +190,9 @@ class OneShotSession:
         await self._teardown()
 
     async def _teardown(self) -> None:
-        client, transport = self._client, self._transport
+        pipeline, client, transport = self._pipeline, self._client, self._transport
+        if pipeline is not None:
+            await pipeline.aclose()
         if client is not None:
             client.fail_pending("one-shot session closing")
         if transport is not None:
@@ -274,6 +335,18 @@ class OneShotSession:
             raise RuntimeError("OneShotSession used outside its async context")
         return self._client
 
+    async def _pipeline_core(self, msg: dict) -> dict | None:
+        """The ``Next``-shaped upstream core for :attr:`_pipeline` -- identical
+        request stamping/timeout handling as a direct :meth:`_request`, so a
+        decorator's own upstream calls (e.g. ``gate``'s preflight) behave the
+        same as ``call_tool``'s own outer request."""
+        return await self._request(self._prepare(msg))
+
+    def _need_pipeline(self) -> Pipeline:
+        if self._pipeline is None:
+            raise RuntimeError("OneShotSession used outside its async context")
+        return self._pipeline
+
     async def _request(self, msg: dict) -> dict | None:
         """Send one upstream request under a bounded timeout.
 
@@ -320,6 +393,59 @@ class OneShotSession:
         tools = await fetch_all_tools(self._paginated_request, self._ctx)
         return filter_tools(tools, self.cfg.tools)
 
+    async def list_tools_checked(self) -> list[dict]:
+        """Like :meth:`list_tools`, but raises :class:`UpstreamError` on any
+        malformed or error ``tools/list`` response instead of silently
+        truncating the catalog.
+
+        :func:`agent_mcp.decorators._catalog.fetch_all_tools` treats *any*
+        response missing a well-formed top-level ``result`` -- a genuine
+        JSON-RPC ``error``, a non-dict response, or a ``result`` that isn't a
+        mapping -- as "no more pages" and returns whatever it already
+        collected (possibly an empty list). That's the right lenient default
+        for a live decorator (``defer``/``code-mode``) mid-session, but it
+        means a caller that needs to know the catalog fetch itself *failed*
+        (``agent-mcp diagnose``) cannot tell a healthy empty catalog from a
+        broken one via :meth:`list_tools` alone. This variant duplicates the
+        same bounded pagination loop, treating every one of those shapes as a
+        hard failure rather than an early, silent stop.
+        """
+        client = self._need_client()
+        if self._ctx is None:
+            raise RuntimeError("OneShotSession used outside its async context")
+        tools: list[dict] = []
+        cursor: str | None = None
+        for _ in range(100):  # same safety bound as fetch_all_tools' _PAGE_LIMIT
+            params: dict[str, str] = {"cursor": cursor} if cursor else {}
+            req = {"jsonrpc": "2.0", "id": client.new_id(), "method": "tools/list",
+                   "params": params}
+            resp = await self._paginated_request(req)
+            if isinstance(resp, dict) and "error" in resp:
+                _raise_error(resp["error"], context="tools/list")
+            if not isinstance(resp, dict) or not isinstance(resp.get("result"), dict):
+                raise UpstreamError(
+                    f"tools/list: malformed response (expected a 'result' "
+                    f"object, got {resp!r})"
+                )
+            result = resp["result"]
+            page = result.get("tools")
+            if not isinstance(page, list):
+                raise UpstreamError(
+                    f"tools/list: malformed response (expected 'result.tools' "
+                    f"to be a list, got {page!r})"
+                )
+            for entry in page:
+                if not isinstance(entry, dict):
+                    raise UpstreamError(
+                        f"tools/list: malformed response (expected every "
+                        f"'result.tools' entry to be an object, got {entry!r})"
+                    )
+                tools.append(entry)
+            cursor = result.get("nextCursor")
+            if not cursor:
+                break
+        return filter_tools(tools, self.cfg.tools)
+
     async def call_tool(self, name: str, arguments: dict) -> dict:
         """Invoke one tool; return the ``tools/call`` result mapping.
 
@@ -328,6 +454,7 @@ class OneShotSession:
         the exit code) -- only a protocol-level error raises.
         """
         client = self._need_client()
+        pipeline = self._need_pipeline()
         if not tool_visible(name, self.cfg.tools):
             raise UpstreamError(
                 f"tools/call '{name}': blocked by bridge tools filter",
@@ -339,7 +466,7 @@ class OneShotSession:
             "method": "tools/call",
             "params": {"name": name, "arguments": arguments or {}},
         }
-        resp = await self._request(self._prepare(req))
+        resp = await pipeline.handle(req)
         if not isinstance(resp, dict):
             raise UpstreamError(f"no response for tools/call '{name}'")
         if "error" in resp:

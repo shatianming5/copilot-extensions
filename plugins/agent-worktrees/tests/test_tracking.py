@@ -7,19 +7,25 @@ from pathlib import Path
 import pytest
 import yaml
 
+from agent_worktrees import record_cache, tracking
 from agent_worktrees.effort_focus import ActiveEffort
 from agent_worktrees.tracking import (
     ClaimRef,
+    ControllerRelation,
+    FollowUpRef,
     ResourceClaim,
     SessionEntry,
     WorktreeRecord,
     _atomic_write,
     _RecordLock,
     _strip_control_chars,
+    add_follow_up,
     add_resource_claim,
     cap_title,
     create_new_record,
     deregister_session,
+    dismiss_follow_up,
+    effective_open_follow_up_count,
     find_orphaned_children,
     find_paired_record,
     find_worktree_id_by_cwd,
@@ -29,10 +35,14 @@ from agent_worktrees.tracking import (
     load_record,
     load_record_by_id,
     mark_resumed,
+    open_handoff,
     parse_claim_ref,
     register_session,
     release_all_resources,
+    release_at_rest_resources,
+    resolve_follow_up,
     resolve_worktree_path,
+    retire_record,
     save_record,
     set_disposition,
     update_status,
@@ -197,6 +207,53 @@ class TestSaveLoadRoundTrip:
         loaded = load_record(path)
         assert loaded.title == "Fix: handle edge case #42 & more"
 
+    def test_activity_round_trip(self, tmp_path: Path):
+        """#3307 worktrees-pivot-ux-overhaul follow-up: activity/activity_at
+        round-trip through YAML save/load, same as summary/status_note_at."""
+        rec = self._make_record(
+            activity="running the retry-budget tests",
+            activity_at="2026-09-26T10:00:00",
+        )
+        path = tmp_path / "wt.yaml"
+        save_record(rec, path)
+        loaded = load_record(path)
+        assert loaded.activity == "running the retry-budget tests"
+        assert loaded.activity_at == "2026-09-26T10:00:00"
+
+    def test_activity_absent_by_default(self, tmp_path: Path):
+        rec = self._make_record()
+        path = tmp_path / "wt.yaml"
+        save_record(rec, path)
+        assert "activity:" not in path.read_text("utf-8")
+        loaded = load_record(path)
+        assert loaded.activity == ""
+        assert loaded.activity_at is None
+
+    @pytest.mark.parametrize(
+        ("serialized", "expected"),
+        [
+            ("false", False),
+            ("'false'", True),
+            ("null", True),
+            (None, True),
+        ],
+    )
+    def test_checkout_managed_only_accepts_explicit_false(
+        self, tmp_path: Path, serialized: str | None, expected: bool
+    ):
+        path = tmp_path / "wt.yaml"
+        save_record(self._make_record(checkout_managed=False), path)
+        text = path.read_text()
+        if serialized is None:
+            text = text.replace("checkout_managed: false\n", "")
+        else:
+            text = text.replace(
+                "checkout_managed: false", f"checkout_managed: {serialized}"
+            )
+        path.write_text(text)
+
+        assert load_record(path).checkout_managed is expected
+
     def test_load_repairs_control_poison_and_next_save_persists_repair(
         self, tmp_path: Path
     ):
@@ -282,6 +339,147 @@ class TestSaveLoadRoundTrip:
         save_record(rec2, path2)
         assert "caller_worktree" not in path2.read_text()
         assert load_record(path2).caller_worktree is None
+
+    def test_codename_round_trip(self, tmp_path: Path):
+        # pr-attribution-codenames Phase 2 (#2838): the assigned codename
+        # survives save/load and is omitted (byte-identical legacy YAML)
+        # when unset.
+        rec = self._make_record(codename="rusty-gizmo")
+        path = tmp_path / "wt.yaml"
+        save_record(rec, path)
+        assert "codename: rusty-gizmo" in path.read_text()
+        assert load_record(path).codename == "rusty-gizmo"
+        rec2 = self._make_record()
+        path2 = tmp_path / "wt2.yaml"
+        save_record(rec2, path2)
+        assert "codename" not in path2.read_text()
+        assert load_record(path2).codename is None
+
+    def test_codename_source_round_trip(self, tmp_path: Path):
+        # codename-attribution-by-default: the per-record provenance
+        # classification survives save/load and is omitted (byte-identical
+        # legacy YAML) when unset.
+        rec = self._make_record(codename="rusty-gizmo", codename_source="built-in")
+        path = tmp_path / "wt.yaml"
+        save_record(rec, path)
+        assert "codename_source: built-in" in path.read_text()
+        assert load_record(path).codename_source == "built-in"
+        rec2 = self._make_record(codename="stormy-lantern")
+        path2 = tmp_path / "wt2.yaml"
+        save_record(rec2, path2)
+        assert "codename_source" not in path2.read_text()
+        assert load_record(path2).codename_source is None
+
+    def test_stale_writer_does_not_erase_concurrent_codename_assignment(
+        self, tmp_path: Path,
+    ):
+        # codename-attribution-by-default (round-11 finding): a status/PR
+        # writer holding an in-memory record from BEFORE a concurrent
+        # lazy-backfill assigned a codename must not save over it and
+        # erase the just-assigned codename/codename_source.
+        path = tmp_path / "wt.yaml"
+        stale = self._make_record()  # no codename yet
+        save_record(stale, path)
+        # A concurrent writer assigns a codename directly on disk.
+        current = load_record(path)
+        current.codename = "amber-thicket"
+        current.codename_source = "custom"
+        save_record(current, path)
+        # The stale in-memory snapshot (still codename-less) saves an
+        # unrelated field -- must not erase the concurrent assignment.
+        stale.title = "unrelated update"
+        save_record(stale, path)
+        reloaded = load_record(path)
+        assert reloaded.codename == "amber-thicket"
+        assert reloaded.codename_source == "custom"
+        assert reloaded.title == "unrelated update"
+
+    def test_in_memory_codename_assignment_is_never_discarded(
+        self, tmp_path: Path,
+    ):
+        # The merge rule only protects an ON-DISK assignment from a stale
+        # writer -- it must never go the other direction and discard a
+        # codename the SAME writer just assigned in this call chain merely
+        # because the on-disk copy (loaded before this writer's own
+        # assignment) still shows none.
+        path = tmp_path / "wt.yaml"
+        rec = self._make_record()
+        save_record(rec, path)
+        rec.codename = "quiet-harbor"
+        rec.codename_source = "built-in"
+        save_record(rec, path)
+        reloaded = load_record(path)
+        assert reloaded.codename == "quiet-harbor"
+        assert reloaded.codename_source == "built-in"
+
+    def test_known_on_disk_codename_source_survives_a_matching_stale_save(
+        self, tmp_path: Path,
+    ):
+        # PR #3037 review finding: the codename-provenance merge only
+        # imported provenance when the in-memory codename was EMPTY -- if
+        # both sides already agree on the SAME codename but the in-memory
+        # copy's codename_source is unset (e.g. an operator's manual
+        # per-record promotion landed on disk after this snapshot was
+        # taken), a stale save must not silently erase that known
+        # provenance.
+        path = tmp_path / "wt.yaml"
+        rec = self._make_record(codename="amber-thicket")
+        save_record(rec, path)
+        stale_snapshot = load_record(path)
+        assert stale_snapshot.codename_source is None
+
+        current = load_record(path)
+        current.codename_source = "custom"  # manual operator promotion
+        save_record(current, path)
+
+        stale_snapshot.title = "touch"
+        save_record(stale_snapshot, path)
+
+        reloaded = load_record(path)
+        assert reloaded.codename == "amber-thicket"
+        assert reloaded.codename_source == "custom"
+        assert reloaded.title == "touch"
+
+    def test_disk_codename_source_wins_over_a_disagreeing_stale_value(
+        self, tmp_path: Path,
+    ):
+        # Round-7 review finding: the fix above only handled an EMPTY
+        # in-memory `codename_source` -- if the stale in-memory copy
+        # instead holds a DIFFERENT non-empty value (e.g. it saw
+        # "built-in" before an operator reclassified the same codename to
+        # "custom" on disk, a direct promotion that bypasses the ordinary
+        # merge entirely via `preserve_handoff_reservations=False`), the
+        # merge must still prefer the on-disk value on the next ordinary
+        # (stale) save, not silently keep the stale one merely because it
+        # isn't empty. This matters because `may_publish_codename` gates
+        # on `codename_source`.
+        from agent_worktrees.tracking import _save_record_unlocked
+
+        path = tmp_path / "wt.yaml"
+        rec = self._make_record(codename="amber-thicket", codename_source="built-in")
+        save_record(rec, path)
+        stale_snapshot = load_record(path)
+        assert stale_snapshot.codename_source == "built-in"
+
+        # A direct reclassification write (bypasses the merge above --
+        # this is the "operator promotes it on disk" scenario the review
+        # describes, distinct from an ordinary racing in-memory writer).
+        promoted = load_record(path)
+        promoted.codename_source = "custom"
+        _save_record_unlocked(
+            promoted, path, preserve_handoff_reservations=False,
+        )
+        assert load_record(path).codename_source == "custom"
+
+        # The genuinely stale in-memory snapshot (never saw the
+        # reclassification) now saves an unrelated field.
+        stale_snapshot.title = "touch"
+        save_record(stale_snapshot, path)
+
+        reloaded = load_record(path)
+        assert reloaded.codename == "amber-thicket"
+        assert reloaded.codename_source == "custom"
+        assert reloaded.title == "touch"
 
     def test_owner_ref_round_trip(self, tmp_path: Path):
         # resource-claims: the backward owner link survives save/load, is
@@ -546,6 +744,8 @@ class TestSaveLoadRoundTrip:
                 branch="feature/fix-auth-abc123",
                 base_sha="abc123",
                 head_sha="def456",
+                head_observed_at="2026-09-05T06:01:02+00:00",
+                head_observed_api_base="https://gitea.example",
                 patch_id="pid789",
                 url="https://example/pulls/42",
                 number=42,
@@ -560,10 +760,147 @@ class TestSaveLoadRoundTrip:
         assert loaded.pr.branch == "feature/fix-auth-abc123"
         assert loaded.pr.base_sha == "abc123"
         assert loaded.pr.head_sha == "def456"
+        assert loaded.pr.head_observed_at == "2026-09-05T06:01:02+00:00"
+        assert loaded.pr.head_observed_api_base == "https://gitea.example"
         assert loaded.pr.patch_id == "pid789"
         assert loaded.pr.url == "https://example/pulls/42"
         assert loaded.pr.number == 42
         assert loaded.pr.provider == "gitea"
+
+    def test_pr_record_frozen_attribution_and_identity_round_trip(
+        self, tmp_path: Path,
+    ):
+        from agent_worktrees.tracking import PRRecord
+
+        # codename-attribution-by-default: the frozen attribution pair,
+        # pr_id, and pr_revision survive save/load and are omitted
+        # (byte-identical legacy YAML) when unset.
+        rec = self._make_record(
+            prs=[PRRecord(
+                state="open", branch="feature/x", provider="gitea",
+                attribution_mode="codename", attribution_explicit=True,
+                pr_id="a1b2c3", pr_revision=3,
+            )]
+        )
+        path = tmp_path / "wt.yaml"
+        save_record(rec, path)
+        text = path.read_text()
+        assert "attribution_mode: codename" in text
+        assert "attribution_explicit: true" in text
+        assert "pr_id: a1b2c3" in text
+        assert "pr_revision: 3" in text
+        loaded = load_record(path)
+        assert loaded.pr is not None
+        assert loaded.pr.attribution_mode == "codename"
+        assert loaded.pr.attribution_explicit is True
+        assert loaded.pr.pr_id == "a1b2c3"
+        assert loaded.pr.pr_revision == 3
+
+        rec2 = self._make_record(prs=[PRRecord(state="creating", branch="feature/y")])
+        path2 = tmp_path / "wt2.yaml"
+        save_record(rec2, path2)
+        text2 = path2.read_text()
+        assert "attribution_mode" not in text2
+        assert "attribution_explicit" not in text2
+        assert "pr_id" not in text2
+        assert "pr_revision" not in text2
+        loaded2 = load_record(path2)
+        assert loaded2.pr is not None
+        assert loaded2.pr.attribution_mode == ""
+        assert loaded2.pr.attribution_explicit is False
+        assert loaded2.pr.pr_id == ""
+        assert loaded2.pr.pr_revision == 0
+
+    def test_pr_record_attribution_explicit_false_still_round_trips(
+        self, tmp_path: Path,
+    ):
+        from agent_worktrees.tracking import PRRecord
+
+        # round-34 finding: attribution_explicit is emitted whenever
+        # attribution_mode is non-empty, NOT only when attribution_explicit
+        # is itself truthy -- a False explicitness is a legitimately-frozen
+        # state (an IMPLICIT codename decision), and omitting it would
+        # strand attribution_mode without its partner on reload, silently
+        # re-triggering the lazy-backfill freeze.
+        rec = self._make_record(
+            prs=[PRRecord(
+                state="open", branch="feature/x", provider="gitea",
+                attribution_mode="codename", attribution_explicit=False,
+            )]
+        )
+        path = tmp_path / "wt.yaml"
+        save_record(rec, path)
+        assert "attribution_explicit: false" in path.read_text()
+        loaded = load_record(path)
+        assert loaded.pr is not None
+        assert loaded.pr.attribution_mode == "codename"
+        assert loaded.pr.attribution_explicit is False
+
+    def test_pr_record_malformed_attribution_explicit_string_rejected(
+        self, tmp_path: Path,
+    ):
+        # round-30 finding, sharpened by a PR #3037 review finding: a
+        # hand-edited attribution_explicit: "false" (a truthy STRING, not
+        # the boolean False) must invalidate the WHOLE pair back to the
+        # empty legacy sentinel -- not just neutralize explicitness while
+        # leaving mode valid. A naive "coerce non-True to False" would
+        # leave attribution_mode="codename" standing, but the raw-marker
+        # "true" mode publishes on mode alone without ever consulting
+        # explicitness, so that shape could still authorize a
+        # privacy-sensitive marker from a malformed record.
+        from agent_worktrees.tracking import _parse_pr_mapping
+        parsed = _parse_pr_mapping(
+            {
+                "state": "open", "branch": "feature/x",
+                "attribution_mode": "codename",
+                "attribution_explicit": "false",
+            },
+            "ext",
+        )
+        assert parsed.attribution_explicit is False
+        assert parsed.attribution_mode == ""
+
+    def test_pr_record_unrecognized_attribution_mode_migrated_like_missing(
+        self, tmp_path: Path,
+    ):
+        # round-30 finding, corrected round-33: an unrecognized
+        # attribution_mode value is migrated via the same one-time
+        # lazy-backfill freeze as a missing value -- never read as one of
+        # the three known modes and never perpetually re-derived from live
+        # config.
+        from agent_worktrees.tracking import _parse_pr_mapping
+        parsed = _parse_pr_mapping(
+            {
+                "state": "open", "branch": "feature/x",
+                "attribution_mode": "not-a-real-mode",
+                "attribution_explicit": True,
+            },
+            "ext",
+        )
+        assert parsed.attribution_mode == ""
+        assert parsed.attribution_explicit is False
+
+    def test_pr_record_partial_attribution_pair_treated_as_empty_sentinel(
+        self, tmp_path: Path,
+    ):
+        # round-30 finding: a partial pair (only one field set) must ALSO
+        # be treated as the empty legacy sentinel -- never let a
+        # half-written record produce a mode without its matching
+        # explicitness, or an explicitness without its matching mode.
+        from agent_worktrees.tracking import _parse_pr_mapping
+        only_mode = _parse_pr_mapping(
+            {"state": "open", "branch": "x", "attribution_mode": "codename"},
+            "ext",
+        )
+        assert only_mode.attribution_mode == ""
+        assert only_mode.attribution_explicit is False
+        only_explicit = _parse_pr_mapping(
+            {"state": "open", "branch": "x", "attribution_explicit": True},
+            "ext",
+        )
+        assert only_explicit.attribution_mode == ""
+        assert only_explicit.attribution_explicit is False
+
 
     def test_pr_record_number_optional(self, tmp_path: Path):
         from agent_worktrees.tracking import PRRecord
@@ -710,6 +1047,442 @@ class TestSaveLoadRoundTrip:
 # Session registry â three-state semantics
 # ---------------------------------------------------------------------------
 
+class TestEnsurePrId:
+    """PR #3037 review finding: `ensure_pr_id` backfills a legacy entry's
+    `pr_id` with no other side effect (distinct from
+    `stamp_frozen_attribution`, which also touches attribution fields)."""
+
+    def test_assigns_id_when_missing_and_returns_true(self):
+        from agent_worktrees.tracking import PRRecord, ensure_pr_id
+
+        pr = PRRecord(branch="feature/x", number=1)
+        assert not pr.pr_id
+
+        assigned = ensure_pr_id(pr)
+
+        assert assigned is True
+        assert pr.pr_id
+
+    def test_no_op_when_already_present_and_returns_false(self):
+        from agent_worktrees.tracking import PRRecord, ensure_pr_id
+
+        pr = PRRecord(branch="feature/x", number=1, pr_id="existing-id")
+
+        assigned = ensure_pr_id(pr)
+
+        assert assigned is False
+        assert pr.pr_id == "existing-id"
+
+    def test_does_not_touch_attribution_fields(self):
+        from agent_worktrees.tracking import PRRecord, ensure_pr_id
+
+        pr = PRRecord(branch="feature/x", number=1)
+
+        ensure_pr_id(pr)
+
+        assert pr.attribution_mode == ""
+        assert pr.attribution_explicit is False
+
+
+class TestPrAttributionMerge:
+    """codename-attribution-by-default (rounds 26-39): the per-entry PR
+    merge in `_save_record_unlocked` protecting the frozen attribution
+    pair from a stale concurrent writer."""
+
+    def _make(self, tmp_path, **overrides):
+        from agent_worktrees.tracking import (
+            create_new_record, load_record, save_record,
+        )
+        path = tmp_path / "wt.yaml"
+        rec = create_new_record(
+            "wt-a", "worktree/wt-a", "/tmp/wt-a", "repo", "machine", "wsl",
+            tmp_path,
+        )
+        for k, v in overrides.items():
+            setattr(rec, k, v)
+        save_record(rec, path)
+        return path, load_record(path)
+
+    def test_stale_writer_does_not_erase_freshly_frozen_entry(
+        self, tmp_path: Path,
+    ):
+        from agent_worktrees.tracking import PRRecord, load_record, save_record
+
+        path, stale = self._make(tmp_path)
+        stale.prs = [PRRecord(state="open", branch="feature/x", provider="gitea")]
+        save_record(stale, path)
+        # A stale in-memory snapshot, captured BEFORE the stamp below.
+        stale_snapshot = load_record(path)
+
+        current = load_record(path)
+        current.prs[0].attribution_mode = "codename"
+        current.prs[0].attribution_explicit = False
+        current.prs[0].pr_id = "abc123"
+        current.prs[0].pr_revision = 1
+        save_record(current, path)
+
+        # Saving the stale snapshot (unrelated field bump) must not erase
+        # the freshly-frozen entry.
+        stale_snapshot.title = "unrelated update"
+        save_record(stale_snapshot, path)
+
+        reloaded = load_record(path)
+        assert reloaded.prs[0].attribution_mode == "codename"
+        assert reloaded.prs[0].pr_id == "abc123"
+        assert reloaded.prs[0].pr_revision == 1
+        assert reloaded.title == "unrelated update"
+
+    def test_legacy_same_branch_matches_stay_one_to_one(self, tmp_path: Path):
+        # Round-5 review finding: two on-disk legacy PRs (no pr_id) that
+        # reuse the SAME branch -- a terminal PR followed by a fresh one
+        # opened on the same branch, the ordinary sequential-PR case --
+        # must not both match the SAME single in-memory legacy entry via
+        # `_pr_identity_match`'s branch fallback. Matching must stay
+        # one-to-one, or the second on-disk PR is silently dropped.
+        from agent_worktrees.tracking import PRRecord, load_record, save_record
+
+        path, stale = self._make(tmp_path)
+        # The in-memory snapshot has only the FIRST (now-terminal) legacy
+        # PR on this branch, captured before the second was opened on disk.
+        stale.prs = [
+            PRRecord(state="merged", branch="feature/x", number=1),
+        ]
+        save_record(stale, path)
+        stale_snapshot = load_record(path)
+
+        # On disk, a second PR opens on the SAME branch after the first
+        # merged (both still legacy: no pr_id).
+        current = load_record(path)
+        current.prs.append(
+            PRRecord(state="open", branch="feature/x", number=2),
+        )
+        save_record(current, path)
+
+        # Saving the stale (single-entry) snapshot must not collapse the
+        # on-disk record back down to one entry.
+        stale_snapshot.title = "unrelated update"
+        save_record(stale_snapshot, path)
+
+        reloaded = load_record(path)
+        assert len(reloaded.prs) == 2
+        numbers = {pr.number for pr in reloaded.prs}
+        assert numbers == {1, 2}
+        # Both entries end up with distinct, non-empty pr_ids.
+        pr_ids = {pr.pr_id for pr in reloaded.prs}
+        assert len(pr_ids) == 2
+        assert all(pr_ids)
+
+    def test_merge_protects_non_active_parallel_pr_entry(self, tmp_path: Path):
+        # round-32 finding: the merge must operate on the full `prs` list,
+        # keyed by identity -- not just the single `.pr` active-PR
+        # accessor, which cannot protect a frozen pair on a non-active
+        # (e.g. merged/closed) entry.
+        from agent_worktrees.tracking import PRRecord, load_record, save_record
+
+        path, rec = self._make(tmp_path)
+        entry_a = PRRecord(
+            state="merged", branch="feature/a", provider="gitea", pr_id="pid-a",
+        )
+        entry_b = PRRecord(
+            state="open", branch="feature/b", provider="gitea", pr_id="pid-b",
+        )
+        rec.prs = [entry_a, entry_b]
+        save_record(rec, path)
+        stale_snapshot = load_record(path)  # holds stale copies of BOTH
+
+        current = load_record(path)
+        # Stamp entry B (the active PR) under the lock.
+        b = next(p for p in current.prs if p.pr_id == "pid-b")
+        b.attribution_mode = "true"
+        b.attribution_explicit = True
+        b.pr_revision = 1
+        save_record(current, path)
+
+        # The stale snapshot's `.pr` (active-PR) accessor resolves to entry
+        # A (merged is non-active... actually active_pr() may resolve
+        # differently; the key assertion is per-entry protection
+        # regardless of which entry the accessor currently points at).
+        stale_snapshot.title = "touch"
+        save_record(stale_snapshot, path)
+
+        reloaded = load_record(path)
+        reloaded_b = next(p for p in reloaded.prs if p.pr_id == "pid-b")
+        assert reloaded_b.attribution_mode == "true"
+        assert reloaded_b.attribution_explicit is True
+
+    def test_matches_across_number_none_to_assigned_transition(
+        self, tmp_path: Path,
+    ):
+        from agent_worktrees.tracking import PRRecord, load_record, save_record
+
+        path, rec = self._make(tmp_path)
+        pr = PRRecord(
+            state="creating", branch="feature/x", provider="gitea",
+            number=None, pr_id="pid-1",
+        )
+        rec.prs = [pr]
+        save_record(rec, path)
+        stale_snapshot = load_record(path)  # still number=None
+
+        current = load_record(path)
+        current.prs[0].number = 7
+        current.prs[0].attribution_mode = "codename"
+        current.prs[0].attribution_explicit = False
+        current.prs[0].pr_revision = 1
+        save_record(current, path)
+
+        # The stale save (an unrelated field bump) must MERGE onto the
+        # matched entry -- proving the identity rule matches across the
+        # number=None -> provider-assigned-number transition via pr_id --
+        # not append a duplicate. (The stale snapshot's own OTHER fields,
+        # like `number`, are not themselves merge-protected -- only the
+        # frozen attribution pair is; this test's assertion is scoped to
+        # that, not to `number` surviving the stale write.)
+        stale_snapshot.title = "touch"
+        save_record(stale_snapshot, path)
+
+        reloaded = load_record(path)
+        assert len(reloaded.prs) == 1  # merged, not duplicate-appended
+        assert reloaded.prs[0].attribution_mode == "codename"
+
+    def test_matches_across_number_reassignment(self, tmp_path: Path):
+        from agent_worktrees.tracking import PRRecord, load_record, save_record
+
+        path, rec = self._make(tmp_path)
+        pr = PRRecord(
+            state="open", branch="feature/x", provider="gitea",
+            number=7, pr_id="pid-1",
+        )
+        rec.prs = [pr]
+        save_record(rec, path)
+        stale_snapshot = load_record(path)  # still number=7
+
+        current = load_record(path)
+        current.prs[0].number = 8  # manual set-pr correction
+        current.prs[0].attribution_mode = "true"
+        current.prs[0].attribution_explicit = True
+        current.prs[0].pr_revision = 1
+        save_record(current, path)
+
+        # Matched via pr_id (not number) -- a number correction alone must
+        # never cause a false non-match/duplicate-append.
+        stale_snapshot.title = "touch"
+        save_record(stale_snapshot, path)
+
+        reloaded = load_record(path)
+        assert len(reloaded.prs) == 1
+        assert reloaded.prs[0].attribution_mode == "true"
+
+    def test_two_independent_blank_entries_never_match(self, tmp_path: Path):
+        # Two independent blank PRRecords (no pr_id, no branch, no number
+        # on either side) must never be treated as the same entry: saving
+        # a second, independently-created blank must not merge into the
+        # first.
+        from agent_worktrees.tracking import PRRecord, load_record, save_record
+
+        path, rec = self._make(tmp_path)
+        blank_a = PRRecord(state="", branch="", provider="")
+        rec.prs = [blank_a]
+        save_record(rec, path)  # on-disk: [blank_a]
+
+        # A separate writer, without having seen blank_a, saves its OWN
+        # independently-created blank_b.
+        fresh = load_record(path)
+        fresh.prs = [PRRecord(state="", branch="", provider="")]
+        save_record(fresh, path)
+
+        reloaded = load_record(path)
+        assert len(reloaded.prs) == 2  # never merged into one
+
+    def test_pr_id_survives_branch_and_number_rename_together(
+        self, tmp_path: Path,
+    ):
+        # round-36/38 finding: pr_id (not branch, not number) is the
+        # identity that survives a rename of EITHER field, so the frozen
+        # attribution pair is still found and merge-protected across the
+        # rename.
+        from agent_worktrees.tracking import PRRecord, load_record, save_record
+
+        path, rec = self._make(tmp_path)
+        pr = PRRecord(
+            state="open", branch="feature/x", provider="gitea",
+            number=7, pr_id="pid-stable",
+        )
+        rec.prs = [pr]
+        save_record(rec, path)
+        stale_snapshot = load_record(path)  # branch=x, number=7
+
+        current = load_record(path)
+        current.prs[0].branch = "feature/y"
+        current.prs[0].number = 8
+        current.prs[0].attribution_mode = "codename"
+        current.prs[0].attribution_explicit = True
+        current.prs[0].pr_revision = 1
+        save_record(current, path)
+
+        stale_snapshot.title = "touch"
+        save_record(stale_snapshot, path)
+
+        reloaded = load_record(path)
+        assert len(reloaded.prs) == 1
+        assert reloaded.prs[0].attribution_mode == "codename"
+
+    def test_legacy_reconciliation_backfills_pr_id_onto_in_memory_entry(
+        self, tmp_path: Path,
+    ):
+        # round-38 finding: a stale in-memory entry with NO pr_id must
+        # reconcile against the on-disk entry via the branch fallback (not
+        # append a duplicate), and the resolved pr_id must be written back
+        # onto the in-memory entry too -- so a SECOND save from that same
+        # in-memory object no longer needs the fallback.
+        from agent_worktrees.tracking import PRRecord, load_record, save_record
+
+        path, rec = self._make(tmp_path)
+        pr = PRRecord(state="open", branch="feature/x", provider="gitea")
+        assert pr.pr_id == ""  # genuinely legacy, no pr_id at all
+        rec.prs = [pr]
+        save_record(rec, path)
+        stale_in_memory = load_record(path)  # also has no pr_id yet
+        assert stale_in_memory.prs[0].pr_id == ""
+
+        # A concurrent save backfills a fresh pr_id onto the on-disk entry
+        # (same branch) and stamps the frozen pair.
+        current = load_record(path)
+        current.prs[0].pr_id = "backfilled-id"
+        current.prs[0].attribution_mode = "codename"
+        current.prs[0].attribution_explicit = False
+        current.prs[0].pr_revision = 1
+        save_record(current, path)
+
+        # The stale save must reconcile onto that entry via the branch
+        # fallback, not append a duplicate.
+        stale_in_memory.title = "touch"
+        save_record(stale_in_memory, path)
+        reloaded = load_record(path)
+        assert len(reloaded.prs) == 1
+        assert reloaded.prs[0].pr_id == "backfilled-id"
+        assert reloaded.prs[0].attribution_mode == "codename"
+        # The in-memory object itself came away carrying the SAME
+        # backfilled pr_id.
+        assert stale_in_memory.prs[0].pr_id == "backfilled-id"
+
+        # A SECOND save from that same in-memory object (now pr_id-bearing)
+        # must not re-append either.
+        stale_in_memory.title = "touch again"
+        save_record(stale_in_memory, path)
+        reloaded2 = load_record(path)
+        assert len(reloaded2.prs) == 1
+        assert reloaded2.title == "touch again"
+
+    def test_no_identity_established_never_merges_with_a_pr_id_entry(
+        self, tmp_path: Path,
+    ):
+        # A genuinely unrelated blank entry (no branch, no number, no
+        # pr_id) must never accidentally match an entry that DOES have an
+        # identity established.
+        from agent_worktrees.tracking import PRRecord, load_record, save_record
+
+        path, rec = self._make(tmp_path)
+        identified = PRRecord(
+            state="open", branch="feature/x", provider="gitea", pr_id="pid-1",
+        )
+        rec.prs = [identified]
+        save_record(rec, path)
+        stale_snapshot = load_record(path)
+
+        current = load_record(path)
+        blank = PRRecord(state="", branch="", provider="")
+        current.prs.append(blank)
+        save_record(current, path)
+
+        stale_snapshot.title = "touch"
+        save_record(stale_snapshot, path)
+
+        reloaded = load_record(path)
+        assert len(reloaded.prs) == 2
+
+    def test_equal_revision_on_disk_is_authoritative(self, tmp_path: Path):
+        # PR #3037 review finding: two concurrent first-touch freezes of
+        # the same legacy PR can each independently bump their OWN copy's
+        # pr_revision from 0 to 1 -- a strict `>` comparison would then
+        # let whichever copy happens to save SECOND silently overwrite the
+        # already-persisted first decision merely because the revisions
+        # tie. On an EQUAL revision, the value already durably on disk
+        # must win.
+        from agent_worktrees.tracking import PRRecord, load_record, save_record
+
+        path, rec = self._make(tmp_path)
+        pr = PRRecord(
+            state="open", branch="feature/x", provider="gitea", pr_id="pid-1",
+        )
+        rec.prs = [pr]
+        save_record(rec, path)
+
+        # Writer A's in-memory copy, independently frozen to "true".
+        writer_a = load_record(path)
+        writer_a.prs[0].attribution_mode = "true"
+        writer_a.prs[0].attribution_explicit = True
+        writer_a.prs[0].pr_revision = 1
+
+        # Writer B's in-memory copy (loaded before A saved), independently
+        # frozen to "codename" -- SAME revision (1), different decision.
+        writer_b = load_record(path)
+        writer_b.prs[0].attribution_mode = "codename"
+        writer_b.prs[0].attribution_explicit = False
+        writer_b.prs[0].pr_revision = 1
+
+        # A saves first (durably persisting "true").
+        save_record(writer_a, path)
+        # B saves second -- must NOT overwrite A's already-persisted
+        # decision with its own equal-revision one.
+        save_record(writer_b, path)
+
+        reloaded = load_record(path)
+        assert reloaded.prs[0].attribution_mode == "true"
+
+    def test_concurrent_legacy_freeze_does_not_duplicate_the_pr(
+        self, tmp_path: Path,
+    ):
+        # PR #3037 review finding: two concurrent legacy-freeze calls for
+        # the SAME PR (both loaded with no pr_id yet) must not each mint a
+        # DIFFERENT random pr_id before saving -- once both in-memory
+        # copies have distinct non-empty pr_ids, the identity match's
+        # pr_id path (exact equality) stops falling back to branch/number,
+        # and the loser's save appends a duplicate PR record instead of
+        # merging. stamp_frozen_attribution(assign_pr_id=False) is how the
+        # real legacy-freeze call site avoids this; this test proves the
+        # underlying merge mechanics hold when pr_id is deliberately left
+        # unassigned by both racing writers, matching that fix.
+        from agent_worktrees.tracking import PRRecord, load_record, save_record
+
+        path, rec = self._make(tmp_path)
+        pr = PRRecord(state="open", branch="feature/x", provider="gitea")
+        assert pr.pr_id == ""
+        rec.prs = [pr]
+        save_record(rec, path)
+
+        writer_a = load_record(path)
+        assert writer_a.prs[0].pr_id == ""
+        writer_a.prs[0].attribution_mode = "true"
+        writer_a.prs[0].attribution_explicit = True
+        writer_a.prs[0].pr_revision = 1
+
+        writer_b = load_record(path)
+        assert writer_b.prs[0].pr_id == ""
+        writer_b.prs[0].attribution_mode = "codename"
+        writer_b.prs[0].attribution_explicit = False
+        writer_b.prs[0].pr_revision = 1
+
+        save_record(writer_a, path)
+        save_record(writer_b, path)
+
+        reloaded = load_record(path)
+        assert len(reloaded.prs) == 1  # never duplicated
+        assert reloaded.prs[0].pr_id  # backfilled under lock
+        assert reloaded.prs[0].attribution_mode == "true"  # A's, persisted first
+
+
+
 class TestSessionsField:
     """Verify None vs [] vs populated sessions semantics."""
 
@@ -826,6 +1599,25 @@ completed_at: null
 class TestSessionRegistration:
     """Test hook-invoked session registration."""
 
+    @staticmethod
+    def _new_record(tracking_dir: Path, wt_id: str) -> None:
+        rec = WorktreeRecord(
+            worktree_id=wt_id,
+            branch=f"worktree/{wt_id}",
+            worktree_path=f"/tmp/{wt_id}",
+            repo="test-repo",
+            machine="test",
+            platform="wsl",
+            started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00",
+            resume_count=0,
+            title=None,
+            status="active",
+            completed_at=None,
+            sessions=[],
+        )
+        save_record(rec, tracking_dir / f"{wt_id}.yaml")
+
     def test_register_new_session(self, tmp_tracking_dir: Path, monkeypatch_config):
         rec = WorktreeRecord(
             worktree_id="reg-wt",
@@ -923,6 +1715,49 @@ class TestSessionRegistration:
         loaded = load_record(tmp_tracking_dir / "end-wt.yaml")
         assert loaded.sessions[0].ended_at is not None
 
+    def test_register_session_adds_live_session_claim(
+        self, tmp_tracking_dir: Path, monkeypatch_config,
+    ):
+        """register_session journals a live ``session`` ResourceClaim (Phase 8)."""
+        self._new_record(tmp_tracking_dir, "claim-wt")
+
+        register_session("claim-wt", "session-claim-1")
+
+        loaded = load_record(tmp_tracking_dir / "claim-wt.yaml")
+        claims = [c for c in loaded.resources if c.kind == "session"]
+        assert len(claims) == 1
+        assert claims[0].ref == "test/test-repo/claim-wt#session-claim-1"
+        assert claims[0].state == "active"
+        assert claims[0].is_live
+
+    def test_register_session_claim_is_idempotent(
+        self, tmp_tracking_dir: Path, monkeypatch_config,
+    ):
+        """Re-registering the same session does not duplicate its claim."""
+        self._new_record(tmp_tracking_dir, "claim-dup-wt")
+
+        register_session("claim-dup-wt", "session-claim-2")
+        register_session("claim-dup-wt", "session-claim-2")
+
+        loaded = load_record(tmp_tracking_dir / "claim-dup-wt.yaml")
+        claims = [c for c in loaded.resources if c.kind == "session"]
+        assert len(claims) == 1
+
+    def test_deregister_session_releases_its_claim(
+        self, tmp_tracking_dir: Path, monkeypatch_config,
+    ):
+        """A clean sessionEnd releases (not just settles) the session's claim."""
+        self._new_record(tmp_tracking_dir, "release-wt")
+        register_session("release-wt", "session-claim-3")
+
+        deregister_session("release-wt", "session-claim-3")
+
+        loaded = load_record(tmp_tracking_dir / "release-wt.yaml")
+        claims = [c for c in loaded.resources if c.kind == "session"]
+        assert len(claims) == 1
+        assert claims[0].state == "released"
+        assert not claims[0].is_live
+
     def test_register_nonexistent_worktree(self, tmp_tracking_dir: Path, monkeypatch_config):
         """Registering against a missing worktree is a no-op."""
         register_session("nonexistent", "some-session")
@@ -932,6 +1767,87 @@ class TestSessionRegistration:
         """Deregistering against a missing worktree is a no-op."""
         deregister_session("nonexistent", "some-session")
         # Should not raise
+
+    def test_deregister_last_session_stops_fsmonitor(
+        self, tmp_tracking_dir: Path, monkeypatch_config, tmp_path, monkeypatch,
+    ):
+        """Ending a worktree's only open session stops its fsmonitor daemon.
+
+        The daemon otherwise leaks forever: nothing else reaps it, including
+        `finalize` (which deliberately leaves worktree state alone). See #2265.
+        """
+        worktree_dir = tmp_path / "live-wt"
+        worktree_dir.mkdir()
+        rec = WorktreeRecord(
+            worktree_id="fsmon-wt",
+            branch="worktree/fsmon-wt",
+            worktree_path=str(worktree_dir),
+            repo="test-repo",
+            machine="test",
+            platform="wsl",
+            started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00",
+            resume_count=0,
+            title=None,
+            status="active",
+            completed_at=None,
+            sessions=[SessionEntry("sess-only", "2026-06-01T10:00:00")],
+        )
+        save_record(rec, tmp_tracking_dir / "fsmon-wt.yaml")
+
+        calls = []
+
+        def _fake_git(*args, cwd=None, **kwargs):
+            calls.append((args, cwd))
+
+            class _Result:
+                returncode = 0
+
+            return _Result()
+
+        from agent_worktrees import git_ops
+        monkeypatch.setattr(git_ops, "git", _fake_git)
+
+        deregister_session("fsmon-wt", "sess-only")
+
+        assert calls == [
+            (("fsmonitor--daemon", "stop"), str(worktree_dir)),
+        ]
+
+    def test_deregister_keeps_fsmonitor_while_another_session_is_open(
+        self, tmp_tracking_dir: Path, monkeypatch_config, tmp_path, monkeypatch,
+    ):
+        """A still-open sibling session on the same worktree vetoes the stop."""
+        worktree_dir = tmp_path / "shared-wt"
+        worktree_dir.mkdir()
+        rec = WorktreeRecord(
+            worktree_id="fsmon-shared",
+            branch="worktree/fsmon-shared",
+            worktree_path=str(worktree_dir),
+            repo="test-repo",
+            machine="test",
+            platform="wsl",
+            started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00",
+            resume_count=0,
+            title=None,
+            status="active",
+            completed_at=None,
+            sessions=[
+                SessionEntry("sess-a", "2026-06-01T10:00:00"),
+                SessionEntry("sess-b", "2026-06-01T10:05:00"),
+            ],
+        )
+        save_record(rec, tmp_tracking_dir / "fsmon-shared.yaml")
+
+        calls = []
+        from agent_worktrees import git_ops
+        monkeypatch.setattr(
+            git_ops, "git", lambda *a, cwd=None, **kw: calls.append((a, cwd)))
+
+        deregister_session("fsmon-shared", "sess-a")
+
+        assert calls == []
 
     def test_deregister_unknown_session(self, tmp_tracking_dir: Path, monkeypatch_config):
         """Deregistering a session ID that doesn't exist is a no-op."""
@@ -957,6 +1873,68 @@ class TestSessionRegistration:
         loaded = load_record(tmp_tracking_dir / "noop-wt.yaml")
         assert len(loaded.sessions) == 1
         assert loaded.sessions[0].ended_at is None
+
+    def test_register_session_returns_fresh_handoff_for_new_entry(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        """#2457 Stage 10: a fresh session entry consuming a pending token via
+        ``handoff_token`` gets its head transferred, and the call reports the
+        just-linked SessionHandoff so callers can emit Stage 10/11 exactly
+        once."""
+        self._new_record(tmp_tracking_dir, "wt-fresh-link")
+        register_session("wt-fresh-link", "old")
+        rec = load_record(tmp_tracking_dir / "wt-fresh-link.yaml")
+        open_handoff(rec, "old", "token-a")
+
+        linked = register_session("wt-fresh-link", "new", handoff_token="token-a")
+
+        assert linked is not None
+        assert linked.token == "token-a"
+        assert linked.predecessor == "old"
+        assert linked.successor == "new"
+        rec = load_record(tmp_tracking_dir / "wt-fresh-link.yaml")
+        assert rec.resolved_head_session == "new"
+
+    def test_register_session_returns_fresh_handoff_for_existing_entry(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        """The same, but the successor session is already tracked (e.g. a
+        candidate registered earlier via associate_handoff_candidate)."""
+        self._new_record(tmp_tracking_dir, "wt-existing-link")
+        register_session("wt-existing-link", "old")
+        register_session("wt-existing-link", "new")
+        rec = load_record(tmp_tracking_dir / "wt-existing-link.yaml")
+        open_handoff(rec, "old", "token-b")
+
+        linked = register_session("wt-existing-link", "new", handoff_token="token-b")
+
+        assert linked is not None
+        assert linked.token == "token-b"
+        assert linked.predecessor == "old"
+        assert linked.successor == "new"
+
+    def test_register_session_reports_none_for_an_already_linked_token(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        """A second call for an already-linked token is idempotent at the
+        tracking layer (link_handoff no-ops) and must report no fresh link,
+        so callers don't re-emit Stage 10/11."""
+        self._new_record(tmp_tracking_dir, "wt-idempotent")
+        register_session("wt-idempotent", "old")
+        rec = load_record(tmp_tracking_dir / "wt-idempotent.yaml")
+        open_handoff(rec, "old", "token-c")
+        first = register_session("wt-idempotent", "new", handoff_token="token-c")
+        assert first is not None
+
+        second = register_session("wt-idempotent", "new", handoff_token="token-c")
+
+        assert second is None
+
+    def test_register_session_returns_none_without_a_handoff_token(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        self._new_record(tmp_tracking_dir, "wt-no-token")
+        assert register_session("wt-no-token", "solo") is None
 
 
 # ---------------------------------------------------------------------------
@@ -1023,6 +2001,91 @@ class TestListRecords:
     def test_nonexistent_dir(self, tmp_path: Path):
         records = list_records(tmp_path / "nonexistent")
         assert records == []
+
+
+class TestListRecordsCache:
+    """copilot-extensions#3721: list_records' per-file (mtime, size) cache."""
+
+    def _make(self, wt_id: str, **overrides) -> WorktreeRecord:
+        defaults = dict(
+            worktree_id=wt_id,
+            branch=f"worktree/{wt_id}",
+            worktree_path=f"/tmp/{wt_id}",
+            repo="test-repo",
+            machine="test",
+            platform="wsl",
+            started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00",
+            resume_count=0,
+            title=None,
+            status="active",
+            completed_at=None,
+            sessions=[],
+        )
+        defaults.update(overrides)
+        return WorktreeRecord(**defaults)
+
+    def setup_method(self):
+        # Each test starts with a cold cache: entries are keyed by absolute
+        # path, and tmp_path fixtures reuse paths across the whole suite run
+        # only within a single test's own tmp_path, so this is purely
+        # defensive isolation against cross-test pollution.
+        record_cache.clear()
+
+    def test_second_call_does_not_reparse_unchanged_file(
+        self, tmp_tracking_dir: Path, monkeypatch
+    ):
+        save_record(self._make("a"), tmp_tracking_dir / "a.yaml")
+        list_records(tmp_tracking_dir)  # warm the cache
+
+        calls = []
+        real_yaml_load = tracking._yaml_safe_load
+
+        def _spy(raw):
+            calls.append(1)
+            return real_yaml_load(raw)
+
+        monkeypatch.setattr(tracking, "_yaml_safe_load", _spy)
+        records = list_records(tmp_tracking_dir)
+
+        assert len(records) == 1
+        assert calls == []  # cache hit: no reparse
+
+    def test_cache_invalidates_on_content_change(self, tmp_tracking_dir: Path):
+        rec = self._make("a", title=None)
+        save_record(rec, tmp_tracking_dir / "a.yaml")
+        first = list_records(tmp_tracking_dir)
+        assert first[0].title is None
+
+        rec.title = "Renamed"
+        save_record(rec, tmp_tracking_dir / "a.yaml")
+        second = list_records(tmp_tracking_dir)
+        assert second[0].title == "Renamed"
+
+    def test_cache_picks_up_added_and_removed_files(self, tmp_tracking_dir: Path):
+        save_record(self._make("a"), tmp_tracking_dir / "a.yaml")
+        assert len(list_records(tmp_tracking_dir)) == 1
+
+        save_record(self._make("b"), tmp_tracking_dir / "b.yaml")
+        assert len(list_records(tmp_tracking_dir)) == 2
+
+        (tmp_tracking_dir / "a.yaml").unlink()
+        remaining = list_records(tmp_tracking_dir)
+        assert len(remaining) == 1
+        assert remaining[0].worktree_id == "b"
+
+    def test_returned_records_are_independent_copies(self, tmp_tracking_dir: Path):
+        save_record(self._make("a", title=None), tmp_tracking_dir / "a.yaml")
+        first = list_records(tmp_tracking_dir)
+        first[0].title = "Mutated by caller"
+
+        second = list_records(tmp_tracking_dir)
+        assert second[0].title is None  # cache entry itself was never touched
+
+        third = list_records(tmp_tracking_dir)
+        third[0].sessions.append("leaked")
+        fourth = list_records(tmp_tracking_dir)
+        assert fourth[0].sessions == []  # deep copy: no shared mutable list
 
 
 # ---------------------------------------------------------------------------
@@ -1410,6 +2473,25 @@ class TestFindWorktreeIdByCwd:
     def test_empty_cwd_returns_none(self, tmp_tracking_dir: Path, monkeypatch_config):
         assert find_worktree_id_by_cwd("") is None
 
+    def test_explicit_project_overrides_ambient_project(
+        self, tmp_path: Path, monkeypatch_config,
+    ) -> None:
+        """An out-of-context caller (e.g. a machine-wide sync process whose own
+        CWD is unrelated to the session being resolved) passes ``project=`` to
+        scope the lookup to a specific project's tracking dir rather than the
+        ambient (CWD-resolved) active one."""
+        other_tracking_dir = tmp_path / ".other-project" / "worktrees"
+        other_tracking_dir.mkdir(parents=True)
+        self._save(other_tracking_dir, "other-wt", "/tmp/src/other-wt")
+
+        # Not found in the ambient (test-project) tracking dir...
+        assert find_worktree_id_by_cwd("/tmp/src/other-wt") is None
+        # ...but resolves once scoped to the project that actually owns it.
+        assert (
+            find_worktree_id_by_cwd("/tmp/src/other-wt", project="other-project")
+            == "other-wt"
+        )
+
 
 class TestPairedRecordResolution:
     """load_record_by_id + find_paired_record -- the #957 pairing resolver."""
@@ -1462,8 +2544,12 @@ class TestPairedRecordResolution:
             pair_ref="test/citadel-harness/wt-harness",
             pair_kind="worktree",
         )
-        self._save(tmp_tracking_dir, harness)
-        self._save(tmp_tracking_dir, knowledge)
+        harness_dir = tmp_tracking_dir.parent / ".citadel-harness" / "worktrees"
+        knowledge_dir = (
+            tmp_tracking_dir.parent / ".citadel-knowledge" / "worktrees"
+        )
+        self._save(harness_dir, harness)
+        self._save(knowledge_dir, knowledge)
         sib = find_paired_record(harness)
         assert sib is not None and sib.worktree_id == "wt-knowledge"
         assert sib.pair_role == "knowledge"
@@ -1482,8 +2568,370 @@ class TestPairedRecordResolution:
             "wt-x", pair_id="p", pair_role="harness",
             pair_ref="test/proj/wt-gone", pair_kind="worktree",
         )
-        self._save(tmp_tracking_dir, rec)
         assert find_paired_record(rec) is None
+
+
+class TestOwningTrackingDirResolution:
+    """Regression for copilot-extensions#2788: a foreign-project record must
+    never be looked up (or, worse, re-saved) into the ambient project's own
+    tracking directory just because that happens to be the current process's
+    resolved project.
+    """
+
+    def _rec(self, wt_id: str, *, repo: str, **overrides) -> WorktreeRecord:
+        base = dict(
+            worktree_id=wt_id,
+            branch=f"worktree/{wt_id}",
+            worktree_path=f"/tmp/src/{wt_id}",
+            repo=repo,
+            machine="test",
+            platform="wsl",
+            started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00",
+            resume_count=0,
+            title=None,
+            status="active",
+            completed_at=None,
+            sessions=[],
+        )
+        base.update(overrides)
+        return WorktreeRecord(**base)
+
+    def _wire_two_projects(self, monkeypatch, tmp_path: Path):
+        """Ambient project is 'harness-proj'; 'knowledge-proj' is a sibling
+        project on the same machine (mirrors a harness + bound knowledge
+        repo pairing, or simply two unrelated adopted projects)."""
+        from agent_worktrees import config as _cfg
+        from agent_worktrees import repos as _repos
+        from agent_worktrees import tracking as _t
+
+        harness_dir = tmp_path / ".harness-proj" / "worktrees"
+        knowledge_dir = tmp_path / ".knowledge-proj" / "worktrees"
+        harness_dir.mkdir(parents=True)
+        knowledge_dir.mkdir(parents=True)
+
+        _cfg.set_active_project("harness-proj")
+        monkeypatch.setattr(_cfg, "tracking_dir", lambda: harness_dir)
+        monkeypatch.setattr(
+            _cfg, "project_dir",
+            lambda name=None: tmp_path / f".{name or 'harness-proj'}",
+        )
+        monkeypatch.setattr(
+            _repos, "_adopted_project_names",
+            lambda: {"harness-proj", "knowledge-proj"},
+        )
+        return harness_dir, knowledge_dir, _t
+
+    def test_yaml_path_uses_records_own_repo_not_ambient_project(
+        self, tmp_path: Path, monkeypatch
+    ):
+        harness_dir, knowledge_dir, _t = self._wire_two_projects(monkeypatch, tmp_path)
+        rec = self._rec("wt-k", repo="knowledge-proj")
+        # Ambient project is 'harness-proj', but the record itself knows it
+        # belongs to 'knowledge-proj' -- yaml_path must honor that, not the
+        # ambient tracking_dir().
+        assert rec.yaml_path == knowledge_dir / "wt-k.yaml"
+        assert rec.yaml_path != harness_dir / "wt-k.yaml"
+
+    def test_bare_id_lookup_falls_back_to_owning_project_without_duplicating(
+        self, tmp_path: Path, monkeypatch
+    ):
+        harness_dir, knowledge_dir, _t = self._wire_two_projects(monkeypatch, tmp_path)
+        knowledge_rec = self._rec("wt-k", repo="knowledge-proj")
+        save_record(knowledge_rec, knowledge_dir / "wt-k.yaml")
+
+        # register_session only has a bare worktree_id -- ambient project is
+        # 'harness-proj', but 'wt-k' actually lives under 'knowledge-proj'.
+        # Pre-fix, this would silently create a stale duplicate under
+        # harness_dir instead of updating the real record.
+        _t.register_session("wt-k", "session-1")
+
+        assert not (harness_dir / "wt-k.yaml").exists()
+        updated = load_record(knowledge_dir / "wt-k.yaml")
+        assert updated.sessions and updated.sessions[-1].session_id == "session-1"
+
+    def test_bare_id_lookup_prefers_ambient_when_present_there(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The fast path stays fast: when the id genuinely belongs to the
+        ambient project, no cross-project scan result is needed/used."""
+        harness_dir, knowledge_dir, _t = self._wire_two_projects(monkeypatch, tmp_path)
+        own_rec = self._rec("wt-own", repo="harness-proj")
+        save_record(own_rec, harness_dir / "wt-own.yaml")
+
+        _t.register_session("wt-own", "session-1")
+
+        assert (harness_dir / "wt-own.yaml").exists()
+        assert not (knowledge_dir / "wt-own.yaml").exists()
+
+
+class TestRetireRecord:
+    """retire_record -- archive-tombstone an unpaired record, or
+    finalized-tombstone a paired sibling (#957/#220).
+
+    Reproduces the "paired sibling state unknown" bug: a plain unlink on reap
+    left the OTHER half of a -harness/-knowledge pair permanently unable to
+    tell "sibling never carved" apart from "sibling already reaped", because
+    both looked identical (no record file). A paired record must instead be
+    retired to a minimal ``finalized`` tombstone that :func:`find_paired_record`
+    can still resolve. Once BOTH halves have gone through their own reap (each
+    observing the other's ``reaped_at``-stamped tombstone), both records are
+    hard-deleted instead of leaving two dangling tombstones behind forever.
+
+    An unpaired record has no sibling to unblock, but per the
+    *archival-is-a-terminus-not-a-deletion* vision behavior it is likewise
+    tombstoned rather than deleted outright -- as ``archived`` -- so its
+    identity, lineage, and session history remain durably queryable after
+    its checkout is reclaimed.
+    """
+
+    def _rec(self, wt_id: str, **overrides) -> WorktreeRecord:
+        base = dict(
+            worktree_id=wt_id,
+            branch=f"worktree/{wt_id}",
+            worktree_path=f"/tmp/src/{wt_id}",
+            repo="test-repo",
+            machine="test",
+            platform="wsl",
+            started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00",
+            resume_count=0,
+            title=None,
+            status="completed",
+            completed_at=None,
+            sessions=[],
+        )
+        base.update(overrides)
+        return WorktreeRecord(**base)
+
+    def test_unpaired_record_is_archived_not_deleted(self, tmp_tracking_dir: Path):
+        rec = self._rec("wt-solo")
+        save_record(rec, tmp_tracking_dir / "wt-solo.yaml")
+        retire_record(rec, tmp_tracking_dir)
+        path = tmp_tracking_dir / "wt-solo.yaml"
+        assert path.exists()
+        tombstoned = load_record(path)
+        assert tombstoned.status == "archived"
+        assert tombstoned.completed_at is not None
+        assert tombstoned.reaped_at is not None
+
+    def test_archived_tombstone_preserves_session_history(self, tmp_tracking_dir: Path):
+        """The whole point of archiving over deleting: a session's binding
+        to this worktree must remain resolvable after the checkout is gone."""
+        rec = self._rec(
+            "wt-solo-sessions",
+            sessions=[SessionEntry("sess-a", "2026-06-01T10:00:00")],
+        )
+        save_record(rec, tmp_tracking_dir / "wt-solo-sessions.yaml")
+        retire_record(rec, tmp_tracking_dir)
+        tombstoned = load_record(tmp_tracking_dir / "wt-solo-sessions.yaml")
+        assert tombstoned.status == "archived"
+        assert [s.session_id for s in tombstoned.sessions] == ["sess-a"]
+
+    def test_paired_record_is_tombstoned_not_deleted(self, tmp_tracking_dir: Path):
+        rec = self._rec(
+            "wt-k", pair_id="p1", pair_role="knowledge",
+            pair_ref="test/citadel-harness/wt-harness", pair_kind="worktree",
+            status="active",
+        )
+        save_record(rec, tmp_tracking_dir / "wt-k.yaml")
+        retire_record(rec, tmp_tracking_dir)
+        path = tmp_tracking_dir / "wt-k.yaml"
+        assert path.exists()
+        tombstoned = load_record(path)
+        assert tombstoned.status == "finalized"
+        assert tombstoned.completed_at is not None
+        assert tombstoned.reaped_at is not None
+
+    def test_reaping_knowledge_side_first_unblocks_harness_side(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """End-to-end repro of the reported bug + fix, across two projects."""
+        from agent_worktrees import prune
+
+        harness_dir = tmp_path / ".citadel-harness" / "worktrees"
+        knowledge_dir = tmp_path / ".citadel-knowledge" / "worktrees"
+        monkeypatch.setattr(
+            "agent_worktrees.config.project_dir",
+            lambda name=None: tmp_path / f".{name}",
+        )
+
+        harness = self._rec(
+            "wt-harness", pair_id="p1", pair_role="harness",
+            pair_ref="test/citadel-knowledge/wt-k", pair_kind="worktree",
+            status="finalized",
+        )
+        knowledge = self._rec(
+            "wt-k", pair_id="p1", pair_role="knowledge",
+            pair_ref="test/citadel-harness/wt-harness", pair_kind="worktree",
+            status="active",
+        )
+        save_record(harness, harness_dir / "wt-harness.yaml")
+        save_record(knowledge, knowledge_dir / "wt-k.yaml")
+
+        # Before the knowledge side is reaped, the harness side is correctly held.
+        assert prune.default_paired_sibling_final(harness) is False
+
+        # Reap the knowledge-side sibling first (this is what cleanup --clean
+        # --include-unused does for an `unused` knowledge worktree).
+        retire_record(knowledge, knowledge_dir)
+
+        # Bug (pre-fix): the record file was gone -> find_paired_record returned
+        # None -> default_paired_sibling_final returned None ("unknown") forever,
+        # even though the sibling is legitimately settled.
+        # Fix: the tombstone resolves and reports finalized -> True.
+        assert prune.default_paired_sibling_final(harness) is True
+
+        # Now the harness side is itself reaped. Its sibling (knowledge) is a
+        # confirmed reap tombstone (reaped_at set), so both records are safe
+        # to hard-delete -- no tombstones linger forever.
+        retire_record(harness, harness_dir)
+        assert not (harness_dir / "wt-harness.yaml").exists()
+        assert not (knowledge_dir / "wt-k.yaml").exists()
+
+    def test_concurrent_both_reaped_hard_delete_does_not_deadlock(
+        self, tmp_path: Path, monkeypatch
+    ):
+        # pr-attribution-codenames Phase 2 follow-up: the both-reaped
+        # hard-delete branch needs BOTH this record's and its sibling's
+        # locks. Acquiring "self first, then sibling" unconditionally would
+        # let two concurrent retire_record calls -- one on each half of the
+        # SAME pair -- each hold one lock while waiting for the other
+        # (a genuine cross-call deadlock). Locks must be acquired in a
+        # deterministic order regardless of which side initiates.
+        import threading
+
+        harness_dir = tmp_path / ".citadel-harness" / "worktrees"
+        knowledge_dir = tmp_path / ".citadel-knowledge" / "worktrees"
+        monkeypatch.setattr(
+            "agent_worktrees.config.project_dir",
+            lambda name=None: tmp_path / f".{name}",
+        )
+
+        now = "2026-06-01T12:00:00"
+        harness = self._rec(
+            "wt-harness", pair_id="p1", pair_role="harness",
+            pair_ref="test/citadel-knowledge/wt-k", pair_kind="worktree",
+            status="finalized", completed_at=now, reaped_at=now,
+        )
+        knowledge = self._rec(
+            "wt-k", pair_id="p1", pair_role="knowledge",
+            pair_ref="test/citadel-harness/wt-harness", pair_kind="worktree",
+            status="finalized", completed_at=now, reaped_at=now,
+        )
+        save_record(harness, harness_dir / "wt-harness.yaml")
+        save_record(knowledge, knowledge_dir / "wt-k.yaml")
+
+        results: dict[str, bool] = {}
+
+        def _retire_harness() -> None:
+            results["harness"] = retire_record(harness, harness_dir)
+
+        def _retire_knowledge() -> None:
+            results["knowledge"] = retire_record(knowledge, knowledge_dir)
+
+        t1 = threading.Thread(target=_retire_harness)
+        t2 = threading.Thread(target=_retire_knowledge)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        assert not t1.is_alive(), "retire_record deadlocked (harness side)"
+        assert not t2.is_alive(), "retire_record deadlocked (knowledge side)"
+        assert not (harness_dir / "wt-harness.yaml").exists()
+        assert not (knowledge_dir / "wt-k.yaml").exists()
+
+    def test_retire_after_peer_already_hard_deleted_both_does_not_recreate(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Deterministic (non-threaded) regression for the race the
+        concurrent test above only sometimes hit: retire_record's own
+        both-reaped hard-delete branch already unlinks BOTH this record's
+        file and its sibling's -- so a second, "losing" retire_record call
+        for the SAME already-deleted record must recognize its own file is
+        gone and return, never recreate it via the tombstone-write fallback
+        (copilot-extensions#3749)."""
+        harness_dir = tmp_path / ".citadel-harness" / "worktrees"
+        knowledge_dir = tmp_path / ".citadel-knowledge" / "worktrees"
+        monkeypatch.setattr(
+            "agent_worktrees.config.project_dir",
+            lambda name=None: tmp_path / f".{name}",
+        )
+
+        now = "2026-06-01T12:00:00"
+        harness = self._rec(
+            "wt-harness", pair_id="p1", pair_role="harness",
+            pair_ref="test/citadel-knowledge/wt-k", pair_kind="worktree",
+            status="finalized", completed_at=now, reaped_at=now,
+        )
+        knowledge = self._rec(
+            "wt-k", pair_id="p1", pair_role="knowledge",
+            pair_ref="test/citadel-harness/wt-harness", pair_kind="worktree",
+            status="finalized", completed_at=now, reaped_at=now,
+        )
+        save_record(harness, harness_dir / "wt-harness.yaml")
+        save_record(knowledge, knowledge_dir / "wt-k.yaml")
+
+        # The harness-side call runs to completion first (as if it "won"
+        # the race) -- its both-reaped branch hard-deletes BOTH files.
+        assert retire_record(harness, harness_dir) is True
+        assert not (harness_dir / "wt-harness.yaml").exists()
+        assert not (knowledge_dir / "wt-k.yaml").exists()
+
+        # The knowledge-side call (the "loser") still runs afterward with
+        # its own stale in-memory `knowledge` object -- it must notice its
+        # own file is already gone and stop, not recreate it.
+        assert retire_record(knowledge, knowledge_dir) is True
+        assert not (knowledge_dir / "wt-k.yaml").exists()
+
+    def test_live_finalized_sibling_is_not_mistaken_for_reaped(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Regression: a live, not-yet-cleaned sibling must never be treated
+        as "already reaped" merely because it reads status == "finalized" --
+        that status is set well before a worktree's directory is ever removed
+        (see finalize's own contract). Only ``reaped_at`` proves an actual
+        reap. Getting this wrong would hard-delete tracking metadata for a
+        worktree that is still fully alive on disk.
+        """
+        harness_dir = tmp_path / ".citadel-harness" / "worktrees"
+        knowledge_dir = tmp_path / ".citadel-knowledge" / "worktrees"
+        monkeypatch.setattr(
+            "agent_worktrees.config.project_dir",
+            lambda name=None: tmp_path / f".{name}",
+        )
+
+        # The harness side is finalized (merge-safe) but NOT reaped: no
+        # reaped_at, and (in reality) its worktree directory still exists.
+        harness = self._rec(
+            "wt-harness", pair_id="p1", pair_role="harness",
+            pair_ref="test/citadel-knowledge/wt-k", pair_kind="worktree",
+            status="finalized",
+        )
+        knowledge = self._rec(
+            "wt-k", pair_id="p1", pair_role="knowledge",
+            pair_ref="test/citadel-harness/wt-harness", pair_kind="worktree",
+            status="active",
+        )
+        save_record(harness, harness_dir / "wt-harness.yaml")
+        save_record(knowledge, knowledge_dir / "wt-k.yaml")
+
+        # Reaping the knowledge side must NOT hard-delete the harness side's
+        # live record just because it already reads "finalized".
+        retire_record(knowledge, knowledge_dir)
+
+        assert (harness_dir / "wt-harness.yaml").exists()
+        reloaded_harness = load_record(harness_dir / "wt-harness.yaml")
+        assert reloaded_harness.status == "finalized"
+        assert reloaded_harness.reaped_at is None
+
+        # The knowledge side itself was correctly tombstoned (not deleted).
+        path = knowledge_dir / "wt-k.yaml"
+        assert path.exists()
+        tombstoned = load_record(path)
+        assert tombstoned.status == "finalized"
+        assert tombstoned.reaped_at is not None
 
 
 class TestCascadeAndOrphans:
@@ -1535,6 +2983,100 @@ class TestCascadeAndOrphans:
         self._save(tmp_tracking_dir, parent)
         assert release_all_resources(parent) == []
 
+    def test_release_all_resources_snapshots_trail_for_reopen(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        """worktree-finality-and-obligations Phase 2: the cascade leaves a
+        durable, persisted trail of exactly what it released, distinct from
+        the general (possibly manually-released) ``resources`` list, so a
+        later reopen notice can enumerate it."""
+        parent = self._rec("wt-parent", resources=[
+            ResourceClaim(kind="codespace", ref="cs-1", state="active", note="n1"),
+            ResourceClaim(kind="worktree", ref="test/other/wt-old", state="released"),
+        ])
+        self._save(tmp_tracking_dir, parent)
+        released = release_all_resources(parent)
+        assert [c.ref for c in released] == ["cs-1"]
+        assert [c.ref for c in parent.last_finalize_released] == ["cs-1"]
+        assert parent.last_finalize_released[0].note == "n1"
+        # Persisted, and reads back as a real (separate) copy, not the same
+        # object as the general resources list.
+        reloaded = load_record_by_id("wt-parent")
+        assert [c.ref for c in reloaded.last_finalize_released] == ["cs-1"]
+        assert reloaded.last_finalize_released[0] is not reloaded.resources[0]
+        # A second cascade with nothing new to release overwrites the trail
+        # to empty rather than leaving the prior (now-stale) snapshot behind.
+        assert release_all_resources(reloaded) == []
+        assert reloaded.last_finalize_released == []
+        reloaded_again = load_record_by_id("wt-parent")
+        assert reloaded_again.last_finalize_released == []
+
+    def test_release_at_rest_resources_only_touches_at_rest(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        """worktree-finality-and-obligations Phase 4 / design.md's dedicated
+        reconciliation command: releases AT-REST claims only, never an
+        ``active`` one -- the explicit, operator-driven counterpart to the
+        automatic finalize-freeze release (``release_all_resources``)."""
+        parent = self._rec("wt-parent", resources=[
+            ResourceClaim(kind="codespace", ref="cs-active", state="active"),
+            ResourceClaim(kind="worktree", ref="test/other/wt-rest", state="at-rest"),
+            ResourceClaim(kind="worktree", ref="test/other/wt-old", state="released"),
+        ])
+        self._save(tmp_tracking_dir, parent)
+        released = release_at_rest_resources(parent)
+        assert [c.ref for c in released] == ["test/other/wt-rest"]
+        reloaded = load_record_by_id("wt-parent")
+        by_ref = {c.ref: c.state for c in reloaded.resources}
+        assert by_ref["cs-active"] == "active"          # never touched
+        assert by_ref["test/other/wt-rest"] == "released"
+        assert by_ref["test/other/wt-old"] == "released"  # already released
+
+    def test_release_at_rest_resources_excludes_session_claims(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        parent = self._rec("wt-session", resources=[
+            ResourceClaim(kind="session", ref="test/p/wt-session#s1", state="at-rest"),
+            ResourceClaim(kind="worktree", ref="test/other/wt-rest", state="at-rest"),
+        ])
+        self._save(tmp_tracking_dir, parent)
+        released = release_at_rest_resources(parent)
+        assert [c.ref for c in released] == ["test/other/wt-rest"]
+        reloaded = load_record_by_id("wt-session")
+        session_claim = next(c for c in reloaded.resources if c.kind == "session")
+        assert session_claim.state == "at-rest"
+
+    def test_release_at_rest_resources_idempotent(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        parent = self._rec("wt-parent", resources=[
+            ResourceClaim(kind="worktree", ref="test/other/wt-rest", state="released"),
+        ])
+        self._save(tmp_tracking_dir, parent)
+        assert release_at_rest_resources(parent) == []
+
+
+    def test_release_all_resources_excludes_session_claims(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        """A live ``session`` claim (Phase 8) survives the generic cascade.
+
+        It has its own lifecycle (settled on finalize, released only by
+        ``deregister_session``); the generic release-everything cascade must
+        not release it out from under a still-running session.
+        """
+        parent = self._rec("wt-session-cascade", resources=[
+            ResourceClaim(kind="worktree", ref="test/other/wt-child", state="active"),
+            ResourceClaim(kind="session", ref="test/p/wt-session-cascade#s1", state="active"),
+        ])
+        self._save(tmp_tracking_dir, parent)
+        released = release_all_resources(parent)
+        assert [c.ref for c in released] == ["test/other/wt-child"]
+        reloaded = load_record_by_id("wt-session-cascade")
+        session_claim = next(c for c in reloaded.resources if c.kind == "session")
+        assert session_claim.state == "active"
+        assert session_claim.is_live
+
     def test_find_orphaned_children_finalized_and_absent_parents(
         self, tmp_tracking_dir: Path, monkeypatch_config, monkeypatch
     ):
@@ -1568,7 +3110,6 @@ class TestCascadeAndOrphans:
         self, tmp_tracking_dir: Path, monkeypatch, tmp_path: Path
     ):
         import types
-        monkeypatch.setenv("WORKTREE_PROJECT", "test-project")
         monkeypatch.setattr("agent_worktrees.config.tracking_dir",
                             lambda: tmp_tracking_dir)
         monkeypatch.setattr("agent_worktrees.config.load_config",
@@ -1622,6 +3163,22 @@ class TestFindWorktreeIdBySession:
         self._save(tmp_tracking_dir, "wt-a", ["other"])
         assert find_worktree_id_by_session("missing") is None
         assert find_worktree_id_by_session("") is None
+
+    def test_explicit_project_overrides_ambient_project(
+        self, tmp_path: Path, monkeypatch_config,
+    ) -> None:
+        """Mirrors :class:`TestFindWorktreeIdByCwd`'s equivalent case -- a
+        caller that already knows a session's project scopes the lookup to
+        it rather than the ambient (CWD-resolved) active one."""
+        other_tracking_dir = tmp_path / ".other-project" / "worktrees"
+        other_tracking_dir.mkdir(parents=True)
+        self._save(other_tracking_dir, "other-wt", ["other-session"])
+
+        assert find_worktree_id_by_session("other-session") is None
+        assert (
+            find_worktree_id_by_session("other-session", project="other-project")
+            == "other-wt"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1724,6 +3281,43 @@ class TestSystemWorktreeKind:
         assert [r.worktree_id for r in sessions_only] == ["s1"]
         assert len(list_records(tmp_path)) == 2
 
+    def test_list_records_copy_records_false_skips_the_deep_copy(self, tmp_path: Path):
+        """picker-performance-and-responsiveness Phase 3: the resident
+        status-monitor's hot path (``find_worktree_id_by_cwd``, called once
+        per live session per sweep) opts out of ``list_records``'s normal
+        per-record ``copy.deepcopy`` via ``copy_records=False`` -- verify
+        the records returned really are the cache's own objects (so the
+        CPU cost this phase removes is actually gone), while the default
+        call every other caller uses is unaffected."""
+        record_cache.clear()
+        save_record(self._base(worktree_id="s1", kind="session"), tmp_path / "s1.yaml")
+
+        default_a = list_records(tmp_path)[0]
+        default_b = list_records(tmp_path)[0]
+        assert default_a is not default_b, "default callers must still get independent copies"
+
+        shared_a = list_records(tmp_path, copy_records=False)[0]
+        shared_b = list_records(tmp_path, copy_records=False)[0]
+        assert shared_a is shared_b, "copy_records=False must hand back the cache's own object"
+        assert shared_a.worktree_id == default_a.worktree_id == "s1"
+
+    def test_find_worktree_id_by_cwd_unaffected_by_the_copy_skip(self, tmp_path: Path, monkeypatch):
+        """The actual hot-path caller must still resolve correctly with the
+        deep copy skipped -- this is a pure read (``worktree_path``/
+        ``worktree_id`` only), so dropping the copy must not change behavior."""
+        record_cache.clear()
+        proj_dir = tmp_path / "proj"
+        save_record(
+            self._base(worktree_id="s1", kind="session", worktree_path=str(proj_dir)),
+            tmp_path / "s1.yaml",
+        )
+        import agent_worktrees.tracking as tracking_mod
+        monkeypatch.setattr(tracking_mod.cfg, "tracking_dir", lambda name=None: tmp_path)
+
+        assert find_worktree_id_by_cwd(str(proj_dir / "sub")) == "s1"
+        assert find_worktree_id_by_cwd(str(proj_dir)) == "s1"
+        assert find_worktree_id_by_cwd(str(tmp_path / "other")) is None
+
     def test_create_new_record_system(self, tmp_path: Path):
         rec = create_new_record(
             "sys-x", "worktree/sys-x", "/tmp/sys-x", "test-repo", "test", "wsl",
@@ -1734,6 +3328,206 @@ class TestSystemWorktreeKind:
         loaded = load_record(tmp_path / "sys-x.yaml")
         assert loaded.kind == "system"
         assert loaded.owner == "session-sync"
+
+    def test_create_new_record_bound_agent_round_trips(self, tmp_path: Path):
+        """agent-bridge-worktree-native-agents: a charter bound at create
+        time persists through save/load, and an unbound worktree's YAML
+        carries no bound_agent key at all (legacy-shape preserved)."""
+        rec = create_new_record(
+            "wt-bound", "worktree/wt-bound", "/tmp/wt-bound", "test-repo",
+            "test", "wsl", tmp_path, bound_agent="board-sweep-worker",
+        )
+        assert rec.bound_agent == "board-sweep-worker"
+        loaded = load_record(tmp_path / "wt-bound.yaml")
+        assert loaded.bound_agent == "board-sweep-worker"
+
+        unbound = create_new_record(
+            "wt-unbound", "worktree/wt-unbound", "/tmp/wt-unbound",
+            "test-repo", "test", "wsl", tmp_path,
+        )
+        assert unbound.bound_agent is None
+        raw = (tmp_path / "wt-unbound.yaml").read_text(encoding="utf-8")
+        assert "bound_agent" not in raw
+
+    def test_create_new_record_pending_seed_round_trips(self, tmp_path: Path):
+        """picker-new-session-prompt-and-composer: a prompt persisted at
+        creation time (`create`/`resolve --new --seed`) round-trips through
+        real save/load (not a fake), including a multiline value, YAML
+        special characters, and a value that LOOKS like a YAML boolean (the
+        hand-rolled ``_yaml_scalar`` used for most string fields would emit
+        this unquoted and load it back as the bool ``False``, not the
+        string ``"false"`` -- this field must use the real YAML emitter
+        instead); a worktree with none carries no pending_seed key at all
+        (legacy-shape preserved, mirrors bound_agent)."""
+        multiline = 'fix the "flaky" test:\n- check retries\n- see #123'
+        rec = create_new_record(
+            "wt-seeded", "worktree/wt-seeded", "/tmp/wt-seeded", "test-repo",
+            "test", "wsl", tmp_path, pending_seed=multiline,
+        )
+        assert rec.pending_seed == multiline
+        loaded = load_record(tmp_path / "wt-seeded.yaml")
+        assert loaded.pending_seed == multiline
+
+        boolish = create_new_record(
+            "wt-boolish", "worktree/wt-boolish", "/tmp/wt-boolish",
+            "test-repo", "test", "wsl", tmp_path, pending_seed="false",
+        )
+        assert boolish.pending_seed == "false"
+        loaded_boolish = load_record(tmp_path / "wt-boolish.yaml")
+        assert loaded_boolish.pending_seed == "false"
+        assert loaded_boolish.pending_seed is not False
+
+        unseeded = create_new_record(
+            "wt-unseeded", "worktree/wt-unseeded", "/tmp/wt-unseeded",
+            "test-repo", "test", "wsl", tmp_path,
+        )
+        assert unseeded.pending_seed is None
+        raw = (tmp_path / "wt-unseeded.yaml").read_text(encoding="utf-8")
+        assert "pending_seed" not in raw
+
+        # Clearing (the embody consumption contract) and re-saving must omit
+        # the key again, not emit it as an empty/null scalar.
+        loaded.pending_seed = None
+        save_record(loaded, tmp_path / "wt-seeded.yaml")
+        raw = (tmp_path / "wt-seeded.yaml").read_text(encoding="utf-8")
+        assert "pending_seed" not in raw
+
+    def test_stale_full_record_writer_cannot_resurrect_a_delivered_seed(
+        self, tmp_path: Path,
+    ):
+        """A process that loaded the record BEFORE a claim (e.g. to update
+        an unrelated field like `summary`) and saves its own stale
+        in-memory snapshot AFTER the claim must not resurrect the
+        already-delivered seed -- `_save_record_unlocked` merges
+        `pending_seed` the same way it already does for
+        `effort_revision`/`lifecycle_revision`: the ON-DISK
+        `pending_seed_revision` wins when it is newer."""
+        path = tmp_path / "wt-stale.yaml"
+        rec = create_new_record(
+            "wt-stale", "worktree/wt-stale", "/tmp/wt-stale", "test-repo",
+            "test", "wsl", tmp_path, pending_seed="do the thing",
+        )
+        assert rec.pending_seed_revision == 0
+
+        # Another process loads the SAME on-disk state before the claim.
+        stale = load_record(path)
+        assert stale.pending_seed == "do the thing"
+
+        # The claim happens (clear + bump revision) and is saved first.
+        rec.pending_seed = None
+        rec.pending_seed_revision += 1
+        save_record(rec, path)
+        assert load_record(path).pending_seed is None
+
+        # The stale writer's later save (e.g. after bumping `summary`,
+        # unaware of the claim) must not bring the seed back.
+        stale.summary = "unrelated update"
+        save_record(stale, path)
+
+        final = load_record(path)
+        assert final.pending_seed is None
+        assert final.summary == "unrelated update"
+        assert final.pending_seed_revision == 1
+
+    def test_stale_full_record_writer_cannot_erase_a_concurrent_pause(
+        self, tmp_path: Path,
+    ):
+        """A process (e.g. `finalize.py`) that loaded the record BEFORE a
+        concurrent `status --paused` write, and holds that stale snapshot
+        across its own Git/network work before saving, must not silently
+        overwrite the already-persisted `paused=True` with its own stale
+        `paused=False` -- `_save_record_unlocked` merges `paused` the same
+        way it already does for `pending_seed`/`effort_revision`: the
+        ON-DISK `paused_revision` wins when it is newer."""
+        path = tmp_path / "wt-stale-pause.yaml"
+        rec = create_new_record(
+            "wt-stale-pause", "worktree/wt-stale-pause", "/tmp/wt-stale-pause",
+            "test-repo", "test", "wsl", tmp_path,
+        )
+        assert rec.paused_revision == 0
+        save_record(rec, path)
+
+        # Another process (e.g. finalize.py) loads the SAME on-disk state
+        # before the pause, then holds it across its own slow work.
+        stale = load_record(path)
+        assert stale.paused is False
+
+        # Meanwhile, `status --paused` happens under the record lock and
+        # is saved first.
+        set_disposition(rec, paused=True, save=False)
+        assert rec.paused_revision == 1
+        save_record(rec, path)
+        assert load_record(path).paused is True
+
+        # The stale writer's later save (unaware of the pause) must not
+        # revert it, even though it also legitimately changes an unrelated
+        # field.
+        stale.summary = "unrelated update"
+        save_record(stale, path)
+
+        final = load_record(path)
+        assert final.paused is True
+        assert final.summary == "unrelated update"
+        assert final.paused_revision == 1
+
+    def test_stale_pause_merge_preserves_the_newer_status_note_at(
+        self, tmp_path: Path,
+    ):
+        """Adopting the on-disk `paused` must not also adopt the stale
+        writer's own (older) `status_note_at` -- that would erase the
+        pause write's freshness/glance-ordering timestamp even though the
+        record correctly ends up `paused=True`."""
+        path = tmp_path / "wt-stale-pause-ts.yaml"
+        rec = create_new_record(
+            "wt-stale-pause-ts", "worktree/wt-stale-pause-ts",
+            "/tmp/wt-stale-pause-ts", "test-repo", "test", "wsl", tmp_path,
+        )
+        save_record(rec, path)
+
+        # A stale writer loads before the pause -- its own status_note_at
+        # is whatever the record had at that point (None, here).
+        stale = load_record(path)
+        assert stale.status_note_at is None
+
+        set_disposition(rec, paused=True, save=False)
+        pause_stamp = rec.status_note_at
+        assert pause_stamp is not None
+        save_record(rec, path)
+
+        # The stale writer's later save must not erase that fresher stamp.
+        stale.summary = "unrelated update"
+        save_record(stale, path)
+
+        final = load_record(path)
+        assert final.paused is True
+        assert final.status_note_at == pause_stamp
+
+    def test_create_new_record_bound_agent_whitespace_normalizes_to_none(
+        self, tmp_path: Path,
+    ):
+        """A whitespace-only --agent value must not persist as a binding."""
+        rec = create_new_record(
+            "wt-blank", "worktree/wt-blank", "/tmp/wt-blank", "test-repo",
+            "test", "wsl", tmp_path, bound_agent="   ",
+        )
+        assert rec.bound_agent is None
+        raw = (tmp_path / "wt-blank.yaml").read_text(encoding="utf-8")
+        assert "bound_agent" not in raw
+
+    def test_load_record_strips_whitespace_only_bound_agent(self, tmp_path: Path):
+        """A hand-edited YAML with a whitespace-only bound_agent must load as
+        unbound, matching create_new_record()'s own normalization."""
+        path = tmp_path / "wt-handedit.yaml"
+        create_new_record(
+            "wt-handedit", "worktree/wt-handedit", "/tmp/wt-handedit",
+            "test-repo", "test", "wsl", tmp_path,
+        )
+        path.write_text(
+            path.read_text(encoding="utf-8") + 'bound_agent: "   "\n',
+            encoding="utf-8",
+        )
+        loaded = load_record(path)
+        assert loaded.bound_agent is None
 
 
 # ---------------------------------------------------------------------------
@@ -1857,6 +3651,21 @@ class TestSetDisposition:
         assert loaded.summary == "work left"
         assert loaded.status_note_at  # stamped
 
+    def test_set_follow_up_true_reopens_finalized_owner(self, tmp_path: Path, monkeypatch):
+        # worktree-finality-and-obligations Phase 3: any caller asserting
+        # follow_up=True (manual `status --follow-up`, or `effort-focus
+        # bind`'s automatic set_disposition(follow_up=True, ...)) reopens a
+        # finalized owner -- not just the itemized ledger path.
+        rec = self._rec(status="finalized", completed_at="2026-09-01T00:00:00")
+        p = tmp_path / "wt.yaml"
+        monkeypatch.setattr("agent_worktrees.tracking.save_record",
+                            lambda record, path=None: save_record(record, p))
+        set_disposition(rec, follow_up=True)
+        loaded = load_record(p)
+        assert loaded.status == "active"
+        assert loaded.completed_at is None
+        assert loaded.last_finalized_at == "2026-09-01T00:00:00"
+
     def test_partial_update_preserves_other_field(self, tmp_path: Path, monkeypatch):
         rec = self._rec(follow_up=True, summary="old")
         p = tmp_path / "wt.yaml"
@@ -1920,6 +3729,60 @@ class TestSetDisposition:
         assert stored.endswith("\u2026")            # truncated with an ellipsis
         assert stored.startswith("Session a900")     # keeps the leading text
         assert load_record(p).title_asserted is True
+
+    def test_set_paused_is_purely_informational(self, tmp_path: Path, monkeypatch):
+        """`paused` never reopens a finalized owner (unlike `follow_up=True`)
+        and never affects `status`/`completed_at` -- it's a parallel,
+        independent overlay."""
+        rec = self._rec(status="finalized", completed_at="2026-09-01T00:00:00")
+        p = tmp_path / "wt.yaml"
+        monkeypatch.setattr("agent_worktrees.tracking.save_record",
+                            lambda record, path=None: save_record(record, p))
+        set_disposition(rec, paused=True)
+        loaded = load_record(p)
+        assert loaded.paused is True
+        assert loaded.status == "finalized"  # unchanged -- no gate interaction
+        assert loaded.completed_at == "2026-09-01T00:00:00"
+
+    def test_paused_round_trips_and_omits_when_false(self, tmp_path: Path, monkeypatch):
+        rec = self._rec()
+        p = tmp_path / "wt.yaml"
+        monkeypatch.setattr("agent_worktrees.tracking.save_record",
+                            lambda record, path=None: save_record(record, p))
+        set_disposition(rec, summary="s")
+        assert load_record(p).paused is False
+        assert "paused" not in p.read_text()  # emitted only when True
+
+        set_disposition(load_record(p), paused=True)
+        assert "paused: true" in p.read_text()
+        assert load_record(p).paused is True
+
+        set_disposition(load_record(p), paused=False)
+        assert load_record(p).paused is False
+        # The `paused` key itself is omitted once cleared, but
+        # `paused_revision` persists -- same convention as
+        # `pending_seed`/`pending_seed_revision`: the revision must survive
+        # the value returning to its default so a later stale save can
+        # still be detected and rejected (see the dedicated
+        # `_save_record_unlocked` stale-writer tests).
+        content = p.read_text()
+        assert "paused: true" not in content
+        assert "paused_revision: 2" in content
+
+    def test_paused_independent_of_follow_up(self, tmp_path: Path, monkeypatch):
+        rec = self._rec()
+        p = tmp_path / "wt.yaml"
+        monkeypatch.setattr("agent_worktrees.tracking.save_record",
+                            lambda record, path=None: save_record(record, p))
+        set_disposition(rec, follow_up=True, paused=True)
+        loaded = load_record(p)
+        assert loaded.follow_up is True
+        assert loaded.paused is True
+        # Clearing one leaves the other untouched.
+        set_disposition(loaded, follow_up=False)
+        again = load_record(p)
+        assert again.follow_up is False
+        assert again.paused is True
 
     def test_summary_strips_illegal_controls_before_write(
         self, tmp_path: Path, monkeypatch
@@ -2003,6 +3866,15 @@ class TestForwardCompatContract:
             resume_count=2, title="t", status="active", completed_at=None,
             interface="cli", origin="user",
             parent_session="sess-1", caller_worktree="anomalous-potato-win-caller",
+            controller_revision=1,
+            controllers=[ControllerRelation(
+                kind="worktree",
+                source="caller-worktree",
+                controller_ref="anomalous-potato-win-caller#sess-1",
+                controller_session_id="sess-1",
+                relation_revision=1,
+                created_at="2026-07-15T00:00:00",
+            )],
             follow_up=True, summary="work left", status_note_at="2026-07-15T01:00:00",
             active_effort=ActiveEffort(
                 path="efforts/active/durable-loop/README.md",
@@ -2017,6 +3889,15 @@ class TestForwardCompatContract:
         assert r.origin == "user"
         assert r.parent_session == "sess-1"
         assert r.caller_worktree == "anomalous-potato-win-caller"
+        assert r.controller_revision == 1
+        assert r.controllers == [ControllerRelation(
+            kind="worktree",
+            source="caller-worktree",
+            controller_ref="anomalous-potato-win-caller#sess-1",
+            controller_session_id="sess-1",
+            relation_revision=1,
+            created_at="2026-07-15T00:00:00",
+        )]
         assert r.follow_up is True
         assert r.summary == "work left"
         assert r.status_note_at
@@ -2314,6 +4195,103 @@ class TestAddResourceClaim:
         assert rec.resources[0].state == "released"
         assert rec.resources[0].note == "second"
 
+    def test_complete_session_worktree_can_add_claim(self, tmp_path: Path):
+        rec = self._rec(tmp_path)
+        rec.status = "complete"
+
+        add_resource_claim(
+            rec,
+            ResourceClaim(kind="worktree", ref="host/repo/wt-B"),
+            save=False,
+        )
+
+        assert [claim.ref for claim in rec.resources] == ["host/repo/wt-B"]
+
+    def test_finalized_worktree_can_add_claim(self, tmp_path: Path):
+        """``finalized`` is not terminal -- a resumed worktree may still take
+        on new outbound obligations (docs/worktree-lifecycle.md), and the
+        record atomically reopens to `active` (worktree-finality-and-
+        obligations, Phase 2 reopen transaction)."""
+        rec = self._rec(tmp_path)
+        rec.status = "finalized"
+        rec.completed_at = "2026-09-01T00:00:00"
+
+        add_resource_claim(
+            rec,
+            ResourceClaim(kind="worktree", ref="host/repo/wt-B"),
+            save=False,
+        )
+
+        assert [claim.ref for claim in rec.resources] == ["host/repo/wt-B"]
+        assert rec.status == "active"
+        assert rec.completed_at is None
+        assert rec.last_finalized_at == "2026-09-01T00:00:00"
+
+    def test_reactivating_a_released_claim_reopens_finalized_owner(
+        self, tmp_path: Path,
+    ):
+        rec = self._rec(tmp_path)
+        add_resource_claim(
+            rec, ResourceClaim(kind="worktree", ref="host/repo/wt-B",
+                                state="released"),
+            save=False,
+        )
+        rec.status = "finalized"
+
+        add_resource_claim(
+            rec, ResourceClaim(kind="worktree", ref="host/repo/wt-B",
+                                state="active"),
+            save=False,
+        )
+
+        assert rec.status == "active"
+        assert rec.resources[0].state == "active"
+
+    def test_idempotent_replay_does_not_reopen_finalized_owner(
+        self, tmp_path: Path,
+    ):
+        rec = self._rec(tmp_path)
+        claim = ResourceClaim(kind="worktree", ref="host/repo/wt-B",
+                               state="active", note="x")
+        add_resource_claim(rec, claim, save=False)
+        rec.status = "finalized"
+
+        # Re-adding the exact same kind/state/note is a no-op replay.
+        add_resource_claim(
+            rec, ResourceClaim(kind="worktree", ref="host/repo/wt-B",
+                                state="active", note="x"),
+            save=False,
+        )
+
+        assert rec.status == "finalized"
+
+    def test_adding_an_already_released_claim_does_not_reopen(
+        self, tmp_path: Path,
+    ):
+        rec = self._rec(tmp_path)
+        rec.status = "finalized"
+
+        # A claim that is not itself live never increases held obligations.
+        add_resource_claim(
+            rec, ResourceClaim(kind="worktree", ref="host/repo/wt-B",
+                                state="released"),
+            save=False,
+        )
+
+        assert rec.status == "finalized"
+
+    def test_complete_managed_worktree_rejects_claim(self, tmp_path: Path):
+        rec = self._rec(tmp_path)
+        rec.kind = "bridge"
+        rec.status = "complete"
+
+        with pytest.raises(ValueError, match="creator ownership is frozen"):
+            add_resource_claim(
+                rec,
+                ResourceClaim(kind="worktree", ref="host/repo/wt-B"),
+                save=False,
+            )
+
     def test_stamp_owner_ref_via_create(self, tmp_path: Path):
         # create_new_record stamps the backward owner link on the resource.
         create_new_record(
@@ -2324,3 +4302,191 @@ class TestAddResourceClaim:
         loaded = load_record(tmp_path / "wt-B.yaml")
         assert loaded.owner_ref == "anomalous-potato/test-chamber/wt-A#s1"
         assert loaded.owner_claim_ref.worktree_id == "wt-A"
+
+
+class TestFollowUpLedger:
+    """worktree-finality-and-obligations Phase 3: the itemized follow-up
+    ledger replacing the boolean-only `follow_up` flag."""
+
+    def _rec(self, tmp_path: Path) -> WorktreeRecord:
+        return create_new_record(
+            "wt-A", "worktree/wt-A", str(tmp_path / "wt-A"), "test-chamber",
+            "anomalous-potato", "wsl", tmp_path,
+        )
+
+    def test_add_creates_open_item(self, tmp_path: Path):
+        rec = self._rec(tmp_path)
+        item = add_follow_up(rec, "deploy the merged runtime", save=False)
+        assert item.state == "open"
+        assert item.revision == 1
+        assert rec.follow_ups == [item]
+        assert effective_open_follow_up_count(rec) == 1
+
+    def test_add_with_refs_round_trips_through_yaml(self, tmp_path: Path):
+        rec = self._rec(tmp_path)
+        add_follow_up(
+            rec, "file the bug", refs=[FollowUpRef(kind="issue", ref="org/repo#9")],
+            save=False,
+        )
+        path = tmp_path / "wt-A.yaml"
+        save_record(rec, path)
+        loaded = load_record(path)
+        assert len(loaded.follow_ups) == 1
+        fu = loaded.follow_ups[0]
+        assert fu.summary == "file the bug"
+        assert fu.refs == [FollowUpRef(kind="issue", ref="org/repo#9")]
+
+    def test_resolve_clears_effective_open_count(self, tmp_path: Path):
+        rec = self._rec(tmp_path)
+        item = add_follow_up(rec, "x", save=False)
+        resolved = resolve_follow_up(rec, item.id, result_ref="org/repo#PR", save=False)
+        assert resolved.state == "resolved"
+        assert resolved.result_ref == "org/repo#PR"
+        assert resolved.revision == 2
+        assert effective_open_follow_up_count(rec) == 0
+
+    def test_dismiss_clears_effective_open_count(self, tmp_path: Path):
+        rec = self._rec(tmp_path)
+        item = add_follow_up(rec, "x", save=False)
+        dismissed = dismiss_follow_up(rec, item.id, reason="not needed", save=False)
+        assert dismissed.state == "dismissed"
+        assert dismissed.reason == "not needed"
+        assert effective_open_follow_up_count(rec) == 0
+
+    def test_resolve_unknown_id_is_a_noop(self, tmp_path: Path):
+        rec = self._rec(tmp_path)
+        assert resolve_follow_up(rec, "fu-missing", save=False) is None
+
+    def test_legacy_boolean_counts_as_one_when_ledger_empty(self, tmp_path: Path):
+        rec = self._rec(tmp_path)
+        rec.follow_up = True
+        assert effective_open_follow_up_count(rec) == 1
+
+    def test_legacy_boolean_does_not_double_count_with_items(self, tmp_path: Path):
+        rec = self._rec(tmp_path)
+        rec.follow_up = True
+        add_follow_up(rec, "x", save=False)
+        add_follow_up(rec, "y", save=False)
+        assert effective_open_follow_up_count(rec) == 2
+
+    def test_adding_open_follow_up_reopens_finalized_owner(self, tmp_path: Path):
+        rec = self._rec(tmp_path)
+        rec.status = "finalized"
+        rec.completed_at = "2026-09-01T00:00:00"
+        add_follow_up(rec, "deploy it", save=False)
+        assert rec.status == "active"
+        assert rec.completed_at is None
+        assert rec.last_finalized_at == "2026-09-01T00:00:00"
+
+    def test_add_rejects_finalizing_owner(self, tmp_path: Path):
+        rec = self._rec(tmp_path)
+        rec.status = "finalizing"
+        with pytest.raises(ValueError, match="creator ownership is frozen"):
+            add_follow_up(rec, "x", save=False)
+
+    def test_add_rejects_orphaned_owner(self, tmp_path: Path):
+        rec = self._rec(tmp_path)
+        rec.status = "orphaned"
+        with pytest.raises(ValueError, match="creator ownership is frozen"):
+            add_follow_up(rec, "x", save=False)
+
+
+class TestFollowUpLedgerConcurrencyMerge:
+    """worktree-finality-and-obligations Phase 1: stale-snapshot concurrency
+    fixtures proving a background writer's save cannot erase, resurrect, or
+    silently drop a concurrently-mutated follow-up. ``save_record``'s
+    per-item highest-revision merge (mirroring the existing `resources`
+    merge-by-ref reconciliation just above it) is what makes this true --
+    these fixtures pin that contract, not just exercise it incidentally."""
+
+    def _rec(self, tmp_path: Path) -> WorktreeRecord:
+        return create_new_record(
+            "wt-A", "worktree/wt-A", str(tmp_path / "wt-A"), "test-chamber",
+            "anomalous-potato", "wsl", tmp_path,
+        )
+
+    def test_stale_writer_save_never_erases_a_concurrently_added_item(
+        self, tmp_path: Path,
+    ):
+        # Writer A loads the record (no follow-ups yet) and holds it in
+        # memory while doing unrelated work (e.g. a background liveness
+        # stamp). Writer B, independently, loads its OWN fresh copy, adds a
+        # follow-up, and saves.
+        path = tmp_path / "wt-A.yaml"
+        writer_a = self._rec(tmp_path)
+        writer_b = load_record(path)
+        add_follow_up(writer_b, "file the bug", save=True)
+        # Writer A's later save must not erase writer B's item, even though
+        # writer A's own in-memory `follow_ups` is still empty.
+        assert writer_a.follow_ups == []
+        save_record(writer_a, path)
+        reloaded = load_record(path)
+        assert [fu.summary for fu in reloaded.follow_ups] == ["file the bug"]
+
+    def test_stale_writer_save_cannot_resurrect_a_resolved_item(
+        self, tmp_path: Path,
+    ):
+        path = tmp_path / "wt-A.yaml"
+        seed = self._rec(tmp_path)
+        item = add_follow_up(seed, "x", save=True)
+        # Writer A loads AFTER the item exists but BEFORE it is resolved.
+        writer_a = load_record(path)
+        # Writer B loads independently, resolves the item, and saves.
+        writer_b = load_record(path)
+        resolve_follow_up(writer_b, item.id, result_ref="org/repo#PR", save=True)
+        # Writer A still holds the stale open/rev-1 copy in memory.
+        assert writer_a.follow_ups[0].state == "open"
+        assert writer_a.follow_ups[0].revision == 1
+        save_record(writer_a, path)
+        reloaded = load_record(path)
+        assert len(reloaded.follow_ups) == 1
+        assert reloaded.follow_ups[0].state == "resolved"
+        assert reloaded.follow_ups[0].revision == 2
+        assert reloaded.follow_ups[0].result_ref == "org/repo#PR"
+
+    def test_stale_writer_save_cannot_resurrect_a_dismissed_item(
+        self, tmp_path: Path,
+    ):
+        path = tmp_path / "wt-A.yaml"
+        seed = self._rec(tmp_path)
+        item = add_follow_up(seed, "x", save=True)
+        writer_a = load_record(path)
+        writer_b = load_record(path)
+        dismiss_follow_up(writer_b, item.id, reason="not needed", save=True)
+        save_record(writer_a, path)
+        reloaded = load_record(path)
+        assert reloaded.follow_ups[0].state == "dismissed"
+        assert reloaded.follow_ups[0].reason == "not needed"
+
+    def test_stale_writers_own_concurrent_mutation_still_wins_over_disk(
+        self, tmp_path: Path,
+    ):
+        # Writer A's OWN in-memory mutation (a higher revision than whatever
+        # is on disk when it saves) must not be discarded by the merge --
+        # the merge favors the higher revision on EITHER side, not
+        # unconditionally the on-disk copy.
+        path = tmp_path / "wt-A.yaml"
+        seed = self._rec(tmp_path)
+        item = add_follow_up(seed, "x", save=True)
+        writer_a = load_record(path)
+        resolve_follow_up(writer_a, item.id, result_ref="org/repo#PR", save=False)
+        assert writer_a.follow_ups[0].revision == 2
+        # Disk still has the older (unresolved) revision at this point.
+        save_record(writer_a, path)
+        reloaded = load_record(path)
+        assert reloaded.follow_ups[0].state == "resolved"
+        assert reloaded.follow_ups[0].revision == 2
+
+    def test_two_independent_concurrent_additions_are_both_preserved(
+        self, tmp_path: Path,
+    ):
+        path = tmp_path / "wt-A.yaml"
+        writer_a = self._rec(tmp_path)
+        writer_b = load_record(path)
+        add_follow_up(writer_a, "from A", save=False)
+        add_follow_up(writer_b, "from B", save=True)
+        save_record(writer_a, path)
+        reloaded = load_record(path)
+        assert {fu.summary for fu in reloaded.follow_ups} == {"from A", "from B"}
+
+

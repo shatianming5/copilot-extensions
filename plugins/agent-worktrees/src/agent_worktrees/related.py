@@ -7,10 +7,12 @@ which other repos are relevant, why, and -- crucially -- **where to actually
 work on them**.
 
 The data lives **in-repo and committed**, at
-``<anchor>/.agent-worktrees/related.yaml`` (alongside the in-repo
-``config.yaml``), with a plain-markdown narrative per related repo under
-``<anchor>/.agent-worktrees/related/<name>.md``.  Because it is committed, it
-travels with the repo and is shared across machines and collaborators.
+``<anchor>/.copilot-extensions/agent-worktrees/related.yaml`` (alongside the
+in-repo ``config.yaml``), with a plain-markdown narrative per related repo
+under ``<anchor>/.copilot-extensions/agent-worktrees/related/<name>.md``.
+Legacy ``.agent-worktrees/related.yaml`` remains readable for compatibility.
+Because it is committed, it travels with the repo and is shared across
+machines and collaborators.
 
 Design intent (so we never duplicate the registry):
 
@@ -24,7 +26,7 @@ Design intent (so we never duplicate the registry):
   global registry is intentionally *not* extended with per-machine paths.
 * A top-level ``primary:`` marker names the default/primary project repo.
 
-Schema (``<anchor>/.agent-worktrees/related.yaml``)::
+Schema (``<anchor>/.copilot-extensions/agent-worktrees/related.yaml``)::
 
     primary: example-web
     related:
@@ -54,21 +56,23 @@ loaders.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import yaml
 from dropin_registry import ScanAuthority
-from plugin_activation import resolve_active_plugins
+from plugin_activation import ActivationReport, resolve_active_plugins
 
-# The in-repo ``.agent-worktrees/`` directory name.  Kept in sync with
-# ``config.INREPO_CONFIG_DIRNAME``; defined locally so this module has no
-# import-time dependency on the config layer.
-INREPO_DIRNAME = ".agent-worktrees"
-RELATED_FILENAME = "related.yaml"      # <anchor>/.agent-worktrees/related.yaml
-RELATED_DOCS_DIRNAME = "related"       # <anchor>/.agent-worktrees/related/<name>.md
+# Repo-owned related-repo config moves toward the shared plugin namespace;
+# payload contributions retain the legacy in-payload ``.agent-worktrees/`` location.
+INREPO_DIRNAME = ".agent-worktrees"  # marketplace-isolation: allow legacy-compatibility
+CANONICAL_RELATED_DIR = Path(".copilot-extensions") / "agent-worktrees"
+RELATED_FILENAME = "related.yaml"
+RELATED_DOCS_DIRNAME = "related"
+MARKETPLACE_OVERLAYS_DIR = CANONICAL_RELATED_DIR / "marketplaces"
 
 # Descriptive roles a related repo can play, *from the current repo's POV*.
 # Stored verbatim (lower-cased) -- unknown values are kept, not coerced, since
@@ -81,24 +85,27 @@ VALID_DELEGATES = (
     "agent-bridge", "agent-codespaces", "agent-containers", "none",
 )
 
-# Ownership relationship of a related repo, from the operator's POV. This is
-# **expected-behavior metadata** (e.g. it drives the AI-attribution decision:
-# an authored increment in an ``owned`` -- or non-public ``internal`` -- target
-# needs no acknowledgement, an ``external`` one does). It is **derived ONCE at
-# registration** from the operator's own gh account logins + the repo's remote
-# (see :func:`classify_ownership`), then persisted here and treated as
-# authoritative -- consumers read this manifest instead of re-inspecting live gh
-# accounts. An explicit value always wins over the derivation (e.g. an ADO repo
-# the operator wholly owns is marked ``owned`` even though the ADO-host default
-# is ``internal``).
-#   owned     -- the operator wholly owns the target (their own gh namespace, or
-#                an explicitly-owned repo). No AI-acknowledgement on authored
-#                increments.
-#   internal  -- org-internal, not owned (e.g. an enterprise ADO org repo). No
-#                acknowledgement on authored increments, but not the operator's.
-#   external  -- public/external, not owned. Authored increments are
-#                acknowledged.
+# Ownership relationship of a related repo, from the operator's POV: who
+# maintains/reviews it -- NOT the AI-attribution axis (see ``VALID_AUDIENCE``
+# below). Derived ONCE at registration from the operator's own gh account
+# logins + the repo's remote (:func:`classify_ownership`), then persisted and
+# treated as authoritative; an explicit value always wins over the derivation.
+#   owned     -- operator wholly owns the target.
+#   internal  -- org-internal, not owned (e.g. an enterprise ADO org repo).
+#   external  -- public/external, not owned.
 VALID_OWNERSHIP = ("owned", "internal", "external")
+
+# Audience of a related repo -- who can read what gets published there. The
+# axis that actually drives the AI-attribution decision, orthogonal to
+# ``ownership`` above (an operator-owned repo can still be ``public``; a
+# third-party repo could be ``private``). Not reliably derivable from a git
+# remote, so set explicitly when it matters; empty means "unclassified" and
+# consumers judge the target themselves rather than assume the
+# disclosure-exempt case.
+#   public/internal -- disclosure applies by default.
+#   private          -- disclosure not required, but must be a positive,
+#                        verified classification, never assumed by default.
+VALID_AUDIENCE = ("public", "internal", "private")
 
 # Locus "kinds" -- where work on a related repo actually happens.
 VALID_LOCUS_KINDS = ("local", "machine", "codespace", "container")
@@ -134,13 +141,14 @@ class Locus:
 
     preferred: str = ""
     machines: list[str] = field(default_factory=list)
+    # Machines opted out of related_machine_presence auto-registration.
+    excluded_machines: list[str] = field(default_factory=list)
     codespace: dict[str, Any] = field(default_factory=dict)
     container: dict[str, Any] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
-        return not (
-            self.preferred or self.machines or self.codespace or self.container
-        )
+        return not (self.preferred or self.machines or self.excluded_machines
+                    or self.codespace or self.container)
 
 
 @dataclass
@@ -156,10 +164,21 @@ class RelatedEntry:
     # Ownership relationship (one of VALID_OWNERSHIP) + the resolving operator
     # account. Derived once at registration (:func:`classify_ownership`) and
     # then authoritative; an explicit value in related.yaml always wins. Empty
-    # ``ownership`` means "not classified" -- consumers fall back to judging the
-    # target themselves. See VALID_OWNERSHIP for the AI-attribution semantics.
+    # means "not classified." Contribution/authority axis -- see
+    # ``audience``/``ai_attribution`` below for the AI-attribution axis.
     ownership: str = ""
     owner: str = ""                     # resolving operator account login (optional)
+    # Audience (one of VALID_AUDIENCE): who can read what gets published to
+    # this repo. Orthogonal to ``ownership``; drives AI-attribution. Never
+    # derived automatically; empty means "unclassified."
+    audience: str = ""
+    # Per-repo AI-attribution overrides for the ``ai-attribution`` plugin:
+    # ``disclose_on_open``/``disclose_on_reply`` (bool). Each key absent from
+    # this dict falls back to the audience-derived default (see
+    # ``effective_ai_attribution``); a present key is honored verbatim in
+    # either direction (can turn disclosure off *or* on relative to that
+    # default), not restricted to narrowing.
+    ai_attribution: dict[str, Any] = field(default_factory=dict)
     # Plugins this control plane side-loads when delegating work to the related
     # repo (the *related-repo* plugin lane -- distinct from a CodeSpace's own
     # ``codespacePlugins``). Each item is a normalized ``{"source": str,
@@ -182,7 +201,15 @@ class RelatedEntry:
     # entry's narrative ``doc`` -- which is relative to ITS source repo's
     # ``.agent-worktrees/`` -- still resolves against that repo, not the harness
     # base. ``None`` for a plain single-anchor read; never serialized.
-    origin_anchor: str | None = None
+    origin_anchor: str | None = field(default=None, compare=False)
+    # Effective graft source, populated alongside ``origin_anchor`` and never
+    # serialized to related.yaml. Empty means the entry bypassed grafting.
+    origin_layer: str = field(default="", compare=False)
+    origin_plugin: str = field(default="", compare=False)
+    # Absolute directory the entry's narrative doc resolves relative to. Set by
+    # the loader so canonical, legacy, and marketplace-overlay entries each keep
+    # their own doc root without callers needing to know which committed path won.
+    doc_root: str | None = field(default=None, compare=False)
 
 
 @dataclass
@@ -197,18 +224,36 @@ class RelatedConfig:
 # Path helpers
 # ---------------------------------------------------------------------------
 
+def _looks_like_plugin_anchor(anchor: Path) -> bool:
+    """Whether ``anchor`` is an installed plugin payload root."""
+    return _has_plugin_manifest(anchor)
+
+
 def related_dir(anchor: str | Path) -> Path:
-    """The in-repo ``<anchor>/.agent-worktrees`` directory."""
+    """The preferred related-config directory for ``anchor``."""
+    root = Path(anchor)
+    if _looks_like_plugin_anchor(root):
+        return root / INREPO_DIRNAME
+    return root / CANONICAL_RELATED_DIR
+
+
+def legacy_related_dir(anchor: str | Path) -> Path:
+    """The legacy repo-local related-config directory for ``anchor``."""
     return Path(anchor) / INREPO_DIRNAME
 
 
 def related_path(anchor: str | Path) -> Path:
-    """Path to ``<anchor>/.agent-worktrees/related.yaml``."""
+    """Path to the preferred related.yaml for ``anchor``."""
     return related_dir(anchor) / RELATED_FILENAME
 
 
+def legacy_related_path(anchor: str | Path) -> Path:
+    """Path to the legacy ``<anchor>/.agent-worktrees/related.yaml``."""
+    return legacy_related_dir(anchor) / RELATED_FILENAME
+
+
 def docs_dir(anchor: str | Path) -> Path:
-    """The narrative docs directory ``<anchor>/.agent-worktrees/related``."""
+    """The preferred narrative docs directory for ``anchor``."""
     return related_dir(anchor) / RELATED_DOCS_DIRNAME
 
 
@@ -228,6 +273,8 @@ def doc_abs_path(anchor: str | Path, entry_or_name: RelatedEntry | str) -> Path:
     """
     if isinstance(entry_or_name, RelatedEntry):
         rel = entry_or_name.doc or default_doc_rel(entry_or_name.name)
+        if entry_or_name.doc_root:
+            return Path(entry_or_name.doc_root) / rel
         if entry_or_name.origin_anchor:
             anchor = entry_or_name.origin_anchor
     else:
@@ -254,10 +301,40 @@ def normalize_ownership(value: str | None) -> str:
 
     Only members of :data:`VALID_OWNERSHIP` are kept -- an unrecognized value
     normalizes to ``""`` (unclassified) so a typo never silently asserts a
-    wrong AI-attribution posture.
+    wrong AI-attribution posture. A non-string input (e.g. a YAML integer)
+    also normalizes to ``""`` rather than raising.
     """
-    v = (value or "").strip().lower()
+    if not isinstance(value, str):
+        return ""
+    v = value.strip().lower()
     return v if v in VALID_OWNERSHIP else ""
+
+
+def normalize_audience(value: str | None) -> str:
+    """Lower-case/strip an audience value; drop anything outside
+    :data:`VALID_AUDIENCE` to ``""`` (unclassified) rather than silently
+    asserting the disclosure-exempt ``private`` posture on a typo. A
+    non-string input (e.g. a YAML integer) also normalizes to ``""`` rather
+    than raising -- a single malformed entry must never break loading the
+    whole related config."""
+    if not isinstance(value, str):
+        return ""
+    v = value.strip().lower()
+    return v if v in VALID_AUDIENCE else ""
+
+
+def _parse_ai_attribution(raw: Any) -> dict[str, Any]:
+    """Normalize an ``ai_attribution:`` override block: keep only
+    ``disclose_on_open``/``disclose_on_reply`` as booleans, dropping anything
+    else (unknown keys, non-bool values, non-mapping input) so a malformed
+    override falls back to the audience-derived default."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in ("disclose_on_open", "disclose_on_reply"):
+        if key in raw and isinstance(raw[key], bool):
+            out[key] = raw[key]
+    return out
 
 
 def parse_preferred(value: str | None) -> tuple[str, str]:
@@ -296,20 +373,16 @@ def _parse_venue(raw: Any) -> dict[str, Any]:
             out[str(k)] = str(v)
     return out
 
+def _parse_str_list(raw: Any) -> list[str]:
+    return [str(m).strip() for m in raw if str(m).strip()] if isinstance(raw, list) else []
 
 def _parse_locus(raw: Any) -> Locus:
     if not isinstance(raw, dict):
         return Locus()
-    preferred = str(raw.get("preferred", "")).strip()
-    raw_machines = raw.get("machines", [])
-    machines = (
-        [str(m).strip() for m in raw_machines if str(m).strip()]
-        if isinstance(raw_machines, list)
-        else []
-    )
     return Locus(
-        preferred=preferred,
-        machines=machines,
+        preferred=str(raw.get("preferred", "")).strip(),
+        machines=_parse_str_list(raw.get("machines", [])),
+        excluded_machines=_parse_str_list(raw.get("excluded_machines", [])),
         codespace=_parse_venue(raw.get("codespace", {})),
         container=_parse_venue(raw.get("container", {})),
     )
@@ -362,16 +435,8 @@ def _parse_related_pr(raw: Any) -> dict[str, Any]:
     return dict(raw) if isinstance(raw, dict) else {}
 
 
-def read_related(anchor: str | Path) -> RelatedConfig:
-    """Load ``<anchor>/.agent-worktrees/related.yaml``.
-
-    Returns an empty :class:`RelatedConfig` if the file is missing, empty, or
-    malformed -- never raises on bad content.
-    """
-    path = related_path(anchor)
-    if not path.exists():
-        return RelatedConfig()
-
+def _parse_related_file(path: Path) -> RelatedConfig:
+    """Load one related.yaml file, or an empty config when unreadable."""
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
     except Exception:
@@ -399,11 +464,78 @@ def read_related(anchor: str | Path) -> RelatedConfig:
                 delegate=_parse_delegate(entry.get("delegate")),
                 ownership=normalize_ownership(entry.get("ownership")),
                 owner=str(entry.get("owner", "")).strip(),
+                audience=normalize_audience(entry.get("audience")),
+                ai_attribution=_parse_ai_attribution(entry.get("ai_attribution")),
                 plugins=_parse_plugins(entry.get("plugins")),
                 pr=_parse_related_pr(entry.get("pr")),
+                doc_root=str(path.parent),
             )
 
     return RelatedConfig(primary=primary, related=related)
+
+
+def _repo_base_related_path(anchor: Path) -> Path | None:
+    for candidate in (anchor / CANONICAL_RELATED_DIR / RELATED_FILENAME, legacy_related_path(anchor)):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _repo_marketplace_overlay_related_path(anchor: Path) -> Path | None:
+    raw = os.environ.get("COPILOT_EXTENSIONS_CONTEXT", "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.startswith("{"):
+            context = json.loads(raw)
+        else:
+            context = json.loads(Path(raw).expanduser().read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return None
+    if not isinstance(context, dict):
+        return None
+    marketplace_id = str(context.get("marketplaceId") or "").strip()
+    if not marketplace_id:
+        return None
+    candidate = (
+        anchor
+        / MARKETPLACE_OVERLAYS_DIR
+        / marketplace_id
+        / RELATED_FILENAME
+    )
+    return candidate if candidate.exists() else None
+
+
+def read_related(anchor: str | Path) -> RelatedConfig:
+    """Load a repo or plugin anchor's effective related-repo config.
+
+    Repo anchors read the canonical
+    ``<anchor>/.copilot-extensions/agent-worktrees/related.yaml`` first, fall
+    back to legacy ``<anchor>/.agent-worktrees/related.yaml``, then overlay the
+    explicit marketplace-specific file from
+    ``<anchor>/.copilot-extensions/agent-worktrees/marketplaces/<marketplace-id>/related.yaml``
+    when present. Installed plugin payload anchors keep their historical
+    ``.agent-worktrees/related.yaml`` location. Missing, empty, or malformed
+    files yield an empty :class:`RelatedConfig`.
+    """
+    root = Path(anchor)
+    if _looks_like_plugin_anchor(root):
+        return _parse_related_file(legacy_related_path(root))
+
+    merged = RelatedConfig()
+    layers: list[Path] = []
+    base = _repo_base_related_path(root)
+    if base is not None:
+        layers.append(base)
+    overlay = _repo_marketplace_overlay_related_path(root)
+    if overlay is not None:
+        layers.append(overlay)
+    for path in layers:
+        loaded = _parse_related_file(path)
+        if loaded.primary:
+            merged.primary = loaded.primary
+        merged.related.update(loaded.related)
+    return merged
 
 
 def _quote(v: str) -> str:
@@ -438,8 +570,10 @@ def _emit_locus(lines: list[str], locus: Locus, indent: str) -> None:
     if locus.preferred:
         lines.append(f"{inner}preferred: {_quote(locus.preferred)}")
     if locus.machines:
-        rendered = ", ".join(_quote(m) for m in locus.machines)
-        lines.append(f"{inner}machines: [{rendered}]")
+        lines.append(f"{inner}machines: [{', '.join(_quote(m) for m in locus.machines)}]")
+    if locus.excluded_machines:
+        rendered = ', '.join(_quote(m) for m in locus.excluded_machines)
+        lines.append(f"{inner}excluded_machines: [{rendered}]")
     if locus.codespace:
         lines.append(f"{inner}{_emit_venue('codespace', locus.codespace)}")
     if locus.container:
@@ -475,10 +609,11 @@ def write_related(anchor: str | Path, cfg: RelatedConfig) -> None:
     path = related_path(anchor)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    _rp = "~/.agent-worktrees/repos.yaml"  # marketplace-isolation: allow legacy
     lines = [
-        "# <repo>/.agent-worktrees/related.yaml",
+        "# <repo>/.copilot-extensions/agent-worktrees/related.yaml",
         "# Directional, per-project related-repos index (this repo's POV).",
-        "# Keys are names in the global repos registry (~/.agent-worktrees/repos.yaml);",
+        f"# Keys are names in the global repos registry ({_rp});",
         "# this file adds relationship + locus + delegate + ownership -- never checkout paths.",
         "",
     ]
@@ -505,6 +640,14 @@ def write_related(anchor: str | Path, cfg: RelatedConfig) -> None:
                 lines.append(f"    ownership: {_quote(entry.ownership)}")
             if entry.owner:
                 lines.append(f"    owner: {_quote(entry.owner)}")
+            if entry.audience:
+                lines.append(f"    audience: {_quote(entry.audience)}")
+            if entry.ai_attribution:
+                lines.append("    ai_attribution:")
+                for key in ("disclose_on_open", "disclose_on_reply"):
+                    if key in entry.ai_attribution:
+                        val = "true" if entry.ai_attribution[key] else "false"
+                        lines.append(f"      {key}: {val}")
             if entry.plugins:
                 lines.append("    plugins:")
                 for p in entry.plugins:
@@ -536,7 +679,7 @@ def _control_plane_project(anchor: str | Path) -> str | None:
     bare form (``control_plane: <name>``). Returns ``None`` when the file is
     absent/malformed or declares no control plane. Fail-safe (never raises).
     """
-    path = Path(anchor) / ".agent-worktrees" / "machines.yaml"
+    path = Path(anchor) / INREPO_DIRNAME / "machines.yaml"
     if not path.is_file():
         path = Path(anchor) / "machines.yaml"  # legacy repo-root fallback
     try:
@@ -621,7 +764,76 @@ INSTALLED_PLUGINS_ENV = "AGENT_WORKTREES_INSTALLED_PLUGINS_DIR"
 
 
 class _PluginContributionAnchor(str):
-    """Path marker preserving plugin provenance through graft ordering."""
+    """Path marker preserving plugin identity through graft ordering."""
+
+    plugin_name: str
+
+    def __new__(
+        cls, value: str, plugin_name: str = "",
+    ) -> "_PluginContributionAnchor":
+        marker = super().__new__(cls, value)
+        marker.plugin_name = plugin_name
+        return marker
+
+
+class _ConfigContributionAnchor(str):
+    """Path marker preserving harness/knowledge config-source identity."""
+
+    source_layer: str
+
+    def __new__(
+        cls, value: str, source_layer: str,
+    ) -> "_ConfigContributionAnchor":
+        marker = super().__new__(cls, value)
+        marker.source_layer = source_layer
+        return marker
+
+
+def config_contribution_anchor(
+    anchor: str | Path, source_layer: str,
+) -> str:
+    """Tag one repository config anchor with its stable public source layer."""
+    layer = source_layer if source_layer in {"harness", "machine", "knowledge"} else "repository"
+    return _ConfigContributionAnchor(str(anchor), layer)
+
+
+def _plugin_manifest_name(plugin_root: Path) -> str:
+    """Read a plugin's declared identity, or return empty when unverifiable."""
+    for manifest in (
+        plugin_root / "plugin.json",
+        plugin_root / ".claude-plugin" / "plugin.json",
+    ):
+        try:
+            raw = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(raw, dict):
+            name = str(raw.get("name") or "").strip()
+            if name:
+                return name
+    return ""
+
+
+def entry_provenance(entry: RelatedEntry) -> dict[str, str]:
+    """Return safe effective-source metadata without exposing local paths."""
+    if entry.origin_layer == "plugin":
+        return {
+            "layer": "plugin",
+            "plugin": entry.origin_plugin or "unknown",
+        }
+    if entry.origin_layer in {"harness", "machine", "knowledge", "repository"}:
+        return {"layer": entry.origin_layer}
+    return {"layer": "unknown"}
+
+
+def public_doc(entry: RelatedEntry) -> str:
+    """Return a plugin-safe narrative path without exposing absolute paths."""
+    doc = entry.doc or f"{RELATED_DOCS_DIRNAME}/{entry.name}.md"
+    if entry.origin_layer != "plugin":
+        return doc
+    if PurePosixPath(doc).is_absolute() or PureWindowsPath(doc).is_absolute():
+        return f"{RELATED_DOCS_DIRNAME}/{entry.name}.md"
+    return doc
 
 
 def installed_plugins_root() -> Path:
@@ -661,7 +873,7 @@ def _filesystem_plugin_related_anchors(base: Path) -> list[str]:
         except OSError:
             continue
     return [
-        _PluginContributionAnchor(path)
+        _PluginContributionAnchor(path, _plugin_manifest_name(Path(path)))
         for path in sorted(found, key=os.path.normcase)
     ]
 
@@ -670,18 +882,19 @@ def installed_plugin_related_anchors(
     root: Path | None = None,
     *,
     home: str | Path | None = None,
+    report: ActivationReport | None = None,
 ) -> list[str]:
     """Discover active plugins that ship a ``.agent-worktrees/related.yaml``.
 
     Returns each contributing plugin's directory (a valid :func:`read_related`
-    anchor), de-duplicated and sorted deterministically. Production discovery
-    uses the effective global-plus-adopted-project activation graph, so copied
-    payloads and live directory-marketplace plugins follow the same enabled and
-    identity-verified contract.
+    anchor), de-duplicated and sorted. Production discovery uses the effective
+    global-plus-adopted-project activation graph (enabled + identity-verified).
 
     ``root`` and :data:`INSTALLED_PLUGINS_ENV` retain the legacy explicit
     filesystem scan for contained tests and diagnostics. That scan tolerates
     marketplace-nested and flat layouts and requires a plugin manifest.
+    ``report`` reuses an already-resolved scan to avoid repeating this
+    not-cheap resolution (see ``related_briefing.write_related_briefings``).
 
     These anchors are the lowest-precedence config-graft layer (see the module
     note above); callers prepend them ahead of the base/knowledge anchors.
@@ -693,22 +906,21 @@ def installed_plugin_related_anchors(
         )
 
     try:
-        report = resolve_active_plugins(home=home)
+        report = report or resolve_active_plugins(home=home)
     except (OSError, ValueError):
         return []
     if report.authority is ScanAuthority.INDETERMINATE:
         return []
-    active = report.active.values()
-
-    found: set[str] = set()
-    for plugin in active:
-        try:
-            if related_path(plugin.root).is_file():
-                found.add(str(plugin.root))
-        except OSError:
-            continue
+    found: dict[str, str] = {}
+    for plugin in report.active.values():
+        for selected in plugin.live_roots:
+            try:
+                if related_path(selected.root).is_file():
+                    found[str(selected.root)] = plugin.name
+            except OSError:
+                continue
     return [
-        _PluginContributionAnchor(path)
+        _PluginContributionAnchor(path, found[path])
         for path in sorted(found, key=os.path.normcase)
     ]
 
@@ -758,10 +970,34 @@ def read_related_grafted(anchors: list[str | Path]) -> RelatedConfig:
     merged = RelatedConfig()
     for anchor in anchors:
         rc = read_related(anchor)
-        if rc.primary and not _is_installed_plugin_anchor(anchor):
+        plugin_anchor = _is_installed_plugin_anchor(anchor)
+        if rc.primary and not plugin_anchor:
             merged.primary = rc.primary
         for name, entry in rc.related.items():
-            entry.origin_anchor = str(anchor)
+            origin = (
+                anchor
+                if isinstance(anchor, _PluginContributionAnchor)
+                else (
+                    _PluginContributionAnchor(
+                        str(anchor),
+                        _plugin_manifest_name(Path(str(anchor))),
+                    )
+                    if plugin_anchor
+                    else str(anchor)
+                )
+            )
+            entry.origin_anchor = origin
+            if plugin_anchor:
+                entry.origin_layer = "plugin"
+            elif isinstance(anchor, _ConfigContributionAnchor):
+                entry.origin_layer = anchor.source_layer
+            else:
+                entry.origin_layer = "repository"
+            entry.origin_plugin = (
+                origin.plugin_name
+                if isinstance(origin, _PluginContributionAnchor)
+                else ""
+            )
             merged.related[name] = entry
     return merged
 
@@ -832,6 +1068,10 @@ def upsert_related(anchor: str | Path, entry: RelatedEntry) -> RelatedConfig:
             existing.ownership = entry.ownership
         if entry.owner:
             existing.owner = entry.owner
+        if entry.audience:
+            existing.audience = entry.audience
+        if entry.ai_attribution:
+            existing.ai_attribution = {**existing.ai_attribution, **entry.ai_attribution}
     write_related(anchor, cfg)
     return cfg
 
@@ -917,6 +1157,81 @@ def effective_ownership(entry: RelatedEntry) -> str:
         return classify_ownership(entry.name)[0]
     except Exception:
         return ""
+
+
+# Layers trusted to weaken AI-attribution disclosure (claim a `private`
+# audience, or an override that turns a key OFF): "machine" (the
+# machine-local project root harness *setup* writes, never an arbitrary
+# repo checkout) and "knowledge" (the operator's own bound personal
+# knowledge repo). Both are independently, positively provisioned by the
+# operator -- their mere existence as a config source is itself evidence
+# of operator control.
+#
+# "harness" is deliberately NEVER trusted, even to describe a repo OTHER
+# than itself. An earlier revision tried path-comparing the entry's
+# origin against the *described* repo's own checkout (trusting a
+# "harness" entry whenever it describes a sibling, not itself) -- that
+# does correctly block a target's own self-entry, but doesn't establish
+# that the "harness" anchor itself is operator-controlled at all: per
+# ``state_root.config_source_anchors``, "harness" just means "whichever
+# repo happens to be the current launch/base anchor," so an untrusted
+# repo A can commit a `related.yaml` entry describing some OTHER
+# registered repo B (not itself) with `audience: private` -- the path
+# inequality (A != B) would wrongly call that trusted. There is currently
+# no positive signal in this layer that distinguishes "the operator's own
+# control-plane repo" from "an arbitrary repo that happens to be the
+# launch anchor," so it stays untrusted unconditionally until one exists.
+# "repository"/"plugin"/``""``/"unknown" are untrusted for the same
+# reason (no positive evidence of operator authorship). An untrusted
+# entry can still WIDEN disclosure (claim `public`, or an override that
+# turns a key ON) -- only narrowing requires this trust.
+_TRUSTED_FOR_POLICY_WEAKENING = frozenset({"machine", "knowledge"})
+
+
+def _entry_trusted_for_policy_weakening(entry: RelatedEntry) -> bool:
+    """Whether ``entry`` may claim a disclosure-*weakening* value (a
+    ``private`` audience, or an ``ai_attribution`` override that turns a
+    key off) -- true only for :data:`_TRUSTED_FOR_POLICY_WEAKENING`
+    layers. See that constant's own comment for why ``"harness"`` is
+    excluded even when it appears to describe a different repo than
+    itself."""
+    return entry.origin_layer in _TRUSTED_FOR_POLICY_WEAKENING
+
+
+def effective_audience(entry: RelatedEntry) -> str:
+    """The authoritative audience for an entry: its explicit value, or ``""``
+    (unclassified) when unset -- unlike ``effective_ownership``, there is no
+    derivation fallback to guess it from. A ``private`` claim from a source
+    :func:`_entry_trusted_for_policy_weakening` doesn't trust is discarded
+    (treated as unclassified) rather than honored -- an untrusted source
+    must never be able to assert the disclosure-exempt case for itself."""
+    if entry.audience == "private" and not _entry_trusted_for_policy_weakening(entry):
+        return ""
+    return entry.audience
+
+
+def effective_ai_attribution(entry: RelatedEntry) -> dict[str, bool]:
+    """The resolved AI-attribution disclosure policy for an entry:
+    ``{"disclose_on_open": bool, "disclose_on_reply": bool}``. Defaults from
+    ``audience`` (``public``/``internal``/unclassified -> both True;
+    ``private`` -> both False), then applies any explicit per-key
+    ``ai_attribution`` override on the entry; a key absent from the override
+    stays at its audience-derived default. An override that would turn a key
+    OFF is only honored when
+    :func:`_entry_trusted_for_policy_weakening` trusts the entry -- from any
+    other source it is discarded (the key stays at its audience-derived
+    default), since an untrusted entry must never be able to narrow
+    disclosure for itself, only widen it."""
+    default = effective_audience(entry) != "private"
+    resolved = {"disclose_on_open": default, "disclose_on_reply": default}
+    trusted = _entry_trusted_for_policy_weakening(entry)
+    for key in ("disclose_on_open", "disclose_on_reply"):
+        if key in entry.ai_attribution:
+            value = bool(entry.ai_attribution[key])
+            if not trusted and value is False and resolved[key] is True:
+                continue
+            resolved[key] = value
+    return resolved
 
 
 def owned_targets(anchor: str | Path) -> list[dict[str, str]]:

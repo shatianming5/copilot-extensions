@@ -1,0 +1,178 @@
+"""Cheap canonical/vendor and bootstrap independence contracts."""
+from __future__ import annotations
+
+import ast
+import importlib.util
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+def test_all_packaged_launchers_and_validators_match():
+    canonical = ROOT / "libs" / "peer-launch" / "peer_launch.py"
+    primitive_dir = ROOT / "libs" / "installation-context"
+    primitive = primitive_dir / "installation_context.py"
+    fragments = sorted(path.name for path in primitive_dir.glob("_installation_context_*.py"))
+    for plugin, filename in (
+        ("agent-bridge", "_peer_launch.py"),
+        ("agent-dispatch", "peer_launch.py"), ("agent-codespaces", "_peer_launch.py"),
+        ("agent-containers", "_peer_launch.py"), ("agent-worktrees", "_peer_launch.py"),
+        ("agent-logger", "_peer_launch.py"), ("agent-index", "_peer_launch.py"),
+        ("agent-machines", "_peer_launch.py"),
+    ):
+        package = ROOT / "plugins" / plugin / "src" / plugin.replace("-", "_")
+        assert (package / filename).read_bytes() == canonical.read_bytes()
+        assert (package / "_installation_context.py").read_bytes() == primitive.read_bytes()
+        for fragment in fragments:
+            assert (package / fragment).read_bytes() == (primitive_dir / fragment).read_bytes()
+
+
+def _import_roots(source: str) -> set[str]:
+    roots = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            roots.add(node.module.split(".")[0])
+    return roots
+
+
+def test_launcher_has_no_runtime_dependency():
+    source = ROOT / "libs" / "peer-launch" / "peer_launch.py"
+    assert _import_roots(source.read_text(encoding="utf-8")) <= sys.stdlib_module_names
+
+
+def test_dependency_guard_sees_both_import_forms():
+    for source in ("import agent_procutil", "from agent_worktrees import cli"):
+        assert _import_roots(source) - sys.stdlib_module_names
+
+
+def test_sync_tool_registers_all_packaged_primitives():
+    spec = importlib.util.spec_from_file_location(
+        "sync_installation_context", ROOT / "tools" / "sync-installation-context.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    destinations = {destination for _, destination in module.vendor_pairs()}
+    for plugin in (
+        "agent-bridge", "agent-dispatch", "agent-codespaces", "agent-containers",
+        "agent-worktrees", "agent-logger", "agent-index", "agent-machines",
+    ):
+        assert (
+            ROOT / "plugins" / plugin / "src" / plugin.replace("-", "_")
+            / "_installation_context.py"
+        ) in destinations
+
+
+def test_converted_codespaces_paths_have_no_unexplained_sibling_launches(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "peer_launch_isolation_guard", ROOT / "tools" / "check-marketplace-isolation.py",
+    )
+    guard = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, guard)
+    spec.loader.exec_module(guard)
+    plugin = ROOT / "plugins" / "agent-codespaces"
+    files = [plugin / "scripts" / "emit_codespace_map.py"]
+    files.extend(
+        plugin / "src" / "agent_codespaces" / filename
+        for filename in (
+            "__main__.py", "config.py", "coordination.py", "gh_account.py", "lease.py",
+        )
+    )
+    patterns = guard._command_patterns(ROOT)
+    findings = [
+        finding
+        for path in files
+        for finding in guard._scan_file(path, ROOT, patterns)
+        if finding.category == "path-sibling-launch"
+    ]
+    assert findings == []
+
+
+def test_containers_config_has_no_unexplained_sibling_launches(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "containers_peer_isolation_guard", ROOT / "tools" / "check-marketplace-isolation.py",
+    )
+    guard = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, guard)
+    spec.loader.exec_module(guard)
+    path = ROOT / "plugins" / "agent-containers" / "src" / "agent_containers" / "config.py"
+    assert not [
+        finding for finding in guard._scan_file(path, ROOT, guard._command_patterns(ROOT))
+        if finding.category == "path-sibling-launch"
+    ]
+
+
+def test_logger_compact_has_no_unexplained_sibling_launches(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "logger_peer_isolation_guard", ROOT / "tools" / "check-marketplace-isolation.py",
+    )
+    guard = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, guard)
+    spec.loader.exec_module(guard)
+    path = ROOT / "plugins" / "agent-logger" / "src" / "agent_logger" / "sync" / "compact.py"
+    assert not [
+        finding for finding in guard._scan_file(path, ROOT, guard._command_patterns(ROOT))
+        if finding.category == "path-sibling-launch"
+    ]
+
+
+def test_index_resolve_effective_config_has_no_unexplained_sibling_launches(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "index_peer_isolation_guard", ROOT / "tools" / "check-marketplace-isolation.py",
+    )
+    guard = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, guard)
+    spec.loader.exec_module(guard)
+    path = ROOT / "plugins" / "agent-index" / "scripts" / "resolve_effective_config.py"
+    findings = [
+        finding for finding in guard._scan_file(path, ROOT, guard._command_patterns(ROOT))
+        if finding.category == "path-sibling-launch"
+    ]
+    assert findings == [], findings
+
+
+def test_containers_provider_ssh_has_no_unexplained_sibling_launches(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "containers_ssh_peer_isolation_guard", ROOT / "tools" / "check-marketplace-isolation.py",
+    )
+    guard = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, guard)
+    spec.loader.exec_module(guard)
+    path = ROOT / "plugins" / "agent-containers" / "src" / "agent_containers" / "provider_ssh.py"
+    findings = [
+        finding for finding in guard._scan_file(path, ROOT, guard._command_patterns(ROOT))
+        if finding.category == "path-sibling-launch"
+    ]
+    assert findings == [], findings
+
+
+def test_machines_self_update_has_no_unexplained_sibling_launches(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "machines_ssh_peer_isolation_guard", ROOT / "tools" / "check-marketplace-isolation.py",
+    )
+    guard = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, guard)
+    spec.loader.exec_module(guard)
+    path = ROOT / "plugins" / "agent-machines" / "src" / "agent_machines" / "self_update.py"
+    findings = [
+        finding for finding in guard._scan_file(path, ROOT, guard._command_patterns(ROOT))
+        if finding.category == "path-sibling-launch"
+    ]
+    assert findings == [], findings
+
+
+def test_bridge_handoff_check_has_no_unexplained_sibling_launches(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "bridge_peer_isolation_guard", ROOT / "tools" / "check-marketplace-isolation.py",
+    )
+    guard = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, guard)
+    spec.loader.exec_module(guard)
+    path = ROOT / "plugins" / "agent-bridge" / "src" / "agent_bridge" / "__main__.py"
+    findings = [
+        finding for finding in guard._scan_file(path, ROOT, guard._command_patterns(ROOT))
+        if finding.category == "path-sibling-launch"
+    ]
+    assert findings == [], findings

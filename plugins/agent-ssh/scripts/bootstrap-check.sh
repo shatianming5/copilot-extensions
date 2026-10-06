@@ -1,4 +1,27 @@
 #!/usr/bin/env bash
+
+# --- bootstrap-killswitch guard (vendored; see libs/bootstrap-killswitch/README.md) ---
+# One shared, repo-wide switch (not per-plugin) that pauses EVERY adopting
+# plugin's reconcile-on-session-start at once, for when an operator/agent is
+# hand-diagnosing a venv/install and a background reconcile must not race it.
+# Legacy/default installation ONLY: a namespaced marketplace cell
+# (COPILOT_EXTENSIONS_CONTEXT set) reconciles through its own cell-scoped
+# mechanism, never this global state file -- crossing that installation-cell
+# boundary would let one marketplace's switch pause an unrelated,
+# independently-owned cell's reconcile (visions/plugin-services/
+# installation-cells). This guard is therefore a deliberate no-op under a
+# cell context, same as this hook's own existing cell-context exit below.
+if [ -z "${COPILOT_EXTENSIONS_CONTEXT:-}" ]; then
+  _bks_guard_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  _bks_guard="$_bks_guard_dir/bootstrap-killswitch-guard.sh"
+  if [ -f "$_bks_guard" ] && bash "$_bks_guard" check >&2; then
+    printf '{}'
+    exit 0
+  fi
+  unset _bks_guard_dir _bks_guard
+fi
+# --- end bootstrap-killswitch guard ---
+
 # agent-ssh session-start hook -- version-gated runtime reconcile.
 #
 # Runs at session start (via hooks.json). Ensures the installed agent-ssh
@@ -13,6 +36,30 @@
 # build; the versioned-venv swap is atomic, so concurrent use stays safe.
 #
 # Deployed to ~/.agent-ssh/bin/ by scripts/install.sh. Only reconciles staleness.
+#
+# NO OPT-IN GATE (agent-bridge-unified-zdd-cutover Phase 0): background
+# reconcile used to require a checked-in, per-project opt-in flag in
+# <project>/.copilot-extensions/config.yaml, because a raw reconcile could
+# race a live session. Now that every reconcile-capable plugin's update
+# path is always-ZDD (safe to run unattended), that justification is gone;
+# the gate was removed rather than kept as a redundant consent checkbox.
+# Frequency/trigger stays deliberately bounded -- still only once per
+# session start, only on a real version drift. What DOES still bound
+# concurrency is the single-flight + stale-reap guard below (a lock file,
+# not the removed opt-in).
+
+session_start_json_emitted=0
+emit_session_start_json() {
+  if [ "${session_start_json_emitted:-0}" -eq 0 ]; then
+    printf '{}'
+    session_start_json_emitted=1
+  fi
+}
+trap 'emit_session_start_json' EXIT
+
+if [ -n "${COPILOT_EXTENSIONS_CONTEXT:-}" ]; then
+  exit 0
+fi
 
 InstallDir="$HOME/.agent-ssh"
 Manifest="$InstallDir/deploy-manifest.json"
@@ -65,7 +112,30 @@ if [ "$provisioned" = 1 ] && [ "$deployed" = "$current" ]; then exit 0; fi
 init="$pluginDir/scripts/init.sh"
 [ -f "$init" ] || exit 0
 
-echo "[agent-ssh] runtime $deployed -> $current; reconciling in background..."
+# --- Good boot-citizen guard: single-flight + stale-reap ---
+# This hook fires on EVERY new session now that the opt-in gate is gone
+# (agent-bridge-unified-zdd-cutover Phase 0 review finding): without this,
+# a slow or wedged reconcile gets re-spawned every session, stacking
+# orphaned background installers. If a prior reconcile is still running:
+#   YOUNG (<10m) -> already in flight; do nothing (never stack).
+#   STALE (>=10m) -> wedged; reap it, then relaunch (self-heals a one-off
+#                    wedge instead of poisoning every future session).
+lockFile="$InstallDir/reconcile.lock"
+staleSeconds=600
+if [ -f "$lockFile" ]; then
+  lockPid="$(tr -d '[:space:]' < "$lockFile" 2>/dev/null)"
+  if [ -n "$lockPid" ] && kill -0 "$lockPid" 2>/dev/null; then
+    lockMtime="$(stat -c %Y "$lockFile" 2>/dev/null || stat -f %m "$lockFile" 2>/dev/null || echo 0)"
+    nowSecs="$(date -u +%s)"
+    if [ "$lockMtime" -gt 0 ] && [ $((nowSecs - lockMtime)) -lt "$staleSeconds" ]; then
+      exit 0
+    fi
+    kill "$lockPid" 2>/dev/null || true
+  fi
+fi
+
+echo "[agent-ssh] runtime $deployed -> $current; reconciling in background..." >&2
 nohup bash "$init" >/dev/null 2>&1 &
+echo $! > "$lockFile" 2>/dev/null || true
 
 exit 0

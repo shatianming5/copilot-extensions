@@ -30,6 +30,7 @@ from .sockio import (
     _TCP_HOST,
     _endpoint_path,
     _read_endpoint,
+    default_home_dir,
     default_socket_path,
     serve_socket_if_available,
 )
@@ -50,7 +51,9 @@ __all__ = [
     "_read_endpoint",
     "aclose_writer",
     "call_via_socket",
+    "default_home_dir",
     "default_socket_path",
+    "list_tools_via_socket",
     "open_attached_session",
     "request_via_socket",
     "serve_socket_if_available",
@@ -83,8 +86,25 @@ async def _connect(socket_path: str | Path):
     ep = _read_endpoint(socket_path)
     if ep is None:
         raise OSError(f"no serve endpoint for {socket_path}")
-    reader, writer = await asyncio.open_connection(_TCP_HOST, ep["port"])
-    return reader, writer, ep.get("token")
+    # #4366: a transient ConnectionRefusedError against a live, already-
+    # advertised endpoint has been observed under heavy Windows host load
+    # (the daemon's asyncio.start_server() completes -- and its endpoint
+    # sidecar is written -- only once the listener is bound and accepting,
+    # so this is not an endpoint-before-listener ordering race; the cause is
+    # unconfirmed, consistent with transient host/OS-level contention).
+    # Retry a ConnectionRefusedError a few times with a short backoff before
+    # giving up. Any other OSError (e.g. the daemon has genuinely exited)
+    # still surfaces immediately, unretried.
+    attempts, delay = 5, 0.05
+    for attempt in range(attempts):
+        try:
+            reader, writer = await asyncio.open_connection(_TCP_HOST, ep["port"])
+            return reader, writer, ep.get("token")
+        except ConnectionRefusedError:
+            if attempt == attempts - 1:
+                raise
+            await asyncio.sleep(delay)
+            delay *= 2
 
 
 async def request_via_socket(socket_path: str | Path, request: dict) -> dict | None:
@@ -119,6 +139,26 @@ async def call_via_socket(socket_path: str | Path, bridge: str, tool: str,
     resp = await request_via_socket(
         socket_path,
         {"op": "call", "bridge": bridge, "tool": tool, "arguments": arguments},
+    )
+    if resp is None:
+        raise OSError("serve socket closed without a response")
+    return resp
+
+
+async def list_tools_via_socket(socket_path: str | Path, bridge: str) -> dict:
+    """Send one ``list`` over the serve socket and return the parsed response.
+
+    Returns the bridge's tool catalog exactly as a live session would see it
+    (the bridge's ``tools:`` allow/deny filter applies) -- the same result
+    ``materialize``'s cold ``OneShotSession.list_tools()`` path already
+    returns, so consulting a warm daemon changes nothing about *what*
+    materialize projects, only *how fast* and at what contention cost it
+    gets there. Raises ``OSError`` if the socket can't be reached (caller
+    falls back to the cold one-shot path).
+    """
+    resp = await request_via_socket(
+        socket_path,
+        {"op": "list", "bridge": bridge},
     )
     if resp is None:
         raise OSError("serve socket closed without a response")

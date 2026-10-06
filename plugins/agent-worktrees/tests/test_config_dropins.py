@@ -13,7 +13,7 @@ from dropin_registry import (
     ScanAuthority,
     WarningTracker,
 )
-from plugin_activation import ActivationReport, ActivePlugin
+from plugin_activation import ActivationReport, ActivePlugin, ActivePluginRoot
 
 from agent_worktrees import config_dropins as dropins
 
@@ -82,6 +82,100 @@ def test_operator_yaml_fault_isolated_from_valid_peer(tmp_path):
     assert report.findings[0].remedy
 
 
+def test_pr_required_body_sections_rejects_non_string_shape():
+    error = dropins._validate_pr(
+        {"required_body_sections": 7},
+        location="repos.sample.pr",
+    )
+
+    assert error == "repos.sample.pr.required_body_sections must be a list"
+
+
+def test_pr_dismiss_stale_reviews_accepts_booleans():
+    assert dropins._validate_pr(
+        {"dismiss_stale_reviews": True}, location="repos.sample.pr",
+    ) is None
+    assert dropins._validate_pr(
+        {"dismiss_stale_reviews": False}, location="repos.sample.pr",
+    ) is None
+
+
+def test_pr_dismiss_stale_reviews_accepts_null():
+    # Tri-state: null means "unknown/unread", same as leaving it unset.
+    assert dropins._validate_pr(
+        {"dismiss_stale_reviews": None}, location="repos.sample.pr",
+    ) is None
+
+
+def test_pr_dismiss_stale_reviews_rejects_non_bool_non_null():
+    error = dropins._validate_pr(
+        {"dismiss_stale_reviews": "true"},
+        location="repos.sample.pr",
+    )
+
+    assert error == "repos.sample.pr.dismiss_stale_reviews must be a boolean or null"
+
+
+def test_pr_source_attribution_accepts_codename_string():
+    error = dropins._validate_pr(
+        {"source_attribution": "codename"},
+        location="repos.sample.pr",
+    )
+
+    assert error is None
+
+
+def test_pr_source_attribution_accepts_booleans():
+    assert dropins._validate_pr(
+        {"source_attribution": True}, location="repos.sample.pr",
+    ) is None
+    assert dropins._validate_pr(
+        {"source_attribution": False}, location="repos.sample.pr",
+    ) is None
+
+
+def test_pr_source_attribution_rejects_other_strings():
+    error = dropins._validate_pr(
+        {"source_attribution": "always"},
+        location="repos.sample.pr",
+    )
+
+    assert error == (
+        'repos.sample.pr.source_attribution must be a boolean or the '
+        'string "codename"'
+    )
+
+
+def test_pr_source_attribution_rejects_non_bool_non_string():
+    error = dropins._validate_pr(
+        {"source_attribution": 1},
+        location="repos.sample.pr",
+    )
+
+    assert error == (
+        'repos.sample.pr.source_attribution must be a boolean or the '
+        'string "codename"'
+    )
+
+
+def test_codename_wordlist_path_must_be_string():
+    error = dropins._validate_codename(
+        {"wordlist_path": 7},
+        location="repos.sample.codename",
+    )
+
+    assert error == "repos.sample.codename.wordlist_path must be a string"
+
+
+def test_codename_accepts_well_formed_block():
+    error = dropins._validate_codename(
+        {"wordlist_path": "config/codenames.yaml"},
+        location="repos.sample.codename",
+    )
+
+    assert error is None
+
+
 def test_managed_pointer_requires_current_project_scope_and_root(tmp_path):
     source = "sample@example-marketplace"
     root = tmp_path / "plugin"
@@ -120,6 +214,39 @@ def test_managed_pointer_requires_current_project_scope_and_root(tmp_path):
     )
     assert not mismatch.active_configs
     assert mismatch.findings[0].reason == "identity-mismatch"
+
+
+def test_managed_pointer_uses_root_selected_for_project_scope(tmp_path):
+    source = "sample@example-marketplace"
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    local = tmp_path / "local"
+    target = _target(local)
+    directory = tmp_path / "config.d"
+    directory.mkdir()
+    entry = _pointer(directory, source, local, target)
+    active = ActivePlugin(
+        source=source,
+        name="sample",
+        marketplace="example-marketplace",
+        root=local.resolve(),
+        scopes=("global", "project:sample"),
+        roots=(
+            ActivePluginRoot(local.resolve(), ("project:sample",), "directory"),
+            ActivePluginRoot(installed.resolve(), ("global",), "installed"),
+        ),
+    )
+
+    report = dropins.scan_config_dropin_registry(
+        directory,
+        project_name="sample",
+        activation_report=ActivationReport(
+            ScanAuthority.COMPLETE,
+            {source: EntryDecision.active(active)},
+        ),
+    )
+
+    assert [item.entry for item in report.active_configs] == [entry]
 
 
 def test_managed_target_escape_and_invalid_shape_are_isolated(tmp_path):
@@ -255,6 +382,45 @@ def test_invalid_nested_pr_types_do_not_change_behavior(tmp_path, monkeypatch):
     assert report.active_entries == {}
     assert report.findings[0].reason == "invalid-entry"
     assert "enabled must be a boolean" in report.findings[0].detail
+
+
+def test_malformed_bootstrap_services_is_rejected_not_silently_emptied(
+    tmp_path, monkeypatch
+):
+    """A typo such as ``bootstrap_services: vault`` (a bare string, not a
+    list) must be rejected as invalid configuration -- like the sibling
+    ``service_paths`` field -- rather than silently coerced to an empty list
+    by the repo-config parser, which would unexpectedly disable launch
+    blocking for a service the operator meant to opt in."""
+    from agent_worktrees import config as cfg
+
+    anchor = tmp_path / "repo"
+    anchor.mkdir()
+    machine = tmp_path / "config.yaml"
+    machine.write_text(
+        "repo_name: sample\n"
+        "repos:\n"
+        "  sample:\n"
+        f"    anchor: {anchor}\n",
+        encoding="utf-8",
+    )
+    directory = tmp_path / "config.d"
+    directory.mkdir()
+    (directory / "bad.yaml").write_text(
+        "repos:\n  sample:\n    bootstrap_services: vault\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cfg, "global_config_path", lambda: tmp_path / "missing-global.yaml"
+    )
+
+    report = dropins.scan_config_dropin_registry(
+        directory, project_name="sample"
+    )
+
+    assert report.active_entries == {}
+    assert report.findings[0].reason == "invalid-entry"
+    assert "bootstrap_services" in report.findings[0].detail
 
 
 def test_disabled_or_uninstalled_managed_plugin_withdraws_prior(tmp_path):
@@ -460,7 +626,8 @@ def test_scanner_generated_entry_finding_and_no_project_report(tmp_path):
 
 def test_doctor_json_runs_without_project_context(tmp_path, monkeypatch, capfd):
     from agent_worktrees import __main__ as main
-    from agent_worktrees.picker_tui import pivots
+    from agent_worktrees import daemon_health
+    from agent_worktrees.picker_support import pivots
 
     pivot_report = pivots.scan_pivot_registry(
         tmp_path / "absent-pivots",
@@ -477,6 +644,11 @@ def test_doctor_json_runs_without_project_context(tmp_path, monkeypatch, capfd):
     monkeypatch.setattr(
         pivots, "scan_pivot_registry", lambda **_: pivot_report
     )
+    monkeypatch.setattr(
+        daemon_health,
+        "doctor_report",
+        lambda *, apply: {"mode": "report", "findings": [], "counts": {"total": 0}},
+    )
 
     assert main._is_no_project_invocation(["doctor", "--json"])
     assert main.main(["doctor", "--json"]) == 0
@@ -485,3 +657,36 @@ def test_doctor_json_runs_without_project_context(tmp_path, monkeypatch, capfd):
     assert payload["project_health_available"] is False
     assert payload["config_d"]["authority"] == "absent"
     assert payload["pivots"]["authority"] == "absent"
+    assert payload["daemon_health"]["counts"]["total"] == 0
+
+
+def test_doctor_apply_daemon_health_flag_reaches_report(monkeypatch, tmp_path, capfd):
+    from agent_worktrees import __main__ as main
+    from agent_worktrees import daemon_health
+    from agent_worktrees.picker_support import pivots
+
+    pivot_report = pivots.scan_pivot_registry(
+        tmp_path / "absent-pivots",
+        materialize=False,
+        activation_report=ActivationReport(ScanAuthority.COMPLETE, {}),
+    )
+    monkeypatch.setattr(
+        main.cfg,
+        "project_name",
+        lambda: (_ for _ in ()).throw(RuntimeError("no project")),
+    )
+    monkeypatch.setattr(main, "_find_repo_dir", lambda: None)
+    monkeypatch.setattr(main.reclaim, "find_bare_orphans", lambda: [])
+    monkeypatch.setattr(pivots, "scan_pivot_registry", lambda **_: pivot_report)
+    seen = {}
+
+    def _report(*, apply: bool) -> dict:
+        seen["apply"] = apply
+        return {"mode": "apply" if apply else "report", "findings": [], "counts": {"total": 0}}
+
+    monkeypatch.setattr(daemon_health, "doctor_report", _report)
+
+    assert main.main(["doctor", "--json", "--apply-daemon-health"]) == 0
+    payload = json.loads(capfd.readouterr().out)
+    assert seen["apply"] is True
+    assert payload["daemon_health"]["mode"] == "apply"

@@ -41,9 +41,40 @@ def test_engine_endpoint_env(monkeypatch):
 
 def test_engine_command_targets_durable_venv(tmp_path):
     cmd = daemon.engine_command(tmp_path)
-    assert cmd[1:] == ["-m", "agent_index.engine.app", "--host",
+    assert cmd[1:] == ["-m", "agent_index_engine.app", "--host",
                         daemon.engine_endpoint()[0], "--port", str(daemon.engine_endpoint()[1])]
     assert str(tmp_path) in cmd[0]
+
+
+def test_engine_command_prefers_pythonw_to_avoid_console_reexec_window(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(daemon.os, "name", "nt")
+    scripts = tmp_path / ".venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "python.exe").write_bytes(b"")
+    (scripts / "pythonw.exe").write_bytes(b"")
+
+    cmd = daemon.engine_command(tmp_path)
+
+    # The console python.exe launcher re-execs the base interpreter as a
+    # visible-console child even under CREATE_NO_WINDOW; pythonw.exe never
+    # allocates a console at all, and this single long-lived server has no
+    # recurring console descendants that would need a console interpreter.
+    assert cmd[0] == str(scripts / "pythonw.exe")
+
+
+def test_engine_command_falls_back_to_console_python_without_pythonw_sibling(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(daemon.os, "name", "nt")
+    scripts = tmp_path / ".venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "python.exe").write_bytes(b"")
+
+    cmd = daemon.engine_command(tmp_path)
+
+    assert cmd[0] == str(scripts / "python.exe")
 
 
 # -- health ------------------------------------------------------------------
@@ -67,6 +98,26 @@ def test_is_healthy_false_on_error(monkeypatch):
     assert daemon.is_healthy("127.0.0.1", 8421) is False
 
 
+def test_health_reports_unreachable_details(monkeypatch):
+    import httpx
+
+    def boom(*_a, **_k):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr("httpx.get", boom)
+    assert daemon.health("127.0.0.1", 8421) == {
+        "status": "unreachable",
+        "generation": None,
+        "gpu_deps_installed": False,
+        "model_loaded": False,
+        "model_name": None,
+        "device": None,
+        "cuda_available": None,
+        "python_executable": None,
+        "detail": "Engine not reachable at http://127.0.0.1:8421",
+    }
+
+
 # -- start / stop / status ---------------------------------------------------
 
 
@@ -82,6 +133,57 @@ def test_start_raises_when_venv_missing(monkeypatch, tmp_path):
         daemon.start(tmp_path)
 
 
+def _prepare_venv(tmp_path):
+    py = daemon.engine_venv_python(tmp_path)
+    py.parent.mkdir(parents=True, exist_ok=True)
+    py.write_text("", encoding="ascii")
+    return py
+
+
+def test_start_default_wait_timeout_is_300_seconds(monkeypatch, tmp_path):
+    """A cold torch + embedding-model import (before uvicorn even starts
+    listening) has been observed to take upwards of two minutes -- the
+    default wait must be generous enough to tolerate that, not the old 90s
+    that gave up while the engine was still loading."""
+    monkeypatch.delenv("AGENT_INDEX_ENGINE_START_TIMEOUT", raising=False)
+    _prepare_venv(tmp_path)
+    monkeypatch.setattr(daemon, "is_healthy", lambda *a, **k: False)
+    monkeypatch.setattr(daemon, "_spawn", lambda cmd, *, python, home: FakeProc(alive=True))
+    monkeypatch.setattr(daemon, "_write_pid", lambda *a, **k: None)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: clock["t"])
+
+    def advancing_sleep(_seconds):
+        clock["t"] += 1.0
+
+    monkeypatch.setattr(daemon.time, "sleep", advancing_sleep)
+
+    with pytest.raises(TimeoutError, match="within 300s"):
+        daemon.start(tmp_path)
+    assert clock["t"] >= 300.0
+
+
+def test_start_wait_timeout_is_overridable_via_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_INDEX_ENGINE_START_TIMEOUT", "5")
+    _prepare_venv(tmp_path)
+    monkeypatch.setattr(daemon, "is_healthy", lambda *a, **k: False)
+    monkeypatch.setattr(daemon, "_spawn", lambda cmd, *, python, home: FakeProc(alive=True))
+    monkeypatch.setattr(daemon, "_write_pid", lambda *a, **k: None)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: clock["t"])
+
+    def advancing_sleep(_seconds):
+        clock["t"] += 1.0
+
+    monkeypatch.setattr(daemon.time, "sleep", advancing_sleep)
+
+    with pytest.raises(TimeoutError, match="within 5s"):
+        daemon.start(tmp_path)
+    assert 5.0 <= clock["t"] < 300.0
+
+
 def test_start_spawns_and_waits_for_health(monkeypatch, tmp_path):
     # Make the durable venv python "exist".
     py = daemon.engine_venv_python(tmp_path)
@@ -95,7 +197,7 @@ def test_start_spawns_and_waits_for_health(monkeypatch, tmp_path):
         return calls["n"] >= 2  # unhealthy at the guard, healthy while waiting
 
     monkeypatch.setattr(daemon, "is_healthy", health)
-    monkeypatch.setattr(daemon, "_spawn", lambda cmd: FakeProc())
+    monkeypatch.setattr(daemon, "_spawn", lambda cmd, *, python, home: FakeProc())
     monkeypatch.setattr(daemon.time, "sleep", lambda _s: None)
 
     out = daemon.start(tmp_path)
@@ -103,12 +205,40 @@ def test_start_spawns_and_waits_for_health(monkeypatch, tmp_path):
     assert daemon._read_pid(tmp_path) == 5150
 
 
+def test_spawn_uses_windowless_daemon_contract(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(
+        daemon,
+        "windowless_daemon_kwargs",
+        lambda: {"creationflags": 0x08000000},
+    )
+    monkeypatch.setattr(
+        daemon.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: captured.update(cmd=cmd, kwargs=kwargs) or FakeProc(),
+    )
+
+    daemon._spawn(
+        ["pythonw.exe", "-m", "agent_index_engine.app"], python="python.exe", home=tmp_path
+    )
+
+    assert captured["kwargs"]["creationflags"] == 0x08000000
+    assert captured["kwargs"]["stdin"] is daemon.subprocess.DEVNULL
+    assert captured["kwargs"]["stdout"] is daemon.subprocess.DEVNULL
+    assert captured["kwargs"]["stderr"] is daemon.subprocess.DEVNULL
+    # Never the caller's ambient cwd -- this is a long-lived, detached
+    # daemon rooted at its own durable engine home instead.
+    assert captured["kwargs"]["cwd"] == str(tmp_path)
+
+
 def test_start_raises_on_early_exit(monkeypatch, tmp_path):
     py = daemon.engine_venv_python(tmp_path)
     py.parent.mkdir(parents=True, exist_ok=True)
     py.write_text("", encoding="ascii")
     monkeypatch.setattr(daemon, "is_healthy", lambda *a, **k: False)
-    monkeypatch.setattr(daemon, "_spawn", lambda cmd: FakeProc(alive=False, returncode=1))
+    monkeypatch.setattr(
+        daemon, "_spawn", lambda cmd, *, python, home: FakeProc(alive=False, returncode=1)
+    )
     monkeypatch.setattr(daemon.time, "sleep", lambda _s: None)
     with pytest.raises(RuntimeError, match="exited early"):
         daemon.start(tmp_path)
@@ -131,13 +261,31 @@ def test_stop_terminates(monkeypatch, tmp_path):
 
 
 def test_status_shape(monkeypatch, tmp_path):
-    monkeypatch.setattr(daemon, "is_healthy", lambda *a, **k: False)
+    monkeypatch.setattr(
+        daemon,
+        "health",
+        lambda *a, **k: {
+            "status": "ok",
+            "generation": "engine-v1",
+            "gpu_deps_installed": True,
+            "model_loaded": False,
+            "model_name": "example-model",
+            "device": "cpu",
+            "cuda_available": False,
+            "python_executable": "python",
+            "detail": None,
+        },
+    )
     st = daemon.status(tmp_path)
     assert set(st) == {
         "healthy", "host", "port", "pid", "pid_alive",
-        "engine_home", "venv_python", "provisioned",
+        "engine_home", "venv_python", "provisioned", "generation",
+        "observed_generation", "gpu_deps_installed", "model_loaded",
+        "cuda_available", "python_executable", "detail",
     }
     assert st["provisioned"] is False
+    assert st["healthy"] is True
+    assert st["observed_generation"] == "engine-v1"
 
 
 # -- CLI ---------------------------------------------------------------------

@@ -1,11 +1,16 @@
 {
   "schema": "copilot-extensions.payload-invocation",
-  "version": 1,
+  "version": 2,
   "command": "agent-index",
   "module": "agent_index",
-  "runtimeRoot": ".agent-index",
+  "legacyRuntimeRoot": ".agent-index",
+  "installationContext": "required",
   "noSelfProvisionEnv": "AGENT_INDEX_NO_SELFPROVISION",
   "purpose": "Search and operate the semantic index",
+  "installer": "install",
+  "sessionStartBootstrap": false,
+  "payloadRootEnv": "AGENT_INDEX_PAYLOAD_ROOT",
+  "catalogGate": "scripts/resolve_effective_config.py",
   "payloadDispatcher": {
     "posix": "scripts/runtime-gate.sh",
     "windows": "scripts/runtime-gate.ps1"

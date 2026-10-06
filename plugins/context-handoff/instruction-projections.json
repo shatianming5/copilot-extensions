@@ -1,0 +1,30 @@
+{
+  "schema": "copilot-extensions.instruction-projections",
+  "version": 1,
+  "projections": [
+    {
+      "id": "session-guidance",
+      "template": "instructions/session-guidance.instructions.md",
+      "destination": ".github/instructions/context-handoff/session-guidance.instructions.md",
+      "customizationKind": "instructions",
+      "applyTo": "**",
+      "legacyMarkers": []
+    },
+    {
+      "id": "handoff-fallback",
+      "template": "instructions/handoff-fallback.instructions.md",
+      "destination": ".github/instructions/context-handoff/handoff-fallback.instructions.md",
+      "customizationKind": "instructions",
+      "applyTo": "**",
+      "legacyMarkers": []
+    },
+    {
+      "id": "awareness",
+      "template": "instructions/awareness.instructions.md",
+      "destination": ".github/instructions/context-handoff/awareness.instructions.md",
+      "customizationKind": "instructions",
+      "applyTo": "**",
+      "legacyMarkers": []
+    }
+  ]
+}

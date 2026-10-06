@@ -10,8 +10,9 @@ its own live local endpoint.
 Routing (per invocation):
 
 1. Resolve the backing **project** from the current directory (git top-level, or
-   ``AGENT_INDEX_REPO``). The project selects which ``.agent-index/config.yaml``
-   ``indexer:`` block governs (``machine``/``ssh``/``shell``).
+   ``AGENT_INDEX_REPO``). The project selects which effective repository config
+   (checked-in ``.agent-index/config.yaml`` defaults plus any repo-local overlay)
+   governs its ``indexer:`` block (``machine``/``ssh``/``shell``).
 2. Determine this machine's **role** for that project: ``host`` iff
    ``machine_id()`` equals the project's ``indexer.machine`` (canonical hostname).
    A project without an explicit indexer designation is ``unconfigured``. Only
@@ -56,6 +57,7 @@ SSH_TRANSPORT_RC = 255
 # invocation. Bounds how long an unreachable indexer stalls before failover
 # moves to the next; overridable via ``AGENT_INDEX_SSH_CONNECT_TIMEOUT_S``.
 DEFAULT_SSH_CONNECT_TIMEOUT_S = 8
+MAX_FORWARDED_CONFIG_BYTES = 4096
 
 
 def _ssh_connect_timeout() -> int:
@@ -81,7 +83,7 @@ def plan_route() -> tuple[str, dict | None]:
     is resolvable.
     """
     root = config.repo_root()
-    indexers = config.read_indexers(root) if root is not None else []
+    indexers = config.read_indexers(root)
     indexer = indexers[0] if indexers else None
     if indexers:
         me = config.machine_id().strip().lower()
@@ -102,8 +104,6 @@ def has_usable_client_transport() -> bool:
     if config.configured_endpoints():
         return True
     root = config.repo_root()
-    if root is None:
-        return False
     return any(
         str(item.get("ssh") or item.get("endpoint") or "").strip()
         for item in config.read_indexers(root)
@@ -128,18 +128,50 @@ def _pwsh_remote(inner: str) -> str:
     return f"pwsh -NoProfile -WindowStyle Hidden -EncodedCommand {enc}"
 
 
-def _build_inner(shell: str, argv: list[str]) -> str:
+def _forwarded_routing(indexer: dict) -> str:
+    machine = str(indexer.get("machine") or "").strip()
+    if not machine or len(machine) > 256 or any(
+        ord(character) < 32 for character in machine
+    ):
+        raise ValueError(
+            "agent-index SSH routing requires a safe indexer machine identity"
+        )
+    raw = json.dumps(
+        {"indexers": [{"machine": machine}]},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(raw) > MAX_FORWARDED_CONFIG_BYTES:
+        raise ValueError("agent-index forwarded routing configuration is too large")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _build_inner(
+    shell: str, argv: list[str], indexer: dict | None = None
+) -> str:
     """Build the remote command that runs ``agent-index <argv>`` on the host.
 
     Invokes the host's installed binstub by absolute path (resolvable over a
     non-interactive SSH logon, where ``~/.local/bin`` may not be on PATH).
     """
+    indexer = dict(indexer or {"machine": "indexer"})
+    routing = _forwarded_routing(indexer)
+    machine = str(indexer["machine"])
     if shell == "bash":
         quoted = " ".join(shlex.quote(a) for a in argv)
-        return f'"$HOME/.local/bin/agent-index" {quoted}'
+        _bin = '"$HOME/.local/bin/agent-index"'  # marketplace-isolation: allow remote-management
+        return (
+            f"AGENT_INDEX_CONFIG_DATA_B64={shlex.quote(routing)} "
+            f"AGENT_INDEX_MACHINE={shlex.quote(machine)} "
+            f"{_bin} {quoted}"
+        )
     # pwsh (default)
     quoted = " ".join(_q_pwsh(a) for a in argv)
-    return f'& "$env:USERPROFILE\\.local\\bin\\agent-index.ps1" {quoted}'
+    return (
+        f"$env:AGENT_INDEX_CONFIG_DATA_B64={_q_pwsh(routing)}; "
+        f"$env:AGENT_INDEX_MACHINE={_q_pwsh(machine)}; "
+        f'& "$env:USERPROFILE\\.local\\bin\\agent-index.ps1" {quoted}'
+    )
 
 
 def build_ssh_argv(indexer: dict, argv: list[str]) -> list[str]:
@@ -152,7 +184,7 @@ def build_ssh_argv(indexer: dict, argv: list[str]) -> list[str]:
     """
     alias = str(indexer["ssh"]).strip()
     shell = str(indexer.get("shell") or DEFAULT_SHELL).strip().lower()
-    inner = _build_inner(shell, argv)
+    inner = _build_inner(shell, argv, indexer)
     opts = ["-o", "BatchMode=yes", "-o", f"ConnectTimeout={_ssh_connect_timeout()}"]
     if shell == "bash":
         escaped = inner.replace("'", "'\\''")
@@ -201,7 +233,7 @@ def maybe_delegate(sub: str, raw_argv: list[str]) -> int | None:
     if sub not in DELEGABLE:
         return None
     root = config.repo_root()
-    indexers = config.read_indexers(root) if root is not None else []
+    indexers = config.read_indexers(root)
 
     if indexers:
         me = config.machine_id().strip().lower()
@@ -241,7 +273,8 @@ def maybe_delegate(sub: str, raw_argv: list[str]) -> int | None:
         if role == config.UNCONFIGURED_ROLE:
             message = (
                 "agent-index is not configured on this machine. Run inside a "
-                "repository with .agent-index/config.yaml, or run `agent-index "
+                "repository with .agent-index/config.yaml, "
+                "or run `agent-index "
                 "setup` explicitly."
             )
         else:
@@ -249,7 +282,9 @@ def maybe_delegate(sub: str, raw_argv: list[str]) -> int | None:
                 "agent-index: no indexer transport resolvable here. This machine is a "
                 "client, so read commands run on the designated indexer over SSH — but "
                 "the current directory is not inside an adopted repo. Run inside a repo "
-                "with .agent-index/config.yaml indexer.ssh, or set AGENT_INDEX_REPO."
+                "with .agent-index/config.yaml or "
+                ".copilot-extensions/agent-index/config.yaml indexer.ssh, "
+                "or set AGENT_INDEX_REPO."
             )
         return _emit_error(
             {

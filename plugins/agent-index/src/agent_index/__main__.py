@@ -12,18 +12,31 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.request
+from pathlib import Path
 from typing import Any
 
-from agent_procutil import detached_kwargs, windowless_python
+from agent_procutil import (
+    detached_kwargs,
+    no_window_kwargs,
+    windowless_python,
+    windowless_python_env,
+)
 import httpx
 
-from . import __version__
 from .client import AgentIndexClient
-from .config import Config, client_url, discovered_endpoint, load_config, routing_dir, run_dir
+from .config import (
+    Config,
+    client_url,
+    discovered_endpoint,
+    install_dir,
+    load_config,
+    routing_dir,
+    run_dir,
+    server_venv_python,
+)
 from .query_surface import format_error, hit_to_dict
-from .rendezvous import clear_endpoint
-from .server import serve
+from .rendezvous import clear_endpoint, pid_alive as _pid_exists
+from .runtime_version import current_runtime_version
 
 
 def _emit(value: Any) -> int:
@@ -37,7 +50,413 @@ def _emit_error(exc: BaseException) -> int:
     return 1
 
 
+class ServiceOwnershipError(RuntimeError):
+    """A reachable endpoint is not owned by this installation."""
+
+
+class CutoverGovernanceBlocked(ServiceOwnershipError):
+    """Installation governance changed after passive service preparation."""
+
+    def __init__(self, governance: dict[str, Any]) -> None:
+        super().__init__("installation governance blocked cutover before commit")
+        self.governance = governance
+
+
+CELL_TRANSACTION_PATH_ENV = "AGENT_INDEX_CELL_TRANSACTION"
+CELL_TRANSACTION_TOKEN_ENV = "AGENT_INDEX_CELL_TRANSACTION_TOKEN"
+CELL_LOCK_TOKEN_ENV = "AGENT_INDEX_CELL_LOCK_TOKEN"
+CELL_LOCK_ROOT_ENV = "AGENT_INDEX_CELL_LOCK_ROOT"
+CELL_START_TOKEN_ENV = "AGENT_INDEX_CELL_START_TOKEN"
+CELL_TRANSACTION_SCHEMA = "copilot-extensions.agent-index.selection-transaction"
+CUTOVER_CRASH_EVIDENCE_FILE = "cutover-crash-evidence.json"
+CUTOVER_CRASH_EXIT_CODES = {
+    "passive": 86,
+    "flipped": 87,
+    "draining": 88,
+    "committed": 89,
+}
+
+
+def _expected_installation_id() -> str:
+    return os.environ.get("AGENT_INDEX_INSTALLATION_ID", "")
+
+
+def _selected_interpreter_matches(environment_name: str) -> bool:
+    selected = os.environ.get(environment_name, "")
+    if not selected:
+        return False
+    try:
+        return os.path.samefile(selected, sys.executable)
+    except OSError:
+        return False
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ServiceOwnershipError(f"duplicate transaction field: {key}")
+        value[key] = item
+    return value
+
+
+def _validated_cell_transaction() -> dict[str, Any] | None:
+    installation_id = _expected_installation_id()
+    if not installation_id:
+        return None
+    root_value = os.environ.get("AGENT_INDEX_HOME", "")
+    path_value = os.environ.get(CELL_TRANSACTION_PATH_ENV, "")
+    supplied_token = os.environ.get(CELL_TRANSACTION_TOKEN_ENV, "")
+    supplied_id = os.environ.get("AGENT_INDEX_CELL_TRANSACTION_ID", "")
+    if not root_value or not path_value or not supplied_token or not supplied_id:
+        raise ServiceOwnershipError(
+            "namespaced deploy/recovery requires an installation transaction receipt"
+        )
+    root = Path(root_value).resolve()
+    expected = root / "selection-transaction.json"
+    path = Path(path_value)
+    try:
+        if path.is_symlink() or path.resolve(strict=True) != expected.resolve(strict=True):
+            raise ServiceOwnershipError(
+                "installation transaction receipt is outside the selected cell"
+            )
+        raw = path.read_text(encoding="utf-8")
+        value = json.loads(raw, object_pairs_hook=_strict_json_object)
+    except ServiceOwnershipError:
+        raise
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ServiceOwnershipError(
+            "installation transaction receipt is unavailable or malformed"
+        ) from exc
+    target = value.get("target") if isinstance(value, dict) else None
+    marketplace_id, separator, plugin_id = installation_id.partition("/")
+    expected_context = os.environ.get("COPILOT_EXTENSIONS_CONTEXT", "")
+    management = value.get("management") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != CELL_TRANSACTION_SCHEMA
+        or value.get("version") != 1
+        or value.get("id") != supplied_id
+        or value.get("marketplaceId") != marketplace_id
+        or not separator
+        or value.get("pluginId") != plugin_id
+        or value.get("installationId") != installation_id
+        or value.get("token") != supplied_token
+        or len(supplied_token) < 32
+        or not isinstance(value.get("context"), str)
+        or not expected_context
+        or os.path.normcase(os.path.abspath(value["context"]))
+        != os.path.normcase(os.path.abspath(expected_context))
+        or value.get("state")
+        not in {"prepared", "marker-published", "manifest-published", "reconciling"}
+        or not isinstance(management, dict)
+        or not isinstance(management.get("path"), str)
+        or not isinstance(management.get("version"), str)
+        or not isinstance(target, dict)
+        or not isinstance(target.get("payloadRoot"), str)
+        or not isinstance(target.get("payloadVersion"), str)
+        or not isinstance(target.get("snapshotId"), str)
+        or target.get("runtimeVersion") != current_runtime_version()
+    ):
+        raise ServiceOwnershipError(
+            "installation transaction receipt does not authorize this runtime"
+        )
+    return value
+
+
+def _validate_cutover_governance(transaction: dict[str, Any] | None) -> None:
+    if transaction is None:
+        return
+    management = transaction.get("management")
+    governance: dict[str, Any] = {
+        "status": "invalid",
+        "reason": "governance-check-failed",
+    }
+    try:
+        if not isinstance(management, dict):
+            raise OSError("management payload identity is absent")
+        management_root = Path(str(management["path"]))
+        if _path_is_link_or_reparse(management_root):
+            raise OSError("management payload root is linked")
+        management_root = management_root.resolve(strict=True)
+        script = management_root / "scripts" / "cell-runtime.py"
+        if (
+            _path_is_link_or_reparse(script)
+            or not script.is_file()
+            or _path_is_link_or_reparse(script.parent)
+        ):
+            raise OSError("management governance checker is unavailable")
+        context = Path(str(transaction["context"])).resolve(strict=True)
+        durable_home = context.parents[4]
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-X",
+                "utf8",
+                str(script),
+                "governance-check",
+                "--context",
+                str(context),
+                "--expected-marketplace-id",
+                str(transaction["marketplaceId"]),
+                "--durable-home",
+                str(durable_home),
+            ],
+            cwd=management_root,
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if key not in {"PYTHONPATH", "PYTHONHOME"}
+            },
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=30,
+            **no_window_kwargs(),
+        )
+        if result.returncode != 0:
+            raise OSError(
+                (result.stderr or result.stdout).strip()
+                or "governance checker exited unsuccessfully"
+            )
+        payload = json.loads(
+            result.stdout,
+            object_pairs_hook=_strict_json_object,
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("governance result is not an object")
+        observed = payload.get("governance")
+        if isinstance(observed, dict):
+            governance = observed
+        if payload.get("active") is not True:
+            raise CutoverGovernanceBlocked(governance)
+    except CutoverGovernanceBlocked:
+        raise
+    except (
+        KeyError,
+        IndexError,
+        OSError,
+        ServiceOwnershipError,
+        subprocess.SubprocessError,
+        UnicodeError,
+        ValueError,
+    ):
+        raise CutoverGovernanceBlocked(governance) from None
+
+
+def _path_is_link_or_reparse(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    try:
+        return bool(path.lstat().st_file_attributes & 0x400)
+    except (AttributeError, OSError):
+        return False
+
+
+def _configured_service_role() -> str | None:
+    role = os.environ.get("AGENT_INDEX_ROLE", "").strip().lower()
+    if not role:
+        from .config import _read_config_role, config_path
+
+        role = (_read_config_role(config_path()) or "").strip().lower()
+    if role in {"host", "engine", "server", "indexer"}:
+        return "host"
+    if role in {"client", "none", "consumer"}:
+        return "client"
+    return None
+
+
+def _validate_cell_start_authority(*, passive: bool) -> None:
+    installation_id = _expected_installation_id()
+    if not installation_id:
+        raise ServiceOwnershipError(
+            "the private cell startup path requires a namespaced installation"
+        )
+    if _configured_service_role() != "host":
+        raise ServiceOwnershipError(
+            "the private cell startup path requires the configured host role"
+        )
+    root_value = os.environ.get("AGENT_INDEX_HOME", "")
+    lock_root_value = os.environ.get(CELL_LOCK_ROOT_ENV, "")
+    lock_token = os.environ.get(CELL_LOCK_TOKEN_ENV, "")
+    start_token = os.environ.get(CELL_START_TOKEN_ENV, "")
+    if (
+        not root_value
+        or not lock_root_value
+        or not lock_token
+        or len(lock_token) < 32
+        or start_token != lock_token
+    ):
+        raise ServiceOwnershipError(
+            "the private cell startup path requires the owning lifecycle lock"
+        )
+    root = Path(root_value).resolve()
+    lock_root = Path(lock_root_value).resolve()
+    if os.path.normcase(str(root)) != os.path.normcase(str(lock_root)):
+        raise ServiceOwnershipError(
+            "the private cell startup lock belongs to another installation"
+        )
+    owner = root / ".payload-provision.lock.d" / "owner.json"
+    try:
+        if _path_is_link_or_reparse(owner) or _path_is_link_or_reparse(owner.parent):
+            raise ServiceOwnershipError(
+                "the private cell startup lock is not an ordinary receipt"
+            )
+        value = json.loads(
+            owner.read_text(encoding="utf-8"),
+            object_pairs_hook=_strict_json_object,
+        )
+    except ServiceOwnershipError:
+        raise
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ServiceOwnershipError(
+            "the private cell startup lock receipt is unavailable or malformed"
+        ) from exc
+    pid = value.get("pid") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != "copilot-extensions.agent-index.cell-lock"
+        or value.get("version") != 1
+        or value.get("token") != lock_token
+        or type(pid) is not int
+        or not _pid_exists(pid)
+    ):
+        raise ServiceOwnershipError(
+            "the private cell startup lifecycle lock is not live"
+        )
+    transaction_values = tuple(
+        os.environ.get(name, "")
+        for name in (
+            CELL_TRANSACTION_PATH_ENV,
+            CELL_TRANSACTION_TOKEN_ENV,
+            "AGENT_INDEX_CELL_TRANSACTION_ID",
+        )
+    )
+    if any(transaction_values):
+        transaction = (
+            _validated_cell_transaction() if all(transaction_values) else None
+        )
+        if transaction is None or transaction.get("state") != "reconciling":
+            raise ServiceOwnershipError(
+                "the private cell startup transaction is not in its "
+                "service-reconciliation phase"
+            )
+    elif passive:
+        raise ServiceOwnershipError(
+            "a passive cell service requires the owning selection transaction"
+        )
+
+
+def _owned_service_status(
+    url: str,
+    *,
+    expected_version: str | None = None,
+    expected_pid: int | None = None,
+    expected_instance_token: str | None = None,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    with httpx.Client(timeout=timeout) as client:
+        response = client.get(f"{url.rstrip('/')}/health")
+        response.raise_for_status()
+        payload = response.json()
+    if not isinstance(payload, dict):
+        raise ServiceOwnershipError("service status is not an object")
+    expected_installation = _expected_installation_id()
+    if (payload.get("installationId") or "") != expected_installation:
+        raise ServiceOwnershipError(
+            "service installation identity does not match this invocation"
+        )
+    if payload.get("plugin") != "agent-index":
+        raise ServiceOwnershipError("endpoint is not an Agent Index service")
+    if expected_version is not None and payload.get("version") != expected_version:
+        raise ServiceOwnershipError(
+            f"service runtime {payload.get('version')} does not match "
+            f"{expected_version}"
+        )
+    if expected_pid is not None and int(payload.get("pid", 0)) != expected_pid:
+        raise ServiceOwnershipError("service pid does not match routing ownership")
+    token = payload.get("instanceToken")
+    if expected_installation and (not isinstance(token, str) or not token):
+        raise ServiceOwnershipError("service did not attest an instance token")
+    if expected_instance_token is not None and token != expected_instance_token:
+        raise ServiceOwnershipError("service instance token changed during ownership check")
+    return payload
+
+
+def _routing_endpoint_for_url(url: str):
+    try:
+        from zdd.routing import Endpoint, read_table
+
+        table = read_table(routing_dir()) or {}
+        normalized = url.rstrip("/")
+        for key in ("active", "previous"):
+            raw = table.get(key)
+            endpoint = Endpoint.from_dict(raw) if isinstance(raw, dict) else None
+            if endpoint is not None and endpoint.base_url.rstrip("/") == normalized:
+                return endpoint
+    except Exception:
+        pass
+    return None
+
+
+def _owned_service_client(
+    url: str,
+    *,
+    timeout: float,
+    transaction_token: str | None = None,
+) -> tuple[dict[str, Any], AgentIndexClient]:
+    expected_installation = _expected_installation_id()
+    route = _routing_endpoint_for_url(url)
+    if expected_installation and route is None:
+        raise ServiceOwnershipError(
+            "service endpoint is not present in this installation's routing record"
+        )
+    status = _owned_service_status(
+        url,
+        expected_version=getattr(route, "version", None),
+        expected_pid=getattr(route, "pid", None),
+        timeout=min(timeout, 5.0),
+    )
+    instance_token = (
+        str(status["instanceToken"]) if status.get("instanceToken") else None
+    )
+    if expected_installation:
+        if not instance_token:
+            raise ServiceOwnershipError(
+                "namespaced control requires an exact service instance token"
+            )
+        confirmed_route = _routing_endpoint_for_url(url)
+        if (
+            confirmed_route is None
+            or confirmed_route.base_url.rstrip("/") != route.base_url.rstrip("/")
+            or confirmed_route.pid != route.pid
+            or confirmed_route.version != route.version
+        ):
+            raise ServiceOwnershipError(
+                "service routing ownership changed during control validation"
+            )
+        status = _owned_service_status(
+            url,
+            expected_version=confirmed_route.version,
+            expected_pid=confirmed_route.pid,
+            expected_instance_token=instance_token,
+            timeout=min(timeout, 5.0),
+        )
+    return status, AgentIndexClient(
+        url,
+        timeout=timeout,
+        installation_id=expected_installation,
+        instance_token=instance_token,
+        transaction_token=transaction_token,
+    )
+
+
 def _setup_required_payload(*, runtime_state: str = "ready") -> dict[str, Any]:
+    from . import __version__
+
     return {
         "schema": "agent-index.lifecycle",
         "schema_version": 1,
@@ -60,7 +479,7 @@ def _setup_required_payload(*, runtime_state: str = "ready") -> dict[str, Any]:
 
 
 def _status_payload() -> dict[str, Any]:
-    from . import transport
+    from . import __version__, transport
 
     role, _indexer = transport.plan_route()
     if role == "unconfigured":
@@ -81,8 +500,53 @@ def _status_payload() -> dict[str, Any]:
             "index": {"chunks": None, "available": None, "unreachable": True},
         }
     try:
+        expected_installation = _expected_installation_id()
+        route = _routing_endpoint_for_url(url)
+        if expected_installation and route is None:
+            raise ServiceOwnershipError(
+                "service endpoint is not present in this installation's routing record"
+            )
+        health = _owned_service_status(
+            url,
+            expected_version=getattr(route, "version", None),
+            expected_pid=getattr(route, "pid", None),
+            timeout=10.0,
+        )
         with httpx.Client(timeout=10.0) as client:
             payload = client.get(f"{url}/status").json()
+        if not isinstance(payload, dict):
+            raise ValueError("service status is not an object")
+        if (payload.get("installationId") or "") != expected_installation:
+            raise ServiceOwnershipError(
+                "service installation identity does not match this invocation"
+            )
+        if (
+            payload.get("pid") != health.get("pid")
+            or payload.get("version") != health.get("version")
+            or payload.get("instanceToken") != health.get("instanceToken")
+        ):
+            raise ServiceOwnershipError(
+                "service status changed during ownership validation"
+            )
+        if expected_installation and payload.get("promoted") is not True:
+            raise ServiceOwnershipError(
+                "service endpoint is passive and has not completed promotion"
+            )
+        if payload.get("draining") is True or health.get("status") == "draining":
+            payload["schema"] = "agent-index.lifecycle"
+            payload["schema_version"] = 1
+            payload["state"] = "draining"
+            payload["setup_required"] = False
+            payload["configured"] = True
+            payload["role"] = role
+            payload["runtime"] = {"state": "ready"}
+            payload["running"] = False
+            payload["endpoint"] = url
+            return payload
+        if health.get("status") != "ok":
+            raise ServiceOwnershipError(
+                f"service health state is not ready: {health.get('status')}"
+            )
         payload["schema"] = "agent-index.lifecycle"
         payload["schema_version"] = 1
         payload["state"] = "ready"
@@ -93,7 +557,7 @@ def _status_payload() -> dict[str, Any]:
         payload["running"] = True
         payload["endpoint"] = url
         return payload
-    except (httpx.HTTPError, ValueError) as exc:
+    except (httpx.HTTPError, ServiceOwnershipError, ValueError) as exc:
         # Failing to reach the service is "unknown," not an empty index:
         # never fabricate chunks:0 here (dotfiles issue #1531).
         return {
@@ -120,7 +584,126 @@ def _config_from_args(args: argparse.Namespace) -> Config:
     return Config(host=host, port=cfg.port if port is None else int(port))
 
 
+def serve(cfg: Config | None = None, *, passive: bool = False) -> None:
+    """Lazily import and delegate to the real ``.server.serve``.
+
+    Kept as a real, always-present module attribute (not a bare local
+    import inside each caller) so tests can monkeypatch ``cli.serve``
+    exactly as before -- only the heavy FastAPI/uvicorn import underneath
+    is deferred, to the first actual call. Signature (parameter name
+    ``cfg``, defaulting to ``None``) matches ``server.serve`` exactly, so
+    any existing caller of ``agent_index.__main__.serve()`` -- positional
+    or keyword, with no argument or with ``cfg=...`` -- keeps working
+    unchanged.
+    """
+    from .server import serve as _serve
+
+    return _serve(cfg, passive=passive)
+
+
+def _dispatch_to_server_venv(
+    args: argparse.Namespace, subcommand: str
+) -> int | None:
+    """Dispatch a FOREGROUND start/serve/__cell-start invocation to the
+    sibling SERVER venv's own interpreter, when one is provisioned
+    (agent-index-server-venv-split). Returns the dispatched child's exit
+    code, or ``None`` when no server venv exists so the caller falls back
+    to running ``serve()`` in-process exactly as before.
+
+    Unlike ``spawn_passive``'s fully-detached background spawn, this is a
+    genuine foreground replacement: it inherits this process's own stdio
+    (so operator-visible output is identical) and deliberately does NOT
+    create a new process group/session, so the terminal's own Ctrl+C
+    (SIGINT) / Ctrl+Break already reaches the child directly, alongside
+    this process -- the OS's own signal fan-out across the inherited
+    console/process group, not a hand-rolled forwarder. A SIGTERM sent to
+    just this process (e.g. by a supervisor, which -- unlike a terminal
+    signal -- targets only this PID) IS explicitly relayed to the child,
+    since nothing else would deliver it there. This process then simply
+    waits for the child and relays its exit code, swallowing its own
+    KeyboardInterrupt from the same terminal signal so it doesn't race the
+    child's own graceful shutdown with a second one.
+    """
+    server_python = server_venv_python()
+    if server_python is None:
+        return None
+
+    cfg = _config_from_args(args)
+    cmd = [
+        str(server_python),
+        "-I",
+        "-X",
+        "utf8",
+        "-m",
+        "agent_index",
+        subcommand,
+        "--host",
+        cfg.host,
+        "--port",
+        str(cfg.port),
+    ]
+    if getattr(args, "passive", False):
+        cmd.append("--passive")
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTHONPATH", "PYTHONHOME"}
+    }
+    process = subprocess.Popen(  # noqa: S603
+        cmd, cwd=str(install_dir().resolve()), env=env
+    )
+
+    def _forward_sigterm(signum: int, _frame: Any) -> None:
+        with contextlib.suppress(OSError):
+            process.terminate()
+
+    previous_handler = signal.signal(signal.SIGTERM, _forward_sigterm)
+    try:
+        while True:
+            try:
+                return process.wait()
+            except KeyboardInterrupt:
+                continue
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+
+
 def cmd_start(args: argparse.Namespace) -> int:
+    """Run the local service -- dispatched to the sibling SERVER venv's own
+    interpreter when one is provisioned (agent-index-server-venv-split),
+    else run in the current interpreter exactly as before."""
+    subcommand = getattr(args, "command", None) or "start"
+    dispatched = _dispatch_to_server_venv(args, subcommand)
+    if dispatched is not None:
+        return dispatched
+    serve(_config_from_args(args), passive=bool(getattr(args, "passive", False)))
+    return 0
+
+
+def cmd_restart(_args: argparse.Namespace) -> int:
+    """Gracefully replace the active service, or start one if absent."""
+    return cmd_deploy(
+        argparse.Namespace(
+            health_timeout=60.0,
+            drain_timeout=300.0,
+            force=False,
+            recover=False,
+            json=False,
+        )
+    )
+
+
+def cmd_cell_start(args: argparse.Namespace) -> int:
+    try:
+        _validate_cell_start_authority(
+            passive=bool(getattr(args, "passive", False))
+        )
+    except ServiceOwnershipError as exc:
+        print(f"agent-index: {exc}", file=sys.stderr)
+        return 2
+    dispatched = _dispatch_to_server_venv(args, "__cell-start")
+    if dispatched is not None:
+        return dispatched
     serve(_config_from_args(args), passive=bool(getattr(args, "passive", False)))
     return 0
 
@@ -154,12 +737,24 @@ def cmd_installer_readiness(_args: argparse.Namespace) -> int:
 
 
 def cmd_version(_args: argparse.Namespace) -> int:
+    from . import __version__
+
     payload = _status_payload()
     print(payload.get("version") or __version__)
     return 0
 
 
 def cmd_mcp(_args: argparse.Namespace) -> int:
+    import importlib.util
+
+    if importlib.util.find_spec("mcp") is None:
+        print(
+            "agent-index: the optional stdio MCP dependencies are unavailable "
+            "in the lightweight client runtime. Use the read CLI or the hosted "
+            "HTTP service; this command will not install host dependencies.",
+            file=sys.stderr,
+        )
+        return 2
     from agent_index.mcp_app import serve_stdio
 
     serve_stdio()
@@ -238,6 +833,12 @@ def _setup_multi(cfg, args, this: str, root, indexers: list[dict]) -> int:
         "ssh_targets": ssh_targets,
         "repo": str(root) if root else None,
         "written": {"machine_config": str(role_path)},
+        "service": {
+            "manager": "agent-index" if role == "host" else None,
+            "state": "self-supervised" if role == "host" else "not-required",
+            "started_by_setup": False,
+            "provisioned_by_setup": False,
+        },
     }
     if getattr(args, "json", False):
         return _emit(result)
@@ -255,8 +856,8 @@ def _setup_multi(cfg, args, this: str, root, indexers: list[dict]) -> int:
         else:
             print("  routing endpoints: (unset) -- add endpoints to the repo's indexers list")
     else:
-        print("  next: run the installer here to provision the service + engine daemon "
-              "(agent-index-install install)")
+        print("  host service: self-supervised after install/start; setup does not "
+              "provision or start it. The independent embedding engine is unchanged.")
     print(f"  machine config: {role_path}")
     return 0
 
@@ -264,11 +865,14 @@ def _setup_multi(cfg, args, this: str, root, indexers: list[dict]) -> int:
 def cmd_setup(args: argparse.Namespace) -> int:
     """Adopt agent-index: designate one indexer, then write role + designation config.
 
-    Records the shared indexer designation into ``<repo>/.agent-index/config.yaml``
-    and this machine's concrete ``role:`` into the machine-local config (which the
-    installer reads). Running setup on the designated machine makes it the ``host``;
-    everywhere else it is a ``client`` (effort agent-index-engine-daemon, Phase 6;
-    vision §adoption-designates-one-indexer).
+    Records the shared indexer designation into the repo-local writable overlay
+    (``<repo>/.copilot-extensions/agent-index/config.yaml``) while leaving the
+    checked-in ``<repo>/.agent-index/config.yaml`` defaults untouched, and writes
+    this machine's concrete ``role:`` into the machine-local config (which the
+    installer reads). Running setup on the designated machine makes it the
+    ``host``; everywhere else it is a ``client`` (effort
+    agent-index-engine-daemon, Phase 6; vision
+    §adoption-designates-one-indexer).
     """
     from agent_index import config as cfg
 
@@ -288,7 +892,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # operator-authored, so setup only resolves THIS machine's role/routing from it
     # and never rewrites it (vision §adoption-designates-ordered-indexers).
     if not single and not indexer and root is not None:
-        raw = cfg._load_yaml(cfg.repo_config_path(root))
+        raw = cfg._load_effective_repo_config(root)
         if isinstance(raw.get("indexers"), list) and cfg.read_indexers(root):
             return _setup_multi(cfg, args, this, root, cfg.read_indexers(root))
 
@@ -369,6 +973,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
         "endpoint": endpoint,
         "repo": str(root) if root else None,
         "written": written,
+        "service": {
+            "manager": "agent-index" if role == "host" else None,
+            "state": "self-supervised" if role == "host" else "not-required",
+            "started_by_setup": False,
+            "provisioned_by_setup": False,
+        },
     }
     if getattr(args, "json", False):
         return _emit(result)
@@ -390,10 +1000,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print(f"  repo config:    {written.get('repo_config')}")
     print(f"  machine config: {written['machine_config']}")
     if role == "host":
-        print("  next: run the installer here to provision the service + engine daemon "
-              "(agent-index-install install)")
+        print("  host service: self-supervised after install/start; setup does not "
+              "provision or start it. The independent embedding engine is unchanged.")
     else:
-        print("  next: run the installer here for the client (service/CLI, no model stack).")
+        print("  next: use the lightweight client CLI; no local host service is installed.")
         if ssh and endpoint:
             print(f"        establish the trusted transport, e.g. an SSH port-forward via '{ssh}' "
                   f"so {endpoint} reaches the indexer '{designated}'.")
@@ -454,20 +1064,41 @@ def cmd_stop(_args: argparse.Namespace) -> int:
     url = client_url()
     if url:
         try:
-            AgentIndexClient(url, timeout=5.0).shutdown()
-            pid = getattr(routed, "pid", None)
+            status, owned_client = _owned_service_client(url, timeout=5.0)
+            pid = int(status.get("pid", 0)) or None
+            if (
+                pid is None
+                and routed is not None
+                and routed.base_url.rstrip("/") == url.rstrip("/")
+            ):
+                pid = getattr(routed, "pid", None)
+            owned_client.shutdown()
             if pid and pid != os.getpid():
                 deadline = time.monotonic() + 5.0
                 while time.monotonic() < deadline:
-                    try:
-                        os.kill(pid, 0)
-                    except OSError:
+                    if not _pid_exists(pid):
                         return _emit({"stopped": True, "pid": pid})
                     time.sleep(0.2)
                 return _emit({"stopped": False, "reason": "still-running", "pid": pid})
             return _emit({"stopped": True})
-        except Exception:
-            url = None
+        except ServiceOwnershipError as exc:
+            return _emit(
+                {
+                    "stopped": False,
+                    "reason": "ownership-mismatch",
+                    "error": str(exc),
+                    "endpoint": url,
+                }
+            )
+        except Exception as exc:
+            return _emit(
+                {
+                    "stopped": False,
+                    "reason": "ownership-unverified",
+                    "error": str(exc),
+                    "endpoint": url,
+                }
+            )
 
     ep = discovered_endpoint()
     if ep is None or not ep.pid:
@@ -475,24 +1106,51 @@ def cmd_stop(_args: argparse.Namespace) -> int:
     if ep.pid == os.getpid():
         return _emit({"stopped": False, "reason": "refusing-to-stop-self"})
     try:
-        os.kill(ep.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        clear_endpoint(run_dir())
-        return _emit({"stopped": False, "reason": "not-running", "pid": ep.pid})
-    except PermissionError as exc:
+        status, owned_client = _owned_service_client(
+            f"http://{ep.address}",
+            timeout=5.0,
+        )
+    except ServiceOwnershipError as exc:
         return _emit(
-            {"stopped": False, "reason": "permission-denied", "pid": ep.pid, "error": str(exc)}
+            {
+                "stopped": False,
+                "reason": "ownership-mismatch",
+                "pid": ep.pid,
+                "error": str(exc),
+            }
+        )
+    except Exception as exc:
+        if not _pid_exists(ep.pid):
+            clear_endpoint(run_dir())
+            return _emit({"stopped": False, "reason": "not-running", "pid": ep.pid})
+        return _emit(
+            {
+                "stopped": False,
+                "reason": "ownership-unverified",
+                "pid": ep.pid,
+                "error": str(exc),
+            }
+        )
+    pid = int(status.get("pid", 0)) or ep.pid
+    try:
+        owned_client.shutdown()
+    except Exception as exc:
+        return _emit(
+            {
+                "stopped": False,
+                "reason": "shutdown-refused",
+                "pid": pid,
+                "error": str(exc),
+            }
         )
 
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
-        try:
-            os.kill(ep.pid, 0)
-        except OSError:
+        if not _pid_exists(pid):
             clear_endpoint(run_dir())
-            return _emit({"stopped": True, "pid": ep.pid})
+            return _emit({"stopped": True, "pid": pid})
         time.sleep(0.2)
-    return _emit({"stopped": False, "reason": "still-running", "pid": ep.pid})
+    return _emit({"stopped": False, "reason": "still-running", "pid": pid})
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -639,13 +1297,83 @@ def cmd_clusters(args: argparse.Namespace) -> int:
 
 def cmd_deploy(args: argparse.Namespace) -> int:
     from zdd import breadcrumb
+    from zdd import routing as zdd_routing
     from zdd.cutover import CutoverOrchestrator
 
     cfg = load_config()
+    expected_installation = _expected_installation_id()
+    runtime_version = current_runtime_version()
+    try:
+        transaction = _validated_cell_transaction()
+    except ServiceOwnershipError as exc:
+        if args.json:
+            _emit(
+                {
+                    "ok": False,
+                    "reason": "transaction-unauthorized",
+                    "error": str(exc),
+                }
+            )
+        else:
+            print(f"[FAIL] {exc}", file=sys.stderr)
+        return 1
+    transaction_token = (
+        str(transaction["token"]) if transaction is not None else None
+    )
+    injected_phase = (
+        os.environ.get("AGENT_INDEX_TEST_CUTOVER_CRASH_PHASE", "").strip().lower()
+        if expected_installation
+        else ""
+    )
+    passive_instance: dict[str, Any] = {}
+    governance_block: dict[str, Any] = {}
+    drain_started: set[str] = set()
+
+    def crash_at(phase: str) -> None:
+        if injected_phase == phase:
+            exit_code = CUTOVER_CRASH_EXIT_CODES[phase]
+            route = _routing_endpoint()
+            evidence = {
+                "schema": "copilot-extensions.agent-index.cutover-crash-evidence",
+                "version": 1,
+                "phase": phase,
+                "exitCode": exit_code,
+                "pid": os.getpid(),
+                "installationId": expected_installation,
+                "runtimeVersion": runtime_version,
+                "transactionId": (
+                    transaction.get("id") if isinstance(transaction, dict) else None
+                ),
+                "passive": dict(passive_instance),
+                "route": (
+                    {
+                        "bind": route.bind,
+                        "port": route.port,
+                        "pid": route.pid,
+                        "version": route.version,
+                    }
+                    if route is not None
+                    else None
+                ),
+            }
+            path = run_dir() / CUTOVER_CRASH_EVIDENCE_FILE
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(
+                f".{path.name}.{os.getpid()}.{phase}.tmp"
+            )
+            temporary.write_text(
+                json.dumps(evidence, separators=(",", ":"), sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            os.replace(temporary, path)
+            os._exit(exit_code)
+
     wildcard_v4 = ".".join(("0", "0", "0", "0"))
     host = cfg.host if cfg.host not in (wildcard_v4, "", "::") else "127.0.0.1"
     if cfg.host == "::":
         host = "::1"
+    cutover_started = False
 
     def pick_free_port() -> int:
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
@@ -654,11 +1382,21 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             return int(sock.getsockname()[1])
 
     def spawn_passive(port: int):
+        start_command = "__cell-start" if expected_installation else "start"
+        # Prefer the dedicated SERVER venv's own interpreter, if one has been
+        # provisioned (agent-index-server-venv-split) -- the passive instance
+        # then never loads fastapi/uvicorn/pydantic into a client-shaped venv.
+        # Falls back to the current interpreter (today's single-venv layout)
+        # when no server venv exists yet.
+        python = str(server_venv_python() or sys.executable)
         cmd = [
-            windowless_python(sys.executable),
+            windowless_python(python),
+            "-I",
+            "-X",
+            "utf8",
             "-m",
             "agent_index",
-            "start",
+            start_command,
             "--host",
             cfg.host,
             "--port",
@@ -666,25 +1404,99 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             "--passive",
         ]
         kwargs: dict[str, Any] = {
+            "cwd": str(install_dir().resolve()),
+            "env": {
+                key: value
+                for key, value in os.environ.items()
+                if key not in {"PYTHONPATH", "PYTHONHOME"}
+            },
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL,
         }
+        kwargs["env"].update(windowless_python_env(python))
         kwargs.update(detached_kwargs())
-        return subprocess.Popen(cmd, **kwargs)  # noqa: S603
+        handle = subprocess.Popen(cmd, **kwargs)  # noqa: S603
+        passive_instance.update({"port": port, "pid": handle.pid})
+        return handle
 
     def health_check(check_host: str, port: int) -> bool:
         try:
-            with urllib.request.urlopen(f"http://{check_host}:{port}/health", timeout=2) as resp:
-                if resp.status != 200:
-                    return False
-                payload = json.loads(resp.read().decode("utf-8"))
-                return payload.get("status") != "draining"
+            route = _routing_endpoint_for_url(f"http://{check_host}:{port}")
+            expected_pid = (
+                int(passive_instance["pid"])
+                if passive_instance.get("port") == port
+                else getattr(route, "pid", None)
+            )
+            expected_version = (
+                runtime_version
+                if passive_instance.get("port") == port
+                else getattr(route, "version", None)
+            )
+            payload = _owned_service_status(
+                f"http://{check_host}:{port}",
+                expected_version=expected_version,
+                expected_pid=expected_pid,
+                timeout=2.0,
+            )
+            if (
+                passive_instance.get("port") == port
+                and payload.get("promoted") is not True
+            ):
+                crash_at("passive")
+            return payload.get("status") != "draining"
         except Exception:
             return False
 
+    def make_recovery_client(base_url: str) -> AgentIndexClient:
+        _status, client = _owned_service_client(
+            base_url,
+            timeout=float(args.drain_timeout) + 60.0,
+            transaction_token=transaction_token,
+        )
+        return client
+
     def make_client(base_url: str) -> AgentIndexClient:
-        return AgentIndexClient(base_url, timeout=float(args.drain_timeout) + 60.0)
+        normalized_url = base_url.rstrip("/")
+        if (
+            cutover_started
+            and injected_phase == "flipped"
+            and passive_instance.get("port") is not None
+            and base_url.rstrip("/")
+            != f"http://{host}:{passive_instance['port']}".rstrip("/")
+        ):
+            crash_at("flipped")
+        client = make_recovery_client(base_url)
+
+        class PhaseClient:
+            def health(self) -> dict[str, Any]:
+                return client.health()
+
+            def drain(
+                self,
+                *,
+                timeout: float,
+                poll: float,
+                force: bool,
+            ) -> dict[str, Any]:
+                drain_started.add(normalized_url)
+                result = client.drain(timeout=timeout, poll=poll, force=force)
+                crash_at("draining")
+                return result
+
+            def undrain(self) -> dict[str, Any]:
+                if normalized_url not in drain_started:
+                    return {"draining": False}
+                return client.undrain()
+
+            def shutdown(self) -> dict[str, Any]:
+                crash_at("committed")
+                return client.shutdown()
+
+            def adopt_relay(self) -> dict[str, Any]:
+                return client.adopt_relay()
+
+        return PhaseClient()  # type: ignore[return-value]
 
     def liveness_check(check_host: str, port: int) -> bool:
         # Recovery MUST use a plain liveness probe, NOT the draining-aware
@@ -694,13 +1506,107 @@ def cmd_deploy(args: argparse.Namespace) -> int:
         # breadcrumb without undraining -- leaving the service permanently closed to
         # new work. A drained daemon still answers /health 200, so any 200 is alive.
         try:
-            with urllib.request.urlopen(f"http://{check_host}:{port}/health", timeout=2) as resp:
-                return resp.status == 200
+            route = _routing_endpoint_for_url(f"http://{check_host}:{port}")
+            if expected_installation and route is None:
+                return False
+            payload = _owned_service_status(
+                f"http://{check_host}:{port}",
+                expected_version=getattr(route, "version", None),
+                expected_pid=getattr(route, "pid", None),
+                timeout=2.0,
+            )
+            return payload.get("plugin") == "agent-index"
         except Exception:
             return False
 
+    class PromotingRouting:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(zdd_routing, name)
+
+        def publish_active(self, config_dir: Any, **kwargs: Any):
+            target_publish = (
+                passive_instance.get("port") == kwargs.get("port")
+                and passive_instance.get("pid") == kwargs.get("pid")
+            )
+            if not target_publish:
+                current = zdd_routing.read_active_endpoint(
+                    config_dir,
+                    verify_listener=False,
+                )
+                if (
+                    current is not None
+                    and current.bind == kwargs.get("bind")
+                    and current.port == kwargs.get("port")
+                    and current.pid == kwargs.get("pid")
+                    and current.version == kwargs.get("version")
+                ):
+                    return current
+            if target_publish:
+                try:
+                    _validate_cutover_governance(transaction)
+                except CutoverGovernanceBlocked as exc:
+                    governance_block.update(exc.governance)
+                    raise
+                base_url = f"http://{host}:{kwargs['port']}"
+                status = _owned_service_status(
+                    base_url,
+                    expected_version=kwargs.get("version"),
+                    expected_pid=kwargs.get("pid"),
+                    timeout=5.0,
+                )
+                instance_token = str(status.get("instanceToken") or "")
+                if expected_installation and not instance_token:
+                    raise ServiceOwnershipError(
+                        "passive service did not attest an instance token"
+                    )
+                promoted = AgentIndexClient(
+                    base_url,
+                    timeout=30.0,
+                    installation_id=expected_installation,
+                    instance_token=instance_token or None,
+                    transaction_token=transaction_token,
+                ).promote()
+                if promoted.get("promoted") is not True:
+                    raise ServiceOwnershipError(
+                        "passive service did not acknowledge promotion"
+                    )
+                ready = _owned_service_status(
+                    base_url,
+                    expected_version=kwargs.get("version"),
+                    expected_pid=kwargs.get("pid"),
+                    expected_instance_token=instance_token or None,
+                    timeout=5.0,
+                )
+                if (
+                    ready.get("promoted") is not True
+                    or ready.get("status") != "ok"
+                ):
+                    raise ServiceOwnershipError(
+                        "promoted service did not become read-ready"
+                    )
+            return zdd_routing.publish_active(config_dir, **kwargs)
+
+    routed = _routing_endpoint()
+    if routed is not None:
+        try:
+            _owned_service_client(routed.base_url, timeout=2.0)
+        except ServiceOwnershipError as exc:
+            if args.json:
+                _emit(
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "reason": "ownership-mismatch",
+                    }
+                )
+            else:
+                print(f"[FAIL] {exc}", file=sys.stderr)
+            return 1
+        except Exception:
+            pass
+
     recovery = breadcrumb.recover_stale_cutover(
-        routing_dir(), make_client, health_check=liveness_check
+        routing_dir(), make_recovery_client, health_check=liveness_check
     )
     if getattr(args, "recover", False):
         if args.json:
@@ -713,14 +1619,16 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     if recovery.get("recovered") and not args.json:
         print(f"[>] Recovered a prior aborted cutover: {recovery.get('reason')}")
 
+    cutover_started = True
     orch = CutoverOrchestrator(
         routing_dir(),
         bind=cfg.host,
-        version=__version__,
+        version=runtime_version,
         spawn_passive=spawn_passive,
         health_check=health_check,
         make_client=make_client,
         pick_free_port=pick_free_port,
+        routing_mod=PromotingRouting(),
     )
     result = orch.run(
         health_timeout=args.health_timeout,
@@ -728,8 +1636,33 @@ def cmd_deploy(args: argparse.Namespace) -> int:
         force=args.force,
     )
 
+    if result.ok:
+        active = _routing_endpoint()
+        if active is None:
+            result.ok = False
+            result.error = "cutover did not publish an active endpoint"
+        else:
+            try:
+                _owned_service_client(
+                    active.base_url,
+                    timeout=2.0,
+                )
+                _owned_service_status(
+                    active.base_url,
+                    expected_version=runtime_version,
+                    expected_pid=getattr(active, "pid", None),
+                    timeout=2.0,
+                )
+            except Exception as exc:
+                result.ok = False
+                result.error = f"cutover endpoint failed ownership validation: {exc}"
+
     if args.json:
-        _emit(result.to_dict())
+        payload = result.to_dict()
+        if governance_block:
+            payload["reason"] = "governance-blocked-before-commit"
+            payload["governance"] = governance_block
+        _emit(payload)
     else:
         for step in result.steps:
             print(f"  - {step}")
@@ -742,9 +1675,34 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+class _LazyVersionAction(argparse.Action):
+    """Defer ``__version__`` resolution until ``--version`` is actually
+    passed, instead of eagerly formatting it into every parser build
+    (argparse's own ``action="version"`` requires the finished string up
+    front, forcing the ``importlib.metadata`` lookup on every invocation
+    regardless of subcommand)."""
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS,
+                 default=argparse.SUPPRESS, help=None):
+        super().__init__(
+            option_strings=option_strings, dest=dest, default=default,
+            nargs=0, help=help,
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        from . import __version__
+
+        parser._print_message(f"{__version__}\n", sys.stdout)
+        parser.exit()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-index")
-    parser.add_argument("--version", action="version", version=__version__)
+    parser.add_argument(
+        "--version",
+        action=_LazyVersionAction,
+        help="show program's version number and exit",
+    )
     sub = parser.add_subparsers(dest="command")
 
     def add_start_args(p: argparse.ArgumentParser) -> None:
@@ -759,9 +1717,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_start = sub.add_parser("start", help="run the local service shell")
     add_start_args(p_start)
     p_start.set_defaults(func=cmd_start)
+    p_restart = sub.add_parser(
+        "restart", help="gracefully replace the active local service"
+    )
+    p_restart.set_defaults(func=cmd_restart)
     p_serve = sub.add_parser("serve", help="alias for start")
     add_start_args(p_serve)
     p_serve.set_defaults(func=cmd_start)
+    p_cell_start = sub.add_parser("__cell-start", help=argparse.SUPPRESS)
+    add_start_args(p_cell_start)
+    p_cell_start.set_defaults(func=cmd_start)
     p_status = sub.add_parser("status", help="print service status as JSON")
     p_status.set_defaults(func=cmd_status)
     p_readiness = sub.add_parser(

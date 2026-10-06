@@ -17,6 +17,10 @@ $ErrorActionPreference = 'SilentlyContinue'
 $AwaitContext = $args -contains '--await-context'
 $ContextOnly = ($args -contains '--context-only') -or $AwaitContext
 $SideEffectOnly = $args -contains '--side-effect-only'
+if ($env:COPILOT_EXTENSIONS_CONTEXT) {
+    [Console]::Out.Write('{}')
+    exit 0
+}
 $Payload = ''
 if ([Console]::IsInputRedirected) {
     try { $Payload = [Console]::In.ReadToEnd() } catch { }
@@ -54,16 +58,39 @@ function Get-LaunchKey([string]$InputPayload, [string]$Version) {
             $Timestamp -isnot [ValueType]) {
             return ''
         }
-        $CanonicalCwd = if (Test-Path -LiteralPath $Cwd -PathType Container) {
+        $GitTop = if (Test-Path -LiteralPath $Cwd -PathType Container) {
+            (& git -C $Cwd rev-parse --show-toplevel 2>$null)
+        } else {
+            $null
+        }
+        $CanonicalCwd = if ($LASTEXITCODE -eq 0 -and $GitTop) {
+            ([string]$GitTop).Trim()
+        } elseif (Test-Path -LiteralPath $Cwd -PathType Container) {
             (Resolve-Path -LiteralPath $Cwd).Path
         } else {
             [IO.Path]::GetFullPath($Cwd)
         }
         if (-not $CanonicalCwd) { return '' }
-        $TimestampText = [Convert]::ToString(
-            $Timestamp,
-            [Globalization.CultureInfo]::InvariantCulture
-        )
+        $TimestampText = if (
+            $Timestamp -is [double] -or
+            $Timestamp -is [single] -or
+            $Timestamp -is [decimal]
+        ) {
+            $Value = [double]$Timestamp
+            if ([double]::IsNaN($Value) -or [double]::IsInfinity($Value)) {
+                return ''
+            }
+            $Bits = [BitConverter]::DoubleToInt64Bits($Value)
+            'f64:' + $Bits.ToString(
+                'x16',
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+        } else {
+            [Convert]::ToString(
+                $Timestamp,
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+        }
         if (-not $TimestampText) { return '' }
         $Identity = @(
             $SessionId, $CanonicalCwd, $Source, $Version, $TimestampText
@@ -128,9 +155,25 @@ if ($ContextOnly) {
 
 function Emit-Empty { Publish-Context '{}'; exit 0 }
 
-# Only nudge when agent-worktrees is available to register with.
+# Only nudge when agent-worktrees is available to register with (the
+# self-provisioning tool binstub is on PATH or deployed, OR the durable
+# runtime-root pointer -- see install-contract.md "Durable runtime-root
+# pointer" -- names a currently-existing root, e.g. a marketplace-cell
+# install with no legacy binstub at all). Resolver-free by design: a plain
+# file read, no JSON parsing, so this still works on a tools-half box. The
+# pointer is advisory and may be missing or stale; either way this stays
+# fail-open exactly as it already does for every other uncertainty here --
+# a missing/stale pointer just falls through to "not available".
 $binstub = Join-Path $env:USERPROFILE '.local\bin\agent-worktrees'
-if (-not (Get-Command agent-worktrees -ErrorAction SilentlyContinue) -and -not (Test-Path $binstub)) { Emit-Empty }
+$available = [bool](Get-Command agent-worktrees -ErrorAction SilentlyContinue) -or (Test-Path $binstub)
+if (-not $available) {
+    $pointer = Join-Path $env:USERPROFILE '.copilot-extensions\agent-worktrees\runtime-root'
+    if (Test-Path $pointer) {
+        $pointerRoot = (Get-Content -LiteralPath $pointer -TotalCount 1 -ErrorAction SilentlyContinue)
+        if ($pointerRoot -and (Test-Path -LiteralPath $pointerRoot)) { $available = $true }
+    }
+}
+if (-not $available) { Emit-Empty }
 
 # Must be inside a git work tree.
 $top = (git rev-parse --show-toplevel 2>$null)

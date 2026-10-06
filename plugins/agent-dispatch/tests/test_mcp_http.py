@@ -248,6 +248,85 @@ def test_hosted_emitter_side_load_can_create_proposed_task(tmp_path, monkeypatch
     assert queue.list(status="proposed")[0].source == "emitter"
 
 
+def test_mcp_heartbeat_and_recover_publish_bus_events(tmp_path):
+    """Phase 3a audit: `dispatch_heartbeat`/`dispatch_recover` are MCP's own
+    transport for the same mutations the HTTP routes already cover -- wire
+    them through `_mutate`/a direct `bus.publish` the same way, and prove it
+    through this transport specifically (not just the HTTP route's own
+    test), since nothing else would fail if `_mutate(..., "task.heartbeat")`
+    were removed or mistyped."""
+    import asyncio
+
+    queue = TaskQueue(tmp_path / "tasks.db")
+    app = create_app(queue)
+    events: list[dict] = []
+    original = app.state.bus.publish
+
+    def _record(event: dict) -> None:
+        events.append(event)
+        original(event)
+
+    app.state.bus.publish = _record
+    url, stop = _boot(app)
+    try:
+        client = DispatchClient(url)
+        task = client.create("work")
+        client.claim("w1", repo=TEST_REPO)
+        client.start(task["id"], "w1")
+
+        result = asyncio.new_event_loop().run_until_complete(
+            _call(url, "dispatch_heartbeat", {"task_id": task["id"], "worker_id": "w1"})
+        )
+        assert not result.is_error
+        assert any(e["type"] == "task.heartbeat" for e in events)
+
+        events.clear()
+        result = asyncio.new_event_loop().run_until_complete(
+            _call(url, "dispatch_recover", {})
+        )
+        assert not result.is_error
+        assert any(e["type"] == "task.recovered" for e in events)
+    finally:
+        stop()
+
+
+def test_mcp_heartbeat_does_not_emit_telemetry(tmp_path):
+    """Same no-telemetry contract as `coordinator_tasks.py`'s own HTTP
+    `/tasks/{id}/heartbeat` route -- `dispatch_heartbeat` must still wake
+    the bus (the subscribe relay needs that; see the test above), but must
+    NOT record a `kind: state_transition` telemetry event for a periodic,
+    non-state-transitioning lease extension."""
+    import asyncio
+
+    from agent_dispatch import telemetry
+
+    queue = TaskQueue(tmp_path / "tasks.db")
+    app = create_app(queue)
+    url, stop = _boot(app)
+    try:
+        client = DispatchClient(url)
+        task = client.create("work")
+        client.claim("w1", repo=TEST_REPO)
+        client.start(task["id"], "w1")
+
+        seen: list[dict] = []
+        telemetry.set_telemetry_sink(seen.append)
+        try:
+            result = asyncio.new_event_loop().run_until_complete(
+                _call(
+                    url,
+                    "dispatch_heartbeat",
+                    {"task_id": task["id"], "worker_id": "w1"},
+                )
+            )
+            assert not result.is_error
+            assert seen == []
+        finally:
+            telemetry.clear_telemetry_sink()
+    finally:
+        stop()
+
+
 def test_mcp_rearm_spawn(coord):
     import asyncio
     import json
@@ -315,10 +394,22 @@ def test_mcp_create_visible_over_rest(coord):
     import json
 
     res = asyncio.new_event_loop().run_until_complete(
-        _call(coord, "dispatch_create", {"title": "via mcp", "dedup_key": "m1", "repo": TEST_REPO})
+        _call(
+            coord,
+            "dispatch_create",
+            {
+                "title": "via mcp",
+                "dedup_key": "m1",
+                "exclusive_key": "resource:42",
+                "require_verification": True,
+                "repo": TEST_REPO,
+            },
+        )
     )
     task = json.loads(res.content[0].text)
     assert task["status"] == Status.QUEUED
+    assert task["exclusive_key"] == "resource:42"
+    assert task["require_verification"] is True
     # the REST client sees the same task
     got = DispatchClient(coord).get(task["id"])
     assert got["title"] == "via mcp"
@@ -522,6 +613,120 @@ def test_mcp_retry_fill_emits_result_recorded_not_duplicate_completion(
     types = [event["type"] for event in published]
     assert types.count("task.completed") == 1
     assert types.count("task.result_recorded") == 1
+
+
+def test_mcp_complete_releases_handoff_claim(coord, monkeypatch):
+    """dispatch_complete calls queue.complete_with_outcome directly
+    (in-process), bypassing the coordinator's own HTTP routes entirely -- so
+    the release must be wired into mcp_http's own _mutate, not just
+    coordinator_tasks.py's _guard."""
+    import asyncio
+
+    from agent_dispatch import handoff_claim_release
+
+    client = DispatchClient(coord)
+    task = client.create(
+        "work", repo=TEST_REPO, labels=["handoff"], target_worktree="wt-9",
+    )
+    owner = client.claim(
+        worker_id="m/wt-9", repo=TEST_REPO, task_id=task["id"],
+        machine="m", worktree="wt-9",
+    )["owner"]
+    client.start(task["id"], owner)
+
+    calls = []
+    monkeypatch.setattr(
+        handoff_claim_release, "_release_task_claim",
+        lambda task_id, **k: calls.append((task_id, k.get("worktree"))),
+    )
+    asyncio.new_event_loop().run_until_complete(
+        _call(
+            coord, "dispatch_complete",
+            {"task_id": task["id"], "worker_id": owner},
+        )
+    )
+    time.sleep(0.1)  # release runs on a background thread
+    assert calls == [(task["id"], "wt-9")]
+
+
+def test_mcp_complete_never_releases_a_non_handoff_task(coord, monkeypatch):
+    import asyncio
+
+    from agent_dispatch import handoff_claim_release
+
+    client = DispatchClient(coord)
+    task = client.create("work")
+    owner = client.claim(worker_id="worker-1", repo=TEST_REPO)["owner"]
+    client.start(task["id"], owner)
+
+    calls = []
+    monkeypatch.setattr(
+        handoff_claim_release, "_release_task_claim",
+        lambda task_id, **k: calls.append(task_id),
+    )
+    asyncio.new_event_loop().run_until_complete(
+        _call(
+            coord, "dispatch_complete",
+            {"task_id": task["id"], "worker_id": owner},
+        )
+    )
+    time.sleep(0.1)
+    assert calls == []
+
+
+def test_mcp_abandon_releases_handoff_claim(coord, monkeypatch):
+    import asyncio
+
+    from agent_dispatch import handoff_claim_release
+
+    client = DispatchClient(coord)
+    task = client.create(
+        "work", repo=TEST_REPO, labels=["handoff"], target_worktree="wt-9",
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        handoff_claim_release, "_release_task_claim",
+        lambda task_id, **k: calls.append((task_id, k.get("worktree"))),
+    )
+    asyncio.new_event_loop().run_until_complete(
+        _call(
+            coord, "dispatch_abandon",
+            {"task_id": task["id"], "permit": True},
+        )
+    )
+    time.sleep(0.1)
+    assert calls == [(task["id"], "wt-9")]
+
+
+def test_mcp_idempotent_abandon_retry_does_not_re_release(coord, monkeypatch):
+    """PR #3248 review: the MCP abandon tool passed a constant
+    `"task.abandoned"` into `_mutate` unconditionally, so a retry against
+    an already-abandoned task (idempotent, no error) re-fired the release
+    hook every time. `abandon_with_outcome` fixes this the same way
+    `complete_with_outcome` already does for completion retries."""
+    import asyncio
+
+    from agent_dispatch import handoff_claim_release
+
+    client = DispatchClient(coord)
+    task = client.create(
+        "work", repo=TEST_REPO, labels=["handoff"], target_worktree="wt-9",
+    )
+    asyncio.new_event_loop().run_until_complete(
+        _call(coord, "dispatch_abandon", {"task_id": task["id"], "permit": True})
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        handoff_claim_release, "_release_task_claim",
+        lambda task_id, **k: calls.append(task_id),
+    )
+    asyncio.new_event_loop().run_until_complete(
+        _call(coord, "dispatch_abandon", {"task_id": task["id"], "permit": True})
+    )
+    time.sleep(0.1)
+    assert calls == []
 
 
 def test_mcp_complete_rejects_null_result(coord):

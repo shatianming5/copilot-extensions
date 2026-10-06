@@ -62,6 +62,24 @@ complete.
    the actual authoritative root. Enabling policy never creates a parallel
    runtime beside unattributed legacy state, and disabling policy never silently
    reactivates legacy writers after a cell is active.
+10. Runtime selection is crash-consistent across the marker and deploy
+    manifest. A durable installation transaction records the prior selection,
+    validated completed target, receipt generations, and random transaction
+    authorization before marker CAS. Bootstrap/retry finishes the target or
+    restores the prior state; governance is rechecked before marker cutover and
+    before service reconciliation.
+11. Service-bearing cells separate passive instance evidence from active
+    discovery evidence. A passive generation does not start/dequeue shared work
+    or publish shared endpoint/running-version records before an ownership-checked
+    pre-route promotion has made it read-ready. Namespaced deploy, promotion,
+    and recovery require the live cell transaction receipt. Promotion requires
+    the exact passive instance PID/version/installation identity and token;
+    drain, undrain, and shutdown additionally bind that identity to the current
+    route.
+12. Cutover cleanup is installation-scoped and ownership-attested. Recovery may
+    reconcile attributable passive/demoted instance receipts, but it never kills
+    by process name or broad executable match; a completed transition leaves
+    exactly one owned installation PID.
 
 After canonicalizing the configured durable home, receipt validation requires
 the physical path chain `marketplaces/<marketplace-id>/plugins/<plugin-id>` to
@@ -205,17 +223,30 @@ may not regress below the pinned values.
 
 Python and PowerShell publication prepare a hidden
 `<versionsRoot-parent>/.runtime-slot-<slot-digest>-<nonce>/` sibling outside
-`versionsRoot` and use an OS-native atomic no-replace directory rename. If
+`versionsRoot`, write `.runtime-slot-reservation.json` before ownership, and
+use an OS-native atomic no-replace directory rename. If
 another slot appears first, publication fails and preserves it. An interruption
 outside normal in-process cleanup may leave the hidden sibling; it is inert,
 lies outside canonical version-slot enumeration, and requires explicit
-reconciliation rather than automatic deletion. Dependency-light Bash reserves
-the final slot with atomic `mkdir`, then publishes the marker with a no-replace
-hard link from a completed temporary file within that reserved slot. Ordinary
-in-process failures remove the still-empty reservation they own; an interruption
-between reservation and marker publication can leave a markerless slot. That
-visible slot is ambiguous, remains untouched, and fails closed until an explicit
-repair/release transaction.
+receipt-checked release rather than automatic deletion. Dependency-light Bash
+reserves the final slot with atomic `mkdir`, writes the reservation receipt as
+its first entry, then publishes ownership with a no-replace hard link.
+Successful publication removes reservation evidence. A Bash interruption before
+the first entry can still leave a markerless slot; it is never releasable.
+
+The reservation has the exact ownership identity fields, changes `schema` to
+`copilot-extensions.runtime-slot-reservation`, retains `version: 1`, and adds
+`generation`, a random non-negative signed-64-bit integer. `slot-release`
+requires explicit context, durable home, marketplace/plugin/runtime identity,
+current namespace/install generations, the exact reservation root, reservation
+generation, and SHA-256 of the observed receipt bytes. The root may be the
+canonical final slot or its digest-qualified hidden sibling. Both shared locks
+cover receipt, path, identity, contents, and current/LKG revalidation before
+each deletion. Only a directory containing exactly that receipt is removed.
+Completed, selected, LKG, non-empty, markerless, malformed, linked/reparsed,
+foreign, and replaced targets fail closed. Generation drift returns
+`revalidation-required`; absent replay returns `ready` with `released: false`,
+without claiming that the absent target was previously owned.
 
 Slot ownership is non-activating. Publication does not write payload content,
 `.install-complete.json`, `current-version`, `last-known-good`,
@@ -226,9 +257,8 @@ repair, and uninstall transactions remain separately gated.
 `status: "ready"` means the ownership record is attributable, not that the
 current installation is active; results expose `namespaceState`, `installState`,
 and `slotEmpty` for later callers. A runtime version is an immutable build
-identity and cannot be reassigned to another snapshot. Markerless or conflicting
-slots require an explicit future repair/release transaction; this foundation
-does not delete or reclaim them.
+identity and cannot be reassigned to another snapshot. Markerless or conflicting slots remain protected; only receipt-only
+reservations are eligible for explicit release.
 
 Slot provisioning allows up to 30 seconds to serialize under the shared
 genesis and installation locks so slower dependency-light runners retain the
@@ -252,6 +282,50 @@ platform-appropriate publication primitive described above.
 Expected generation arguments use unsigned ASCII decimal syntax, normalize
 leading zeroes before comparison, and must fit the portable signed 64-bit range.
 
+An operative plugin adapter holds one cell-root provisioning lock across the
+entire snapshot, slot reservation, venv/package build, completion, cutover, and
+deploy-manifest publication transaction. Receipt primitives retain their own
+short locks, but releasing those locks never permits a second caller to mutate
+the same supposedly immutable slot during the build. First-use dispatch,
+session-start bootstrap, and direct management calls enter through that same
+outer lock. Payload snapshot publication stages into a uniquely owned sibling
+below `snapshotsRoot`, copies the complete payload there, and atomically renames
+that directory into the final version path before publishing provenance. A
+temporary ownership marker remains until provenance publication and validation
+complete. Retry may remove only a marker-proven final directory that still has
+no provenance sidecar; a pre-existing, unowned, malformed, or conflicting
+snapshot is never deleted or replaced.
+
+Agent Index qualifies its runtime-slot identity by dependency profile:
+`<payload-version>+host`, `<payload-version>+client`, or
+`<payload-version>+unconfigured`. Its canonical `.install-complete.json`
+retains exactly `version`, `completed_at`, `pid`, and `payload_hash`; the
+separate immutable `.agent-index-runtime-profile.json` strictly binds
+marketplace, plugin, slot root/version, role, and extras. A configured-profile
+change therefore builds and selects another attributable slot rather than
+mutating a completed same-version runtime.
+
+POSIX virtual environments may use the standard slot-local `bin/python`
+symlink. An operative adapter may permit only that interpreter leaf after the
+slot ownership transaction validates, while also requiring an ordinary
+`pyvenv.cfg`, a resolvable executable target, and an isolated
+`agent_index.__file__` beneath the owned slot. This exception does not weaken
+the general prohibition on linked or reparsed slot roots, parent directories,
+receipts, package origins, or Windows interpreter artifacts.
+
+After a successful plugin-level cutover, the adapter atomically republishes
+`deploy-manifest.json` schema 4. Its `source` object records the most recently
+reconciled payload provenance that bootstrap uses to decide whether a newly
+loaded payload requires a forward update. Its `runtime` object independently
+records the selected interpreter kind, version, slot path, interpreter path, and
+the payload that selected it. A full provision advances both source provenance
+and runtime selection. A marker-only historical rollback preserves `source`
+while changing only `runtime`, so the next bootstrap does not silently reverse
+the explicit rollback; a later different payload provenance still triggers
+forward reconciliation. Missing, malformed, cross-cell, path-inconsistent, or
+marker-inconsistent manifest data fails closed. A failed compare-and-swap does
+not replace the manifest.
+
 The same three runners expose explicit `slot-complete`,
 `slot-completion-validate`, and `slot-cutover` transactions. Completion captures
 strict build evidence into an immutable owned-slot receipt without selecting the
@@ -265,6 +339,54 @@ rollback pointer. An already-current target is idempotent. Cutover changes the
 versioned-runtime tier-1 selection inside the cell; `activated: false` means it
 does not publish `installation-activation.json`. It does not mutate launchers,
 services, manifests, payloads, or plugin application state.
+
+Payload-invocation manifest version 2 is additive and leaves version 1
+generation unchanged. Version 2 replaces `runtimeRoot` with
+`legacyRuntimeRoot` and declares
+`installationContext: "legacy" | "required"`. The generator accepts
+`required` only for a runtime-bearing core `agent-*` identity present in this
+suite's canonical marketplace; source provenance may still name an independent
+marketplace carrying that same identity. Payload-only and unrelated identities
+are rejected even when their manifests advertise commands, tools, runtimes, or
+services.
+
+Agent Machines is the first operative `required` adopter. Its payload dispatcher
+uses legacy resolution unchanged when authoritative policy is absent or false.
+It selects a cell root only from an active validated Agent Machines activation,
+propagates that canonical context to the runtime, and never falls back to legacy
+after requested-only, malformed, foreign-environment, maintenance, orphaned, or
+generation-stale evidence. First-use and bootstrap reconciliation may build,
+publish immutable completion, and cut over only inside an already-active cell;
+neither path creates activation. Its fixed-identity `slot-cutover` installer
+adapter supplies exact payload, marketplace, plugin, generation, and
+current-marker expectations for forward update or explicit historical rollback.
+Its explicit `cell-repair` and `cell-uninstall` actions are separate lifecycle
+boundaries; neither accepts ambient authorization. Both shell adapters delegate
+to one payload-local stdlib Python engine, require exact caller-supplied
+payload/snapshot/runtime identity, namespace/install generations, and both
+current/LKG expectations, and join the outer provisioning lock plus both receipt
+locks.
+
+Repair derives only schema-4 deploy metadata and the intended current/LKG
+selection from existing validated immutable completion. It preserves
+receipt-defined source provenance separately from historical runtime selection.
+Agent Machines has no additional cell-local launch metadata to reconstruct.
+Missing ownership/completion or snapshot evidence refuses repair; no payload,
+snapshot, receipt, state/run/log/cache, service/task/endpoint, or external
+resource is recreated.
+
+Uninstall first preflights every artifact and refuses active activation, live
+owned processes, or ambiguous evidence. Explicit deactivation is a separate
+transaction. It clears selection by exact CAS before removing every validated
+owned historical slot and snapshot, then derived deploy/launcher/run/log/cache
+artifacts. Each deletion revalidates receipt generations, selection, ownership,
+and the exact captured target and ancestors. POSIX venv interpreter links and
+the exact `lib64 -> lib` scaffolding are removed as links, never followed;
+other linked/reparsed artifacts refuse removal. Durable `state/`,
+`namespace.json`, `install.json`, activation evidence, locks, and attributable
+empty directory structure remain. Namespace GC stays separate. Repeated
+uninstall returns `preserved`; drift returns `revalidation-required`, never
+permission to delete a changed target.
 
 ### Installation-mode governance
 
@@ -420,7 +542,19 @@ Migration writes `<legacy-root>/.installation-ownership.json`:
     "homeRealPath": "C:\\Users\\example",
     "wslDistro": null
   },
-  "transferredAt": "2026-01-01T00:00:00Z"
+  "transferredAt": "2026-01-01T00:00:00Z",
+  "attribution": {
+    "kind": "explicit-legacy-attribution",
+    "legacyRoot": "C:\\Users\\example\\.agent-example",
+    "context": "C:\\Users\\example\\.copilot-extensions\\marketplaces\\example--0123456789abcdef\\plugins\\agent-example\\install.json",
+    "items": [
+      {
+        "kind": "path",
+        "identity": ".agent-example",
+        "path": "C:\\Users\\example\\.agent-example"
+      }
+    ]
+  }
 }
 ```
 
@@ -429,6 +563,180 @@ generation. A tombstone whose activation is missing, unreadable, mismatched, or
 foreign is `orphaned-transfer`: all writers fail closed and legacy operation
 must never resume. Explicit rollback first publishes the next legacy activation
 generation and only then clears the tombstone while holding both locks.
+When a caller records explicit attribution details, `attribution.items`
+enumerates exactly which legacy artifacts were claimed from which paths; absent,
+ambiguous, linked/reparsed, or orphaned artifacts are preserved unchanged and
+remain outside that list.
+
+#### Deactivation record schema
+
+Explicit rollback or deactivation writes
+`<plugin-root>/deactivations/activation-<target-generation>.json`:
+
+```json
+{
+  "schema": "copilot-extensions.installation-deactivation",
+  "version": 1,
+  "marketplaceId": "example--0123456789abcdef",
+  "pluginId": "agent-example",
+  "context": "C:\\Users\\example\\.copilot-extensions\\marketplaces\\example--0123456789abcdef\\plugins\\agent-example\\install.json",
+  "environment": {
+    "platform": "windows",
+    "homeRealPath": "C:\\Users\\example",
+    "wslDistro": null
+  },
+  "target": {
+    "kind": "legacy-attribution-rollback",
+    "activation": {
+      "path": "C:\\Users\\example\\.copilot-extensions\\marketplaces\\example--0123456789abcdef\\plugins\\agent-example\\installation-activation.json",
+      "generation": 1,
+      "mode": "namespaced",
+      "state": "active",
+      "namespaceGeneration": 1,
+      "installGeneration": 1,
+      "legacyDisposition": "retained-inert"
+    },
+    "tombstone": {
+      "path": "C:\\Users\\example\\.agent-example\\.installation-ownership.json",
+      "activationGeneration": 1,
+      "transferredAt": "2026-01-01T00:00:00Z",
+      "attribution": {"kind": "explicit-legacy-attribution"}
+    }
+  },
+  "result": {
+    "activation": {
+      "path": "C:\\Users\\example\\.copilot-extensions\\marketplaces\\example--0123456789abcdef\\plugins\\agent-example\\installation-activation.json",
+      "generation": 2,
+      "mode": "legacy",
+      "state": "deactivated",
+      "legacyDisposition": "restored"
+    },
+    "tombstone": {
+      "path": "C:\\Users\\example\\.agent-example\\.installation-ownership.json",
+      "cleared": true,
+      "clearedAt": "2026-01-01T00:10:00Z"
+    }
+  },
+  "createdAt": "2026-01-01T00:10:00Z"
+}
+```
+
+#### Legacy retirement record schema
+
+Explicit compatibility retirement writes
+`<plugin-root>/retirements/activation-<target-generation>--<retirement-id>.json`:
+
+```json
+{
+  "schema": "copilot-extensions.legacy-retirement",
+  "version": 1,
+  "marketplaceId": "example--0123456789abcdef",
+  "pluginId": "agent-example",
+  "context": "C:\\Users\\example\\.copilot-extensions\\marketplaces\\example--0123456789abcdef\\plugins\\agent-example\\install.json",
+  "environment": {
+    "platform": "windows",
+    "homeRealPath": "C:\\Users\\example",
+    "wslDistro": null
+  },
+  "target": {
+    "id": "global-binstubs",
+    "activation": {
+      "path": "C:\\Users\\example\\.copilot-extensions\\marketplaces\\example--0123456789abcdef\\plugins\\agent-example\\installation-activation.json",
+      "generation": 1,
+      "mode": "namespaced",
+      "state": "active",
+      "namespaceGeneration": 1,
+      "installGeneration": 1,
+      "legacyDisposition": "retained-inert"
+    },
+    "tombstone": {
+      "path": "C:\\Users\\example\\.agent-example\\.installation-ownership.json",
+      "activationGeneration": 1,
+      "transferredAt": "2026-01-01T00:00:00Z",
+      "attribution": {"kind": "explicit-legacy-attribution"}
+    },
+    "health": {
+      "kind": "example-runtime",
+      "status": "ready",
+      "reason": "cell-runtime-healthy",
+      "checkedAt": "2026-01-01T00:15:00Z",
+      "evidence": {"source": "test"}
+    },
+    "items": [
+      {
+        "kind": "path",
+        "identity": ".local/bin/agent-example",
+        "path": "C:\\Users\\example\\.local\\bin\\agent-example"
+      }
+    ]
+  },
+  "result": {
+    "items": [
+      {
+        "kind": "path",
+        "identity": ".local/bin/agent-example",
+        "path": "C:\\Users\\example\\.local\\bin\\agent-example",
+        "disposition": "removed"
+      }
+    ]
+  },
+  "createdAt": "2026-01-01T00:15:00Z"
+}
+```
+
+Retirement is fail-closed and auditable. A wrapper or service artifact is
+retireable only when the claimed tombstone still binds that artifact to the
+current active namespaced activation and the destination cell contributes an
+explicit `health.status: "ready"` report from its own validated runtime or
+service health path. Missing or ambiguous ownership, unhealthy replacements,
+and reappeared artifacts preserve the legacy surface unchanged.
+
+#### Retention and deactivated cells
+
+Phase 6's audit evidence is intentionally asymmetric:
+
+- The legacy ownership tombstone is **temporary ownership evidence**. Explicit
+  rollback clears the matching tombstone under the legacy lock and the cell
+  install lock after publishing the next `legacy`/`deactivated` activation
+  generation and its paired deactivation record. If the tombstone remains but no
+  current namespaced activation can validate it, the result is
+  `orphaned-transfer` and all writers fail closed.
+- `deactivations/activation-<target-generation>.json` and
+  `retirements/activation-<target-generation>--<retirement-id>.json` are
+  **durable audit records**. The shared installation-context library has no
+  age-based expiry, background cleanup, or rotation for either directory.
+  Repeating the same explicit target reuses the existing record for idempotency;
+  it does not rewrite or delete it.
+- `installation-activation.json` is also retained across deactivation.
+  Deactivation advances it to `mode: legacy`, `state: deactivated`; it does not
+  delete the record or remove the cell's runtime artifacts. Cleanup is the only
+  operation permitted to delete the activation record, and only after companion
+  ownership and rollback evidence has been cleared under the required locks.
+
+Operator shorthand may call this an "inactive cell", but the authoritative
+evidence is the deactivated activation record. Diagnose it by reading
+`installation-activation.json` first:
+
+- `mode: legacy`, `state: deactivated` means the cell is no longer
+  authoritative.
+- `legacy.disposition: restored` means rollback restored the legacy footprint
+  and cleared the matching tombstone.
+- `legacy.disposition: absent` means the cell was deactivated only after the
+  caller proved no tombstone remained and the declared legacy probe was absent.
+
+The plugin root may still retain runtime slots, snapshots, logs, cache, and any
+deactivation or retirement records until an explicit cleanup or uninstall path
+removes the artifacts it owns. Deactivation alone is evidence publication and
+authority transfer, not removal.
+
+`target.kind` is `legacy-attribution-rollback` when the caller explicitly
+clears a matching tombstone under the legacy lock and `cell-deactivation` when
+the caller explicitly proves no tombstone exists. The record is keyed by the
+rolled-back activation generation, so repeating the same explicit target is an
+idempotent no-op rather than a second destructive mutation. The active
+`installation-activation.json` still advances to `generation + 1`; the
+deactivation record is the auditable companion that preserves the rolled-back
+target, its prior mode/state, and whether a tombstone was cleared.
 
 Legacy footprint is qualified by ownership. Present but unattributed state
 blocks automatic activation for every cell. A valid tombstone attributing an
@@ -592,6 +900,49 @@ The following reason codes are stable for version 1:
 Implementations may add a more specific stable invalid-evidence reason, such as
 `activation-invalid` or `context-invalid`, without changing status precedence.
 
+#### Durable runtime-root pointer (resolver-free consumers)
+
+**Added 2026-09-27** (`marketplace-scoped-installations` effort, Phase 2
+consumer-resolution correction). Some callers must run before a full
+resolver invocation is safely possible — a session-start hook on a
+"tools-half box" (before the plugin's own runtime is provisioned), or any
+caller for which even `bash` 4.4/`awk`/Python cannot be assumed. These
+callers cannot invoke the resolver directly, yet still need a best-effort
+answer to "is there a currently active runtime for plugin X, and where."
+
+Every `status` resolution (`resolve_installation_mode` / `installation-context.sh
+status` / `installation-context.ps1 status`) that reaches `status: "ready"`
+with a non-null `runtimeRoot` publishes that value, as a side effect, to a
+durable, plain-text, well-known location:
+
+```text
+<durable-home>/<plugin-id>/runtime-root
+```
+
+(`<durable-home>` is the same canonical `.copilot-extensions` root used by
+`installation-mode.json`.) The file contains exactly one line: the absolute
+`runtimeRoot` path, UTF-8, LF-terminated, written with the same atomic
+same-directory-replacement discipline as every other durable-home write. It
+is not a secret (a path, not a credential); each runtime follows its own
+existing atomic-write primitive's default permissions rather than adding new
+platform-specific permission-hardening code for this one file. Publication is
+skipped — the existing pointer, if any, is left
+untouched — whenever `status` is not `"ready"` or `runtimeRoot` is null;
+a transient bad resolution must never overwrite a last-known-good pointer,
+and a failed write must never fail or block the resolver's real result.
+
+**This pointer is advisory-only and never authoritative.** It exists purely
+to let a resolver-free reader make a best-effort existence/path check
+(`test -x "$(cat .../runtime-root 2>/dev/null)/bin/<command>"`, or equivalent)
+with a plain `cat`/`head -n1` — no JSON parsing, no `awk`, no bash-4.4
+features required to read it. Any caller that can afford the real resolver
+must call it directly instead of trusting this file; the pointer may be
+stale (a plugin update, migration, or rollback since the last `status` call)
+and a resolver-free reader that finds it missing or stale must fail open
+exactly as it already does today for "no answer" — it must never treat the
+pointer's absence as proof nothing is installed, and never use it to gate a
+mutating decision.
+
 #### Effective-mode and status table
 
 | Policy/evidence | Activation and legacy state | Effective result |
@@ -606,7 +957,7 @@ Implementations may add a more specific stable invalid-evidence reason, such as
 | Any | Tombstone exists but its activation is missing, unreadable, mismatched, or foreign | `orphaned-transfer`; no legacy or namespaced mutation and never resume legacy |
 | Any | Activation/tombstone environment differs from the current exact environment tuple | `foreign-environment`; fail closed |
 | Any | Observed activation, namespace, or install generation changed | `revalidation-required`; restart resolution |
-| Any | Marketplace provenance is unresolved or ambiguous | `provenance-blocked`; do not create or migrate a cell |
+| Any | Marketplace provenance is unresolved or ambiguous | `provenance-blocked`; do not create or migrate a cell. When policy is genuinely missing/default-false and the legacy root is active with no ownership tombstone, `probe-legacy` may authorize only that legacy root's bootstrap or maintenance. |
 | Malformed or invalid supported-v1 policy | Pinned actual root can be validated | `invalid`; retain that root for diagnosis, but block mutation except the explicitly defined repair path |
 | Higher unsupported policy version | Valid active namespaced activation | `invalid`; keep pinned namespaced runtime and doctor/repair available, but block policy-changing operations |
 | Higher unsupported policy version | No valid activation | `invalid`; create or migrate nothing |
@@ -623,6 +974,9 @@ verification. Failure to acquire either lock fails closed. Publication order
 for a transferred legacy footprint must never expose namespaced activation
 without its matching tombstone, nor clear the tombstone before a rollback
 activation is durable.
+An explicit attribution command may no-op when the same destination already owns
+the tombstoned footprint, but it must never silently claim ambiguous or
+orphaned legacy state.
 
 At every iteration boundary and immediately before mutation, legacy and
 namespaced long-running loops recheck maintenance, the tombstone, activation
@@ -646,12 +1000,15 @@ The primitive exposes two read-only actions:
 
 `probe-legacy` refuses valid namespaced activation, every valid legacy
 tombstone, clean namespaced pre-activation, maintenance, invalid or foreign
-evidence, orphaned transfer, generation revalidation, unresolved provenance,
-deactivation-required state, and any other unsafe state. It permits a ready
-authoritative legacy runtime and `migration-required`, because legacy remains
-authoritative until the explicit two-lock migration transaction publishes
-activation and tombstone ownership. Neither action creates, modifies, or clears
-any file or directory.
+evidence, orphaned transfer, generation revalidation, deactivation-required
+state, and any other unsafe state. Unresolved provenance remains fail-closed
+for cell creation and migration; the sole legacy-mutation exception is a
+genuinely missing/default-false policy with an active, untombstoned legacy
+root, because no namespaced ownership has been requested or published. It also
+permits a ready authoritative legacy runtime and `migration-required`, because
+legacy remains authoritative until the explicit two-lock migration transaction
+publishes activation and tombstone ownership. Neither action creates, modifies,
+or clears any file or directory.
 
 #### Maintenance contract
 
@@ -668,6 +1025,12 @@ or dead-owner sidecar reports `maintenance-stale` and is never auto-cleared.
 Read-only doctor/status remains available. Repair or maintenance mutation
 requires an explicit authorization flag on the invoked management command;
 environment variables and inherited context cannot authorize it.
+The canonical Python primitive now provides explicit `maintenance-enter`,
+`maintenance-status`, and `maintenance-release` actions. Entering maintenance
+returns a random token recorded only in the sidecar; a management command may
+proceed during applicable maintenance only when it presents that exact token,
+and release removes the marker only when the token still matches the active
+owner.
 
 Remote dispatchers query target maintenance before provisioning. If target
 state cannot be determined, they treat the target as quiesced and do not
@@ -739,12 +1102,16 @@ Consequence — a rule for every plugin in this repo:
      agent-bridge), `agent-codespaces:codespaces-setup` (agent-codespaces), `agent-containers:containers-fleet`
      (agent-containers).
 
-  A Python `agent-*` runtime that exposes an agent-facing command additionally
+  A Python runtime that exposes an agent-facing command additionally
   ships:
   3. `payload-invocation.json` plus its generated POSIX, PowerShell, and CMD
      payload-local command shims, and
-  4. attributable `sessionStart` hooks for both `bootstrap-check` and
-     `emit-command-catalog`.
+  4. an attributable `sessionStart` hook for `emit-command-catalog`, plus
+     `bootstrap-check` unless `payload-invocation.json` explicitly declares
+     `"sessionStartBootstrap": false`. That exception is for repository-gated,
+     explicit-first-use runtimes whose session start must remain non-mutating;
+     their catalog and payload dispatcher must share the same fail-closed
+     activation gate.
 
 Every agent-facing command belongs to its implementing payload. Skills consume
 the owning plugin's exact catalog `argv`; they do not hardcode another plugin's
@@ -775,9 +1142,9 @@ manifest, and service restart (see "What NOT to Do" and "Deploying: one command
 > **every** enabled runtime plugin, not just agent-worktrees and the
 > `modules.json` services, so a runtime like agent-codespaces can no longer have
 > its payload refreshed while its venv silently keeps serving stale code
-> (dotfiles #1025). The per-PR **version-bump guard** (`check-version-bump.py`)
-> makes the same-version-drift case rare in the first place, so `--force` stays a
-> last resort.
+> (dotfiles #1025). The per-PR **changefile-presence guard**
+> (`check-changefile-presence.py`) makes the same-version-drift case rare in
+> the first place, so `--force` stays a last resort.
 
 ### What the marketplace vendors (copied vs loaded)
 
@@ -828,6 +1195,14 @@ When a session launches in a repo whose `.github/copilot/settings.json`
    `~/.<name>/deploy-manifest.json` `source.version`, and running the plugin's
    own `scripts/install.* update` (or `init.*`) only on drift.
 
+For a plugin that vendors the installation-context library, reconciliation
+locates and validates that plugin's active core-marketplace `install.json`
+receipt before running its installer. The child process receives that exact
+receipt through `COPILOT_EXTENSIONS_CONTEXT`; caller payload roots, Python
+paths, and any foreign plugin context are removed. A missing or invalid receipt
+blocks that plugin's mutation with an explicit diagnostic rather than falling
+through to an unattributed legacy root.
+
 A plugin declares whether — and where — its runtime should be reconciled via a
 **`runtimeScope`** field in its `plugin.json`:
 
@@ -862,7 +1237,7 @@ configured, from that repo via the repos registry. Both knobs are **pluggable**
 via environment variables — `WORKTREE_GATE_MANIFEST` (the filename) and
 `WORKTREE_GATE_ANCHOR` (the anchor repo name) — so any control harness can point
 the gate at its own manifest; the defaults (`external-repos.yaml`, anchor
-`aperture-labs`) match this repo's reference facility. With no gate info
+`private downstream reference repo`) match this repo's reference facility. With no gate info
 available, a `machine-gated` runtime is **skipped** (safe default — never
 auto-install a machine-specific runtime where the policy is unknown).
 Reconciliation is local and version-keyed, so a re-launch with no version change
@@ -1005,8 +1380,9 @@ write deploy-manifest.json  (schema_version 3, source block, atomic temp+move)
     `copilot plugin update` triggers must be **fast** and must never hold the
     singleton marketplace payload open long enough to wedge a concurrent update:
     - **`stamp`** — snapshot the payload SOURCE into the versioned slot area
-      (Windows: `~/.<name>/snapshots/<ver>/` + a `payload-dir`/`stamped-version`
-      marker; POSIX records a `payload-dir` pointer) and deploy the
+      (Windows: `~/.<name>/snapshots/<ver>-<unique>/` + a `payload-dir`/
+      `stamped-version` marker; POSIX records the same `payload-dir` pointer)
+      and deploy the
       **self-provisioning binstub** — **no inline venv build**. Fits a hook grace
       window; frees the payload immediately (it copies from the already
       self-staged `$PluginDir`).
@@ -1021,6 +1397,38 @@ write deploy-manifest.json  (schema_version 3, source block, atomic temp+move)
       the ps1-lane exemption seam `BASELINE_NO_STAMP_PS1` tracks the not-yet-ported
       Thread-B service runtimes and must shrink as each lands. See the
       `correct-install-flows` effort.
+
+### Contained-test persistent environment contract (Windows)
+
+Redirecting `USERPROFILE` or `HOME` does not redirect .NET
+`EnvironmentVariableTarget.User` or `EnvironmentVariableTarget.Machine`; those
+targets still address the real Windows registry. Every PowerShell installer or
+transport setup script that reads or writes persistent User/Machine environment
+state must use the shared `install-contract:test-persistent-environment`
+adapter. When `COPILOT_EXTENSIONS_TEST_CONTAINED=1`, the adapter maps those
+operations to Process scope. A subprocess launched by pytest receives the same
+mapping through pytest's inherited `PYTEST_CURRENT_TEST` marker, including when
+the suite is run directly instead of through the repository runner. Outside
+those test contexts, the adapter preserves the real User/Machine behavior
+required by production installation.
+
+`tools/check-install-contract.py` scans every plugin PowerShell script, rejects
+multiline .NET calls whose target is not explicitly Process (including target
+variables and `EnvironmentVariableTarget.User` / `.Machine`), and rejects direct
+access to the persistent User or Machine environment registry paths outside the
+byte-identical adapter. This automatically covers new installers and nested
+transport scripts. **It also sweeps every other tracked `.ps1` in the repo**
+(tests, helpers, shared libs — anything outside `plugins/`) for the same direct
+violations, so a test/integration-harness script that has no reason to carry
+the full adapter is still blocked from calling the real registry-backed
+target directly — a live-hit failure mode: an untracked ad-hoc test
+invocation once leaked dead entries into the operator's real, persistent
+Windows User `PATH`. Only the `plugins/**/*.ps1` installers must additionally
+carry the adapter itself; a non-installer script may instead pass an explicit
+`Process` target. The contained test runner adds detection-only defense in
+depth: it snapshots the real User and Machine registry environment keys and
+fails the test flow if drift is observed. It never rolls back the whole key,
+because doing so could overwrite a legitimate concurrent edit.
 
 ## Update-flow robustness — self-stage, watchdog, completion markers (#935)
 
@@ -1078,6 +1486,47 @@ default; `<=0` disables. Secondary: `UV_HTTP_TIMEOUT` bounds each uv request so 
 download degrades to "failed + retryable" rather than wedging. Backstop:
 `bootstrap-check`'s single-flight + stale-reap.
 
+### Agent Machines Windows first-use diagnostics
+
+The [Agent Machines Windows dispatcher](../plugins/agent-machines/scripts/invoke-payload-runtime.ps1)
+implements the [self-provisioning runtime intent](../visions/plugin-services/README.md#self-provisioning-runtime)
+for an unresolved runtime. It invokes the owning installer's legacy
+`stamp`/snapshot `provision` or active-cell `cell-provision` path. Commands with
+an already-resolved runtime bypass this installer-output path.
+
+The dispatcher launches the current PowerShell executable with text-format
+output and separate file-backed stdout/stderr capture. This keeps nested
+installer output outside PowerShell's native CLIXML/error-record parser. Both
+streams are forwarded to **stderr**, leaving command stdout available for the
+runtime's result. Complete CR/LF-terminated records are forwarded while the
+installer runs; final unterminated text is emitted after exit and draining.
+There is no line-count truncation. Order is preserved within each stream;
+chronological ordering across the two streams is not guaranteed.
+
+Incremental byte reads use a persistent decoder per stream. The inherited
+console encoding is the default; a BOM selects UTF-8, UTF-16, or UTF-32 with its
+byte order. Partial BOMs and multibyte characters survive a growing file's
+temporary EOF. Decoders flush only after installer exit and complete draining.
+Read-buffer size controls transfer granularity, not output retention. Capture
+files are deleted during cleanup and their on-disk size is not capped; they
+are temporary transport rather than an archival log.
+
+The dispatcher retains the process handle for PowerShell 5.1 exit-code reporting
+and waits on the direct installer, rather than using a whole-descendant-tree
+wait. The installer's existing self-stage/watchdog owns staged-child deadlines
+and exit `124`. If capture fails while the owned installer is still running,
+the dispatcher attempts PID-scoped tree termination. Resource disposal and
+capture-file deletion are attempted independently; secondary cleanup failures
+are reported without replacing the installer result or original exception.
+
+The [dispatcher regressions](../plugins/agent-machines/tests/test_payload_provisioning_powershell.py)
+cover live/full output, argument forwarding, encoding, retry, and warm-runtime
+behavior. The [lifecycle regressions](../plugins/agent-machines/tests/test_payload_installer_lifecycle_powershell.py)
+cover cleanup-failure outcomes, split decoding, direct-child waiting, and real
+installer self-staging/watchdog behavior through its offline smoke seam.
+These suites do not establish a full network/package installation or every
+cancellation and descendant-termination race.
+
 ### Completion marker — no corpse reuse, clean retry
 
 Completion was inferred only from the runtime-root `deploy-manifest.json` /
@@ -1105,6 +1554,90 @@ and the markerless corpse is tossed + rebuilt on the next run (automatic retry).
 > NOT-IN-PAYLOAD, PAYLOAD-FREE-during-install, MARKETPLACE-preserved, NO-COLLISION,
 > WATCHDOG whole-tree kill, MARKER/TOSS, NO-ORPHANS, BOUNDED) — via a
 > `COPILOT_PLUGIN_INSTALL_SMOKE` seam, without a heavy venv build.
+
+> **`worktree-manager` carries an independent analog, not this shared
+> helper.** It is deliberately **not** a Copilot plugin (see its own
+> [README](../worktree-manager/README.md)) and ships no `libs/` monorepo
+> ancestor to a machine that fetched it standalone via tarball, so its
+> `self_install.py` cannot depend on `versioned_runtime.py`. It reimplements
+> the same "marker published only after a verified-complete build" invariant
+> directly: a per-slot `.install-complete` file, invalidated before
+> mutation and published only after its three key entrypoint files are
+> confirmed present (a cheap secondary check, not an exhaustive scan of
+> every module the package imports), closing the identical corpse-slot
+> hazard (there, a Windows `PermissionError` from
+> `shutil.rmtree`/`shutil.copytree` hitting a slot still held open by
+> another process) for this one standalone installer.
+
+### Update-in-progress marker — installer self-reports a live transition (#5066)
+
+A **separate** concern from the completion marker above: that one records
+whether a *build* finished; this one records whether the *live-service*
+update/start lifecycle (drain → stop → stage → start, or a zero-downtime
+cutover) is **currently in flight** — seconds to a couple of minutes, during
+which the daemon can legitimately be briefly down or mid-handoff. Before
+this, nothing locally visible could distinguish "correctly mid-transition"
+from "actually dead and never came back" (the originating incident:
+agent-bridge sat dead for 3+ days after an interrupted cutover,
+aperture-labs#7890 §3), so a local liveness watchdog had to rely on a
+caller-side wrapper around every manual update — exactly the kind of
+fragile convention this marker eliminates, including for *automatic*
+self-update cutovers that nothing ever wraps.
+
+Each live-service installer (`agent-bridge`, `agent-dispatch`) writes its
+own well-known, documented marker at `$INSTALL_DIR/update-in-progress`: a
+file containing a single epoch-seconds expiry (20 minutes past write time
+by default — generous past any observed real cutover), atomically published
+(temp-file + rename, never a truncate-then-write race for a reader) at the
+start of `do_update`'s/`do_start`'s live-service branch, **after** every
+"nothing to do" early return (an already-healthy daemon, a forwarded host
+route, a lock-contention defer) so the marker is never set when nothing is
+actually happening. Any downstream consumer (a local liveness watchdog, a
+diagnostic tool) can check
+`[[ -f "$INSTALL_DIR/update-in-progress" ]] && (( $(cat ...) > $(date +%s) ))`
+without needing any plugin-specific caller-side cooperation.
+
+**Reference-counted, not single-owner.** A long-running `do_update`/
+`Invoke-Update` and a short `do_start`/`Invoke-Start` can legitimately
+overlap (neither serializes against the other beyond the install lock each
+already takes independently). A naive "last writer wins" marker breaks
+here: the short call's exit-time cleanup would delete the marker while the
+long call is still genuinely mid-transition. Both languages instead guard
+a small on-disk counter with a dedicated lock — **`flock` on a separate fd
+(never the main install-lock fd)** for `.sh`, a named
+**`System.Threading.Mutex`** for `.ps1` (the Windows cross-process
+primitive; `flock` has no Windows equivalent) — so the first caller to
+enter (count 0→1) writes the marker with a fresh expiry, later concurrent
+callers just increment, and only the caller that brings the count back to
+0 actually removes the marker. A same-process nested call (`do_update`
+calling `do_start` internally, where that pattern exists) is tracked via a
+process-local "already held" flag so it reuses the outer holder's slot
+rather than double-incrementing.
+
+**Scope: covers the installer's own lifecycle only.** This marker is
+written by the `do_update`/`do_start` (`Invoke-Update`/`Invoke-Start`)
+code paths in these install scripts. It does **not** cover
+`agent-dispatch`'s coordinator-driven self-deploy/successor-respawn paths
+(the coordinator process redeploying or replacing itself without going
+through the installer's CLI entry point) — a consumer watching this marker
+sees no transition during those, and must not assume it has full coverage
+of every way the daemon can restart.
+
+Cleared on **every** exit path uniformly — success, a cutover-then-fallback,
+a failed update's rollback, or an unhandled error — via a single cleanup
+hook per language rather than scattered manual clears at each return site:
+
+- **`.sh`:** a **global `trap _clear_update_marker EXIT`**, set immediately
+  after the first `_write_update_marker` call — never a function-local
+  `RETURN` trap, since under `set -euo pipefail` an unexpected command
+  failure terminates the whole script rather than returning normally, and
+  only an `EXIT` trap is guaranteed to still fire in that case.
+- **`.ps1`:** `Write-UpdateMarker` followed by `try { ... } finally {
+  Clear-UpdateMarker }` wrapping the remaining live-service body —
+  PowerShell's `trap` statement only fires for terminating *errors*, never
+  a clean `return`, so `finally` is the correct primitive here (the same
+  one `agent-bridge/scripts/install.ps1`'s `Invoke-Update` already relies on
+  for releasing its install lock on every exit path, `exit` included).
 
 ### POSIX parity (`.sh`)
 
@@ -1377,6 +1910,64 @@ A plugin's own `scripts/*` and `src/<pkg>/installer.py` ship together, so they
 may share freely. Secondary entry points (e.g. `init.ps1`/`init.sh`) should
 delegate to the canonical `install.*` rather than duplicate the deploy logic.
 
+## Shared installer-engine helpers (`libs/installer-engine/`)
+
+A canonical pair of files, `libs/installer-engine/installer-engine.ps1` and
+`.sh`, carries the installer logic that was mechanically duplicated across
+every Python runtime plugin's own `install.*` before this existed: native
+command capture, the transient-uv-race retry helpers (SRE module mismatch
+`#6785`, `pyvenv.cfg` corruption `#6852`), signed-venv creation, `uv`
+self-bootstrap, schema-version-3 deploy-manifest writing, and a minimal
+self-provisioning binstub writer (`Write-SimpleBinstub`) for a plugin with no
+scheduled-task/service lifecycle. Adoption is **opt-in and byte-vendored, not
+imported** at ship time, but there are now **two valid dev-time authoring
+forms**:
+
+- **Byte-vendored form** — the adopter keeps a real
+  `scripts/installer-engine.{ps1,sh}` copy in its own tree, byte-identical to
+  canonical and kept in sync by `tools/sync-installer-engine.py` (`--check`
+  verifies; write mode repairs or refreshes the local copies).
+- **Canonical-reference form** — the adopter's `install.sh` / `install.ps1`
+  sources `libs/installer-engine/installer-engine.{sh,ps1}` directly while
+  working on `dev`, and keeps **no** plugin-local engine copy there.
+
+Regardless of the dev-time form, the **shipped payload is always materialized
+back to a real local `scripts/installer-engine.{ps1,sh}` copy** before release:
+`materialize_main.py` / `preview_release.py` copy canonical into the plugin's
+own `scripts/` directory and rewrite the wrapper back to the local source line,
+so the installed artifact never reaches across a plugin boundary at install or
+runtime. `tools/sync-installer-engine.py`'s own `unregistered_adopters()`
+check also fails closed if a plugin references or carries installer-engine
+content without being registered in the tool's `ADOPTERS` tuple, so a
+hand-added adopter cannot drift silently forever.
+
+`agent-worktrees`' packaged non-editable launch fallback follows the same
+contract: the authoritative launch-wrapper scripts live under
+`worktree-manager/bin/` on `dev`, but release/preview materialization copies the
+manifest-declared wrapper set into `plugins/agent-worktrees/bin/` before ship,
+so `deploy_wrappers()` in a packaged payload never depends on a sibling
+checkout being present.
+
+The engine deliberately does **not** cover per-service concerns that
+genuinely differ across plugins — scheduled-task/service lifecycle,
+sibling-plugin installs, or any bespoke per-service config — those stay in
+each plugin's own `install.*`, which sources the vendored engine file for the
+shared primitives and supplies its own config/parameters around it. Vendoring
+(byte-copy + `--check` drift detection) was chosen over a runtime
+git-fetch/import specifically to preserve this doc's existing
+self-containment constraint (a plugin's installer must not reach across a
+plugin boundary at install time) — see the `vendored-installer-engine`
+effort's Journal for the full git-fetch-vs-vendoring reasoning.
+
+Only a plugin explicitly opted into `tools/sync-installer-engine.py`'s
+`ADOPTERS` tuple is expected to carry (and keep in sync) the vendored engine
+files; this is a phased rollout, not a blanket requirement for every runtime
+plugin yet. `agent-worktrees` carries a standing, permanent exception (it is
+the control-plane plugin, by far the largest and most bespoke installer, and
+already opts out of the related `versioned_runtime.py` fan-out for the same
+specialization reason) — it is not expected to adopt this engine, now or
+later.
+
 ## Runtime self-reconcile and command glossary (session-start hooks)
 
 A Python runtime plugin currently installs a legacy `~/.local/bin/<name>`
@@ -1399,7 +1990,22 @@ commands; a desired flag or environment hint alone is insufficient.
 
 So every Python runtime plugin **self-reconciles at session start**: it declares
 a `sessionStart` hook that re-runs its own installer **only when the deployed
-version drifts** from the payload.
+version drifts** from the payload -- **unless the bootstrap-killswitch is
+active**, in which case that plugin's hook skips its own reconcile entirely for
+this session (see `libs/bootstrap-killswitch/README.md`; amends the
+*self-provisioning-runtime* vision in `visions/plugin-services/README.md`).
+Every adopting plugin's `bootstrap-check.{ps1,sh}` checks its vendored
+`bootstrap-killswitch-guard.{ps1,sh}` as its very first step, before any
+version comparison below, against one shared, cross-plugin state file
+(`~/.copilot-extensions/bootstrap-killswitch.json`) -- an operator/agent hand-
+diagnosing a venv or install path directly sets this switch so a background
+reconcile can never race that diagnosis; it fails open to "reconcile proceeds
+normally" on a missing or malformed state file. This switch applies **only to
+the default (non-namespaced) installation**: a namespaced marketplace cell's
+own `COPILOT_EXTENSIONS_CONTEXT` reconcile path is a deliberate no-op for this
+guard, so the switch can never cross an installation-cell boundary (see the
+[Marketplace Installation Cells](../visions/plugin-services/installation-cells/README.md)
+vision).
 
 - `plugin.json` sets `"hooks": "hooks.json"`.
 - `hooks.json` `hooks.sessionStart` runs the plugin's `scripts/bootstrap-check.{ps1,sh}`
@@ -1411,6 +2017,10 @@ version drifts** from the payload.
   plugin's canonical installer (`init.*`, or `install.* install`) **in the
   background** — the atomic versioned-venv swap keeps concurrent use safe, and
   backgrounding keeps session start non-blocking.
+- A namespaced Agent Machines cell uses the schema-4 distinction defined above:
+  bootstrap compares the loaded payload only with reconciled `source`
+  provenance, validates `runtime` against the cell-local marker/interpreter, and
+  does not treat an intentionally selected historical runtime as payload drift.
 - A separate `sessionStart` command hook runs
   `scripts/emit-command-catalog.{ps1,sh}` from `COPILOT_PLUGIN_ROOT` and emits
   exact payload-local `argv` plus `availability`. It never snapshots dynamic
@@ -1438,10 +2048,20 @@ runtime entrypoint (`install.*` if present, else `init.*`):
 - each Python runtime's `scripts/versioned_runtime.py` is byte-identical to the
   canonical `libs/versioned-runtime/versioned_runtime.py` (edit the canonical and
   run `python tools/sync-versioned-runtime.py`; `--check` verifies in CI/pre-push),
+- an adopting plugin's `scripts/installer-engine.{ps1,sh}` is byte-identical to
+  the canonical `libs/installer-engine/installer-engine.{ps1,sh}`, and no
+  unregistered plugin carries a drifted copy (`python
+  tools/sync-installer-engine.py --check`, wired into CI's `guards + lint`
+  job; see [Shared installer-engine helpers](#shared-installer-engine-helpers-libsinstaller-engine)),
 - each Python runtime wires the **session-start reconcile hook** above
-  (`plugin.json` `hooks` → a `sessionStart` `bootstrap-check`). Plugins predating
+  (`plugin.json` `hooks` → a `sessionStart` `bootstrap-check`), unless its
+  payload manifest explicitly sets `sessionStartBootstrap: false` for a
+  repository-gated, explicit-first-use runtime whose session start is required
+  to remain non-mutating. Plugins predating
   the invariant are listed in `EXEMPT_SESSION_HOOK` (tracked in dotfiles#779) —
   new runtime plugins must comply, not be added to that set.
+- every plugin PowerShell script routes persistent User/Machine environment
+  access through the shared contained-test adapter; direct access is rejected.
 
 Wire it as a `pre-push` hook (see `tools/hooks/pre-push`, which also runs
 `tools/check-no-internal-identifiers.py` — a repo-wide guard that fails the push

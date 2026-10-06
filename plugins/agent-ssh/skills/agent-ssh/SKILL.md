@@ -116,6 +116,47 @@ point remotely, invoke that repository's published binstub through the same
 profile. Transport setup and repair remain in the dedicated client, host, key,
 and troubleshooting skills shipped by this plugin.
 
+## CLI-mode session on a machine
+
+For an observable Copilot CLI session on a POSIX SSH machine:
+
+```bash
+<catalog argv[0]> copilot-config set <ssh-target> --workspace /path/to/remote/checkout
+<catalog argv[0]> copilot <ssh-target>
+<catalog argv[0]> copilot <ssh-target> --detach --seed-file task.md
+<catalog argv[0]> copilot <ssh-target> --stop
+```
+
+The target must already have `bash`, `tmux`, `copilot`, `agent-worktrees`, and
+the `agent-bridge` Copilot plugin installed. With no mode flag, `copilot`
+attaches this terminal to the remote machine's tmux-backed anchor session;
+re-running the command re-attaches. If a detached keeper or another attached
+process already provides the bridge route, the attached command reuses it
+instead of binding the same remote forward again. `--detach` provisions the host
+bridge registration credentials on the remote, starts a small keeper for the
+bridge reverse forward, reserves a venue-qualified CLI-mode identity
+(`anchor-<repo>@<ssh-target>`), runs the target's own worktree `embody` verb
+(anchor, JSON mode), waits for registration, and prints a JSON handle with
+`status`/`observe`/`nudge`/`attach`/`stop` commands. `--stop` stops that
+detached session and releases its keeper. Windows SSH targets are not supported
+yet; run the orchestrator on that machine and embody the session there locally.
+
+The remote checkout is resolved fail-closed: explicit `--workspace`, then the
+per-host config this plugin owns, written by
+`<catalog argv[0]> copilot-config set <ssh-target> --workspace /path/to/checkout`
+(`~/.agent-ssh/copilot-hosts.json`). It does not scan the remote machine for a
+checkout. If no workspace resolves, pass `--workspace` or set the per-host
+config. `--ttl-seconds` is attached mode only; detached launches use a fixed
+short launch reservation and release it after registration.
+
+`--ref-file PATH` (repeatable; a file or a folder, up to 256 MiB per call)
+copies an operator file (a HAR, a log, a transcript) to
+`~/.agent-bridge/refs/<batch>/` on the target, outside the checkout, over the <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
+SSH channel's stdin, and tells the worker the exact paths: in the seed for a
+new session, or as a message when the same `--detach` rejoins a running one.
+The handle reports `ref_files` and `refs_delivered` (`seed`/`message`/`failed`).
+The orchestrator passes only the host path and never reads the file itself.
+
 ## Explore a machine
 
 ```bash
@@ -155,7 +196,17 @@ so use `<catalog argv[0]> verify <alias>` to probe a host live.
 A cwd-gated `sessionStart` hook (`scripts/emit-mesh-pointer.*`) emits only a
 **succinct pointer** to this command when the repo has a `machines.yaml`, rather
 than injecting the whole table every session — run `mesh-status` on demand for
-the detail.
+the detail. The same pointer defines the unreachable-route handoff: after every
+declared route remains unavailable following bounded diagnosis, put repeatable
+state in agent-machines or another declared auto-update owner and queue residual
+local work in the explicitly identified user repository. Target-local execution
+uses the optional cross-plugin `agent-machines:performing-machine-maintenance`
+skill when active. Without it, maintenance is inspection-only: preserve the
+machine-scoped issue and do not mutate until an equivalent trusted workflow
+supplies queue location, atomic claim, revision, confirmation, and verification
+semantics.
+Authentication, host-key, profile, and transport-configuration failures remain
+diagnosis paths rather than maintenance queue entries.
 
 ## Writing a transport
 

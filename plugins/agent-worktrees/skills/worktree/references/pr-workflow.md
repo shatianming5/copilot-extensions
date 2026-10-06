@@ -12,8 +12,13 @@ rules.
 
 ## Contents
 - Check the target repo's PR flow first (profiles + verb applicability)
+- Addressing a foreign repo -- no local checkout needed (the claimant contract)
 - Detecting PR mode + where PR config lives (machine-local vs in-repo)
-- `create-pr` (auto-open, attribution marker, labels)
+- Auto-complete/auto-merge is not a bypass -- prefer it, keep watching
+- Default conduct: drive every PR through to merge (waiting policy + sanctioned deviations)
+- Never assert what masked/redacted tool output literally contains
+- `create-pr` (auto-open, attribution marker, labels) -- for tracing a PR you
+  didn't open, see [pr-attribution.md](pr-attribution.md) instead
 - Dispositions: keep-alive vs detach
 - Draft PRs (`--draft` / `pr-ready`)
 - Multiple PRs from one worktree
@@ -24,6 +29,45 @@ rules.
 
 Some repos opt into a **pull-request workflow** instead of direct-push
 finalization. A repo is in PR mode when its config sets `pr.enabled: true`.
+
+### Addressing a foreign repo -- no local checkout needed (the claimant contract)
+
+`pr-watch` and `pr-merge` can act on a PR in a repo you have **no local
+checkout of at all** -- the `foreign-repo-pr-operations` capability. The
+contract is fixed, regardless of which repo you're addressing:
+
+- **The owning project is always your CWD.** Run these commands from your
+  own worktree -- the one responsible for the work, and the **claimant**
+  that owns this operation's lifetime. Never run them from an untracked
+  directory, a bare project anchor, or -- the common mistake -- from inside
+  the *target* repo's own checkout.
+- **The target repo is always an explicit argument** (`owner/name` or ADO
+  `project/repo`), never inferred from "whichever repo's checkout I happen
+  to be sitting in." Addressing a repo this way needs it **registered**
+  (`<agent-worktrees catalog argv[0]> repos add <name> <path> --remote <url>`)
+  so its own provider/token/policy can be resolved -- it does **not** need a
+  local worktree of it.
+
+```
+<agent-worktrees catalog argv[0]> pr-watch wait owner/other-repo 42 --timeout 1
+<agent-worktrees catalog argv[0]> pr-merge owner/other-repo 42 --now
+```
+
+Both commands refuse, with actionable guidance, instead of silently doing
+the wrong thing, when:
+- **CWD isn't a tracked worktree** -- there is no claimant to own the
+  operation. The error names the fix: run it from your own worktree.
+- **The target slug isn't a repo this machine can resolve a binding for** --
+  it refuses rather than falling back to *your own* project's
+  provider/token/policy for a *different* repo (which would silently act
+  under the wrong identity/policy).
+
+**If either refusal fires, follow the guidance in the error -- do not fall
+back to `gh`/`az repos`/`git` directly for the same operation.** That skips
+the provider/token/policy resolution this command exists to get right, and
+defeats the point of having one coherent PR surface at all.
+
+
 
 ### Check the target repo's PR flow FIRST -- it is not the same everywhere
 
@@ -43,7 +87,7 @@ The three profiles (derived purely from config -- provider-generic, no network):
 | Profile | Config shape | How work lands | Verbs that apply |
 |---------|--------------|----------------|------------------|
 | **`direct`** | `pr.enabled: false` | `finalize` lands to the default branch | *(none -- no PR flow)* |
-| **`pr-human-merge`** | enabled, **no** `automerge_label` | PR-gated; a **human** approves + merges | `create-pr`, `pr-watch`, `pr-status`, `pr-complete` -- **not `pr-merge`** |
+| **`pr-human-merge`** | enabled, **no** `automerge_label` | PR-gated; a **human** approves + merges | `create-pr`, `pr-watch`, `pr-status`, `pr-nudge`, `pr-complete` -- **not `pr-merge`** |
 | **`pr-agent-merge`** | enabled + an `automerge_label` bound | PR-gated; the author **signals merge consent** after approval; the review gate merges | the full `pr-*` family, including `pr-merge` |
 
 **Applicability is self-describing.** `pr-status` prints the profile (`flow:`
@@ -82,14 +126,57 @@ So an **ADO repo** (e.g. `example-marketplace`) binds `automerge_label: auto-com
 - `approval_required: false` -- **self-complete**: eligible when simply *not*
   changes-requested (we own the merge; no approval vote needed). A
   `CHANGES_REQUESTED` review still blocks -- address it, then re-run.
+- `allow_stale_approval: true` -- preserve an approval as merge authority only
+  for the bounded race where the same provider endpoint observed the exact
+  tracked current head before the stale approval was submitted. Both timestamps
+  come from the provider clock, and the observation must strictly precede the
+  approval. Every mediated create, push, or manual association clears and
+  reacquires the evidence, so a post-approval mediated push cannot inherit the
+  approval. Same-second, missing, malformed, endpoint-mismatched, head-
+  mismatched, or provider-unsupported evidence fails closed. Providers expose
+  no portable head-generation watermark, so enabling this policy also requires
+  branch updates to use the mediated PR flow; a generic client cannot detect an
+  arbitrary out-of-band replay of a previously observed SHA. `pr-status` and
+  `pr-watch` expose `approval_stale` plus `approval_stale_authorized`;
+  mergeability, holds, WIP state, and changes-requested verdicts still block.
 - `bypass_policy: true` -- complete **past** a branch policy that never
   auto-satisfies for our own PRs (e.g. a central governance status policy);
   otherwise ADO auto-complete would wait forever.
 
+**Auto-complete/auto-merge is not the same thing as a bypass merge, and
+arming it is not itself a self-merge/bypass act.** Requesting auto-complete
+(this whole "Request auto-complete" mechanism, on any provider) is a
+hands-off *completion* mechanic: the platform merges automatically **only
+once every required review and status-check gate the PR would need anyway is
+satisfied** -- it grants no gate, skips no approval, and a submitter cannot
+use it to force their own unapproved PR through. That is categorically
+different from an actual bypass/admin merge (the `bypass_policy` knob above,
+or an equivalent "complete past a policy" action on another provider), which
+deliberately overrides a gate rather than waiting for it -- keep those two
+concepts distinct in any guidance you write or give.
+
+- **Prefer requesting auto-complete/auto-merge whenever the provider offers
+  it**, on any repo, independent of whether this identity holds self-merge or
+  bypass authority there. It is the normal low-friction path once a PR is
+  ready for its gates to run -- not a privileged shortcut reserved for
+  maintainers, and not something to disable out of caution on a
+  human-review-gated repo. Arming it there is still correct and expected,
+  precisely because it cannot complete until a human actually approves.
+- **Requesting it is not "driving the PR to merge" by itself.** A submitter
+  (and any agent reviewing the PR) must keep watching an auto-complete-armed
+  PR until it actually merges -- a late conflict with the target branch, a
+  needed rebase, or a reviewer (human or automated) raising a new finding
+  after a later push can all reopen gates auto-complete was waiting on. Don't
+  treat the PR as unattended just because the affordance is set; see
+  "Default conduct" below.
+
 The natural "wait for the auto-review, then complete" loop is
 `pr-watch` (blocks until the reviewer weighs in / mergeability settles) →
 `pr-merge` (requests auto-complete once eligible) → `pr-complete` (post-merge
-reconcile).
+reconcile). If the wait times out with no verdict at all (or a stale one
+sitting untouched), `pr-nudge` asks this repo's bound automated reviewer
+(`pr.reviewer`) to (re-)review before you re-arm the watch -- it reports
+`supported: False` rather than erroring when no such binding exists.
 
 **`pr-watch` tells you when to run `pr-merge`.** Its result payload carries a
 `merge` block derived from the same verdict/consent classifier `pr-status` uses:
@@ -117,6 +204,63 @@ In **direct mode** (the default), use the two-phase `push-changes` +
 `finalize` flow above. In **PR mode**, the flow becomes
 `create-pr -> [delegate PR creation] -> finalize`, and `push-changes` targets
 the *feature* branch instead of the default branch.
+
+### Never assert what masked/redacted tool output literally contains
+
+A host's content-exclusion or secret-redaction layer can replace sensitive-
+looking substrings (tokens, credentials, certain patterns) with a placeholder
+(e.g. a run of asterisks) before the content ever reaches the agent --
+invisibly, with no "denied"/error signal distinguishing it from genuinely
+trivial content. This differs from an outright denied tool call (which IS
+clearly signaled); here the call succeeds and returns content, just with some
+substrings swapped for a mask the agent cannot see through.
+
+**Never treat masked output as ground truth about what the real file
+contains.** A real incident this guidance is drawn from: an agent read a
+source line displaying a six-asterisk placeholder in an `Authorization`
+header call, assumed it was literal source text, and then filed a review
+reply and a GitHub issue making confident factual claims ("the code sends the
+literal string `******`") and asking the operator to fix it accordingly --
+when the masking was purely a display artifact of the agent's own tooling,
+and the agent had no actual way to know what the underlying bytes were.
+
+Telltale signs worth treating as a yellow flag before asserting anything
+about such content:
+- The same suspicious placeholder (asterisks, `[REDACTED]`, etc.) appears
+  verbatim and identically across multiple, otherwise-unrelated call sites or
+  files -- a real secret value would vary; a masking layer produces identical
+  output for every match.
+- The placeholder sits exactly where a credential, token, or secret-shaped
+  string would naturally go (e.g. an `Authorization` header value, a
+  `--token` argument, a connection string).
+
+When you notice this pattern:
+- Do not assert, in a commit message, PR comment, review reply, or filed
+  issue, what the real characters are or what the code "does" with them --
+  you only know what your own tooling displayed, not the real bytes.
+- If the real content's correctness genuinely matters (e.g. a review bot
+  flagged a possible bug at that exact line), say so honestly: name the
+  uncertainty, and ask a human (or a path without this masking) to verify
+  directly, rather than describing masked display text as if it were the
+  file's real content.
+- **Never edit the masked expression itself, or any syntax it depends on
+  (a wrapping quote, an `f`/`r`/`b` string prefix, an escape sequence) --
+  even a change that looks purely cosmetic can silently change what the
+  real, unseen bytes mean.** The hidden characters determine whether
+  surrounding syntax is load-bearing: an f-string prefix masked as
+  `f"******"` could be hiding a real `{token}` interpolation, and dropping
+  the prefix to "fix" an apparent lint complaint would silently disable
+  that interpolation -- a real mistake made while drafting this very
+  guidance, caught by a review bot before merge. Treat the masked span,
+  and anything syntactically coupled to it, as off-limits until an
+  unmasked path (a different tool, or a human with real access) confirms
+  what is actually safe to change. An edit well outside and independent of
+  the masked span is fine; one touching its boundary is not.
+- If you already filed something (an issue, a PR comment) based on a
+  masked-content assumption, correct it explicitly once you notice --
+  retract the specific factual claim, keep only what you can actually verify
+  (e.g. a real, unmasked CI diagnostic that independently flagged the same
+  line).
 
 ### Where PR config lives (machine-local vs in-repo)
 
@@ -153,6 +297,66 @@ If `<agent-worktrees catalog argv[0]> get pr-required` returns `true`, **do not*
 direct `push-changes`/`finalize` for unmerged work — it will be refused. Go
 straight to the end-to-end PR loop below.
 
+### Default conduct: drive every PR you open through to merge
+
+This is the default for **every** PR an agent opens through `create-pr`,
+regardless of whether the target repo sets `pr.required: true` — not only the
+mandatory-PR case. Opening a PR and stopping (or reporting it as "landed") is
+not the end state; **merged** is. Apply whichever waiting policy actually
+fits the target repo's configured flow — they are not interchangeable:
+
+- **Self-merge repos** (`merge_actor: submitter-direct` / `pr-self-merge`):
+  wait briefly for CI and any non-blocking automated review, check real
+  status rather than assuming, rebase if the head goes stale, then merge
+  once the repo's own gates allow it. **`pr-status`/`pr-watch`'s raw
+  `eligible: false` / `reason: "not yet approved"` pair is not necessarily
+  a live blocker on this profile** — it often reflects only a
+  human-approval/codeowner gate that is a documented, separate concern from
+  Copilot's own (non-blocking) review verdict, and the acting identity may
+  hold a live bypass right on that gate the raw fields don't represent
+  (`self_merge_note`, when present in the same JSON, surfaces exactly this
+  — read it before treating `eligible`/`reason` as authoritative). **Before
+  trusting either field at face value, check the target repo's own
+  CONTRIBUTING-equivalent doc for its documented verdict-shape and merge
+  rules** — many self-merge repos (e.g. a repo whose Copilot review
+  structurally never renders `Approve` on the owner's own PRs) define a
+  different passing condition than "wait for Approve," and a generic
+  `pr-watch`/`pr-status` field can misreport (see
+  `ThomasMichon/copilot-extensions#3638`, filed after exactly this
+  confusion drove a 12-round review-fix loop before an agent noticed the
+  target repo's own docs already said not to wait. A later, separate
+  25-round loop on a different PR was actually caused by carried-over
+  review findings not clearing after being fixed — see #5183 — but this
+  same verdict/bypass confusion is what then stalled *merging* that PR for
+  roughly 90 minutes once the findings themselves were resolved; keep the
+  two causes distinct when reasoning about either).
+- **Human-review repos**: poll for review state and comments (the
+  end-to-end loop below); address feedback in the same worktree and
+  re-request review; repeat until approved and merged.
+- **Auto-complete providers** (e.g. Azure DevOps): set the provider's
+  auto-complete affordance at PR-open time so the platform lands it once its
+  gate clears, rather than polling forever in-session.
+
+**The only sanctioned deviations** from driving a PR through to merge:
+
+1. **The operator explicitly says otherwise** for this PR/session (e.g. "just
+   open it, don't merge yet").
+2. **A specific alternate charter governs differently** — a task, skill, or
+   recurring cycle that itself defines an async hand-off (e.g. a triage cycle
+   that records status and lets a later cycle or a human pick up a stalled
+   PR) supersedes the default, but only for the scope that charter actually
+   covers.
+
+Absent one of those two, do not silently settle for "PR opened" — see it
+through, using the waiting policy above.
+
+**Repo-specific instructions:** a repo's own PR quirks that don't fit any of
+the structured `pr.*` config fields (why a bypass mode is shaped a
+particular way, an unusual review-request step, etc.) surface as an extra
+`Note:` line in every `pr_reminder()` when the repo sets `pr.notes` — read it
+the same way you'd read any other `Note:` line; it is not optional
+commentary. See `docs/config-reference.md`'s `pr.notes` entry.
+
 ### End-to-end PR loop (when PRs are required)
 
 The normal, expected flow for a worktree with work to land:
@@ -172,15 +376,17 @@ The normal, expected flow for a worktree with work to land:
 6. **Repeat 4–5** until the PR is **approved and merged upstream**. With
    auto-merge set, merge happens automatically on approval; otherwise a human
    merges.
-7. **Finalize.** Once the feature branch is safely pushed you *may* `finalize`
-   at any point — finalize is decoupled from merge (see below). Choose the
-   disposition deliberately (keep-alive to babysit review, detach to let it
-   ride).
+7. **Finalize.** Under `detach`, the feature branch being safely pushed is
+   enough to `finalize` at any point, before merge (see below) — the rare,
+   operator-approved opt-out. Under `keep-alive` (the safe default),
+   `finalize` requires the PR to have actually **merged** first; stay on the
+   PR through review, consent, and merge, then finalize.
 
-**Rare opt-out — submit and detach without babysitting review.** An agent may,
-when the operator approves, open the PR and immediately `finalize` (detach
-disposition), leaving the open PR for asynchronous review + auto-merge rather
-than waiting in-session. This still goes through a PR — it is **not** a
+**Rare opt-out — submit and detach without babysitting review.** Per the
+sanctioned-deviations list above: an agent may, when the operator approves (or
+a specific alternate charter says so), open the PR and immediately `finalize`
+(detach disposition), leaving the open PR for asynchronous review + auto-merge
+rather than waiting in-session. This still goes through a PR — it is **not** a
 direct-to-default-branch bypass. Use it sparingly: the default is to see the PR
 through to merge. Never skip the PR entirely when `pr-required` is `true`.
 
@@ -206,9 +412,10 @@ origin/<default>  <—  worktree/{id}  ——push——>  origin/pr/{slug}-{suff
                     sits ahead while open)
 ```
 
-The head ref (`pr/{slug}-{suffix}` by default; templated via `pr.head_pattern`,
-e.g. `user/{username}/{slug}-{suffix}`) is ephemeral and provider-deleted on
-merge. Requires the repo's pre-push hook to allow the mediated
+The head ref (`pr/{slug}-{suffix}` by default for non-Azure-DevOps repos;
+Azure DevOps defaults to `user/{username}/{slug}-{suffix}` regardless of
+scheme; all of it is templated via `pr.head_pattern`) is ephemeral and
+provider-deleted on merge. Requires the repo's pre-push hook to allow the mediated
 `worktree/{id} → pr/{slug}` push (a hook that blocks `worktree/*` by ref name
 must honor `AGENT_WORKTREES_PR_PUSH=1`). A parallel `--new` PR auto-falls-back
 to a snapshot ref (one worktree branch hosts only one live refspec PR).
@@ -239,18 +446,45 @@ Set `head_scheme` per repo to choose; the multi-machine system default is `refsp
 <agent-worktrees catalog argv[0]> create-pr --title "Concise PR title"
 ```
 
+Provide a reviewable description with `--body` or `--body-file`. A repository
+may configure `pr.required_body_sections` (for example `Intent`, `Changes`, and
+`Validation`); `create-pr` then fails before publishing unless every named
+Markdown section contains visible text. A hidden source marker never satisfies
+the human-readable body requirement.
+
 Squashes the worktree's commits into one and rebases onto upstream, leaving HEAD
 on `worktree/{id}` at the squashed commit (both schemes — it is never reset off
 it, #1804). Under the default **refspec** scheme it pushes `worktree/{id}`
-straight to the PR head ref (`pr/{slug}`) — no local feature branch. Under
-**snapshot** it instead copies the squashed commit onto a local `feature/{slug}`
-branch and pushes that (no reset, no checkout dance). Either way HEAD never
-leaves `worktree/{id}`. Records `pr.state` and prints the branch, base/head SHAs, and provider.
+straight to the provider-resolved PR head ref (`pr/{slug}-{suffix}` for
+non-Azure-DevOps repos; `user/{username}/{slug}-{suffix}` for Azure DevOps) —
+no local feature branch. Under **snapshot** it instead copies the squashed
+commit onto a local snapshot branch (`feature/{slug}-{suffix}` by default;
+Azure DevOps still defaults to `user/{username}/{slug}-{suffix}`) and pushes
+that (no reset, no checkout dance). Either way HEAD never leaves
+`worktree/{id}`. Records `pr.state` and prints the
+branch, base/head SHAs, and provider.
 Add `--json`
 to capture the metadata, or `--branch NAME` to override the generated name.
 Use `--repo owner/name` to target a different repo than the worktree's own,
 and `--new` to force a brand-new PR even when one is already open (parallel
 PRs). `create-pr` is idempotent -- safe to re-run.
+
+**No local checkout of `--repo`?** Add `--from-branch <branch>` when that
+branch was ALREADY PUSHED to the target repo by some other process (a
+container, another host, ...) -- `create-pr` skips its entire local
+squash/push path and opens the PR directly against the target's own
+resolved provider, auto-journaling a claim on THIS (the calling) worktree
+so `finalize` still knows the work is outstanding. Requires an explicit,
+non-blank `--title` (there is no local commit history to derive one from)
+and is incompatible with `--dry-run`/`--no-open` (there is no local step to
+preview or skip). Without `--from-branch`, naming a different, registered
+`--repo` is refused outright -- there is no mechanism to push into it from
+a checkout that isn't its own. If the target repo isn't registered here at
+all (so neither `--repo` nor `--from-branch` can resolve it), use
+`<agent-pull-requests catalog argv[0]> create --repo <repo> --head
+<branch>` instead -- it needs no repo registration, but its branch must
+ALSO already be pushed to that repo; neither command creates or pushes a
+branch for you.
 
 A worktree can track **multiple PRs** over its life. When the active PR is
 already **merged or closed**, `create-pr` automatically opens a *fresh* PR
@@ -267,14 +501,47 @@ credentials (`pr.api_base`, `pr.token_command`/`pr.token_env`) and
 `pr.auto_open` is on, `create-pr` **opens the PR itself** right after the push
 -- via the provider CLI (`curl` for Gitea, `gh` for GitHub, `az` for Azure
 DevOps) -- and **auto-records** the url/number on the worktree (no manual
-`set-pr`). A closed-circuit repo may additionally set
-`pr.source_attribution: true` to embed a hidden marker containing the raw source
-worktree, machine, session, and head SHA. The marker is **off by default** and
-must stay off for public PRs. Useful flags: `--no-open` (push only),
+`set-pr`). By default (codename-attribution-by-default), `create-pr` embeds a
+public-safe marker carrying **only** the worktree's assigned codename --
+resolve it back via `resolve --codename` (or `embody --codename`) on the same
+machine, or on a *different* machine it now runs a cross-machine SSH scan
+automatically (effort `pr-attribution-codenames` Phase 3): every other known,
+ssh-ready machine is asked over SSH whether its own tracking store has that
+codename. A match on a different machine still fails closed -- it reports the
+resolving machine and worktree id rather than attempting a remote launch; SSH
+there directly (or use a future agent-bridge dispatch) to actually resume it.
+(This is the *author's* path back to their own worktree; a maintainer or
+reviewer tracing a PR they didn't open should instead read
+[pr-attribution.md](pr-attribution.md), written from that side.)
+A closed-circuit repo may instead set `pr.source_attribution: true` to embed
+a hidden marker containing the raw source worktree, machine, session, and
+head SHA -- this must stay off for a public repo. Setting
+`pr.source_attribution: false` opts fully out of any marker (the anonymous
+opt-out). Useful flags: `--no-open` (push only),
 `--no-attribution` (suppress a configured marker), `--body`/`--body-file`,
 `--repo owner/name`. If the provider call fails the branch is still pushed, and
 the result carries `pr_open_error` so you can fall back to Steps 2-3 below. A
 repo **without** provider credentials configured uses the manual flow unchanged.
+
+**Branch-name leak class.** The hidden marker above is not the only surface
+that can carry a private identifier -- the PR head's *branch name* is public
+too. Whenever `pr.source_attribution` isn't exactly `true`, `create-pr` hard-
+blocks (never warns) publishing an effective head -- however resolved: the
+scheme default, an explicit `--branch`, an existing-PR reuse, or a rendered
+`pr.head_pattern` -- that contains the raw worktree id, the machine name
+(case-insensitively; checked against both the live and originally-recorded
+machine identity), or an unresolved `{machine}`/`{worktree_id}` template
+marker. `push-changes` enforces the same block on every re-push (both the
+snapshot and refspec publish paths), since it republishes a worktree's
+recorded PR branch directly -- including one set via `set-pr --branch`, or
+one that predates this guard. Run
+`<agent-worktrees catalog argv[0]> attribution-audit` to check a repo's configured
+`head_pattern` for this risk ahead of time.
+
+`push-changes` and an idempotent `create-pr` re-run publish the final pushed
+head as a dedicated hidden PR comment. Consumers use the newest source marker
+across the initial body and managed comments. Mutable attribution never
+replaces the authored PR description.
 
 > **Trust the result -- do not open a second PR.** When `create-pr` returns
 > `pr_opened: true` (or any `number`/`url`), the PR is already open and recorded
@@ -284,6 +551,41 @@ repo **without** provider credentials configured uses the manual flow unchanged.
 > rather than silently succeeding with no PR. Only fall back to Steps 2-3 when
 > the result carries a `pr_open_error`, or when `pr.auto_open` is off / no
 > provider creds are configured.
+
+> **Never run `create-pr`/`push-changes` for the same worktree from two
+> actors at once -- not even a delegated sub-agent "helping" with the exact
+> PR you're already driving.** `create-pr` squashes commits and rebases IN
+> PLACE on `worktree/{id}`'s own checkout; a second actor (a spawned sub-agent
+> given the same worktree path, or a second session bound to it) committing,
+> stashing, or pushing concurrently corrupts the other's in-flight edits
+> invisibly -- a mid-flight multi-step edit can land half-applied with no
+> error, and commits already safely pushed to an open PR can vanish from
+> `git log` the moment the other actor's own `create-pr` run rebases past
+> them, with nothing to suggest why. Confirmed live: a background sub-agent
+> mistakenly delegated the SAME repo/worktree (rather than its own,
+> independently created one) ran for 3+ hours alongside the delegating
+> session, pushing its own commits and `git stash`-ing the other session's
+> uncommitted work out of its way -- surfacing hours later as what looked
+> like a mysterious, unexplained loss of already-committed work. One worktree
+> checkout, one active git actor, always: give a delegated sub-agent doing
+> PR/git work its own freshly created worktree (`<catalog argv[0]> create
+> --json`), never the path you're concurrently editing in the same session.
+> If you suspect this already happened, `git reflog`/`git fsck --unreachable`
+> recovers a dropped commit; check `git stash list` for displaced work before
+> concluding anything is actually lost.
+
+> **A bare "failed to push some refs" from `create-pr` can hide the REAL
+> reason.** The error message is built from git's stderr plus (as of the
+> `agent-worktrees` push-failure-stdout fix) its stdout -- but a pre-push
+> hook's own check script commonly prints its failure detail (e.g. a
+> module-size-cap violation, a missing changefile) to stdout, not stderr, and
+> an older `agent-worktrees` build only ever surfaced stderr, silently
+> dropping that detail across every retry. If a push keeps failing with no
+> further detail even after one retry, don't keep guessing or retrying
+> blindly: run the repo's own pre-push hook script(s) directly (see
+> `tools/hooks/pre-push`, e.g. `python tools/check-module-size.py` or
+> `python tools/check-changefile-presence.py`) to see the exact, un-truncated
+> failure before trying again.
 
 > **`pr_label_error` -- PR opened, but a label didn't stick.** When `create-pr`
 > opens the PR but a configured label (e.g. `auto-merge` / `source:<machine>`)
@@ -440,9 +742,13 @@ then update the PR branch with:
 In PR mode `push-changes` updates the PR head, never the default branch. Feedback commits
 ride on `worktree/{id}` (create-pr leaves HEAD there); `push-changes` rebases
 `worktree/{id}` onto the default branch and then publishes per scheme — under **refspec**
-(default) it force-with-lease pushes `worktree/{id}` to the PR head ref
-(`pr/{slug}`); under **snapshot** it snapshots the `feature/{slug}` branch to the
-new tip and force-with-lease pushes that. Either way HEAD stays on
+(default) it force-with-lease pushes `worktree/{id}` to the provider-resolved PR
+head ref (`pr/{slug}-{suffix}` for non-Azure-DevOps repos;
+`user/{username}/{slug}-{suffix}` for Azure DevOps); under **snapshot** it
+snapshots the local publish branch (`feature/{slug}-{suffix}` by default;
+Azure DevOps still defaults to `user/{username}/{slug}-{suffix}`) to the new
+tip and force-with-lease pushes that.
+Either way HEAD stays on
 `worktree/{id}` — just commit there and run `push-changes`. (A worktree still
 checked out on a legacy feature branch is accepted too and pushed as-is.) It
 does not create a PR; it updates the existing one.
@@ -453,12 +759,30 @@ does not create a PR; it updates the existing one.
 <agent-worktrees catalog argv[0]> finalize
 ```
 
-**Finalize is decoupled from merge.** A PR-mode worktree finalizes as soon as
-its work is *safely upstream* -- the feature branch is pushed with no unpushed
-commits. The PR does **not** need to be merged first. Finalize tears down the
-worktree and removes the local branches but **leaves the remote feature branch
-intact** (it backs the open PR). If there are unpushed commits, finalize blocks
-and tells you to run `push-changes`.
+**`finalize`'s HEAD-reset behavior depends on `pr.strategy`; it is never a
+blanket "decoupled from merge."** The safe default, `keep-alive`, requires
+the PR to have **merged** (or the branch's content to already sit on
+`origin/<default>`) before finalize will proceed -- an open-but-unmerged PR
+blocks it, by design, so a worktree can never tear itself down while it is
+still the sole party positioned to drive that PR to merge. Only the
+explicit, operator-approved `detach` opt-out accepts "the feature branch is
+safely pushed" as sufficient on its own, without requiring a merge --
+finalize tears down the worktree and local branches but **leaves the remote
+feature branch intact** (it backs the open PR), for asynchronous review to
+land later. If there are unpushed commits, finalize blocks either way and
+tells you to run `push-changes` first.
+
+Every code path that moves a worktree branch's HEAD off unmerged commits
+(`finalize`'s own pointer-reconciliation pass, and `pr-complete`'s
+post-squash-merge realignment) is independently gated on the branch's
+content being **already confirmed present on upstream** before it resets or
+rebases anything -- never on an assumption, and never while real unmerged
+work would be discarded. `detach` is the only strategy where finalize itself
+accepts an open, unmerged PR as sufficient to proceed; every other path
+requires actual merge (or upstream-equivalent content) first. See the
+`pr-merge-obligation-gate` effort (`efforts/active/pr-merge-obligation-gate/`)
+for the audit that confirmed this and the further structural (obligation-
+claim) and guidance defenses layered on top of it.
 
 ### Recovering a PR after teardown (detach disposition)
 

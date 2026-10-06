@@ -41,8 +41,156 @@ import shutil
 import time
 from pathlib import Path
 
-from . import activity, git_ops, hooks, obligations, output, permissions, procs, sessions, tracking
+from . import (
+    activity,
+    env_scrub,
+    git_ops,
+    hooks,
+    obligations,
+    output,
+    permissions,
+    procs,
+    sessions,
+    tracking,
+)
 from .config import Config
+from .finalize_lock import FinalizeLock
+from .finalize_ref import is_content_on_upstream as _is_content_on_upstream
+from .finalize_ref import resolve_finalize_ref as _resolve_finalize_ref
+from .finalize_ref import warn_if_tracked_branch_diverged as _warn_if_diverged
+
+
+def _warn_of_codespace_claims_for_worktree(worktree_id: str) -> None:
+    """Warn-only safety net: report any real ``agent-codespaces`` claim this
+    worktree still holds, with the exact command to release each one --
+    never releases anything itself.
+
+    The calling agent (not this finalize hook) is the one who knows whether
+    the claimed CodeSpace is genuinely done with -- finalize cannot safely
+    assume that on the worktree's behalf. Only two things are ever entitled
+    to self-release automatically at finalize time: the CURRENT session
+    (whose own claim it is unambiguously safe to drop, since finalize is
+    itself sanctioned by that same session) and an ACTIVE HANDOFF's claim
+    (whose successor has already been notified and can reclaim on demand).
+    Everything else is surfaced here for the operator/agent to release
+    explicitly, after confirming it's genuinely no longer needed.
+
+    ``tracking.release_all_resources`` (run alongside this) only clears THIS
+    repo's own bookkeeping ledger of what a worktree claimed -- it never
+    calls back out to the venue plugin that actually enforces exclusivity
+    (``agent-codespaces``' own ``leases.json``), so without a warning here a
+    real claim could otherwise be silently forgotten past this worktree's
+    own finalization.
+
+    Shells ``agent-codespaces leases --owner <worktree_id> --json``
+    (marketplace-isolation: agent-worktrees never imports a sibling plugin's
+    runtime) -- read-only. Absent binstub / any failure is swallowed --
+    this must never block finalize.
+    """
+    import json
+    import subprocess
+
+    from agent_procutil import no_window_flags
+
+    binstub = shutil.which("agent-codespaces")  # marketplace-isolation: allow provider-management
+    if not binstub:
+        return
+    try:
+        result = subprocess.run(
+            [binstub, "leases", "--owner", worktree_id, "--json"],
+            capture_output=True, text=True, timeout=30,
+            creationflags=no_window_flags(),
+        )
+        claims = json.loads(result.stdout or "[]") if result.returncode == 0 else []
+    except Exception:
+        return
+    if not claims:
+        return
+    output.warn(
+        f"{len(claims)} live CodeSpace claim(s) are still held by {worktree_id} "
+        "-- finalize does NOT release these for you. Confirm each is genuinely "
+        "no longer needed, then release it explicitly:"
+    )
+    for entry in claims:
+        name = entry.get("codespace") if isinstance(entry, dict) else None
+        if not name:
+            continue
+        print(
+            f"  · {name}: agent-codespaces release-claim {name} "
+            f"--owner {worktree_id}"
+        )
+    print(
+        "    (or release every one of this worktree's claims at once: "
+        f"agent-codespaces release-claim --owner {worktree_id} --all)"
+    )
+
+
+def _warn_of_dev_slot_claims_for_worktree(worktree_id: str, worktree_path: str) -> None:
+    """Warn-only safety net: report any mutable dev-slot claim this worktree
+    still holds across every plugin, with the exact release command --
+    never releases anything itself (mirrors
+    :func:`_warn_of_codespace_claims_for_worktree`'s posture exactly).
+
+    A dev-slot claim (see ``libs/versioned-runtime``'s mutable-dev-slot
+    pattern) is a plain ``<root>/dev-claim.json`` sidecar a plugin installer
+    writes next to its ``current-version`` marker when a worktree opts a
+    plugin's local install into the shared, mutable ``dev`` slot. Its schema
+    is a small, stable, dependency-free JSON shape
+    (``copilot-extensions.dev-slot-claim``) specifically so a reader never
+    needs to import or shell out to the owning plugin's own runtime --
+    marketplace-isolation, same posture as the CodeSpace-claim warning above,
+    just satisfied by reading a plain file instead of calling a sibling
+    plugin's binstub. Every plugin's root lives at ``~/.<plugin-name>/`` by
+    convention, so this scans every such directory rather than hardcoding a
+    plugin list -- a plugin that adopts the pattern later needs no change
+    here.
+
+    Matches on the full worktree checkout path (the same value
+    ``agent-codespaces``' CodeSpace claims use as ``owner``), not the short
+    ``worktree_id`` -- a dev-slot claim's ``owner`` is written by the
+    installer from ``agent-worktrees get worktree-dir``, which returns the
+    path, not the id.
+    """
+    import json as _json
+
+    home = Path.home()
+    try:
+        candidates = list(home.glob(".*/dev-claim.json"))
+    except OSError:
+        return
+    held: list[tuple[str, dict]] = []
+    for path in candidates:
+        try:
+            data = _json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("schema") != "copilot-extensions.dev-slot-claim":
+            continue
+        if data.get("owner") != worktree_path:
+            continue
+        plugin_name = path.parent.name.lstrip(".")
+        held.append((plugin_name, data))
+    if not held:
+        return
+    output.warn(
+        f"{len(held)} live dev-slot claim(s) are still held by {worktree_id} "
+        "-- finalize does NOT release these for you. Confirm each plugin's "
+        "local dev install is genuinely no longer needed, then release it:"
+    )
+    for plugin_name, data in held:
+        previous = data.get("previous_version") or "(unknown -- check dev-claim.json)"
+        print(
+            f"  · {plugin_name}: from a copilot-extensions checkout, "
+            f"`cd plugins/{plugin_name}; ./scripts/install.ps1 dev-release` "
+            f"(or `install.sh dev-release`) once that plugin has adopted the "
+            f"mutable-dev-slot pattern's release verb (see "
+            f"docs/patterns/mutable-dev-slot.md); this restores "
+            f"current-version -> {previous}. Until then, release manually: "
+            f"delete ~/.{plugin_name}/dev-claim.json, then run that plugin's "
+            f"`versioned_runtime.py activate {previous}` from its scripts/ dir."
+        )
 
 
 def _has_live_session(record) -> bool:
@@ -56,50 +204,18 @@ def _has_live_session(record) -> bool:
     """
     if record is None:
         return False
+    if (
+        getattr(record, "session_backend_opaque", False)
+        or getattr(record, "execution_leg_opaque", False)
+    ):
+        return True
+    execution_leg = tracking.derive_execution_leg(record)
+    if execution_leg is not None and execution_leg.state in {"active", "unknown"}:
+        return True
     if sessions.worktree_has_live_session(record):
         return True
     wt_id = getattr(record, "worktree_id", None)
     return bool(wt_id and sessions.has_mux_session(wt_id))
-
-
-class FinalizeLock:
-    """Simple file-based lock with timeout and stale detection."""
-
-    def __init__(self, lock_path: Path, timeout: int = 120) -> None:
-        self.lock_path = lock_path
-        self.timeout = timeout
-
-    def acquire(self) -> None:
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        start = time.monotonic()
-
-        while self.lock_path.exists():
-            try:
-                age = time.time() - self.lock_path.stat().st_mtime
-            except OSError:
-                break
-            if age > self.timeout:
-                output.warn(f"Stale lock detected (age: {int(age)}s) -- breaking.")
-                self.lock_path.unlink(missing_ok=True)
-                break
-
-            print("Waiting for finalization lock...")
-            time.sleep(2)
-
-            if time.monotonic() - start > self.timeout:
-                raise TimeoutError("Timed out waiting for finalization lock.")
-
-        self.lock_path.write_text(f"{os.getpid()}")
-
-    def release(self) -> None:
-        self.lock_path.unlink(missing_ok=True)
-
-    def __enter__(self) -> FinalizeLock:
-        self.acquire()
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.release()
 
 
 def push_changes(
@@ -132,7 +248,6 @@ def push_changes(
     repo = config.default_repo
     anchor = repo.anchor
     worktree_path = tracking.resolve_worktree_path(worktree_id, repo.worktree_root)
-    branch = f"worktree/{worktree_id}"
     upstream = f"{repo.remote}/{repo.default_branch}"
     lock_path = Path(repo.worktree_root) / ".finalize.lock"
 
@@ -150,15 +265,18 @@ def push_changes(
                 "creator ownership is preserved."
             )
             return False
+    branch = _worktree_branch(record, worktree_id)
 
-    # Set title early so it survives even if push fails
-    if title and record:
+    # Set title early so it survives even if push fails. Gate on the
+    # *normalized* value -- a whitespace-only `--title` must not overwrite an
+    # existing, genuinely curated persisted title with `None`.
+    new_title = tracking.normalize_title(title)
+    if new_title and record:
         # Foreground RMW (#4547): persist the title under the blocking record
         # lock. `record` was loaded unlocked above (it drives the whole push
         # flow), so reload fresh inside the lock, apply just the title, and save
         # -- then continue on the fresh snapshot. The window holds no I/O; the
         # heavy fetch/push below runs AFTER the lock is released.
-        new_title = title.replace("\n", " ").strip()
         with tracking._RecordLock(yaml_path):
             record = tracking.load_record(yaml_path)
             record.title = new_title
@@ -215,6 +333,12 @@ def push_changes(
         # 1. Fetch
         print(f"Fetching from {repo.remote}...")
         git_ops.fetch(repo.remote, cwd=anchor)
+        # worktree-finality-and-obligations Phase 9: this fetch just made the
+        # repo's remote-tracking refs current -- share that with every OTHER
+        # worktree of this repo via the freshness ledger, instead of only
+        # this call benefiting.
+        if record and record.repo:
+            tracking.record_repo_fetch_confirmed(record.repo)
 
         # 2. Dirty check
         wt_exists = Path(worktree_path).exists()
@@ -256,8 +380,28 @@ def push_changes(
 
         # 4. Pre-squash
         if wt_exists and ahead_count > 1:
-            squash_title = title or (record.title if record else None)
-            squash_msg = squash_title or f"squash: merge worktree/{worktree_id}"
+            # Normalize each candidate separately before the OR -- a
+            # whitespace-only `title` is truthy and must not shadow a
+            # genuinely usable persisted `record.title`.
+            squash_title = tracking.normalize_title(title) or tracking.normalize_title(
+                record.title if record else None
+            )
+            # Never invent a commit message here -- a synthetic placeholder
+            # (e.g. built from worktree_id) is still not a real description,
+            # and can land directly on a public default branch (direct-push
+            # repos). Require an actual title. `normalize_title` checks for
+            # whitespace-only (-> None) without truncating; unlike `cap_title`,
+            # this is the actual commit subject, not a Picker/status-bar string.
+            if not squash_title:
+                output.err(
+                    "No usable title could be determined for this squash "
+                    "commit: --title was either omitted or contained only "
+                    "whitespace, and no title is persisted on the worktree. "
+                    "Re-run with an explicit, non-blank --title describing "
+                    "the change."
+                )
+                return False
+            squash_msg = squash_title
             print(f"Squashing {ahead_count} commits into one...")
             squashed, squash_reason = git_ops.squash_branch(
                 upstream, squash_msg, cwd=worktree_path
@@ -319,6 +463,7 @@ def push_changes(
             import subprocess
             result = subprocess.run(
                 expanded, capture_output=True, text=True,
+                env=env_scrub.scrub_python_runtime_env(os.environ.copy()),
             )
             if result.returncode != 0:
                 output.warn("Core validation failed. Worktree preserved for fixes.")
@@ -347,7 +492,7 @@ def push_changes(
                     ["pwsh.exe", "-NoProfile", "-File", str(validate_script),
                      "-WorktreePath", worktree_path, "-DefaultBranch", upstream],
                     capture_output=True, text=True,
-                )
+                    env=env_scrub.scrub_python_runtime_env(os.environ.copy()))
                 if result.returncode != 0:
                     output.warn("Core validation failed. Worktree preserved for fixes.")
                     print(result.stdout)
@@ -410,11 +555,14 @@ def push_changes(
             if res:
                 pushed = True
                 break
-            # Surface git's REAL stderr instead of a generic "rejected" (#993):
+            # Surface git's REAL detail instead of a generic "rejected" (#993):
             # a pre-push hook decline (e.g. the version-consistency gate), an
             # auth 403, or a protected-branch block is invisible otherwise.
-            if res.stderr:
-                output.err(res.stderr.strip())
+            # Both streams matter -- git's own protocol error lands on
+            # stderr, but a hook's own check output (e.g. a module-size-cap
+            # violation's `[FAIL] ...` detail) commonly lands on stdout.
+            if res.failure_detail:
+                output.err(res.failure_detail.lstrip("\n"))
             # Only a non-fast-forward race is fixed by fetch+rebase+retry.
             # Everything else recurs identically -- fail fast with the real
             # reason above rather than burning three doomed attempts.
@@ -430,6 +578,8 @@ def push_changes(
             if attempt < max_retries:
                 output.warn("Non-fast-forward -- fetching and retrying...")
                 git_ops.fetch(repo.remote, cwd=anchor)
+                if record and record.repo:
+                    tracking.record_repo_fetch_confirmed(record.repo)
                 if not git_ops.rebase(upstream, cwd=anchor):
                     output.err("Rebase after push rejection failed")
                     if record:
@@ -476,63 +626,6 @@ def push_changes(
         lock.release()
 
 
-def _is_content_on_upstream(
-    branch: str,
-    upstream: str,
-    cwd: str,
-) -> bool:
-    """Non-mutating check: is the branch's content already on upstream?
-
-    Uses multiple strategies in order of reliability:
-    1. Ancestor check (branch is ancestor of upstream)
-    2. git cherry (patch-id comparison)
-    3. Blob comparison of changed files
-    """
-    # Strategy 1: branch is an ancestor of upstream (already merged)
-    r = git_ops.git(
-        "merge-base", "--is-ancestor", branch, upstream,
-        cwd=cwd, check=False,
-    )
-    if r.returncode == 0:
-        return True
-
-    # Strategy 2: git cherry -- all patches accounted for on upstream
-    cherry_r = git_ops.git(
-        "cherry", upstream, branch,
-        cwd=cwd, check=False,
-    )
-    if cherry_r.returncode == 0 and cherry_r.stdout.strip():
-        unmerged = [ln for ln in cherry_r.stdout.splitlines() if ln.startswith("+")]
-        if not unmerged:
-            return True
-
-    # Strategy 3: compare file blobs between branch and upstream
-    merge_base_r = git_ops.git(
-        "merge-base", branch, upstream,
-        cwd=cwd, check=False,
-    )
-    if merge_base_r.returncode != 0:
-        return False
-
-    diff_r = git_ops.git(
-        "diff", "--name-only", merge_base_r.stdout.strip(), branch,
-        cwd=cwd, check=False,
-    )
-    changed_files = [f for f in diff_r.stdout.splitlines() if f.strip()]
-    if not changed_files:
-        return True
-
-    for file in changed_files:
-        b_blob = git_ops.git(
-            "rev-parse", f"{branch}:{file}", cwd=cwd, check=False
-        )
-        m_blob = git_ops.git(
-            "rev-parse", f"{upstream}:{file}", cwd=cwd, check=False
-        )
-        if b_blob.stdout.strip() != m_blob.stdout.strip():
-            return False
-
-    return True
 
 
 def _reconcile_merged_pointers(
@@ -693,6 +786,25 @@ def _push_changes_pr(
         output.err("PR mode: no tracked PR feature branch to update.")
         return False
 
+    # Branch-name leak class (pr-attribution-codenames Phase 5): create-pr
+    # validates a NEW feature branch name, but push-changes republishes a
+    # branch recorded earlier -- including one set via `set-pr --branch`, or
+    # one that predates this guard. Re-validate the effective head here too,
+    # so a leaking branch can never be (re)published through this path
+    # either.
+    from .providers.attribution import BranchLeakError, validate_effective_head
+    try:
+        # Both the LIVE config machine and the worktree's originally
+        # RECORDED machine -- see the matching comment in pr_ops.create_pr.
+        validate_effective_head(
+            feature, worktree_id=worktree_id,
+            machine=(config.machine, record.machine),
+            source_attribution=repo.pr.source_attribution,
+        )
+    except BranchLeakError as exc:
+        output.err(str(exc))
+        return False
+
     if not git_ops.is_clean(cwd=worktree_path):
         dirty = git_ops.get_dirty_files(cwd=worktree_path)
         detail = "\n".join(f"    {ln}" for ln in dirty)
@@ -727,6 +839,8 @@ def _push_changes_pr(
     try:
         print(f"Fetching from {remote}...")
         git_ops.fetch(remote, cwd=worktree_path)
+        if record.repo:
+            tracking.record_repo_fetch_confirmed(record.repo)
 
         if git_ops.ref_exists(upstream, cwd=worktree_path):
             if on_wt:
@@ -765,8 +879,8 @@ def _push_changes_pr(
             pushed = git_ops.push(remote, feature, cwd=worktree_path, force_with_lease=True)
         if not pushed:
             output.err(f"Failed to push {feature} to {remote}.")
-            if pushed.stderr:
-                output.err(pushed.stderr.strip())
+            if pushed.failure_detail:
+                output.err(pushed.failure_detail.lstrip("\n"))
             if pushed_pr is not None and pushed_pr.state in ("", "creating"):
                 tracking.save_record(record)
             return False
@@ -776,9 +890,32 @@ def _push_changes_pr(
         ).stdout.strip()
         if pushed_pr is not None:
             pushed_pr.head_sha = head_sha
+            pushed_pr.head_observed_at = ""
+            pushed_pr.head_observed_api_base = ""
             if pushed_pr.state in ("", "creating"):
                 pushed_pr.state = "open"
         tracking.save_record(record)
+        from . import pr_ops
+        observation_error = pr_ops.refresh_head_observation(
+            config, record, pushed_pr, head_sha
+        )
+        if observation_error:
+            output.warn(
+                "PR head was pushed, but authoritative provider observation "
+                f"failed: {observation_error}"
+            )
+        attribution_error = pr_ops.refresh_source_attribution(
+            worktree_id,
+            config,
+            record,
+            pushed_pr,
+            head_sha,
+        )
+        if attribution_error:
+            output.warn(
+                f"PR head was pushed, but source attribution publication "
+                f"failed: {attribution_error}"
+            )
 
         activity.log_event(
             "pr_changes_pushed", worktree_id=worktree_id, branch=feature,
@@ -830,6 +967,19 @@ def _push_changes_pr_refspec(
         output.err("PR mode (refspec): no tracked PR head ref to update.")
         return False
 
+    from .providers.attribution import BranchLeakError, validate_effective_head
+    try:
+        # Both the LIVE config machine and the worktree's originally
+        # RECORDED machine -- see the matching comment in pr_ops.create_pr.
+        validate_effective_head(
+            feature, worktree_id=worktree_id,
+            machine=(config.machine, record.machine),
+            source_attribution=repo.pr.source_attribution,
+        )
+    except BranchLeakError as exc:
+        output.err(str(exc))
+        return False
+
     if not git_ops.is_clean(cwd=worktree_path):
         dirty = git_ops.get_dirty_files(cwd=worktree_path)
         detail = "\n".join(f"    {ln}" for ln in dirty)
@@ -856,6 +1006,8 @@ def _push_changes_pr_refspec(
     try:
         print(f"Fetching from {remote}...")
         git_ops.fetch(remote, cwd=worktree_path)
+        if record.repo:
+            tracking.record_repo_fetch_confirmed(record.repo)
 
         # Rebase the worktree branch forward onto the default branch; feedback
         # commits ride on top. HEAD stays on wt_branch throughout.
@@ -874,8 +1026,8 @@ def _push_changes_pr_refspec(
             )
         if not pushed:
             output.err(f"Failed to push {wt_branch} to {remote}/{feature}.")
-            if pushed.stderr:
-                output.err(pushed.stderr.strip())
+            if pushed.failure_detail:
+                output.err(pushed.failure_detail.lstrip("\n"))
             if pushed_pr is not None and pushed_pr.state in ("", "creating"):
                 tracking.save_record(record)
             return False
@@ -885,9 +1037,32 @@ def _push_changes_pr_refspec(
         ).stdout.strip()
         if pushed_pr is not None:
             pushed_pr.head_sha = head_sha
+            pushed_pr.head_observed_at = ""
+            pushed_pr.head_observed_api_base = ""
             if pushed_pr.state in ("", "creating"):
                 pushed_pr.state = "open"
         tracking.save_record(record)
+        from . import pr_ops
+        observation_error = pr_ops.refresh_head_observation(
+            config, record, pushed_pr, head_sha
+        )
+        if observation_error:
+            output.warn(
+                "PR head was pushed, but authoritative provider observation "
+                f"failed: {observation_error}"
+            )
+        attribution_error = pr_ops.refresh_source_attribution(
+            worktree_id,
+            config,
+            record,
+            pushed_pr,
+            head_sha,
+        )
+        if attribution_error:
+            output.warn(
+                f"PR head was pushed, but source attribution publication "
+                f"failed: {attribution_error}"
+            )
 
         activity.log_event(
             "pr_changes_pushed", worktree_id=worktree_id, branch=feature,
@@ -925,40 +1100,16 @@ def _resolve_content_ref(
 def _pr_is_merged(record: tracking.WorktreeRecord, repo) -> bool:
     """Authoritative, squash-safe check that the tracked PR has merged.
 
-    The durable "did the work land" signal -- **branch-independent** (survives a
-    head branch deleted on merge) and **immune to version-file churn** on the
-    moving upstream tip (the failure that false-blocks an already-merged
-    worktree: its real code matches ``origin/<default>``, but bookkeeping files
-    like ``plugin.json`` / ``marketplace.json`` were re-bumped by *later* PRs, so
-    blob-equivalence against the live tip sees a spurious diff).
-
-    Fast path: a tracking record whose ``pr.state`` is already ``"merged"`` was
-    set from an authoritative observation -- trust it, no network. Otherwise ask
-    the provider (``get_pull().merged``). **Fail-CLOSED**: a missing PR number,
-    no provider/token, or any provider error returns ``False`` so finalize never
-    certifies unmerged work as safe to prune.
+    The durable "did the work land" signal -- **branch-independent**
+    (survives a head branch deleted on merge) and **immune to version-file
+    churn** on the moving upstream tip. Fail-CLOSED: an indeterminate lookup
+    (see ``finalize_open_pr_gate.pr_merge_status``) collapses to ``False``
+    here so finalize never certifies unmerged-or-unknown work as safe to
+    prune. Delegates to that module (not module-size-capped, #4400 round 13)
+    for the tri-state lookup itself.
     """
-    pr = getattr(record, "pr", None)
-    if not pr:
-        return False
-    if getattr(pr, "state", "") == "merged":
-        return True
-    number = getattr(pr, "number", None)
-    slug = getattr(pr, "repo", "") or ""
-    if not number or not slug:
-        return False
-    prcfg = repo.pr
-    try:
-        from . import providers
-        provider = providers.get_provider(prcfg.provider)
-        token = providers.account_token_for_slug(slug, prcfg)
-        result = provider.get_pull(
-            slug, int(number),
-            api_base=getattr(prcfg, "api_base", "") or "", token=token,
-        )
-        return bool(getattr(result, "merged", False))
-    except Exception:
-        return False
+    from . import finalize_open_pr_gate as fopg
+    return fopg.pr_merge_status(record, repo) is True
 
 
 def _pr_finalize_precondition(
@@ -973,39 +1124,36 @@ def _pr_finalize_precondition(
     ``origin/<default>``* -- it does **not** consult the feature/PR branch,
     except in ``detach`` mode. Order:
 
-    1. **Fast path (both modes)** -- content already reachable/patch-equivalent
-       on ``origin/<default>`` (git-only, no network).
-    2. **Authoritative (both modes)** -- the tracked PR *merged*
-       (``_pr_is_merged``); squash-safe and independent of the feature branch or
-       version-file churn.
-    3. **``detach`` mode only** -- accept "code is upstream in an OPEN PR" (the
-       feature branch is on the remote) as an *early* ok, because detached
-       finalizes *before* merge. Non-detached (``keep-alive``) never looks at the
-       feature branch: after the PR merges, ``sync``/``pr-merge`` realigns
-       ``worktree/<id>`` to ``origin/<default>`` (FINAL) and finalize affirms.
-
+    1. **Fast path** -- content on origin/<default>, gated on a tracked merged head (#4400).
+    2. **Authoritative** -- PR merged AND content has no commits beyond its tracked head.
+    3. **``detach`` mode only** -- an open PR (feature branch on the remote)
+       is early-ok, since detached finalizes *before* merge. ``keep-alive``
+       ignores the feature branch: after merge, ``sync``/``pr-merge`` realigns
+       ``worktree/<id>`` and finalize affirms.
     Returns ``(ok, error_message)``.
     """
     remote = repo.remote
     feature = record.pr.branch
     cwd = worktree_path if Path(worktree_path).exists() else anchor
     upstream = f"{remote}/{repo.default_branch}"
-    strategy = (getattr(repo.pr, "strategy", "") or "detach").strip().lower()
+    strategy = (getattr(repo.pr, "strategy", "") or "keep-alive").strip().lower()
 
-    # (1) Fast path: content already on origin/<default>. Resolve a durable ref
-    #     (feature -> worktree/<id> -> HEAD); the refspec head scheme keeps no
-    #     local pr/<slug> branch, so probing ``feature`` alone would miss.
-    content_ref = _resolve_content_ref(feature, record.worktree_id, cwd=cwd)
+    # (1) Fast path (#4400): content on origin/<default>, via the LIVE
+    #     checkout ref, never a frozen feature-branch snapshot.
+    from . import finalize_open_pr_gate as fopg
+    content_ref = fopg.resolve_precondition_ref(
+        feature, record.worktree_id, worktree_path, cwd=cwd)
     if (
         content_ref is not None
         and git_ops.ref_exists(upstream, cwd=cwd)
         and _is_content_on_upstream(content_ref, upstream, cwd=cwd)
+        and fopg.upstream_match_is_trustworthy(record, content_ref, upstream, cwd=cwd, repo=repo)
     ):
         return True, None
-
-    # (2) Authoritative squash-safe signal (both modes): the tracked PR merged.
     if _pr_is_merged(record, repo):
-        return True, None
+        if not fopg.merged_content_exceeds(record, content_ref, upstream, cwd=cwd, repo=repo):
+            return True, None
+        return False, fopg.merged_pr_block_message(record, content_ref, upstream, cwd=cwd)
 
     # (3) DETACHED mode only: "code is upstream in an OPEN PR" (feature branch on
     #     the remote) is an early ok. keep-alive never consults the feature
@@ -1097,6 +1245,91 @@ def _settle_parent_obligation(
         return
 
 
+def _settle_current_session_claim(
+    yaml_path: Path,
+    record: tracking.WorktreeRecord | None,
+    current_session_id: str | None,
+) -> tuple[tracking.WorktreeRecord | None, str | None]:
+    """Settle the invoking session's own claim to ``at-rest``, lock-safe.
+    Dispatches through the shared ``claim_settle`` verb's own
+    ``skip_if_released`` guard (daemon write path when reachable, else the
+    identical logged in-process fallback -- ``agent-worktrees-authoritative-
+    daemon`` effort, Phase 3; reuses the same guard
+    ``handoff_cutover.py``'s ``_settle_predecessor_session_claim`` relies
+    on) rather than a bespoke locked transaction: an interleaving
+    ``register_session``/``deregister_session`` can never be overwritten by
+    this settlement, and an already-``released`` claim (a ``sessionEnd``
+    that raced ahead of a retried/late finalize for the SAME session id) is
+    never resurrected back to ``at-rest``.
+
+    Returns ``(record, current_session_ref)`` -- ``record`` is freshly
+    reloaded when the dispatch ran without raising, else the ``record``
+    passed in unchanged; ``current_session_ref`` is ``None`` when no
+    session id was resolvable (a silent, best-effort no-op)."""
+    if record is None or not current_session_id:
+        return record, None
+    current_session_ref = tracking.format_claim_ref(
+        record.machine, record.repo, record.worktree_id,
+        session=current_session_id,
+    )
+    from . import locks as _locks
+    from . import status_monitor_runtime as _smr
+    from . import tracking_write
+
+    try:
+        tracking_write.dispatch(
+            "claim_settle",
+            {
+                "worktree_id": record.worktree_id,
+                "yaml_path": str(yaml_path),
+                "ref": current_session_ref,
+                "disposition": obligations.AT_REST,
+                "skip_if_released": True,
+            },
+            read_lock_data=lambda: _locks.read_lock(_smr._monitor_lock_path()),
+            ensure_monitor=(
+                _smr._ensure_status_monitor if _smr._status_monitor_enabled() else None
+            ),
+        )
+        record = tracking.load_record(yaml_path)
+    except Exception:
+        pass
+    return record, current_session_ref
+
+
+def _advise_other_live_sessions(
+    record: tracking.WorktreeRecord | None,
+    current_session_ref: str | None,
+) -> None:
+    """Warn (never block) about OTHER live ``session`` claims on ``record``.
+
+    Advisory-only pass (Phase 8, worktree-finality-and-obligations): a
+    ``session`` claim never hard-blocks finalize (see the ``kind !=
+    "session"`` exclusion in :func:`_assert_obligations_settled`), but the
+    operator/agent invoking finalize should still be told when some OTHER
+    session is concurrently live in this worktree. Always returns (proceeds);
+    this is "name them and ask", not an interactive block, since most
+    finalize invocations here are non-interactive/agent-driven.
+    """
+    if record is None:
+        return
+    others = [
+        c for c in record.resources
+        if c.kind == "session" and c.is_live and c.ref != current_session_ref
+    ]
+    if not others:
+        return
+    output.warn(
+        f"Worktree {record.worktree_id} has {len(others)} other live Copilot "
+        "session claim(s) besides the one running finalize:"
+    )
+    for c in others:
+        label = f"  · {c.kind}: {c.ref}"
+        if c.note:
+            label += f" ({c.note})"
+        output.warn(label)
+
+
 def _assert_obligations_settled(
     record: tracking.WorktreeRecord | None,
     worktree_id: str,
@@ -1147,7 +1380,14 @@ def _assert_obligations_settled(
             + ", ".join(active_handoffs)
         )
         return False
-    unsettled = [c for c in record.resources if c.is_unsettled]
+    # A "session" claim (Phase 8, worktree-finality-and-obligations) never
+    # hard-blocks finalize -- it gets its own advisory-only pass
+    # (`_advise_other_live_sessions`), not this refusal gate. Finalize itself
+    # settles the invoking session's own claim before this check ever runs
+    # (see `validate_and_finalize`).
+    unsettled = [
+        c for c in record.resources if c.is_unsettled and c.kind != "session"
+    ]
     if not unsettled:
         return True
     pending = [c for c in unsettled if c.ref.startswith("pending-run:")]
@@ -1206,6 +1446,41 @@ def _assert_obligations_settled(
     return True
 
 
+def _rollback_finalizing_freeze(
+    yaml_path, prior_status: str | None, worktree_id: str,
+) -> None:
+    """Restore a mutable stable state after a post-freeze finalize failure.
+
+    worktree-finality-and-obligations (Ph2): once ``record.status`` is frozen
+    to ``finalizing``, a subsequent failure (lock timeout, an exception during
+    cleanup) must not leave the record wedged there permanently -- creator
+    ownership would stay frozen forever (``add_resource_claim`` hard-rejects
+    ``finalizing``) with no path back. Best-effort and defensive: only reverts
+    when the record is still exactly ``finalizing`` (a concurrent process may
+    have already resolved it) and only when a real prior status was captured.
+    """
+    if prior_status is None or not yaml_path.exists():
+        return
+    try:
+        with tracking._RecordLock(yaml_path, require_sidecar=True):
+            record = tracking.load_record(yaml_path)
+            if record.status != "finalizing":
+                return
+            record.status = prior_status
+            tracking.save_record(record, yaml_path)
+        output.warn(
+            f"Restored {worktree_id}'s tracking status to {prior_status!r} "
+            "after a finalize failure (was wedged at 'finalizing')."
+        )
+    except Exception as exc:
+        output.err(
+            f"Could not roll back {worktree_id}'s 'finalizing' freeze after a "
+            f"finalize failure ({exc}); run 'agent-worktrees doctor' or inspect "
+            f"the record manually -- creator ownership is at risk of being "
+            f"stuck."
+        )
+
+
 def _rehome_abandoned_obligations(
     record, worktree_id: str, config, *, handoff_to: str,
 ) -> bool:
@@ -1219,7 +1494,9 @@ def _rehome_abandoned_obligations(
     requested handoff target. A write/readback failure returns False so finalize
     preserves the creator worktree and its claims.
     """
-    abandoned = [c for c in record.resources if c.is_unsettled]
+    abandoned = [
+        c for c in record.resources if c.is_unsettled and c.kind != "session"
+    ]
     if not abandoned:
         return True
     tracking.rehome_abandoned_obligations(
@@ -1252,6 +1529,14 @@ def _rehome_abandoned_obligations(
     return True
 
 
+def _worktree_branch(
+    record: tracking.WorktreeRecord | None, worktree_id: str
+) -> str:
+    if record is not None and record.branch:
+        return record.branch
+    return f"worktree/{worktree_id}"
+
+
 def validate_and_finalize(
     worktree_id: str,
     config: Config,
@@ -1259,6 +1544,7 @@ def validate_and_finalize(
     dry_run: bool = False,
     abandon: bool = False,
     handoff_to: str | None = None,
+    force_open_pr: bool = False,
 ) -> bool:
     """Validate that worktree content is on upstream, then clean up.
 
@@ -1276,6 +1562,7 @@ def validate_and_finalize(
             escape hatch for the resource-obligation-settlement finalize gate.
         handoff_to: Required with ``abandon`` when obligations remain; the
             affirmative recipient or flow recorded on every orphan entry.
+        force_open_pr: Sole override for the backup open-PR gate.
 
     Returns:
         True on success, False if content is not yet on upstream.
@@ -1283,7 +1570,6 @@ def validate_and_finalize(
     repo = config.default_repo
     anchor = repo.anchor
     worktree_path = tracking.resolve_worktree_path(worktree_id, repo.worktree_root)
-    branch = f"worktree/{worktree_id}"
     upstream = f"{repo.remote}/{repo.default_branch}"
     lock_path = Path(repo.worktree_root) / ".finalize.lock"
 
@@ -1299,6 +1585,8 @@ def validate_and_finalize(
                 f"Cannot finalize {worktree_id}: its existing claim ledger is "
                 f"unreadable ({exc}). Creator ownership is preserved.")
             return False
+    branch = _worktree_branch(record, worktree_id)
+    checkout_managed = record is None or record.checkout_managed
 
     try:
         from . import claim_handoffs
@@ -1338,6 +1626,48 @@ def validate_and_finalize(
     except Exception:
         pass
 
+    # Session-claim lifecycle (Phase 8, worktree-finality-and-obligations): settle the invoking
+    # session's own outbound claim BEFORE the hard obligation gate runs, so finalize never leaves
+    # the operator to settle it by hand -- and it never blocks the gate either way (see the `kind
+    # != "session"` exclusion in `_assert_obligations_settled`).
+    #
+    # Scoping note: this reads ``COPILOT_AGENT_SESSION_ID`` from the CURRENT process's own
+    # environment, so it settles the invoking (interactive) session's claim. `_post_exit_gate`'s
+    # backstop call (after the child Copilot process exits) runs in the *launcher's* environment,
+    # which never carries the exited child's session id -- so if that child's own `sessionEnd` hook
+    # was itself missed (a crash, not a clean exit), this step is a no-op and the orphaned claim is
+    # left `active`. That claim never blocks finalize (the `kind != "session"` exclusion above) and
+    # is exactly the still-deferred "sweep `claim_gone`/`claim_safe` session branch" Plan bullet's
+    # job to reclaim -- not solved here, to keep this slice's scope to the
+    # register/deregister/finalize wiring itself.
+    current_session_id = os.environ.get("COPILOT_AGENT_SESSION_ID") or None
+    record, current_session_ref = _settle_current_session_claim(
+        yaml_path, record, current_session_id,
+    )
+    _advise_other_live_sessions(record, current_session_ref)
+
+    # pr-merge-obligation-gate defense 2: refresh the tracked PR(s) against
+    # the provider RIGHT BEFORE the obligation gate reads the local ledger.
+    # `_reconcile_active_pr` is the one shared observation path every other
+    # PR-workflow verb already funnels through (create-pr, pr-ready,
+    # pr-status, the Picker's background sweep, pr-reconcile); calling it
+    # here too means finalize never trusts a stale/never-verified local
+    # ``pr.state`` -- in particular an out-of-band ``set-pr`` (which
+    # persists state with NO provider read at all) gets its first real
+    # provider confirmation right here, so its `pr`-kind claim is created
+    # (still open) or released (confirmed merged) before the gate below
+    # ever runs. Best-effort: a provider failure/timeout degrades to the
+    # local state exactly as every other caller of this function already
+    # tolerates -- finalize is never blocked BY the reconcile itself, only
+    # by whatever obligation the ledger already (or now) records.
+    if record is not None and repo.pr.enabled:
+        try:
+            from . import pr_ops as _pr_ops
+
+            _pr_ops._reconcile_active_pr(record, config)
+        except Exception:
+            pass
+
     # Obligation gate (resource-obligation-settlement Phase 2). A worktree
     # answers for the outbound resources it still owns before it may finalize.
     # Runs BEFORE any destructive step so a blocking gate refuses cleanly. Read
@@ -1348,33 +1678,71 @@ def validate_and_finalize(
     ):
         return False
 
+    # Backup open-PR gate (finalize_open_pr_gate.py); force_open_pr overrides.
+    from . import finalize_open_pr_gate
+    if not finalize_open_pr_gate.assert_no_live_pr(
+        record, config, worktree_id, force=force_open_pr,
+    ):
+        return False
+
     # Fetch to get current upstream state
     print(f"Fetching from {repo.remote}...")
     git_ops.fetch(repo.remote, cwd=anchor)
+    if record and record.repo:
+        tracking.record_repo_fetch_confirmed(record.repo)
 
+    preserve_tracked_branch = False
+    renamed_branch_to_clean: str | None = None
     if pr_mode:
-        # PR mode: finalize is decoupled from merge. Work is safe to prune as
-        # soon as the feature branch is pushed -- the PR may still be open.
+        # PR mode (#4400 round 12): `assert_no_live_pr` above already refused
+        # a still-open PR (short of --force-open-pr). `detach` allows an
+        # early ok once pushed; other strategies require a genuine merge
+        # AND live content not exceeding that merged head.
+        dirty_err = finalize_open_pr_gate.dirty_worktree_error(worktree_path, wt_exists=wt_exists)
+        if dirty_err:
+            output.err(dirty_err)
+            return False
         ok, err = _pr_finalize_precondition(record, repo, worktree_path, anchor)
         if not ok:
             output.err(err or "PR finalize precondition not met.")
             return False
-        print(
-            f"Verified: feature branch '{record.pr.branch}' is safely on "
-            f"{repo.remote}. Finalizing this worktree (the PR may still be open)."
-        )
+        print(f"Verified: feature branch '{record.pr.branch}' is safely on {repo.remote}.")
     elif wt_exists:
+        # Validate against the worktree's ACTUAL current checkout, not just
+        # the possibly-stale tracked `record.branch` name (#7723). A worktree
+        # can end up checked out to a differently-named branch (e.g. a
+        # `-journal` suffix variant) or in a detached-HEAD state after its
+        # creation-time tracking record was written -- in that case `branch`
+        # no longer names what's actually sitting in `worktree_path`, and
+        # checking it instead of the real HEAD can produce a false "Unmerged
+        # work detected" verdict (or, just as dangerous, silently validate
+        # the wrong ref and let genuinely different content be discarded).
+        effective_ref, current_ref, diverged = _resolve_finalize_ref(
+            branch, worktree_path)
+        if diverged:
+            preserve_tracked_branch = _warn_if_diverged(
+                worktree_id, branch, current_ref, upstream, worktree_path)
+            if current_ref is not None and current_ref != branch:
+                # The checkout renamed to a real (non-detached) branch other
+                # than the tracked name -- that renamed branch is the one
+                # actually validated below, so clean it up too once
+                # confirmed safe, or the rename just leaks a dangling ref
+                # forever (#7723).
+                renamed_branch_to_clean = current_ref
+
         # Check if the worktree is unused (0 commits, clean tree)
-        ahead_commits = git_ops.get_commits_ahead(branch, upstream, cwd=worktree_path)
+        ahead_commits = git_ops.get_commits_ahead(
+            effective_ref, upstream, cwd=worktree_path)
         is_clean = git_ops.is_clean(cwd=worktree_path)
         if len(ahead_commits) == 0 and is_clean:
             print("No commits and clean tree -- finalizing unused worktree.")
             # Fall through to cleanup
-        elif not _is_content_on_upstream(branch, upstream, cwd=worktree_path):
+        elif not _is_content_on_upstream(effective_ref, upstream, cwd=worktree_path):
             if repo.pr.required:
                 output.err(
-                    f"Unmerged work detected on {branch}, and PRs are required "
-                    f"for this repo -- it cannot be finalized direct-to-master.\n"
+                    f"Unmerged work detected on {effective_ref}, and PRs are "
+                    f"required for this repo -- it cannot be finalized "
+                    f"direct-to-master.\n"
                     f"Land it through a pull request:\n"
                     f"  1. agent-worktrees create-pr --title \"...\"\n"
                     f"  2. open the PR via the '{repo.pr.provider}' provider, "
@@ -1384,14 +1752,14 @@ def validate_and_finalize(
                 )
             else:
                 output.err(
-                    f"Unmerged work detected on {branch}. "
+                    f"Unmerged work detected on {effective_ref}. "
                     f"Run 'agent-worktrees push-changes' to push your changes "
                     f"to {repo.remote}/{repo.default_branch} first, "
                     f"then retry 'agent-worktrees finalize'."
                 )
             return False
         else:
-            print(f"Verified: all content from {branch} is on {upstream}.")
+            print(f"Verified: all content from {effective_ref} is on {upstream}.")
     else:
         # Worktree directory gone -- check if branch content is on upstream
         # from the anchor repo
@@ -1425,6 +1793,7 @@ def validate_and_finalize(
             + ", ".join(active_handoffs))
         return False
 
+    prior_status: str | None = None
     if yaml_path.exists():
         try:
             with tracking._RecordLock(yaml_path, require_sidecar=True):
@@ -1446,7 +1815,10 @@ def validate_and_finalize(
                         "claim-handoff bundles before cleanup; finalize is "
                         "refused: " + ", ".join(active_handoffs))
                     return False
-                unsettled = [c for c in record.resources if c.is_unsettled]
+                unsettled = [
+                    c for c in record.resources
+                    if c.is_unsettled and c.kind != "session"
+                ]
                 pending = [
                     c for c in unsettled if c.ref.startswith("pending-run:")
                 ]
@@ -1478,6 +1850,7 @@ def validate_and_finalize(
                     handoff_to=(handoff_to or "").strip(),
                 ):
                     return False
+                prior_status = record.status
                 record.status = "finalizing"
                 tracking.save_record(record, yaml_path)
         except Exception as exc:
@@ -1493,41 +1866,75 @@ def validate_and_finalize(
         lock.acquire()
     except TimeoutError:
         output.err("Timed out waiting for finalization lock.")
+        _rollback_finalizing_freeze(yaml_path, prior_status, worktree_id)
         return False
 
     try:
         # Cleanup -- remove worktree and branch
+        if yaml_path.exists():
+            with tracking._RecordLock(yaml_path, require_sidecar=True):
+                record = tracking.load_record(yaml_path)
+                checkout_managed = record.checkout_managed
         inside_worktree = git_ops.is_cwd_inside(worktree_path)
         has_live_session = _has_live_session(record)
+
+        # PR mode (#4400 round 16): re-validate BEFORE reconciliation --
+        # its rebase can itself drop a just-landed EMPTY race commit,
+        # narrowing that window.
+        if pr_mode:
+            from . import finalize_open_pr_gate
+            err = finalize_open_pr_gate.pr_precondition_recheck(
+                record, repo, worktree_path, anchor, precondition_fn=_pr_finalize_precondition)
+            if err:
+                output.err(err)
+                _rollback_finalizing_freeze(yaml_path, prior_status, worktree_id)
+                return False
 
         # Reconcile local branch pointers with origin now that the content is
         # verified upstream, so a merged-but-not-yet-cleaned worktree stops
         # rendering as diverged in the picker (#1106).
         _reconcile_merged_pointers(repo, worktree_path, anchor, branch)
 
-        if inside_worktree or has_live_session:
+        if not checkout_managed or inside_worktree or has_live_session:
             reason = (
-                "this shell is running inside the worktree" if inside_worktree
-                else "a live Copilot session is still using the worktree"
+                "the checkout is owned by an external session host"
+                if not checkout_managed
+                else (
+                    "this shell is running inside the worktree"
+                    if inside_worktree
+                    else "a live Copilot session is still using the worktree"
+                )
             )
             output.ok(
                 f"Finalized: all content from {branch} is on "
                 f"{repo.remote}/{repo.default_branch}, so this worktree is "
                 f"safe to prune."
             )
-            output.info(
-                f"Leaving the worktree directory and branch in place because "
-                f"{reason}. Finalize never deletes the git branch or the "
-                f"folder of an active worktree -- that's expected, not a "
-                f"failure. They'll be removed by 'agent-worktrees cleanup' "
-                f"once the session ends (this is the normal outcome when you "
-                f"finalize from inside the session)."
-            )
+            if not checkout_managed:
+                output.info(
+                    f"Leaving the worktree directory and branch in place because "
+                    f"{reason}. Later agent-worktrees cleanup may retire this "
+                    f"tracking record, but only the external host may remove the "
+                    f"checkout or branch."
+                )
+            else:
+                output.info(
+                    f"Leaving the worktree directory and branch in place because "
+                    f"{reason}. Finalize never deletes the git branch or the "
+                    f"folder of an active worktree -- that's expected, not a "
+                    f"failure. They'll be removed by 'agent-worktrees cleanup' "
+                    f"once the session ends (this is the normal outcome when you "
+                    f"finalize from inside the session)."
+                )
             activity.log_event(
                 "finalize_skipped_removal",
                 worktree_id=worktree_id,
                 branch=branch,
-                reason="inside_worktree" if inside_worktree else "live_session",
+                reason=(
+                    "external_checkout"
+                    if not checkout_managed
+                    else ("inside_worktree" if inside_worktree else "live_session")
+                ),
             )
         else:
             print("Removing worktree...")
@@ -1545,12 +1952,43 @@ def validate_and_finalize(
                 if names:
                     output.info(f"Terminated lingering process(es): {names}")
 
+            # PR mode (#4400 rounds 14-16): re-validate as the LAST possible
+            # step before removal -- narrows, but per reviewer feedback can't
+            # fully eliminate, the TOCTOU window absent a write-blocking hook.
+            if pr_mode:
+                err = finalize_open_pr_gate.pr_precondition_recheck(
+                    record, repo, worktree_path, anchor,
+                    precondition_fn=_pr_finalize_precondition)
+                if err:
+                    output.err(err)
+                    _rollback_finalizing_freeze(yaml_path, prior_status, worktree_id)
+                    return False
+
             if not git_ops.remove_worktree(anchor, worktree_path):
                 output.warn("Could not remove worktree via git -- forcing directory removal.")
 
             print(f"Removing branch {branch}...")
-            if not git_ops.delete_branch(branch, cwd=anchor):
+            if preserve_tracked_branch:
+                output.warn(
+                    f"Preserving branch {branch} instead of deleting it -- "
+                    f"it was flagged above as a stale tracked ref with "
+                    f"content not confirmed on {upstream}. Deleting it here "
+                    f"would rely on 'git branch -d''s merged-check against "
+                    f"the anchor's local branch (not upstream), which can "
+                    f"silently discard genuinely orphaned work right after "
+                    f"warning about it. Remove it manually once rescued or "
+                    f"confirmed disposable."
+                )
+            elif not git_ops.delete_branch(branch, cwd=anchor):
                 output.warn(f"Could not delete branch {branch} (may already be gone).")
+
+            if renamed_branch_to_clean:
+                print(f"Removing validated renamed branch {renamed_branch_to_clean}...")
+                if not git_ops.delete_branch(renamed_branch_to_clean, cwd=anchor):
+                    output.warn(
+                        f"Could not delete branch {renamed_branch_to_clean} "
+                        f"(may already be gone)."
+                    )
 
             if pr_mode and record.prs:
                 # Remove every tracked PR's local feature branch (serial +
@@ -1579,27 +2017,38 @@ def validate_and_finalize(
 
             git_ops.prune_worktrees(cwd=anchor)
 
-        # Merge permissions
-        merged = permissions.merge_permissions(anchor, worktree_path)
-        if merged:
-            for m in merged:
-                print(f"  Merged new permission: {m}")
-            print("Permissions merged back to anchor and worktree entry removed.")
+        if checkout_managed:
+            merged = permissions.merge_permissions(anchor, worktree_path)
+            if merged:
+                for m in merged:
+                    print(f"  Merged new permission: {m}")
+                print("Permissions merged back to anchor and worktree entry removed.")
 
-        if permissions.remove_trusted_folder(worktree_path):
-            print("Removed worktree path from trustedFolders.")
+            if permissions.remove_trusted_folder(worktree_path):
+                print("Removed worktree path from trustedFolders.")
 
         # Update tracking
         if record:
-            # Citadel E1b cascade (#877): a parent that owns outbound worktree
-            # resources hands them back on finalize -- release the live claims so
-            # the ledger stops asserting the parent holds them, and SURFACE the
-            # children so their downstream cleanup isn't silently forgotten. The
-            # child records keep their own owner_ref; the claimant-liveness gate
-            # now sees this parent as terminal (gone), so the children become
-            # orphans governed by their own prune safety.
+            # Citadel E1b cascade (#877): release live outbound claims so the
+            # ledger stops asserting the parent holds them, surfacing children
+            # for downstream cleanup; the claimant-liveness gate now sees this
+            # parent as terminal, so children become orphans under their own prune safety.
             released = tracking.release_all_resources(record, save=False)
             tracking.update_status(record, "finalized")
+            # Warn about (never auto-release) any real CodeSpace claim(s) this worktree still holds
+            # in agent-codespaces' own lease store -- distinct from (and a necessary complement to)
+            # the bookkeeping-only ledger release just above, which only clears THIS repo's own
+            # claim records and never even queries the venue plugin that actually enforces
+            # exclusivity. Only the CURRENT session and an ACTIVE HANDOFF are entitled to
+            # self-release a claim at finalize time; any other still-live claim is surfaced here,
+            # with the exact release command, for the calling agent to confirm and run explicitly.
+            _warn_of_codespace_claims_for_worktree(worktree_id)
+            # Same posture, for the mutable-dev-slot pattern (see
+            # libs/versioned-runtime): a worktree that claimed dev mode for
+            # one or more plugins' local installs must release it explicitly
+            # too, or the next `<repo> update` on this machine leaves a
+            # different worktree's dev claim dangling indefinitely.
+            _warn_of_dev_slot_claims_for_worktree(worktree_id, worktree_path)
             # Reset the postToolUse disposition-nudge sidecar (#nudge): a
             # finalized worktree's disposition is sealed, so drop its drift
             # counter. Best-effort -- the nudge hook also self-heals on a
@@ -1610,15 +2059,17 @@ def validate_and_finalize(
             except Exception:
                 pass
             if released:
+                from . import claim_history
                 output.warn(
                     f"Released {len(released)} downstream worktree resource(s) "
                     f"owned by {worktree_id} (finalized) -- review/clean them:"
                 )
                 for c in released:
-                    label = f"  · {c.kind}: {c.ref}"
-                    if c.note:
-                        label += f" ({c.note})"
+                    label = f"  · {c.kind}: {c.ref}" + (f" ({c.note})" if c.note else "")
                     print(label)
+                    claim_history.record_claim_released(
+                        c, worktree_id=worktree_id, machine=record.machine, note="finalized",
+                        project=record.repo)
 
             # Obligation settlement, upward (resource-obligation-settlement Ph3):
             # this worktree finalizing means its OWN work is safe, so settle the
@@ -1642,6 +2093,7 @@ def validate_and_finalize(
 
     except Exception as e:
         output.err(f"Finalization cleanup failed: {e}")
+        _rollback_finalizing_freeze(yaml_path, prior_status, worktree_id)
         return False
     finally:
         lock.release()

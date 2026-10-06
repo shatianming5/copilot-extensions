@@ -136,6 +136,31 @@ def test_offer_rejects_missing_inactive_and_cross_machine(handoff_state):
         )
 
 
+def test_finalized_source_and_consumer_may_still_offer(handoff_state):
+    """``finalized`` is not terminal -- a resumed source/consumer worktree may
+    still participate in a claim handoff (docs/worktree-lifecycle.md)."""
+    source_path = (
+        claim_handoffs.cfg.project_dir("source-project")
+        / "worktrees"
+        / "wt-source.yaml"
+    )
+    source = tracking.load_record(source_path)
+    source.status = "finalized"
+    tracking.save_record(source, source_path)
+    consumer_path = (
+        claim_handoffs.cfg.project_dir("consumer-project")
+        / "worktrees"
+        / "wt-consumer.yaml"
+    )
+    consumer = tracking.load_record(consumer_path)
+    consumer.status = "finalized"
+    tracking.save_record(consumer, consumer_path)
+    refs = [handoff_state[0].ref]
+    bundle, created = _offer(refs)
+    assert created is True
+    assert bundle.source == SOURCE and bundle.consumer == CONSUMER
+
+
 def test_decline_and_cancel_are_actor_checked_and_idempotent(handoff_state):
     ref = handoff_state[0].ref
     declined = _offer([ref])[0]
@@ -465,6 +490,10 @@ def test_parser_accepts_claim_handoff_surface():
     ])
     assert offered.target == ["handoff", "offer"]
     assert offered.handoff_to == [CONSUMER, "child-ref"] and offered.json is True
+    accepted = parser.parse_args([
+        "claims", "handoff", "accept", "bundle-1"
+    ])
+    assert accepted.target == ["handoff", "accept", "bundle-1"]
     declined = parser.parse_args([
         "claims", "handoff", "decline", "bundle-1", "--reason", "busy"
     ])
@@ -558,20 +587,29 @@ def test_cli_offer_show_decline_cancel(handoff_state, monkeypatch, capfd):
     monkeypatch.setattr(m.cfg, "load_config", lambda: config)
     monkeypatch.setattr(m, "_infer_worktree_id", lambda explicit, config: "wt-source")
     ref = handoff_state[0].ref
+    logged = []
+    monkeypatch.setattr(m.activity, "log_event", lambda *a, **k: logged.append((a, k)))
     assert m.cmd_claims(_args(
         ["handoff", "offer", ref], handoff_to=[CONSUMER]
     )) == 0
     offered = json.loads(capfd.readouterr().out)
     bundle_id = offered["id"]
     assert offered["state"] == "offered" and offered["created"] is True
+    assert logged[-1] == (("claim_handoff_offered",), {
+        "worktree_id": SOURCE, "bundle_id": bundle_id, "consumer": CONSUMER,
+        "refs": [ref], "created": True})
     assert m.cmd_claims(_args(["handoff", "show", bundle_id])) == 0
     assert json.loads(capfd.readouterr().out)["id"] == bundle_id
+    assert len(logged) == 1  # show is read-only -- never logs a mutation
     monkeypatch.setattr(m, "_infer_worktree_id", lambda explicit, config: "wt-consumer")
     config.repo_name = "consumer-project"
     assert m.cmd_claims(_args(
         ["handoff", "decline", bundle_id], reason="busy"
     )) == 0
     assert json.loads(capfd.readouterr().out)["state"] == "declined"
+    assert logged[-1] == (("claim_handoff_declined",), {
+        "worktree_id": SOURCE, "bundle_id": bundle_id, "consumer": CONSUMER,
+        "reason": "busy"})
     source = tracking.load_record(
         claim_handoffs.cfg.project_dir("source-project")
         / "worktrees"
@@ -590,8 +628,11 @@ def test_cli_offer_show_decline_cancel(handoff_state, monkeypatch, capfd):
         ["handoff", "cancel", second_id], reason="superseded"
     )) == 0
     assert json.loads(capfd.readouterr().out)["state"] == "cancelled"
+    assert logged[-1] == (("claim_handoff_cancelled",), {
+        "worktree_id": SOURCE, "bundle_id": second_id, "consumer": CONSUMER,
+        "reason": "superseded"})
 
 
 def test_cli_reports_invalid_action_as_json(handoff_state, capfd):
-    assert m.cmd_claims(_args(["handoff", "accept", "bundle-1"])) == 1
+    assert m.cmd_claims(_args(["handoff", "adopt", "bundle-1"])) == 1
     assert "unknown action" in json.loads(capfd.readouterr().out)["error"]

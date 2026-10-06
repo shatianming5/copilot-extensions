@@ -24,6 +24,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from . import pr_contract as pc
+from .pr_occupancy import occupancy_from_state
 from .providers import account_token_for_slug, get_provider
 
 
@@ -34,16 +35,34 @@ def _binding(prcfg) -> dict:
         "hold_labels": tuple(getattr(prcfg, "hold_labels", ()) or ()),
         "wip_title_prefixes": tuple(getattr(prcfg, "wip_title_prefixes", ()) or ()),
         "approval_required": bool(getattr(prcfg, "approval_required", True)),
+        "allow_stale_approval": bool(getattr(prcfg, "allow_stale_approval", False)),
+        "dismiss_stale_reviews": getattr(prcfg, "dismiss_stale_reviews", None),
     }
 
 
-def classify_pr(snap: pc.PRSnapshot, prcfg) -> pc.PRState:
+def classify_pr(
+    snap: pc.PRSnapshot,
+    prcfg,
+    *,
+    tracked_head_sha: str = "",
+    head_observed_at: str = "",
+) -> pc.PRState:
     """Classify a snapshot against the repo's merge-consent binding."""
-    return pc.classify_state(snap, **_binding(prcfg))
+    return pc.classify_state(
+        snap,
+        **_binding(prcfg),
+        stale_approval_head_sha=tracked_head_sha,
+        stale_approval_head_observed_at=head_observed_at,
+    )
 
 
 def _decide(
-    snap: pc.PRSnapshot, prcfg, *, default_branch: str = ""
+    snap: pc.PRSnapshot,
+    prcfg,
+    *,
+    default_branch: str = "",
+    tracked_head_sha: str = "",
+    head_observed_at: str = "",
 ) -> tuple[pc.PRState, str, str]:
     """Return ``(state, action, reason)`` incl. the default-branch guard.
 
@@ -51,7 +70,12 @@ def _decide(
     the repo's default branch), layered over the pure classifier so a PR aimed at
     a side branch is skipped even if otherwise eligible.
     """
-    state = classify_pr(snap, prcfg)
+    state = classify_pr(
+        snap,
+        prcfg,
+        tracked_head_sha=tracked_head_sha,
+        head_observed_at=head_observed_at,
+    )
     if default_branch and snap.base_ref and snap.base_ref != default_branch:
         return state, "skip", f"base {snap.base_ref!r} != {default_branch!r}"
     return state, state.consent_action, state.reason
@@ -66,6 +90,8 @@ def merge_one(
     token: str | None = None,
     apply: bool = False,
     default_branch: str = "",
+    tracked_head_sha: str = "",
+    head_observed_at: str = "",
     provider=None,
 ) -> dict:
     """Classify PR ``number`` and, if eligible and ``apply``, apply the label.
@@ -80,12 +106,58 @@ def merge_one(
     tok = token if token is not None else account_token_for_slug(repo, prcfg)
 
     snap = provider.get_snapshot(repo, number, api_base=base, token=tok)
-    state, action, reason = _decide(snap, prcfg, default_branch=default_branch)
+    state, action, reason = _decide(
+        snap,
+        prcfg,
+        default_branch=default_branch,
+        tracked_head_sha=tracked_head_sha,
+        head_observed_at=head_observed_at,
+    )
     row: dict = {
         "pr": number, "action": action, "reason": reason, "title": snap.title,
         "verdict": state.verdict, "merge_state": state.merge_state,
+        "approval_stale": state.approval_stale,
+        "approval_stale_authorized": state.approval_stale_authorized,
+        "occupancy": occupancy_from_state(state),
     }
     if action == "apply" and apply:
+        confirm = provider.get_snapshot(repo, number, api_base=base, token=tok)
+        confirmed_state, confirmed_action, confirmed_reason = _decide(
+            confirm,
+            prcfg,
+            default_branch=default_branch,
+            tracked_head_sha=tracked_head_sha,
+            head_observed_at=head_observed_at,
+        )
+        if (
+            confirm.head_sha != snap.head_sha
+            or confirm.updated_at != snap.updated_at
+        ):
+            row.update(
+                action="skip",
+                reason="PR changed while merge consent was being prepared; retry",
+                verdict=confirmed_state.verdict,
+                merge_state=confirmed_state.merge_state,
+                approval_stale=confirmed_state.approval_stale,
+                approval_stale_authorized=(
+                    confirmed_state.approval_stale_authorized
+                ),
+                occupancy=occupancy_from_state(confirmed_state),
+            )
+            return row
+        if confirmed_action != "apply":
+            row.update(
+                action=confirmed_action,
+                reason=confirmed_reason,
+                verdict=confirmed_state.verdict,
+                merge_state=confirmed_state.merge_state,
+                approval_stale=confirmed_state.approval_stale,
+                approval_stale_authorized=(
+                    confirmed_state.approval_stale_authorized
+                ),
+                occupancy=occupancy_from_state(confirmed_state),
+            )
+            return row
         # "Request auto-complete" is the first-class concept; the provider
         # decides how (gitea/github apply the automerge_label; ADO sets native
         # auto-complete). Applying the label is an implementation detail here.

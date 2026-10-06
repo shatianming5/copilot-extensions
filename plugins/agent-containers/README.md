@@ -32,13 +32,27 @@ this plugin and work standalone; without agent-bridge only bridge addressing
 
 ## Concepts
 
+With an explicit installation-cell context, configuration loading validates the
+Containers owner before using config overrides. Its optional knowledge-repo
+fallback invokes only that cell's Agent Worktrees through the packaged native
+peer boundary, never an ambient command. An absent peer is optional only after
+owner validation; invalid receipts, blocked governance, failed probes, and
+unbound required knowledge roots produce an error rather than default fleet
+configuration. Without explicit context, legacy precedence and fallback remain
+unchanged.
+
 - **Fleet** — a named pool of long-lived dev containers built from one
   devcontainer spec. Kept warm (stopped, not destroyed) between uses.
 - **Lease / borrow** — an *effort* (a logical unit of work) borrows a
   container for the duration of its work, then releases it. Leases persist
-  across CLI invocations and agent dispatches; they expire only on explicit
-  `release` or after a TTL (default 24h). Enforcement is **advisory** — the
-  resolver logs but does not block cross-effort dispatch. Restricted destructive
+  across CLI invocations and agent dispatches; they expire on explicit
+  `release` or after a TTL (default 24h). Acquisition may reclaim a lease sooner
+  only when its exact same-host, same-environment holder PID is definitively
+  gone. Remote, cross-environment, legacy, or otherwise indeterminate holder
+  liveness keeps the TTL behavior, and active lifecycle or provider-session
+  admissions block reclamation. The replacement lease records the reclaim
+  reason and prior holder for audit. Enforcement is **advisory** — the resolver
+  logs but does not block cross-effort dispatch. Restricted destructive
   lifecycle adds a separate provider-owned hold: while a member is being checked
   for recreate/remove, new borrows and provider launches are refused.
 - **`container:` resolver** — `agent-bridge send container:<name> "..."`
@@ -116,6 +130,9 @@ agent-containers down <fleet> [--force-abandon] [--json]
 agent-containers start <fleet>       # start stopped containers
 agent-containers rm <fleet> [--force] [--force-abandon] [--json]
                                       # remove; restricted members rescue first
+agent-containers rescue-capture <fleet> [--json]
+                                      # capture running restricted members' session
+                                      # evidence non-destructively (no stop/remove)
 agent-containers borrow <effort> [--fleet <fleet>] [--container <name>]
                                       # lease a free/specific container -> prints name
 agent-containers release <target>    # release by container or effort name
@@ -123,6 +140,12 @@ agent-containers leases              # show active leases
 agent-containers lifecycle-clear [name]
                                       # clear only expired/dead admission records
 agent-containers exec <name>         # run the ACP launch command (testing)
+agent-containers copilot <name>      # attach a trusted-container CLI session
+                                      # (--ttl-seconds applies here only)
+agent-containers copilot <name> --detach [--seed-file task.md]
+                                      # start/rejoin an observable background CLI session
+agent-containers copilot <name> --stop
+                                      # stop that detached session and release its keeper hold
 agent-containers ssh-profile <name> [--alias <alias>]
                                       # publish a named restricted SSH target
 agent-containers ssh-profile <name> --project <project> [--label <label>]
@@ -137,6 +160,26 @@ agent-containers version             # show version
 
 Bridge-facing commands (`namespace-*`, `relay-profile`) and `ssh-stdio` are
 implementation seams and are not normally invoked by humans.
+
+Detached CLI-mode sessions are trusted-profile only. `--detach` reserves the
+host bridge's CLI-mode slot under `<identity>@<container>`, provisions
+agent-bridge registration credentials inside the container, starts a small
+host-side forward keeper for the bridge and credential-relay reverse forwards,
+runs `agent-worktrees embody --json` in the container workspace without a PTY,
+and prints a JSON handle with `session_id`, `scope_id`, and ready-made
+`status`/`observe`/`nudge`/`attach`/`stop` commands. `--stop` kills the
+container tmux session, verifies it is gone, releases that session's keeper
+hold, stops the shared per-container keeper only when no other session still
+holds it, and deregisters the exact live-session row. `--ttl-seconds` applies
+only to attached mode; detached sessions use their fixed reservation lease.
+Extra Copilot CLI flags can be repeated with
+`--copilot-arg`; use `--seed-file -` for long or multi-line prompts. A new
+session starts on the caller's own model, reasoning effort, and context tier
+(from `~/.copilot/settings.json`); an explicit `--copilot-arg=--model=...`
+wins and `AGENT_CODESPACES_MODEL_PROPAGATE=0` opts out.
+`--ref-file PATH` (repeatable, `--detach` only) copies an operator file outside
+the checkout to `~/.agent-bridge/refs/<batch>/` in the container and names it to
+the worker (seed for a new session, a message on rejoin).
 
 ## Configuration
 
@@ -189,7 +232,7 @@ immutable root filesystem with size-bounded tmpfs workspace/home/scratch
 surfaces, drop all Linux capabilities, disable privilege escalation, apply
 CPU/memory/PID ceilings, and default to `network: none`. They must provide an
 explicit per-fleet `acp_command`; there is no implicit
-`--allow-all-tools` fallback.
+`--allow-all --experimental` fallback.
 
 The primary threat is a fallible worker issuing a mistaken/destructive command,
 including one suggested by prompt injection—not an omnipotent hostile tenant.
@@ -229,6 +272,78 @@ configuration sets `forward_gh_token: true` or `relay_enabled: true` on a
 restricted fleet, both resolve false. `agent-containers fleet --json` reports
 the effective `security_profile`, `network`, and `host_credentials` posture so a
 dispatcher can verify the venue before launch.
+
+### Host-backed persistence and systemd for trusted, image-backed fleets
+
+An `image:`-backed `trusted` fleet otherwise has no persistence mechanism at
+all (`code_model: mount` remains unimplemented) and no capability for a
+containerized `systemd --user` instance (its own maintenance timers need
+`CAP_SYS_ADMIN` + a writable `/sys/fs/cgroup`, neither granted by `trusted`'s
+defaults). Two opt-in fields close that gap -- both are rejected on a
+`restricted` fleet, or alongside `devcontainer_path` (`validate_restricted()`
+raises), since a host bind-mount and `CAP_SYS_ADMIN` both defeat the
+restricted containment contract, and a devcontainer-backed fleet's launch
+path never consumes these fields at all:
+
+```yaml
+fleets:
+  self-maintaining-worker:
+    image: example/agent:latest
+    security_profile: trusted
+    workspace_folder: /workspace/myrepo
+    exec_user: node
+    size: 2
+    host_workspace_path: /srv/agent-containers/workspaces/self-maintaining-worker
+    host_home_path: /srv/agent-containers/home/self-maintaining-worker
+    home_folder: /home/node        # the image's own HOME for exec_user -- not
+                                    # probed automatically for trusted fleets,
+                                    # so it must be declared alongside
+                                    # host_home_path (both or neither -- an
+                                    # incomplete pair is rejected)
+    systemd_capable: true
+```
+
+`host_workspace_path`/`host_home_path` are **parent** directories -- each
+fleet member mounts its own subdirectory, keyed by its unique container name
+(e.g. `self-maintaining-worker-1`, `self-maintaining-worker-2` for `size: 2`
+above), onto `workspace_folder`/`home_folder` respectively, so members of a
+multi-container fleet never collide on the same host path. Each member
+subdirectory is created and `chown`'d to `exec_user`'s real uid/gid (resolved
+the same way `restricted` already does) before it is ever mounted -- a
+missing bind-mount source would otherwise be auto-created by Docker owned by
+the daemon (root), leaving a non-root `exec_user` unable to write to its own
+"persistent" workspace/home on first launch. `chown` is POSIX-only; a
+Windows Docker Desktop host only gets the directory created (see the
+platform note on `_ensure_owned_dir`).
+`systemd_capable: true` (a real boolean only -- a quoted `"false"` or other
+non-boolean value is rejected rather than coerced) adds `--cap-add
+SYS_ADMIN`, writable/executable `/run` + `/run/lock` tmpfs mounts, an
+allocated tty, `container=docker`, and **`--user root`** (PID 1 -- systemd
+itself -- must boot as root regardless of the image's own default `USER`;
+`exec_user` only governs LATER `docker exec` calls for actual work, never
+the entrypoint process -- systemd drops to per-service users for real
+workloads via its own unit files, exactly like a normal machine's init),
+then launches the container via a wrapper that remounts `/sys/fs/cgroup`
+read-write before `exec`'ing `/lib/systemd/systemd` as PID 1 (in place of the
+historical `sleep infinity` placeholder) -- Docker's default `/sys/fs/cgroup`
+mount is read-only even under `trusted`, and a raw host bind-mount of it does
+NOT work (a cgroup-namespace path mismatch produces "No such file or
+directory"); an in-container remount at launch is the fix that actually
+works. **The image itself must provide `systemd`, `systemd-sysv`, and
+`dbus-user-session`** -- this plugin only wires the launch, it does not
+install systemd into the image. Once running, `loginctl enable-linger <user>`
+plus that user's own `systemctl --user ...` registers and runs real
+`.timer`/`.service` units exactly as on a normal machine.
+
+The per-member uid/gid used to `chown` `host_workspace_path`/`host_home_path`
+subdirectories is resolved via a trusted-specific probe (not the
+restricted-only `_image_user`, which requires real `memory`/`cpus`/
+`pids_limit` values and rejects a root `exec_user` -- both wrong for
+`trusted`'s normal unset defaults and its historical allowance of a root
+exec_user). The resolved member subdirectory is also validated to stay
+beneath the configured parent path -- `name` comes from the operator-
+configurable `name_prefix`, so a prefix containing `../` is rejected before
+anything is created or `chown`'d.
 
 Dispatch is defined only for containers with an exact fleet entry in the active
 configuration. An unmanaged/discovered container is visible for inventory but
@@ -297,18 +412,49 @@ member carrying an explicit foreign fleet label is reported as drift and
 deferred; its foreign/trusted configuration can never downgrade a requested
 restricted remove into the trusted direct-removal path.
 
+**Profile migration (`restricted` -> `trusted`):** when a fleet's
+`containers.yaml` entry relaxes its `security_profile` while a member built
+under the old `restricted` profile is still live, `up --recreate` and `rm`
+both detect that drift and recreate/remove the member -- routed through the
+exact same rescue/liveness/lease pipeline above (a restricted-built member
+never gets a lighter-weight path just because the fleet's current config
+moved on), with only the "does it still match the CURRENT fleet's
+conformance policy" check skipped, since that check assumes the container is
+staying restricted. Without `--recreate`, `up` raises instead of silently
+leaving the old member untouched.
+
+`rescue-capture` runs the same admission/lease/liveness gating as `down`/`rm`
+against every running restricted member of the named fleet, but performs no
+stop or remove afterward -- the container keeps running untouched. This is
+for a fleet that is deliberately never recycled (an always-on service), where
+`down`/`rm`'s rescue-on-destruction would otherwise never fire: it lets an
+operator (or a periodic timer) shuttle a live member's session evidence out on
+a schedule instead. A member with an active/unknown session, an active lease,
+or a paused state is deferred, same as `down`/`rm` -- capture-only never
+unpauses a container just to probe it. Unlike `down` (which reports an
+already-stopped member as unchanged) or `rm` (which follows the
+stopped-instance evidence/removal path), a non-`running` member is deferred
+immediately with "nothing to capture": capturing is only ever a live,
+in-place operation, never a fallback onto stale stopped-instance evidence.
+`--json` reports per-member `captured`/`deferred` results the same shape as
+`down`'s.
+
 The rescue is one-way evidence capture, not persistence or restore. The
 provider streams only these members from UUID-named Copilot session-state
 directories into host-owned state:
 
 - `events.jsonl`
 - `workspace.yaml`, `origin.json`, and `context.json` when present
+- `agent-worktrees.json` when it is bounded schema-v1 JSON for the enclosing
+  session ID
 - `checkpoints/index.md` when present
 
 `files/`, rewind snapshots, research, unknown session members, workspaces,
 source roots, settings, databases, credentials, and arbitrary home files are
-never copied. Each allowlisted member is opened by a host-supplied helper executed with the
-image's Node interpreter. The interpreter is resolved to an absolute path
+never copied. The reciprocal sidecar remains inert evidence and does not make a
+restored worktree relation authoritative. Each allowlisted member is opened by
+a host-supplied helper executed with the image's Node interpreter. The
+interpreter is resolved to an absolute path
 whose canonical target is outside the actual inspected tmpfs/mount/home
 surfaces; helper launch fails unless Docker reports `ReadonlyRootfs: true`.
 Bash liveness probes use the same
@@ -354,15 +500,19 @@ Docker container ID and its authoritative `State.StartedAt` execution
 generation; restarting the same container ID creates a new generation that
 cannot reuse evidence from the prior run.
 
-`up`, `down`, and `rm` accept `--json`; their result includes created/stopped/
-removed, unchanged, rescued, abandoned, and deferred members. Any deferred
-member returns the established busy exit code `75`. Restricted `exec` blocked by
-a lifecycle hold uses the same exit code.
+`up`, `down`, `rm`, and `rescue-capture` accept `--json`; their result includes
+created/stopped/removed/captured, unchanged, rescued, abandoned, and deferred
+members. Any deferred member returns the established busy exit code `75`.
+Restricted `exec` blocked by a lifecycle hold uses the same exit code.
 Docker command timeouts are normalized into per-member deferred results:
 liveness timeouts become unknown, while stop/remove/confirmation timeouts leave
 the hold fail-closed and do not abort reconciliation of sibling members.
 Typed rescue/generation/pin failures follow the same per-member rule across
-`up`, `down`, and `rm`.
+`up`, `down`, and `rm`. `agent-codespaces`' peer non-destructive capture verb
+(`sync-sessions`, session-rescue-parity Phase 3) uses the same busy exit
+code `75` and a `captured`/`rescued`-equivalent `ok`+`deferred` result shape,
+scaled down to one target instead of a fleet -- see that plugin's own
+README for the exact field names.
 
 Deploy holds expire after 15 minutes without heartbeat; session admissions
 expire after 5 minutes without heartbeat. This bounds PID-reuse failures.
@@ -424,7 +574,12 @@ not for stamping the binstub.
 ## Runtime state
 
 - `~/.agent-containers/leases.json` — lease records, guarded by an exclusive
-  lock file; corrupt/unreadable state is treated as empty.
+  lock file and kept backward-compatible across runtime versions;
+  corrupt/unreadable state is treated as empty.
+- `~/.agent-containers/lease-details.json` — optional environment and reclaim
+  audit metadata keyed to the exact core lease identity. Missing, stale, or
+  unreadable details make early PID-based reclaim indeterminate without hiding
+  the active lease from older runtimes.
 - `~/.agent-containers/deploy-holds.json` and `session-admissions.json` —
   short-lived, heartbeated provider admission records sharing the lease lock
   discipline across Windows/WSL access to the same Docker provider.

@@ -9,19 +9,64 @@
     "id": "id",
     "title": "display",
     "worktree": "worktree",
-    "group": "group"
+    "group": "group",
+    "subtitle": "subtitle"
   },
   "columns": [
     {"key": "display", "header": "codespace", "width": 26},
     {"key": "health", "header": "health", "width": 8, "palette": "state"},
     {"key": "occupancy", "header": "use", "width": 8, "palette": "state"},
     {"key": "safe", "header": "safe", "width": 8, "palette": "state"},
+    {"key": "sess", "header": "live", "width": 4, "palette": "state", "priority": 5},
     {"key": "worktree", "header": "worktree", "width": 10},
     {"key": "cores", "header": "cores", "width": 5, "align": "r"},
-    {"key": "worktree_title", "header": "task", "width": 30}
+    {"key": "worktree_title", "header": "task", "width": 30, "priority": 6},
+    {"key": "claims_summary", "header": "claims", "width": 18, "priority": 4}
   ],
   "summary": "{spent_cores}/{total_cores} cores in use \u00b7 {headroom_cores} free \u00b7 {running_count}/{total_count} running   {note}",
   "actions": [
+    {
+      "label": "Open",
+      "kind": "internal",
+      "verb": "open-venue"
+    },
+    {
+      "key": "inspect-window",
+      "label": "Inspect in a new window",
+      "kind": "internal",
+      "verb": "open-venue-window"
+    },
+    {
+      "key": "watch",
+      "label": "Watch (live-session view)",
+      "kind": "internal",
+      "verb": "open-bridge-ui",
+      "when": {"sess": ["LIVE", "IDLE"]}
+    },
+    {
+      "key": "send-message",
+      "label": "Send message",
+      "kind": "internal",
+      "verb": "send-worker-message",
+      "when": {"sess": ["LIVE", "IDLE"]}
+    },
+    {
+      "key": "jump-driving-worktree",
+      "label": "View driving worktree",
+      "kind": "internal",
+      "verb": "jump-host",
+      "when": {"has_driving_worktree": "true"}
+    },
+    {
+      "key": "worktree-status",
+      "label": "Worktree status",
+      "kind": "card",
+      "title_from": "worktree_status.title",
+      "status_from": "worktree_status.status",
+      "link_from": "worktree_status.link",
+      "body_from": "worktree_status.body",
+      "when": {"has_driving_worktree": "true"}
+    },
     {
       "label": "Release",
       "run": ["agent-codespaces", "release", "{id}"],
@@ -42,5 +87,6 @@
       "progress": true
     }
   ],
-  "empty_hint": "No CodeSpaces (is the GitHub CLI authenticated with the 'codespace' scope?)."
+  "empty_hint": "No CodeSpaces (is the GitHub CLI authenticated with the 'codespace' scope?).",
+  "worker": {"worktree": "worktree_id", "label": "display", "live": "sess", "activity": "activity"}
 }

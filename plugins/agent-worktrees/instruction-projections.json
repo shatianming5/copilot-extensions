@@ -1,0 +1,46 @@
+{
+  "schema": "copilot-extensions.instruction-projections",
+  "version": 1,
+  "projections": [
+    {
+      "id": "session-guidance",
+      "template": "instructions/session-guidance.instructions.md",
+      "destination": ".github/instructions/agent-worktrees/session-guidance.instructions.md",
+      "customizationKind": "instructions",
+      "applyTo": "**",
+      "legacyMarkers": []
+    },
+    {
+      "id": "worktree-context-guide",
+      "template": "instructions/worktree-context-guide.instructions.md",
+      "destination": ".github/instructions/agent-worktrees/worktree-context-guide.instructions.md",
+      "customizationKind": "instructions",
+      "applyTo": "**",
+      "legacyMarkers": []
+    },
+    {
+      "id": "head-claim-fallback",
+      "template": "instructions/head-claim-fallback.instructions.md",
+      "destination": ".github/instructions/agent-worktrees/head-claim-fallback.instructions.md",
+      "customizationKind": "instructions",
+      "applyTo": "**",
+      "legacyMarkers": []
+    },
+    {
+      "id": "cli-fallback",
+      "template": "instructions/cli-fallback.instructions.md",
+      "destination": ".github/instructions/agent-worktrees/cli-fallback.instructions.md",
+      "customizationKind": "instructions",
+      "applyTo": "**",
+      "legacyMarkers": []
+    },
+    {
+      "id": "ownership-boundary-fallback",
+      "template": "instructions/ownership-boundary-fallback.instructions.md",
+      "destination": ".github/instructions/agent-worktrees/ownership-boundary-fallback.instructions.md",
+      "customizationKind": "instructions",
+      "applyTo": "**",
+      "legacyMarkers": []
+    }
+  ]
+}

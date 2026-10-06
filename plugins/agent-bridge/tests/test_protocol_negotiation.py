@@ -15,13 +15,20 @@ from agent_bridge.app import create_app
 from agent_bridge.client import BridgeClient, BridgeClientError
 from agent_bridge.models import ServiceConfig
 from agent_bridge.protocol import (
+    AT_REST_PROJECTION_PROTOCOL_VERSION,
+    ATTENTION_WAIT_PROTOCOL_VERSION,
+    CLI_MODE_UNCLAIMED_RELEASE_PROTOCOL_VERSION,
+    CONDITIONAL_IDLE_END_PROTOCOL_VERSION,
     CONTAINER_RECREATE_PROTOCOL_VERSION,
     FAILED_ACP_HANDSHAKE_FAULT,
     FAILED_ACP_HANDSHAKE_PROTOCOL_VERSION,
     HTTP_PROTOCOL_MIN_SUPPORTED,
     HTTP_PROTOCOL_VERSION,
     MACHINE_METADATA_PROTOCOL_VERSION,
+    PROVIDER_TARGET_REFRESH_PROTOCOL_VERSION,
     RELAY_INTERRUPT_PROTOCOL_VERSION,
+    REMOTE_OPERATIONS_PROTOCOL_VERSION,
+    REPRESENTED_RESULT_SNAPSHOT_PROTOCOL_VERSION,
     RESULT_SNAPSHOT_PROTOCOL_VERSION,
     UNVERSIONED,
 )
@@ -35,6 +42,60 @@ def test_machine_metadata_capability_is_advertised() -> None:
 def test_result_snapshot_capability_is_advertised() -> None:
     assert RESULT_SNAPSHOT_PROTOCOL_VERSION == 6
     assert RESULT_SNAPSHOT_PROTOCOL_VERSION <= HTTP_PROTOCOL_VERSION
+    assert REPRESENTED_RESULT_SNAPSHOT_PROTOCOL_VERSION == 7
+    assert REPRESENTED_RESULT_SNAPSHOT_PROTOCOL_VERSION <= HTTP_PROTOCOL_VERSION
+    assert PROVIDER_TARGET_REFRESH_PROTOCOL_VERSION == 8
+    assert PROVIDER_TARGET_REFRESH_PROTOCOL_VERSION <= HTTP_PROTOCOL_VERSION
+    assert AT_REST_PROJECTION_PROTOCOL_VERSION == 9
+    assert AT_REST_PROJECTION_PROTOCOL_VERSION <= HTTP_PROTOCOL_VERSION
+
+
+def test_attention_wait_capability_is_advertised() -> None:
+    assert ATTENTION_WAIT_PROTOCOL_VERSION == 10
+    assert ATTENTION_WAIT_PROTOCOL_VERSION <= HTTP_PROTOCOL_VERSION
+
+
+def test_remote_operations_capability_is_advertised() -> None:
+    assert REMOTE_OPERATIONS_PROTOCOL_VERSION == 11
+    assert REMOTE_OPERATIONS_PROTOCOL_VERSION <= HTTP_PROTOCOL_VERSION
+
+
+def test_conditional_idle_end_capability_is_advertised() -> None:
+    assert CONDITIONAL_IDLE_END_PROTOCOL_VERSION == 12
+    assert CONDITIONAL_IDLE_END_PROTOCOL_VERSION <= HTTP_PROTOCOL_VERSION
+
+
+def test_bare_session_transcript_capability_is_advertised() -> None:
+    from agent_bridge.protocol import BARE_SESSION_TRANSCRIPT_PROTOCOL_VERSION
+
+    assert BARE_SESSION_TRANSCRIPT_PROTOCOL_VERSION == 17
+    assert BARE_SESSION_TRANSCRIPT_PROTOCOL_VERSION <= HTTP_PROTOCOL_VERSION
+
+
+def test_remote_session_copilot_args_capability_is_advertised() -> None:
+    from agent_bridge.protocol import REMOTE_SESSION_COPILOT_ARGS_PROTOCOL_VERSION
+
+    assert REMOTE_SESSION_COPILOT_ARGS_PROTOCOL_VERSION == 18
+    assert REMOTE_SESSION_COPILOT_ARGS_PROTOCOL_VERSION <= HTTP_PROTOCOL_VERSION
+
+
+def test_live_session_mode_capability_is_advertised() -> None:
+    from agent_bridge.protocol import LIVE_SESSION_MODE_PROTOCOL_VERSION
+
+    assert LIVE_SESSION_MODE_PROTOCOL_VERSION == 19
+    assert LIVE_SESSION_MODE_PROTOCOL_VERSION <= HTTP_PROTOCOL_VERSION
+
+
+def test_cli_mode_unclaimed_release_capability_is_advertised() -> None:
+    assert CLI_MODE_UNCLAIMED_RELEASE_PROTOCOL_VERSION == 20
+    assert CLI_MODE_UNCLAIMED_RELEASE_PROTOCOL_VERSION <= HTTP_PROTOCOL_VERSION
+
+
+def test_live_session_alias_capability_is_advertised() -> None:
+    from agent_bridge.protocol import LIVE_SESSION_ALIAS_PROTOCOL_VERSION
+
+    assert LIVE_SESSION_ALIAS_PROTOCOL_VERSION == 21
+    assert LIVE_SESSION_ALIAS_PROTOCOL_VERSION <= HTTP_PROTOCOL_VERSION
 
 
 def _app(tmp_path):
@@ -77,6 +138,18 @@ def test_daemon_supports_gates_on_version():
     assert c.daemon_supports(1) is True
     assert c.daemon_supports(2) is True
     assert c.daemon_supports(3) is False  # newer client feature, older daemon
+
+
+def test_conditional_idle_end_refuses_daemon_before_capability_version():
+    c = _client({
+        "protocol_version": CONDITIONAL_IDLE_END_PROTOCOL_VERSION - 1,
+        "min_protocol_version": 1,
+    })
+
+    with pytest.raises(BridgeClientError) as raised:
+        c.end_session("session-1", if_idle=True)
+
+    assert raised.value.status == 426
 
 
 def test_relay_interruption_refuses_daemon_before_capability_version():

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -17,6 +17,9 @@ MKT = reconcile.MARKETPLACE
 REPO = Path(__file__).resolve().parents[3]
 INSTALLATION_CONTEXT = (
     REPO / "libs" / "installation-context" / "installation_context.py"
+)
+INSTALLATION_CONTEXT_PS1 = (
+    REPO / "libs" / "installation-context" / "installation-context.ps1"
 )
 
 
@@ -36,6 +39,7 @@ def env(tmp_path: Path, monkeypatch):
     repo = tmp_path / "repo"
     (repo / ".github" / "copilot").mkdir(parents=True)
     monkeypatch.delenv("COPILOT_EXTENSIONS_CONTEXT", raising=False)
+    monkeypatch.delenv("COPILOT_PLUGIN_ROOT", raising=False)
 
     monkeypatch.setattr(reconcile, "_home", lambda: home)
     monkeypatch.setattr(
@@ -84,15 +88,19 @@ def env(tmp_path: Path, monkeypatch):
         if installer:
             (pdir / "scripts" / installer).write_text("#!/bin/sh\n", encoding="utf-8")
         if name in {"agent-machines", "agent-index", "agent-worktrees"}:
-            helper = (
+            helper_py = (
                 pdir
                 / "scripts"
                 / "installation-context"
                 / "installation_context.py"
             )
-            helper.parent.mkdir(parents=True, exist_ok=True)
-            if not helper.is_file():
-                shutil.copyfile(INSTALLATION_CONTEXT, helper)
+            helper_py.parent.mkdir(parents=True, exist_ok=True)
+            if not helper_py.is_file():
+                for source in INSTALLATION_CONTEXT.parent.glob("*.py"):
+                    shutil.copyfile(source, helper_py.parent / source.name)
+            helper_ps1 = helper_py.with_name("installation-context.ps1")
+            if not helper_ps1.is_file():
+                shutil.copyfile(INSTALLATION_CONTEXT_PS1, helper_ps1)
         return pdir
 
     def deploy_runtime(name: str, version: str):
@@ -130,11 +138,44 @@ def env(tmp_path: Path, monkeypatch):
         )
         helper.parent.mkdir(parents=True, exist_ok=True)
         if not helper.is_file():
-            shutil.copyfile(INSTALLATION_CONTEXT, helper)
-        durable = Path(tempfile.mkdtemp(prefix="aw-cell-")) / ".copilot-extensions"
-        e.cell_homes.append(durable.parent)
-        result = subprocess.run(
-            [
+            for source in INSTALLATION_CONTEXT.parent.glob("*.py"):
+                shutil.copyfile(source, helper.parent / source.name)
+        helper_ps1 = helper.with_name("installation-context.ps1")
+        if not helper_ps1.is_file():
+            shutil.copyfile(INSTALLATION_CONTEXT_PS1, helper_ps1)
+        durable = e.home / ".copilot-extensions"
+        namespace_generation = 0
+        if marketplace_key == MKT:
+            namespace = (
+                durable / "marketplaces" / reconcile.CORE_MARKETPLACE_ID
+                / "namespace.json"
+            )
+            if namespace.is_file():
+                namespace_generation = json.loads(
+                    namespace.read_text(encoding="utf-8")
+                )["generation"]
+        if os.name == "nt":
+            command = [
+                "pwsh", "-NoProfile", "-File", str(helper_ps1), "stamp",
+                "-SourceJson", json.dumps({
+                    "source": "github",
+                    "repo": (
+                        "ThomasMichon/copilot-extensions"
+                        if marketplace_key == MKT
+                        else "Example-Org/Example-Marketplace.git"
+                    ),
+                }),
+                "-MarketplaceKey", marketplace_key,
+                "-PluginId", name,
+                "-PayloadRoot", str(payload_dir),
+                "-PayloadVersion", payload_version,
+                "-PayloadOrigin", "explicit",
+                "-ExpectedNamespaceGeneration", str(namespace_generation),
+                "-ExpectedInstallGeneration", "0",
+                "-DurableHome", str(durable),
+            ]
+        else:
+            command = [
                 sys.executable,
                 str(helper),
                 "stamp",
@@ -158,12 +199,14 @@ def env(tmp_path: Path, monkeypatch):
                 "--payload-origin",
                 "explicit",
                 "--expected-namespace-generation",
-                "0",
+                str(namespace_generation),
                 "--expected-install-generation",
                 "0",
                 "--durable-home",
                 str(durable),
-            ],
+            ]
+        result = subprocess.run(
+            command,
             capture_output=True,
             text=True,
             check=False,
@@ -223,6 +266,95 @@ def _services(plan: dict, phase: str | None = None) -> set[str]:
     return {u["service"] for u in ups}
 
 
+def _mode_resolution(
+    env,
+    name: str,
+    *,
+    status: str,
+    reason: str,
+    actual_mode: str | None,
+    desired_mode: str | None,
+    allow_mutation: bool,
+    context: Path | None = None,
+    runtime_root: Path | None = None,
+    marketplace_id: str | None = None,
+) -> dict:
+    if runtime_root is None and actual_mode == "legacy":
+        runtime_root = env.home / f".{name}"
+    if marketplace_id is None and status != "provenance-blocked":
+        marketplace_id = reconcile.CORE_MARKETPLACE_ID
+    return {
+        "schema": "copilot-extensions.installation-resolution",
+        "version": 1,
+        "marketplaceId": marketplace_id,
+        "pluginId": name,
+        "desiredMode": desired_mode,
+        "actualMode": actual_mode,
+        "status": status,
+        "runtimeRoot": str(runtime_root) if runtime_root is not None else None,
+        "context": str(context) if context is not None else None,
+        "reason": reason,
+        "allowMutation": allow_mutation,
+        "probeReason": reason,
+        "policy": {
+            "state": "missing",
+            "enabled": desired_mode == "namespaced",
+            "reason": (
+                "policy-default-false"
+                if desired_mode == "legacy"
+                else "policy-global-true"
+            ),
+        },
+        "legacy": {
+            "root": str(env.home / f".{name}"),
+            "tombstone": None,
+            "disposition": "active",
+        },
+    }
+
+
+def test_same_path_resolves_symlink_alias(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation unavailable: {error}")
+
+    assert reconcile._same_path(alias, target)
+
+
+def test_installation_mode_helper_failure_includes_bounded_detail(
+    env, monkeypatch
+):
+    monkeypatch.setattr(
+        reconcile.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[],
+            returncode=7,
+            stdout="fallback detail",
+            stderr="specific policy failure\nwith context",
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"installation-mode resolver failed for agent-machines "
+            r"\(exit 7\): specific policy failure with context"
+        ),
+    ):
+        reconcile._run_installation_mode_helper(
+            "agent-machines",
+            env.repo / "payload",
+            INSTALLATION_CONTEXT,
+            env.home / ".agent-machines",
+            context=None,
+        )
+
+
 # ---------------------------------------------------------------------------
 # read_enabled_plugins
 # ---------------------------------------------------------------------------
@@ -277,6 +409,29 @@ def test_read_user_enabled_filters_and_local_override(tmp_path, monkeypatch):
 def test_read_user_enabled_no_file_returns_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(reconcile, "_copilot_home", lambda: tmp_path / "absent")
     assert reconcile.read_user_enabled_plugins() == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{",
+        "[]",
+        '{"enabledPlugins":[]}',
+        f'{{"enabledPlugins":{{"efforts@{MKT}":"true"}}}}',
+    ],
+)
+def test_read_user_enabled_malformed_settings_fail_closed(
+    tmp_path,
+    monkeypatch,
+    content,
+):
+    home = tmp_path / "copilot-home"
+    home.mkdir()
+    (home / "settings.json").write_text(content, encoding="utf-8")
+    monkeypatch.setattr(reconcile, "_copilot_home", lambda: home)
+
+    with pytest.raises(ValueError):
+        reconcile.read_user_enabled_plugins()
 
 
 def test_read_installed_plugins_uses_inventory_not_activation(tmp_path, monkeypatch):
@@ -501,7 +656,408 @@ def test_payload_refresh_suppressed_by_default(env):
 # Explicit installation-context manifest selection
 # ---------------------------------------------------------------------------
 
-def test_context_selected_current_runtime_avoids_legacy_reinstall(
+@pytest.mark.parametrize(
+    ("status", "reason", "desired_mode"),
+    [
+        ("ready", "policy-default-false", "legacy"),
+        ("migration-required", "migration-required", "namespaced"),
+    ],
+)
+def test_cell_aware_legacy_modes_reconcile_without_receipt(
+    env,
+    monkeypatch,
+    status,
+    reason,
+    desired_mode,
+):
+    payload = env.install_payload(
+        "agent-machines",
+        "2.0.0",
+        scope="universal",
+    )
+    receipt = (
+        env.home
+        / ".copilot-extensions"
+        / "marketplaces"
+        / reconcile.CORE_MARKETPLACE_ID
+        / "plugins"
+        / "agent-machines"
+        / "install.json"
+    )
+    assert not receipt.exists()
+    monkeypatch.setattr(
+        reconcile,
+        "_run_installation_mode_helper",
+        lambda *args, **kwargs: _mode_resolution(
+            env,
+            "agent-machines",
+            status=status,
+            reason=reason,
+            actual_mode="legacy",
+            desired_mode=desired_mode,
+            allow_mutation=True,
+        ),
+    )
+
+    selected = reconcile.resolve_runtime_installation(
+        "agent-machines",
+        payload,
+    )
+
+    assert selected.runtime_root == env.home / ".agent-machines"
+    assert selected.context is None
+    assert selected.actual_mode == "legacy"
+
+
+def test_missing_policy_active_legacy_runtime_reconciles_without_receipt(
+    env,
+    monkeypatch,
+):
+    env.write_settings({f"agent-machines@{MKT}": True})
+    payload = env.install_payload(
+        "agent-machines",
+        "2.0.0",
+        scope="universal",
+    )
+    env.deploy_runtime("agent-machines", "1.0.0")
+    receipt = (
+        env.home
+        / ".copilot-extensions"
+        / "marketplaces"
+        / reconcile.CORE_MARKETPLACE_ID
+        / "plugins"
+        / "agent-machines"
+        / "install.json"
+    )
+    assert not receipt.exists()
+    monkeypatch.setattr(
+        reconcile,
+        "_run_installation_mode_helper",
+        lambda *args, **kwargs: _mode_resolution(
+            env,
+            "agent-machines",
+            status="ready",
+            reason="policy-default-false",
+            actual_mode="legacy",
+            desired_mode="legacy",
+            allow_mutation=True,
+        ),
+    )
+
+    plan = reconcile.build_plan(
+        env.repo,
+        machine="m1",
+        cache={},
+        save=False,
+    )
+
+    update = next(u for u in plan["updates"] if u["phase"] == "runtime")
+    assert update["service"] == "agent-machines"
+    assert update["from_version"] == "1.0.0"
+    assert update["to_version"] == "2.0.0"
+    assert "COPILOT_EXTENSIONS_CONTEXT" not in update["environment"]
+    assert plan.get("diagnostics") is None
+    assert payload.is_dir()
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "actual_mode", "desired_mode"),
+    [
+        ("ready", "activation-required", "legacy", "namespaced"),
+        ("maintenance-blocked", "maintenance-active", "legacy", "legacy"),
+        ("invalid", "policy-invalid", None, None),
+        ("orphaned-transfer", "orphaned-transfer", "legacy", "legacy"),
+        ("foreign-environment", "foreign-environment", None, None),
+        ("revalidation-required", "revalidation-required", "namespaced", "namespaced"),
+        ("provenance-blocked", "provenance-blocked", None, None),
+    ],
+)
+def test_unsafe_installation_modes_block_runtime_reconcile(
+    env,
+    monkeypatch,
+    status,
+    reason,
+    actual_mode,
+    desired_mode,
+):
+    payload = env.install_payload(
+        "agent-machines",
+        "2.0.0",
+        scope="universal",
+    )
+    namespaced_context = (
+        env.home
+        / ".copilot-extensions"
+        / "marketplaces"
+        / reconcile.CORE_MARKETPLACE_ID
+        / "plugins"
+        / "agent-machines"
+        / "install.json"
+        if actual_mode == "namespaced"
+        else None
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "_run_installation_mode_helper",
+        lambda *args, **kwargs: _mode_resolution(
+            env,
+            "agent-machines",
+            status=status,
+            reason=reason,
+            actual_mode=actual_mode,
+            desired_mode=desired_mode,
+            allow_mutation=False,
+            context=namespaced_context,
+            runtime_root=(
+                namespaced_context.parent
+                if namespaced_context is not None
+                else None
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="blocks runtime reconciliation"):
+        reconcile.resolve_runtime_installation("agent-machines", payload)
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "desired_mode"),
+    [
+        ("ready", "namespaced-active", "namespaced"),
+        ("deactivation-required", "deactivation-required", "legacy"),
+    ],
+)
+def test_namespaced_modes_require_exact_validated_receipt(
+    env,
+    monkeypatch,
+    status,
+    reason,
+    desired_mode,
+):
+    payload = env.install_payload(
+        "agent-machines",
+        "2.0.0",
+        scope="universal",
+    )
+    receipt = (
+        env.home
+        / ".copilot-extensions"
+        / "marketplaces"
+        / reconcile.CORE_MARKETPLACE_ID
+        / "plugins"
+        / "agent-machines"
+        / "install.json"
+    )
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        reconcile,
+        "_run_installation_mode_helper",
+        lambda *args, **kwargs: _mode_resolution(
+            env,
+            "agent-machines",
+            status=status,
+            reason=reason,
+            actual_mode="namespaced",
+            desired_mode=desired_mode,
+            allow_mutation=False,
+            context=receipt,
+            runtime_root=receipt.parent,
+        ),
+    )
+
+    selected = reconcile.resolve_runtime_installation(
+        "agent-machines",
+        payload,
+    )
+
+    assert selected.context == receipt
+    assert selected.runtime_root == receipt.parent
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "desired_mode"),
+    [
+        ("ready", "namespaced-active", "namespaced"),
+        ("deactivation-required", "deactivation-required", "legacy"),
+    ],
+)
+def test_namespaced_agent_machines_plan_uses_cell_transaction(
+    env,
+    monkeypatch,
+    status,
+    reason,
+    desired_mode,
+):
+    env.write_settings({f"agent-machines@{MKT}": True})
+    env.install_payload(
+        "agent-machines",
+        "2.0.0",
+        scope="universal",
+        installer="init.sh",
+    )
+    receipt = (
+        env.home
+        / ".copilot-extensions"
+        / "marketplaces"
+        / reconcile.CORE_MARKETPLACE_ID
+        / "plugins"
+        / "agent-machines"
+        / "install.json"
+    )
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text("{}", encoding="utf-8")
+    (receipt.parent / "deploy-manifest.json").write_text(
+        json.dumps({"source": {"version": "1.0.0"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "_run_installation_mode_helper",
+        lambda *args, **kwargs: _mode_resolution(
+            env,
+            "agent-machines",
+            status=status,
+            reason=reason,
+            actual_mode="namespaced",
+            desired_mode=desired_mode,
+            allow_mutation=False,
+            context=receipt,
+            runtime_root=receipt.parent,
+        ),
+    )
+
+    plan = reconcile.build_plan(
+        env.repo,
+        machine="m1",
+        cache={},
+        save=False,
+    )
+
+    update = next(u for u in plan["updates"] if u["phase"] == "runtime")
+    assert update["argv"][2] == "cell-provision"
+    assert update["environment"] == {
+        "COPILOT_EXTENSIONS_CONTEXT": str(receipt)
+    }
+    assert update["from_version"] == "1.0.0"
+    assert update["to_version"] == "2.0.0"
+
+
+def test_namespaced_runtime_without_transaction_reports_diagnostic(
+    env,
+    monkeypatch,
+):
+    env.write_settings({f"agent-index@{MKT}": True})
+    env.install_payload(
+        "agent-index",
+        "2.0.0",
+        scope="universal",
+        installer="install.sh",
+    )
+    receipt = (
+        env.home
+        / ".copilot-extensions"
+        / "marketplaces"
+        / reconcile.CORE_MARKETPLACE_ID
+        / "plugins"
+        / "agent-index"
+        / "install.json"
+    )
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text("{}", encoding="utf-8")
+    (receipt.parent / "deploy-manifest.json").write_text(
+        json.dumps({"source": {"version": "1.0.0"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "_run_installation_mode_helper",
+        lambda *args, **kwargs: _mode_resolution(
+            env,
+            "agent-index",
+            status="ready",
+            reason="namespaced-active",
+            actual_mode="namespaced",
+            desired_mode="namespaced",
+            allow_mutation=False,
+            context=receipt,
+            runtime_root=receipt.parent,
+        ),
+    )
+
+    plan = reconcile.build_plan(
+        env.repo,
+        machine="m1",
+        cache={},
+        save=False,
+    )
+
+    assert _services(plan, phase="runtime") == set()
+    assert plan["diagnostics"][0]["reason"] == (
+        "installation-context-unsupported"
+    )
+
+
+@pytest.mark.parametrize(
+    ("context_value", "root_value"),
+    [
+        (None, "expected"),
+        ("expected", "legacy"),
+        ("foreign", "expected"),
+    ],
+)
+def test_namespaced_mode_blocks_missing_or_mismatched_receipt(
+    env,
+    monkeypatch,
+    context_value,
+    root_value,
+):
+    payload = env.install_payload(
+        "agent-machines",
+        "2.0.0",
+        scope="universal",
+    )
+    expected = (
+        env.home
+        / ".copilot-extensions"
+        / "marketplaces"
+        / reconcile.CORE_MARKETPLACE_ID
+        / "plugins"
+        / "agent-machines"
+        / "install.json"
+    )
+    expected.parent.mkdir(parents=True)
+    expected.write_text("{}", encoding="utf-8")
+    context = {
+        None: None,
+        "expected": expected,
+        "foreign": env.home / "foreign" / "install.json",
+    }[context_value]
+    root = {
+        "expected": expected.parent,
+        "legacy": env.home / ".agent-machines",
+    }[root_value]
+    monkeypatch.setattr(
+        reconcile,
+        "_run_installation_mode_helper",
+        lambda *args, **kwargs: _mode_resolution(
+            env,
+            "agent-machines",
+            status="ready",
+            reason="namespaced-active",
+            actual_mode="namespaced",
+            desired_mode="namespaced",
+            allow_mutation=False,
+            context=context,
+            runtime_root=root,
+        ),
+    )
+
+    with pytest.raises(ValueError):
+        reconcile.resolve_runtime_installation("agent-machines", payload)
+
+
+def test_governed_current_legacy_runtime_avoids_reinstall(
     env, monkeypatch
 ):
     env.write_settings({f"agent-index@{MKT}": True})
@@ -509,14 +1065,20 @@ def test_context_selected_current_runtime_avoids_legacy_reinstall(
     _context, plugin_root = env.select_context(
         "agent-index", payload, "2.0.0", "2.0.0"
     )
-    child_environments = []
-    original_run = reconcile.subprocess.run
-
-    def track_environment(*args, **kwargs):
-        child_environments.append(kwargs["env"])
-        return original_run(*args, **kwargs)
-
-    monkeypatch.setattr(reconcile.subprocess, "run", track_environment)
+    env.deploy_runtime("agent-index", "2.0.0")
+    monkeypatch.setattr(
+        reconcile,
+        "_run_installation_mode_helper",
+        lambda *args, **kwargs: _mode_resolution(
+            env,
+            "agent-index",
+            status="ready",
+            reason="policy-default-false",
+            actual_mode="legacy",
+            desired_mode="legacy",
+            allow_mutation=True,
+        ),
+    )
 
     plan = reconcile.build_plan(
         env.repo, machine="m1", cache={}, save=False
@@ -525,38 +1087,44 @@ def test_context_selected_current_runtime_avoids_legacy_reinstall(
     assert plan["action"] == "continue"
     assert _services(plan, phase="runtime") == set()
     assert plan.get("diagnostics") is None
-    assert not (env.home / ".agent-index").exists()
+    assert (env.home / ".agent-index" / "deploy-manifest.json").is_file()
     assert (plugin_root / "deploy-manifest.json").is_file()
-    assert len(child_environments) == 1
-    assert "PYTHONPATH" not in child_environments[0]
 
 
-def test_context_selected_drift_is_diagnostic_not_legacy_install(env):
+def test_governed_reconcile_compares_authoritative_legacy_runtime(env, monkeypatch):
     env.write_settings({f"agent-index@{MKT}": True})
     payload = env.install_payload("agent-index", "2.0.0", scope="universal")
     _context, plugin_root = env.select_context(
-        "agent-index", payload, "2.0.0", "1.0.0"
+        "agent-index", payload, "2.0.0", "2.0.0"
     )
-    env.deploy_runtime("agent-index", "2.0.0")
+    env.deploy_runtime("agent-index", "1.0.0")
+    monkeypatch.setattr(
+        reconcile,
+        "_run_installation_mode_helper",
+        lambda *args, **kwargs: _mode_resolution(
+            env,
+            "agent-index",
+            status="ready",
+            reason="policy-default-false",
+            actual_mode="legacy",
+            desired_mode="legacy",
+            allow_mutation=True,
+        ),
+    )
 
     plan = reconcile.build_plan(
         env.repo, machine="m1", cache={}, save=False
     )
 
-    assert plan["action"] == "continue"
-    assert _services(plan, phase="runtime") == set()
-    assert plan["diagnostics"] == [{
-        "service": "agent-index",
-        "phase": "runtime",
-        "reason": "context-runtime-version-drift",
-        "from_version": "1.0.0",
-        "to_version": "2.0.0",
-        "runtime_root": str(plugin_root),
-        "message": (
-            "namespaced runtime inspection is read-only until activation "
-            "governance and context-aware installers land"
-        ),
-    }]
+    assert plan["action"] == "reconcile", plan
+    assert _services(plan, phase="runtime") == {"agent-index"}
+    update = next(u for u in plan["updates"] if u["phase"] == "runtime")
+    assert "COPILOT_EXTENSIONS_CONTEXT" not in update["environment"]
+    assert "COPILOT_PLUGIN_ROOT" in update["unset_environment"]
+    assert plugin_root.is_dir()
+    candidate = reconcile.runtime_installation_candidate("agent-index", payload)
+    assert candidate is None
+    assert update["from_version"] == "1.0.0"
 
 
 def test_payload_only_context_is_ignored_by_agent_runtime_reconcile(env):
@@ -574,11 +1142,11 @@ def test_payload_only_context_is_ignored_by_agent_runtime_reconcile(env):
 
 
 def test_payload_only_context_does_not_abort_build_plan(env):
-    env.write_settings({f"agent-index@{MKT}": True})
-    env.install_payload("agent-index", "2.0.0", scope="universal")
+    env.write_settings({f"agent-codespaces@{MKT}": True})
+    env.install_payload("agent-codespaces", "2.0.0", scope="universal")
     payload_only = env.install_payload("context-handoff", "1.0.0", scope="none")
     env.select_context("context-handoff", payload_only, "1.0.0", None)
-    env.deploy_runtime("agent-index", "1.0.0")
+    env.deploy_runtime("agent-codespaces", "1.0.0")
 
     plan = reconcile.build_plan(
         env.repo,
@@ -588,7 +1156,7 @@ def test_payload_only_context_does_not_abort_build_plan(env):
     )
 
     assert plan["action"] == "reconcile"
-    assert _services(plan, phase="runtime") == {"agent-index"}
+    assert _services(plan, phase="runtime") == {"agent-codespaces"}
     assert plan.get("diagnostics") is None
 
 
@@ -632,6 +1200,151 @@ def test_direct_agent_runtime_never_uses_installation_cell(env):
     )
 
     assert reconcile.installation_cell_eligibility("agent-helper", direct) is False
+
+
+def _direct_agent_payload(env):
+    direct = (
+        env.home
+        / ".copilot"
+        / "installed-plugins"
+        / "_direct"
+        / "downstream-agent-helper"
+    )
+    (direct / "scripts").mkdir(parents=True, exist_ok=True)
+    (direct / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "agent-helper",
+                "version": "2.0.0",
+                "runtimeScope": "universal",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return direct
+
+
+def test_non_cell_agent_runtime_without_context_remains_legacy(env, monkeypatch):
+    direct = _direct_agent_payload(env)
+    monkeypatch.delenv("COPILOT_EXTENSIONS_CONTEXT", raising=False)
+
+    resolution = reconcile.resolve_runtime_installation(
+        "agent-helper",
+        direct,
+        home=env.home,
+    )
+
+    assert resolution.runtime_root == env.home / ".agent-helper"
+    assert resolution.context is None
+    assert resolution.actual_mode == "legacy"
+
+
+@pytest.mark.parametrize("kind", ["relative", "malformed", "unsafe"])
+def test_non_cell_agent_runtime_rejects_invalid_explicit_context(
+    env,
+    monkeypatch,
+    kind,
+):
+    direct = _direct_agent_payload(env)
+    if kind == "relative":
+        pointer = Path("relative/install.json")
+    else:
+        pointer = env.home / ".copilot-extensions" / f"{kind}.json"
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.write_text(
+            "{"
+            if kind == "malformed"
+            else json.dumps(
+                {
+                    "marketplaceId": reconcile.CORE_MARKETPLACE_ID,
+                    "pluginId": "../unsafe",
+                }
+            ),
+            encoding="utf-8",
+        )
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", str(pointer))
+
+    with pytest.raises(ValueError):
+        reconcile.resolve_runtime_installation(
+            "agent-helper",
+            direct,
+            home=env.home,
+        )
+
+
+def test_non_cell_agent_runtime_rejects_exact_core_context(env, monkeypatch):
+    direct = _direct_agent_payload(env)
+    pointer = env.home / ".copilot-extensions" / "core.json"
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_text(
+        json.dumps(
+            {
+                "marketplaceId": reconcile.CORE_MARKETPLACE_ID,
+                "pluginId": "agent-machines",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", str(pointer))
+
+    with pytest.raises(ValueError, match="cannot authorize non-cell runtime"):
+        reconcile.resolve_runtime_installation(
+            "agent-helper",
+            direct,
+            home=env.home,
+        )
+
+
+def test_helperless_agent_runtime_rejects_exact_core_context(env, monkeypatch):
+    payload = env.install_payload(
+        "agent-codespaces",
+        "2.0.0",
+        scope="universal",
+    )
+    pointer = env.home / ".copilot-extensions" / "core.json"
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_text(
+        json.dumps(
+            {
+                "marketplaceId": reconcile.CORE_MARKETPLACE_ID,
+                "pluginId": "agent-codespaces",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", str(pointer))
+
+    with pytest.raises(ValueError, match="no trusted installation-context"):
+        reconcile.resolve_runtime_installation(
+            "agent-codespaces",
+            payload,
+            home=env.home,
+        )
+
+
+def test_non_cell_agent_runtime_ignores_foreign_context(env, monkeypatch):
+    direct = _direct_agent_payload(env)
+    pointer = env.home / ".copilot-extensions" / "foreign.json"
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_text(
+        json.dumps(
+            {
+                "marketplaceId": "foreign--0000000000000000",
+                "pluginId": "../unsafe",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", str(pointer))
+
+    resolution = reconcile.resolve_runtime_installation(
+        "agent-helper",
+        direct,
+        home=env.home,
+    )
+
+    assert resolution.runtime_root == env.home / ".agent-helper"
+    assert resolution.context is None
 
 
 def test_foreign_same_name_context_does_not_capture_core_runtime(env):
@@ -713,7 +1426,7 @@ def test_same_prefix_foreign_marketplace_is_ignored(env, monkeypatch):
     assert not context_selected
 
 
-def test_exact_core_context_rejects_same_name_direct_payload(env, monkeypatch):
+def test_ambient_core_context_blocks_unconfigured_payload(env, monkeypatch):
     direct = (
         env.home
         / ".copilot"
@@ -745,18 +1458,15 @@ def test_exact_core_context_rejects_same_name_direct_payload(env, monkeypatch):
     )
     monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", str(receipt))
 
-    plan = reconcile.build_plan(
-        env.repo,
-        machine="m1",
-        cache={},
-        save=False,
-    )
-
-    assert plan["action"] == "continue"
-    assert plan["diagnostics"][0]["reason"] == "installation-context-payload-missing"
+    with pytest.raises(ValueError, match="cannot authorize non-cell runtime"):
+        reconcile.resolve_runtime_installation(
+            "agent-index",
+            direct,
+            home=env.home,
+        )
 
 
-def test_explicit_context_preserves_legacy_reconcile_for_other_plugins(
+def test_explicit_context_preserves_governed_reconcile_for_other_plugins(
     env, monkeypatch
 ):
     env.write_settings({
@@ -765,8 +1475,18 @@ def test_explicit_context_preserves_legacy_reconcile_for_other_plugins(
     })
     selected = env.install_payload("agent-index", "2.0.0", scope="universal")
     env.select_context("agent-index", selected, "2.0.0", "2.0.0")
-    env.install_payload("agent-machines", "2.0.0", scope="universal")
+    other = env.install_payload("agent-machines", "2.0.0", scope="universal")
+    env.select_context("agent-machines", other, "2.0.0", "1.0.0")
+    env.deploy_runtime("agent-index", "2.0.0")
     env.deploy_runtime("agent-machines", "1.0.0")
+    monkeypatch.setenv(
+        "COPILOT_EXTENSIONS_CONTEXT",
+        str(
+            env.home / ".copilot-extensions" / "marketplaces"
+            / reconcile.CORE_MARKETPLACE_ID / "plugins" / "agent-index"
+            / "install.json"
+        ),
+    )
     selections = []
     original_select = reconcile._selected_runtime_root
 
@@ -775,6 +1495,19 @@ def test_explicit_context_preserves_legacy_reconcile_for_other_plugins(
         return original_select(name, plugin_dir, **kwargs)
 
     monkeypatch.setattr(reconcile, "_selected_runtime_root", track_selection)
+    monkeypatch.setattr(
+        reconcile,
+        "_run_installation_mode_helper",
+        lambda name, *args, **kwargs: _mode_resolution(
+            env,
+            name,
+            status="ready",
+            reason="policy-default-false",
+            actual_mode="legacy",
+            desired_mode="legacy",
+            allow_mutation=True,
+        ),
+    )
 
     plan = reconcile.build_plan(
         env.repo, machine="m1", cache={}, save=False
@@ -783,7 +1516,9 @@ def test_explicit_context_preserves_legacy_reconcile_for_other_plugins(
     assert plan["action"] == "reconcile"
     assert _services(plan, phase="runtime") == {"agent-machines"}
     assert plan.get("diagnostics") is None
-    assert selections == ["agent-index"]
+    assert selections == ["agent-machines"]
+    update = next(u for u in plan["updates"] if u["service"] == "agent-machines")
+    assert "COPILOT_EXTENSIONS_CONTEXT" not in update["environment"]
 
 
 def test_invalid_cross_plugin_context_does_not_enable_legacy_reconcile(
@@ -830,7 +1565,8 @@ def test_untrusted_plugin_id_does_not_select_validator_path(
         / "installation_context.py"
     )
     helper.parent.mkdir(parents=True)
-    shutil.copyfile(INSTALLATION_CONTEXT, helper)
+    for source in INSTALLATION_CONTEXT.parent.glob("*.py"):
+        shutil.copyfile(source, helper.parent / source.name)
     context = (
         tmp_path
         / "durable"
@@ -906,6 +1642,98 @@ def test_installer_argv_prefers_install_then_init(env, monkeypatch):
     pdir2 = env.install_payload("agent-mcp", "1.0.0", installer="init.sh")
     _cmd2, argv2 = reconcile.runtime_installer_argv(pdir2)
     assert argv2 == ["bash", str(pdir2 / "scripts" / "init.sh")]
+
+
+def test_namespaced_agent_machines_uses_cell_provision_transaction(
+    env,
+    monkeypatch,
+):
+    monkeypatch.setattr(reconcile.platform, "system", lambda: "Linux")
+    payload = env.install_payload(
+        "agent-machines",
+        "1.0.0",
+        installer="init.sh",
+    )
+    context = (
+        env.home
+        / ".copilot-extensions"
+        / "marketplaces"
+        / reconcile.CORE_MARKETPLACE_ID
+        / "plugins"
+        / "agent-machines"
+        / "install.json"
+    )
+
+    _cmd, argv = reconcile.runtime_installer_argv(
+        payload,
+        context=context,
+    )
+
+    assert argv == [
+        "bash",
+        str(payload / "scripts" / "init.sh"),
+        "cell-provision",
+        "--context",
+        str(context),
+        "--expected-marketplace-id",
+        reconcile.CORE_MARKETPLACE_ID,
+        "--durable-home",
+        str(env.home / ".copilot-extensions"),
+    ]
+
+
+def test_namespaced_agent_machines_windows_uses_powershell_fallback(
+    env,
+    monkeypatch,
+):
+    payload = env.install_payload(
+        "agent-machines",
+        "1.0.0",
+        installer="init.ps1",
+    )
+    context = (
+        env.home
+        / ".copilot-extensions"
+        / "marketplaces"
+        / reconcile.CORE_MARKETPLACE_ID
+        / "plugins"
+        / "agent-machines"
+        / "install.json"
+    )
+    monkeypatch.setattr(reconcile.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(
+        reconcile.shutil,
+        "which",
+        lambda name: "powershell" if name == "powershell" else None,
+    )
+
+    _cmd, argv = reconcile.runtime_installer_argv(
+        payload,
+        context=context,
+    )
+
+    assert argv[0] == "powershell"
+    assert argv[4] == "cell-provision"
+
+
+def test_namespaced_runtime_without_transaction_fails_closed(env):
+    payload = env.install_payload(
+        "agent-index",
+        "1.0.0",
+        installer="install.sh",
+    )
+    context = (
+        env.home
+        / ".copilot-extensions"
+        / "marketplaces"
+        / reconcile.CORE_MARKETPLACE_ID
+        / "plugins"
+        / "agent-index"
+        / "install.json"
+    )
+
+    with pytest.raises(ValueError, match="transaction is unavailable"):
+        reconcile.runtime_installer_argv(payload, context=context)
 
 
 # ---------------------------------------------------------------------------
@@ -1125,12 +1953,13 @@ def test_monotonic_guard_still_deploys_forward_upgrade(env, monkeypatch):
 
 
 def test_zero_downtime_appends_flag(tmp_path, monkeypatch):
-    """A plugin declaring zeroDowntimeUpdate carries -ZeroDowntime into its
-    reconcile-driven install.ps1 update (Windows); absence -> no flag (#533 B)."""
+    """A plugin declaring zeroDowntimeUpdate carries the compatibility flag
+    into reconcile-driven installer updates on both platforms (#533 B)."""
     monkeypatch.setattr(reconcile.platform, "system", lambda: "Windows")
     pdir = tmp_path / "plug"
     (pdir / "scripts").mkdir(parents=True)
     (pdir / "scripts" / "install.ps1").write_text("", encoding="utf-8")
+    (pdir / "scripts" / "install.sh").write_text("# --zero-downtime\n", encoding="utf-8")
 
     # No zeroDowntimeUpdate -> plain `update`, no flag.
     (pdir / "plugin.json").write_text(
@@ -1147,6 +1976,14 @@ def test_zero_downtime_appends_flag(tmp_path, monkeypatch):
     )
     _, argv = reconcile.runtime_installer_argv(pdir)
     assert argv[-2:] == ["update", "-ZeroDowntime"]
+
+    monkeypatch.setattr(reconcile.platform, "system", lambda: "Linux")
+    _, argv = reconcile.runtime_installer_argv(pdir)
+    assert argv[-2:] == ["update", "--zero-downtime"]
+
+    (pdir / "scripts" / "install.sh").write_text("", encoding="utf-8")
+    _, argv = reconcile.runtime_installer_argv(pdir)
+    assert "--zero-downtime" not in argv
 
 
 
@@ -1219,7 +2056,7 @@ def test_apply_plan_noop_when_current(env):
     assert calls == []
 
 
-def test_apply_plan_runs_runtime_drift(env):
+def test_apply_plan_runs_runtime_drift(env, monkeypatch):
     """A drifted runtime -> the installer argv is executed and recorded."""
     import time
     env.write_settings({f"agent-bridge@{MKT}": True})
@@ -1227,14 +2064,35 @@ def test_apply_plan_runs_runtime_drift(env):
     env.deploy_runtime("agent-bridge", "1.0.0")  # drift
     reconcile.save_cache({"plugins": {"agent-bridge": {"last_payload_update": time.time()}}})
 
+    foreign_context = env.home / ".copilot-extensions" / "foreign.json"
+    foreign_context.parent.mkdir(parents=True, exist_ok=True)
+    foreign_context.write_text(
+        json.dumps(
+            {
+                "marketplaceId": "foreign--0000000000000000",
+                "pluginId": "agent-bridge",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", str(foreign_context))
     calls: list = []
+    child_contexts: list[str | None] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        child_contexts.append(os.environ.get("COPILOT_EXTENSIONS_CONTEXT"))
+        return 0
+
     summary = reconcile.apply_plan(
         env.repo, machine="anywhere", passes=1,
-        runner=lambda argv: calls.append(list(argv)) or 0,
+        runner=runner,
     )
     assert summary["action"] == "reconcile"
     assert len(calls) == 1
     assert calls[0][0] == "bash"  # install.sh runtime installer (POSIX-pinned)
+    assert child_contexts == [None]
+    assert os.environ["COPILOT_EXTENSIONS_CONTEXT"] == str(foreign_context)
     assert summary["executed"][0]["service"] == "agent-bridge"
     assert summary["executed"][0]["ok"] is True
 
@@ -1242,6 +2100,7 @@ def test_apply_plan_runs_runtime_drift(env):
 def test_apply_plan_strips_caller_payload_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("COPILOT_PLUGIN_ROOT", "/caller/payload")
     monkeypatch.setenv("PYTHONPATH", "/caller/python")
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", "/caller/install.json")
     monkeypatch.setenv("RECONCILE_KEEP", "present")
     monkeypatch.setattr(
         reconcile,
@@ -1253,6 +2112,10 @@ def test_apply_plan_strips_caller_payload_environment(monkeypatch, tmp_path):
                     "service": "target-plugin",
                     "reason": "runtime-drift",
                     "argv": ["target-installer", "update"],
+                    "environment": {
+                        "COPILOT_EXTENSIONS_CONTEXT": "/target/install.json",
+                    },
+                    "unset_environment": list(reconcile._RUNTIME_ENV_UNSET),
                 }
             ],
         },
@@ -1272,7 +2135,33 @@ def test_apply_plan_strips_caller_payload_environment(monkeypatch, tmp_path):
     assert captured["argv"] == ["target-installer", "update"]
     assert "COPILOT_PLUGIN_ROOT" not in captured["env"]
     assert "PYTHONPATH" not in captured["env"]
+    assert captured["env"]["COPILOT_EXTENSIONS_CONTEXT"] == "/target/install.json"
     assert captured["env"]["RECONCILE_KEEP"] == "present"
+
+
+def test_launch_adapters_apply_planned_runtime_environment():
+    # The interactive mux launch scripts relocated to Worktree Manager in
+    # Phase 3b Sub-slice 2a Step 2 (efforts/active/worktree-manager-control-
+    # plane/phase-3b-mux-relocation.md); agent-worktrees no longer ships its
+    # own copy.
+    powershell = (
+        REPO / "worktree-manager" / "bin" / "launch-session.ps1"
+    ).read_text(encoding="utf-8")
+    posix = (
+        REPO / "worktree-manager" / "bin" / "launch-session.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "$u.PSObject.Properties['unset_environment']" in powershell
+    assert "$u.PSObject.Properties['environment'] -and $u.environment" in powershell
+    assert "$u.unset_environment" in powershell
+    assert "$u.environment.PSObject.Properties" in powershell
+    assert "update.get('unset_environment', [])" in posix
+    assert "update.get('environment', {}).items()" in posix
+    assert "status.get('unset_environment', [])" in posix
+    assert '--install-dir "$runtime_root"' in posix
+    assert "Push-UpdateEnvironment $status" in powershell
+    assert "Push-UpdateEnvironment $update" in powershell
+    assert "'-InstallDir'" in powershell
 
 
 def test_apply_plan_skips_copilot_when_absent(env, monkeypatch):
@@ -1425,9 +2314,8 @@ def test_hook_shims_drifted_true_when_shim_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(reconcile, "_home", lambda: home)
     plugin_dir = tmp_path / "plugin"
     _, bin_dir = _make_hook_layout(home, plugin_dir, deploy=True)
-    # Simulate a payload that added a new shim never deployed to bin/ (the
-    # resolve-runtime.ps1 / #1106 case that broke the sessionStart reseed).
-    (bin_dir / "resolve-runtime.ps1").unlink()
+    # A guard companion missing from bin/ disables registry validation.
+    (bin_dir / "registry_root.py").unlink()
     assert reconcile.hook_shims_drifted(plugin_dir) is True
 
 
@@ -1462,3 +2350,156 @@ def test_hook_shims_drifted_false_when_dirs_absent(tmp_path, monkeypatch):
     monkeypatch.setattr(reconcile, "_home", lambda: home)
     # No scripts/ and no bin/ -> nothing to compare, never force a redeploy.
     assert reconcile.hook_shims_drifted(tmp_path / "plugin") is False
+
+
+# ---------------------------------------------------------------------------
+# build_uninstall_plan / apply_uninstall_plan -- teardown sweep
+# ---------------------------------------------------------------------------
+
+def test_uninstall_plan_sweeps_deployed_runtime(env):
+    """A plugin with a deployed runtime -> its own uninstall action, no purge."""
+    env.install_payload("agent-bridge", "1.0.0", scope="universal")
+    env.deploy_runtime("agent-bridge", "1.0.0")
+    plan = reconcile.build_uninstall_plan(home=env.home)
+    assert plan["action"] == "uninstall"
+    upd = [u for u in plan["updates"] if u["service"] == "agent-bridge"]
+    assert len(upd) == 1
+    assert upd[0]["argv"] == ["bash", str(env.home / ".copilot" / "installed-plugins"
+                                           / MKT / "agent-bridge" / "scripts" / "install.sh"),
+                               "uninstall"]
+    assert "purge" not in upd[0]["argv"] and "--purge" not in upd[0]["argv"]
+
+
+def test_uninstall_plan_skips_payload_only_plugin(env):
+    """No deploy-manifest.json -> not swept (nothing was ever deployed)."""
+    env.install_payload("ai-attribution", "1.0.0", scope="none")
+    plan = reconcile.build_uninstall_plan(home=env.home)
+    assert plan["action"] == "continue"
+    assert plan["updates"] == []
+
+
+def test_uninstall_plan_sweeps_scope_none_with_deployed_runtime(env):
+    """runtimeScope 'none' (lazy/self-provisioned) still gets swept when a
+    runtime IS deployed -- scope governs proactive install, not teardown."""
+    env.install_payload("agent-ssh", "1.0.0", scope="none")
+    env.deploy_runtime("agent-ssh", "1.0.0")
+    plan = reconcile.build_uninstall_plan(home=env.home)
+    services = {u["service"] for u in plan["updates"]}
+    assert "agent-ssh" in services
+
+
+def test_uninstall_plan_init_only_plugin_emits_diagnostic(env):
+    """A plugin deployed only via init.* (no install.{sh,ps1}) can't be
+    uninstalled by this sweep -- must be a named diagnostic, never a silent skip."""
+    env.install_payload("agent-mcp", "1.0.0", scope="machine-gated", installer="init.sh")
+    env.deploy_runtime("agent-mcp", "1.0.0")
+    plan = reconcile.build_uninstall_plan(home=env.home)
+    assert plan["action"] == "continue"
+    diag = [d for d in plan.get("diagnostics", []) if d["service"] == "agent-mcp"]
+    assert diag and diag[0]["reason"] == "uninstall-unsupported"
+
+
+def test_uninstall_plan_cascades_dtssh_host(env):
+    """agent-ssh's own uninstall doesn't remove the dtssh Startup listener --
+    the sweep must cascade to install-host.sh explicitly."""
+    pdir = env.install_payload("agent-ssh", "1.0.0", scope="none")
+    env.deploy_runtime("agent-ssh", "1.0.0")
+    host_scripts = pdir / "transports" / "dtssh" / "scripts"
+    host_scripts.mkdir(parents=True)
+    (host_scripts / "install-host.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+
+    plan = reconcile.build_uninstall_plan(home=env.home)
+    cascaded = [u for u in plan["updates"] if u["service"] == "agent-ssh:dtssh-host"]
+    assert len(cascaded) == 1
+    assert cascaded[0]["argv"] == ["bash", str(host_scripts / "install-host.sh"), "uninstall"]
+
+
+def test_uninstall_plan_dtssh_host_missing_emits_diagnostic(env):
+    """No dtssh install-host script in the payload -> diagnostic, not silence."""
+    env.install_payload("agent-ssh", "1.0.0", scope="none")
+    env.deploy_runtime("agent-ssh", "1.0.0")
+    plan = reconcile.build_uninstall_plan(home=env.home)
+    diag = [d for d in plan.get("diagnostics", []) if d["service"] == "agent-ssh:dtssh-host"]
+    assert diag and diag[0]["reason"] == "dtssh-host-script-missing"
+
+
+def test_uninstall_plan_wsl_setup_diagnostic_when_payload_present(env):
+    """wsl-setup's keepalive scheduled task isn't in the deploy-manifest
+    convention this sweep discovers -- must still be named, not dropped."""
+    env.install_payload("wsl-setup", "1.0.0", scope="none")
+    plan = reconcile.build_uninstall_plan(home=env.home)
+    diag = [d for d in plan.get("diagnostics", []) if d["service"] == "wsl-setup"]
+    assert diag and diag[0]["reason"] == "manual-cleanup-required"
+
+
+def test_uninstall_plan_excludes_self(env):
+    """agent-worktrees itself is never swept here -- it has its own top-level
+    `uninstall` verb."""
+    env.install_payload("agent-worktrees", "1.0.0", scope="universal")
+    env.deploy_runtime("agent-worktrees", "1.0.0")
+    plan = reconcile.build_uninstall_plan(home=env.home)
+    assert all(u["service"] != "agent-worktrees" for u in plan["updates"])
+
+
+def test_uninstall_plan_dry_run_appends_preview_flag(env):
+    """dry_run=True appends each installer's own real preview switch (POSIX
+    --dry-run pinned by this suite's platform mock), never guessed argv."""
+    env.install_payload("agent-bridge", "1.0.0", scope="universal")
+    env.deploy_runtime("agent-bridge", "1.0.0")
+    plan = reconcile.build_uninstall_plan(home=env.home, dry_run=True)
+    upd = [u for u in plan["updates"] if u["service"] == "agent-bridge"]
+    assert upd[0]["argv"][-1] == "--dry-run"
+
+
+def test_uninstall_plan_default_omits_preview_flag(env):
+    """dry_run defaults to False -- the real (mutating) uninstall argv."""
+    env.install_payload("agent-bridge", "1.0.0", scope="universal")
+    env.deploy_runtime("agent-bridge", "1.0.0")
+    plan = reconcile.build_uninstall_plan(home=env.home)
+    upd = [u for u in plan["updates"] if u["service"] == "agent-bridge"]
+    assert upd[0]["argv"][-1] == "uninstall"
+
+
+def test_uninstall_plan_dtssh_cascade_dry_run_appends_preview_flag(env):
+    pdir = env.install_payload("agent-ssh", "1.0.0", scope="none")
+    env.deploy_runtime("agent-ssh", "1.0.0")
+    host_scripts = pdir / "transports" / "dtssh" / "scripts"
+    host_scripts.mkdir(parents=True)
+    (host_scripts / "install-host.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+
+    plan = reconcile.build_uninstall_plan(home=env.home, dry_run=True)
+    cascaded = [u for u in plan["updates"] if u["service"] == "agent-ssh:dtssh-host"]
+    assert cascaded[0]["argv"][-1] == "--dry-run"
+
+
+def test_apply_uninstall_plan_dry_run_uses_preview_argv(env):
+    """apply_uninstall_plan(dry_run=True) -- the CLI's --verify -- executes
+    the PREVIEW argv (with the flag), not the real removal argv."""
+    env.install_payload("agent-bridge", "1.0.0", scope="universal")
+    env.deploy_runtime("agent-bridge", "1.0.0")
+    calls: list = []
+    summary = reconcile.apply_uninstall_plan(
+        home=env.home, dry_run=True,
+        runner=lambda argv: calls.append(list(argv)) or 0,
+    )
+    assert summary["action"] == "uninstall"
+    assert calls[0][-1] == "--dry-run"
+    assert summary["executed"][0]["ok"] is True
+
+
+def test_apply_uninstall_plan_runs_and_records(env):
+    env.install_payload("agent-bridge", "1.0.0", scope="universal")
+    env.deploy_runtime("agent-bridge", "1.0.0")
+    calls: list = []
+    summary = reconcile.apply_uninstall_plan(
+        home=env.home, runner=lambda argv: calls.append(list(argv)) or 0
+    )
+    assert summary["action"] == "uninstall"
+    assert len(calls) == 1 and calls[0][-1] == "uninstall"
+    assert summary["executed"][0]["ok"] is True
+
+
+def test_apply_uninstall_plan_noop_when_nothing_deployed(env):
+    summary = reconcile.apply_uninstall_plan(home=env.home)
+    assert summary["action"] == "continue"
+    assert summary["executed"] == []

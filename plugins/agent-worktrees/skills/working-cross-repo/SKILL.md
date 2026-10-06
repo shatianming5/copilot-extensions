@@ -71,10 +71,10 @@ Only exact JSON
 effort. `{}`, malformed output, an unavailable checkout, and a remote-only
 target keep orchestration host-owned. The probe reads the target's bounded
 adoption data and Git root only; it does not execute target code or infer
-capability from a repository name. If target-owned placement is explicitly
-selected, use one canonical target-local effort with one-way references from
-host efforts. Multiple hosts join that target effort rather than creating
-cyclic or drifting peer copies.
+capability from a repository name. `planning-efforts` (and its
+`references/efforts.md`) owns the resulting placement decision -- the three
+placement models, the one-way-reference rule, and the no-drifting-copies
+guarantee -- follow it rather than duplicating that decision here.
 
 ## Orient before you crawl -- the root `AGENTS.md` is the map
 
@@ -101,7 +101,7 @@ antidote to balking at a repo's size.
   for how *we* relate to the repo, the target's `AGENTS.md` for how the repo
   wants to be worked.
 
-## The four rules
+## The five rules
 
 ### 1. Honor the management CLASS (from the global registry)
 
@@ -153,30 +153,22 @@ Always read the repo's `CONTRIBUTING.md` / `AGENTS.md` and its narrative
 > partial, and error-prone -- the venue gives you real search, cross-file tracing,
 > and a build to check assumptions against.)
 
-> **Mind cross-repo plan/effort state on a venue.** When you delegate to a
-> CodeSpace/container agent but the task tracks against a **plan, effort, or spec
-> doc that lives in a *different* repo** than the one on the venue, the on-venue
-> agent **cannot see it** unless that repo is *also* materialized there
-> (`/workspaces/<repo>` by convention). Don't point the agent at a path that
-> isn't present: either ensure the doc's repo is on the venue and name its
-> `/workspaces/<repo>` path, or **relay the needed context inline in the dispatch
-> prompt and have the agent report results back** for you (the host) to record.
-> Your control-plane's own dispatch skill owns the concrete host↔venue interop.
+> **Mind cross-repo plan/effort state on a venue.** A task dispatched to a
+> CodeSpace/container that tracks against a plan/effort/spec doc living in a
+> *different* repo needs that context relayed inline or the repo materialized
+> on the venue -- the on-venue agent can't see it otherwise. Detail:
+> [`references/venue-and-claims.md`](references/venue-and-claims.md) §
+> *Mind cross-repo plan/effort state on a venue*.
 
-> **A cross-repo PR you open is an obligation on your worktree — journal it.**
-> When you open a PR in *another* repo (e.g. an **example-web ADO PR** created with
-> the AZ CLI / ADO REST / `gh`, on a CodeSpace or locally) it is **not**
-> auto-journaled — only `<agent-worktrees catalog argv[0]> create-pr` in *this* repo is. So your
-> worktree's `finalize` won't know that cross-repo work is still open. Record it
-> as a claim so the gate keeps you accountable, then settle it when the PR merges:
-> ```
-> aw='<agent-worktrees catalog argv[0]>'
-> "$aw" claims add pr <pr-url> --owner-ref "$("$aw" get owner-ref)"
-> # when it merges/closes:
-> "$aw" claims settle <pr-url>     # (sweep spares pr-kind — manual)
-> ```
-> See the `worktree` skill's finalize-gate section for the full model
-> (example-operator/dotfiles#1351 tracks auto-journaling these).
+> **A cross-repo PR you open is an obligation on your worktree -- journal it.**
+> A PR opened in *another* repo is **not** auto-journaled the way
+> `<agent-worktrees catalog argv[0]> create-pr` is here, so `finalize` won't
+> know it's still open. Record it as a claim
+> (`claims add pr <pr-url> --owner-ref ...`) and settle it when it merges.
+> Investigating someone *else's* PR in a target repo instead? Use
+> `tracing-claimant-graphs`. Commands and the full model:
+> [`references/venue-and-claims.md`](references/venue-and-claims.md) §
+> *A cross-repo PR you open is an obligation on your worktree*.
 
 ### 3. Prefer DELEGATION over reaching across machines
 
@@ -192,6 +184,43 @@ A repo's local path **varies by machine**. Always resolve it with
 `<agent-worktrees catalog argv[0]> repos find <name>` (it falls back to the per-machine
 `repos srcroot`). Never write a fixed drive path into a doc, skill, or command.
 
+### 5. Resolve the target's SOURCE, ACCOUNT, and POLICY -- don't assume your home repo's
+
+A target repo can require a different git/gh identity, remote host, and
+contribution policy than the one you're already using. Never reuse your home
+repo's account or assume ambient `gh auth` applies:
+
+- **Account -- GitHub targets only.** `<agent-worktrees catalog argv[0]> repos
+  account-for <owner|owner/name|reponame>` prints the resolved `gh` login for
+  a GitHub repo (explicit `account:` -> `account_map` -> the remote owner
+  itself -> none/ambient); route every `gh`/API call for it through
+  `<agent-worktrees catalog argv[0]> repos gh <owner|owner/name|reponame> --
+  <args>`, never a bare `gh <cmd>` or a machine-global `gh auth switch`. A
+  bare *registered repo name* resolves through the registry to that entry's
+  own `account:` override first, else its remote owner, rather than being
+  treated as a literal owner. A non-GitHub remote (Gitea, Azure DevOps)
+  resolves **no** account through this path *unless* its registered entry has
+  an explicit `account:` override, which still applies -- `related resolve`
+  still surfaces the resolved account (`explicit` vs `derived`) when one
+  applies, alongside the class/locus facts above.
+- **Source/host** -- check the registry entry's actual `remote` (via
+  `<agent-worktrees catalog argv[0]> repos list` / the repo's `repos.yaml`
+  entry) before assuming a target is on GitHub and the account commands above
+  apply -- `repos find`/`related resolve` name the local path and class, not
+  the provider; don't infer either from habit.
+- **Policy** -- both the PR flow (`get pr-profile`, below) *and* the target's
+  own **issue tracker and coordination convention** are repo-specific. Before
+  filing a bug or claiming work, read the target's `CONTRIBUTING.md`/`AGENTS.md`
+  for where issues are tracked and how concurrent drivers claim work (some
+  repos require a claiming issue before you start, per their own convention) --
+  never file against your home repo's tracker, and never assume a convention
+  from one target repo carries over to another.
+
+Full account/source mechanics (the `account_map` decoupled-identity layer,
+the accounts catalog, repo-scoped identity resolution) live in the
+**`agent-worktrees-repos`** skill -- read it before your first cross-repo
+identity operation on an unfamiliar target.
+
 ## End-to-end shape
 
 1. `related resolve <name>` (link it first if needed).
@@ -199,19 +228,51 @@ A repo's local path **varies by machine**. Always resolve it with
    docs you actually need, then read its narrative + `CONTRIBUTING.md` for the
    contribution flow. Don't crawl the tree to figure out the repo.
 3. Act on the plan:
-   - local -> edit per class (worktree
+   - **editing code** -> local (worktree
      `<agent-worktrees catalog argv[0]> create` / singleton
-     anchor / reference read-only);
-   - elsewhere -> delegate via agent-bridge / agent-codespaces.
+     anchor / reference read-only) or elsewhere via agent-bridge /
+     agent-codespaces.
+   - **only checking/merging an existing PR, nothing else** -> no new
+     worktree needed. Stay in **your own** worktree (the claimant) and
+     address the target by slug: `pr-watch wait <owner/name> <pr>` /
+     `pr-merge <owner/name> <pr> --now`, once that repo is registered (see
+     `pr-workflow.md`'s *Addressing a foreign repo* section for the full
+     contract and its refusal/guidance behavior). Don't create or `cd` into
+     a worktree of the target purely to run these two commands.
 4. Land changes through the **target repo's** own contribution flow (its branch
    naming, PR/merge policy, version-bump rules) -- not this repo's.
-   - **Check the target repo's PR flow before you drive one:**
-     `<agent-worktrees catalog argv[0]> get pr-profile` reports `direct` (no PR),
-     `pr-human-merge` (PR-gated, a **human** approves + merges -- `pr-merge`
-     does not apply), or `pr-agent-merge` (author signals consent with
-     `pr-merge` and the gate merges). Do **not** assume the flow your home repo
-     uses. When a `pr-*` verb reports it does not apply to the target, follow
-     its pointer (and the repo's `CONTRIBUTING`) rather than hand-merging.
+   - **Check the target repo's PR flow before you drive one -- every time,
+     never from memory.** `<agent-worktrees catalog argv[0]> get pr-profile`
+     reports `direct` (no PR), `pr-human-merge` (PR-gated, a **human**
+     approves + merges -- `pr-merge` does not apply), `pr-agent-merge`
+     (author signals consent with `pr-merge` and the gate merges), or
+     `pr-self-merge` (PR-gated, the submitter merges directly with
+     `pr-merge <#> --now` once required checks/reviews allow it). The same
+     facts also surface automatically in the target worktree's bounded
+     session-start context (a `PR:` line: profile + enabled/required/
+     merge_actor) and as an extra `Note:` line on every `pr-*` verb's
+     reminder text when the target repo sets `pr.notes` -- read both, they
+     exist precisely so you don't have to guess or reuse your home repo's
+     protocol. Do **not** assume the flow your home repo uses, and do
+     **not** infer a target's flow from a different repo you worked in
+     earlier in the same session. When a `pr-*` verb reports it does not
+     apply to the target, follow its pointer (and the repo's
+     `CONTRIBUTING`) rather than hand-merging.
+   - **Drive the PR through to merge, regardless of whose repo it is** --
+     the same default-conduct rule as your home repo (see
+     `pr-workflow.md`'s *Default conduct*), applied to the *target's*
+     profile: self-merge means you merge once eligible, human-merge means
+     you wait for and don't skip the reviewer, agent-merge means you signal
+     consent once approved. A PR left open because you weren't sure which
+     protocol applied is the single most common way cross-repo work goes
+     stuck -- resolve the uncertainty by re-running `get pr-profile` and
+     checking `pr-status`, not by leaving it for later.
+   - **Filing a bug or claiming work?** Resolve the target's own issue
+     tracker and coordination convention first (its `CONTRIBUTING.md`/
+     `AGENTS.md`) -- some repos require claiming a stretch of work with an
+     issue before you start (see *Resolve the target's SOURCE, ACCOUNT, and
+     POLICY* above). Never file against your home repo's tracker, and never
+     assume one target's convention applies to another.
 
 ## Anti-patterns (don't)
 
@@ -221,5 +282,14 @@ A repo's local path **varies by machine**. Always resolve it with
 - Cloning a repo locally to dodge delegating to the machine/CodeSpace that owns
   it.
 - Hardcoding a checkout path instead of `repos find`.
-- Applying *this* repo's conventions (branch prefix, merge style) to the target
-  repo -- follow the target's.
+- Reusing your home repo's `gh` account/identity, or a machine-global `gh auth
+  switch`, instead of resolving the target's own account with `repos
+  account-for` / routing through `repos gh`.
+- Applying *this* repo's conventions (branch prefix, merge style, issue
+  tracker) to the target repo -- follow the target's.
+- Opening a PR on a target repo and leaving it stuck open because the
+  protocol was unclear or assumed rather than checked (`get pr-profile` +
+  the session `PR:` line + any `pr.notes` exist to remove exactly this
+  ambiguity -- use them before acting, not after a PR is already stalled).
+- Filing an issue against a target's tracker without reading its own
+  coordination convention first, risking a duplicate or a claim collision.

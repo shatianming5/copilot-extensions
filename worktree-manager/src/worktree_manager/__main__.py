@@ -15,6 +15,7 @@ Everything here is **programmatic and non-agentic**: no AI agent is in the loop.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -34,10 +35,11 @@ from .harness_state import (
     user_enabled_plugins,
 )
 from .model import Model, build_model, coverage, effective_prereqs
-from .prereqs import current_os, detect_baseline, missing
+from .prereqs import detect_baseline, missing
 from .provision import apply as provision_apply
 from .provision import plan as provision_plan
 from .provision import restart_needed
+from .relocated_launch import _relocated_launch_script, _run_relocated_mux_launch
 from .self_install import self_install
 from .self_install import status as self_status
 
@@ -329,6 +331,341 @@ def _cmd_repos(rest: list[str]) -> int:
     return 0
 
 
+def _parse_flagged_args(rest: list[str], *, flags_with_value: set[str], flags_bool: set[str]):
+    """Minimal flag parser shared by ``terminal-fragment``/``profiles``.
+
+    Returns ``(positionals, values)`` where ``values`` maps each
+    ``flags_with_value`` name (without leading dashes) to its argument (or
+    ``None``) and each ``flags_bool`` name to ``True``/``False``.
+    """
+    positionals: list[str] = []
+    values: dict[str, object] = {f: None for f in flags_with_value}
+    values.update({f: False for f in flags_bool})
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        key = a.lstrip("-").replace("-", "_")
+        if a.startswith("--") and key in flags_with_value:
+            i += 1
+            values[key] = rest[i] if i < len(rest) else None
+        elif a.startswith("--") and key in flags_bool:
+            values[key] = True
+        else:
+            positionals.append(a)
+        i += 1
+    return positionals, values
+
+
+def _resolve_terminal_fragment_machine(project: str | None, explicit: str | None) -> str | None:
+    """Resolve the local machine key: ``--machine``, else the named
+    project's own ``config.yaml`` ``machine:`` field (a direct file read --
+    no cwd-based ``config.load_config()`` CLI-root dependency)."""
+    if explicit:
+        return explicit
+    if project:
+        from .harness_state import project_config
+        m = project_config(project).get("machine")
+        if isinstance(m, str) and m:
+            return m
+    return None
+
+
+def _cmd_terminal_fragment(rest: list[str]) -> int:
+    """``worktree-manager terminal-fragment <project> [--machine K]
+    [--explain|--doctor|--migrate-selections|--deploy [--live]]`` -- preview
+    (or, with ``--deploy --live``, actually write) the Windows Terminal
+    fragment a machine's config would emit.
+
+    Phase 3e Step 4 (copilot-extensions#3390): the read-only equivalent of
+    agent-worktrees' own ``profiles``/``terminal-fragment`` CLI verbs, now
+    backed entirely by the relocated ``terminal_fragment``/``harness_state``
+    modules. Unlike agent-worktrees' cwd-based ``--machine`` default, this
+    takes an **explicit** ``<project>`` positional (matching
+    ``worktree-manager projects``/``repos``'s own convention) and resolves
+    the machine key from that project's own config.yaml directly -- no
+    cwd-based ``config.load_config()`` needed.
+
+    Phase 3e Step 5: ``--deploy`` computes the real deploy plan (fragment
+    write + ``state.json``/``settings.json`` reconciliation) via
+    :func:`terminal_fragment.deploy_fragment` and always previews it first.
+    Only ``--deploy --live`` together perform the actual writes -- ``--deploy``
+    alone is a dry run, on purpose: this surface has not yet had a live trial
+    against a real machine's Windows Terminal install (see the Phase 3e
+    effort doc's Step 5 blocker), so live writes stay behind an explicit,
+    separate flag until that trial happens.
+    """
+    from . import terminal_fragment as tf
+
+    positionals, values = _parse_flagged_args(
+        rest,
+        flags_with_value={"machine"},
+        flags_bool={"explain", "doctor", "migrate_selections", "deploy", "live"},
+    )
+    project = positionals[0] if positionals else None
+    machine = _resolve_terminal_fragment_machine(project, values["machine"])
+    if not machine:
+        print("error: could not resolve this machine's key -- pass --machine <key> "
+              "or a <project> whose config.yaml records one")
+        return 2
+
+    if values["migrate_selections"]:
+        changed = tf.migrate_local_selections(current_project=project)
+        if changed:
+            print("Migrating terminal_profiles selections to machine keys")
+            for name in changed:
+                print(f"  {name}: selection rewritten to canonical keys")
+        else:
+            print("terminal_profiles selections already use machine keys")
+        return 0
+
+    if values["doctor"]:
+        return _terminal_fragment_doctor(tf, machine, project)
+
+    if values["deploy"]:
+        return _terminal_fragment_deploy(tf, machine, project, live=bool(values["live"]))
+
+    result = tf.preview_local(machine, current_project=project)
+
+    if values["explain"]:
+        print(
+            f"Terminal fragment preview for '{machine}' "
+            f"({len(result.profiles)} profile(s) across "
+            f"{len(result.plans)} project(s)):\n"
+        )
+        for plan in result.plans:
+            state = (
+                "unmanaged -> default column" if plan.unmanaged_default else "managed selection"
+            )
+            agent = "agent-exposed" if plan.agent_exposed else "no-agent"
+            print(f"- {plan.display} [{plan.name}]  ({state}; {agent})")
+            if not plan.profiles:
+                print("    (no profiles emitted)")
+            for p in plan.profiles:
+                print(f"    - {p.name!r}  <{p.kind}>  {p.commandline}")
+            print()
+        return 0
+
+    print(json.dumps(result.fragment(), indent=2))
+    return 0
+
+
+def _terminal_fragment_doctor(tf, machine: str, project: str | None) -> int:
+    """Read-only report of Windows Terminal state drift vs. the fragment.
+
+    Ported from agent-worktrees' own ``_terminal_fragment_doctor``. Never
+    mutates anything -- the actual heal happens through Phase 3e Step 5's
+    deploy path.
+    """
+    diag = tf.diagnose_wt_state()
+    if diag is None:
+        print("warning: Windows Terminal state unavailable (non-Windows, or WT not installed).")
+        return 0
+
+    result = tf.preview_local(machine, current_project=project)
+    frag_names = {p.guid.lower(): p.name for p in result.profiles}
+
+    print(f"Windows Terminal state doctor for '{machine}':")
+    print(f"  fragment profiles : {diag.fragment_count}")
+    print(f"  settings profiles : {diag.settings_count}")
+    print(f"  generatedProfiles : {diag.generated_count}")
+
+    if diag.hidden:
+        print(
+            f"\n  HIDDEN -- in fragment + generatedProfiles but not in "
+            f"settings.json ({len(diag.hidden)}):"
+        )
+        for g in diag.hidden:
+            print(f"    - {frag_names.get(g, g)}  {g}")
+        print(
+            "    -> the next deploy will prune these from generatedProfiles "
+            "so WT re-discovers them."
+        )
+    if diag.orphans:
+        print(
+            f"\n  ORPHANS -- generatedProfiles entries in no fragment and not "
+            f"materialized ({len(diag.orphans)}): accumulated cruft."
+        )
+        if diag.reclaimable_orphans:
+            print(
+                f"    - {len(diag.reclaimable_orphans)} reclaimable (ours) -> "
+                f"the next deploy prunes these automatically."
+            )
+        if diag.foreign_orphans:
+            print(
+                f"    - {len(diag.foreign_orphans)} kept (v4/v5 GUIDs -- "
+                f"WT built-in / random profiles; never auto-pruned)."
+            )
+    if diag.duplicate_names:
+        print(
+            "\n  DUPLICATE profile names in settings.json "
+            "(often a legacy stand-alone fragment colliding with the "
+            "generated one):"
+        )
+        for name, count in diag.duplicate_names:
+            print(f"    - {name!r} x{count}")
+
+    if diag.healthy:
+        print("\n  OK -- no hidden or duplicate profiles detected.")
+    return 0
+
+
+def _terminal_fragment_deploy(tf, machine: str, project: str | None, *, live: bool) -> int:
+    """``terminal-fragment <project> --deploy [--live]`` -- print the deploy
+    plan; only ``--live`` actually writes anything.
+
+    Phase 3e Step 5 (copilot-extensions#3390). Always prints the plan
+    (fragment path, what would change in ``generatedProfiles``/
+    ``settings.json``, and any operator-facing notes) before returning, so a
+    dry run and a live deploy report the exact same information -- the only
+    difference is whether ``deploy_fragment(..., apply=live)`` actually wrote
+    anything.
+    """
+    plan = tf.deploy_fragment(machine, current_project=project, apply=live)
+
+    print(f"Terminal fragment deploy plan for '{machine}':")
+    print(f"  fragment path     : {plan.fragment_path or '(unresolvable -- non-Windows?)'}")
+    print(f"  profiles (new)    : {len(plan.new_guids)}")
+    if plan.stale_guids:
+        print(f"  stale (removed)   : {len(plan.stale_guids)}")
+    if plan.changed_guids:
+        print(f"  changed (rediscover): {len(plan.changed_guids)}")
+    if plan.generated_plan is not None:
+        gp = plan.generated_plan
+        print(f"  generatedProfiles : {len(gp.keep)} kept, {len(gp.remove)} pruned"
+              f" ({len(gp.healed)} healed, {len(gp.reclaimed)} reclaimed orphans)")
+    if plan.settings_stale_count:
+        print(f"  settings.json     : {plan.settings_stale_count} stale profile(s) to remove")
+    for note in plan.notes:
+        print(f"  note: {note}")
+
+    if live:
+        print("  -> LIVE: writes applied." if plan.applied else "  -> LIVE requested but nothing was applied.")
+    else:
+        print("  -> DRY RUN: nothing was written. Pass --live to actually deploy.")
+    return 0
+
+
+def _cmd_profiles(rest: list[str]) -> int:
+    """``worktree-manager profiles <project> get|apply [--machine K]
+    [--set JSON] [--mirror [--live]] [--json]`` -- read or write a machine's
+    terminal-profile column for ``<project>``.
+
+    Phase 3e Step 4 (copilot-extensions#3390): the equivalent of
+    agent-worktrees' own ``profiles get/apply`` CLI verb, backed by the
+    relocated ``terminal_profiles`` module.
+
+    Phase 3e Step 5: ``apply --mirror`` computes what deploying the
+    resulting fragment would do (via ``terminal_fragment.deploy_fragment``)
+    and includes it as a preview; only ``apply --mirror --live`` together
+    perform the actual write. Without ``--mirror``, ``apply`` behaves exactly
+    as before Step 5 -- it persists the selection and reports
+    ``mirrored: false``, deliberately never mirroring by default.
+    """
+    from . import terminal_fragment as tf
+    from . import terminal_profiles as profiles
+    from .harness_state import home as hs_home
+
+    if not rest or rest[0].startswith("-"):
+        print("usage: worktree-manager profiles <project> get|apply "
+              "[--machine K] [--set '<json-array>'] [--mirror [--live]] [--json]")
+        return 2
+    project = rest[0]
+    action = rest[1] if len(rest) > 1 and not rest[1].startswith("-") else "get"
+    flag_rest = rest[2:] if len(rest) > 1 and not rest[1].startswith("-") else rest[1:]
+    _, values = _parse_flagged_args(
+        flag_rest, flags_with_value={"machine", "set"},
+        flags_bool={"json", "mirror", "live"},
+    )
+    machine = _resolve_terminal_fragment_machine(project, values["machine"])
+    if not machine:
+        print("error: could not resolve this machine's key -- pass --machine <key> "
+              "or a <project> whose config.yaml records one")
+        return 2
+    env = tf.detect_env_label()
+    cfg_path = hs_home() / f".{project}" / "config.yaml"
+
+    if action == "get":
+        managed = profiles.has_selection(cfg_path)
+        if managed:
+            sels = profiles.normalize_selection(
+                profiles.load_selection(cfg_path), machine, env
+            )
+        else:
+            sels = profiles.default_selection(
+                [profiles.self_diagonal(machine, env)], machine, env
+            )
+        payload = {
+            "machine": machine, "env": env, "managed": managed,
+            "targets": [s.as_dict() for s in sels],
+        }
+        if values["json"]:
+            print(json.dumps(payload))
+        else:
+            state = "managed" if managed else "default (minimal + bare cross-machine)"
+            print(f"Terminal profiles for {machine} {env} [{state}]:")
+            for s in sels:
+                lock = (" (self, locked)"
+                        if (s.machine == machine and s.env == env and s.kind == "agent")
+                        else "")
+                print(f"  - {s.machine} {s.env} · {s.kind}{lock}")
+        return 0
+
+    if action != "apply":
+        print(f"error: unknown action {action!r} (expected 'get' or 'apply')")
+        return 2
+
+    raw = values["set"]
+    if raw is None:
+        print("error: profiles apply requires --set '<json-array>'")
+        return 2
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"error: invalid --set JSON: {e}")
+        return 2
+    if not isinstance(parsed, list):
+        print("error: --set must be a JSON array of {machine, env, kind} objects")
+        return 2
+    sels = [
+        profiles.TargetSel(
+            str(o.get("machine", "")).strip(),
+            str(o.get("env", "")).strip(),
+            str(o.get("kind", "agent")).strip().lower(),
+        )
+        for o in parsed if isinstance(o, dict)
+    ]
+    written = profiles.save_selection(cfg_path, sels, self_machine=machine, self_env=env)
+    payload = {
+        "machine": machine, "env": env,
+        "targets": [s.as_dict() for s in written],
+        "mirrored": False,
+    }
+
+    mirror_note = "not yet mirrored to disk -- see Phase 3e Step 5"
+    if values["mirror"]:
+        live = bool(values["live"])
+        plan = tf.deploy_fragment(machine, current_project=project, apply=live)
+        payload["mirrored"] = plan.applied
+        payload["mirror_plan"] = {
+            "would_change": plan.would_change,
+            "new_profiles": len(plan.new_guids),
+            "stale_profiles": len(plan.stale_guids),
+            "changed_profiles": len(plan.changed_guids),
+            "notes": plan.notes,
+        }
+        mirror_note = (
+            "mirrored to disk" if plan.applied
+            else "mirror previewed (dry run) -- pass --mirror --live to write it"
+        )
+
+    if values["json"]:
+        print(json.dumps(payload))
+    else:
+        print(f"Saved {len(written)} terminal profile(s) for {machine} {env} "
+              f"({mirror_note})")
+    return 0
+
+
 def _worktree_row(w) -> str:
     """One rendered worktree line: id4 · machine · repo · STATE sync · title."""
     state = (w.state or "-").upper()
@@ -466,6 +803,26 @@ def _cmd_contracts(rest: list[str]) -> int:
     print()
     return 0
 
+def _cmd_mux_daemon(rest: list[str]) -> int:
+    """Manager mux-companion daemon internals (Phase 3b Sub-slice 3)."""
+    from .mux_daemon_cli import cmd_mux_daemon
+    return cmd_mux_daemon(rest)
+
+
+def _cmd_companion(rest: list[str]) -> int:
+    """Launch the Mux Companion: a read-only status + session-lineage view
+    for the CURRENT worktree, resolved from cwd (visions/mux-companion).
+
+    v1 is view-only -- explains the worktree's status in plain language and
+    lists its session lineage with the current head marked. No session
+    switching, resume, or head-override action lives here yet; that is a
+    distinct, later feature (see the vision's Non-Goals).
+    """
+    del rest  # no options yet
+    from .mux_companion import run as run_companion
+
+    return run_companion()
+
 
 def _cmd_picker(rest: list[str]) -> int:
     """Run, mock, or capture the Manager-owned production Picker."""
@@ -478,7 +835,7 @@ def _cmd_picker(rest: list[str]) -> int:
     flags: set[str] = set()
     positionals: list[str] = []
     value_options = {"--screenshot", "--out", "--format", "--pivot", "--wait"}
-    flag_options = {"--demo", "--local", "--live", "--json"}
+    flag_options = {"--demo", "--preview", "--local", "--live", "--json"}
     index = 0
     while index < len(args):
         token = args[index]
@@ -503,7 +860,7 @@ def _cmd_picker(rest: list[str]) -> int:
         print("error: picker accepts at most one project name")
         return 2
 
-    demo_mode = "--demo" in flags
+    demo_mode = "--demo" in flags or "--preview" in flags
     legacy_screenshot = values.get("--screenshot")
     if legacy_screenshot:
         action = "screenshot"
@@ -521,14 +878,19 @@ def _cmd_picker(rest: list[str]) -> int:
         return 2
 
     if demo_mode:
-        from . import picker_app
-        from .demo import DEMO_PROJECT
-        project = DEMO_PROJECT
-        source = picker_app.demo_source()
-        subtitle = f"{project} · demo (Aperture Labs)"
-        on_launch = _demo_launch_preview
-        contributions = ()
-        context_source = None
+        # Preview mode: render the REAL production Picker (not a stand-in
+        # app) against deterministic mock data -- see preview.py's module
+        # docstring for the two injections this composes (a fake-engine
+        # worktree data source + a manifest-injected mock pivot). This
+        # requires the named project to be a genuine locally-registered
+        # agent-worktrees project (its identity/config still resolves
+        # normally); only the worktree/pivot DATA is faked.
+        from . import preview as preview_mod
+
+        preview_mod.enable_preview_mode()
+        project = positionals[0] if positionals else preview_mod.DEMO_PROJECT
+        if action == "run":
+            return _run_production_picker(project)
     else:
         if action == "run" and not engine_available():
             print()
@@ -537,8 +899,33 @@ def _cmd_picker(rest: list[str]) -> int:
             print()
             return 1
         projects = build_projects()
-        project = positionals[0] if positionals else (
-            projects[0].name if projects else "")
+        # A knowledge-only repo (repo class "knowledge", see #knowledge_only)
+        # exists solely to be carved as another project's paired "-k"
+        # companion -- it must never be silently picked as an implicit
+        # default or offered in the ambiguous-selection prompt below.
+        launchable = [
+            p for p in projects if not (p.repo and p.repo.klass == "knowledge")
+        ]
+        if positionals:
+            project = positionals[0]
+        elif len(launchable) == 1:
+            # Exactly one registered launchable project is an unambiguous
+            # default -- no risk of silently opening the wrong one.
+            project = launchable[0].name
+        elif not launchable:
+            project = ""
+        else:
+            # #2426: multiple registered projects with no explicit selection
+            # is genuinely ambiguous -- picking projects[0] here silently
+            # opened an arbitrary (registration-order-dependent, not
+            # caller-intent-dependent) project's content with no visible
+            # error. Refuse instead of guessing.
+            print(
+                "error: multiple projects are registered and none was "
+                "specified. Pass a project name: "
+                f"{', '.join(p.name for p in launchable)}"
+            )
+            return 2
         if not project:
             print("error: no project to open. Adopt one, or pass a project name.")
             return 2
@@ -549,150 +936,177 @@ def _cmd_picker(rest: list[str]) -> int:
         if action == "run":
             return _run_production_picker(project)
 
-        from .production_picker import runner
+    from .production_picker import runner
 
-        if action == "mock":
-            try:
-                decision = runner.run(
-                    project,
-                    mock_mode=True,
-                    local="--local" in flags,
-                )
-            except Exception as error:
-                print(f"error: production Picker mock failed: {error}")
-                return 1
-            if "--json" in flags:
-                print(json.dumps({"mock": True, "decision": decision}))
-            else:
-                print(f"mock picker exited - decision: {decision!r}")
-            return 0
-
+    if action == "mock":
         try:
-            captures = runner.capture(
+            decision = runner.run(
                 project,
-                live="--live" in flags,
-                pivot=values.get("--pivot"),
-                wait_pivot=wait_pivot,
+                mock_mode=True,
+                local="--local" in flags,
             )
         except Exception as error:
-            print(f"error: production Picker capture failed: {error}")
+            print(f"error: production Picker mock failed: {error}")
             return 1
-        content = captures[capture_format]
-        if screenshot_out:
-            with open(screenshot_out, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(content)
-            if "--json" in flags:
-                print(json.dumps({
-                    "screenshot": screenshot_out,
-                    "format": capture_format,
-                    "bytes": len(content),
-                }))
-            else:
-                print(
-                    f"  wrote {capture_format} screenshot: {screenshot_out} "
-                    f"({len(content)} bytes)"
-                )
+        if "--json" in flags:
+            print(json.dumps({"mock": True, "decision": decision}))
         else:
-            sys.stdout.write(content)
-            if not content.endswith("\n"):
-                sys.stdout.write("\n")
+            print(f"mock picker exited - decision: {decision!r}")
         return 0
 
-    if action == "screenshot":
-        svg = picker_app.capture_svg(
-            source,
-            project=project,
-            subtitle=subtitle,
-            contributions=contributions,
-            context_source=context_source,
+    try:
+        captures = runner.capture(
+            project,
+            live="--live" in flags,
+            pivot=values.get("--pivot"),
+            wait_pivot=wait_pivot,
         )
-        if screenshot_out:
-            with open(screenshot_out, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(svg)
-            print(f"  wrote screenshot: {screenshot_out}")
+    except Exception as error:
+        print(f"error: production Picker capture failed: {error}")
+        return 1
+    content = captures[capture_format]
+    if screenshot_out:
+        with open(screenshot_out, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+        if "--json" in flags:
+            print(json.dumps({
+                "screenshot": screenshot_out,
+                "format": capture_format,
+                "bytes": len(content),
+            }))
         else:
-            sys.stdout.write(svg)
-            if not svg.endswith("\n"):
-                sys.stdout.write("\n")
-        return 0
-    return picker_app.run_picker(
-        source,
-        project=project,
-        subtitle=subtitle,
-        on_launch=on_launch,
-        contributions=contributions,
-        context_source=context_source,
-    )
+            print(
+                f"  wrote {capture_format} screenshot: {screenshot_out} "
+                f"({len(content)} bytes)"
+            )
+    else:
+        sys.stdout.write(content)
+        if not content.endswith("\n"):
+            sys.stdout.write("\n")
+    return 0
+
+
+def _remote_machine_env(decision: dict) -> tuple[str | None, str | None]:
+    """(machine, environment) for a remote decision, else (None, None) for local."""
+    if decision.get("is_local", True):
+        return None, None
+    return decision.get("machine") or None, decision.get("env") or None
 
 
 def _run_production_picker(project: str) -> int:
-    """Run the transplanted production UX and act on its launch decision."""
+    """Run the transplanted production UX and act on its launch decision.
+
+    ``"refresh"``/``"manager-update"`` apply an update and loop back to
+    reopen the Picker (#4423); every other decision ends this function.
+    """
     from . import picker_app
     from .production_picker import runner
 
-    try:
-        decision = runner.run(project)
-    except Exception as error:
-        print(f"error: production Picker failed: {error}")
-        return 1
-    if not decision:
-        return 0
+    while True:
+        try:
+            decision = runner.run(project)
+        except Exception as error:
+            print(f"error: production Picker failed: {error}")
+            return 1
+        if not decision:
+            return 0
+        action = str(decision.get("action") or "")
+        options = decision.get("options")
+        opts = dict(options) if isinstance(options, dict) else {}
+        if action == "resume":
+            worktree_id = decision.get("worktree_id")
+            if not worktree_id:
+                print("error: Picker returned a resume decision with no worktree id.")
+                return 1
+            if not decision.get("is_local", True) and opts.get("ahp"):
+                print("error: AHP is supported only for same-machine launches.")
+                return 1
+            machine, environment = _remote_machine_env(decision)
+            return _run_launch(picker_app.LaunchRequest(
+                project=str(decision.get("project") or project or ""),
+                worktree_id=str(worktree_id),
+                mode="bare-resume" if opts.get("bare_resume") else "resume",
+                title=str(decision.get("title") or "") or None,
+                no_mux=bool(opts.get("no_mux")),
+                ahp=bool(opts.get("ahp")),
+                machine=machine,
+                environment=environment,
+            ))
+        if action == "restore":
+            worktree_id = decision.get("worktree_id")
+            if not worktree_id:
+                print("error: Picker returned a restore decision with no worktree id.")
+                return 1
+            return _restore_production_picker_session(
+                project,
+                str(worktree_id),
+                title=str(decision.get("title") or "") or None,
+                is_local=bool(decision.get("is_local", True)),
+                machine=str(decision.get("machine") or "") or None,
+                environment=str(decision.get("env") or "") or None,
+            )
+        if action == "dispose-hosted-session":
+            worktree_id = decision.get("worktree_id")
+            if not worktree_id:
+                print("error: Picker returned a disposal decision with no worktree id.")
+                return 1
+            if not decision.get("is_local", True):
+                print("error: AHP session disposal is supported only on this machine.")
+                return 1
+            request = picker_app.LaunchRequest(
+                project=project,
+                worktree_id=str(worktree_id),
+                mode="resume",
+            )
+            plan, code = _resolve_for(request)
+            if plan is None:
+                return code
+            from . import ahp_provider, engine_client, manager_config
 
-    action = str(decision.get("action") or "")
-    options = decision.get("options")
-    opts = dict(options) if isinstance(options, dict) else {}
-    if action == "resume":
-        worktree_id = decision.get("worktree_id")
-        if not worktree_id:
-            print("error: Picker returned a resume decision with no worktree id.")
-            return 1
-        return _run_launch(picker_app.LaunchRequest(
-            project=project,
-            worktree_id=str(worktree_id),
-            mode="bare-resume" if opts.get("bare_resume") else "resume",
-            title=str(decision.get("title") or "") or None,
-            no_mux=bool(opts.get("no_mux")),
-            machine=(
-                None if decision.get("is_local", True)
-                else str(decision.get("machine") or "") or None
-            ),
-            environment=(
-                None if decision.get("is_local", True)
-                else str(decision.get("env") or "") or None
-            ),
-        ))
-    if action == "restore":
-        worktree_id = decision.get("worktree_id")
-        if not worktree_id:
-            print("error: Picker returned a restore decision with no worktree id.")
-            return 1
-        return _restore_production_picker_session(
-            project,
-            str(worktree_id),
-            title=str(decision.get("title") or "") or None,
-            is_local=bool(decision.get("is_local", True)),
-            machine=str(decision.get("machine") or "") or None,
-            environment=str(decision.get("env") or "") or None,
-        )
-    if action == "new":
-        return _run_launch(picker_app.LaunchRequest(
-            project=project,
-            worktree_id=None,
-            mode="base" if opts.get("anchor") else "new",
-            no_mux=bool(opts.get("no_mux")),
-            machine=(
-                None if decision.get("is_local", True)
-                else str(decision.get("machine") or "") or None
-            ),
-            environment=(
-                None if decision.get("is_local", True)
-                else str(decision.get("env") or "") or None
-            ),
-        ))
-    if action == "refresh":
-        return _cmd_update([])
-    print(f"error: Picker returned an unsupported decision: {action!r}")
-    return 1
+            try:
+                disposed = ahp_provider.dispose_worktree_session(
+                    project,
+                    str(worktree_id),
+                    str(plan.work_dir or ""),
+                )
+            except (
+                ahp_provider.AhpProviderError,
+                engine_client.EngineError,
+                manager_config.ManagerConfigError,
+            ) as error:
+                print(f"error: could not dispose AHP session: {error}")
+                return 1
+            print(
+                "Disposed the AHP-hosted session."
+                if disposed
+                else "No active AHP-hosted session was present."
+            )
+            return 0
+        if action == "new":
+            if not decision.get("is_local", True) and opts.get("ahp"):
+                print("error: AHP is supported only for same-machine launches.")
+                return 1
+            machine, environment = _remote_machine_env(decision)
+            return _run_launch(picker_app.LaunchRequest(
+                project=project,
+                worktree_id=None,
+                mode="base" if opts.get("anchor") else "new",
+                no_mux=bool(opts.get("no_mux")),
+                ahp=bool(opts.get("ahp")),
+                machine=machine,
+                environment=environment,
+                seed_prompt=str(opts.get("seed_prompt") or "") or None,
+            ))
+        if action in ("refresh", "manager-update"):
+            # Apply the update, then loop back to reopen the Picker rather
+            # than exiting the process (#4423).
+            _cmd_update(["--project", project])
+            continue
+        if action == "open-venue":
+            from . import launcher
+            return launcher.open_venue(decision.get("provider", ""), decision.get("venue", ""))
+        print(f"error: Picker returned an unsupported decision: {action!r}")
+        return 1
 
 
 def _restore_production_picker_session(
@@ -768,16 +1182,7 @@ def _restore_production_picker_session(
         machine=None if is_local else machine,
         environment=None if is_local else environment,
     )
-    if not is_local:
-        return _run_launch(request)
-
-    try:
-        return engine_client.run_project_passthrough(
-            project, ["--worktree-id", worktree_id]
-        )
-    except engine_client.EngineError as error:
-        print(f"error: could not launch restored session: {error}")
-        return 1
+    return _run_launch(request)
 
 
 def _resolve_for(req) -> "tuple[object | None, int]":
@@ -791,7 +1196,6 @@ def _resolve_for(req) -> "tuple[object | None, int]":
     from .engine_client import (
         EngineError,
         EngineFeatureUnavailable,
-        launch_plan_from_dict,
         resolve_launch_plan,
     )
     try:
@@ -802,26 +1206,20 @@ def _resolve_for(req) -> "tuple[object | None, int]":
             target_machine=getattr(req, "machine", None),
             target_environment=getattr(req, "environment", None),
             target_no_mux=getattr(req, "no_mux", False),
+            seed=getattr(req, "seed_prompt", None),
         )
-    except EngineFeatureUnavailable:
-        from .production_picker import runner
-
-        try:
-            plan = launch_plan_from_dict(runner.compatibility_remote_plan(
-                req.project,
-                machine=req.machine,
-                environment=getattr(req, "environment", None),
-                worktree_id=req.worktree_id,
-                mode=req.mode,
-                no_mux=getattr(req, "no_mux", False),
-            ))
-        except (RuntimeError, OSError, ValueError) as error:
-            print(f"error: could not resolve a remote launch plan: {error}")
-            return None, 1
+    except EngineFeatureUnavailable as e:
+        print(f"error: could not resolve a launch plan: {e}")
+        return None, 1
     except EngineError as e:
         print(f"error: could not resolve a launch plan: {e}")
         return None, 1
     return plan, 0
+
+
+def _is_windows() -> bool:
+    """Monkeypatchable platform seam so tests need not mutate global ``os.name``."""
+    return os.name == "nt"
 
 
 def _run_launch(req) -> int:
@@ -832,82 +1230,94 @@ def _run_launch(req) -> int:
         return code
     if plan.action == "none":
         return plan.exit_code
+    new_window = bool(getattr(req, "new_window", False))
+    if plan.action == "remote":
+        if new_window:
+            print('error: "new window" launches are supported only for local worktrees.')
+            return 1
+        if getattr(req, "ahp", False):
+            print("error: AHP is supported only for same-machine launches")
+            return 1
+        return launcher.launch(plan, want_mux=not getattr(req, "no_mux", False))
+    use_ahp = bool(getattr(req, "ahp", False))
+    worktree_id = str(getattr(plan, "worktree_id", None) or "")
+    if (
+        getattr(req, "machine", None) is None
+        and worktree_id
+        and getattr(req, "mode", "") in {"resume", "bare-resume"}
+    ):
+        from . import engine_client
+
+        try:
+            persisted = engine_client.execution_leg_get(
+                req.project,
+                worktree_id,
+            ).get("execution_leg")
+        except engine_client.EngineFeatureUnavailable:
+            persisted = None
+        except engine_client.EngineError as error:
+            print(f"error: could not inspect the persisted execution leg: {error}")
+            return 1
+        if persisted is not None:
+            if not isinstance(persisted, dict):
+                print("error: agent-worktrees returned an invalid execution leg")
+                return 1
+            state = str(persisted.get("state") or "unknown")
+            if state in {"active", "unknown"}:
+                provider = str(persisted.get("provider") or "")
+                if provider != "ahp":
+                    print(
+                        "error: worktree requires unsupported execution-leg "
+                        f"provider {provider or '<unknown>'}"
+                    )
+                    return 1
+                if req.mode == "bare-resume":
+                    print(
+                        "error: bare resume is incompatible with the worktree's "
+                        "active AHP execution leg"
+                    )
+                    return 1
+                use_ahp = True
+    if use_ahp:
+        if new_window:
+            print('error: "new window" launches are not yet supported for AHP-backed sessions.')
+            return 1
+        from . import ahp_provider, engine_client, manager_config
+
+        if getattr(req, "machine", None):
+            print("error: AHP is supported only for same-machine launches")
+            return 1
+        if req.mode in {"base", "bare-resume"}:
+            print("error: AHP requires an agent-worktrees-managed worktree")
+            return 1
+        try:
+            attachment = ahp_provider.ensure_session(
+                req.project,
+                str(plan.worktree_id or ""),
+                str(plan.work_dir or ""),
+            )
+            plan = ahp_provider.attach_plan(plan, attachment)
+        except (
+            ahp_provider.AhpProviderError,
+            engine_client.EngineError,
+            manager_config.ManagerConfigError,
+        ) as error:
+            print(f"error: could not prepare AHP launch: {error}")
+            return 1
+        # AHP already rewrote plan.cmd to the attach client; the relocated
+        # launch-session script would re-resolve a vanilla plan and clobber
+        # that rewrite, so AHP stays on the direct-exec path (no mux wrapping
+        # for AHP attachment in this pass -- a known follow-up gap, not a
+        # regression: AHP launches never went through launch-session.ps1).
+        return launcher.launch(plan, want_mux=not getattr(req, "no_mux", False))
+    if getattr(req, "machine", None) is None and plan.action == "exec":
+        script = _relocated_launch_script()
+        if script is not None:
+            return _run_relocated_mux_launch(req, plan, script)
+    if new_window:
+        print('error: "new window" launches require the relocated launch-session script, which was not found.')
+        return 1
     return launcher.launch(plan, want_mux=not getattr(req, "no_mux", False))
-
-
-def _demo_launch_preview(req) -> int:
-    """Show what the launch/resume *would* run, without starting anything.
-
-    Exercises the same resolve -> compose path (through the fake Aperture engine)
-    the real launch uses, then prints the composed argv instead of executing it --
-    so the demo never spawns a Copilot session.
-    """
-    from . import launcher
-    plan, code = _resolve_for(req)
-    if plan is None:
-        return code
-    le = launcher.compose_launch(plan)
-    print()
-    target = req.worktree_id or "a new worktree"
-    print(f"  demo launch ({req.mode}) — {target}")
-    print(f"    action: {plan.action}   muxed: {le.muxed}   cwd: {le.cwd}")
-    print(f"    argv:   {' '.join(le.argv)}")
-    print("  (demo mode — not executed)")
-    print()
-    return 0
-
-
-def _prereq_line(s) -> str:
-    if not s.present:
-        state = "optional, absent" if s.optional else "MISSING"
-        mark = "○" if s.optional else "✗"
-    elif not s.satisfied:
-        state = f"{s.version or '?'} < required {s.min_required}"
-        mark = "✗"
-    else:
-        ver = f" {s.version}" if s.version else ""
-        state = f"ok{ver}"
-        mark = "✓"
-    return f"    {mark} {s.name.ljust(9)} {state}"
-
-
-def _cmd_doctor() -> int:
-    statuses = detect_baseline()
-    core = core_status()
-    print()
-    print(f"  {_BANNER} — doctor  (os: {current_os()})")
-    print()
-    print("  prerequisites:")
-    for s in statuses:
-        print(_prereq_line(s))
-    print()
-    print("  agent-worktrees core:")
-    print(f"    state: {core.state}")
-    print(f"    runtime: {core.runtime_dir} "
-          f"({'present' if core.runtime_present else 'absent'}"
-          f"{', venv' if core.venv_present else ''})")
-    print(f"    binstub: {core.binstub or 'not found in ~/.local/bin'}")
-    print()
-    selfst = self_status()
-    print("  worktree-manager (self):")
-    print(f"    installed version: {selfst.installed_version or '(not versioned-installed)'}")
-    print(f"    running version:   {__version__}")
-    print(f"    binstub: {selfst.binstub or 'not found in ~/.local/bin'}")
-    print(f"    root: {selfst.root}")
-    from . import source_config as _sc
-    _cfg_repo, _cfg_ref = _sc.configured_source()
-    print(f"    update source: {_sc.resolved_repo()} @ {_sc.resolved_ref()}"
-          f"{' (default)' if not (_cfg_repo or _cfg_ref) else ' (configured)'}")
-    print()
-    gaps = missing(statuses)
-    if gaps or not core.installed:
-        print("  → not fully set up. Run `worktree-manager setup` to see the plan "
-              "(add --apply to execute).")
-    else:
-        print("  ✓ prerequisites satisfied and the core is installed.")
-    print()
-    return 0 if (not gaps and core.installed) else 1
-
 
 def _cmd_setup(rest: list[str]) -> int:
     do_apply = "--apply" in rest
@@ -1001,6 +1411,12 @@ def _cmd_self_install(rest: list[str]) -> int:
     else:
         print(f"  ! {res.reason}")
         return 1
+    if res.cleaned:
+        verb = "removed" if do_apply else "would remove"
+        print()
+        print(f"  legacy artifacts {verb}:")
+        for c in res.cleaned:
+            print(f"      {c}")
     print()
     return 0
 
@@ -1068,32 +1484,26 @@ def _cmd_source(rest: list[str]) -> int:
     return 0
 
 
-def _strip_project(rest: list[str]) -> list[str]:
-    """Drop a threaded ``--project <name>`` (update is harness-wide, not scoped)."""
+def _extract_project(rest: list[str]) -> tuple[str | None, list[str]]:
+    """Pull a threaded ``--project <name>`` out (returned, not forwarded)."""
     out: list[str] = []
+    project: str | None = None
     i = 0
     while i < len(rest):
-        if rest[i] == "--project":
-            i += 2
+        if rest[i] == "--project" and i + 1 < len(rest):
+            project, i = rest[i + 1], i + 2
             continue
         out.append(rest[i])
         i += 1
-    return out
+    return project, out
 
 
 def _cmd_update(rest: list[str]) -> int:
     """Update the harness — the Worktree Manager AS the plugin updater/aligner.
 
-    Where ``<project> update`` lands after the agent-worktrees seam hands off
-    (its DQ8 fallback runs the in-plugin update directly). Two steps:
-
-    1. **Self-update the Manager** to the latest out-of-band payload (git fetch →
-       versioned slot); best-effort + non-fatal, effective on the next run.
-    2. **Orchestrate the harness update** by driving the engine's own mechanics
-       via ``agent-worktrees update --no-manager`` (the seam bypass, so this does
-       not recurse) — refreshing every plugin payload + runtime, reconciling
-       binstubs, and syncing anchors. The Manager sequences + aligns; the plugin
-       still does the work. Forwarded flags (``--force`` …) are passed through.
+    Two steps: (1) self-update the Manager (best-effort; effective next run);
+    (2) orchestrate via the engine (``agent-worktrees update --no-manager``,
+    the seam bypass) -- refreshing plugin payloads/runtimes, syncing anchors.
     """
     from . import engine_client as ec
     from .self_install import self_update
@@ -1105,6 +1515,17 @@ def _cmd_update(rest: list[str]) -> int:
     # 1. Self-update the Manager (best-effort; the new slot takes effect next run).
     print("  Self-updating the Worktree Manager …")
     su = self_update(dry_run=False)
+    cutover = su.cutover if isinstance(su.cutover, dict) else None
+    cutover_failed = bool(
+        cutover
+        and (
+            cutover.get("action") == "error"
+            or (
+                isinstance(cutover.get("result"), dict)
+                and cutover["result"].get("ok") is False
+            )
+        )
+    )
     if su.action == "updated":
         print(f"    ✓ updated {su.previous or '(none)'} → {su.version} "
               "(active on next run)")
@@ -1112,20 +1533,31 @@ def _cmd_update(rest: list[str]) -> int:
         print(f"    ✓ already current ({su.version})")
     else:
         print(f"    ○ self-update {su.action}: {su.reason} — continuing")
+    if cutover_failed:
+        print(f"    ✗ mux-daemon cutover failed: {cutover}")
+    # The manager_update_check cache is stale after a version change -- drop
+    # it so the next poll re-checks for real instead of serving the
+    # pre-update verdict (#4424).
+    from . import manager_update_check as _muc
 
-    # 2. Orchestrate the harness/plugin update through the engine, bypassing the
-    #    seam (so we do not recurse back into the Manager).
-    forwarded = _strip_project(rest)
+    _muc.invalidate()
+
+    # 2. Orchestrate via the engine, bypassing the seam. A threaded --project is
+    #    forwarded through run_engine_passthrough's own project param (placed
+    #    before the verb), not appended to args, so the engine can resolve it
+    #    even when this Manager itself runs outside any adopted repo.
+    project, forwarded = _extract_project(rest)
     print()
     print("  Updating harness plugins + runtimes via agent-worktrees …")
     print()
     try:
-        return ec.run_engine_passthrough(None, ["update", "--no-manager", *forwarded])
+        rc = ec.run_engine_passthrough(project, ["update", "--no-manager", *forwarded])
     except ec.EngineError as e:
         print(f"  ✗ {e}")
         if getattr(e, "install_hint", False):
             print("    Run `worktree-manager setup --apply` to install the engine first.")
         return 1
+    return 1 if cutover_failed and rc == 0 else rc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1145,7 +1577,8 @@ def main(argv: list[str] | None = None) -> int:
         print("commands:")
         print("  (no args)              show the app banner + build-out roadmap")
         print("  --project NAME         launch NAME's interactive Picker (binstub seam)")
-        print("  doctor                 report prerequisites + the agent-worktrees core")
+        print("  doctor [--json] [--apply-daemon-health]")
+        print("                         report prerequisites + the agent-worktrees core")
         print("  setup [--apply]        plan (default) or run prereq provisioning + core install")
         print("  self-install [--apply] version the app: current-version marker + ~/.local/bin binstub")
         print("  source                 show the self-update source (git repo + ref/branch)")
@@ -1160,6 +1593,10 @@ def main(argv: list[str] | None = None) -> int:
         print("  projects [<name>]      registered projects (harness repos: binstubs + profiles)")
         print("  repos [<name>]         every known repo + its config-state indicators")
         print("  worktrees [<project>]  live worktrees via the agent-worktrees engine (--json)")
+        print("  terminal-fragment <project> [--machine K] [--explain|--doctor|--migrate-selections]")
+        print("                         preview the Windows Terminal fragment a project would emit")
+        print("  profiles <project> get|apply [--machine K] [--set '<json>'] [--json]")
+        print("                         read/write this machine's terminal-profile column")
         print("  contracts [--project NAME] [--json]")
         print("                         validate plugin-contributed pivots/actions/cards/config")
         print("  picker [<project>]     launch the production Picker (Textual)")
@@ -1167,8 +1604,13 @@ def main(argv: list[str] | None = None) -> int:
         print("                         production UX with simulated mutations")
         print("  picker screenshot [<project>] [--format svg|text|ansi] [--out F]")
         print("                         capture the production Picker headlessly")
-        print("  picker --demo          preview the retired minimal scaffold")
+        print("  picker [screenshot] --demo|--preview [<project>]")
+        print("                         same, against deterministic mock data (no live")
+        print("                         engine/session state required); real Picker,")
+        print("                         real project identity, faked worktree/pivot data")
         print("                         (in the Picker: l launch/resume · b bare-resume · n new)")
+        print("  companion              Mux Companion: read-only status + session lineage for the current worktree (visions/mux-companion)")
+        print("  mux-daemon <run|ensure|register|remove|show|status [--json]>  (status alias: daemons status; #5001 Phase 1)")
         print()
         print("Phase 2 provisions prerequisites + drives the core install; Phase 3")
         print("adds the Manager state views (projects/repos/plugin enablement); later")
@@ -1182,12 +1624,25 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_repos(args[1:])
     if args and args[0] == "worktrees":
         return _cmd_worktrees(args[1:])
+    if args and args[0] == "terminal-fragment":
+        return _cmd_terminal_fragment(args[1:])
+    if args and args[0] == "profiles":
+        return _cmd_profiles(args[1:])
     if args and args[0] == "contracts":
         return _cmd_contracts(args[1:])
     if args and args[0] == "picker":
         return _cmd_picker(args[1:])
+    if args and args[0] == "companion":
+        return _cmd_companion(args[1:])
+    if args and args[0] == "mux-daemon":
+        return _cmd_mux_daemon(args[1:])
+    if args and args[0] == "daemons":
+        from .daemons_cli import cmd_daemons
+        return cmd_daemons(args[1:])
     if args and args[0] == "doctor":
-        return _cmd_doctor()
+        from . import doctor_cli
+
+        return doctor_cli.cmd_doctor(args[1:])
     if args and args[0] == "setup":
         return _cmd_setup(args[1:])
     if args and args[0] == "self-install":
@@ -1205,5 +1660,44 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _ensure_utf8_streams() -> None:
+    """Make ``stdout``/``stderr`` UTF-8-safe regardless of the console codepage.
+
+    Windows consoles default to the system ANSI codepage (e.g. ``cp1252``)
+    for a process's standard streams unless ``PYTHONUTF8=1``/
+    ``PYTHONIOENCODING=utf-8`` was set *before* the interpreter started. The
+    generated binstubs set ``PYTHONUTF8=1`` for exactly this reason, but a
+    stale (not-yet-redeployed) binstub, a direct
+    ``python -m worktree_manager`` invocation, or ``uv run`` bypassing the
+    binstub entirely can still reach here with a non-UTF-8 stream -- in which
+    case printing a status glyph (``\u2713``/``\u2192``) raises
+    ``UnicodeEncodeError`` and crashes the whole command (#5218). Reconfigure
+    defensively so every command is covered, not just the ones that happen to
+    print a glyph today.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            pass
+
+
+def console_entry() -> None:
+    """Entry point for both the ``python -m worktree_manager`` guard below
+    and the installed ``worktree-manager`` console script
+    (`pyproject.toml`'s ``[project.scripts]``) -- the generated script
+    wrapper calls this directly, bypassing the ``__main__`` guard, so
+    routing both through here is required for the shutdown-crash workaround
+    to cover the installed command too.
+    """
+    from ._shutdown_exit import run_and_exit
+
+    _ensure_utf8_streams()
+    run_and_exit(main)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    console_entry()

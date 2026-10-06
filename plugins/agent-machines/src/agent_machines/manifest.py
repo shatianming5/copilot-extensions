@@ -1,10 +1,15 @@
 """Requirement-package manifest parsing, validation, and per-machine layering.
 
-A **requirement package** is one YAML file under a repo's
-``.agent-machines/all/`` or ``.agent-machines/machines/<machine>/``. It declares
-desired machine state as a set of
+A **requirement package** is one YAML file under a repo's canonical
+``.copilot-extensions/agent-machines/all/`` or
+``.copilot-extensions/agent-machines/machines/<machine>/`` surface, with
+legacy repo-local fallbacks. It declares desired machine state as a set of
 ``manage`` entries, each governed by a **disposition** (see ``DISPOSITIONS``).
 The plugin defines this schema; each repo supplies the data.
+
+Schema v4 adds bounded integer authority at package level with optional
+manage/resource/module overrides. Authority is inherited only for deterministic
+selection and reporting; per-machine layering remains manage-only.
 
 Layering is *within a repo*: a package's ``per-machine.<machine>`` block is a
 partial ``manage``-shaped override that is deep-merged onto the base ``manage``
@@ -16,16 +21,19 @@ the engine unions resolved packages across repos (see ``discover``/``reconcile``
 from __future__ import annotations
 
 import copy
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from .authority import AUTHORITY_MAX, AUTHORITY_MIN
+
 #: Current requirement-package schema version. Bumped only by a deliberate,
 #: fixture-guarded migration (see docs/patterns/config-schema-migration.md).
-SCHEMA_VERSION = 3
-SUPPORTED_SCHEMA_VERSIONS = (1, 2, SCHEMA_VERSION)
+SCHEMA_VERSION = 4
+SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3, SCHEMA_VERSION)
 
 #: The dispositions that govern a managed key.
 DISPOSITIONS = (
@@ -40,18 +48,27 @@ DISPOSITIONS = (
 )
 
 PLUGIN_ACTIVATION_GROUP = "copilot.settings.plugin-activation"
+PAYLOAD_COMMAND_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 #: The stack-critical plugins/marketplaces the bootstrap-floor assertion protects
 #: (a package may add to, but never remove from, the union of these).
 BOOTSTRAP_CRITICAL_PLUGINS = ("agent-worktrees", "agent-machines")
 BOOTSTRAP_CRITICAL_MARKETPLACES = ("copilot-extensions",)
 
-#: Declarative-resource types the schema recognizes. All four are fully
-#: handled today -- ``package``, ``file`` (whole-file and managed-block),
+#: Declarative-resource types the schema recognizes. All are fully handled
+#: today -- ``package``, ``file`` (whole-file and managed-block),
 #: ``registry`` (Windows), ``feature`` (Windows optional features /
-#: capabilities and Linux/WSL units), and ``power-setting`` (Windows power
-#: schemes). See ``resources.py`` for the handlers.
-KNOWN_RESOURCE_TYPES = ("package", "file", "registry", "feature", "power-setting")
+#: capabilities and Linux/WSL units), ``power-setting`` (Windows power
+#: schemes), ``self-update`` (machine-local unattended tier opt-in),
+#: ``fleet-update`` (machine-local unattended worktree-manager update
+#: sweep opt-in), and ``copilot-cli-update`` (the Copilot CLI's own
+#: built-in self-updater: disable it and/or pin the installed binary to a
+#: known-good version -- Windows only for now). See ``resources.py`` for the
+#: handlers.
+KNOWN_RESOURCE_TYPES = (
+    "package", "file", "registry", "feature", "power-setting", "self-update",
+    "fleet-update", "copilot-cli-update",
+)
 
 #: Minimal required identity fields per resource type (checked at load).
 REQUIRED_FIELDS = {
@@ -60,11 +77,16 @@ REQUIRED_FIELDS = {
     "registry": ("path",),
     "feature": ("id", "manager"),
     "power-setting": ("subgroup", "setting"),
+    "self-update": ("tier",),
+    "fleet-update": ("tier",),
+    "copilot-cli-update": (),
 }
 
 #: Accepted values for a resource's ``state`` / ``strategy`` selectors.
 RESOURCE_STATES = ("present", "absent")
 RESOURCE_STRATEGIES = ("enforce", "ensure-present", "managed-block")
+SELF_UPDATE_TIERS = ("watchdog", "sweep")
+FLEET_UPDATE_TIERS = ("sweep",)
 
 #: Registry value types accepted by the ``registry`` resource (friendly names
 #: mapped to ``reg.exe`` ``REG_*`` types in ``resources.py``). Kept here for
@@ -128,6 +150,8 @@ class RequirementPackage:
     name: str
     schema_version: int
     manage: dict[str, dict[str, Any]]
+    authority: int = 0
+    authority_declared: bool = False
     gate: list[str] = field(default_factory=list)
     aliases: dict[str, Any] = field(default_factory=dict)
     per_machine: dict[str, Any] = field(default_factory=dict)
@@ -139,7 +163,11 @@ class RequirementPackage:
     source_path: Path | None = None
     source_anchor: Path | None = None
 
-    def applies_to(self, machine: str) -> bool:
+    def applies_to(
+        self,
+        machine: str,
+        accepted_machines: tuple[str, ...] | None = None,
+    ) -> bool:
         """True when this package targets ``machine`` (empty/``*`` gate = all).
 
         The gate match is **case-insensitive**: ``current_machine()`` returns
@@ -150,14 +178,19 @@ class RequirementPackage:
         """
         if not self.gate or "*" in self.gate:
             return True
-        return machine.casefold() in {g.casefold() for g in self.gate}
+        accepted = accepted_machines or (machine,)
+        names = {name.casefold() for name in accepted}
+        return bool(names & {g.casefold() for g in self.gate})
 
     def repo_root(self) -> Path | None:
         """Derive the repo root from a canonical or legacy package path."""
         if self.source_path is None:
             return None
+        _legacy = ".agent-machines"  # marketplace-isolation: allow legacy-compatibility
         for parent in self.source_path.absolute().parents:
-            if parent.name == ".agent-machines":
+            if parent.name == "agent-machines" and parent.parent.name == ".copilot-extensions":
+                return parent.parent.parent
+            if parent.name == _legacy:
                 return parent.parent
             if parent.name == "machine-state" and parent.parent.name == ".github":
                 return parent.parent.parent
@@ -175,12 +208,82 @@ def _require(mapping: dict[str, Any], key: str, path: Path) -> Any:
     return mapping[key]
 
 
+def _validate_authority(
+    mapping: dict[str, Any],
+    schema: int,
+    path: Path,
+    location: str,
+    *,
+    allow_none: bool = False,
+) -> None:
+    if "authority" not in mapping:
+        return
+    value = mapping["authority"]
+    if schema < 4:
+        raise ManifestError(
+            f"{path}: {location}.authority requires schema_version 4"
+        )
+    if allow_none and value is None:
+        return
+    if type(value) is not int or not AUTHORITY_MIN <= value <= AUTHORITY_MAX:
+        raise ManifestError(
+            f"{path}: {location}.authority must be an integer from "
+            f"{AUTHORITY_MIN} through {AUTHORITY_MAX}"
+        )
+
+
+def _manage_is_authority_sensitive(key: str, spec: dict[str, Any]) -> bool:
+    if spec.get("disposition") == "ensure-absent":
+        return True
+    if key in {
+        "copilot.settings.plugin-tombstones",
+        PLUGIN_ACTIVATION_GROUP,
+    }:
+        return True
+    payloads = (
+        spec.get("values"),
+        spec.get("value"),
+        spec.get("keys"),
+    )
+
+    def contains_sensitive_key(value: Any) -> bool:
+        if isinstance(value, dict):
+            return bool(
+                {"enabledPlugins", "extraKnownMarketplaces"} & set(value)
+            ) or any(contains_sensitive_key(child) for child in value.values())
+        if isinstance(value, list):
+            return any(contains_sensitive_key(child) for child in value)
+        return False
+
+    return any(contains_sensitive_key(payload) for payload in payloads)
+
+
 def _validate_manage(
-    manage: dict[str, Any], schema: int, path: Path
+    manage: dict[str, Any],
+    schema: int,
+    path: Path,
+    *,
+    package_authority_declared: bool = False,
+    allow_authority_none: bool = False,
 ) -> None:
     for key, spec in manage.items():
         if not isinstance(spec, dict):
             raise ManifestError(f"{path}: manage.{key} must be a mapping")
+        _validate_authority(
+            spec,
+            schema,
+            path,
+            f"manage.{key}",
+            allow_none=allow_authority_none,
+        )
+        if (
+            (package_authority_declared or "authority" in spec)
+            and _manage_is_authority_sensitive(key, spec)
+        ):
+            raise ManifestError(
+                f"{path}: authority is not allowed on plugin activation, "
+                f"tombstone, marketplace, or removal manage spec manage.{key}"
+            )
         disp = spec.get("disposition", "ignore")
         if disp not in DISPOSITIONS:
             raise ManifestError(
@@ -248,10 +351,19 @@ def load_package(
     if not isinstance(name, str) or not name:
         raise ManifestError(f"{path}: 'package' must be a non-empty string")
 
+    _validate_authority(raw, schema, path, "package")
+    package_authority_declared = "authority" in raw
+    authority = raw.get("authority", 0)
+
     manage = raw.get("manage") or {}
     if not isinstance(manage, dict):
         raise ManifestError(f"{path}: 'manage' must be a mapping")
-    _validate_manage(manage, schema, path)
+    _validate_manage(
+        manage,
+        schema,
+        path,
+        package_authority_declared=package_authority_declared,
+    )
 
     gate = raw.get("gate") or []
     if not isinstance(gate, list):
@@ -263,6 +375,46 @@ def load_package(
     for mod in modules:
         if not isinstance(mod, dict) or not mod.get("name"):
             raise ManifestError(f"{path}: each module must be a mapping with a 'name'")
+        _validate_authority(mod, schema, path, f"module {mod.get('name')!r}")
+        invocation = mod.get("invocation")
+        if invocation is None:
+            continue
+        plugin_identity = (
+            invocation.get("plugin") if isinstance(invocation, dict) else None
+        )
+        plugin_parts = (
+            plugin_identity.split("@")
+            if isinstance(plugin_identity, str)
+            else []
+        )
+        valid = (
+            isinstance(invocation, dict)
+            and len(plugin_parts) == 2
+            and all(
+                part
+                and part == part.strip()
+                and not any(char.isspace() for char in part)
+                and "\0" not in part
+                for part in plugin_parts
+            )
+            and isinstance(invocation.get("command"), str)
+            and PAYLOAD_COMMAND_ID.fullmatch(invocation["command"]) is not None
+            and all(
+                key not in invocation or isinstance(invocation[key], list)
+                for key in (
+                    "arguments",
+                    "dry_run_arguments",
+                    "apply_arguments",
+                    "platforms",
+                )
+            )
+        )
+        if not valid:
+            raise ManifestError(
+                f"{path}: module {mod.get('name')!r} invocation requires "
+                "plugin '<name>@<marketplace>', command, and list-valued "
+                "arguments/dry_run_arguments/apply_arguments/platforms"
+            )
 
     resources = raw.get("resources") or []
     if not isinstance(resources, list):
@@ -270,6 +422,12 @@ def load_package(
     for res in resources:
         if not isinstance(res, dict):
             raise ManifestError(f"{path}: each resource must be a mapping")
+        _validate_authority(
+            res,
+            schema,
+            path,
+            f"resource {res.get('type')!r}:{res.get('id') or res.get('path')!r}",
+        )
         rtype = res.get("type")
         if rtype not in KNOWN_RESOURCE_TYPES:
             raise ManifestError(
@@ -284,6 +442,11 @@ def load_package(
         if state is not None and state not in RESOURCE_STATES:
             raise ManifestError(
                 f"{path}: resource state {state!r} must be one of {RESOURCE_STATES}"
+            )
+        maintenance_safe = res.get("maintenance_safe")
+        if maintenance_safe is not None and type(maintenance_safe) is not bool:
+            raise ManifestError(
+                f"{path}: resource maintenance_safe must be a boolean when declared"
             )
         strategy = res.get("strategy")
         if strategy is not None and strategy not in RESOURCE_STRATEGIES:
@@ -359,6 +522,37 @@ def load_package(
                         f"is not supported by setting {res['setting']!r}; "
                         f"allowed indexes are {sorted(allowed)}"
                     )
+        if rtype == "self-update":
+            tier = res.get("tier")
+            if tier not in SELF_UPDATE_TIERS:
+                raise ManifestError(
+                    f"{path}: self-update tier {tier!r} must be one of "
+                    f"{SELF_UPDATE_TIERS}"
+                )
+        if rtype == "fleet-update":
+            tier = res.get("tier")
+            if tier not in FLEET_UPDATE_TIERS:
+                raise ManifestError(
+                    f"{path}: fleet-update tier {tier!r} must be one of "
+                    f"{FLEET_UPDATE_TIERS}"
+                )
+        if rtype == "copilot-cli-update":
+            auto_update = res.get("auto_update")
+            pinned_version = res.get("pinned_version")
+            if auto_update is None and pinned_version is None:
+                raise ManifestError(
+                    f"{path}: copilot-cli-update resource requires at least one of "
+                    "'auto_update' or 'pinned_version'"
+                )
+            if auto_update is not None and type(auto_update) is not bool:
+                raise ManifestError(
+                    f"{path}: copilot-cli-update 'auto_update' must be a boolean when declared"
+                )
+            if pinned_version is not None and not isinstance(pinned_version, str):
+                raise ManifestError(
+                    f"{path}: copilot-cli-update 'pinned_version' must be a string "
+                    "when declared"
+                )
         process_guard = res.get("process_guard")
         if process_guard is not None:
             if rtype != "package":
@@ -423,6 +617,33 @@ def load_package(
                 "normalize to the same case-insensitive identity"
             )
         original_machine_keys[folded] = machine_key
+        _validate_authority(
+            overlay,
+            schema,
+            path,
+            f"per-machine.{machine_key}",
+            allow_none=True,
+        )
+        unsupported = sorted(
+            key for key in ("authority", "resources", "modules")
+            if key in overlay
+        )
+        if unsupported:
+            raise ManifestError(
+                f"{path}: per-machine.{machine_key} supports manage overlays only; "
+                f"per-machine {', '.join(unsupported)} are not supported"
+            )
+        manage_overlay = overlay.get("manage", overlay)
+        if isinstance(manage_overlay, dict):
+            for manage_key, spec in manage_overlay.items():
+                if isinstance(spec, dict):
+                    _validate_authority(
+                        spec,
+                        schema,
+                        path,
+                        f"per-machine.{machine_key}.manage.{manage_key}",
+                        allow_none=True,
+                    )
         normalized_per_machine[folded] = overlay
     per_machine = normalized_per_machine
 
@@ -430,6 +651,8 @@ def load_package(
         name=name,
         schema_version=schema,
         manage=manage,
+        authority=authority,
+        authority_declared=package_authority_declared,
         gate=[str(g) for g in gate],
         aliases=raw.get("aliases") or {},
         per_machine=per_machine,
@@ -460,7 +683,11 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
     return out
 
 
-def resolve_for_machine(pkg: RequirementPackage, machine: str) -> RequirementPackage:
+def resolve_for_machine(
+    pkg: RequirementPackage,
+    machine: str,
+    accepted_machines: tuple[str, ...] | None = None,
+) -> RequirementPackage:
     """Return a copy of ``pkg`` with its ``per-machine.<machine>`` layer applied.
 
     The per-machine block is a partial ``manage``-shaped override deep-merged onto
@@ -468,7 +695,19 @@ def resolve_for_machine(pkg: RequirementPackage, machine: str) -> RequirementPac
     unchanged. This is the *layer-within-repo* step that must precede any
     cross-repo union.
     """
-    overlay = pkg.per_machine.get(machine.casefold()) or {}
+    accepted = accepted_machines or (machine,)
+    accepted_folded = {name.casefold() for name in accepted}
+    overlay_keys = [
+        key for key in pkg.per_machine
+        if key.casefold() in accepted_folded
+    ]
+    if len(overlay_keys) > 1:
+        raise ManifestError(
+            f"{pkg.source_path or pkg.name}: multiple per-machine overlays match "
+            f"{machine!r}: {', '.join(sorted(overlay_keys))}"
+        )
+    overlay = pkg.per_machine.get(overlay_keys[0]) if overlay_keys else {}
+    overlay = overlay or {}
     manage_overlay = overlay.get("manage", overlay) if isinstance(overlay, dict) else {}
     if not isinstance(manage_overlay, dict):
         manage_overlay = {}
@@ -477,18 +716,34 @@ def resolve_for_machine(pkg: RequirementPackage, machine: str) -> RequirementPac
         resolved_manage,
         pkg.schema_version,
         pkg.source_path or Path(pkg.name),
+        package_authority_declared=pkg.authority_declared,
     )
+    modules = copy.deepcopy(pkg.modules)
+    resources = copy.deepcopy(pkg.resources)
+    for declaration in (*modules, *resources):
+        gate = declaration.get("gate")
+        if isinstance(gate, list) and "*" not in gate and (
+            accepted_folded & {
+                str(value).casefold() for value in gate if isinstance(value, str)
+            }
+        ):
+            declaration["gate"] = [machine]
+    resolved_gate = list(pkg.gate)
+    if "*" not in resolved_gate and pkg.applies_to(machine, accepted):
+        resolved_gate = [machine]
     return RequirementPackage(
         name=pkg.name,
         schema_version=pkg.schema_version,
         manage=resolved_manage,
-        gate=list(pkg.gate),
+        authority=pkg.authority,
+        authority_declared=pkg.authority_declared,
+        gate=resolved_gate,
         aliases=copy.deepcopy(pkg.aliases),
         per_machine={},
         bootstrap_floor=copy.deepcopy(pkg.bootstrap_floor),
         exclude=list(pkg.exclude),
-        modules=copy.deepcopy(pkg.modules),
-        resources=copy.deepcopy(pkg.resources),
+        modules=modules,
+        resources=resources,
         source_repo=pkg.source_repo,
         source_path=pkg.source_path,
         source_anchor=pkg.source_anchor,

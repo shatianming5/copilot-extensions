@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import pytest
 
 from agent_worktrees import __main__ as m
-from agent_worktrees import sessions
+from agent_worktrees import embody_resume, sessions, worktree_identity
 
 
 # -- build_mux_new_session_argv (pure) --------------------------------------
@@ -23,7 +24,7 @@ class TestBuildMuxNewSessionArgv:
         argv = sessions.build_mux_new_session_argv(
             "wt1-abc",
             "/w/wt1",
-            ["bash", "setup.sh", "--allow-all-tools"],
+            ["bash", "setup.sh", "--allow-all", "--experimental"],
             {"COPILOT_FEATURE_FLAGS": "x"},
             mux="tmux",
             pane_wrapper="/does/not/exist",
@@ -42,7 +43,7 @@ class TestBuildMuxNewSessionArgv:
         assert argv[e:e + 5] == [
             "env", "-u", "WORKTREE_PROJECT", "-u", "WORKTREE_ID",
         ]
-        assert argv[-3:] == ["bash", "setup.sh", "--allow-all-tools"]
+        assert argv[-4:] == ["bash", "setup.sh", "--allow-all", "--experimental"]
         assert "--" not in argv
 
     def test_tmux_with_wrapper_wraps_command(self, tmp_path):
@@ -91,6 +92,29 @@ class TestMuxNewSession:
         assert out["session"] == "wt-id"
         assert out["new_pane"] == "%2"
 
+    def test_success_emits_stage_2_mux_session_assigned(self, monkeypatch, tmp_path):
+        """Stage 2 (mux_session_assigned): the programmatic cutover path's own
+        emitter for the embody flow, alongside the ordinary-launch path's
+        mux_attached."""
+        from agent_worktrees import activity
+
+        monkeypatch.setattr(
+            "agent_worktrees.config.install_dir", lambda: tmp_path / ".agent-worktrees"
+        )
+
+        class R:
+            returncode = 0
+            stdout = "%2\n"
+            stderr = ""
+
+        import subprocess
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: R())
+        sessions.mux_new_session("id", "/w", ["copilot"], None, mux="tmux")
+        events = activity.read_events(worktree_id="id", event="mux_session_assigned")
+        assert len(events) == 1
+        assert events[0]["stage"] == 2
+        assert events[0]["stage_name"] == "mux_session_assigned"
+
     def test_failure_returns_error(self, monkeypatch):
         class R:
             returncode = 1
@@ -106,16 +130,23 @@ class TestMuxNewSession:
 
 # -- cmd_embody control flow ------------------------------------------------
 def _ns(**kw):
-    base = dict(worktree_id=None, new=False, seed=None, driver=None,
+    base = dict(worktree_id=None, new=False, codename=None, anchor=False,
+                seed=None, driver=None,
                 seed_ready_timeout=180.0,
-                verify_timeout=0.0, recovery=False, dry_run=False)
+                verify_timeout=0.0, recovery=False, dry_run=False,
+                ensure_mux=False)
     base.update(kw)
     return argparse.Namespace(**base)
 
 
 def _stub_config(monkeypatch):
     class _Cfg:
-        pass
+        repos = {}
+        default_repo = type(
+            "Repo",
+            (),
+            {"worktree_root": str(Path.home() / "test-worktrees")},
+        )()
     monkeypatch.setattr(m.cfg, "load_config", lambda: _Cfg())
     monkeypatch.setattr(
         m,
@@ -140,7 +171,7 @@ class TestCmdEmbody:
 
     def test_existing_worktree_not_found(self, monkeypatch, capfd, tmp_path):
         _stub_config(monkeypatch)
-        monkeypatch.setattr(m, "_resolve_worktree_id", lambda r: "wtX")
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wtX")
         monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
         rc = m.cmd_embody(_ns(worktree_id="wtX"))
         assert rc == 1
@@ -148,7 +179,7 @@ class TestCmdEmbody:
 
     def test_resume_when_mux_session_exists(self, monkeypatch, capfd, tmp_path):
         _stub_config(monkeypatch)
-        monkeypatch.setattr(m, "_resolve_worktree_id", lambda r: "wtY")
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wtY")
         monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
         (tmp_path / "wtY.yaml").write_text("x")
         monkeypatch.setattr(
@@ -166,9 +197,83 @@ class TestCmdEmbody:
         assert out["created"] is False and out["resumed"] is True
         assert out["session"] == "wt-wtY" and out["new_pane"] == "%1"
 
+    def test_resume_delivers_pending_seed_left_by_an_external_pane_creator(
+        self, monkeypatch, capfd, tmp_path,
+    ):
+        """picker-new-session-prompt-and-composer Phase A item 4: the
+        Picker's own launch-session.{ps1,sh} creates the `wt-<id>` mux pane
+        directly (never calling embody) -- so THIS is the path that actually
+        delivers a pending_seed for that flow, via the resume branch, not
+        the create branch."""
+        _stub_config(monkeypatch)
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wtE")
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+        (tmp_path / "wtE.yaml").write_text("x")
+        record = type(
+            "Rec", (), {"worktree_path": "/w/wtE", "pending_seed": "external pane prompt"},
+        )()
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: record)
+        saved = {}
+        monkeypatch.setattr(
+            m.tracking, "save_record",
+            lambda rec, path: saved.update(pending_seed=rec.pending_seed, path=path),
+        )
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: True)
+        monkeypatch.setattr(sessions, "mux_copilot_pane", lambda w: "%3")
+        monkeypatch.setattr(sessions, "mux_new_session",
+                            lambda *a, **k: pytest.fail("should not spawn"))
+        seeded = {}
+        def _seed(pane, seed, **k):
+            seeded.update(pane=pane, seed=seed)
+            return {"ok": True, "pane": pane, "ready": True, "sent": True,
+                    "submitted": True, "reason": None}
+        monkeypatch.setattr(sessions, "mux_seed_pane", _seed)
+
+        rc = m.cmd_embody(_ns(worktree_id="wtE"))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["resumed"] is True and out["seeded"] is True
+        assert seeded == {"pane": "%3", "seed": "external pane prompt"}
+        assert saved == {"pending_seed": None, "path": tmp_path / "wtE.yaml"}
+
+    def test_resume_leaves_unconfirmed_pending_seed_for_a_later_retry(
+        self, monkeypatch, capfd, tmp_path,
+    ):
+        _stub_config(monkeypatch)
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wtF")
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+        (tmp_path / "wtF.yaml").write_text("x")
+        state = {"worktree_path": "/w/wtF", "pending_seed": "not yet delivered"}
+
+        def _load(p):
+            return type("Rec", (), dict(state))()
+
+        def _save(rec, path):
+            state["pending_seed"] = rec.pending_seed
+
+        monkeypatch.setattr(m.tracking, "load_record", _load)
+        monkeypatch.setattr(m.tracking, "save_record", _save)
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: True)
+        monkeypatch.setattr(sessions, "mux_copilot_pane", lambda w: "%4")
+        monkeypatch.setattr(
+            sessions, "mux_seed_pane",
+            lambda pane, seed, **k: {"ok": False, "pane": pane, "ready": False,
+                                     "sent": False, "submitted": False,
+                                     "reason": "not-ready-timeout"},
+        )
+
+        rc = m.cmd_embody(_ns(worktree_id="wtF"))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["resumed"] is True and out["seeded"] is False
+        assert state["pending_seed"] == "not yet delivered"
+        assert out["seed_deferred"] is True  # kept for later: reported, not silent
+
     def test_create_detached_session_and_seed(self, monkeypatch, capfd, tmp_path):
         _stub_config(monkeypatch)
-        monkeypatch.setattr(m, "_resolve_worktree_id", lambda r: "wtZ")
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wtZ")
         monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
         (tmp_path / "wtZ.yaml").write_text("x")
         monkeypatch.setattr(
@@ -202,9 +307,261 @@ class TestCmdEmbody:
             "pane": "%5", "seed": "do the thing", "ready_timeout": 180.0,
         }
 
+    def test_pending_seed_is_delivered_and_cleared_on_confirmed_submit(
+        self, monkeypatch, capfd, tmp_path,
+    ):
+        """picker-new-session-prompt-and-composer Phase A item 4: a prompt
+        persisted at creation time (`create`/`resolve --new --seed`) is
+        delivered on the first real attach even with no explicit --seed, and
+        the record is updated to clear it once confirmed submitted."""
+        _stub_config(monkeypatch)
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wtP")
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+        (tmp_path / "wtP.yaml").write_text("x")
+        record = type(
+            "Rec", (), {"worktree_path": "/w/wtP", "pending_seed": "queued prompt"},
+        )()
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: record)
+        saved = {}
+        monkeypatch.setattr(
+            m.tracking, "save_record",
+            lambda rec, path: saved.update(pending_seed=rec.pending_seed, path=path),
+        )
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: False)
+        monkeypatch.setattr(
+            sessions, "mux_new_session",
+            lambda *a, **k: {"ok": True, "session": "wt-wtP",
+                             "new_pane": "%7", "error": None},
+        )
+        seeded = {}
+        def _seed(pane, seed, **k):
+            seeded.update(pane=pane, seed=seed)
+            return {"ok": True, "pane": pane, "ready": True, "sent": True,
+                    "submitted": True, "reason": None}
+        monkeypatch.setattr(sessions, "mux_seed_pane", _seed)
+
+        rc = m.cmd_embody(_ns(worktree_id="wtP"))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["seeded"] is True and out["seed_submitted"] is True
+        assert seeded == {"pane": "%7", "seed": "queued prompt"}
+        assert saved == {"pending_seed": None, "path": tmp_path / "wtP.yaml"}
+
+    def test_pending_seed_left_in_place_when_delivery_unconfirmed(
+        self, monkeypatch, capfd, tmp_path,
+    ):
+        """An unconfirmed delivery (pane never ready in time) must not lose
+        the pending prompt -- a later attach should still be able to retry
+        it. The claim-then-restore race guard clears it optimistically and
+        restores it on an unconfirmed delivery, so the net final state is
+        unchanged even though save_record is invoked twice."""
+        _stub_config(monkeypatch)
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wtQ")
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+        (tmp_path / "wtQ.yaml").write_text("x")
+        state = {"worktree_path": "/w/wtQ", "pending_seed": "still queued"}
+
+        def _load(p):
+            return type("Rec", (), dict(state))()
+
+        def _save(rec, path):
+            state["pending_seed"] = rec.pending_seed
+
+        monkeypatch.setattr(m.tracking, "load_record", _load)
+        monkeypatch.setattr(m.tracking, "save_record", _save)
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: False)
+        monkeypatch.setattr(
+            sessions, "mux_new_session",
+            lambda *a, **k: {"ok": True, "session": "wt-wtQ",
+                             "new_pane": "%8", "error": None},
+        )
+        monkeypatch.setattr(
+            sessions, "mux_seed_pane",
+            lambda pane, seed, **k: {"ok": False, "pane": pane, "ready": False,
+                                     "sent": False, "submitted": False,
+                                     "reason": "not-ready-timeout"},
+        )
+
+        rc = m.cmd_embody(_ns(worktree_id="wtQ"))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["seeded"] is False
+        assert state["pending_seed"] == "still queued"
+        assert out["seed_deferred"] is True and out["seed_reason"] == "not-ready-timeout"
+
+    @pytest.mark.parametrize("live_pane", [False, True])
+    @pytest.mark.parametrize("outcome", [
+        {"sent": True, "reason": "seed-not-echoed"},
+        {"sent": True, "reason": "enter-failed"},
+        {"sent": False, "reason": "send-failed"},  # may follow a partial send
+    ])
+    def test_an_ambiguous_pending_seed_delivery_is_reported_not_retried(
+        self, monkeypatch, capfd, tmp_path, live_pane, outcome,
+    ):
+        """A delivery that may have typed (a draft left in the input) keeps its
+        pending seed claimed, on a fresh launch and on a live-pane resume alike:
+        the next attach would otherwise type a second copy after the draft."""
+        _stub_config(monkeypatch)
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wtA")
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+        (tmp_path / "wtA.yaml").write_text("x")
+        state = {"worktree_path": "/w/wtA", "pending_seed": "queued"}
+
+        def _save(rec, path):
+            state["pending_seed"] = rec.pending_seed
+
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: type("Rec", (), dict(state))())
+        monkeypatch.setattr(m.tracking, "save_record", _save)
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: live_pane)
+        monkeypatch.setattr(sessions, "mux_copilot_pane", lambda w: "%4")
+        monkeypatch.setattr(
+            sessions, "mux_new_session",
+            lambda *a, **k: {"ok": True, "session": "wt-wtA", "new_pane": "%8", "error": None},
+        )
+        monkeypatch.setattr(
+            sessions, "mux_seed_pane",
+            lambda pane, seed, **k: {"ok": False, "pane": pane, "ready": True,
+                                     "submitted": False, **outcome},
+        )
+
+        rc = m.cmd_embody(_ns(worktree_id="wtA"))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert state["pending_seed"] is None  # not restored for an automatic retry
+        assert out["seed_reason"] == outcome["reason"]
+        assert out["seed_unconfirmed"] is True  # reported, on either path
+
+    def test_explicit_seed_wins_and_supersedes_any_stale_pending_seed(
+        self, monkeypatch, capfd, tmp_path,
+    ):
+        """An explicit --seed always wins for DELIVERY -- but it must also
+        CLEAR any separately persisted pending_seed, not leave it behind:
+        otherwise a later ordinary resume would re-deliver that stale
+        prompt into an already-active conversation as an unwanted
+        later-turn injection."""
+        _stub_config(monkeypatch)
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wtR")
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+        (tmp_path / "wtR.yaml").write_text("x")
+        state = {"worktree_path": "/w/wtR", "pending_seed": "persisted"}
+
+        def _load(p):
+            return type("Rec", (), dict(state))()
+
+        def _save(rec, path):
+            state["pending_seed"] = rec.pending_seed
+
+        monkeypatch.setattr(m.tracking, "load_record", _load)
+        monkeypatch.setattr(m.tracking, "save_record", _save)
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: False)
+        monkeypatch.setattr(
+            sessions, "mux_new_session",
+            lambda *a, **k: {"ok": True, "session": "wt-wtR",
+                             "new_pane": "%6", "error": None},
+        )
+        seeded = {}
+        def _seed(pane, seed, **k):
+            seeded.update(pane=pane, seed=seed)
+            return {"ok": True, "pane": pane, "ready": True, "sent": True,
+                    "submitted": True, "reason": None}
+        monkeypatch.setattr(sessions, "mux_seed_pane", _seed)
+
+        rc = m.cmd_embody(_ns(worktree_id="wtR", seed="explicit wins"))
+
+        assert rc == 0
+        assert seeded == {"pane": "%6", "seed": "explicit wins"}
+        assert state["pending_seed"] is None
+
+    def test_ensure_mux_not_called_without_explicit_opt_in(self, monkeypatch, tmp_path):
+        # opt-in-not-ambient-default: a bare embody must never install tmux
+        # underneath an operator running their own terminal/session manager.
+        _stub_config(monkeypatch)
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wtY")
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+        (tmp_path / "wtY.yaml").write_text("x")
+        monkeypatch.setattr(
+            m.tracking, "load_record",
+            lambda p: type("Rec", (), {"worktree_path": "/w/wtY"})(),
+        )
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: False)
+        monkeypatch.setattr(
+            sessions, "mux_new_session",
+            lambda *a, **k: {"ok": True, "session": "wt-wtY", "new_pane": "%1", "error": None},
+        )
+        called = []
+        monkeypatch.setattr(
+            sessions, "ensure_mux_available", lambda *a, **k: called.append(1) or True,
+        )
+
+        rc = m.cmd_embody(_ns(worktree_id="wtY"))
+
+        assert rc == 0
+        assert called == []
+
+    def test_ensure_mux_called_with_explicit_opt_in(self, monkeypatch, tmp_path):
+        # `cli-mode launch` (agent-bridge) is the deliberate per-request case
+        # that IS fine defaulting tmux on -- it passes --ensure-mux.
+        _stub_config(monkeypatch)
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wtX")
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+        (tmp_path / "wtX.yaml").write_text("x")
+        monkeypatch.setattr(
+            m.tracking, "load_record",
+            lambda p: type("Rec", (), {"worktree_path": "/w/wtX"})(),
+        )
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: False)
+        monkeypatch.setattr(
+            sessions, "mux_new_session",
+            lambda *a, **k: {"ok": True, "session": "wt-wtX", "new_pane": "%1", "error": None},
+        )
+        called = []
+        monkeypatch.setattr(
+            sessions, "ensure_mux_available", lambda *a, **k: called.append(1) or True,
+        )
+
+        rc = m.cmd_embody(_ns(worktree_id="wtX", ensure_mux=True))
+
+        assert rc == 0
+        assert called == [1]
+
+    def test_terminal_managed_worktree_refuses_embodiment(
+        self,
+        monkeypatch,
+        capfd,
+        tmp_path,
+    ):
+        _stub_config(monkeypatch)
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wt-terminal")
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+        (tmp_path / "wt-terminal.yaml").write_text("x")
+        record = type(
+            "Rec",
+            (),
+            {
+                "worktree_path": "/w/wt-terminal",
+                "kind": "bridge",
+                "status": "complete",
+            },
+        )()
+        monkeypatch.setattr(m.tracking, "load_record", lambda _path: record)
+        monkeypatch.setattr(sessions, "has_mux_session", lambda _wt: False)
+        monkeypatch.setattr(
+            sessions,
+            "mux_new_session",
+            lambda *_args, **_kwargs: pytest.fail("must not spawn"),
+        )
+
+        rc = m.cmd_embody(_ns(worktree_id="wt-terminal"))
+
+        assert rc == 3
+        assert "terminal and managed" in capfd.readouterr().out
+
     def test_seed_ready_timeout_is_forwarded(self, monkeypatch, capfd, tmp_path):
         _stub_config(monkeypatch)
-        monkeypatch.setattr(m, "_resolve_worktree_id", lambda r: "wtT")
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wtT")
         monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
         (tmp_path / "wtT.yaml").write_text("x")
         monkeypatch.setattr(
@@ -235,7 +592,7 @@ class TestCmdEmbody:
         # D4: --driver injects AGENT_BRIDGE_DRIVEN_BY into the session env and is
         # reported in the JSON (the "driven by <agent>" banner source).
         _stub_config(monkeypatch)
-        monkeypatch.setattr(m, "_resolve_worktree_id", lambda r: "wtDr")
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wtDr")
         monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
         (tmp_path / "wtDr.yaml").write_text("x")
         monkeypatch.setattr(
@@ -262,6 +619,20 @@ class TestCmdEmbody:
         monkeypatch.setattr(
             m, "_create_worktree_core",
             lambda c, **k: {"worktree": {"id": "fresh-1", "path": "/w/fresh-1"}},
+        )
+        monkeypatch.setattr(
+            m.tracking,
+            "load_record",
+            lambda _path: type(
+                "Rec",
+                (),
+                {"worktree_path": "/w/fresh-1", "repo": None},
+            )(),
+        )
+        monkeypatch.setattr(
+            m.cfg,
+            "tracking_dir",
+            lambda: Path.home() / "tracking",
         )
         monkeypatch.setattr(sessions, "has_mux_session", lambda w: False)
         monkeypatch.setattr(
@@ -334,7 +705,7 @@ class TestCmdEmbody:
 
     def test_spawn_failure_exits_4(self, monkeypatch, capfd, tmp_path):
         _stub_config(monkeypatch)
-        monkeypatch.setattr(m, "_resolve_worktree_id", lambda r: "wtE")
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wtE")
         monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
         (tmp_path / "wtE.yaml").write_text("x")
         monkeypatch.setattr(
@@ -353,7 +724,7 @@ class TestCmdEmbody:
 
     def test_dry_run_reports_plan(self, monkeypatch, capfd, tmp_path):
         _stub_config(monkeypatch)
-        monkeypatch.setattr(m, "_resolve_worktree_id", lambda r: "wtD")
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: "wtD")
         monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
         (tmp_path / "wtD.yaml").write_text("x")
         monkeypatch.setattr(
@@ -368,3 +739,353 @@ class TestCmdEmbody:
         out = json.loads(capfd.readouterr().out)
         assert out["dry_run"] is True and out["would"] == "create"
         assert out["cmd"] == ["copilot"]
+
+    def _stub_existing(self, monkeypatch, tmp_path, wt="wtR"):
+        _stub_config(monkeypatch)
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: wt)
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+        (tmp_path / f"{wt}.yaml").write_text("x")
+        monkeypatch.setattr(
+            m.tracking, "load_record",
+            lambda p: type("Rec", (), {"worktree_path": f"/w/{wt}"})(),
+        )
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: False)
+        monkeypatch.setattr(sessions, "resolve_resume_target", lambda rec: "head-1")
+
+    @pytest.mark.parametrize(
+        "extra, resumed",
+        [
+            ({}, "head-1"),  # bringing a worktree back resumes its head
+            ({"seed": "new task"}, None),  # a seed is a new task: fresh
+            ({"seed": "carry on", "resume_head": True}, "head-1"),
+            ({"fresh": True}, None),
+            ({"copilot_args": ["--resume=other"]}, None),  # caller chose
+        ],
+    )
+    def test_dry_run_resumes_the_head_conversation(
+        self, monkeypatch, capfd, tmp_path, extra, resumed,
+    ):
+        self._stub_existing(monkeypatch, tmp_path)
+        monkeypatch.setattr(sessions, "mux_new_session",
+                            lambda *a, **k: pytest.fail("dry-run must not spawn"))
+        rc = m.cmd_embody(_ns(worktree_id="wtR", dry_run=True, **extra))
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["resume_session"] == resumed
+        assert out["cmd"] == (["copilot", "--resume=head-1"] if resumed else ["copilot"])
+
+    def test_create_resumes_the_head_conversation(self, monkeypatch, capfd, tmp_path):
+        self._stub_existing(monkeypatch, tmp_path)
+        monkeypatch.setattr(embody_resume, "session_liveness", lambda sid: "dead")
+        spawned = {}
+
+        def _spawn(wt, wd, cmd, env, **k):
+            spawned["cmd"] = cmd
+            return {"ok": True, "session": f"wt-{wt}", "new_pane": "%5", "error": None}
+
+        monkeypatch.setattr(sessions, "mux_new_session", _spawn)
+        rc = m.cmd_embody(_ns(worktree_id="wtR"))
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["created"] is True and out["resume_session"] == "head-1"
+        assert spawned["cmd"] == ["copilot", "--resume=head-1"]
+
+    @pytest.mark.parametrize("state, why", [
+        ("live", "already running"),  # a bare-terminal Copilot on the same conversation
+        ("unknown", "can't confirm"),  # no process probe here: fail closed
+    ])
+    def test_a_head_that_may_still_run_is_never_forked(
+        self, monkeypatch, capfd, tmp_path, state, why,
+    ):
+        self._stub_existing(monkeypatch, tmp_path)
+        monkeypatch.setattr(embody_resume, "session_liveness", lambda sid: state)
+        monkeypatch.setattr(sessions, "mux_new_session",
+                            lambda *a, **k: pytest.fail("must not fork a possibly-live head"))
+        rc = m.cmd_embody(_ns(worktree_id="wtR"))
+        assert rc == 3
+        assert why in capfd.readouterr().out
+
+    def test_the_head_is_resolved_under_the_lifecycle_fence(self, monkeypatch, capfd, tmp_path):
+        """The ledger advanced while embody waited: the session resumed is the
+        one the fenced re-read names, not the one seen at preflight."""
+        self._stub_existing(monkeypatch, tmp_path)
+        loads = {"n": 0}
+
+        def _load(p):
+            loads["n"] += 1
+            head = "stale-head" if loads["n"] == 1 else "fresh-head"
+            return type("Rec", (), {"worktree_path": "/w/wtR", "head": head})()
+
+        monkeypatch.setattr(m.tracking, "load_record", _load)
+        monkeypatch.setattr(sessions, "resolve_resume_target", lambda rec: rec.head)
+        monkeypatch.setattr(embody_resume, "session_liveness", lambda sid: "dead")
+        spawned = {}
+
+        def _spawn(wt, wd, cmd, env, **k):
+            spawned["cmd"] = cmd
+            return {"ok": True, "session": f"wt-{wt}", "new_pane": "%5", "error": None}
+
+        monkeypatch.setattr(sessions, "mux_new_session", _spawn)
+        assert m.cmd_embody(_ns(worktree_id="wtR")) == 0
+        assert loads["n"] >= 2
+        assert spawned["cmd"] == ["copilot", "--resume=fresh-head"]
+        assert json.loads(capfd.readouterr().out)["resume_session"] == "fresh-head"
+
+
+# -- cmd_embody --anchor: deliver directly in the anchor, no worktree ------
+def _stub_anchor_config(monkeypatch, *, repo_name="example-web", anchor="/w/anchor"):
+    class _Cfg:
+        repos = {}
+        default_repo = type("Repo", (), {"anchor": anchor})()
+    _Cfg.repo_name = repo_name
+    monkeypatch.setattr(m.cfg, "load_config", lambda: _Cfg())
+    monkeypatch.setattr(m, "_preflight_launch", lambda c, a, w: m.LaunchPreflight())
+    monkeypatch.setattr(m, "_build_launch_cmd", lambda c, a, w, **k: ["copilot"])
+    monkeypatch.setattr(m, "_build_env", lambda p, s=None, work_dir=None: {})
+    monkeypatch.setattr(m, "_repo_session_env", lambda c, w="": {})
+
+
+class TestCmdEmbodyAnchor:
+    def test_anchor_mutually_exclusive_with_worktree_id(self, capfd):
+        rc = m.cmd_embody(_ns(anchor=True, worktree_id="x"))
+        assert rc == 2
+        assert "mutually exclusive" in capfd.readouterr().out
+
+    def test_anchor_mutually_exclusive_with_new(self, capfd):
+        rc = m.cmd_embody(_ns(anchor=True, new=True))
+        assert rc == 2
+        assert "mutually exclusive" in capfd.readouterr().out
+
+    def test_anchor_requires_active_project(self, monkeypatch, capfd):
+        class _Cfg:
+            repo_name = None
+            default_repo = type("Repo", (), {"anchor": ""})()
+        monkeypatch.setattr(m.cfg, "load_config", lambda: _Cfg())
+        rc = m.cmd_embody(_ns(anchor=True))
+        assert rc == 2
+        assert "requires an active project" in capfd.readouterr().out
+
+    def test_anchor_creates_session_at_the_anchor_path_no_worktree_record(
+        self, monkeypatch, capfd,
+    ):
+        _stub_anchor_config(monkeypatch, repo_name="example-web", anchor="/w/example-web")
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: False)
+        spawned = {}
+
+        def _spawn(wt, wd, cmd, env, **k):
+            spawned.update(wt=wt, wd=wd, cmd=cmd)
+            return {"ok": True, "session": f"wt-{wt}", "new_pane": "%7", "error": None}
+
+        monkeypatch.setattr(sessions, "mux_new_session", _spawn)
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: pytest.fail(
+            "anchor mode must never look up a worktree tracking record"
+        ))
+
+        rc = m.cmd_embody(_ns(anchor=True))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["ok"] is True
+        assert out["anchor"] is True
+        assert out["worktree_id"] == "anchor-example-web"
+        assert out["session"] == "wt-anchor-example-web"
+        assert out["work_dir"] == "/w/example-web"
+        assert out["created"] is True and out["resumed"] is False
+        assert spawned == {
+            "wt": "anchor-example-web", "wd": "/w/example-web", "cmd": ["copilot"],
+        }
+
+    def test_anchor_resumes_an_already_live_session(self, monkeypatch, capfd):
+        _stub_anchor_config(monkeypatch)
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: True)
+        monkeypatch.setattr(sessions, "mux_active_pane", lambda w: "%2")
+        monkeypatch.setattr(sessions, "mux_copilot_pane", lambda w: None)
+        monkeypatch.setattr(
+            sessions, "mux_new_session",
+            lambda *a, **k: pytest.fail("must not spawn a duplicate"),
+        )
+
+        rc = m.cmd_embody(_ns(anchor=True))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["created"] is False and out["resumed"] is True
+        assert out["anchor"] is True
+        assert out["new_pane"] == "%2"
+
+    def test_anchor_seeds_the_first_turn(self, monkeypatch, capfd):
+        _stub_anchor_config(monkeypatch)
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: False)
+        monkeypatch.setattr(
+            sessions, "mux_new_session",
+            lambda wt, wd, cmd, env, **k: {
+                "ok": True, "session": f"wt-{wt}", "new_pane": "%4", "error": None,
+            },
+        )
+        seeded = {}
+
+        def _seed(pane, seed, **k):
+            seeded.update(pane=pane, seed=seed)
+            return {"ok": True, "sent": True, "ready": True, "submitted": True, "reason": None}
+
+        monkeypatch.setattr(sessions, "mux_seed_pane", _seed)
+
+        rc = m.cmd_embody(_ns(anchor=True, seed="explore the repo"))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["seeded"] is True
+        assert seeded == {"pane": "%4", "seed": "explore the repo"}
+
+    def test_anchor_dry_run_reports_plan_without_spawning(self, monkeypatch, capfd):
+        _stub_anchor_config(monkeypatch)
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: False)
+        monkeypatch.setattr(
+            sessions, "mux_new_session",
+            lambda *a, **k: pytest.fail("dry-run must not spawn"),
+        )
+
+        rc = m.cmd_embody(_ns(anchor=True, dry_run=True))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["dry_run"] is True
+        assert out["anchor"] is True
+        assert out["would"] == "create"
+        assert out["worktree_id"] == "anchor-example-web"
+
+    def test_anchor_spawn_failure_exits_4(self, monkeypatch, capfd):
+        _stub_anchor_config(monkeypatch)
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: False)
+        monkeypatch.setattr(
+            sessions, "mux_new_session",
+            lambda *a, **k: {"ok": False, "session": "wt-anchor-example-web",
+                             "new_pane": None, "error": "boom"},
+        )
+
+        rc = m.cmd_embody(_ns(anchor=True))
+
+        assert rc == 4
+        assert "boom" in capfd.readouterr().out
+
+
+
+class TestEmbodyLaunchPassthrough:
+    """`--copilot-arg` / `--bridge-scope-id` (venue CLI-mode detached launch)."""
+
+    def _spawn_capture(self, monkeypatch):
+        spawned = {}
+
+        def _spawn(wt, wd, cmd, env, **k):
+            spawned.update(wt=wt, env=dict(env or {}))
+            return {"ok": True, "session": f"wt-{wt}", "new_pane": "%9", "error": None}
+
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: False)
+        monkeypatch.setattr(sessions, "mux_new_session", _spawn)
+        return spawned
+
+    def test_parser_accepts_repeatable_copilot_args_and_scope(self):
+        parser = m.build_parser()
+        for verb in ("embody", "copilot"):
+            args = parser.parse_args([
+                verb, "--anchor",
+                "--copilot-arg=--plugin-dir=/stage/example-agent",
+                "--copilot-arg=--no-ask-user",
+                "--bridge-scope-id", "anchor-example-web@cs-1",
+            ])
+            assert args.copilot_args == [
+                "--plugin-dir=/stage/example-agent", "--no-ask-user",
+            ]
+            assert args.bridge_scope_id == "anchor-example-web@cs-1"
+
+    def test_parser_defaults_are_inert(self):
+        args = m.build_parser().parse_args(["embody", "--anchor"])
+        assert args.copilot_args == []
+        assert args.bridge_scope_id is None
+
+    def test_anchor_exports_bridge_scope_but_keeps_mux_name(self, monkeypatch, capfd):
+        _stub_anchor_config(monkeypatch)
+        spawned = self._spawn_capture(monkeypatch)
+
+        rc = m.cmd_embody(_ns(anchor=True, bridge_scope_id="anchor-example-web@cs-1"))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["session"] == "wt-anchor-example-web"
+        assert spawned["wt"] == "anchor-example-web"
+        assert spawned["env"]["AGENT_BRIDGE_SCOPE_ID"] == "anchor-example-web@cs-1"
+
+    def test_no_scope_means_no_env_override(self, monkeypatch, capfd):
+        _stub_anchor_config(monkeypatch)
+        spawned = self._spawn_capture(monkeypatch)
+
+        assert m.cmd_embody(_ns(anchor=True)) == 0
+        assert "AGENT_BRIDGE_SCOPE_ID" not in spawned["env"]
+
+    def test_copilot_args_reach_the_launch_builder(self, monkeypatch, capfd):
+        _stub_anchor_config(monkeypatch)
+        self._spawn_capture(monkeypatch)
+        seen = {}
+
+        def _build(c, a, w, **k):
+            seen["copilot_args"] = list(getattr(a, "copilot_args", []))
+            return ["copilot", *seen["copilot_args"]]
+
+        monkeypatch.setattr(m, "_build_launch_cmd", _build)
+
+        rc = m.cmd_embody(_ns(anchor=True, copilot_args=["--plugin-dir=/p"]))
+
+        assert rc == 0
+        assert seen["copilot_args"] == ["--plugin-dir=/p"]
+
+    @pytest.mark.parametrize(
+        "bad", ["--acp", "--stdio", "-p", "--prompt=do it", "-i", "--interactive=x"],
+    )
+    def test_mode_changing_copilot_args_are_refused(self, monkeypatch, capfd, bad):
+        _stub_anchor_config(monkeypatch)
+        monkeypatch.setattr(
+            sessions, "mux_new_session",
+            lambda *a, **k: pytest.fail("a refused passthrough must not spawn"),
+        )
+
+        rc = m.cmd_embody(_ns(anchor=True, copilot_args=[bad]))
+
+        assert rc == 2
+        assert "not allowed" in capfd.readouterr().out
+
+    def test_worktree_path_also_exports_bridge_scope(self, monkeypatch, capfd, tmp_path):
+        _stub_config(monkeypatch)
+        spawned = self._spawn_capture(monkeypatch)
+        wt_root = tmp_path / "trk"
+        wt_root.mkdir()
+        (wt_root / "wt1.yaml").write_text("x")
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: wt_root)
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda r: r)
+
+        class _Rec:
+            worktree_id = "wt1"
+            worktree_path = str(tmp_path)
+            branch = None
+            repo = None
+            kind = "session"
+            status = "active"
+
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: _Rec())
+        monkeypatch.setattr(m, "_unsupported_hosted_launch", lambda r, v: None)
+        monkeypatch.setattr(
+            m, "_launch_profile_selection",
+            lambda *a, **k: m.profile_assignment.LaunchProfileSelection(profile=None),
+        )
+        monkeypatch.setattr(m, "_reflect_assignment", lambda r, s: None)
+        monkeypatch.setattr(
+            m, "_apply_assignment_env", lambda env, s: env,
+        )
+        monkeypatch.setattr(
+            m, "_repo_for_record",
+            lambda c, r: type("R", (), {"worktree_root": str(tmp_path)})(),
+        )
+
+        rc = m.cmd_embody(_ns(worktree_id="wt1", bridge_scope_id="scope-x"))
+
+        assert rc == 0, capfd.readouterr().out
+        assert spawned["env"]["AGENT_BRIDGE_SCOPE_ID"] == "scope-x"

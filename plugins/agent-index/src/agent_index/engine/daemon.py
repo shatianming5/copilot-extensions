@@ -23,13 +23,20 @@ import subprocess
 import time
 from pathlib import Path
 
-from agent_procutil import detached_kwargs, windowless_python
+from agent_procutil import (
+    windowless_daemon_kwargs,
+    windowless_python,
+    windowless_python_env,
+)
+
+from .generation import current_engine_generation
 
 
 def engine_home() -> Path:
     """Durable engine root (holds the heavy venv), outside the versioned runtime."""
+    _default = "~/.agent-index/engine"  # marketplace-isolation: allow legacy-compatibility
     return Path(
-        os.environ.get("AGENT_INDEX_ENGINE_HOME", "~/.agent-index/engine")
+        os.environ.get("AGENT_INDEX_ENGINE_HOME", _default)
     ).expanduser()
 
 
@@ -63,6 +70,31 @@ def is_healthy(host: str, port: int, *, timeout: float = 3.0) -> bool:
         return False
 
 
+def health(host: str, port: int, *, timeout: float = 3.0) -> dict:
+    """Return the engine health payload, or a normalized unreachable result."""
+    import httpx
+
+    try:
+        resp = httpx.get(f"http://{host}:{port}/health", timeout=timeout)
+        resp.raise_for_status()
+        payload = resp.json()
+        if isinstance(payload, dict):
+            return payload
+    except (httpx.HTTPError, OSError, ValueError):
+        pass
+    return {
+        "status": "unreachable",
+        "generation": None,
+        "gpu_deps_installed": False,
+        "model_loaded": False,
+        "model_name": None,
+        "device": None,
+        "cuda_available": None,
+        "python_executable": None,
+        "detail": f"Engine not reachable at http://{host}:{port}",
+    }
+
+
 def _write_pid(pid: int, home: Path | None = None) -> None:
     pf = _pid_file(home)
     pf.parent.mkdir(parents=True, exist_ok=True)
@@ -94,25 +126,42 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _spawn(cmd: list[str]) -> subprocess.Popen:
+def _spawn(cmd: list[str], *, python: str, home: Path) -> subprocess.Popen:
     kwargs: dict[str, object] = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
         "env": os.environ.copy(),
+        # Never the caller's ambient cwd: this is a long-lived, detached
+        # daemon that may outlive whatever repo/worktree checkout the
+        # caller happened to be running `agent-index engine start` from
+        # (service-lifecycle-supervision's "nothing pins the plugin
+        # payload" rule, generalized to every deletable checkout). Its own
+        # durable engine home is already a stable, versioned-runtime-
+        # independent location -- root it there.
+        "cwd": str(home),
     }
-    kwargs.update(detached_kwargs())
+    kwargs["env"].update(windowless_python_env(python))
+    kwargs.update(windowless_daemon_kwargs())
     return subprocess.Popen(cmd, **kwargs)  # type: ignore[arg-type]  # noqa: S603
 
 
 def engine_command(home: Path | None = None) -> list[str]:
-    """The argv that launches the engine from the durable venv (host/port bound)."""
+    """The argv that launches the engine from the durable venv (host/port bound).
+
+    Uses the venv's ``pythonw.exe`` sibling on Windows: the console-subsystem
+    ``python.exe`` launcher re-execs the base interpreter as a child even under
+    ``CREATE_NO_WINDOW``, and that child allocates its own visible console (a
+    single long-lived server, so there is no recurring-console-descendant need
+    for a console interpreter here -- unlike the Docker daemon-with-recurring-
+    children case).
+    """
     host, port = engine_endpoint()
     py = engine_venv_python(home)
     return [
-        windowless_python(py),
+        windowless_python(str(py)),
         "-m",
-        "agent_index.engine.app",
+        "agent_index_engine.app",
         "--host",
         host,
         "--port",
@@ -120,13 +169,24 @@ def engine_command(home: Path | None = None) -> list[str]:
     ]
 
 
-def start(home: Path | None = None, *, wait_timeout: float = 90.0) -> str:
+def start(home: Path | None = None, *, wait_timeout: float | None = None) -> str:
     """Start the persistent engine daemon from the durable venv.
 
     Returns a short status string. Idempotent: a no-op when already healthy.
     Raises :class:`FileNotFoundError` if the durable engine venv is missing (the
     engine runtime hasn't been provisioned -- run the installer / provisioning).
+
+    ``wait_timeout`` defaults to a generous 300s: a cold process import of
+    torch + the embedding model (before uvicorn even starts listening) has
+    been observed to take upwards of two minutes on a CPU-only host, well
+    past what a short timeout tuned for a lightweight service would allow --
+    this is a one-time cost per process start, not a steady-state latency,
+    so a long ceiling here costs nothing once healthy. Overridable via
+    ``AGENT_INDEX_ENGINE_START_TIMEOUT`` for a host that needs longer still
+    (e.g. a slow disk or first-ever model download).
     """
+    if wait_timeout is None:
+        wait_timeout = float(os.environ.get("AGENT_INDEX_ENGINE_START_TIMEOUT", "300"))
     home = home or engine_home()
     host, port = engine_endpoint()
     if is_healthy(host, port):
@@ -139,7 +199,7 @@ def start(home: Path | None = None, *, wait_timeout: float = 90.0) -> str:
             f"first (installer, or 'agent-index engine install')"
         )
 
-    proc = _spawn(engine_command(home))
+    proc = _spawn(engine_command(home), python=str(py), home=home)
     _write_pid(proc.pid, home)
 
     deadline = time.monotonic() + wait_timeout
@@ -183,8 +243,9 @@ def status(home: Path | None = None) -> dict:
     home = home or engine_home()
     host, port = engine_endpoint()
     pid = _read_pid(home)
+    observed = health(host, port)
     return {
-        "healthy": is_healthy(host, port),
+        "healthy": observed.get("status") != "unreachable",
         "host": host,
         "port": port,
         "pid": pid,
@@ -192,6 +253,13 @@ def status(home: Path | None = None) -> dict:
         "engine_home": str(home),
         "venv_python": str(engine_venv_python(home)),
         "provisioned": engine_venv_python(home).exists(),
+        "generation": current_engine_generation(),
+        "observed_generation": observed.get("generation"),
+        "gpu_deps_installed": observed.get("gpu_deps_installed"),
+        "model_loaded": observed.get("model_loaded"),
+        "cuda_available": observed.get("cuda_available"),
+        "python_executable": observed.get("python_executable"),
+        "detail": observed.get("detail"),
     }
 
 

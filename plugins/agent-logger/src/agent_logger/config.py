@@ -27,6 +27,8 @@ try:
 except ImportError:  # pragma: no cover - pyyaml is a hard dependency
     yaml = None  # type: ignore[assignment]
 
+from .repo_trust import has_symlink_ancestor, path_traverses_symlink, repo_config_is_trusted
+
 #: Neutral, personality- and multi-machine system-free defaults.
 DEFAULTS: dict[str, Any] = {
     # Where collated digest chunks are written/read.
@@ -59,9 +61,24 @@ DEFAULTS: dict[str, Any] = {
         # matches none is marked machine-only. Superset of repo_allowlist
         # (which governs what syncs); this governs what the origin mark records.
         "harness_repos": [],
+        # When true, a session's matched repo (or its bound knowledge repo)
+        # must ALSO durably declare itself in via a checked-in
+        # `.copilot-extensions/agent-logger/config.yaml` (`sync: {opt_in:
+        # true}`) -- mirroring agent-index's repo-owned activation-gate
+        # convention -- as an additional requirement on top of
+        # repo_allowlist/repo_denylist. Off by default (this machine-scoped
+        # config remains sufficient on its own, as today) so enabling it is
+        # an explicit, opt-in behavior change, not a silent one.
+        "require_repo_opt_in": False,
         # Retention for destination pruning. None/<=0 -> retain everything.
         "retention_days": None,
         "lock_timeout_sec": 10,
+        # Name of the push lock file under <home>. Default serializes every
+        # sync of the same source. The multi-tenant orchestrator keeps this
+        # default so all tenants syncing one shared ~/.copilot (and the legacy
+        # session-sync) coordinate on the same lock; a tenant with a distinct
+        # source sets its own name to run in parallel.
+        "lock_name": "session-sync.lock",
         # Target-independent post-push notify. After any successful push the
         # engine fires a best-effort HTTP POST to `url` (JSON body
         # {"machine": <machine>}; `{machine}` in the url is also substituted),
@@ -111,6 +128,8 @@ DEFAULTS: dict[str, Any] = {
     # with a -wsl suffix inside WSL).
     "machine": {
         "name": None,
+        # Optional exact role used by aggregate machine selectors.
+        "role": None,
     },
     # Background chronicling -- the scheduled orchestrator daemon. Off by
     # default; only the single elected chronicler host (fleet-wide, one machine)
@@ -145,6 +164,15 @@ DEFAULTS: dict[str, Any] = {
         # narration_style, exemplars, closing_remark, landing, push}.
         "sinks": {},
     },
+    # The review-annotation catalog index -- a small SQLite derived cache over
+    # every session's review-annotations.json sidecar, keyed on (repo,
+    # pr_number). See agent_logger.catalog. The sidecar remains the durable
+    # source of truth; this index only makes it queryable without sweeping
+    # every session directory.
+    "catalog": {
+        # Index db path; None -> <home>/review-catalog.db.
+        "db_path": None,
+    },
 }
 
 REPO_CONFIG_FILENAMES: tuple[str, ...] = (
@@ -153,7 +181,7 @@ REPO_CONFIG_FILENAMES: tuple[str, ...] = (
     ".config/agent-logger.yaml",
     ".config/agent-logger.yml",
 )
-REPO_CONFIG_SCHEMA_VERSION = 1
+REPO_CONFIG_SCHEMA_VERSION = 3  # v3 adds the ``sync.local_path`` field
 REPO_LOG_FIELDS = {
     "root",
     "path_template",
@@ -164,6 +192,17 @@ REPO_LOG_FIELDS = {
     "exemplars",
     "closing_remark",
 }
+# Deliberately narrow: only the canonical local sync destination, which is the
+# SAME absolute path for every machine in the fleet (a shared NAS mount), not
+# a per-machine secret or a choice of *which* target type is active. Declaring
+# it once in the repo eliminates the exact drift this field exists to prevent
+# -- a machine whose local ``~/.agent-logger/config.yaml`` was never written
+# (or was written with a stale/wrong path) silently syncing nowhere useful,
+# confirmed live across two real machines before this field existed. See
+# ``_load_repo_config``'s own docstring for why this is a deliberate,
+# consciously-decided relaxation of the "repo can't touch machine sync state"
+# boundary, not an oversight.
+REPO_SYNC_FIELDS = {"local_path"}
 # The background chronicle's first-class narration style. When
 # ``narration_style`` is exactly this keyword the writer produces a neutral,
 # factual chronicle; :func:`resolve_narration_style` expands it to the canonical
@@ -217,7 +256,7 @@ def home_dir() -> Path:
     env = os.environ.get("AGENT_LOGGER_HOME")
     if env:
         return Path(env).expanduser()
-    return Path.home() / ".agent-logger"
+    return Path.home() / ".agent-logger"  # marketplace-isolation: allow legacy compatibility root
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -269,6 +308,36 @@ def _validate_relative_path(value: Any, location: str) -> str:
     if ".." in PurePosixPath(text.replace("\\", "/")).parts:
         raise RepositoryConfigError(f"{location} must not escape the repository root")
     return text
+
+
+def _validate_portable_absolute_path(value: Any, location: str) -> str:
+    """Platform-neutral checks for a facility-wide absolute path: non-empty,
+    no ``~``, absolute on *some* platform's syntax, no ``..``. Does not check
+    absoluteness on *this* platform -- see :func:`_validate_native_absolute_path`.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise RepositoryConfigError(f"{location} must be a non-empty absolute path")
+    text = value.strip()
+    if text.startswith("~"):
+        raise RepositoryConfigError(f"{location} must not use '~' (not machine-portable)")
+    if not (PurePosixPath(text).is_absolute() or PureWindowsPath(text).is_absolute()):
+        raise RepositoryConfigError(f"{location} must be an absolute path")
+    if ".." in PurePosixPath(text.replace("\\", "/")).parts:
+        raise RepositoryConfigError(f"{location} must not contain '..'")
+    return text
+
+
+def _validate_native_absolute_path(value: str, location: str) -> str:
+    """Host-native final check: must be absolute (not a bare root) on *this*
+    platform -- a foreign-platform path must never silently resolve relative.
+    """
+    native = Path(value)
+    if not native.is_absolute():
+        raise RepositoryConfigError(f"{location} must be an absolute path")
+    if len(native.parts) <= 1:
+        raise RepositoryConfigError(f"{location} must not be a bare filesystem root")
+    return value
+
 
 
 def _validate_template(
@@ -348,25 +417,79 @@ def find_repo_config(start: Path | None = None) -> Path | None:
 
     ``$AGENT_LOGGER_REPO_CONFIG`` may point at an explicit file. Set it to
     ``0``/``false``/``off``/``none`` to disable repo-local config discovery.
-    Otherwise the nearest git root is searched for :data:`REPO_CONFIG_FILENAMES`.
+    Otherwise the nearest git root is searched for :data:`REPO_CONFIG_FILENAMES`,
+    but only when that repo is a registered project checked out on its
+    default branch -- see :func:`agent_logger.repo_trust.repo_config_is_trusted`.
+
+    The explicit-file override is likewise gated: it names a *file*, not a
+    trust decision, so an untrusted checkout could otherwise use it to
+    bypass the gate entirely by pointing it at its own repo-local config.
+    The file's containing git root is resolved and trust-checked the same
+    way -- and when no git root can be found at all (e.g. the path came
+    from an ``agent-worktrees`` ``reference``-class registration, which is
+    not guaranteed to be a git checkout), the trust check runs against the
+    file's own containing directory instead of being skipped: falling back
+    to "no git root means unconditionally trusted" would let a non-git
+    reference path bypass the gate entirely, which is exactly what a
+    ``reference`` entry is (a read-only mirror, not an operator-reviewed
+    checkout). A candidate that is a symlink (committed or otherwise), or
+    reached through a symlinked ancestor directory such as ``.config``
+    (some :data:`REPO_CONFIG_FILENAMES` aliases nest under it, and this
+    override can point at any of them via install.sh/install.ps1's
+    config-repo discovery), is rejected outright -- discovery must never
+    follow a link out of the checkout to read arbitrary machine-local YAML.
     """
     env = os.environ.get("AGENT_LOGGER_REPO_CONFIG")
     if env:
         if env.strip().lower() in {"0", "false", "off", "none"}:
             return None
         explicit = Path(env).expanduser()
+        if not explicit.is_absolute():
+            # has_symlink_ancestor() needs both sides absolute for
+            # relative_to() -- Path.absolute() (never .resolve(), which
+            # follows symlinks, or normpath's '..'-collapsing, which could
+            # walk past a symlinked component) only textually joins cwd,
+            # so it can't mask the symlink checks below.
+            explicit = explicit.absolute()
         if not explicit.is_file():
             raise RepositoryConfigError(
                 f"AGENT_LOGGER_REPO_CONFIG does not name a file: {explicit}"
             )
+        if explicit.is_symlink():
+            return None
+        found_root = _find_repo_root(explicit.parent)
+        explicit_root = found_root if found_root is not None else explicit.parent
+        if found_root is None:
+            # No git root at all (e.g. a non-git agent-worktrees
+            # `reference` mirror). has_symlink_ancestor() below only walks
+            # components BETWEEN root and candidate, never root's own
+            # ancestry, so a symlinked fallback root would pass unexamined.
+            # path_traverses_symlink() checks each ORIGINAL (uncollapsed)
+            # component in order -- unlike normpath()+resolve(), it can't
+            # be fooled by a later '..' lexically erasing an earlier
+            # symlinked component (e.g. '.../link/../trusted'), while still
+            # allowing an ordinary relative override like
+            # ../trusted/.agent-logger.yaml that never touches a symlink.
+            if path_traverses_symlink(explicit_root):
+                return None
+        if not repo_config_is_trusted(explicit_root):
+            return None
+        if has_symlink_ancestor(explicit_root, explicit):
+            return None
         return explicit
 
     root = _find_repo_root(start)
     if root is None:
         return None
+    if not repo_config_is_trusted(root):
+        return None
     for name in REPO_CONFIG_FILENAMES:
         candidate = root / name
-        if candidate.is_file():
+        if (
+            candidate.is_file()
+            and not candidate.is_symlink()
+            and not has_symlink_ancestor(root, candidate)
+        ):
             return candidate
     return None
 
@@ -374,23 +497,63 @@ def find_repo_config(start: Path | None = None) -> Path | None:
 def _load_repo_config(path: Path) -> dict[str, Any]:
     """Load the repo-local organization config.
 
-    Repo-local config is intentionally scoped to ``log`` settings. It lets a
-    repository define its checked-in log organization without letting arbitrary
-    checkouts change machine-local sync targets or runtime state locations.
+    Repo-local config is scoped to ``log`` settings, the ``tenant`` block
+    (consumed only by tenancy discovery), and -- as of schema v3, a
+    deliberate, narrow relaxation -- ``sync.local_path``: the ONE sync
+    setting that is genuinely the same absolute value for every machine in
+    the fleet (a shared NAS mount), not a per-machine secret or a choice of
+    *which* sync target is active. Every other sync/runtime-state setting
+    stays machine-local; a repo still cannot redirect a machine to a
+    different sync target type, change machine identity, or touch anything
+    credential-bearing.
+
+    This relaxation exists because the alternative -- requiring every
+    machine to hand-author its own copy of a value that must be identical
+    everywhere -- is exactly the drift this field closes: confirmed live
+    across two real machines before this field existed, one had the wrong
+    path (contradicting its own adjacent comment) and the other had no
+    sync config file at all, silently syncing to a useless local-only
+    default for its entire lifetime.
+
+    **Forward compatibility (rolling updates).** A config written for a *newer*
+    schema than this build supports is read **tolerantly** -- top-level,
+    ``log``, and ``sync`` fields this version does not recognize are ignored
+    rather than fatal -- so a fleet mid-upgrade never has an older reader
+    hard-fail on a config a newer machine committed. A config at or below
+    this build's schema is validated **strictly** (unknown fields are a typo
+    and raise). This is why growing the schema is a version bump, not a
+    breaking change.
     """
     data = _load_repo_yaml(path)
-    _reject_unknown_fields(data, {"schema_version", "log"}, str(path))
     schema_version = data.get("schema_version", REPO_CONFIG_SCHEMA_VERSION)
-    if schema_version != REPO_CONFIG_SCHEMA_VERSION:
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
         raise RepositoryConfigError(
-            f"{path}: schema_version must be {REPO_CONFIG_SCHEMA_VERSION}, "
-            f"got {schema_version!r}"
+            f"{path}: schema_version must be an integer, got {schema_version!r}"
         )
+    if schema_version < 1:
+        raise RepositoryConfigError(
+            f"{path}: schema_version must be >= 1, got {schema_version!r}"
+        )
+    future = schema_version > REPO_CONFIG_SCHEMA_VERSION
+    if not future:
+        _reject_unknown_fields(data, {"schema_version", "log", "tenant", "sync"}, str(path))
 
+    # The ``tenant`` block is consumed only by tenancy discovery (see
+    # agent_logger.tenancy), never by the ambient repo-local layer -- an
+    # arbitrary checkout must not be able to change machine-local sync state
+    # BEYOND the one narrow ``sync.local_path`` exception documented above.
+    # A repo may carry a tenant block with no ``log``/``sync`` block; that is
+    # a no-op here.
     log = data.get("log")
+    if log is None:
+        log = {}
     if not isinstance(log, dict):
         raise RepositoryConfigError(f"{path}: log must be a mapping")
-    _reject_unknown_fields(log, REPO_LOG_FIELDS, f"{path}: log")
+    if future:
+        # Tolerant read: keep only the fields this build understands.
+        log = {k: v for k, v in log.items() if k in REPO_LOG_FIELDS}
+    else:
+        _reject_unknown_fields(log, REPO_LOG_FIELDS, f"{path}: log")
 
     scoped = copy.deepcopy(log)
     config_base = path.parent.parent if path.parent.name == ".config" else path.parent
@@ -453,7 +616,23 @@ def _load_repo_config(path: Path) -> dict[str, Any]:
                 "or a list of non-empty strings"
             )
 
-    return {"log": scoped}
+    result: dict[str, Any] = {"log": scoped}
+
+    sync = data.get("sync")
+    if sync is not None:
+        if not isinstance(sync, dict):
+            raise RepositoryConfigError(f"{path}: sync must be a mapping")
+        if future:
+            sync = {k: v for k, v in sync.items() if k in REPO_SYNC_FIELDS}
+        else:
+            _reject_unknown_fields(sync, REPO_SYNC_FIELDS, f"{path}: sync")
+        if "local_path" in sync:
+            # Native-absoluteness check deferred to load_config() once the
+            # final target is known (see _validate_native_absolute_path).
+            local_path = _validate_portable_absolute_path(sync["local_path"], "sync.local_path")
+            result["sync"] = {"targets": {"local": {"path": local_path}}}
+
+    return result
 
 
 class Config:
@@ -528,6 +707,19 @@ class Config:
         return int(self._data.get("sync", {}).get("lock_timeout_sec", 10))
 
     @property
+    def sync_lock_name(self) -> str:
+        """Push lock file name under ``home``.
+
+        Defaults to ``session-sync.lock``. A tenant-resolved config sets a
+        distinct name so independent tenant syncs sharing one home do not
+        serialize against each other.
+        """
+        raw = self._data.get("sync", {}).get("lock_name") or "session-sync.lock"
+        name = str(raw).strip() or "session-sync.lock"
+        # Guard against a path-injecting name; the lock always sits in home.
+        return Path(name).name
+
+    @property
     def sync_repo_allowlist(self) -> list[str]:
         """Repo patterns to include; empty list means "sync all"."""
         raw = self._data.get("sync", {}).get("repo_allowlist", [])
@@ -569,6 +761,15 @@ class Config:
         return [str(s).strip() for s in raw if str(s).strip()]
 
     @property
+    def sync_require_repo_opt_in(self) -> bool:
+        """When true, a session only syncs if its matched repo (or that
+        repo's bound knowledge repo) durably declares
+        ``sync: {opt_in: true}`` in a checked-in
+        ``.copilot-extensions/agent-logger/config.yaml``, on top of whatever
+        repo_allowlist/repo_denylist otherwise decide. Off by default."""
+        return bool(self._data.get("sync", {}).get("require_repo_opt_in", False))
+
+    @property
     def sync_notify(self) -> dict[str, Any]:
         """Resolved target-independent post-push notify config.
 
@@ -595,38 +796,26 @@ class Config:
 
     @property
     def sync_compact(self) -> dict[str, Any]:
-        """Resolved cold-session compaction settings (``sync.compact``).
+        """Resolved ``sync.compact``; see ``compact.resolve_compact_settings``."""
+        from agent_logger.sync.compact import resolve_compact_settings
 
-        Compaction is **opt-in** (``enabled: false`` by default). ``codec`` is a
-        registered :mod:`agent_logger.sessions` codec (default ``targz``, stdlib
-        only). A cold session is one at least ``min_age_days`` old that (when
-        ``require_untracked_worktree``) does not belong to a tracked worktree --
-        one the picker renders. Since the picker only renders tracked worktrees,
-        an archived session is never one the picker needs.
-        """
         raw = dict(self._data.get("sync", {}).get("compact", {}) or {})
-        return {
-            "enabled": bool(raw.get("enabled", False)),
-            "codec": str(raw.get("codec") or "targz"),
-            "min_age_days": int(raw.get("min_age_days") or 30),
-            "require_untracked_worktree": bool(
-                raw.get("require_untracked_worktree", True)
-            ),
-            "archive_root": raw.get("archive_root"),
-        }
+        return resolve_compact_settings(raw)
 
     @property
     def compact_archive_root(self) -> Path:
-        """Local archive store for compacted sessions.
+        """Local archive store for compacted sessions; see ``compact.resolve_archive_root``."""
+        from agent_logger.sync.compact import resolve_archive_root
 
-        Deliberately **outside** ``~/.copilot`` (the Copilot CLI owns and
-        rotates that tree) — defaults to ``<home>/archived-sessions``, a stable
-        agent-logger-owned, non-cloud-synced location.
-        """
-        raw = self.sync_compact.get("archive_root")
-        if raw:
-            return Path(raw).expanduser()
-        return self.home / "archived-sessions"
+        return resolve_archive_root(self.sync_compact, self.home)
+
+    @property
+    def sync_change_tracking(self) -> dict[str, Any]:
+        """Resolved ``sync.change_tracking``; see ``change_tracker.resolve_settings``."""
+        from agent_logger.sync.change_tracker import resolve_settings
+
+        raw = dict(self._data.get("sync", {}).get("change_tracking", {}) or {})
+        return resolve_settings(raw)
 
     @property
     def log_path_template(self) -> str:
@@ -675,6 +864,10 @@ class Config:
     def machine_name(self) -> str | None:
         return self._data.get("machine", {}).get("name")
 
+    @property
+    def machine_role(self) -> str | None:
+        return self._data.get("machine", {}).get("role")
+
     # -- background chronicle -------------------------------------------
 
     @property
@@ -714,6 +907,15 @@ class Config:
         if configured:
             return Path(configured).expanduser()
         return self.home / "chronicle-manifests"
+
+    # -- review-annotation catalog index ----------------------------------
+
+    @property
+    def catalog_db_path(self) -> Path:
+        configured = self._data.get("catalog", {}).get("db_path")
+        if configured:
+            return Path(configured).expanduser()
+        return self.home / "review-catalog.db"
 
     def get(self, key: str, default: Any = None) -> Any:
         return self._data.get(key, default)
@@ -759,13 +961,28 @@ def load_config(
     data = _deep_merge(DEFAULTS, _load_user_config(resolved_home / "config.yaml"))
     repo_root = _find_repo_root(repo_start) if include_repo else None
     repo_config_path = find_repo_config(repo_start) if include_repo else None
+    repo_data: dict[str, Any] = {}
+    pre_repo_local_path = (data["sync"]["targets"].get("local") or {}).get("path")
     if repo_config_path:
-        data = _deep_merge(data, _load_repo_config(repo_config_path))
-
+        repo_data = _load_repo_config(repo_config_path)
+        data = _deep_merge(data, repo_data)
     # Environment overrides (flat, opt-in).
     if os.environ.get("AGENT_LOGGER_SYNC_TARGET"):
         data["sync"]["target"] = os.environ["AGENT_LOGGER_SYNC_TARGET"]
     if os.environ.get("AGENT_LOGGER_VOICE_PACK"):
         data["log"]["voice_pack"] = os.environ["AGENT_LOGGER_VOICE_PACK"]
+
+    # Deferred host-native check (see _validate_native_absolute_path). Every
+    # consumer of Config.sync_path reads it regardless of the active sync
+    # target, so a foreign value must never stay in data. Raise only when
+    # target is "local"; else restore whatever machine-local path preceded it.
+    repo_local_path = repo_data.get("sync", {}).get("targets", {}).get("local", {}).get("path")
+    if repo_local_path is not None:
+        try:
+            _validate_native_absolute_path(repo_local_path, "sync.local_path")
+        except RepositoryConfigError:
+            if data["sync"]["target"] == "local":
+                raise
+            data["sync"]["targets"]["local"]["path"] = pre_repo_local_path
 
     return Config(data, resolved_home, repo_config_path, repo_root)

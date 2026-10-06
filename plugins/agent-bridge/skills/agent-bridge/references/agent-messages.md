@@ -15,7 +15,7 @@ A delivered message looks like this (a marker in the same family as the runtime'
 `<system_reminder>` / `<system_notification>`):
 
 ```
-<agent-message from="cjohnson@orchestrator" reply-to="anomalous-potato-wsl-20260710-200009-ffc8" msg-id="2">
+<agent-message from="contributor_user@orchestrator" reply-to="anomalous-potato-wsl-20260710-200009-ffc8" msg-id="2">
 …the actual message body…
 </agent-message>
 ```
@@ -60,6 +60,10 @@ protocol to learn:
   `--status-check` (asks the receiver for a terse status ack, not new work), vs
   the default `prompt` (a work directive). Pair `--status-check` with the default
   wait to send a ping and read the short answer; pair `--notify` with `--no-wait`.
+- `--delivery` sets live-session urgency without changing `kind`: `queue`
+  (default) waits until the receiver's current turn ends, `steer` injects at the
+  running turn's next step without cancelling it, and `interrupt` aborts the
+  current turn before sending. Shorthands: `--steer`, `--interrupt`.
 
 This is the everyday way to interrogate a peer: one `send`, read the reply, no
 cold sub-agent and no operator relay.

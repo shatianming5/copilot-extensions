@@ -7,8 +7,10 @@ import json
 import pytest
 
 from agent_dispatch.registrar import RegistrarError
+from agent_dispatch.registrar_reconcile import declared_registrations
 from agent_dispatch.registrar_discovery import (
     INREPO_SUBDIR,
+    LEGACY_INREPO_SUBDIR,
     Pointer,
     add_pointer,
     discover,
@@ -52,6 +54,13 @@ def test_repo_pointer_resolves_into_inrepo_subdir(tmp_path):
     p = repo_pointer(tmp_path)
     assert p.kind == "repo"
     assert p.resolved_location() == tmp_path / INREPO_SUBDIR
+
+
+def test_repo_pointer_falls_back_to_legacy_dir(tmp_path):
+    legacy = tmp_path / LEGACY_INREPO_SUBDIR
+    legacy.mkdir(parents=True)
+    p = repo_pointer(tmp_path)
+    assert p.resolved_location() == legacy
 
 
 def test_dir_pointer_resolves_to_location(tmp_path):
@@ -167,6 +176,11 @@ def test_reviewer_loop_expands_to_stable_existing_primitives(tmp_path):
                 "kind": "reviewer-loop",
                 "repo": "github.com/example/project",
                 "task_label": "external-review",
+                "stale_after_days": 7,
+                "filters": {
+                    "permit": {"machine": ["host-a", "host-b"]},
+                    "reject": {"machine": ["retired"]},
+                },
                 "emitter": {
                     "command": ["python", "tools/reviews.py", "discover"],
                     "interval_seconds": 60,
@@ -184,6 +198,17 @@ def test_reviewer_loop_expands_to_stable_existing_primitives(tmp_path):
                 "evaluator": {"evaluator_spec": {"rules": []}, "interval": 30},
                 "pool": {
                     "max_active_processes": 2,
+                    "additional_labels": ["review-inbox", "external-review"],
+                    "filters": {
+                        "permit": {
+                            "machine": ["host-b", "host-c"],
+                            "role": ["review"],
+                        },
+                        "reject": {
+                            "env": ["unsafe"],
+                            "capabilities": ["dangerous"],
+                        },
+                    },
                     "body": {"type": "headless", "agent": "reviewer"},
                 },
             }
@@ -202,11 +227,158 @@ def test_reviewer_loop_expands_to_stable_existing_primitives(tmp_path):
     assert source.spec["id"] == "example-review-source"
     assert source.spec["evaluator_ref"] == "example-review-lifecycle"
     assert source.spec["cwd"] == str(root.resolve())
+    assert source.filters.permit == {
+        "machine": frozenset({"host-a", "host-b"})
+    }
+    assert source.filters.reject == {"machine": frozenset({"retired"})}
     assert evaluator.spec["repo"] == "github.com/example/project"
     assert evaluator.spec["evaluator_ref"] == "example-review-lifecycle"
+    assert evaluator.spec["reviewer_loop"] == {"stale_after_days": 7.0}
+    assert evaluator.filters == source.filters
     assert workers.repos == "github.com/example/project"
-    assert workers.labels == ("external-review",)
+    assert workers.labels == ("external-review", "review-inbox")
     assert workers.concurrency == 2
+    assert workers.filters.permit == {
+        "machine": frozenset({"host-b"}),
+        "role": frozenset({"review"}),
+    }
+    assert workers.filters.reject == {
+        "machine": frozenset({"retired"}),
+        "env": frozenset({"unsafe"}),
+        "capabilities": frozenset({"dangerous"}),
+    }
+    assert workers.effective_filters().permit["repo"] == frozenset(
+        {"github.com/example/project"}
+    )
+    assert workers.effective_filters().permit["task-type"] == frozenset(
+        {"example-review-workers", "external-review", "review-inbox"}
+    )
+    assert len(declared_registrations(declarations, machine="host-b")) == 3
+    assert declared_registrations(declarations, machine="host-c") == []
+
+
+@pytest.mark.parametrize(
+    ("filters", "message"),
+    [
+        ({"permit": {"region": ["west"]}}, "unknown dimension 'region'"),
+        (
+            {"permit": {"repo": ["github.com/example/project"]}},
+            "top-level placement supports only the 'machine' dimension",
+        ),
+    ],
+)
+def test_reviewer_loop_rejects_invalid_placement_filters(tmp_path, filters, message):
+    path = tmp_path / "reviews.json"
+    path.write_text(
+        json.dumps(
+            {
+                "name": "example-review",
+                "kind": "reviewer-loop",
+                "repo": "github.com/example/project",
+                "task_label": "external-review",
+                "filters": filters,
+                "emitter": {"command": ["reviews"], "interval_seconds": 60},
+                "evaluator": {"evaluator_spec": {"rules": []}},
+                "pool": {"max_active_processes": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RegistrarError, match=message):
+        read_declaration_file_set(path)
+
+
+@pytest.mark.parametrize(
+    ("placement", "pool_filters", "message"),
+    [
+        (
+            {"permit": {"machine": ["host-a"]}},
+            {"permit": {"machine": ["host-b"]}},
+            "combined filters permit no 'machine' value",
+        ),
+        (
+            {"permit": {"machine": ["host-a"]}},
+            {"reject": {"machine": ["host-a"]}},
+            "every permitted 'machine' value is rejected",
+        ),
+    ],
+)
+def test_reviewer_loop_rejects_impossible_filter_composition(
+    tmp_path, placement, pool_filters, message
+):
+    path = tmp_path / "reviews.json"
+    path.write_text(
+        json.dumps(
+            {
+                "name": "example-review",
+                "kind": "reviewer-loop",
+                "repo": "github.com/example/project",
+                "task_label": "external-review",
+                "filters": placement,
+                "emitter": {"command": ["reviews"], "interval_seconds": 60},
+                "evaluator": {"evaluator_spec": {"rules": []}},
+                "pool": {
+                    "max_active_processes": 1,
+                    "filters": pool_filters,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RegistrarError, match=message):
+        read_declaration_file_set(path)
+
+
+def test_reviewer_loop_preserves_pool_filters_without_placement(tmp_path):
+    path = tmp_path / "reviews.json"
+    path.write_text(
+        json.dumps(
+            {
+                "name": "example-review",
+                "kind": "reviewer-loop",
+                "repo": "github.com/example/project",
+                "task_label": "external-review",
+                "emitter": {"command": ["reviews"], "interval_seconds": 60},
+                "evaluator": {"evaluator_spec": {"rules": []}},
+                "pool": {
+                    "max_active_processes": 1,
+                    "filters": {"permit": {"role": ["review"]}},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    source, evaluator, workers = read_declaration_file_set(path)
+    assert source.filters.is_empty()
+    assert evaluator.filters.is_empty()
+    assert workers.filters.permit == {"role": frozenset({"review"})}
+
+
+def test_reviewer_loop_rejects_invalid_additional_labels(tmp_path):
+    path = tmp_path / "reviews.json"
+    path.write_text(
+        json.dumps(
+            {
+                "name": "example-review",
+                "kind": "reviewer-loop",
+                "repo": "github.com/example/project",
+                "task_label": "external-review",
+                "emitter": {"command": ["reviews"], "interval_seconds": 60},
+                "evaluator": {"evaluator_spec": {"rules": []}},
+                "pool": {
+                    "max_active_processes": 1,
+                    "additional_labels": ["review-inbox", ""],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RegistrarError, match="additional_labels"):
+        read_declaration_file_set(path)
 
 
 @pytest.mark.parametrize(
@@ -290,6 +462,101 @@ def test_read_declaration_file_non_mapping(tmp_path):
         read_declaration_file(f)
 
 
+# -- extends: resolution, wired into read_declaration_file_set ---------------
+
+def test_read_declaration_file_set_resolves_extends_against_repo_root(tmp_path):
+    """Phase 3's own validation contract: a resolved `extends:` declaration
+    must behave *identically* to a hand-written direct declaration with the
+    same effective fields -- compare the full `ProfileDeclaration`, not just
+    a couple of fields a regression in `kind`/`owner`/`concurrency`/filters
+    could slip past."""
+    repo_root = tmp_path / "repo"
+    recipe_dir = repo_root / "recipes"
+    recipe_dir.mkdir(parents=True)
+    template = {
+        "labels": ["from-recipe"],
+        "owner": "team:example",
+        "description": "a recipe-templated lane",
+        "concurrency": 2,
+    }
+    (recipe_dir / "lane.json").write_text(json.dumps(template), encoding="utf-8")
+    declaration_dir = repo_root / ".agent-dispatch" / "registrar"
+    declaration_dir.mkdir(parents=True)
+
+    extends_path = declaration_dir / "concrete.json"
+    extends_path.write_text(
+        json.dumps({"extends": "./recipes/lane.json", "name": "concrete-lane"}),
+        encoding="utf-8",
+    )
+    direct_path = declaration_dir / "direct.json"
+    direct_path.write_text(
+        json.dumps({**template, "name": "concrete-lane"}), encoding="utf-8"
+    )
+
+    (resolved,) = read_declaration_file_set(extends_path, repo_root=repo_root)
+    (direct,) = read_declaration_file_set(direct_path, repo_root=repo_root)
+
+    assert resolved == direct
+
+
+def test_read_declaration_file_set_resolves_extends_against_declaration_dir_without_repo_root(
+    tmp_path,
+):
+    recipe_dir = tmp_path / "recipes"
+    recipe_dir.mkdir()
+    (recipe_dir / "lane.json").write_text(
+        json.dumps({"name": "template-name", "labels": ["from-recipe"]}),
+        encoding="utf-8",
+    )
+    path = tmp_path / "concrete.json"
+    path.write_text(
+        json.dumps({"extends": "./recipes/lane.json", "name": "concrete-lane"}),
+        encoding="utf-8",
+    )
+
+    (declaration,) = read_declaration_file_set(path)
+
+    assert declaration.name == "concrete-lane"
+    assert declaration.labels == ("from-recipe",)
+
+
+def test_read_declaration_file_set_extends_params_do_not_leak_as_unknown_keys(tmp_path):
+    """A `params:`-only substitution value (not a valid top-level
+    declaration field on its own) must never survive into the resolved
+    declaration -- otherwise `load_declaration` would reject it as an
+    unknown key, even though it was only ever meant to fill a placeholder."""
+    recipe_dir = tmp_path / "recipes"
+    recipe_dir.mkdir()
+    (recipe_dir / "lane.json").write_text(
+        json.dumps({"description": "login: {producer_login}"}), encoding="utf-8"
+    )
+    path = tmp_path / "concrete.json"
+    path.write_text(
+        json.dumps(
+            {
+                "extends": "./recipes/lane.json",
+                "name": "concrete-lane",
+                "params": {"producer_login": "issue-bot"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    (declaration,) = read_declaration_file_set(path)
+
+    assert declaration.name == "concrete-lane"
+    assert declaration.description == "login: issue-bot"
+
+
+def test_read_declaration_file_set_without_extends_is_unaffected(tmp_path):
+    path = tmp_path / "plain.json"
+    path.write_text(json.dumps({"name": "plain", "labels": ["x"]}), encoding="utf-8")
+
+    (declaration,) = read_declaration_file_set(path)
+
+    assert declaration.name == "plain"
+
+
 def test_read_location_scans_sorted_and_stamps_owner(tmp_path):
     (tmp_path / "b.json").write_text(json.dumps({"name": "b"}), encoding="utf-8")
     (tmp_path / "a.yaml").write_text("name: a\n", encoding="utf-8")
@@ -353,6 +620,150 @@ def test_discover_repo_reads_inrepo_dir(tmp_path):
     decls = discover_repo(tmp_path)
     assert [d.name for d in decls] == ["general"]
     assert decls[0].owner == f"repo:{tmp_path.name}"
+
+
+def test_discover_repo_reads_legacy_dir_when_canonical_absent(tmp_path):
+    reg = tmp_path / LEGACY_INREPO_SUBDIR
+    reg.mkdir(parents=True)
+    (reg / "general.yaml").write_text("name: general\nlabels: [general]\n", encoding="utf-8")
+    decls = discover_repo(tmp_path)
+    assert [d.name for d in decls] == ["general"]
+
+
+def test_discover_repo_resolves_repo_local_worker_identity_for_issue_loop(tmp_path):
+    """Regression guard for the daemon-facing discovery path: a
+    repository-issue-loop declaration's ``worker_identity`` naming a
+    repo-local identity must resolve through ``discover_repo`` (the entry
+    point the supervisor daemon and ``agent-dispatch registrar discover``
+    both use), not only through the direct expansion/CLI paths already
+    covered elsewhere."""
+    identities_dir = (
+        tmp_path / ".copilot-extensions" / "agent-dispatch" / "identities"
+    )
+    identities_dir.mkdir(parents=True)
+    (identities_dir / "custom.identity.md").write_text(
+        "---\nname: custom\ndescription: A custom identity.\n---\n\n"
+        "Follow the custom rules.\n",
+        encoding="utf-8",
+    )
+    reg = tmp_path / INREPO_SUBDIR
+    reg.mkdir(parents=True)
+    (reg / "backlog.json").write_text(
+        json.dumps(
+            {
+                "name": "backlog",
+                "kind": "repository-issue-loop",
+                "repo": "example/project",
+                "source": "repository-backlog",
+                "cadence_seconds": 3600,
+                "tick_interval_seconds": 60,
+                "quiet_period_seconds": 0,
+                "include_labels": ["ready"],
+                "exclude_labels": ["bootstrap"],
+                "priority_labels": ["priority:high"],
+                "batch_size": 1,
+                "task_label": "repository-issue-work",
+                "forge": {"provider": "github", "producer_login": "issue-bot"},
+                "reservation": {
+                    "label": "agent-reserved",
+                    "comment": True,
+                    "orphan_after_seconds": 600,
+                },
+                "pool": {
+                    "max_active_processes": 1,
+                    "body": {"type": "headless", "agent": "issue-worker"},
+                },
+                "worker_identity": "custom",
+            }
+        ),
+        encoding="utf-8",
+    )
+    decls = discover_repo(tmp_path)
+    source = next(d for d in decls if d.kind == "emitter")
+    config = source.spec["repository_issue_loop"]
+    assert config["worker_identity"] == "custom"
+    assert source.spec["cwd"] == str(tmp_path.resolve())
+
+
+def test_discover_trusted_derives_repo_root_for_inrepo_dir_pointer(tmp_path):
+    """Regression guard: `registrar add-pointer` supports a plain ``dir``
+    pointer aimed directly at an in-repo registrar surface (not only a
+    ``repo`` pointer at the repo root). That path must still derive the
+    declaring repo's root for a repository-issue-loop declared there, so its
+    worker_identity resolves a repo-local override against that repo rather
+    than this process's own cwd or the generic built-in."""
+    identities_dir = (
+        tmp_path / ".copilot-extensions" / "agent-dispatch" / "identities"
+    )
+    identities_dir.mkdir(parents=True)
+    (identities_dir / "custom.identity.md").write_text(
+        "---\nname: custom\ndescription: A custom identity.\n---\n\n"
+        "Follow the custom rules.\n",
+        encoding="utf-8",
+    )
+    reg = tmp_path / INREPO_SUBDIR
+    reg.mkdir(parents=True)
+    (reg / "backlog.json").write_text(
+        json.dumps(
+            {
+                "name": "backlog",
+                "kind": "repository-issue-loop",
+                "repo": "example/project",
+                "source": "repository-backlog",
+                "cadence_seconds": 3600,
+                "tick_interval_seconds": 60,
+                "quiet_period_seconds": 0,
+                "include_labels": ["ready"],
+                "exclude_labels": ["bootstrap"],
+                "priority_labels": ["priority:high"],
+                "batch_size": 1,
+                "task_label": "repository-issue-work",
+                "forge": {"provider": "github", "producer_login": "issue-bot"},
+                "reservation": {
+                    "label": "agent-reserved",
+                    "comment": True,
+                    "orphan_after_seconds": 600,
+                },
+                "pool": {
+                    "max_active_processes": 1,
+                    "body": {"type": "headless", "agent": "issue-worker"},
+                },
+                "worker_identity": "custom",
+            }
+        ),
+        encoding="utf-8",
+    )
+    decls = discover([Pointer(name="p", location=str(reg), kind="dir")])
+    source = next(d for d in decls if d.kind == "emitter")
+    assert source.spec["cwd"] == str(tmp_path.resolve())
+
+
+def test_discover_repo_marketplace_overlay_replaces_base_declaration(tmp_path, monkeypatch):
+    base = tmp_path / INREPO_SUBDIR
+    overlay = (
+        tmp_path
+        / ".copilot-extensions"
+        / "agent-dispatch"
+        / "marketplaces"
+        / "mp-test"
+        / "registrar"
+    )
+    base.mkdir(parents=True)
+    overlay.mkdir(parents=True)
+    (base / "general.json").write_text(
+        json.dumps({"name": "general", "labels": ["base"]}),
+        encoding="utf-8",
+    )
+    (overlay / "general.json").write_text(
+        json.dumps({"name": "general", "labels": ["overlay"]}),
+        encoding="utf-8",
+    )
+    (overlay / "extra.json").write_text(json.dumps({"name": "extra"}), encoding="utf-8")
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", '{"marketplaceId":"mp-test"}')
+    decls = discover_repo(tmp_path)
+    by_name = {decl.name: decl for decl in decls}
+    assert set(by_name) == {"extra", "general"}
+    assert by_name["general"].labels == ("overlay",)
 
 
 # -- Legacy env-profile back-compat bridge (Phase 4) -------------------------

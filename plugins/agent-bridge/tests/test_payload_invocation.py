@@ -21,26 +21,32 @@ def test_payload_manifest_describes_agent_bridge_runtime() -> None:
     )
     assert manifest == {
         "schema": "copilot-extensions.payload-invocation",
-        "version": 1,
+        "version": 2,
         "command": "agent-bridge",
         "module": "agent_bridge",
-        "runtimeRoot": ".agent-bridge",
+        "legacyRuntimeRoot": ".agent-bridge",
+        "installationContext": "required",
         "noSelfProvisionEnv": "AGENT_BRIDGE_NO_SELFPROVISION",
         "purpose": "Communicate with persistent agent sessions",
         "installer": "install",
         "windowsCatalogShim": "cmd",
         "provisionMode": "direct",
+        "payloadRootEnv": "AGENT_BRIDGE_PAYLOAD_ROOT",
+        "payloadDispatcher": {
+            "posix": "scripts/runtime-gate.sh",
+            "windows": "scripts/runtime-gate.ps1",
+        },
     }
 
     posix = (PLUGIN / "bin" / "agent-bridge").read_text(encoding="utf-8")
     powershell = (PLUGIN / "bin" / "agent-bridge.ps1").read_text(encoding="utf-8")
-    assert 'bash "$_installer" provision' in posix
-    assert "payload-dir" not in posix
-    assert "$_installer provision" in powershell
-    assert "payload-dir" not in powershell
+    assert 'scripts/runtime-gate.sh' in posix
+    assert 'AGENT_BRIDGE_PAYLOAD_ROOT' in posix
+    assert 'scripts\\runtime-gate.ps1' in powershell
+    assert 'AGENT_BRIDGE_PAYLOAD_ROOT' in powershell
 
 
-def test_session_catalog_hook_is_payload_root_aware_and_fail_open() -> None:
+def test_session_catalog_producer_is_not_registered_as_a_hook() -> None:
     hooks = json.loads((PLUGIN / "hooks.json").read_text(encoding="utf-8"))
     session_hooks = hooks["hooks"]["sessionStart"]
     assert all(
@@ -50,16 +56,7 @@ def test_session_catalog_hook_is_payload_root_aware_and_fail_open() -> None:
     )
     assert "else printf '{}'" in session_hooks[0]["bash"]
     assert "else { [Console]::Out.Write('{}') }" in session_hooks[0]["powershell"]
-
-    catalog_hooks = [
-        hook
-        for hook in session_hooks
-        if "emit-command-catalog" in hook["bash"]
-        and "emit-command-catalog" in hook["powershell"]
-    ]
-    assert len(catalog_hooks) == 1
-    assert "else printf '{}'" in catalog_hooks[0]["bash"]
-    assert "else { [Console]::Out.Write('{}') }" in catalog_hooks[0]["powershell"]
+    assert not any("emit-command-catalog" in str(hook) for hook in session_hooks)
 
     powershell_catalog = (
         PLUGIN / "scripts" / "emit-command-catalog.ps1"
@@ -73,6 +70,16 @@ def test_out_of_session_boundaries_remain_explicit() -> None:
         (PLUGIN / "pivots" / "agent-bridge.json").read_text(encoding="utf-8")
     )
     assert pivot["list"][0] == "agent-bridge"
+
+    # The Picker runs this argv verbatim, so it must actually parse. `--json` is
+    # a GLOBAL flag (declared before the subcommand); placing it after the
+    # subcommand makes argparse exit 2 with "unrecognized arguments: --json" and
+    # the Bridges tab can never populate.
+    from agent_bridge.__main__ import build_parser
+
+    parsed = build_parser().parse_args(pivot["list"][1:])
+    assert parsed.json is True
+    assert parsed.command == "agents"
 
     provider = (
         PLUGIN / "src" / "agent_bridge" / "session_host" / "spawner.py"
@@ -93,8 +100,41 @@ def test_out_of_session_boundaries_remain_explicit() -> None:
     extension = (
         PLUGIN / "extensions" / "agent-bridge" / "extension.mjs"
     ).read_text(encoding="utf-8")
-    assert "agent-bridge session command catalog" in extension
+    # KIND_GUIDANCE (the status-check reply instructions) moved out of
+    # extension.mjs into delivery.mjs during agent-bridge-cli-mode-sessions
+    # Phase 1 (extension.mjs's top-level joinSession() makes it untestable
+    # directly, so the pure rendering/options logic was extracted into a
+    # separately-importable module -- see delivery.mjs's own module docstring
+    # and extension.mjs's `import { buildDeliveredSendOptions } from
+    # "./delivery.mjs"`). extension.mjs still delivers that guidance to the
+    # operator at runtime through the import; the literal text now lives in
+    # delivery.mjs, not duplicated here.
+    delivery = (
+        PLUGIN / "extensions" / "agent-bridge" / "delivery.mjs"
+    ).read_text(encoding="utf-8")
+    assert "agent-bridge session command catalog" in delivery
     assert "`agent-bridge send <reply-to>" not in extension
+    assert "`agent-bridge send <reply-to>" not in delivery
+
+
+def test_list_command_docs_place_global_json_before_subcommand() -> None:
+    skill = (
+        PLUGIN / "skills" / "agent-bridge" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    cli_reference = (
+        PLUGIN
+        / "skills"
+        / "agent-bridge"
+        / "references"
+        / "cli-commands.md"
+    ).read_text(encoding="utf-8")
+    combined = skill + "\n" + cli_reference
+
+    for command in ("agents", "machines", "sessions"):
+        assert f"<agent-bridge catalog argv[0]> --json {command}" in combined
+        assert f"<agent-bridge catalog argv[0]> {command} --json" not in combined
+    assert "<agent-bridge catalog argv[0]> --json config show" in combined
+    assert "<agent-bridge catalog argv[0]> config show --json" not in combined
 
 
 @pytest.mark.asyncio
@@ -104,6 +144,7 @@ async def test_session_host_strips_parent_payload_context(monkeypatch) -> None:
     async def fake_spawn(*args, **kwargs):
         captured["args"] = args
         captured["env"] = kwargs["env"]
+        captured["kwargs"] = kwargs
         return object()
 
     monkeypatch.setenv("COPILOT_PLUGIN_ROOT", "/parent/payload")
@@ -120,12 +161,36 @@ async def test_session_host_strips_parent_payload_context(monkeypatch) -> None:
     assert isinstance(child_env, dict)
     assert "COPILOT_PLUGIN_ROOT" not in child_env
     assert child_env["KEEP"] == "yes"
+    spawn_kwargs = captured["kwargs"]
+    assert isinstance(spawn_kwargs, dict)
+    assert spawn_kwargs["creationflags"] == launcher.no_window_flags()
+    assert spawn_kwargs["stdin"] is launcher.asyncio.subprocess.PIPE
+    assert spawn_kwargs["stdout"] is launcher.asyncio.subprocess.PIPE
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX payload command test")
 def test_posix_payload_command_ignores_shadow_path_and_preserves_stdin(
     tmp_path: Path,
 ) -> None:
+    plugin = tmp_path / "plugin"
+    bin_dir = plugin / "bin"
+    bin_dir.mkdir(parents=True)
+    shutil.copy2(PLUGIN / "bin" / "agent-bridge", bin_dir / "agent-bridge")
+    shutil.copy2(PLUGIN / "plugin.json", plugin)
+    scripts = plugin / "scripts"
+    scripts.mkdir()
+    (scripts / "runtime-gate.sh").write_text(
+        "#!/usr/bin/env bash\nexec \"$(dirname \"$0\")/../fake-python\" -m agent_bridge \"$@\"\n",
+        encoding="utf-8",
+    )
+    (scripts / "runtime-gate.sh").chmod(0o755)
+    fake_python = plugin / "fake-python"
+    fake_python.write_text(
+        '#!/bin/sh\nprintf "%s|" "$*"\ncat\n',
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
     home = tmp_path / "home"
     runtime = home / ".agent-bridge"
     python = runtime / "versions" / "test" / "bin" / "python"
@@ -158,12 +223,12 @@ def test_posix_payload_command_ignores_shadow_path_and_preserves_stdin(
     env.update(
         {
             "HOME": str(home),
-            "COPILOT_PLUGIN_ROOT": str(PLUGIN),
+            "COPILOT_PLUGIN_ROOT": str(plugin),
             "PATH": f"{shadow_bin}{os.pathsep}{env['PATH']}",
         }
     )
     result = subprocess.run(
-        [str(PLUGIN / "bin" / "agent-bridge"), "create", "example"],
+        [str(plugin / "bin" / "agent-bridge"), "create", "example"],
         input="prompt",
         env=env,
         capture_output=True,
@@ -187,9 +252,8 @@ def test_windows_catalog_cmd_preserves_native_stdin(tmp_path: Path) -> None:
 
     scripts = plugin / "scripts"
     scripts.mkdir()
-    (scripts / "resolve-runtime.ps1").write_text(
-        "$AgentRtPy = Join-Path (Split-Path -Parent $PSScriptRoot) "
-        "'fake-python.cmd'\n",
+    (scripts / "runtime-gate.ps1").write_text(
+        "& (Join-Path (Split-Path -Parent $PSScriptRoot) 'fake-python.cmd') -m agent_bridge @args\n",
         encoding="utf-8",
     )
     (plugin / "fake-python.cmd").write_text(
@@ -232,9 +296,8 @@ def test_windows_catalog_cmd_survives_oversized_path(tmp_path: Path) -> None:
 
     scripts = plugin / "scripts"
     scripts.mkdir()
-    (scripts / "resolve-runtime.ps1").write_text(
-        "$AgentRtPy = Join-Path (Split-Path -Parent $PSScriptRoot) "
-        "'fake-python.ps1'\n",
+    (scripts / "runtime-gate.ps1").write_text(
+        "& (Join-Path (Split-Path -Parent $PSScriptRoot) 'fake-python.ps1') -m agent_bridge @args\n",
         encoding="utf-8",
     )
     (plugin / "fake-python.ps1").write_text(

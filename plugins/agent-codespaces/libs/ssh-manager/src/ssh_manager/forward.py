@@ -27,18 +27,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
-import subprocess
-import sys
 
 from .config_sources import SSHConfig
+from .process import terminate_ssh_process_tree
+from .proxy import create_ssh_subprocess
 
 log = logging.getLogger("ssh-manager.forward")
-
-
-def _creation_flags() -> int:
-    if sys.platform == "win32":
-        return subprocess.CREATE_NO_WINDOW
-    return 0
 
 
 def pick_free_local_port() -> int:
@@ -65,6 +59,7 @@ def build_forward_ssh_args(
     remote_host: str = "127.0.0.1",
     reverse_forwards: list[str] | None = None,
     extra_options: dict[str, str] | None = None,
+    exit_on_forward_failure: bool | None = None,
 ) -> list[str]:
     """Build the ``ssh -N`` argv for a dedicated forward process.
 
@@ -76,7 +71,10 @@ def build_forward_ssh_args(
 
     ``ExitOnForwardFailure=yes`` makes ssh exit immediately if a local port
     cannot be bound, so the caller can retry with a fresh port instead of
-    hanging on a half-open forward.
+    hanging on a half-open forward. By default it is set only for a pure
+    ``-L`` forward; ``exit_on_forward_failure`` overrides that, e.g. for a
+    reverse-only relay channel, where a failed remote bind must end the
+    process so its supervisor re-establishes it.
 
     ``reverse_forwards`` are additional ``-R`` specs (e.g. the credential-relay
     port ``"51234:127.0.0.1:51234"``) carried on the *same* persistent process,
@@ -105,20 +103,28 @@ def build_forward_ssh_args(
         "-N",  # no remote command -- forward only
     ]
     # ExitOnForwardFailure makes ssh exit fast if a forward can't bind so the
-    # caller can retry on a fresh local port. Enable it only for a pure ``-L``
-    # forward: with a ``-R`` relay present, a remote bind collision (relay port
-    # already forwarded by another connection) must NOT tear down the ``-L``
-    # endpoint too -- the endpoint's own TCP-accept probe is the readiness gate.
-    if local_port is not None and not reverse_forwards:
-        args += ["-o", "ExitOnForwardFailure=yes"]
+    # caller can retry on a fresh local port. By default enable it only for a
+    # pure ``-L`` forward: with a ``-R`` relay present, a remote bind collision
+    # (relay port already forwarded by another connection) must NOT tear down
+    # the ``-L`` endpoint too -- the endpoint's own TCP-accept probe is the
+    # readiness gate. The value is always explicit: ssh keeps the first value
+    # it sees, and command-line options beat the ``-F`` config file, so neither
+    # a generated config nor an option map can override the per-shape choice.
+    if exit_on_forward_failure is None:
+        exit_on_forward_failure = local_port is not None and not reverse_forwards
+    args += ["-o", f"ExitOnForwardFailure={'yes' if exit_on_forward_failure else 'no'}"]
     for key, val in config.extra_options.items():
         # ControlMaster machinery must not leak in: a dedicated forward is not
         # multiplexed over the shared master (that master may not exist on
         # Windows, and reusing it would tie the forward's lifetime to it).
         if key.lower() in ("controlmaster", "controlpath", "controlpersist"):
             continue
+        if key.lower() == "exitonforwardfailure":
+            continue  # decided above, per forward shape
         args += ["-o", f"{key}={val}"]
     for key, val in (extra_options or {}).items():
+        if key.lower() == "exitonforwardfailure":
+            continue  # decided above, per forward shape
         args += ["-o", f"{key}={val}"]
     if local_port is not None:
         args += ["-L", f"127.0.0.1:{local_port}:{remote_host}:{remote_port}"]
@@ -133,6 +139,7 @@ def build_remote_exec_args(
     command: str,
     *,
     reverse_forwards: list[str] | None = None,
+    pty: bool = False,
 ) -> list[str]:
     """Build an ``ssh`` argv that runs a one-shot remote ``command`` over a
     fresh, non-multiplexed connection.
@@ -148,6 +155,11 @@ def build_remote_exec_args(
     full remote-command lifetime. A requested reverse forward is a required
     launch dependency, so ``ExitOnForwardFailure=yes`` fails before the remote
     command starts when its far-side bind cannot be established.
+
+    ``pty=True`` requests a real PTY (``-t`` instead of the default ``-T``/no-
+    PTY) -- needed when the remote command itself attaches an interactive
+    terminal session (e.g. a venue's `copilot` verb attaching a tmux session),
+    as opposed to a one-shot probe/health-check command.
     """
     args = ["ssh"]
     if config.config_file:
@@ -161,7 +173,7 @@ def build_remote_exec_args(
         "-o", "ServerAliveInterval=30",
         "-o", "ServerAliveCountMax=3",
         "-o", "BatchMode=yes",
-        "-T",  # no PTY
+        "-t" if pty else "-T",
     ]
     for key, val in config.extra_options.items():
         if key.lower() in (
@@ -237,13 +249,12 @@ class LocalForward:
             )
             log.debug("Establishing local forward (attempt %d): %s",
                       attempt, " ".join(args))
-            proc = await asyncio.create_subprocess_exec(
+            proc = await create_ssh_subprocess(
                 *args,
+                config=self._config,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                creationflags=_creation_flags(),
-                start_new_session=(sys.platform != "win32"),
             )
             self._proc = proc
             self.local_port = port
@@ -335,11 +346,4 @@ class LocalForward:
     async def _kill(proc: asyncio.subprocess.Process) -> None:
         if proc.returncode is not None:
             return
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            return
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except (asyncio.TimeoutError, ProcessLookupError):
-            pass
+        await terminate_ssh_process_tree(proc)

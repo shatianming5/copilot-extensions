@@ -17,6 +17,7 @@ def _args(**kw) -> argparse.Namespace:
         spawn_backend="embody", target_machine="emancipation-cube",
         label=None, require=None, affinity=None, target_repo=None,
         target_worktree=None, source=None, origin_ref=None, evaluator_ref=None,
+        require_verification=False,
         dedup_key=None, producer_id=None, producer_generation=None,
         producer_capability=None, producer_request_id=None, verify_timeout=0,
     )
@@ -108,12 +109,14 @@ def test_build_remote_argv_preserves_producer_association():
             source="emitter",
             origin_ref="review-source",
             evaluator_ref="review-loop",
+            require_verification=True,
         ),
         repo="r",
         has_payload=False,
     )
     assert argv[argv.index("--origin-ref") + 1] == "review-source"
     assert argv[argv.index("--evaluator-ref") + 1] == "review-loop"
+    assert "--require-verification" in argv
 
 
 def test_build_remote_argv_preserves_producer_fence():
@@ -165,10 +168,7 @@ def test_dispatch_to_remote_builds_ssh_command(monkeypatch):
         return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
 
     monkeypatch.setattr(remote_dispatch.shutil, "which", lambda _n: "/usr/bin/ssh")
-    monkeypatch.setattr(remote_dispatch.subprocess, "run", fake_run)
-    monkeypatch.setattr(
-        remote_dispatch, "no_window_kwargs", lambda: {"creationflags": 123}
-    )
+    monkeypatch.setattr(remote_dispatch, "run_ssh_command", fake_run)
 
     remote_dispatch.dispatch_to_remote(
         "emancipation-cube", _args(prompt="go"), repo="gitea/x", payload="the brief"
@@ -183,7 +183,7 @@ def test_dispatch_to_remote_builds_ssh_command(monkeypatch):
     assert "--spawn-backend embody" in remote_cmd
     assert "'do X'" in remote_cmd  # title is shell-quoted
     assert captured["input"] == "the brief"  # payload streamed over stdin
-    assert captured["kwargs"]["creationflags"] == 123
+    assert captured["kwargs"]["timeout"] is None
 
 
 def test_dispatch_to_remote_keeps_producer_capability_out_of_argv(monkeypatch):
@@ -195,8 +195,7 @@ def test_dispatch_to_remote_keeps_producer_capability_out_of_argv(monkeypatch):
         return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
 
     monkeypatch.setattr(remote_dispatch.shutil, "which", lambda _n: "/usr/bin/ssh")
-    monkeypatch.setattr(remote_dispatch.subprocess, "run", fake_run)
-    monkeypatch.setattr(remote_dispatch, "no_window_kwargs", lambda: {})
+    monkeypatch.setattr(remote_dispatch, "run_ssh_command", fake_run)
 
     remote_dispatch.dispatch_to_remote(
         "emancipation-cube",
@@ -233,8 +232,7 @@ def test_dispatch_to_remote_fetches_capability_once_for_argv_and_stdin(
         return "fetched-once" if len(fetches) == 1 else None
 
     monkeypatch.setattr(remote_dispatch.shutil, "which", lambda _n: "/usr/bin/ssh")
-    monkeypatch.setattr(remote_dispatch.subprocess, "run", fake_run)
-    monkeypatch.setattr(remote_dispatch, "no_window_kwargs", lambda: {})
+    monkeypatch.setattr(remote_dispatch, "run_ssh_command", fake_run)
     monkeypatch.setattr(remote_dispatch, "producer_capability", fetch)
 
     remote_dispatch.dispatch_to_remote(
@@ -266,8 +264,7 @@ def test_dispatch_to_remote_empty_explicit_capability_keeps_envelope_framing(
         return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
 
     monkeypatch.setattr(remote_dispatch.shutil, "which", lambda _n: "/usr/bin/ssh")
-    monkeypatch.setattr(remote_dispatch.subprocess, "run", fake_run)
-    monkeypatch.setattr(remote_dispatch, "no_window_kwargs", lambda: {})
+    monkeypatch.setattr(remote_dispatch, "run_ssh_command", fake_run)
 
     remote_dispatch.dispatch_to_remote(
         "emancipation-cube",
@@ -394,10 +391,7 @@ def test_browse_remote_builds_ssh_command(monkeypatch):
         return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
 
     monkeypatch.setattr(remote_dispatch.shutil, "which", lambda _n: "/usr/bin/ssh")
-    monkeypatch.setattr(remote_dispatch.subprocess, "run", fake_run)
-    monkeypatch.setattr(
-        remote_dispatch, "no_window_kwargs", lambda: {"creationflags": 123}
-    )
+    monkeypatch.setattr(remote_dispatch, "run_ssh_command", fake_run)
 
     out = remote_dispatch.browse_remote("emancipation-cube", ["agent-dispatch", "list"])
     cmd = captured["cmd"]
@@ -407,7 +401,7 @@ def test_browse_remote_builds_ssh_command(monkeypatch):
     assert "ConnectTimeout=5" in cmd
     assert cmd[-1] == "agent-dispatch list"
     assert out.stdout == "[]"
-    assert captured["kwargs"]["creationflags"] == 123
+    assert captured["kwargs"]["timeout"] is None
 
 
 def test_browse_remote_unavailable_without_ssh(monkeypatch):
@@ -428,7 +422,7 @@ def test_browse_remote_lowercases_display_cased_alias(monkeypatch):
         return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
 
     monkeypatch.setattr(remote_dispatch.shutil, "which", lambda _n: "/usr/bin/ssh")
-    monkeypatch.setattr(remote_dispatch.subprocess, "run", fake_run)
+    monkeypatch.setattr(remote_dispatch, "run_ssh_command", fake_run)
 
     remote_dispatch.browse_remote("Emancipation-Cube", ["agent-dispatch", "list"])
     cmd = captured["cmd"]
@@ -444,7 +438,7 @@ def test_dispatch_to_remote_lowercases_display_cased_alias(monkeypatch):
         return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
 
     monkeypatch.setattr(remote_dispatch.shutil, "which", lambda _n: "/usr/bin/ssh")
-    monkeypatch.setattr(remote_dispatch.subprocess, "run", fake_run)
+    monkeypatch.setattr(remote_dispatch, "run_ssh_command", fake_run)
 
     remote_dispatch.dispatch_to_remote(
         "Emancipation-Cube", _args(prompt="go"), repo="gitea/x", payload="brief"
@@ -498,32 +492,32 @@ def test_diagnose_remote_failure_no_stderr():
 
 
 def test_local_machine_prefers_configured_environment(monkeypatch):
-    monkeypatch.setenv("AGENT_DISPATCH_SUPERVISE_MACHINE", "AugLoop1")
+    monkeypatch.setenv("AGENT_DISPATCH_SUPERVISE_MACHINE", "box1")
     monkeypatch.setattr(
         "agent_dispatch.identity.resolve_identity",
         lambda: pytest.fail("identity subprocess fallback should not run"),
     )
-    assert remote_dispatch.local_machine() == "augloop1"
+    assert remote_dispatch.local_machine() == "box1"
 
 
 def test_local_machine_reads_configured_supervisor_file(monkeypatch, tmp_path):
     monkeypatch.delenv("AGENT_DISPATCH_SUPERVISE_MACHINE", raising=False)
     monkeypatch.setenv("AGENT_DISPATCH_INSTALL_DIR", str(tmp_path))
     (tmp_path / "supervisor.env").write_text(
-        "AGENT_DISPATCH_SUPERVISE_MACHINE=AugLoop1\n", encoding="utf-8"
+        "AGENT_DISPATCH_SUPERVISE_MACHINE=box1\n", encoding="utf-8"
     )
     monkeypatch.setattr(
         "agent_dispatch.identity.resolve_identity",
         lambda: pytest.fail("identity subprocess fallback should not run"),
     )
-    assert remote_dispatch.local_machine() == "augloop1"
+    assert remote_dispatch.local_machine() == "box1"
 
 
 def test_local_machine_falls_back_to_identity(monkeypatch, tmp_path):
     monkeypatch.delenv("AGENT_DISPATCH_SUPERVISE_MACHINE", raising=False)
     monkeypatch.setenv("AGENT_DISPATCH_INSTALL_DIR", str(tmp_path))
     monkeypatch.setattr(
-        "agent_dispatch.identity.resolve_identity", lambda: ("anomalous-potato", "wt-1")
+        "agent_dispatch.identity.resolve_machine", lambda: "anomalous-potato"
     )
     assert remote_dispatch.local_machine() == "anomalous-potato"
 
@@ -531,7 +525,7 @@ def test_local_machine_falls_back_to_identity(monkeypatch, tmp_path):
 def test_local_machine_falls_back_to_host_node_name(monkeypatch, tmp_path):
     monkeypatch.delenv("AGENT_DISPATCH_SUPERVISE_MACHINE", raising=False)
     monkeypatch.setenv("AGENT_DISPATCH_INSTALL_DIR", str(tmp_path))
-    monkeypatch.setattr("agent_dispatch.identity.resolve_identity", lambda: (None, None))
+    monkeypatch.setattr("agent_dispatch.identity.resolve_machine", lambda: None)
     monkeypatch.setattr("platform.node", lambda: "Anomalous-Potato")
     assert remote_dispatch.local_machine() == "anomalous-potato"
 
@@ -539,6 +533,6 @@ def test_local_machine_falls_back_to_host_node_name(monkeypatch, tmp_path):
 def test_local_machine_none_when_nothing_resolves(monkeypatch, tmp_path):
     monkeypatch.delenv("AGENT_DISPATCH_SUPERVISE_MACHINE", raising=False)
     monkeypatch.setenv("AGENT_DISPATCH_INSTALL_DIR", str(tmp_path))
-    monkeypatch.setattr("agent_dispatch.identity.resolve_identity", lambda: (None, None))
+    monkeypatch.setattr("agent_dispatch.identity.resolve_machine", lambda: None)
     monkeypatch.setattr("platform.node", lambda: "")
     assert remote_dispatch.local_machine() is None

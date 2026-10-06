@@ -2,7 +2,8 @@
 name: codespaces-setup
 description: >
   GitHub Codespaces setup and adoption -- work out of the box on standard
-  CodeSpaces, or add supplementary .agent-codespaces/config.yaml for repos that
+  CodeSpaces, or add supplementary
+  .copilot-extensions/agent-codespaces/config.yaml for repos that
   deviate (split CodeSpaces-vs-product repos, pinned devcontainers, ADO hosts,
   provision hooks). Use for first-time setup or config changes, not day-to-day
   operations.
@@ -93,20 +94,20 @@ is about that supplementary config.
   Without the `codespace` scope, CodeSpace operations fail with
   `HTTP 403 ... needs the "codespace" scope`.
   `<agent-codespaces catalog argv[0]> doctor` checks
-  the ambient account and any mapped accounts and prints the exact remedy.
+  the accounts that serve a CodeSpace (plus the active account when a CodeSpace
+  uses ambient ownership) and prints the exact remedy.
 - **agent-bridge** (optional sibling) -- needed for `codespace:<name>`
   dispatch and for the managed host credential relay. The agent-codespaces
   CLI/binstub itself remains standalone; lifecycle commands and relay-free
   diagnostic SSH (`--no-relay`) still work without a bridge daemon.
 
-## When you DO need config -- `.agent-codespaces/config.yaml`
+## When you DO need config -- `.copilot-extensions/agent-codespaces/config.yaml`
 
-Supplementary config lives **in the adopting repo**, in the canonical in-repo
-location aligned with the sibling `agent-*` plugins (e.g.
-`.agent-worktrees/config.yaml`):
+Supplementary config lives **in the adopting repo**, in the canonical
+`.copilot-extensions/<plugin>/` namespace:
 
 ```
-<repo>/.agent-codespaces/config.yaml
+<repo>/.copilot-extensions/agent-codespaces/config.yaml
 ```
 
 It carries **only** the CodeSpace-specific bits convention can't derive. The
@@ -130,10 +131,12 @@ cd /path/to/your/repo
 
 `config init`:
 
-- writes a **supplementary-only** `.agent-codespaces/config.yaml` (deriving what
+- writes a **supplementary-only**
+  `.copilot-extensions/agent-codespaces/config.yaml` (deriving what
   it can from your existing CodeSpaces via `gh codespace list`), and
 - **auto-adopts** the repo (registers its path in
-  `~/.agent-codespaces/adopted-repos.yaml`) so the detached agent-bridge daemon
+  the active cell-local adoption store, falling back to
+  `~/.agent-codespaces/adopted-repos.yaml`) so the detached agent-bridge daemon <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
   reads it too. No separate `config adopt` step.
 
 If your repo already matches convention, `config init` will tell you so and the
@@ -141,11 +144,12 @@ file it writes is safe to delete.
 
 **Or author it by hand:** copy the annotated example,
 [`references/config.yaml`](references/config.yaml), to
-`.agent-codespaces/config.yaml` and adapt. Then run
+`.copilot-extensions/agent-codespaces/config.yaml` and adapt. Then run
 `<agent-codespaces catalog argv[0]> config adopt`.
 
 > **Auto-discovery.** Running any `agent-codespaces` command *inside* a repo that
-> carries `.agent-codespaces/config.yaml` picks it up automatically -- adoption
+> carries `.copilot-extensions/agent-codespaces/config.yaml` picks it up
+> automatically -- adoption
 > only persists it for the daemon and for extra/multi-repo setups.
 
 ### 2. Migrate a legacy `codespaces.yaml`
@@ -229,8 +233,9 @@ defaults:
 
 ## Config Reference
 
-Config is read live from the repo (canonical `.agent-codespaces/config.yaml`, or
-legacy `codespaces.yaml`) -- no generated intermediate file.
+Config is read live from the repo (canonical
+`.copilot-extensions/agent-codespaces/config.yaml`, with legacy fallbacks) --
+no generated intermediate file.
 
 ### `defaults`
 
@@ -248,7 +253,7 @@ legacy `codespaces.yaml`) -- no generated intermediate file.
 #### `workspace_folder`
 
 The absolute path to the repo checkout on the CodeSpace. When set, the remote
-agent command becomes `cd <workspace_folder> && copilot --acp --stdio`, which
+agent command becomes `cd <workspace_folder> && copilot --acp --stdio --allow-all --experimental`, which
 ensures Copilot starts in the right directory even when a cold-started
 CodeSpace's workspace volume isn't mounted by the time the SSH login profile
 runs. Without it, convention resolves the folder on the CodeSpace at launch
@@ -263,7 +268,7 @@ Explicit override for the entire remote command; takes priority over
 ```yaml
 defaults:
   # acp_command: "/workspaces/my-wrapper.sh"     # custom wrapper
-  # acp_command: "copilot --acp --stdio"          # bare (no cd prefix)
+  # acp_command: "copilot --acp --stdio --allow-all --experimental"  # bare (no cd prefix)
 ```
 
 ### `credentials`
@@ -277,6 +282,8 @@ extras below.
 |-----|------|---------|-------------|
 | `relay_port` | int | `0` (dynamic) | TCP port for the relay. `0` binds an OS-assigned ephemeral port (recommended). A positive value pins a fixed port. |
 | `ado_host` | string | -- | Default Azure DevOps host (e.g. `<your-org>.visualstudio.com`) for bare `get-access-token` requests that carry no host (npm/nuget via ado-auth-helper). Unset = such requests are rejected. Also settable via the `CODESPACES_ADO_HOST` env var on the relay host. |
+| `feed_token_env` | list[string] | `[]` | Env-var names to populate at launch with a fresh relay-minted Azure bearer for tooling that reads feed/cache auth from a static env token. |
+| `identity_env` | list[string] | `[]` | Env-var names to populate at launch with the host Azure-login identity string behind relay-minted Azure tokens. Ordinary user principals export the short alias (UPN local part); other principal types keep the reported identity string. |
 | `sources` | dict | -- | Optional per-source overrides (see below). |
 
 ### Credential Sources
@@ -355,7 +362,8 @@ repos:
 ```
 
 `provision.files.src` is resolved relative to the **repo root**, regardless of
-whether the config lives at `.agent-codespaces/config.yaml` or the legacy
+whether the config lives at
+`.copilot-extensions/agent-codespaces/config.yaml` or the legacy
 repo-root `codespaces.yaml`.
 
 ## Multi-Repo Adoption

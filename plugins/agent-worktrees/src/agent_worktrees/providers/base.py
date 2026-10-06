@@ -15,13 +15,54 @@ prints a token -- how the multi-machine system points at its vault), then ``pr.t
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from ..pr_contract import PRSnapshot, ThreadsResult
+    from ..pr_contract import PRDiff, PRSnapshot, ReviewNudgeResult, ThreadsResult
+
+
+#: Canonical review-verdict vocabulary a caller passes to
+#: :meth:`PRProvider.submit_review` -- matches the same ``Review.state`` /
+#: ``PRState.verdict`` vocabulary used elsewhere in the contract
+#: (``APPROVED`` / ``CHANGES_REQUESTED``), plus ``COMMENTED`` for a
+#: non-blocking review that carries no verdict.
+REVIEW_EVENTS: tuple[str, ...] = ("APPROVED", "CHANGES_REQUESTED", "COMMENTED")
+
+
+#: Matches a genuine ``@copilot`` mention (asking GitHub's Copilot cloud
+#: coding agent to act) but not a longer real handle like
+#: ``@copilot-extensions`` (excludes anything continued by a word char or
+#: hyphen). On GitHub, submitter-authored ``@copilot`` in a PR/issue
+#: comment or review does not nudge the review bot -- it delegates to the
+#: separate cloud coding agent, which pushes its own unreviewed commits to
+#: the PR branch. Asking that agent to act as the PR's own submitter is bad
+#: etiquette regardless of hook enforcement, so provider comment/review
+#: paths reject it directly rather than relying solely on the shell-level
+#: preToolUse guard (which cannot see text posted via a provider's own
+#: internal transport call).
+COPILOT_MENTION_RE = re.compile(r"@copilot(?![\w-])", re.I)
+
+
+def reject_copilot_mention(body: str, *, what: str = "comment") -> None:
+    """Raise ``ProviderError`` if ``body`` contains a genuine ``@copilot`` mention.
+
+    Called by any provider operation that publishes agent-authored text
+    (comment, review, reply) before it reaches the hosting service's
+    transport, so the block holds regardless of whether a shell-level hook
+    also inspects the invoking command.
+    """
+    if COPILOT_MENTION_RE.search(body):
+        raise ProviderError(
+            f"refusing to publish a {what} containing '@copilot': mentioning "
+            "the Copilot cloud coding agent as a PR/issue submitter invokes "
+            "it to push its own unreviewed commits, not a review request. "
+            "Remove the mention (or use plain text describing the request) "
+            "and try again."
+        )
 
 
 class ProviderError(RuntimeError):
@@ -74,6 +115,8 @@ class PullResult:
     open-but-merged PR, #1375/#1703)."""
     base_ref: str = ""
     """The PR base (target) branch ref, e.g. ``master``."""
+    observed_at: str = ""
+    """Provider-server timestamp captured while observing ``head_sha``."""
     label_error: str = ""
     """Non-empty when the PR opened but one or more configured labels could not
     be applied (lookup/attach failure, or a label absent from the repo).
@@ -83,8 +126,6 @@ class PullResult:
     being silently swallowed, so a dropped ``auto-merge`` / ``source:<machine>``
     label is visible rather than mysterious.
     """
-
-
 @runtime_checkable
 class PRProvider(Protocol):
     """Protocol every PR provider implements."""
@@ -99,6 +140,28 @@ class PRProvider(Protocol):
         self, repo: str, number: int, *, api_base: str = "", token: str | None = None
     ) -> PullResult:
         """Look up an existing PR by number (best-effort; may be unsupported)."""
+        ...
+
+    def observe_head(
+        self, repo: str, number: int, *, api_base: str = "", token: str | None = None
+    ) -> PullResult:
+        """Observe the exact PR head with a timestamp from the provider clock."""
+        ...
+
+    def authority_endpoint(self, api_base: str = "") -> str:
+        """Canonical provider endpoint that scopes review authority."""
+        ...
+
+    def publish_source_marker(
+        self,
+        repo: str,
+        number: int,
+        marker: str,
+        *,
+        api_base: str = "",
+        token: str | None = None,
+    ) -> str:
+        """Publish a managed source-attribution PR comment; "" on success."""
         ...
 
     def remove_label(
@@ -161,6 +224,7 @@ class PRProvider(Protocol):
     def merge_pull(
         self, repo: str, number: int, *, squash: bool = True, admin: bool = False,
         api_base: str = "", token: str | None = None,
+        delete_source_branch: bool = True, expected_head_sha: str = "",
     ) -> str:
         """Directly merge a PR **now** (the submitter-direct merge primitive).
 
@@ -172,14 +236,42 @@ class PRProvider(Protocol):
 
         - **github** runs ``gh pr merge <n> --squash`` (``--admin`` when ``admin``
           is set for the owner's sanctioned merge past a non-blocking gate).
-          Blocking review policy must use ``admin=False``.
-          Deliberately does **not** delete the source branch, so ``finalize`` can
-          still affirm the merge against the (still-present) head.
-        - **gitea / azure-devops** are unsupported today (return a message).
+          Blocking review policy must use ``admin=False``. ``delete_source_branch``
+          (default ``True``, matching :meth:`request_auto_complete`) passes
+          ``--delete-branch``: safe because ``finalize``/``pr-complete`` verify a
+          merged PR against the tracked record's own ``pr.head_sha``, never by
+          requiring the live remote branch to still exist.
+          When ``expected_head_sha`` is given, passes it as
+          ``--match-head-commit`` so GitHub's own merge endpoint refuses rather
+          than silently merging if its view of the PR's head has not caught up
+          with a just-pushed commit (ThomasMichon/copilot-extensions#4949: the
+          PR object's reported head can lag the real branch ref by minutes on a
+          cross-fork PR, and a bare ``gh pr merge <n>`` has no way to know).
+        - **gitea / azure-devops** are unsupported today (return a message);
+          ``expected_head_sha`` is accepted but has no effect there.
 
         Returns "" on success, or a human-readable error string. ``--now`` is only
         offered where the repo's flow profile is ``pr-self-merge``; other profiles
         refuse with a reminder before ever calling this.
+        """
+        ...
+
+
+    def close_pull(
+        self, repo: str, number: int, *, api_base: str = "", token: str | None = None,
+        comment: str = "",
+    ) -> str:
+        """Close PR ``number`` WITHOUT merging -- the ``pr-abandon`` primitive.
+
+        Distinct from :meth:`merge_pull`: this is the explicit, attributed
+        "this PR is genuinely superseded/abandoned, close it unmerged" action
+        behind ``pr-abandon --confirm`` (see the `pr-abandon-flow` effort,
+        #4411's pragmatic follow-up). ``comment``, when given, is posted on
+        the PR before closing (best-effort: a comment failure must never
+        block the close itself -- callers should treat a non-empty
+        ``comment`` post failure as a warning, not a reason to skip closing).
+
+        Returns "" on success, or a human-readable error string.
         """
         ...
 
@@ -208,6 +300,7 @@ class PRProvider(Protocol):
     def enable_auto_merge(
         self, repo: str, number: int, *, squash: bool = True,
         api_base: str = "", token: str | None = None,
+        delete_source_branch: bool = True, expected_head_sha: str = "",
     ) -> str:
         """Enable the provider's **native CI-gated auto-merge** on a PR (#225).
 
@@ -217,8 +310,14 @@ class PRProvider(Protocol):
         required checks pass -- letting an agent stop watching attentively.
 
         - **github** runs ``gh pr merge <n> --squash --auto`` (no ``--admin``: it
-          must wait on the checks, not bypass them). The source branch is not
-          deleted, so ``finalize`` can still affirm the eventual merge.
+          must wait on the checks, not bypass them). ``delete_source_branch``
+          (default ``True``) passes ``--delete-branch``, same safety reasoning as
+          :meth:`merge_pull`.
+          ``expected_head_sha``, like :meth:`merge_pull`'s, is passed as
+          ``--match-head-commit``: since auto-merge (the default,
+          ``prefer_auto_merge=True``) can complete immediately rather than
+          only arm, it must enforce the same expected-head check as the
+          direct merge path.
         - **gitea / azure-devops** are unsupported here today (they merge via
           their own consent/auto-complete flow); they return a message so the
           caller falls back to a direct merge.
@@ -239,10 +338,18 @@ class PRProvider(Protocol):
         (allowed merge methods, native auto-merge availability, delete-branch-on-
         merge, required approving reviews, required status checks) so ``register``
         / ``pr-research`` can prepare the config policy matrix to match reality.
+        It also carries ``viewer_permission`` -- the acting identity's own live
+        permission level, read from the same call -- the primitive behind
+        :func:`actor_viewer_permission` and ``pr-merge --now``'s live
+        merge-authority gate.
 
         - **github** reads ``gh api repos/<repo>`` + the default branch's
           protection.
-        - **gitea / azure-devops** are unsupported today (return a
+        - **gitea** reads ``GET /repos/<repo>`` (merge-method settings +
+          ``viewer_permission``); it needs a token (no ambient CLI auth like
+          `gh`) and does not read branch protection (those fields stay
+          ``None``).
+        - **azure-devops** is unsupported today (returns a
           ``RepoPolicy(supported=False)``).
 
         Never raises: a failed read yields ``RepoPolicy(supported=False, error=...)``.
@@ -273,6 +380,53 @@ class PRProvider(Protocol):
         """
         ...
 
+    def ensure_fork(
+        self, repo: str, *, api_base: str = "", token: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Ensure the caller has a personal fork of ``repo``; return
+        ``(owner, clone_url)`` on success, or ``None`` on any failure.
+
+        The role-aware fork-PR flow's fork-bootstrap primitive (see
+        ``efforts/active/role-aware-fork-pr-flow``): idempotent -- calling it
+        when a fork already exists returns that fork's ``(owner, clone_url)``
+        unchanged, never creates a duplicate. ``create-pr`` uses the returned
+        ``clone_url`` to point a local git remote at the fork (see
+        ``git_ops.ensure_remote``) and the returned ``owner`` to build the
+        ``<owner>:<branch>`` PR head. ``api_base`` pins a GitHub Enterprise
+        host exactly like every other provider call (:meth:`authority_endpoint`).
+
+        - **github** creates (or reads) the fork via the REST API.
+        - other providers are unsupported (return ``None``) -- fork-mode is
+          GitHub-only today.
+
+        Never raises: an unsupported provider, a failed API call, or a
+        malformed response all collapse to ``None``.
+        """
+        ...
+
+    def resolve_fork_owner(
+        self, *, api_base: str = "", token: str | None = None,
+    ) -> str | None:
+        """Non-mutating resolution of the login a fork would be created
+        under -- WITHOUT creating/verifying anything (unlike
+        :meth:`ensure_fork`, which both resolves this and issues a mutating
+        POST to create/read the fork). Lets a caller validate an expected
+        owner (e.g. a durable pre-approval) BEFORE any mutating side effect
+        runs, rather than discovering a stale/typo'd owner only after the
+        fork was already created and the local remote repointed. ``api_base``
+        pins the host exactly like :meth:`ensure_fork`.
+
+        - **github** resolves it via ``gh api user`` (a read-only call).
+        - other providers are unsupported (return ``None``) -- fork-mode is
+          GitHub-only today; a caller falls back to the mutating
+          :meth:`ensure_fork` path in that case, which surfaces the same
+          auth/provider failure there instead.
+
+        Never raises: unsupported provider or a failed API call both
+        collapse to ``None``.
+        """
+        ...
+
     def get_comment_threads(
         self, repo: str, number: int, *, api_base: str = "", token: str | None = None
     ) -> ThreadsResult:
@@ -297,6 +451,91 @@ class PRProvider(Protocol):
     ) -> tuple[int, ...]:
         """Return the numbers of every open PR on ``repo`` (for the sweep mode)."""
         ...
+
+    def find_pull_by_head(
+        self, repo: str, head: str, *, api_base: str = "", token: str | None = None
+    ) -> PullResult | None:
+        """Look up a PR by its head (source) branch name.
+
+        The fleet-flows Phase 2 healing path (#2146): a tracked record whose
+        active PR has no ``number`` (the local record never observed the PR
+        object -- e.g. an interrupted ``create_pr``) can't be reconciled by
+        :func:`PRProvider.get_pull` alone. This resolves the PR by the branch
+        that *is* known (``pr_ops.feature_branch_name`` -- deterministic per
+        worktree), across every state (open/closed/merged) so a since-merged
+        PR heals too. Returns ``None`` when no PR exists for that head, or the
+        provider can't search by head (best-effort; never guesses).
+        """
+        ...
+
+    def request_review(
+        self, repo: str, number: int, *, reviewer: str = "", api_base: str = "",
+        token: str | None = None,
+    ) -> ReviewNudgeResult:
+        """Ask this provider's bound automated reviewer to (re-)review the PR.
+
+        The ``pr-nudge`` primitive. ``reviewer`` is the repo's configured
+        ``pr.reviewer`` token (e.g. ``"copilot"`` -- see ``PRConfig.reviewer``);
+        the provider maps it to a concrete reviewer identity and issues
+        whatever request/re-request call that identity supports. Returns
+        ``supported=False`` (never raises) when this provider/repo has no
+        automated reviewer bound at all, or when ``reviewer`` names one this
+        provider doesn't recognize.
+        """
+        ...
+
+    def get_diff(
+        self, repo: str, number: int, *, api_base: str = "", token: str | None = None
+    ) -> PRDiff:
+        """Return the PR's current unified diff (the reviewer-side "read the
+        current diff and surrounding context" primitive).
+
+        ``PRDiff.supported`` is False when a provider cannot produce a unified
+        diff text -- callers treat that as "no diff available", never as "the
+        PR has no changes".
+        """
+        ...
+
+    def post_comment(
+        self, repo: str, number: int, body: str, *, api_base: str = "",
+        token: str | None = None,
+    ) -> str:
+        """Post a general (non-review) comment on the PR; "" on success.
+
+        The reviewer-side "post a comment" primitive -- distinct from
+        :meth:`publish_source_marker` (a specific managed attribution
+        comment): this posts arbitrary caller-supplied text, so every
+        implementation must call :func:`reject_copilot_mention` on ``body``
+        before publishing.
+        """
+        ...
+
+    def submit_review(
+        self, repo: str, number: int, *, event: str, body: str = "",
+        api_base: str = "", token: str | None = None,
+    ) -> str:
+        """Publish a review verdict on the PR; "" on success.
+
+        The reviewer-side "publish a verdict" primitive. ``event`` is one of
+        :data:`REVIEW_EVENTS` (``"APPROVED"`` / ``"CHANGES_REQUESTED"`` /
+        ``"COMMENTED"``); each provider maps it to its own native vocabulary.
+        ``body`` is the review's summary text (optional for ``APPROVED``,
+        conventionally expected for ``CHANGES_REQUESTED``/``COMMENTED``) and,
+        when non-empty, must pass :func:`reject_copilot_mention` before
+        publishing, same as every other agent-authored-text operation.
+
+        Returns "" on success, or a human-readable error string.
+        """
+        ...
+
+
+def _unsupported_diff(name: str) -> PRDiff:
+    from ..pr_contract import PRDiff as _PD
+
+    return _PD(
+        supported=False,
+        error=f"Provider '{name}' does not support reading a unified diff.",
+    )
 
 
 def _unsupported_snapshot(name: str) -> PRSnapshot:
@@ -323,6 +562,14 @@ def _unsupported_merge(name: str) -> str:
     )
 
 
+def _unsupported_close(name: str) -> str:
+    """The default ``close_pull`` result for a provider without a close primitive yet."""
+    return (
+        f"Provider '{name}' does not support closing a PR here yet (pr-abandon "
+        "is GitHub-only today; close the PR through its own hosting UI/CLI)."
+    )
+
+
 def _unsupported_auto_merge(name: str) -> str:
     """The default ``enable_auto_merge`` result for a provider without native,
     CLI-drivable auto-merge (so the caller falls back to a direct merge)."""
@@ -339,8 +586,48 @@ def _unsupported_repo_policy(name: str):
     return RepoPolicy(
         supported=False,
         error=(f"Provider '{name}' does not support settings reads (adopt-time "
-               "research is GitHub-only today)."),
+               "research is github/gitea only today)."),
     )
+
+
+def _unsupported_review_request(name: str, reviewer: str) -> ReviewNudgeResult:
+    """The default ``request_review`` for a provider with no bound automated
+    reviewer (unconfigured ``pr.reviewer``, or one this provider doesn't map)."""
+    from ..pr_contract import ReviewNudgeResult as _RNR
+
+    if reviewer:
+        detail = (
+            f"Provider '{name}' has no automated-reviewer binding for "
+            f"pr.reviewer={reviewer!r} (nothing to nudge)."
+        )
+    else:
+        detail = f"Repo has no pr.reviewer configured on provider '{name}' (nothing to nudge)."
+    return _RNR(supported=False, reviewer=reviewer, detail=detail)
+
+
+def actor_viewer_permission(
+    provider: PRProvider, repo: str, *, api_base: str = "", token: str | None = None,
+) -> str:
+    """Live, per-identity merge-authority read: "what CAN the acting identity
+    do on this repo right now?" -- the general-comprehension counterpart to a
+    repo's *config* (``pr.self_approve`` / ``pr.merge_actor``), which only says
+    what the repo's flow is designed for, not who is actually running it.
+
+    Reuses :meth:`PRProvider.get_repo_policy` (github/gitea already read the
+    caller's own permissions in that same settings call) rather than a second
+    provider-specific primitive. Fail-open by construction: any exception, an
+    unsupported provider, or a failed read all collapse to ``""`` (unknown) --
+    never raises, never fabricates a denial. Feed the result to
+    :func:`agent_worktrees.pr_contract.actor_merge_authority` to turn it into a
+    merge-eligibility verdict.
+    """
+    try:
+        policy = provider.get_repo_policy(repo, api_base=api_base, token=token)
+    except Exception:
+        return ""
+    if not getattr(policy, "supported", False):
+        return ""
+    return getattr(policy, "viewer_permission", "") or ""
 
 
 def resolve_token(prcfg) -> str | None:
@@ -507,6 +794,7 @@ _PROVIDERS = {
     "gitea": ("agent_worktrees.providers.gitea", "GiteaProvider"),
     "github": ("agent_worktrees.providers.github", "GitHubProvider"),
     "azure-devops": ("agent_worktrees.providers.azure_devops", "AzureDevOpsProvider"),
+    "mock": ("agent_worktrees.providers.mock", "MockPRProvider"),
 }
 
 
@@ -540,13 +828,19 @@ def scope_from_create_result(
 
     ``labels`` are templated with ``{machine}`` so a config entry like
     ``source:{machine}`` becomes ``source:anomalous-potato``.
+
+    ``head`` prefers ``result["pr_head"]`` (an explicit ``<owner>:<branch>``
+    head -- the role-aware fork-PR flow's publish step sets this when the
+    branch was pushed to the caller's fork rather than the repo itself) over
+    the plain ``result["branch"]``. Absent/empty ``pr_head`` falls back to
+    ``branch`` unchanged -- today's behavior for every non-fork repo.
     """
     labels = tuple(
         lbl.replace("{machine}", machine) for lbl in (getattr(prcfg, "labels", ()) or ())
     )
     return PRScope(
         repo=str(result.get("repo", "")),
-        head=str(result.get("branch", "")),
+        head=str(result.get("pr_head") or result.get("branch", "")),
         base=str(result.get("default_branch", "")),
         title=title,
         body=body,

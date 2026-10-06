@@ -3,13 +3,15 @@
     Agent Logger -- session-sync installer (Windows).
 
 .DESCRIPTION
-    Creates a venv at ~/.agent-logger, installs the agent-logger package, and
+    Installs the agent-logger runtime into the selected install root (default:
+    ~/.agent-logger, or -InstallDir for an explicit scoped root), then
     registers a Scheduled Task that runs `session-sync run --prune` every 4
-    hours. Windows-first by design: the runtime is the venv's python invoked
-    as `python -m agent_logger.sync.engine` (the console-script .exe is not
-    relied upon, matching the other plugins' Smart App Control posture). The
-    scheduled task runs under the windowless pythonw.exe host so the sync flow
-    never flashes a console window.
+    hours for that install. Windows-first by design: the runtime is the venv's
+    python invoked as `python -m agent_logger.sync.engine` (the console-script
+    .exe is not relied upon, matching the other plugins' Smart App Control
+    posture). The scheduled task runs through a durable PowerShell launcher so
+    the sync flow keeps the scoped runtime home and never flashes a console
+    window.
 
     Run from the repo root:
       pwsh -File plugins\agent-logger\scripts\install.ps1 install
@@ -17,12 +19,22 @@
 
 .PARAMETER Action
     Lifecycle action: install | update | uninstall | status.
+
+.PARAMETER InstallDir
+    Override the runtime install directory (default: ~/.agent-logger).
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
     [ValidateSet('install', 'update', 'uninstall', 'status', 'stamp', 'provision')]
-    [string]$Action = 'status'
+    [string]$Action = 'status',
+
+    [Alias('install-dir')]
+    [string]$InstallDir,
+
+    # Preview mode for the 'uninstall' action: print what WOULD be removed
+    # without touching the scheduled task or binstubs.
+    [switch]$DryRun
 )
 
 Set-StrictMode -Version Latest
@@ -307,7 +319,114 @@ function Write-Step    { param([string]$m) Write-Host "  ...    $m" }
 function Write-Warn    { param([string]$m) Write-Host "  [WARN] $m" -ForegroundColor Yellow }
 function Write-Fail    { param([string]$m) Write-Host "  [FAIL] $m" -ForegroundColor Red }
 
-$InstallDir = Join-Path $env:USERPROFILE '.agent-logger'
+. (Join-Path $PSScriptRoot 'installer-engine.ps1')
+
+function Test-UvConfiguredIndex {
+    $configPaths = if ($env:UV_CONFIG_FILE) {
+        @($env:UV_CONFIG_FILE)
+    } else {
+        $paths = @()
+        $roaming = [Environment]::GetFolderPath('ApplicationData')
+        if ($roaming) {
+            $paths += Join-Path $roaming 'uv\uv.toml'
+        }
+        if ($env:PROGRAMDATA) {
+            $paths += Join-Path $env:PROGRAMDATA 'uv\uv.toml'
+        }
+        $paths
+    }
+    foreach ($configPath in $configPaths) {
+        if (-not $configPath -or -not (Test-Path -LiteralPath $configPath)) { continue }
+        $inIndex = $false
+        foreach ($line in Get-Content -LiteralPath $configPath) {
+            $value = ($line -replace '\s+#.*$', '').Trim()
+            if ($value -match '^index-url\s*=') { return $true }
+            if ($value -match '^\[\[index\]\]$') {
+                $inIndex = $true
+                continue
+            }
+            if ($value -match '^\[') { $inIndex = $false }
+            if ($inIndex -and $value -match '^default\s*=\s*true$') {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function Ensure-UvIndex {
+    if ($env:UV_DEFAULT_INDEX -or $env:UV_INDEX_URL -or (Test-UvConfiguredIndex)) { return }
+    $idx = ''
+    # pip writes routine "no such key" notices to stderr when unconfigured; under
+    # $ErrorActionPreference='Stop' that becomes a terminating error even with a
+    # 2>$null redirect, so relax it for the duration of these probes.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        if (Get-Command pip -CommandType Application -ErrorAction SilentlyContinue) {
+            $out = & pip config get global.index-url 2>$null
+            if ($LASTEXITCODE -eq 0) { $idx = ($out | Out-String).Trim() }
+        }
+        if (-not $idx) {
+            if (Get-Command py -CommandType Application -ErrorAction SilentlyContinue) {
+                $out = & py -3 -m pip config get global.index-url 2>$null
+                if ($LASTEXITCODE -eq 0) { $idx = ($out | Out-String).Trim() }
+            } elseif (Get-Command python -CommandType Application -ErrorAction SilentlyContinue) {
+                $out = & python -m pip config get global.index-url 2>$null
+                if ($LASTEXITCODE -eq 0) { $idx = ($out | Out-String).Trim() }
+            }
+        }
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+    if (-not $idx) {
+        $configPaths = @($env:PIP_CONFIG_FILE)
+        $roaming = [Environment]::GetFolderPath('ApplicationData')
+        if ($roaming) {
+            $configPaths += Join-Path $roaming 'pip\pip.ini'
+        }
+        if ($env:PROGRAMDATA) {
+            $configPaths += Join-Path $env:PROGRAMDATA 'pip\pip.ini'
+        }
+        foreach ($configPath in $configPaths) {
+            if (-not $configPath -or -not (Test-Path -LiteralPath $configPath)) { continue }
+            $match = Select-String -LiteralPath $configPath `
+                -Pattern '^\s*index-url\s*=\s*(\S+)\s*$' |
+                Select-Object -First 1
+            if ($match) {
+                $idx = $match.Matches[0].Groups[1].Value
+                break
+            }
+        }
+    }
+    if ($idx) {
+        $env:UV_DEFAULT_INDEX = $idx
+        Write-Changed 'uv index derived from pip config (governed-feed bridge)'
+    }
+}
+
+$InstallDir = if ($InstallDir) { $InstallDir } else { Join-Path $env:USERPROFILE '.agent-logger' }
+$InstallDir = [IO.Path]::GetFullPath($InstallDir)
+$legacyInstallDir = [IO.Path]::GetFullPath((Join-Path $env:USERPROFILE '.agent-logger'))
+$publishGlobalBinstubs = [StringComparer]::OrdinalIgnoreCase.Equals(
+    $InstallDir,
+    $legacyInstallDir
+)
+$serviceSuffix = if ($publishGlobalBinstubs) {
+    ''
+} else {
+    $serviceSha = [Security.Cryptography.SHA256]::Create()
+    try {
+        ([BitConverter]::ToString(
+            $serviceSha.ComputeHash(
+                [Text.Encoding]::UTF8.GetBytes($InstallDir.ToLowerInvariant())
+            )
+        )).Replace('-', '').Substring(0, 12).ToLowerInvariant()
+    } finally {
+        $serviceSha.Dispose()
+    }
+}
+$env:AGENT_LOGGER_HOME = $InstallDir
 $VenvDir    = Join-Path $InstallDir '.venv'
 $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
 # pythonw.exe is the GUI-subsystem (windowless) Python host. Running the
@@ -318,7 +437,12 @@ $VenvPythonw = Join-Path $VenvDir 'Scripts\pythonw.exe'
 $LocalBin   = Join-Path $env:USERPROFILE '.local\bin'
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PluginDir  = (Resolve-Path (Join-Path $ScriptDir '..')).Path
-$TaskName   = 'Agent Logger Session Sync'
+$TaskName   = if ($publishGlobalBinstubs) {
+    'Agent Logger Session Sync'
+} else {
+    "Agent Logger Session Sync - $serviceSuffix"
+}
+$TaskLauncher = Join-Path (Join-Path $InstallDir 'bin') 'session-sync-task.ps1'
 $BinstubPs1 = Join-Path $LocalBin 'session-sync.ps1'
 $BinstubCmd = Join-Path $LocalBin 'session-sync.cmd'
 # Every CLI name deployed as a binstub (.ps1 primary + .cmd fallback), each
@@ -446,63 +570,6 @@ function Remove-LoggerTrampolines {
         ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
 }
 
-function Get-SignedBasePython {
-    <# Return a SAC-trusted (Authenticode-signed) base Python (>=3.10), or $null.
-       Smart App Control blocks the unsigned uv-managed Python and console-script
-       trampoline; a venv built from a signed base with `--copies` has a signed
-       python.exe that SAC allows. #>
-    if ($env:OS -ne 'Windows_NT') { return $null }
-    $cands = @()
-    if (Get-Command py -ErrorAction SilentlyContinue) {
-        foreach ($v in '3.13', '3.12', '3.11', '3.10') {
-            $p = (& py "-$v" -c "import sys;print(sys.executable)" 2>$null | Out-String).Trim()
-            if ($LASTEXITCODE -eq 0 -and $p) { $cands += $p }
-        }
-    }
-    foreach ($c in ($cands | Select-Object -Unique)) {
-        if (Test-Path $c) {
-            try { if ((Get-AuthenticodeSignature $c).Status -eq 'Valid') { return $c } } catch {}
-        }
-    }
-    return $null
-}
-
-function New-SignedVenv {
-    <# Create or rebuild $VenvDir so its python.exe is SAC-trusted. Prefers a
-       signed base Python via `--copies`; rebuilds an existing unsigned venv;
-       falls back to uv (unsigned) when no signed Python exists. Returns $true
-       if $VenvPython is present afterward. #>
-    # #935: toss an INCOMPLETE prior slot first so we never build over a corpse.
-    Invoke-VersionedSlotClean
-    if ((Test-Path $VenvPython) -and ($env:OS -eq 'Windows_NT')) {
-        $sig = try { (Get-AuthenticodeSignature $VenvPython).Status } catch { 'Unknown' }
-        if ($sig -ne 'Valid' -and (Get-SignedBasePython)) {
-            Write-Step 'Existing venv python is unsigned (Smart App Control-incompatible) -- rebuilding from signed Python'
-            try { Remove-Item -Recurse -Force $VenvDir -ErrorAction Stop }
-            catch { Write-Warn "Could not remove existing venv (in use?): $_" }
-        }
-    }
-    if (Test-Path $VenvPython) { return $true }
-
-    $signedBase = Get-SignedBasePython
-    if ($signedBase) {
-        & $signedBase -m venv --copies $VenvDir 2>&1 | Out-Null
-        if (Test-Path $VenvPython) {
-            Write-Ok "Venv created from signed Python ($signedBase)"
-            return $true
-        }
-        Write-Warn 'Signed-Python venv creation failed -- falling back to uv'
-    } elseif ($env:OS -eq 'Windows_NT') {
-        Write-Warn 'No signed system Python found -- using uv (unsigned). On Smart App Control machines, install python.org Python 3.10+ and re-run.'
-    }
-    $prevEAP = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    & uv venv $VenvDir --python 3.10 --allow-existing 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { & uv venv $VenvDir --allow-existing 2>&1 | Out-Null }
-    $ErrorActionPreference = $prevEAP
-    return (Test-Path $VenvPython)
-}
-
 function Get-GitInfo {
     param([string]$Path)
     try {
@@ -609,63 +676,82 @@ function Get-SourceKind {
 }
 # === end install-contract:v3 source-kind ===
 
-# Unified schema_version 3 manifest writer. Self-contained per plugin (no shared
-# module -- plugins are pulled independently from the marketplace). Records the
-# source footprint (local vs marketplace) and is written atomically (temp+move).
-function Write-DeployManifestFor {
-    param(
-        [string]$Service,
-        [string]$Plugin,
-        [string]$InstallPath,
-        [string]$PluginPath,
-        [string]$VenvPath
-    )
-    $manifestPath = Join-Path $InstallPath 'deploy-manifest.json'
-    $kind = Get-SourceKind -PluginPath $PluginPath
-
-    $ver = '0.0.0'
-    $pyproj = Join-Path $PluginPath 'pyproject.toml'
-    if (Test-Path $pyproj) {
-        $verLine = Select-String -Path $pyproj -Pattern '^\s*version\s*=' | Select-Object -First 1
-        if ($verLine) { $ver = ($verLine.Line -replace '.*=\s*"([^"]+)".*','$1') }
-    }
-
-    # Git provenance only applies to a local checkout -- the marketplace vendor
-    # copy is not a git repo.
-    $commit = $null; $branch = $null; $dirty = $false
-    if ($kind -eq 'local') {
-        $gitInfo = Get-GitInfo -Path (Split-Path $PluginPath)
-        $commit = $gitInfo.commit; $branch = $gitInfo.branch; $dirty = $gitInfo.dirty
-    }
-
-    $manifest = [ordered]@{
-        schema_version = 3
-        service        = $Service
-        deployed_at    = (Get-Date -Format 'o')
-        deployed_by    = "$($env:COMPUTERNAME.ToLower())-windows"
-        source         = [ordered]@{
-            kind    = $kind
-            path    = ($PluginPath -replace '\\', '/')
-            repo    = 'copilot-extensions'
-            plugin  = $Plugin
-            version = $ver
-            commit  = $commit
-            branch  = $branch
-            dirty   = $dirty
-        }
-        venv           = ($VenvPath -replace '\\', '/')
-        runtime        = 'python'
-    }
-
-    $tmp = "$manifestPath.tmp"
-    $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path $tmp -Encoding UTF8
-    Move-Item -Force -Path $tmp -Destination $manifestPath
-    Write-Ok "Deploy manifest written (source: $kind)"
+function Resolve-SnapshotInstallerEngineSource {
+    param([Parameter(Mandatory)][ValidateSet('ps1', 'sh')][string]$Ext)
+    $localEngine = Join-Path $PSScriptRoot ("installer-engine.$Ext")
+    if (Test-Path -LiteralPath $localEngine) { return $localEngine }
+    return Join-Path (Join-Path $PSScriptRoot '..\..\..\libs\installer-engine') ("installer-engine.$Ext")
 }
 
-function Write-DeployManifest {
-    Write-DeployManifestFor -Service 'agent-logger' -Plugin 'agent-logger' `
-        -InstallPath $InstallDir -PluginPath $PluginDir -VenvPath $LinkDir
+function Materialize-SnapshotLibs {
+    param([Parameter(Mandatory)][string]$SnapshotDir)
+    $libsDir = Join-Path $SnapshotDir 'libs'
+    if (-not (Test-Path $libsDir)) { New-Item -ItemType Directory -Path $libsDir -Force | Out-Null }
+    foreach ($lib in @('config-migrate', 'agent-procutil', 'dropin-registry', 'plugin-resolve', 'plugin-activation')) {
+        $source = Join-Path $PluginDir "libs\$lib"
+        if (-not (Test-Path (Join-Path $source 'pyproject.toml'))) {
+            $source = Join-Path $PluginDir "..\..\libs\$lib"
+        }
+        if (-not (Test-Path (Join-Path $source 'pyproject.toml'))) { continue }
+        $destination = Join-Path $libsDir $lib
+        if ([System.IO.Path]::GetFullPath($source) -eq [System.IO.Path]::GetFullPath($destination)) {
+            continue
+        }
+        Remove-Item -LiteralPath $destination -Recurse -Force -ErrorAction SilentlyContinue
+        Copy-Item -LiteralPath $source -Destination $destination -Recurse -Force
+    }
+}
+
+function Materialize-SnapshotInstallerEngine {
+    param([Parameter(Mandatory)][string]$SnapshotDir)
+    $scriptsDir = Join-Path $SnapshotDir 'scripts'
+    if (-not (Test-Path $scriptsDir)) { New-Item -ItemType Directory -Path $scriptsDir -Force | Out-Null }
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    foreach ($name in @('installer-engine.ps1', 'installer-engine.sh')) {
+        $ext = [System.IO.Path]::GetExtension($name).TrimStart('.')
+        $source = Resolve-SnapshotInstallerEngineSource -Ext $ext
+        $destination = Join-Path $scriptsDir $name
+        if ([System.IO.Path]::GetFullPath($source) -ne [System.IO.Path]::GetFullPath($destination)) {
+            Copy-Item -LiteralPath $source -Destination $destination -Force
+        }
+    }
+    $installSh = Join-Path $scriptsDir 'install.sh'
+    if (Test-Path $installSh) {
+        $shText = [System.IO.File]::ReadAllText($installSh)
+        $shText = $shText.Replace('. "$SCRIPT_DIR/../../../libs/installer-engine/installer-engine.sh"', '. "$SCRIPT_DIR/installer-engine.sh"')
+        [System.IO.File]::WriteAllText($installSh, $shText, $utf8NoBom)
+    }
+    $installPs1 = Join-Path $scriptsDir 'install.ps1'
+    if (Test-Path $installPs1) {
+        $ps1Text = [System.IO.File]::ReadAllText($installPs1)
+        $ps1Text = $ps1Text.Replace('. (Join-Path $PSScriptRoot ''..\..\..\libs\installer-engine\installer-engine.ps1'')', '. (Join-Path $PSScriptRoot ''installer-engine.ps1'')')
+        [System.IO.File]::WriteAllText($installPs1, $ps1Text, $utf8NoBom)
+    }
+}
+
+function Test-SnapshotRequiresMaterializedEngine {
+    param([Parameter(Mandatory)][string]$SnapshotDir)
+    $installSh = Join-Path $SnapshotDir 'scripts\install.sh'
+    if (Test-Path -LiteralPath $installSh) {
+        $shText = Get-Content -LiteralPath $installSh -Raw
+        if (
+            $shText.Contains('. "$SCRIPT_DIR/installer-engine.sh"') -or
+            $shText.Contains('. "$SCRIPT_DIR/../../../libs/installer-engine/installer-engine.sh"')
+        ) {
+            return $true
+        }
+    }
+    $installPs1 = Join-Path $SnapshotDir 'scripts\install.ps1'
+    if (Test-Path -LiteralPath $installPs1) {
+        $ps1Text = Get-Content -LiteralPath $installPs1 -Raw
+        if (
+            $ps1Text.Contains('. (Join-Path $PSScriptRoot ''installer-engine.ps1'')') -or
+            $ps1Text.Contains('. (Join-Path $PSScriptRoot ''..\..\..\libs\installer-engine\installer-engine.ps1'')')
+        ) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Publish-PayloadSnapshot {
@@ -681,6 +767,10 @@ function Publish-PayloadSnapshot {
     if (Test-Path $snapDir) {
         $complete = (Test-Path (Join-Path $snapDir 'plugin.json')) -and
             (Test-Path (Join-Path $snapDir 'bin\agent-logger.ps1'))
+        if ($complete -and (Test-SnapshotRequiresMaterializedEngine -SnapshotDir $snapDir)) {
+            $complete = (Test-Path (Join-Path $snapDir 'scripts\installer-engine.ps1')) -and
+                (Test-Path (Join-Path $snapDir 'scripts\installer-engine.sh'))
+        }
         if (-not $complete) {
             throw "Existing agent-logger snapshot is incomplete; refusing replacement: $snapDir"
         }
@@ -700,6 +790,8 @@ function Publish-PayloadSnapshot {
                 Copy-Item -LiteralPath $_.FullName `
                     -Destination (Join-Path $snapTmp $_.Name) -Recurse -Force
             }
+        Materialize-SnapshotLibs -SnapshotDir $snapTmp
+        Materialize-SnapshotInstallerEngine -SnapshotDir $snapTmp
         Move-Item -LiteralPath $snapTmp -Destination $snapDir
     }
 
@@ -725,19 +817,220 @@ function Write-Binstubs {
     Deploy-AuxiliaryCompatibilityBinstubs
 }
 
+function Deploy-ResolverHelpers {
+    $binDir = Join-Path $InstallDir 'bin'
+    if (-not (Test-Path $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
+    foreach ($r in @('resolve-runtime.ps1', 'resolve-runtime.sh')) {
+        $rSrc = Join-Path $PSScriptRoot $r
+        if (Test-Path $rSrc) { Copy-Item $rSrc (Join-Path $binDir $r) -Force }
+    }
+}
+
+function Get-ConfigRepoRegistrationPath {
+    # Optionally discover a facility-designated multi-machine config repo via
+    # the agent-worktrees registry, if this machine has one adopted -- so
+    # the scheduled task (with no useful working directory of its own)
+    # still discovers that repo's schema v3 sync.local_path declaration.
+    # Which repo (if any) is left to machine-local installer configuration
+    # (config_repo: <name> in $InstallDir\config.yaml) rather than a
+    # hardcoded name -- this is a generic, publicly-distributed plugin and
+    # must not assume any specific private repo. AGENT_LOGGER_REPO_CONFIG's
+    # explicit-file path still goes through the same registered-project +
+    # default-branch trust gate as normal discovery (see
+    # agent_logger.repo_trust) -- this only tells it WHERE to look, never
+    # bypasses WHETHER to trust it. No config_repo set, agent-worktrees
+    # absent, or the named repo not adopted here: silently a no-op (today's
+    # behavior, unaffected).
+    try {
+        $configYaml = Join-Path $InstallDir 'config.yaml'
+        if (-not (Test-Path -LiteralPath $configYaml)) { return $null }
+        if (-not (Test-Path -LiteralPath $VenvPython)) { return $null }
+        # Parsed with real YAML semantics (the venv's own pyyaml, the same
+        # library agent_logger.config uses) rather than a line-oriented
+        # regex -- a bare regex mishandles a trailing "# comment" or a
+        # quoted scalar containing '#'/'"', silently yielding the wrong (or
+        # no) repo name. '-I' (isolated mode) keeps `import yaml` tied to
+        # the venv's own installed package: without it, a same-named
+        # yaml.py/yaml/ reachable from this installer's current directory
+        # could shadow the real dependency and execute arbitrary code
+        # during installation.
+        $pyScript = @'
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(0)
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+except Exception:
+    sys.exit(0)
+value = data.get("config_repo") if isinstance(data, dict) else None
+if isinstance(value, str) and value.strip():
+    print(value.strip())
+'@
+        $repoName = $null
+        try {
+            $repoName = ($pyScript | & $VenvPython '-I' '-' $configYaml 2>$null | Select-Object -First 1)
+        } catch {
+            $repoName = $null
+        }
+        if (-not $repoName) { return $null }
+        if (-not (Get-Command agent-worktrees -ErrorAction SilentlyContinue)) { return $null }
+        $dir = (& agent-worktrees repos find $repoName 2>$null | Select-Object -First 1)
+        if (-not $dir) { return $null }
+        # `repos find` also resolves `reference`-class registrations, which
+        # are not guaranteed to be a git checkout at all -- so this
+        # discovery MUST NOT wire the result into the scheduled launcher
+        # unless it passes the same registered-project + default-branch
+        # trust decision normal (CWD-based) discovery applies. Deferring
+        # entirely to find_repo_config()'s own runtime trust check would
+        # still be *safe* (it re-derives this same verdict from the env
+        # var at consumption time), but embedding an untrusted path here
+        # regardless is needless exposure this installer can avoid
+        # outright by checking first.
+        #
+        # A single isolated python invocation both canonicalizes and
+        # checks trust, printing the resolved directory on success:
+        #   - Path.resolve() canonicalizes physically (follows symlinks
+        #     all the way through), unlike Resolve-Path (which normalizes
+        #     '..'/'.' but does not follow a reparse point) -- a symlinked
+        #     checkout's LOGICAL path embedded here would otherwise be
+        #     rejected outright by find_repo_config()'s symlink-ancestor
+        #     check, silently dropping repo config that normal
+        #     (physically-resolving) discovery honors.
+        #   - '-I' (isolated mode) keeps this security decision tied to
+        #     the INSTALLED package: without it, an ambient PYTHONPATH or
+        #     a same-named agent_logger package reachable from the
+        #     installer's current directory could shadow the real
+        #     repo_trust module and forge a trusted verdict.
+        $pyTrustScript = @'
+import sys
+from pathlib import Path
+try:
+    from agent_logger.repo_trust import repo_config_is_trusted
+except Exception:
+    sys.exit(1)
+root = Path(sys.argv[1]).resolve()
+if repo_config_is_trusted(root):
+    print(root)
+    sys.exit(0)
+sys.exit(1)
+'@
+        $trusted = $false
+        try {
+            $resolvedDir = ($pyTrustScript | & $VenvPython '-I' '-' $dir 2>$null)
+            $probeExitCode = $LASTEXITCODE
+            if ($resolvedDir -is [System.Array]) { $resolvedDir = $resolvedDir[0] }
+            $trusted = ($probeExitCode -eq 0) -and $resolvedDir
+        } catch {
+            $trusted = $false
+        }
+        if (-not $trusted) { return $null }
+        $dir = $resolvedDir
+        # Mirrors agent_logger.config.REPO_CONFIG_FILENAMES's alias set and
+        # precedence order -- a config repo may use any of these filenames,
+        # not just the root .agent-logger.yaml. A candidate whose leaf (or,
+        # for the .config/ aliases, whose .config ancestor) is a
+        # symlink/reparse point is skipped in favor of the next alias,
+        # mirroring find_repo_config()'s own symlink rejection exactly --
+        # selecting a symlinked candidate here would embed a path the real
+        # loader immediately rejects outright, instead of falling through
+        # to a valid lower-priority alias the way normal discovery does.
+        foreach ($candidate in @(
+            '.agent-logger.yaml',
+            '.agent-logger.yml',
+            '.config/agent-logger.yaml',
+            '.config/agent-logger.yml'
+        )) {
+            $configPath = Join-Path $dir $candidate
+            if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { continue }
+            if ((Get-Item -LiteralPath $configPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                continue
+            }
+            $ancestorDir = Split-Path -Parent $candidate
+            if ($ancestorDir) {
+                $ancestorPath = Join-Path $dir $ancestorDir
+                if ((Get-Item -LiteralPath $ancestorPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                    continue
+                }
+            }
+            # Returned alongside the config path: AGENT_WORKTREES_REPOS_YAML
+            # (if the installer's own process has it set) so the caller can
+            # carry forward WHICH registry file to re-check against --
+            # never a trust bypass. The scheduled task's process doesn't
+            # inherit the installer's own env, so without this a non-default
+            # registry location would make the runtime
+            # repo_config_is_trusted() re-check (still driven by the LIVE
+            # git remotes/default branch, never skipped) look in the wrong
+            # place and reject a genuinely registered repo. The default
+            # registry location needs no propagation -- both processes read
+            # the same well-known on-disk path already.
+            return [PSCustomObject]@{
+                ConfigPath = $configPath
+                ReposYaml = $env:AGENT_WORKTREES_REPOS_YAML
+            }
+        }
+        return $null
+    } catch {
+        return $null
+    }
+}
+
+function Write-SyncTaskLauncher {
+    $launcherDir = Split-Path -Parent $TaskLauncher
+    if (-not (Test-Path $launcherDir)) {
+        New-Item -ItemType Directory -Path $launcherDir -Force | Out-Null
+    }
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $repoConfig = Get-ConfigRepoRegistrationPath
+    $repoConfigLine = ''
+    if ($repoConfig) {
+        $escapedConfigPath = $repoConfig.ConfigPath -replace "'", "''"
+        $repoConfigLine = "`$env:AGENT_LOGGER_REPO_CONFIG = '$escapedConfigPath'"
+        if ($repoConfig.ReposYaml) {
+            $escapedReposYaml = $repoConfig.ReposYaml -replace "'", "''"
+            $repoConfigLine += "`n`$env:AGENT_WORKTREES_REPOS_YAML = '$escapedReposYaml'"
+        }
+    }
+    $launcherContent = @'
+$ErrorActionPreference = 'Stop'
+$env:PYTHONUTF8 = '1'
+$_root = '__INSTALL_DIR__'
+$_resolver = Join-Path $_root 'bin\resolve-runtime.ps1'
+function Resolve-RuntimePython {
+    $AgentRtPy = $null
+    if (Test-Path -LiteralPath $_resolver) {
+        $env:AGENT_RT_ROOT = $_root
+        . $_resolver
+    }
+    return $AgentRtPy
+}
+$env:AGENT_LOGGER_HOME = $_root
+__REPO_CONFIG_LINE__
+$_py = Resolve-RuntimePython
+if (-not $_py) { exit 1 }
+& $_py -m agent_logger.sync.engine run --prune
+exit $LASTEXITCODE
+'@.Replace('__INSTALL_DIR__', ($InstallDir -replace "'", "''")).Replace('__REPO_CONFIG_LINE__', $repoConfigLine)
+    [System.IO.File]::WriteAllText($TaskLauncher, $launcherContent, $utf8NoBom)
+}
+
 function Install-Package {
     if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null }
     if (-not (Test-Path $LocalBin))   { New-Item -ItemType Directory -Path $LocalBin -Force | Out-Null }
 
     # Prerequisite: uv (venv + package management per the install contract).
-    try { uv --version 2>&1 | Out-Null } catch {
-        Write-Fail 'uv not found on PATH (required for venv + package management)'
-        Write-Fail 'Install: https://docs.astral.sh/uv/getting-started/installation/'
+    Ensure-UvIndex
+    $uvPath = Ensure-Uv -InstallRoot $InstallDir
+    if (-not $uvPath) {
+        Write-Fail 'uv is required but could not be resolved or acquired'
         exit 1
     }
 
     # SAC-safe venv: prefer a signed base Python via --copies; rebuild unsigned.
-    if (-not (New-SignedVenv)) {
+    Invoke-VersionedSlotClean
+    if (-not (New-SignedVenv -VenvDir $VenvDir -VenvPython $VenvPython -PythonVersion '3.10' -UvCommand $uvPath -RequireSignedBase ($env:OS -eq 'Windows_NT') -AllowExisting $true)) {
         Write-Fail "Failed to create venv at $VenvDir"
         exit 1
     }
@@ -749,22 +1042,77 @@ function Install-Package {
 
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    # Vendored config-schema-migration lib (agent-config-migrate / module
-    # config_migrate): plugin-vendored (marketplace) or repo-root (git checkout).
-    $cfgMigrateDir = Join-Path $PluginDir 'libs\config-migrate'
-    if (-not (Test-Path (Join-Path $cfgMigrateDir 'pyproject.toml'))) {
-        $cfgMigrateDir = Join-Path (Split-Path -Parent (Split-Path -Parent $PluginDir)) 'libs\config-migrate'
+    $setuptoolsResult = Invoke-UvPipInstallResilient -UvCommand $uvPath -Arguments @('--python', $VenvPython, 'setuptools>=83.0.0', '--quiet')
+    $setuptoolsOut = $setuptoolsResult.Output
+    if ($setuptoolsResult.ExitCode -ne 0) {
+        $ErrorActionPreference = $prevEAP
+        Write-Fail "setuptools install failed"
+        if ($setuptoolsOut) { Write-Host ($setuptoolsOut | Out-String) }
+        exit 1
     }
-    if (Test-Path (Join-Path $cfgMigrateDir 'pyproject.toml')) {
-        & uv pip install --python $VenvPython --reinstall-package agent-config-migrate "$cfgMigrateDir" --quiet 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) {
+    $pyyamlResult = Invoke-UvPipInstallResilient -UvCommand $uvPath -Arguments @('--python', $VenvPython, 'pyyaml>=6.0', '--quiet')
+    $pyyamlOut = $pyyamlResult.Output
+    if ($pyyamlResult.ExitCode -ne 0) {
+        $ErrorActionPreference = $prevEAP
+        Write-Fail "pyyaml install failed"
+        if ($pyyamlOut) { Write-Host ($pyyamlOut | Out-String) }
+        exit 1
+    }
+    # Install vendored first-party dependencies from their local paths before the
+    # main package, then install agent-logger itself with --no-deps so deep
+    # staged payload paths do not force uv to rebuild the same path dependency
+    # graph inside the main wheel build.
+    foreach ($lib in @(
+        @{
+            Name = 'config-migrate'
+            Package = 'agent-config-migrate'
+            Dir = 'config-migrate'
+        },
+        @{
+            Name = 'agent-procutil'
+            Package = 'agent-procutil'
+            Dir = 'agent-procutil'
+        },
+        @{
+            Name = 'dropin-registry'
+            Package = 'agent-dropin-registry'
+            Dir = 'dropin-registry'
+        },
+        @{
+            Name = 'plugin-resolve'
+            Package = 'agent-plugin-resolve'
+            Dir = 'plugin-resolve'
+        },
+        @{
+            Name = 'plugin-activation'
+            Package = 'agent-plugin-activation'
+            Dir = 'plugin-activation'
+        }
+    )) {
+        # Prefer the plugin-local vendored copy; fall back to the monorepo's
+        # top-level libs\ directory for a local dev checkout where the payload
+        # was staged without its own libs\ copy (mirrors install.sh's own
+        # ${PLUGIN_DIR}/../../libs/<lib> fallback).
+        $libPath = Join-Path $PluginDir "libs\$($lib.Dir)"
+        if (-not (Test-Path (Join-Path $libPath 'pyproject.toml'))) {
+            $monorepoLibPath = Join-Path $PluginDir "..\..\libs\$($lib.Dir)"
+            if (Test-Path (Join-Path $monorepoLibPath 'pyproject.toml')) {
+                $libPath = $monorepoLibPath
+            }
+        }
+        if (-not (Test-Path (Join-Path $libPath 'pyproject.toml'))) { continue }
+        $libResult = Invoke-UvPipInstallResilient -UvCommand $uvPath -Arguments @('--python', $VenvPython, '--no-build-isolation', '--reinstall-package', $lib.Package, $libPath, '--quiet')
+        $libOut = $libResult.Output
+        if ($libResult.ExitCode -ne 0) {
             $ErrorActionPreference = $prevEAP
-            Write-Fail "config-migrate library install failed"
+            Write-Fail "$($lib.Name) library install failed"
+            if ($libOut) { Write-Host ($libOut | Out-String) }
             exit 1
         }
     }
-    $out = & uv pip install --python $VenvPython "$PluginDir" --quiet 2>&1
-    $result = $LASTEXITCODE
+    $installResult = Invoke-UvPipInstallResilient -UvCommand $uvPath -PayloadDirToScrub $PluginDir -Arguments @('--python', $VenvPython, '--no-build-isolation', '--no-deps', "$PluginDir", '--quiet')
+    $out = $installResult.Output
+    $result = $installResult.ExitCode
     $ErrorActionPreference = $prevEAP
     if ($result -ne 0) {
         Write-Fail "Package install failed (exit $result)"
@@ -776,20 +1124,27 @@ function Install-Package {
     # Strip the uv-regenerated console-script trampolines (SAC-blocked, unused).
     Remove-ConsoleTrampolines -VenvDir $VenvDir
     Remove-LoggerTrampolines -VenvDir $VenvDir
+    Deploy-ResolverHelpers
 
     # Versioned layout (#581): health-gate the slot + swap the `.venv` junction.
     # Everything below (binstubs, task, manifest) resolves through the link.
     if (-not (Invoke-VersionedActivate)) { exit 1 }
 
-    # Binstubs: .ps1 primary + .cmd fallback that invoke `python -m`
-    # (never the SAC-blocked console-script trampolines). Point at the stable
-    # `.venv` link ($LinkPython), never a versions/<v> absolute a `gc` could remove.
     Publish-PayloadSnapshot | Out-Null
-    Write-Binstubs -PythonExe $LinkPython
-    # The primary `agent-logger` entrypoint is a SELF-PROVISIONING binstub
-    # (deployed byte-identically at stamp + here) so it rebuilds the runtime on
-    # first use on a stamped-only box; post-provision it fast-paths the slot.
-    Deploy-SelfProvisioningBinstub
+    Write-SyncTaskLauncher
+    if ($publishGlobalBinstubs) {
+        # Binstubs: .ps1 primary + .cmd fallback that invoke `python -m`
+        # (never the SAC-blocked console-script trampolines). Point at the stable
+        # `.venv` link ($LinkPython), never a versions/<v> absolute a `gc` could remove.
+        Write-Binstubs -PythonExe $LinkPython
+        # The primary `agent-logger` entrypoint is a SELF-PROVISIONING binstub
+        # (deployed byte-identically at stamp + here) so it rebuilds the runtime on
+        # first use on a stamped-only box; post-provision it fast-paths the slot.
+        Deploy-SelfProvisioningBinstub
+        Write-Ok "published compatibility binstubs into $LocalBin"
+    } else {
+        Write-Ok "scoped install keeps runtime helpers inside $InstallDir"
+    }
 
     # Machine-local config schema migration (idempotent + atomic). Non-fatal.
     try {
@@ -800,31 +1155,54 @@ function Install-Package {
     }
 
     # Record the deploy footprint (source: local vs marketplace).
-    Write-DeployManifest
+    Write-DeployManifest -Service 'agent-logger' -Plugin 'agent-logger' -InstallPath $InstallDir -PluginPath $PluginDir -VenvPath $LinkDir -GetSourceKind ${function:Get-SourceKind} -GetGitInfo ${function:Get-GitInfo} -PayloadHash (Get-PayloadHash)
+}
+
+function New-SyncTaskAction {
+    Write-SyncTaskLauncher
+    if (-not (Test-Path -LiteralPath $TaskLauncher)) {
+        return $null
+    }
+    # STABLE host binary, never the invoking process's own path: (Get-Process
+    # -Id $PID).Path resolves to whatever happened to launch *this* install.ps1
+    # invocation (a Copilot CLI wrapper, a different pwsh/powershell install, a
+    # differently-versioned host after a PATH update, ...) -- that is exactly
+    # the kind of run-to-run drift that defeats an idempotent, compare-before-
+    # write task registration: the resolved action would legitimately differ
+    # on almost every run even though nothing about the sync task itself
+    # changed, forcing a real (and often access-denied) rewrite every time.
+    # Prefer `pwsh` (matches this facility's other scheduled-task launchers --
+    # agent-index/agent-dispatch/agent-codespaces all resolve a fixed system
+    # shell the same way), falling back to the well-known Windows PowerShell
+    # path so this never depends on PATH contents at all.
+    $pwshCmd = Get-Command pwsh -ErrorAction SilentlyContinue
+    $taskHost = if ($pwshCmd) { $pwshCmd.Source } else { Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe' }
+    return New-ScheduledTaskAction -Execute $taskHost `
+        -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + $TaskLauncher + '"')
+}
+
+function Test-SyncTaskActionCurrent {
+    # True when the task already exists and its registered action already
+    # matches the freshly-resolved desired action -- so the caller can skip
+    # Set-ScheduledTask entirely. The task's action is meant to be byte-
+    # identical across routine updates (a stable launcher + a stable host
+    # binary resolve the live runtime internally); writing it again when
+    # nothing changed only risks an unnecessary Access-Denied WARN on a
+    # non-elevated run for zero effect.
+    param($Action)
+    $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $existing) { return $false }
+    $existingAction = @($existing.Actions) | Select-Object -First 1
+    return $existingAction -and
+        $existingAction.Execute -eq $Action.Execute -and
+        ("$($existingAction.Arguments)").Trim() -eq ("$($Action.Arguments)").Trim()
 }
 
 function Register-SyncTask {
-    # Prefer the windowless host so the task never flashes a console; fall back
-    # to console python.exe only if pythonw.exe is somehow absent. Resolve through
-    # the stable `.venv` link ($LinkPythonw), never a versions/<v> absolute a `gc`
-    # could remove.
-    $runHost = if (Test-Path $LinkPythonw) { $LinkPythonw } else { $LinkPython }
-    # Resolve the active slot from the marker; tolerate either legacy .venv or
-    # already-slot LinkDir when deriving the install root.
-    $_root = Split-Path $LinkDir
-    if ((Split-Path -Leaf $_root) -eq 'versions') { $_root = Split-Path $_root }
-    $_ver = ''
-    try { $_ver = ([IO.File]::ReadAllText((Join-Path $_root 'current-version'))).Trim() } catch {}
-    if ($_ver) {
-        $slot = Join-Path $_root ('versions\' + $_ver)
-        $cand = Join-Path $slot 'Scripts\pythonw.exe'
-        $runHost = if (Test-Path -LiteralPath $cand) { $cand } else { Join-Path $slot 'Scripts\python.exe' }
+    $action = New-SyncTaskAction
+    if (-not $action) {
+        throw "Cannot register scheduled task: no provisioned agent-logger runtime"
     }
-    if (-not ($runHost -and (Test-Path -LiteralPath $runHost))) {
-        $runHost = Get-ChildItem (Join-Path $_root 'versions') -Directory -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { $cand = Join-Path $_.FullName 'Scripts\pythonw.exe'; if (Test-Path -LiteralPath $cand) { $cand } else { Join-Path $_.FullName 'Scripts\python.exe' } } | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Last 1
-    }
-    $action = New-ScheduledTaskAction -Execute $runHost `
-        -Argument '-m agent_logger.sync.engine run --prune'
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(5) `
         -RepetitionInterval (New-TimeSpan -Hours 4)
     $trigger.Repetition.StopAtDurationEnd = $false
@@ -840,14 +1218,78 @@ function Register-SyncTask {
     $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Set-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-            -Settings $settings -Principal $principal | Out-Null
-        Write-Changed "scheduled task updated (every 4h)"
+        if (Test-SyncTaskActionCurrent -Action $action) {
+            Write-Ok "scheduled task already correct (every 4h) -- left registered as-is"
+            return
+        }
+        try {
+            Set-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+                -Settings $settings -Principal $principal -ErrorAction Stop | Out-Null
+            Write-Changed "scheduled task updated (every 4h)"
+        } catch {
+            Write-TaskAccessDeniedWarning $_ 'update'
+        }
     } else {
-        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-            -Settings $settings -Principal $principal `
-            -Description 'Agent Logger -- push Copilot session data to the configured target every 4 hours.' | Out-Null
-        Write-Changed "scheduled task registered (every 4h)"
+        try {
+            Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+                -Settings $settings -Principal $principal `
+                -Description 'Agent Logger -- push Copilot session data to the configured target every 4 hours.' `
+                -ErrorAction Stop | Out-Null
+            Write-Changed "scheduled task registered (every 4h)"
+        } catch {
+            Write-TaskAccessDeniedWarning $_ 'register'
+        }
+    }
+}
+
+function Test-IsAccessDenied {
+    param($ErrorRecord)
+    # Mirror agent-index's Test-AccessDenied classifier (scripts/install.ps1):
+    # check the exception TYPE first (locale-independent), and only fall back
+    # to the message text -- Task Scheduler's Access Denied surfaces as a .NET
+    # UnauthorizedAccessException, but a non-English Windows can localize the
+    # message string.
+    return ("$($ErrorRecord.Exception.Message)" -match '(?i)access is denied' `
+            -or $ErrorRecord.Exception -is [UnauthorizedAccessException])
+}
+
+function Write-TaskAccessDeniedWarning {
+    param($ErrorRecord, [string]$Verb)
+    if (-not (Test-IsAccessDenied $ErrorRecord)) {
+        throw $ErrorRecord
+    }
+    # A task (or, for a brand-new task, the Tasks folder entry Task Scheduler
+    # creates for it) whose DACL only grants the current user Read/Synchronize
+    # (owner BUILTIN\Administrators) was registered/touched by a prior elevated
+    # run. Task Scheduler enforces that ACL regardless of who the task *runs
+    # as* -- a non-elevated Set-ScheduledTask/Register-ScheduledTask/
+    # Unregister-ScheduledTask on it fails with Access Denied even though the
+    # task's own principal is the current user. Recovering the ACL itself
+    # requires one elevated action; don't fail the whole install over it.
+    Write-Warn2 "could not $Verb scheduled task '$TaskName' (Access is denied); left unchanged"
+    Write-Warn2 "one-time fix (run once from an elevated prompt, then re-run this installer):"
+    Write-Warn2 "  schtasks /Delete /TN `"$TaskName`" /F"
+}
+
+function Update-SyncTaskBinding {
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        $action = New-SyncTaskAction
+        if (-not $action) {
+            Write-Warn2 "scheduled task left unchanged: no provisioned runtime"
+            return
+        }
+        if (Test-SyncTaskActionCurrent -Action $action) {
+            Write-Ok "scheduled task already current -- not re-registering"
+            return
+        }
+        try {
+            Set-ScheduledTask -TaskName $TaskName -Action $action -ErrorAction Stop | Out-Null
+            Write-Changed "scheduled task runtime updated"
+        } catch {
+            Write-TaskAccessDeniedWarning $_ 'update'
+        }
+    } else {
+        Write-Ok "package updated (task not registered)"
     }
 }
 
@@ -861,14 +1303,7 @@ function Deploy-SelfProvisioningBinstub {
     # this very binstub never rewrites the .cmd it is mid-execution.
     if (-not (Test-Path $LocalBin)) { New-Item -ItemType Directory -Path $LocalBin -Force | Out-Null }
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    # Co-deploy the canonical resolvers so every launcher resolves identically
-    # (uniform-runtime-resolution, #765).
-    $binDir = Join-Path $InstallDir 'bin'
-    if (-not (Test-Path $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
-    foreach ($r in @('resolve-runtime.ps1', 'resolve-runtime.sh')) {
-        $rSrc = Join-Path $PSScriptRoot $r
-        if (Test-Path $rSrc) { Copy-Item $rSrc (Join-Path $binDir $r) -Force }
-    }
+    Deploy-ResolverHelpers
     if ($env:OS -ne 'Windows_NT') {
         $stubPath = Join-Path $LocalBin 'agent-logger'
         $stubContent = @'
@@ -997,9 +1432,14 @@ function Invoke-Stamp {
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     }
     Publish-PayloadSnapshot | Out-Null
-    Deploy-SelfProvisioningBinstub
-    Deploy-AuxiliaryCompatibilityBinstubs
-    Write-Ok 'Stamped: agent-logger command family on PATH; runtime provisions on first use.'
+    Deploy-ResolverHelpers
+    if ($publishGlobalBinstubs) {
+        Deploy-SelfProvisioningBinstub
+        Deploy-AuxiliaryCompatibilityBinstubs
+        Write-Ok 'Stamped: agent-logger command family on PATH; runtime provisions on first use.'
+    } else {
+        Write-Ok 'Stamped: installation-scoped payload snapshot published without global PATH wrappers.'
+    }
 }
 
 switch ($Action) {
@@ -1017,22 +1457,40 @@ switch ($Action) {
     }
     'update' {
         if (-not $script:SkipPackageInstall) { Install-Package }
-        Write-Ok "package updated (task unchanged)"
+        Update-SyncTaskBinding
     }
     'uninstall' {
+        if ($DryRun) { Write-Host '(dry run -- nothing will be changed)' -ForegroundColor Yellow }
         if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-            Write-Changed "scheduled task removed (config at $InstallDir kept)"
+            if ($DryRun) {
+                Write-Host "[dry-run] would remove scheduled task: $TaskName"
+            } else {
+                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+                Write-Changed "scheduled task removed (config at $InstallDir kept)"
+            }
         } else {
             Write-Warn2 "no scheduled task found"
         }
-        foreach ($name in $BinstubNames) {
-            foreach ($ext in 'ps1', 'cmd') {
-                $f = Join-Path $LocalBin "$name.$ext"
-                if (Test-Path $f) { Remove-Item $f -Force -ErrorAction SilentlyContinue }
+        if ($publishGlobalBinstubs) {
+            $anyStub = $false
+            foreach ($name in $BinstubNames) {
+                foreach ($ext in 'ps1', 'cmd') {
+                    $f = Join-Path $LocalBin "$name.$ext"
+                    if (Test-Path $f) {
+                        $anyStub = $true
+                        if ($DryRun) { Write-Host "[dry-run] would remove binstub: $f" }
+                        else { Remove-Item $f -Force -ErrorAction SilentlyContinue }
+                    }
+                }
             }
+            if (-not $DryRun) { Write-Changed "binstubs removed from $LocalBin" }
+        } else {
+            Write-Changed 'scoped install left legacy global binstubs unchanged'
         }
-        Write-Changed "binstubs removed from $LocalBin"
+        if ($DryRun) {
+            Write-Host "[dry-run] config/session-state at $InstallDir would be kept (agent-logger uninstall never removes it)"
+            Write-Host 'agent-logger uninstall dry run complete -- nothing was changed' -ForegroundColor Yellow
+        }
     }
     'status' {
         if (Test-Path $LinkPython) {
@@ -1041,7 +1499,9 @@ switch ($Action) {
         } else {
             Write-Warn2 "not installed (run: install.ps1 install)"
         }
-        if (Test-Path $BinstubPs1) {
+        if (-not $publishGlobalBinstubs) {
+            Write-Ok 'global compatibility binstubs suppressed for installation-scoped runtime'
+        } elseif (Test-Path $BinstubPs1) {
             Write-Ok "binstub present (session-sync.ps1)"
         } elseif (Test-Path $BinstubCmd) {
             Write-Warn2 "only the .cmd binstub is present (missing session-sync.ps1)"

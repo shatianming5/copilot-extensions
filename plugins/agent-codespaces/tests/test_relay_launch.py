@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 from agent_codespaces.relay_launch import (
+    AZURE_AUTH_HELPER_COMPAT_DIR,
     SCRUB_ENV_VARS,
+    build_azure_auth_helper_compat_shim,
     build_feed_token_exports,
+    build_identity_env_exports,
     build_relay_env,
 )
 
 
 def test_build_relay_env_scrubs_and_exports():
     env = build_relay_env(
-        9857, "tok123", use_relay=True, ado_host="example.visualstudio.com"
+        9857, "tok123", use_relay=True, ado_host="example.visualstudio.com",
+        github_account="bound-user",
     )
     # PAT scrub always prepended
     for v in SCRUB_ENV_VARS:
@@ -22,6 +26,7 @@ def test_build_relay_env_scrubs_and_exports():
         "export LC_GIT_CREDENTIAL_RELAY_ADO_HOST=example.visualstudio.com;"
         in env
     )
+    assert "export LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT=bound-user;" in env
     assert "GIT_TERMINAL_PROMPT=0" in env
     assert "GCM_INTERACTIVE=never" in env
     assert "auth-error-policy.instructions.md" in env
@@ -40,6 +45,39 @@ def test_build_relay_env_no_relay_still_scrubs():
     assert "COPILOT_CUSTOM_INSTRUCTIONS_DIRS" in env
 
 
+def test_build_azure_auth_helper_compat_shim_maps_bare_name():
+    # #415: RushStack's AdoCodespacesAuthCredential hard-codes the bare
+    # "azure-auth-helper" name; map it to the relay-first ado-auth-helper
+    # wrapper via a compat directory, never a persisted dotfile.
+    snippet = build_azure_auth_helper_compat_shim()
+    assert f'mkdir -p "{AZURE_AUTH_HELPER_COMPAT_DIR}"; ' in snippet
+    assert (
+        f'ln -sf "$HOME/.local/bin/ado-auth-helper" '
+        f'"{AZURE_AUTH_HELPER_COMPAT_DIR}/azure-auth-helper"; ' in snippet
+    )
+    assert f'export PATH="{AZURE_AUTH_HELPER_COMPAT_DIR}:$PATH"; ' in snippet
+    # Session/process-scoped only -- never persisted to a dotfile.
+    assert ".bashrc" not in snippet
+    assert ".profile" not in snippet
+
+
+def test_build_relay_env_includes_azure_auth_helper_shim_when_relay_used():
+    env = build_relay_env(9857, "tok123", use_relay=True)
+    assert AZURE_AUTH_HELPER_COMPAT_DIR in env
+    assert "azure-auth-helper" in env
+    # Comes after the relay export (the wrapper resolves the relay via
+    # LC_GIT_CREDENTIAL_RELAY at runtime, matching the feed-token ordering).
+    assert env.index("LC_GIT_CREDENTIAL_RELAY=") < env.index(
+        AZURE_AUTH_HELPER_COMPAT_DIR
+    )
+
+
+def test_build_relay_env_no_relay_omits_azure_auth_helper_shim():
+    env = build_relay_env(9857, "tok", use_relay=False)
+    assert "azure-auth-helper" not in env
+    assert AZURE_AUTH_HELPER_COMPAT_DIR not in env
+
+
 def test_build_feed_token_exports_emits_helper_backed_export():
     # dotfiles#1221: env-token feed auth (npm/nuget/rush) is bridged from the
     # relay-minted ADO bearer via the ado-auth-helper.
@@ -56,6 +94,71 @@ def test_build_feed_token_exports_multiple_and_empty():
     assert build_feed_token_exports(["", None]) == ""
     two = build_feed_token_exports(["A_TOKEN", "B_TOKEN"])
     assert "export A_TOKEN=" in two and "export B_TOKEN=" in two
+
+
+def test_build_feed_token_exports_skips_invalid_env_names():
+    assert build_feed_token_exports(["VALID_TOKEN", "bad-name", "A=B"]) == (
+        'export VALID_TOKEN="$($HOME/.local/bin/ado-auth-helper '
+        'get-access-token 2>/dev/null || true)"; '
+    )
+
+
+def test_build_identity_env_exports_emits_host_identity(monkeypatch):
+    monkeypatch.setattr("agent_codespaces.relay_launch.current_identity", lambda: "owner_user")
+    snippet = build_identity_env_exports(["GITHUB_USER"])
+    assert snippet == "export GITHUB_USER=owner_user; "
+
+
+def test_build_identity_env_exports_multiple_and_empty(monkeypatch):
+    monkeypatch.setattr("agent_codespaces.relay_launch.current_identity", lambda: "owner_user")
+    assert build_identity_env_exports(None) == ""
+    assert build_identity_env_exports([]) == ""
+    assert build_identity_env_exports(["", None]) == ""
+    snippet = build_identity_env_exports(["GITHUB_USER", "UPLOAD_USER"])
+    assert "export GITHUB_USER=owner_user; " in snippet
+    assert "export UPLOAD_USER=owner_user; " in snippet
+
+
+def test_build_identity_env_exports_skips_when_identity_unavailable(monkeypatch):
+    monkeypatch.setattr("agent_codespaces.relay_launch.current_identity", lambda: None)
+    assert build_identity_env_exports(["GITHUB_USER"]) == ""
+
+
+def test_build_identity_env_exports_skips_invalid_env_names(monkeypatch):
+    monkeypatch.setattr(
+        "agent_codespaces.relay_launch.current_identity",
+        lambda: (_ for _ in ()).throw(AssertionError("should not resolve identity")),
+    )
+    assert build_identity_env_exports(["bad-name", "A=B"]) == ""
+
+
+def test_build_relay_env_exports_identity_without_relay(monkeypatch):
+    monkeypatch.setattr("agent_codespaces.relay_launch.current_identity", lambda: "owner_user")
+    env = build_relay_env(
+        9857,
+        "tok",
+        use_relay=False,
+        identity_env=["GITHUB_USER"],
+    )
+    assert "export GITHUB_USER=owner_user;" in env
+    assert "LC_GIT_CREDENTIAL_RELAY" not in env
+
+
+def test_build_relay_env_exports_identity_before_relay(monkeypatch):
+    monkeypatch.setattr("agent_codespaces.relay_launch.current_identity", lambda: "owner_user")
+    env = build_relay_env(
+        9857,
+        "tok123",
+        use_relay=True,
+        identity_env=["GITHUB_USER"],
+        feed_token_env=["EXAMPLE_NPM_AUTH_TOKEN"],
+    )
+    assert env.index("export GITHUB_USER=owner_user;") < env.index(
+        "LC_GIT_CREDENTIAL_RELAY="
+    )
+    assert env.index("export GITHUB_USER=owner_user;") < env.index(
+        "export EXAMPLE_NPM_AUTH_TOKEN="
+    )
 
 
 def test_build_relay_env_exports_feed_token_after_relay():
@@ -78,7 +181,10 @@ def test_build_relay_env_exports_feed_token_after_relay():
 def test_build_relay_env_no_feed_token_by_default():
     env = build_relay_env(9857, "tok123", use_relay=True)
     assert "EXAMPLE_NPM_AUTH_TOKEN" not in env
-    assert "ado-auth-helper" not in env
+    # No feed-token export is emitted by default; the ado-auth-helper
+    # reference that remains comes solely from the azure-auth-helper compat
+    # shim (#415), not from a feed-token export.
+    assert "get-access-token" not in env
 
 
 def test_build_relay_env_no_relay_omits_feed_token():
@@ -88,6 +194,42 @@ def test_build_relay_env_no_relay_omits_feed_token():
         9857, "tok", use_relay=False, feed_token_env=["EXAMPLE_NPM_AUTH_TOKEN"]
     )
     assert "EXAMPLE_NPM_AUTH_TOKEN" not in env
+
+
+def test_current_identity_prefers_short_user_alias(monkeypatch):
+    import agent_codespaces.relay_launch as rl
+
+    class Result:
+        returncode = 0
+        stdout = '{"user":{"name":"someone@example.com","type":"user"}}'
+
+    monkeypatch.setattr(rl, "_az_argv", lambda args: ["az", *args])
+    monkeypatch.setattr(rl.subprocess, "run", lambda *a, **k: Result())
+    assert rl.current_identity() == "someone"
+
+
+def test_current_identity_keeps_non_user_principal_name(monkeypatch):
+    import agent_codespaces.relay_launch as rl
+
+    class Result:
+        returncode = 0
+        stdout = '{"user":{"name":"app://principal@example.com","type":"servicePrincipal"}}'
+
+    monkeypatch.setattr(rl, "_az_argv", lambda args: ["az", *args])
+    monkeypatch.setattr(rl.subprocess, "run", lambda *a, **k: Result())
+    assert rl.current_identity() == "app://principal@example.com"
+
+
+def test_current_identity_rejects_multiline_value(monkeypatch):
+    import agent_codespaces.relay_launch as rl
+
+    class Result:
+        returncode = 0
+        stdout = '{"user":{"name":"someone\\nelse@example.com","type":"user"}}'
+
+    monkeypatch.setattr(rl, "_az_argv", lambda args: ["az", *args])
+    monkeypatch.setattr(rl.subprocess, "run", lambda *a, **k: Result())
+    assert rl.current_identity() is None
 
 
 def test_build_relay_launch_env(monkeypatch, tmp_path):
@@ -106,11 +248,14 @@ def test_build_relay_launch_env(monkeypatch, tmp_path):
                         lambda *a, **k: _Cfg())
     monkeypatch.setattr("agent_codespaces.relay_token.token_for",
                         lambda name, **kw: "minted-tok")
+    monkeypatch.setattr("agent_codespaces.gh_account.fast_credential_account_for_codespace",
+                        lambda name: "bound-user")
     env, port = rl.build_relay_launch_env("cs-foo")
     assert port == 9999
     assert "export LC_GIT_CREDENTIAL_RELAY=9999;" in env
     assert "minted-tok" in env
     assert "LC_GIT_CREDENTIAL_RELAY_ADO_HOST=example.visualstudio.com" in env
+    assert "LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT=bound-user" in env
 
 
 def test_build_relay_launch_env_live_port_override(monkeypatch):
@@ -252,7 +397,9 @@ def test_prelude_publishes_port_mapping_file():
     assert "relay-ports/51234.json" in env
     assert "|| true" in env  # best-effort; never aborts the prelude
     assert '"ado_host":"%s"' in env
+    assert '"github_account":"%s"' in env
     assert "LC_GIT_CREDENTIAL_RELAY_ADO_HOST" in env
+    assert "LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT" in env
     # Not published when the relay is disabled.
     assert "relay-ports" not in build_relay_env(51234, "tok", use_relay=False)
 
@@ -266,7 +413,9 @@ def test_build_relay_portmap_write_shape():
     assert '"port":%s' in snip
     assert "$LC_GIT_CREDENTIAL_RELAY_TOKEN" in snip   # token not re-interpolated
     assert '"ado_host":"%s"' in snip
+    assert '"github_account":"%s"' in snip
     assert "LC_GIT_CREDENTIAL_RELAY_ADO_HOST" in snip
+    assert "LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT" in snip
     assert snip.rstrip().endswith("|| true;") or "|| true" in snip
 
 
@@ -312,3 +461,16 @@ def test_credentials_config_relay_port_defaults_to_dynamic_sentinel():
     from agent_codespaces.config import CredentialsConfig
     assert CredentialsConfig().relay_port == 0
 
+def test_build_relay_portmap_publish_carries_token_and_account_without_the_prelude():
+    from agent_codespaces.relay_launch import build_relay_portmap_publish
+
+    cmd = build_relay_portmap_publish(
+        41000, "tok", ado_host="ado.example", github_account="alice",
+    )
+    assert "export LC_GIT_CREDENTIAL_RELAY_TOKEN=tok;" in cmd
+    assert "export LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT=alice;" in cmd
+    assert "export LC_GIT_CREDENTIAL_RELAY_ADO_HOST=ado.example;" in cmd
+    assert "relay-ports" in cmd and "/41000.json" in cmd
+    # Only the port map: no PAT scrub, feed-token mint or helper shim.
+    assert "get-access-token" not in cmd and "unset " not in cmd
+    assert "export LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT" not in build_relay_portmap_publish(41000, "tok")

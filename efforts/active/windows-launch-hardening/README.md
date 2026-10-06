@@ -10,7 +10,7 @@
   surfaced real console windows (`python.exe`/`pwsh.exe`/`cmd.exe` with `.agent-`
   paths) because they relied on `-WindowStyle Hidden` alone or spawned without
   window-suppression flags.
-- **Umbrella issue:** #786 (supersedes #775, the headless sub-thread — Phases 1-2 landed).
+- **Umbrella issue:** #786 (supersedes #775, the headless sub-thread — Phases 1-2 landed); current regression: #2334.
 
 ## Guiding Intent
 
@@ -60,6 +60,27 @@ kind:
 5. **Shared helper + guard** — extract a `Start-Headless` pwsh helper (the
    `conhost --headless` wrapper) for uniform pwsh launches, and a guard that
    flags a pwsh/python launch site that isn't headless.
+6. **SSH ProxyCommand descendant containment** — tracked by #1742. Use an
+   inherited hidden console for non-interactive SSH trees on Windows because
+   `CREATE_NO_WINDOW` suppresses `ssh.exe` itself but does not reliably contain
+   console-subsystem proxy helpers. Reap the process tree on managed timeout and
+   teardown paths.
+7. **Crash-proof SSH tree ownership** — evaluate kill-on-close Windows Job
+   Objects for SSH trees whose root exits before a proxy descendant. PID-tree
+   cleanup cannot recover that already-orphaned shape reliably.
+8. **Durable coding and review invariants** — #1940. Run the headless-launch
+   guard in required CI, cover canonical shared libraries, reject
+   `CREATE_NEW_CONSOLE` in production background paths, and require live
+   windowless-parent validation for launch-path reviews.
+9. **agent-worktrees status-loop containment** — completed by #1980. The
+   resident status monitor and per-session status updater now launch from one
+   console-subsystem Python root under `CREATE_NO_WINDOW`, so repeated `psmux`
+   probes inherit one hidden console instead of allocating a new console host
+   per refresh.
+10. **Recurring service-descendant containment** — #2037. Run agent-bridge,
+    agent-dispatch supervision, and the container Docker broker from a hidden
+    console root; suppress every short-lived captured child; and migrate
+    installer probes away from direct console launches.
 
 ## Deferred Backlog Intake
 
@@ -139,3 +160,103 @@ against real behavior.
   it for both identity discovery and bridge liveness, and adds a Windows
   integration regression whose helper child repeatedly launches real
   `git.exe` while observing process and foreground state.
+
+### 2026-09-02 - SSH ProxyCommand descendant residual
+- Live process-tree capture found repeated non-interactive `ssh.exe` probes and
+  forwards whose direct child used `CREATE_NO_WINDOW`, while proxy helpers still
+  acquired their own console hosts.
+- #1742 adds an SSH-specific hidden-console spawn path for every ssh-manager and
+  agent-dispatch SSH launch site. Non-SSH capture retains the narrower
+  `CREATE_NO_WINDOW` primitive.
+- Managed cancellation and timeout paths now reap live SSH trees, including
+  forwards, relay channels, health checks, graceful disconnects, and dispatch
+  probes. Relay teardown still drains captured transports.
+- A Windows integration regression repeatedly launches real console descendants
+  under both capture modes while observing `OpenConsole.exe` and foreground
+  state. Standalone ssh-manager tests and the complete agent-dispatch suite pass.
+
+### 2026-09-03 - Durable invariant follow-up
+- A later periodic-SSH regression showed that the existing unit assertion
+  incorrectly credited `CREATE_NEW_CONSOLE + SW_HIDE` as headless. Default
+  Terminal still surfaced the delegated console.
+- #1940 extends the guard from agent-procutil adopters to canonical shared
+  libraries, makes it a required CI gate, and promotes the live Windows
+  validation matrix into the patterns and contribution guidance.
+- The expanded guard immediately caught two direct `CREATE_NO_WINDOW` references
+  in agent-dispatch's compatibility layer; those now reuse
+  `agent_procutil.no_window_flags()`, demonstrating that the guard closes real
+  drift rather than documenting an already-perfect baseline.
+- Review then closed two further enforcement holes: aliased/numeric flag
+  constants and divergent vendored library copies are now scanned directly, and
+  vendored synchronization itself is required in CI and pre-push.
+- A second review extended coverage to shipped plugin scripts and annotated
+  constants, and made the exception syntax fail closed: it must be an actual
+  inline comment with a non-empty reason.
+
+### 2026-09-04 - agent-worktrees status-loop residual
+- A one-hour Windows process trace attributed repeated short-lived console
+  allocations to the resident `agent-worktrees status-monitor`: each `psmux`
+  probe launched beneath the consoleless `pythonw` daemon allocated its own
+  `conhost`.
+- A controlled comparison over 20 real `psmux list-sessions` cycles reproduced
+  20 descendant `conhost` processes with `pythonw` plus per-child
+  `CREATE_NO_WINDOW`, versus one inherited hidden `conhost` when console
+  `python.exe` was the root under `CREATE_NO_WINDOW`.
+- Accepted #1974 as the status-loop containment slice. The implementation will
+  use the console-root primitive for both the resident monitor and its
+  per-session fallback, then validate multiple real periodic cycles with no
+  Default Terminal process or foreground transition.
+
+### 2026-09-04 - agent-worktrees status-loop containment landed
+- PR #1980 merged the console-root launch path for both status loops, removed
+  the process-wide child-spawn monkeypatch, and shipped agent-worktrees
+  `1.5.5-dev2`.
+- The focused Windows lane downloads a checksum-pinned psmux release, starts a
+  real session, exercises the production daemon spawn seam, and rejects visible
+  terminal windows, focus transitions, repeated console hosts, incomplete
+  process snapshots, and leaked probe processes.
+- The reusable Windows launch pattern now distinguishes fully detached
+  `pythonw` daemons from daemons with recurring console descendants that need
+  one inherited hidden console.
+
+### 2026-09-04 - recurring service descendants
+- Live process inspection found an agent-bridge-owned `ssh.exe` tree whose
+  stale container `ProxyCommand` launched `docker.exe` directly, plus recurring
+  agent-dispatch Python children rooted beneath consoleless daemons.
+- #2028 introduced the container loopback broker, but deployment and follow-up
+  validation exposed the same root-launch mistake in the broker, bridge daemon,
+  and dispatch supervisor: recurring console descendants were still parented by
+  detached `pythonw.exe`.
+- #2037 carries the coordinated correction: hidden-console daemon roots,
+  explicit no-window flags on captured children, and a headless Docker installer
+  probe, followed by multi-cycle Windows validation.
+
+### 2026-09-09 - relocatable venv trampoline residual
+- Live Windows process-tree capture on a detached `agent-dispatch` coordinator
+  and `agent-mcp` serve host showed the shared `windowless_python()` fix from
+  #973 still leaving a console-subsystem child in the tree under `uv`-managed
+  runtimes: the venv-local `Scripts\pythonw.exe` was a relocatable trampoline,
+  not the final interpreter.
+- `pyvenv.cfg` on those runtimes recorded a base install whose real
+  `pythonw.exe` sat alongside the console `python.exe`; the trampoline re-execed
+  the base interpreter without our detached/windowless flags, so Default
+  Terminal surfaced a fresh visible terminal window for the child.
+- #2334 tracks the residual publicly. The fix extends shared `agent-procutil`
+  to read `pyvenv.cfg` and prefer the base install's own `pythonw.exe` when it
+  exists, then re-vendors the byte-identical helper across every consuming
+  plugin.
+
+### 2026-09-09 - audit hardening + live agent-mcp confirmation
+- A repo-wide Windows Python-launch audit against the launch-kind matrix found
+  two additional short-lived captured interpreter launches in `agent-index`
+  that still used bare `subprocess.run(sys.executable, ...)`: the management
+  governance checker and the LanceDB FTS rebuild worker. Both now route through
+  `agent_procutil.no_window_kwargs()`; the other Python-launch hits were either
+  foreground/non-background probes or already used the approved shared
+  primitives.
+- Live validation on this Windows host reinstalled the local `agent-mcp`
+  checkout, warmed a uv-managed bridge runtime, killed the first spawned
+  `agent_mcp serve` host, and forced a lazy respawn. In both the initial spawn
+  and the respawn, the live serve process was the uv base install's real
+  `pythonw.exe` with no console `python.exe` child beneath it, confirming the
+  trampoline layer is now skipped instead of delegated to Default Terminal.

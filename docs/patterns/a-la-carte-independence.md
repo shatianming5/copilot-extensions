@@ -2,9 +2,11 @@
 
 **Serves:** *Vision plugin-services* §Features/`a-la-carte-installability`,
 `graceful-composition`, `self-contained-runtime`; §Behaviors/`standalone-reachability`,
-`degrade-gracefully`; §Non-Goals/`no-mandatory-central-coordinator`.
+`degrade-gracefully`; §Non-Goals/`no-mandatory-central-coordinator`;
+§Concepts & Components/`Plugin-stack tier`, `Claim provider`.
 **Exemplars:** agent-mcp (standalone), agent-bridge ↔ agent-codespaces /
-agent-containers (provider-manifest registry).
+agent-containers (provider-manifest registry), agent-worktrees ↔
+agent-dispatch / agent-codespaces / agent-containers (claim-provider registry).
 
 ## Problem
 
@@ -51,19 +53,65 @@ absolute-command manifest is the only seam that survives. Two rules keep it clea
   suite-wide warning, provenance, reconciliation, and doctor rules are the
   [`drop-in-registry-hygiene`](drop-in-registry-hygiene.md) pattern.
 
+**The plugin-stack layering rule.** The suite's plugins sit in one explicit,
+ordered, one-way dependency stack (lowest to highest): agent-machines,
+agent-ssh, agent-worktrees, agent-mcp, agent-logger (optional), agent-vault
+(optional), agent-bridge, agent-codespaces/agent-containers, agent-dispatch,
+agent-index. A plugin may call **downward**, gracefully degrading if the
+lower tier is absent — it must never call **upward** directly (no ambient
+`PATH`/`shutil.which` lookup of a higher-tier sibling's binstub, no importing
+its package). Functionality a higher tier owns is exposed to a lower tier
+exclusively through a drop-in contribution registry the *lower* tier itself
+owns — the higher tier contributes a manifest into it, never the reverse.
+The provider-manifest sub-pattern above is the general shape this rule
+requires; the **claim-provider** instance below is one concrete registry
+built on it.
+
+**The claim-provider instance.** agent-worktrees (tier 3) owns the claims
+ledger (`claims add|release|settle|sweep|mirror-status|cleanup|orphans`) for
+resources a worktree can hold — a CodeSpace, a container, a dispatch task,
+... — several of which are actually owned by higher-tier plugins
+(agent-codespaces, agent-containers, agent-dispatch). Rather than
+agent-worktrees hardcoding a call to each higher-tier sibling's CLI to check
+a claim's status (an upward call, forbidden by the rule above), each
+claim-owning plugin registers as a **claim provider**: it ships a static
+`<plugin_root>/claim-providers/<namespace>.json` template in its own
+payload declaring the claim **namespace** it serves (e.g. `codespace:`,
+`container:`, `dispatch-task:`) and one or both **status-check**/
+**reclaim** callback argv templates. Unlike the bridge-provider's
+config-dir-plus-sessionStart-hook registry, agent-worktrees discovers these
+templates by scanning the **installed-plugins tree directly** (mirroring
+this same plugin's own pivot and claim-kind registries) — no separate
+registration step, since the manifest ships with, and is always current
+with, the contributing plugin's own installed version. agent-worktrees
+verifies the contributing plugin's identity, resolves the declared command
+only to that plugin's own payload-local binstub (never ambient `PATH`),
+and invokes the callback for status/reclaim — never importing the
+provider's package, never assuming its internal layout, and degrading that
+one namespace's resolution (never the whole claims command) if the
+provider is absent or its manifest is malformed.
+
 **No cross-plugin reach-around.** A plugin talks to a sibling through the sibling's
 declared surface (its CLI, its service endpoint, its resolver), never by poking the
 sibling's runtime files or assuming its internal layout.
 
-**Optional session-context composition.** `context-injection` is an optional
-coordinator, not a prerequisite for any contributor. Each context-producing
-plugin retains a payload-relative standalone path. Its producer wrapper uses
-that path until the repository proves the exact compatible
-`context-injection@copilot-extensions` authority; after proof, the producer
-joins the pair-key rendezvous and emits `{}`, while only the authority emits the
-aggregate. Missing, incompatible, ambiguous, or inactive coordination restores
-standalone behavior. Direct bootstrap and reconciliation side effects never run
-through the coordinator.
+**Version optional authorization contracts.** A provider may ask an optional
+sibling whether an owner is authorized to create shared coordination state.
+Missing commands, malformed/unversioned responses, and unknown versions behave
+as an absent peer; only an explicit rejection from a compatible version blocks
+provider work. The owner project is passed explicitly across the process
+boundary, and the check precedes local ownership and external provider side
+effects. A compatible rejection exits agent-codespaces with `78`; agent-bridge
+treats that value as a bounced dispatch rather than a degradable bookkeeping
+error. See
+[`state-root-bound coordination`](state-root-coordination.md).
+
+**Session guidance remains plugin-local.** Each plugin projects its own static
+pointer and writes its own exact-session guidance file without requiring a
+sibling coordinator. Direct bootstrap and reconciliation side effects remain
+owned by that plugin. If a supported host later proves native composition of
+independent `additionalContext` outputs, plugins may activate their own direct
+contributors without adding a cross-plugin authority.
 
 ## Rationale
 
@@ -79,3 +127,5 @@ whose absence would break everyone.
   (communication paths, provider-manifest registry)
 - Hygiene contract:
   [`drop-in-registry-hygiene.md`](drop-in-registry-hygiene.md)
+- Coordination authorization:
+  [`state-root-coordination.md`](state-root-coordination.md)

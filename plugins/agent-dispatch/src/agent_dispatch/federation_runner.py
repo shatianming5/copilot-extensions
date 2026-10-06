@@ -22,14 +22,16 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from . import config
 from .federation import CoordinatorRendezvous
 from .lease import CoordinatorLease
+from .satellites import ROLE_SATELLITE
 
 if TYPE_CHECKING:
     from .federation import Rendezvous
+    from .satellite_work_intake import SatelliteWorkIntake
 
 
 # -- rendezvous factories ----------------------------------------------------
@@ -57,6 +59,20 @@ def local_rendezvous(url: str | None = None, *, token: str | None = None) -> Coo
     return build_rendezvous(url or config.client_url(), token=token or config.client_token())
 
 
+def rendezvous_from_config() -> Rendezvous | None:
+    """The rendezvous for whichever backend ``AGENT_DISPATCH_FEDERATION_BACKEND``
+    selects (``gateway`` default -> :func:`hosted_rendezvous`; ``devtunnels`` ->
+    the Phase-4 Dev Tunnels backend), or ``None`` when that backend isn't
+    configured/reachable. Kept separate from :func:`hosted_rendezvous` so a
+    caller that specifically wants the Gateway backend (e.g. a test) is
+    unaffected by the backend selector."""
+    if config.federation_backend() == "devtunnels":
+        from .devtunnel_rendezvous import devtunnel_rendezvous
+
+        return devtunnel_rendezvous()
+    return hosted_rendezvous()
+
+
 # -- the runner --------------------------------------------------------------
 
 
@@ -70,7 +86,14 @@ class FederationRunner:
       are the active coordinator or a standby (discovery, not election), so the
       *reported* role is the lease outcome, not the static config hint.
     * **presence-only** node (role ``peer`` / ``satellite``) -- register once, then
-      heartbeat; if our entry was TTL-reaped between beats, re-register.
+      heartbeat; if our entry was TTL-reaped between beats, re-register. A
+      ``satellite`` additionally pushes its own live embodiment status (worktrees
+      + per-worktree activity, sourced only from this machine's local bridge
+      sessions -- see :func:`agent_dispatch.tracking.satellite_status_snapshot`)
+      on every register/heartbeat, and is gated: while
+      :func:`agent_dispatch.config.satellite_gate_open` is ``False`` (the
+      default), it never registers at all, and withdraws immediately if the
+      gate closes mid-session (see the ``satellite-agent-exposure`` effort).
 
     :meth:`discover_coordinator` / :meth:`discover_peers` expose the directory reads
     peers use to route claims through the pinned coordinator.
@@ -101,6 +124,9 @@ class FederationRunner:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lease: CoordinatorLease | None = None
+        self._work_intake: SatelliteWorkIntake | None = None
+        self._work_intake_url: str | None = None
+        self._work_intake_client: Any | None = None
         if role in config.FEDERATION_LEASE_ROLES:
             lease_kwargs = {} if lease_ttl is None else {"lease_ttl": lease_ttl}
             self._lease = CoordinatorLease(
@@ -129,15 +155,54 @@ class FederationRunner:
                 "epoch": state.epoch,
                 "is_active": state.is_active,
             }
+        if self._role == ROLE_SATELLITE and not config.satellite_gate_open():
+            # Outbound exposure gate closed (default): never register or
+            # heartbeat, and withdraw promptly if a registration exists --
+            # an operator closing it mid-session must take effect on the
+            # very next tick, not linger until the directory's own TTL reap
+            # (see the satellite-agent-exposure effort's security steer:
+            # exposure is opt-in, never ambient).
+            #
+            # Always ATTEMPT deregister here, never gate it on self._registered:
+            # this in-process flag only reflects what THIS runner instance did.
+            # A process restart (crash, redeploy, a fresh runner for the same
+            # stable instance id) starts with _registered=False even though a
+            # PRIOR process's registration can still be live in the directory --
+            # gating on the local flag would skip cleanup entirely in that case,
+            # leaving a stale entry exposed until TTL expiry. deregister() is
+            # idempotent (a no-op, returning False, when nothing is registered),
+            # so attempting it unconditionally is always safe.
+            self._rv.deregister(self._instance)
+            self._registered = False
+            # The gate closing must retire any live work-intake client too --
+            # otherwise its transport stays open while gated off, and
+            # reopening the gate would resume the STALE cached instance
+            # instead of picking up any config changed while closed.
+            self._close_work_intake_client()
+            self._work_intake = None
+            self._work_intake_url = None
+            return {
+                "instance": self._instance,
+                "role": self._role,
+                "epoch": 0,
+                "is_active": False,
+                "gate_state": "closed",
+            }
         # Presence-only: register once, then heartbeat (re-register if reaped).
         if not self._registered:
             self._register()
         else:
             try:
-                self._rv.heartbeat(self._instance, role=self._role)
+                self._heartbeat()
             except Exception:
                 # Entry expired between beats -> re-assert it.
                 self._register()
+        if self._role == ROLE_SATELLITE:
+            # Work-intake (Phase 3): only ever attempted once presence is
+            # asserted for this tick, and only for the satellite role -- a
+            # transient failure here must never disrupt the presence half
+            # above (see `_attempt_work_intake`'s own try/except).
+            self._attempt_work_intake()
         return {
             "instance": self._instance,
             "role": self._role,
@@ -145,14 +210,109 @@ class FederationRunner:
             "is_active": False,
         }
 
+    def _satellite_kwargs(self) -> dict:
+        """Extra register/heartbeat kwargs for a satellite role -- its live
+        embodiment status, sourced only from this machine's own local bridge
+        sessions (see :func:`agent_dispatch.tracking.satellite_status_snapshot`).
+        Empty for every other role: peers/coordinator/standby push no status."""
+        if self._role != ROLE_SATELLITE:
+            return {}
+        from .tracking import satellite_status_snapshot
+
+        worktrees, status = satellite_status_snapshot()
+        return {"worktrees": worktrees, "status": status}
+
+    def _attempt_work_intake(self) -> None:
+        """Discover + trigger a bounded number of local spawns for this
+        machine's own queued work (Phase 3 -- see
+        :mod:`agent_dispatch.satellite_work_intake`). A no-op, not an error,
+        when no shared coordinator is configured (``AGENT_DISPATCH_SHARED_URL``
+        unset): work-intake needs the shared coordinator's task queue, which
+        is a separate concern from the awareness-plane directory this
+        runner's rendezvous already talks to (and which may itself be a
+        *different* backend, e.g. Dev Tunnels).
+
+        The shared URL is re-read on **every** tick, not just once: an
+        operator unsetting/changing ``AGENT_DISPATCH_SHARED_URL`` at runtime
+        must disable (or repoint) work-intake on its very next tick, not
+        leave a cached client silently polling a stale/removed coordinator
+        indefinitely -- the cached :class:`SatelliteWorkIntake` is rebuilt
+        whenever the configured URL no longer matches the one it was built
+        from (including "now unset", which tears it down entirely).
+
+        Every teardown/rebuild also **closes** the previous
+        :class:`~agent_dispatch.client.DispatchClient` (its HTTP transport,
+        and any tunnel it owns): otherwise a URL that changes/clears
+        repeatedly would leak a connection per change instead of releasing
+        the old one.
+
+        Everything past the shared-URL check -- building the client, building
+        the work-intake object, and ticking it -- is one guarded block: a
+        transient coordinator/spawn error must never disrupt this tick's
+        presence half, nor kill the caller's loop (mirrors `run`'s own "a
+        transient error must not kill the loop" contract), and that guarantee
+        has to cover *construction* failures (e.g. a malformed shared
+        endpoint) exactly as much as a failure inside `tick()` itself."""
+        try:
+            url = config.shared_url()
+            if not url:
+                self._close_work_intake_client()
+                self._work_intake = None
+                self._work_intake_url = None
+                return
+            if self._work_intake is None or url != self._work_intake_url:
+                self._close_work_intake_client()
+                from .client import DispatchClient
+                from .satellite_work_intake import SatelliteWorkIntake
+
+                client = DispatchClient(url, token=config.shared_token())
+                try:
+                    self._work_intake = SatelliteWorkIntake(
+                        client,
+                        machine=self._machine or self._instance,
+                        project=config.satellite_project(),
+                        max_concurrent=config.satellite_max_concurrent(),
+                        spawn_timeout=config.satellite_spawn_timeout(),
+                        discovery_time_budget=config.satellite_discovery_timeout(),
+                        clock=self._clock,
+                    )
+                except Exception:
+                    # Never leak the just-built client if constructing the
+                    # work-intake object around it fails for any reason.
+                    client.close()
+                    raise
+                self._work_intake_client = client
+                self._work_intake_url = url
+            self._work_intake.tick()
+        except Exception:
+            pass
+
+    def _close_work_intake_client(self) -> None:
+        """Close and drop this runner's owned
+        :class:`~agent_dispatch.client.DispatchClient` (if any) -- its HTTP
+        transport (and any tunnel it owns) must not outlive the
+        :class:`SatelliteWorkIntake` it was built for. Idempotent and never
+        raises: a close failure is display-only cleanup, not a reason to
+        disrupt whatever teardown/rebuild triggered it."""
+        if self._work_intake_client is not None:
+            try:
+                self._work_intake_client.close()
+            except Exception:
+                pass
+            self._work_intake_client = None
+
     def _register(self) -> None:
         self._rv.register(
             self._instance,
             role=self._role,
             machine=self._machine,
             capabilities=self._capabilities,
+            **self._satellite_kwargs(),
         )
         self._registered = True
+
+    def _heartbeat(self) -> None:
+        self._rv.heartbeat(self._instance, role=self._role, **self._satellite_kwargs())
 
     def discover_coordinator(self) -> dict | None:
         return self._rv.discover_coordinator()
@@ -196,13 +356,30 @@ class FederationRunner:
         self._thread.start()
 
     def stop(self, *, resign: bool = True, timeout: float = 5.0) -> None:
-        """Stop the background loop and (by default) give up our directory entry."""
+        """Stop the background loop and (by default) give up our directory entry.
+
+        Closing this runner's work-intake `DispatchClient` must never race a
+        still-running tick using it: if the bounded `join()` below returns
+        while the loop thread is genuinely still alive (e.g. mid-`tick()`
+        blocked in a synchronous spawn attempt up to `spawn_timeout`), this
+        skips closing the client / clearing `_work_intake` and leaves
+        `_thread` set so a caller can `join()` again once it actually
+        exits -- never yanking a resource out from under a live in-flight
+        tick. Resigning presence (deregister/release lease) is unaffected:
+        it touches no work-intake resource."""
         self._stop.set()
+        thread_exited = True
         if self._thread is not None:
             self._thread.join(timeout=timeout)
-            self._thread = None
+            thread_exited = not self._thread.is_alive()
+            if thread_exited:
+                self._thread = None
         if resign:
             self.resign()
+        if thread_exited:
+            self._close_work_intake_client()
+            self._work_intake = None
+            self._work_intake_url = None
 
     def resign(self) -> None:
         """Give up this node's standing: release the lease (eligible) or deregister
@@ -216,22 +393,40 @@ class FederationRunner:
                 self._registered = False
 
 
+def satellite_self_status(role: str | None, instance: str | None) -> dict:
+    """This node's own role/instance/gate-state, for the CLI's ``federation
+    status self`` section -- distinct from the peer-visible directory entry,
+    since a gate-closed satellite never registers at all (see the
+    satellite-agent-exposure effort's Phase 2)."""
+    info: dict = {"role": role, "instance": instance}
+    if role == ROLE_SATELLITE:
+        info["gate_state"] = "open" if config.satellite_gate_open() else "closed"
+    return info
+
+
 def runner_from_config(rendezvous: Rendezvous | None = None) -> FederationRunner | None:
     """Build a :class:`FederationRunner` from the environment, or ``None`` when
     federation is not enabled (no valid ``AGENT_DISPATCH_FEDERATION_ROLE``).
 
-    Uses the hosted rendezvous (:func:`hosted_rendezvous`) unless one is passed
-    in; raises :class:`RuntimeError` if federation is enabled but no directory URL
-    is reachable, so a misconfiguration fails loud rather than silently idling."""
+    Uses whichever backend ``AGENT_DISPATCH_FEDERATION_BACKEND`` selects
+    (:func:`rendezvous_from_config`) unless a rendezvous is passed in directly;
+    raises :class:`RuntimeError` if federation is enabled but the selected
+    backend's directory isn't reachable/configured, so a misconfiguration fails
+    loud rather than silently idling."""
     role = config.federation_role()
     if role is None:
         return None
     instance = config.federation_instance()
     if not instance:
         raise RuntimeError("federation enabled but no instance id could be resolved")
-    rv = rendezvous if rendezvous is not None else hosted_rendezvous()
+    rv = rendezvous if rendezvous is not None else rendezvous_from_config()
     if rv is None:
-        raise RuntimeError(
-            "federation enabled but no AGENT_DISPATCH_SHARED_URL (hosted coordinator) configured"
+        backend = config.federation_backend()
+        reason = (
+            "no AGENT_DISPATCH_SHARED_URL (hosted coordinator) configured"
+            if backend == "gateway"
+            else f"backend {backend!r} could not be constructed"
         )
+        raise RuntimeError(f"federation enabled but {reason}")
     return FederationRunner(rv, instance, role=role, machine=instance)
+

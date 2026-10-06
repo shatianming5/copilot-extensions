@@ -5,10 +5,19 @@
 
 ## Status
 
-**Non-operative foundation.** The reviewed contract, cross-platform resolver,
-immutable runtime-slot ownership, and immutable build-completion publication are
-in place before the installation root becomes operative. Phase 2 payload-local
-shims continue using legacy runtime roots.
+**Command-only and service-bearing exemplars operative on the accepted Linux
+arm; Agent Machines repair/release and uninstall implemented and accepted.**
+The reviewed contract, cross-platform resolver, immutable runtime-slot
+ownership/completion/cutover, Agent Machines payload/runtime flow, and Agent
+Index service/runtime implementation are in place. Each path may use only its
+own already-active validated cell; absent/false policy remains legacy. Agent
+Index passed its full Linux lifecycle. Windows clean-room arms are waived for
+this effort; deterministic PowerShell parity remains required. Issue
+[#2122](https://github.com/ThomasMichon/copilot-extensions/issues/2122) supplies
+receipt-only reservation release, derived-only repair, and state-preserving
+removal of all owned historical slots and snapshots. The full Linux Agent
+Machines scenario passes phase 0's fixture check plus all eight numbered
+stages.
 
 ## Goals
 
@@ -21,8 +30,9 @@ shims continue using legacy runtime roots.
   remote execution, and uninstall.
 - Make a missing or conflicting context fail closed instead of selecting a
   legacy root or same-named command.
-- Prove the contract with two simultaneous cells containing the same plugin name
-  and version on Windows and Linux/WSL.
+- Prove the contract with two simultaneous Linux/WSL cells containing the same
+  plugin name and version, and preserve deterministic PowerShell parity for the
+  waived Windows clean-room arm.
 
 ## Non-goals
 
@@ -481,13 +491,13 @@ uninstall behavior.
   immutable snapshot and stable cell identity while rejecting generation
   regression, so update and state transitions do not strand rollback slots.
 - Python and PowerShell publication use a reserved hidden sibling outside
-  `versionsRoot` and an OS-native atomic no-replace rename. Interrupted hidden siblings
-  are inert, remain outside canonical slot enumeration, and require explicit
-  reconciliation. Bash uses atomic final-slot `mkdir` reservation followed by
-  no-replace hard-link marker publication from within the reserved slot.
-  Ordinary failures remove their still-empty owned reservation; an interruption
-  between those steps leaves a markerless slot that remains untouched and fails
-  closed pending explicit repair/release.
+  `versionsRoot`, publish reservation evidence there, and use an OS-native atomic
+  no-replace rename. Interrupted hidden siblings are inert and remain outside
+  canonical slot enumeration. Bash uses atomic final-slot `mkdir`, publishes
+  reservation evidence as its first entry, then no-replace hard-link ownership
+  publication. Successful ownership publication removes reservation evidence.
+  Receipt-only interruptions require explicit release; legacy markerless slots
+  and mixed reservation/ownership evidence remain protected.
 - Results distinguish attributable ownership from lifecycle readiness with
   `namespaceState`, `installState`, and `slotEmpty`. Runtime versions remain
   immutable build identities; conflicting slots await a separate explicit
@@ -605,10 +615,63 @@ uninstall behavior.
 - Rollback explicitly selects only a completed historical slot owned by the
   same `install.json` and compare-and-swaps from the observed current version.
   After selection, both runtime markers name that rollback target.
-- Repair recreates only artifacts whose ownership receipt matches.
-- Uninstall validates the namespace and plugin receipt immediately before every
-  destructive step. It never removes the namespace or repo state merely because
-  the last payload is absent.
+- Interrupted runtime reservations become releasable only through a new
+  `.runtime-slot-reservation.json` receipt. Python and PowerShell publish it in
+  the hidden sibling before the no-replace rename; Bash publishes it as the
+  first entry immediately after the final-slot `mkdir` reservation. The Bash
+  directory may therefore be filesystem-visible briefly, but it remains inert
+  and ineligible for attributable enumeration or reconciliation until the
+  receipt is durably published. The receipt mirrors the immutable ownership
+  identity: marketplace/plugin/source identity, canonical runtime root/version,
+  snapshot id/root/provenance digest, canonical namespace/install receipt paths
+  and generations, a non-negative reservation generation, and an RFC3339 UTC
+  creation time.
+- Successful ownership publication replaces the reservation receipt with
+  `.runtime-slot-ownership.json`. Existing markerless hidden or final
+  reservations remain protected: absence of the reservation receipt is never
+  proof of ownership or permission to delete.
+- The shared Python, dependency-light Bash, and PowerShell primitives expose
+  `slot-release` (the release half of the repair/release lifecycle). It requires
+  explicit context, marketplace/plugin ids, runtime version, reservation
+  generation, current namespace/install generations, and durable home. The exact
+  reservation root and SHA-256 of the caller-observed receipt pin target and
+  receipt identity. Under
+  the marketplace genesis lock and plugin install lock it revalidates the
+  receipt and target immediately before deletion.
+- `slot-release` removes only a slot containing the exact matching reservation
+  receipt and no other entries. It refuses completed, selected, last-known-good,
+  non-empty, markerless, malformed, linked/reparse, foreign, generation-drifted,
+  or receipt-replaced targets. Matching replay after release is idempotent.
+- Agent Machines exposes `cell-repair` as an explicit installer action requiring
+  caller-supplied context, marketplace id, payload root/version, snapshot id,
+  runtime version, receipt generations, and an exact current-selection CAS.
+  Both current and LKG expectations are explicit. Ambient context never
+  authorizes repair.
+- Repair is derived-only. It may recreate missing or invalid
+  `deploy-manifest.json` and Agent Machines cell-local launch metadata only
+  from a validated completed slot, snapshot, payload, and receipt chain. It may
+  restore `current-version` and `last-known-good` only when the caller supplies
+  the exact intended runtime and the current-selection CAS still matches under
+  both locks. It never rewrites payload/snapshot contents, ownership or
+  completion receipts, state/run/log/cache data, services, tasks, endpoints, or
+  external machine resources. A missing immutable completion receipt is a
+  refusal, not repairable evidence.
+- Agent Machines exposes `cell-uninstall` as an explicit installer action
+  requiring caller-supplied context, marketplace id, receipt generations, and
+  exact current/LKG expectations, with payload/snapshot/runtime identity for the
+  selected completed target. Ambient context never authorizes uninstall.
+- Uninstall acquires the same two locks and revalidates `namespace.json`,
+  `install.json`, canonical roots, generations, and the exact target immediately
+  before every destructive step. It clears current and LKG markers by CAS,
+  removes every validated owned runtime slot and snapshot, then removes derived
+  deploy/launcher/run/log/cache artifacts.
+- Uninstall preserves `state/`, `install.json`, `namespace.json`, and the plugin
+  directory structure required to retain attribution. It refuses every foreign,
+  malformed, linked/reparse, markerless, non-empty-unattributable, active, or
+  otherwise unvalidated artifact rather than partially claiming it.
+- Repeated repair returns already healthy; repeated uninstall returns preserved
+  when only durable state and receipts remain. Generation or selection drift
+  returns revalidation required without deleting the drifted target.
 - Namespace garbage collection is a separate explicit management operation and
   acts only on attributable, inactive cells.
 - Existing installations do not switch to cell mode merely because an exemplar
@@ -646,7 +709,23 @@ exact installer payload root and version. Completion reads the build evidence
 from that canonical slot. Ambient context is not authorization, and these
 adapter actions do not complete the operative exemplar slice.
 
-### Service-bearing: agent-index
+The operative payload dispatcher evaluates installation-mode governance before
+runtime resolution. Absent/false policy preserves the legacy root; an active
+validated Agent Machines activation selects only its cell-local runtime.
+Requested-only, malformed, foreign, maintenance, orphaned, and stale evidence
+never falls back to legacy. First use and bootstrap reconciliation may snapshot,
+build, complete, and cut over only after that active proof; neither path writes
+activation. A fixed-identity `slot-cutover` adapter selects a completed current
+or historical slot under receipt-generation and current-marker CAS, covering
+update and rollback without adding repair or uninstall behavior. Its schema-4
+deploy manifest records reconciled payload provenance separately from active
+runtime selection: historical rollback preserves the former and changes the
+latter, so bootstrap leaves the rollback selected until a different payload
+provenance requires forward reconciliation. Snapshot publication stages into an
+owned sibling and retries may reclaim only a marker-proven, unproven
+interruption.
+
+### Service-bearing: agent-index (implementation-ready; acceptance pending)
 
 agent-index was the first payload-invocation pilot and has strong clean-room and
 cutover coverage. It proves:
@@ -670,6 +749,33 @@ Its pre-activation adapter has the same explicit authorization, ownership, and
 completion boundary as Agent Machines, including exact snapshot payload
 root/version matching. It does not build the runtime or mutate service, engine,
 task/unit, endpoint, current/LKG, or activation identity.
+
+The implementation-ready payload dispatcher applies installation-mode governance
+before runtime resolution. An active validated Agent Index cell selects only
+its cell-local runtime and qualifies durable state, run/routing, logs, cache,
+configuration, launchers, and engine roots beneath that installation. Service
+launch uses an installation-local launcher and an OS-assigned loopback endpoint;
+it publishes no generic systemd unit, scheduled task, or machine-global command.
+Cell provisioning carries snapshot provenance through immutable slot ownership
+and completion before marker cutover, and schema-4 deploy manifests keep
+reconciled payload provenance separate from the selected runtime so historical
+rollback does not masquerade as a payload downgrade.
+
+Marker CAS and manifest publication are joined by an installation-scoped
+transaction receipt. Bootstrap/retry can finish a validated target or restore
+the prior selection after interruption, including historical rollback.
+Governance is rechecked immediately before marker cutover and before service
+reconciliation. A passive daemon publishes only its per-instance ownership
+receipt until the new route selects it and an exact-instance,
+transaction-authorized promotion starts task adoption and publishes active
+evidence. Namespaced deploy/recovery is therefore reachable only through the
+cell transaction; successful and recovered cutovers reconcile exact owned
+instance receipts until one installation PID remains.
+
+The clean-room-only restriction is an operational rollout policy: namespaced
+Agent Index lifecycle is exercised only in disposable fixtures until both
+acceptance arms pass. It is not a host-detection security boundary, and the
+implementation does not rely on a spoofable "clean room" marker.
 
 ## Delivery slices
 
@@ -724,6 +830,12 @@ other platform still derives a different marketplace id or root.
 | Historical completion validation after receipt advance | Same immutable slot remains attributable; generation regression fails |
 | One cell updates or rolls back | Other runtime/service remains unchanged and available |
 | Receipt changes during mutation | Generation check restarts; stale writer cannot overwrite |
+| Crash after marker CAS or before/after manifest publication | Transaction retry finishes the validated target or restores the exact prior selection |
+| Governance changes before cutover or service reconcile | Completed target stays inert; selection/service remain or return to the prior owned state |
+| Passive, flipped, draining, or committed cutover crash | Installer recovery converges to one ownership-attested installation PID |
+| Ordinary namespaced payload invokes deploy/recover | Rejected without the live cell transaction id and random token |
+| Stale same-cell control endpoint | Routing PID/version and exact instance token mismatch is rejected before control |
+| Two waiters reclaim one stale install lock | One atomically claims a tombstone; neither can delete the other's new lock |
 | Service runs while receipt/payload updates | Service keeps its pinned immutable slot |
 | Payload disappears | Cell remains attributable and inert |
 | Uninstall with mismatched receipt | Refuses every destructive action |

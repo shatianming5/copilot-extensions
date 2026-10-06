@@ -31,6 +31,8 @@ param(
     [ValidateSet('install', 'uninstall', 'start', 'stop', 'status', 'update', 'stamp', 'provision')]
     [string]$Action = 'status',
 
+    [string]$InstallDir,
+
     [switch]$Purge,
 
     # Opt-in: run the daemon "whether the user is logged on or not" (a headless
@@ -46,11 +48,39 @@ param(
     # automatically (invariant #1), so this opt-in is no longer required. The switch
     # is still ACCEPTED (so existing callers, e.g. the launch-path reconciler, don't
     # break) but has no effect; it will be removed in a later cleanup.
-    [switch]$ZeroDowntime
+    [switch]$ZeroDowntime,
+
+    # Preview mode for the 'uninstall' action: print what WOULD be removed (or
+    # preserved) without touching the filesystem, scheduled task, or registry.
+    # No other action honors this switch.
+    [switch]$DryRun
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+
+# === install-contract:test-persistent-environment -- keep byte-identical across installers ===
+function Get-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    return [Environment]::GetEnvironmentVariable($Name, $effectiveTarget)
+}
+
+function Set-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [AllowNull()][string]$Value,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    [Environment]::SetEnvironmentVariable($Name, $Value, $effectiveTarget)
+}
+# === end install-contract:test-persistent-environment ===
 
 # === install-contract:v4 self-stage -- keep byte-identical across plugins ===
 # dotfiles #935: a plugin installer reads its own payload (src/, libs/,
@@ -219,6 +249,108 @@ function Write-Fail { param([string]$Msg) Write-Host "  [FAIL] $Msg" -Foreground
 function Write-Step { param([string]$Msg) Write-Host "  ...    $Msg" -ForegroundColor DarkGray }
 function Write-Warn { param([string]$Msg) Write-Host "  [WARN] $Msg" -ForegroundColor Yellow }
 
+. (Join-Path $PSScriptRoot 'installer-engine.ps1')
+
+Set-Item -Path Function:Ensure-UvShared -Value ${function:Ensure-Uv}
+Set-Item -Path Function:Invoke-UvPipInstallResilientShared -Value ${function:Invoke-UvPipInstallResilient}
+Set-Item -Path Function:Invoke-UvVenvResilientShared -Value ${function:Invoke-UvVenvResilient}
+Set-Item -Path Function:New-SignedVenvShared -Value ${function:New-SignedVenv}
+Set-Item -Path Function:Write-DeployManifestShared -Value ${function:Write-DeployManifest}
+
+# Stable, documented contract (ThomasMichon/copilot-extensions#5066): a file
+# containing a single epoch-seconds expiry, present for the duration of a
+# live-service update/start lifecycle -- any downstream consumer (a local
+# liveness watchdog, a diagnostic tool) can check its content without
+# needing any plugin-specific caller-side wrapping. $UpdateMarker itself is
+# set once $InstallDir is finalized below; these two functions only
+# reference it at call time, so defining them here is safe.
+#
+# Process-local: true once THIS invocation holds a refcount slot.
+$script:UpdateMarkerHeld = $false
+
+# Reference-counted, not single-owner: Invoke-Update holding the marker for
+# a long cutover and a separate, brief Invoke-Start both legitimately want
+# it live at once, and a single-owner/last-writer-wins scheme would let the
+# SHORT invocation's own exit delete the marker while the LONG one is still
+# mid-transition -- the marker must stay present until every concurrent
+# holder has released its own slot, not just the most recent one. A named
+# System.Threading.Mutex (the standard cross-process lock primitive on
+# Windows -- `flock` has no equivalent here) makes increment/decrement
+# atomic across processes.
+#
+# `New-Item -Force` the parent directory first: on a fresh or deleted
+# install root, $InstallDir itself may not exist yet at the point either
+# live-service lifecycle starts (its own provisioning step is what would
+# normally create it) -- the marker must not fail BEFORE that provisioning
+# ever gets a chance to run.
+function Get-UpdateMarkerMutex {
+    $name = 'Local\' + ($UpdateMarker -replace '[^a-zA-Z0-9]', '_') + '_refcount'
+    return New-Object System.Threading.Mutex($false, $name)
+}
+function Write-UpdateMarker {
+    param([int]$TtlSeconds = $UpdateMarkerTtlDefault)
+    if ($script:UpdateMarkerHeld) { return }
+    New-Item -ItemType Directory -Force -Path (Split-Path $UpdateMarker -Parent) | Out-Null
+    $countPath = "$UpdateMarker.refcount"
+    $mutex = Get-UpdateMarkerMutex
+    $acquired = $false
+    try {
+        $acquired = $mutex.WaitOne(10000)
+        $count = 0
+        if (Test-Path $countPath) {
+            $raw = Get-Content -Path $countPath -Raw -ErrorAction SilentlyContinue
+            if ($raw) { [int]::TryParse($raw.Trim(), [ref]$count) | Out-Null }
+        }
+        if ($count -eq 0) {
+            # First holder: stamp a fresh marker. A later joiner deliberately
+            # does NOT refresh the expiry -- the TTL is a safety-net backstop,
+            # not a per-holder renewal lease.
+            $expiry = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + $TtlSeconds
+            $tmp = "$UpdateMarker.$([Guid]::NewGuid().ToString('N'))"
+            Set-Content -Path $tmp -Value $expiry -NoNewline
+            Move-Item -Path $tmp -Destination $UpdateMarker -Force
+        }
+        $count++
+        $tmp2 = "$countPath.$([Guid]::NewGuid().ToString('N'))"
+        Set-Content -Path $tmp2 -Value $count -NoNewline
+        Move-Item -Path $tmp2 -Destination $countPath -Force
+        $script:UpdateMarkerHeld = $true
+    } finally {
+        if ($acquired) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+# Releases this invocation's own refcount slot; only the holder that takes
+# the count to zero actually removes the marker file, so it stays present
+# for the full duration of whichever concurrent transition runs longest.
+function Clear-UpdateMarker {
+    if (-not $script:UpdateMarkerHeld) { return }
+    $script:UpdateMarkerHeld = $false
+    $countPath = "$UpdateMarker.refcount"
+    $mutex = Get-UpdateMarkerMutex
+    $acquired = $false
+    try {
+        $acquired = $mutex.WaitOne(10000)
+        $count = 0
+        if (Test-Path $countPath) {
+            $raw = Get-Content -Path $countPath -Raw -ErrorAction SilentlyContinue
+            if ($raw) { [int]::TryParse($raw.Trim(), [ref]$count) | Out-Null }
+        }
+        if ($count -gt 0) { $count-- }
+        if ($count -le 0) {
+            Remove-Item -Path $UpdateMarker -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path $countPath -Force -ErrorAction SilentlyContinue
+        } else {
+            $tmp = "$countPath.$([Guid]::NewGuid().ToString('N'))"
+            Set-Content -Path $tmp -Value $count -NoNewline
+            Move-Item -Path $tmp -Destination $countPath -Force
+        }
+    } finally {
+        if ($acquired) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
 # -- Paths -------------------------------------------------------------------
 
 # #935: bound uv's per-request network wait so a hung index/download degrades to
@@ -228,14 +360,39 @@ if (-not $env:UV_HTTP_TIMEOUT) { $env:UV_HTTP_TIMEOUT = '60' }
 
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PluginDir  = (Resolve-Path (Join-Path $ScriptDir '..')).Path
-$InstallDir = Join-Path $env:USERPROFILE '.agent-bridge'
+$legacyInstallDir = [IO.Path]::GetFullPath((Join-Path $env:USERPROFILE '.agent-bridge'))
+$InstallDir = if ($InstallDir) { $InstallDir } else { $legacyInstallDir }
+$InstallDir = [IO.Path]::GetFullPath($InstallDir)
+$UpdateMarker = Join-Path $InstallDir 'update-in-progress'
+$UpdateMarkerTtlDefault = 1200  # 20 min -- generous past any observed real cutover
+$publishGlobalBinstubs = [StringComparer]::OrdinalIgnoreCase.Equals(
+    $InstallDir,
+    $legacyInstallDir
+)
+$serviceSuffix = if ($publishGlobalBinstubs) {
+    ''
+} else {
+    $serviceSha = [Security.Cryptography.SHA256]::Create()
+    try {
+        ([BitConverter]::ToString(
+            $serviceSha.ComputeHash(
+                [Text.Encoding]::UTF8.GetBytes($InstallDir.ToLowerInvariant())
+            )
+        )).Replace('-', '').Substring(0, 12).ToLowerInvariant()
+    } finally {
+        $serviceSha.Dispose()
+    }
+}
+$env:AGENT_BRIDGE_INSTALL_DIR = $InstallDir
+$env:AGENT_BRIDGE_CONFIG_DIR = $InstallDir
+$env:AGENT_BRIDGE_CONNECT_LOG = Join-Path (Join-Path $InstallDir 'logs') 'connect.log'
 $VenvDir    = Join-Path $InstallDir 'venv'
 $LocalBin   = Join-Path $env:USERPROFILE '.local\bin'
 $BinstubCmd = Join-Path $LocalBin 'agent-bridge.cmd'
 $BinstubPs1 = Join-Path $LocalBin 'agent-bridge.ps1'
 $Binstub    = $BinstubPs1   # primary entry point (shown in summaries)
 $PidFile    = Join-Path $InstallDir 'agent-bridge.pid'
-$TaskName   = 'Agent Bridge'
+$TaskName   = if ($publishGlobalBinstubs) { 'Agent Bridge' } else { "AgentBridge-$serviceSuffix" }
 $ScheduledTaskHasNotRunResult = 267011  # 0x41303 / SCHED_S_TASK_HAS_NOT_RUN
 $Port       = 9280
 $RelayPort  = 9857   # integrated credential relay (in-process with the bridge)
@@ -315,25 +472,69 @@ function Get-BootstrapPython {
     return $null
 }
 
-function Invoke-NativeCapture {
-    param([Parameter(Mandatory)][scriptblock]$Command)
+function Remove-PluginBuildArtifacts {
+    param([string]$SourceDir = '')
 
-    $previousErrorAction = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    $exitCode = 1
-    $output = ''
-    try {
-        $output = (& $Command 2>&1 | Out-String -Width 4096).Trim()
-        $exitCode = $LASTEXITCODE
-    } catch {
-        $output = ($_ | Out-String -Width 4096).Trim()
-    } finally {
-        $ErrorActionPreference = $previousErrorAction
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
+        (Join-Path $PluginDir 'build'), `
+        (Join-Path $PluginDir '*.egg-info'), `
+        (Join-Path (Join-Path $PluginDir 'src') '*.egg-info')
+    $libsDir = Join-Path $PluginDir 'libs'
+    if (Test-Path -LiteralPath $libsDir) {
+        Get-ChildItem -LiteralPath $libsDir -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
+                    (Join-Path $_.FullName 'build'), `
+                    (Join-Path $_.FullName '*.egg-info'), `
+                    (Join-Path (Join-Path $_.FullName 'src') '*.egg-info')
+            }
     }
-    return [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
+    if ($SourceDir -and $SourceDir -ne $PluginDir) {
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
+            (Join-Path $SourceDir 'build'), `
+            (Join-Path $SourceDir '*.egg-info'), `
+            (Join-Path (Join-Path $SourceDir 'src') '*.egg-info')
+    }
+}
+
+function Invoke-UvPipInstallResilient {
+    param(
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [string]$SourceDir = ''
+    )
+
+    Remove-PluginBuildArtifacts -SourceDir $SourceDir
+    $delays = @(3, 6, 10)
+    $out = & uv pip install @Arguments 2>&1
+    $exit = $LASTEXITCODE
+    if ($exit -eq 0) { Remove-PluginBuildArtifacts -SourceDir $SourceDir }
+    foreach ($delay in $delays) {
+        if ($exit -eq 0 -or -not (Test-IsSreModuleMismatch ($out | Out-String))) { break }
+        Write-Warn "uv build hit a transient SRE module mismatch (shared Python cache race, #6785) -- retrying in ${delay}s"
+        Start-Sleep -Seconds $delay
+        Remove-PluginBuildArtifacts -SourceDir $SourceDir
+        $out = & uv pip install @Arguments 2>&1
+        $exit = $LASTEXITCODE
+        if ($exit -eq 0) { Remove-PluginBuildArtifacts -SourceDir $SourceDir }
+    }
+    return [pscustomobject]@{ Output = $out; ExitCode = $exit }
+}
+
+function Invoke-UvVenvResilient {
+    param(
+        [Parameter(Mandatory)][string]$VenvDir,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [string]$UvCommand = 'uv'
+    )
+
+    return (Invoke-UvVenvResilientShared -VenvDir $VenvDir -Arguments $Arguments -UvCommand $UvCommand)
 }
 
 function Ensure-Uv {
+    if (-not ($env:AGENT_BRIDGE_UV_BOOTSTRAP_URL -or $env:AGENT_BRIDGE_UV_BOOTSTRAP_SHA256)) {
+        return [bool](Ensure-UvShared -InstallRoot $InstallDir -ToolDirectory 'tool' -AcquireIfMissing $true)
+    }
+
     $existing = Get-Command uv -CommandType Application -ErrorAction SilentlyContinue
     if ($existing) {
         $result = Invoke-NativeCapture { & $existing.Source --version }
@@ -523,7 +724,16 @@ function Get-VersionedCurrent {
     $vr = Join-Path $ScriptDir 'versioned_runtime.py'
     $py = if (Test-Path $LinkPython) { $LinkPython } elseif (Test-Path $VenvPython) { $VenvPython } else { $null }
     if (-not $py) { return '' }
-    $out = & $py $vr --root $InstallDir --link-name 'venv' current 2>$null
+    # versioned_runtime.py routinely writes a "no pyvenv.cfg" notice to stderr
+    # when the 'venv' link is absent/legacy; under $ErrorActionPreference='Stop'
+    # that becomes a terminating error even with a 2>$null redirect.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $py $vr --root $InstallDir --link-name 'venv' current 2>$null
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
     return ("$out").Trim()
 }
 
@@ -610,7 +820,7 @@ function Enter-InstallLock {
        another install held it the whole window -- the caller then DEFERS (the
        in-flight install lands the version). A non-contention error degrades to
        "proceed WITHOUT the lock" so a lock fault can never wedge the installer. #>
-    param([int]$TimeoutSec = 150)
+    param([int]$TimeoutSec = 300)
     if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null }
     $lockPath = Join-Path $InstallDir '.install.lock'
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
@@ -819,42 +1029,14 @@ function Get-SignedBasePython {
 }
 
 function New-SignedVenv {
-    <# Create or rebuild $VenvDir so its python.exe is SAC-trusted. Prefers a
-       signed base Python via `--copies`; rebuilds an existing unsigned venv;
-       falls back to uv (unsigned) when no signed Python exists. Returns $true
-       if $VenvPython is present afterward. #>
-    # #935: toss an INCOMPLETE prior slot first so we never `uv venv
-    # --allow-existing` over a half-built corpse (the current/active slot is
-    # never tossed). No-op in legacy mode.
     Invoke-VersionedSlotClean
-    if ((Test-Path $VenvPython) -and ($env:OS -eq 'Windows_NT')) {
-        $sig = try { (Get-AuthenticodeSignature $VenvPython).Status } catch { 'Unknown' }
-        if ($sig -ne 'Valid' -and (Get-SignedBasePython)) {
-            Write-Step 'Existing venv python is unsigned (Smart App Control-incompatible) -- rebuilding from signed Python'
-            try { Remove-Item -Recurse -Force $VenvDir -ErrorAction Stop }
-            catch { Write-Warn "Could not remove existing venv (in use?): $_" }
-        }
-    }
-    if (Test-Path $VenvPython) { return $true }
-
-    $signedBase = Get-SignedBasePython
-    if ($signedBase) {
-        & $signedBase -m venv --copies $VenvDir 2>&1 | Out-Null
-        if (Test-Path $VenvPython) {
-            Write-Ok "Venv created from signed Python ($signedBase)"
-            return $true
-        }
-        Write-Warn 'Signed-Python venv creation failed -- falling back to uv'
-    } elseif ($env:OS -eq 'Windows_NT') {
-        Write-Warn 'No signed system Python found -- using uv (unsigned). On Smart App Control machines, install python.org Python 3.10+ and re-run.'
-    }
-    $result = Invoke-NativeCapture {
-        & uv venv $VenvDir --python 3.10 --allow-existing
-    }
-    if ($result.ExitCode -ne 0) {
-        $result = Invoke-NativeCapture { & uv venv $VenvDir --allow-existing }
-    }
-    return (Test-Path $VenvPython)
+    return [bool](New-SignedVenvShared `
+        -VenvDir $VenvDir `
+        -VenvPython $VenvPython `
+        -PythonVersion '3.10' `
+        -UvCommand 'uv' `
+        -RequireSignedBase ($env:OS -eq 'Windows_NT') `
+        -AllowExisting $true)
 }
 
 # #1643: venue providers (agent-codespaces / agent-containers) are PURE
@@ -896,8 +1078,16 @@ function Remove-VendoredProviders {
         return
     }
     foreach ($py in $targets) {
-        foreach ($pkg in $pkgs) {
-            & uv pip uninstall --python $py $pkg 2>&1 | Out-Null
+        # uv writes routine progress to stderr; under $ErrorActionPreference='Stop',
+        # a 2>&1 redirect turns that into a terminating error, so relax it here.
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            foreach ($pkg in $pkgs) {
+                & uv pip uninstall --python $py $pkg 2>&1 | Out-Null
+            }
+        } finally {
+            $ErrorActionPreference = $prevEAP
         }
         # Belt-and-suspenders: drop any raw-copied package dir / dist-info left
         # behind by the retired Install-PackageInto vendoring (no uv metadata).
@@ -956,6 +1146,9 @@ function Get-RunningProcess {
     # Last resort: find by port binding (catches orphaned processes
     # whose PID file was lost or exe path changed during update). Resolve the
     # live port from active.json so a dynamic-port daemon is found too (#856).
+    if (Test-ActiveIsForward) {
+        return $null
+    }
     $conn = Get-NetTCPConnection -LocalPort (Get-ActiveEndpoint).Port -ErrorAction SilentlyContinue |
         Where-Object { $_.State -eq 'Listen' } |
         Select-Object -First 1
@@ -992,6 +1185,109 @@ function Get-ActiveEndpoint {
         } catch { }
     }
     return @{ Bind = $bind; Port = $resolved }
+}
+
+function Test-ActiveIsForward {
+    $activeJson = Join-Path $InstallDir 'active.json'
+    if (-not (Test-Path $activeJson)) { return $false }
+    try {
+        $aj = Get-Content $activeJson -Raw -ErrorAction Stop | ConvertFrom-Json
+        $active = $aj.active
+        $p = [int]($active.port)
+        if ($p -le 0) { return $false }
+        if ($active.forwarded -eq $true) { return $true }
+        $names = @($active.PSObject.Properties.Name)
+        return (($names -notcontains 'pid') -and ($names -notcontains 'generation') -and ($names -notcontains 'bind'))
+    } catch {
+        return $false
+    }
+}
+
+function Get-ActiveSignature {
+    $activeJson = Join-Path $InstallDir 'active.json'
+    if (-not (Test-Path $activeJson)) { return '' }
+    try {
+        $aj = Get-Content $activeJson -Raw -ErrorAction Stop | ConvertFrom-Json
+        $active = $aj.active
+        $p = [int]($active.port)
+        if ($p -le 0) { return '' }
+        $names = @($active.PSObject.Properties.Name)
+        $legacyForward = (
+            ($names -notcontains 'pid') -and
+            ($names -notcontains 'generation') -and
+            ($names -notcontains 'bind')
+        )
+        if (($active.forwarded -eq $true) -or $legacyForward) { return '' }
+        $pidValue = if ($names -contains 'pid') { [string]$active.pid } else { '' }
+        $generationValue = if ($names -contains 'generation') { [string]$active.generation } else { '' }
+        $bindValue = if ($names -contains 'bind') { [string]$active.bind } else { '' }
+        return "$bindValue|$p|$pidValue|$generationValue"
+    } catch {
+        return ''
+    }
+}
+
+function Test-UpdateLifecycleStillTargetsPredecessor {
+    # -AllowAbsent: after this update stopped the pinned predecessor, its graceful
+    # shutdown clears its own route, so an absent route still means "ours".
+    param([string]$Signature, [switch]$AllowAbsent)
+    if (Test-ActiveIsForward) {
+        Write-Step 'Forwarded host bridge route appeared during update -- skipping drain/stop/start'
+        return $false
+    }
+    # An empty pin is the legacy fixed-port predecessor with no route: it must
+    # stay empty. -AllowAbsent relaxes only a pinned predecessor that exited.
+    $current = [string](Get-ActiveSignature)
+    $pinned = [string]$Signature
+    if ($AllowAbsent -and $pinned -and -not $current) { return $true }
+    if ($current -ne $pinned) {
+        Write-Step 'Active route changed during update -- skipping drain/stop/start'
+        return $false
+    }
+    return $true
+}
+
+function Get-SignatureBaseUrl {
+    # The validated predecessor's own endpoint (signature "bind|port|pid|generation";
+    # empty = the fixed $Port daemon), so the drain targets exactly it and never
+    # follows a route rewritten after validation -- e.g. to a venue forward.
+    param([string]$Signature)
+    $bind = '127.0.0.1'
+    $p = $Port
+    $parts = if ($Signature) { $Signature.Split('|') } else { @() }
+    $parsed = 0
+    if ($parts.Count -ge 2 -and [int]::TryParse($parts[1], [ref]$parsed) -and $parsed -gt 0) {
+        $p = $parsed
+        if ($parts[0] -eq '::') { $bind = '::1' }
+        elseif ($parts[0] -and $parts[0] -ne '0.0.0.0') { $bind = $parts[0] }
+    }
+    if ($bind.Contains(':')) { return "http://[$bind]:$p" }
+    return "http://${bind}:$p"
+}
+
+function Invoke-UpdateDrainStop {
+    param([string]$Signature, [int]$TimeoutSec = 120)
+    if (-not (Test-UpdateLifecycleStillTargetsPredecessor -Signature $Signature)) {
+        return $false
+    }
+    Invoke-Drain -TimeoutSec $TimeoutSec -BaseUrl (Get-SignatureBaseUrl -Signature $Signature)
+    # The drain can take minutes; a venue forward may publish or bind meanwhile.
+    # Re-check right before stopping so the stop's port cleanup never kills it.
+    if (-not (Test-UpdateLifecycleStillTargetsPredecessor -Signature $Signature -AllowAbsent)) {
+        return $false
+    }
+    Invoke-Stop
+    return $true
+}
+
+function Invoke-UpdateStart {
+    param([string]$Signature, [string]$Message = 'Starting service...')
+    if (-not (Test-UpdateLifecycleStillTargetsPredecessor -Signature $Signature -AllowAbsent)) {
+        return $false
+    }
+    Write-Step $Message
+    Invoke-Start
+    return $true
 }
 
 function Test-HealthOnce {
@@ -1074,15 +1370,21 @@ function Invoke-Drain {
     # Windows pre-stop hook -- Phase 1 zero-downtime). Bounded + forced so an
     # update never blocks indefinitely. Non-fatal; the Stop that follows is the
     # backstop against the Job Object force-kill on daemon exit.
-    param([int]$TimeoutSec = 120)
+    # -BaseUrl pins the drain to that endpoint (AGENT_BRIDGE_BASE_URL overrides the
+    # routing table) instead of whatever active.json names by the time it runs.
+    param([int]$TimeoutSec = 120, [string]$BaseUrl = '')
     $bridgeExe = Join-Path $VenvDir 'Scripts\agent-bridge.exe'
     if (-not (Test-Path $bridgeExe)) { return }
     Write-Step "Draining in-flight sessions (up to ${TimeoutSec}s)..."
+    $prevBaseUrl = $env:AGENT_BRIDGE_BASE_URL
     try {
+        if ($BaseUrl) { $env:AGENT_BRIDGE_BASE_URL = $BaseUrl }
         & $bridgeExe drain --timeout $TimeoutSec --force 2>&1 | Out-Null
         Write-Ok 'Drain window complete'
     } catch {
         Write-Warn 'Drain reported busy sessions -- proceeding with swap'
+    } finally {
+        $env:AGENT_BRIDGE_BASE_URL = $prevBaseUrl
     }
 }
 
@@ -1124,65 +1426,18 @@ function Get-SourceKind {
 # === end install-contract:v3 source-kind ===
 
 function Write-DeployManifest {
-    # The manifest `venv` field records the stable `venv` link ($LinkDir), never
-    # a versions/<v> slot -- consumers resolve the runtime through the link.
-    Write-DeployManifestFor -Service 'agent-bridge' -Plugin 'agent-bridge' `
-        -InstallPath $InstallDir -PluginPath $PluginDir -VenvPath $LinkDir
-}
-
-# Unified schema_version 3 manifest writer. Self-contained per plugin (no shared
-# module -- plugins are pulled independently from the marketplace). Records the
-# source footprint (local vs marketplace) and is written atomically (temp+move).
-function Write-DeployManifestFor {
-    param(
-        [string]$Service,
-        [string]$Plugin,
-        [string]$InstallPath,
-        [string]$PluginPath,
-        [string]$VenvPath
-    )
-    $manifestPath = Join-Path $InstallPath 'deploy-manifest.json'
-    $kind = Get-SourceKind -PluginPath $PluginPath
-
-    $ver = '0.0.0'
-    $pyproj = Join-Path $PluginPath 'pyproject.toml'
-    if (Test-Path $pyproj) {
-        $verLine = Select-String -Path $pyproj -Pattern '^\s*version\s*=' | Select-Object -First 1
-        if ($verLine) { $ver = ($verLine.Line -replace '.*=\s*"([^"]+)".*','$1') }
-    }
-
-    # Git provenance only applies to a local checkout -- the marketplace vendor
-    # copy is not a git repo.
-    $commit = $null; $branch = $null; $dirty = $false
-    if ($kind -eq 'local') {
-        $gitInfo = Get-GitInfo -Path (Split-Path $PluginPath)
-        $commit = $gitInfo.commit; $branch = $gitInfo.branch; $dirty = $gitInfo.dirty
-    }
-
-    $manifest = [ordered]@{
-        schema_version = 3
-        service        = $Service
-        deployed_at    = (Get-Date -Format 'o')
-        deployed_by    = "$($env:COMPUTERNAME.ToLower())-windows"
-        source         = [ordered]@{
-            kind    = $kind
-            path    = ($PluginPath -replace '\\', '/')
-            repo    = 'copilot-extensions'
-            plugin  = $Plugin
-            version = $ver
-            commit  = $commit
-            branch  = $branch
-            dirty   = $dirty
-            content_hash = (Get-PayloadHash)
-        }
-        venv           = ($VenvPath -replace '\\', '/')
-        runtime        = 'python'
-    }
-
-    $tmp = "$manifestPath.tmp"
-    $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path $tmp -Encoding UTF8
-    Move-Item -Force -Path $tmp -Destination $manifestPath
-    Write-Ok "Deploy manifest written (source: $kind)"
+    $sourcePathOverride = if ($env:COPILOT_PLUGIN_STAGED_FROM) { $env:COPILOT_PLUGIN_STAGED_FROM } else { '' }
+    Write-DeployManifestShared `
+        -Service 'agent-bridge' `
+        -Plugin 'agent-bridge' `
+        -InstallPath $InstallDir `
+        -PluginPath $PluginDir `
+        -VenvPath $LinkDir `
+        -GetSourceKind ${function:Get-SourceKind} `
+        -GetGitInfo ${function:Get-GitInfo} `
+        -SourcePathOverride $sourcePathOverride `
+        -VersionOverride $SrcVersion `
+        -PayloadHash (Get-PayloadHash)
 }
 
 function Get-ScheduledTaskLastResult {
@@ -1339,6 +1594,15 @@ function Register-ScheduledTask_ {
 `$root = '$($InstallDir -replace "'", "''")'
 `$launchPy = ''
 try { `$_ver = ([IO.File]::ReadAllText((Join-Path `$root 'current-version'))).Trim(); if (`$_ver) { `$launchPy = Join-Path `$root ('versions\' + `$_ver + '\Scripts\python.exe') } } catch {}
+if (-not (`$launchPy -and (Test-Path -LiteralPath `$launchPy))) {
+    # #742: marker missing/stale -> prefer last-known-good (the last version
+    # activate() published) over a raw newest-slot guess, which could bind a
+    # still-installing/never-activated slot mid-swap.
+    `$_lkg = ''
+    try { `$_lkg = ([IO.File]::ReadAllText((Join-Path `$root 'last-known-good'))).Trim() } catch {}
+    if (`$_lkg) { `$launchPy = Join-Path `$root ('versions\' + `$_lkg + '\Scripts\python.exe') }
+    if (-not (`$launchPy -and (Test-Path -LiteralPath `$launchPy))) { `$launchPy = '' }
+}
 if (-not (`$launchPy -and (Test-Path -LiteralPath `$launchPy))) { `$launchPy = Get-ChildItem (Join-Path `$root 'versions') -Directory -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { Join-Path `$_.FullName 'Scripts\python.exe' } | Where-Object { Test-Path -LiteralPath `$_ } | Select-Object -Last 1 }
 `$pidFile = '$($PidFile -replace "'", "''")'
 `$logFile = Join-Path (Split-Path `$pidFile) 'agent-bridge.log'
@@ -1354,6 +1618,9 @@ if (-not (`$launchPy -and (Test-Path -LiteralPath `$launchPy))) { `$launchPy = G
 # inherits. We set both, and the scheduled task pins -WorkingDirectory too.
 `$runtimeHome = Split-Path `$pidFile
 Set-Location -LiteralPath `$runtimeHome
+[Environment]::SetEnvironmentVariable('AGENT_BRIDGE_INSTALL_DIR', `$runtimeHome, 'Process')
+[Environment]::SetEnvironmentVariable('AGENT_BRIDGE_CONFIG_DIR', `$runtimeHome, 'Process')
+[Environment]::SetEnvironmentVariable('AGENT_BRIDGE_CONNECT_LOG', (Join-Path (Join-Path `$runtimeHome 'logs') 'connect.log'), 'Process')
 
 if (Test-Path `$pidFile) {
     `$existingPid = Get-Content `$pidFile -ErrorAction SilentlyContinue
@@ -1589,6 +1856,10 @@ function Write-Binstubs {
         $rSrc = Join-Path $PSScriptRoot $r
         if (Test-Path $rSrc) { Copy-Item $rSrc (Join-Path $binDir $r) -Force }
     }
+    if (-not $publishGlobalBinstubs) {
+        Write-Ok 'Scoped install keeps the global compatibility binstub unchanged'
+        return
+    }
     $rootLit = $InstallDir -replace "'", "''"
     $ps1 = @'
 $env:PYTHONUTF8 = '1'
@@ -1600,7 +1871,7 @@ function _Resolve-Py {
     return $AgentRtPy
 }
 $_py = _Resolve-Py
-if ($_py) { & $_py -m agent_bridge @args; exit $LASTEXITCODE }
+if ($_py) { if ($MyInvocation.ExpectingInput) { $input | & $_py -m agent_bridge @args } else { & $_py -m agent_bridge @args }; exit $LASTEXITCODE }
 if ($env:AGENT_BRIDGE_NO_SELFPROVISION) { [Console]::Error.WriteLine('[agent-bridge] runtime not provisioned (AGENT_BRIDGE_NO_SELFPROVISION set).'); exit 1 }
 $_snap = ''
 try { $_snap = ([IO.File]::ReadAllText((Join-Path $_root 'payload-dir'))).Trim() } catch {}
@@ -1612,7 +1883,7 @@ $_pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
 $_exe = if ($_pwsh) { $_pwsh.Source } else { 'powershell.exe' }
 & $_exe -NoProfile -ExecutionPolicy Bypass -File $_inst provision 2>&1 | ForEach-Object { [Console]::Error.WriteLine($_) }
 $_py = _Resolve-Py
-if ($_py) { & $_py -m agent_bridge @args; exit $LASTEXITCODE }
+if ($_py) { if ($MyInvocation.ExpectingInput) { $input | & $_py -m agent_bridge @args } else { & $_py -m agent_bridge @args }; exit $LASTEXITCODE }
 [Console]::Error.WriteLine('[agent-bridge] provisioning did not yield a runtime. See the log above; retry, or run the snapshot installer manually.')
 exit 1
 '@ -replace '__ROOT__', $rootLit
@@ -1636,6 +1907,100 @@ exit /b %ERRORLEVEL%
     Write-Ok "Binstub: $BinstubPs1 (+ .cmd fallback) -- marker-routed, self-provisioning"
 }
 
+function Resolve-SnapshotInstallerEngineSource {
+    param([Parameter(Mandatory)][ValidateSet('ps1', 'sh')][string]$Ext)
+    $localEngine = Join-Path $PSScriptRoot ("installer-engine.$Ext")
+    if (Test-Path -LiteralPath $localEngine) { return $localEngine }
+    return Join-Path (Join-Path $PSScriptRoot '..\..\..\libs\installer-engine') ("installer-engine.$Ext")
+}
+
+function Materialize-SnapshotVendoredLibs {
+    param([Parameter(Mandatory)][string]$SnapshotDir)
+    $libsDir = Join-Path $SnapshotDir 'libs'
+    if (-not (Test-Path $libsDir)) { New-Item -ItemType Directory -Path $libsDir -Force | Out-Null }
+    $sources = [ordered]@{
+        'ssh-manager'          = (Resolve-SshManager)
+        'credential-relay'     = (Resolve-CredentialRelay)
+        'zdd'                  = (Resolve-Zdd)
+        'single-instance-lease'= (Resolve-SingleInstanceLease)
+        'config-migrate'       = (Resolve-ConfigMigrate)
+        'agent-procutil'       = (Resolve-VendoredLib -LibName 'agent-procutil')
+        'plugin-resolve'       = (Resolve-VendoredLib -LibName 'plugin-resolve')
+        'dropin-registry'      = (Resolve-VendoredLib -LibName 'dropin-registry')
+        'plugin-activation'    = (Resolve-VendoredLib -LibName 'plugin-activation')
+        'remote-login-shell'   = (Resolve-VendoredLib -LibName 'remote-login-shell')
+    }
+    foreach ($entry in $sources.GetEnumerator()) {
+        $source = $entry.Value
+        if (-not $source) {
+            throw "Cannot materialize stamped snapshot: required vendored library '$($entry.Key)' is unresolved."
+        }
+        $destination = Join-Path $libsDir $entry.Key
+        if ([System.IO.Path]::GetFullPath($source) -eq [System.IO.Path]::GetFullPath($destination)) {
+            continue
+        }
+        Remove-Item -LiteralPath $destination -Recurse -Force -ErrorAction SilentlyContinue
+        Copy-Item -LiteralPath $source -Destination $destination -Recurse -Force
+    }
+
+    $snapshotPyproject = Join-Path $SnapshotDir 'pyproject.toml'
+    if (Test-Path -LiteralPath $snapshotPyproject) {
+        $pyprojectText = [System.IO.File]::ReadAllText($snapshotPyproject)
+        $rewrites = [ordered]@{
+            'agent-ssh-manager'          = 'ssh-manager'
+            'agent-credential-relay'     = 'credential-relay'
+            'agent-zdd'                  = 'zdd'
+            'agent-single-instance-lease'= 'single-instance-lease'
+            'agent-config-migrate'       = 'config-migrate'
+            'agent-plugin-resolve'       = 'plugin-resolve'
+            'agent-procutil'             = 'agent-procutil'
+            'agent-dropin-registry'      = 'dropin-registry'
+            'agent-plugin-activation'    = 'plugin-activation'
+            'agent-remote-login-shell'   = 'remote-login-shell'
+        }
+        foreach ($entry in $rewrites.GetEnumerator()) {
+            $oldLine = '{0} = {{ path = "../../libs/{1}", editable = true }}' -f $entry.Key, $entry.Value
+            $newLine = '{0} = {{ path = "libs/{1}" }}' -f $entry.Key, $entry.Value
+            $pyprojectText = $pyprojectText.Replace($oldLine, $newLine)
+        }
+        [System.IO.File]::WriteAllText($snapshotPyproject, $pyprojectText, $utf8NoBom)
+    }
+
+    foreach ($entry in $rewrites.GetEnumerator()) {
+        $nestedPyproject = Join-Path (Join-Path $libsDir $entry.Value) 'pyproject.toml'
+        if (-not (Test-Path -LiteralPath $nestedPyproject)) { continue }
+        $nestedText = [System.IO.File]::ReadAllText($nestedPyproject)
+        $nestedText = $nestedText.Replace(', editable = true }', ' }')
+        [System.IO.File]::WriteAllText($nestedPyproject, $nestedText, $utf8NoBom)
+    }
+}
+
+function Materialize-SnapshotInstallerEngine {
+    param([Parameter(Mandatory)][string]$SnapshotDir)
+    $scriptsDir = Join-Path $SnapshotDir 'scripts'
+    if (-not (Test-Path $scriptsDir)) { New-Item -ItemType Directory -Path $scriptsDir -Force | Out-Null }
+    foreach ($name in @('installer-engine.ps1', 'installer-engine.sh')) {
+        $ext = [System.IO.Path]::GetExtension($name).TrimStart('.')
+        $source = Resolve-SnapshotInstallerEngineSource -Ext $ext
+        $destination = Join-Path $scriptsDir $name
+        if ([System.IO.Path]::GetFullPath($source) -ne [System.IO.Path]::GetFullPath($destination)) {
+            Copy-Item -LiteralPath $source -Destination $destination -Force
+        }
+    }
+    $installSh = Join-Path $scriptsDir 'install.sh'
+    if (Test-Path $installSh) {
+        $shText = [System.IO.File]::ReadAllText($installSh)
+        $shText = $shText.Replace('. "$SCRIPT_DIR/../../../libs/installer-engine/installer-engine.sh"', '. "$SCRIPT_DIR/installer-engine.sh"')
+        [System.IO.File]::WriteAllText($installSh, $shText, $utf8NoBom)
+    }
+    $installPs1 = Join-Path $scriptsDir 'install.ps1'
+    if (Test-Path $installPs1) {
+        $ps1Text = [System.IO.File]::ReadAllText($installPs1)
+        $ps1Text = $ps1Text.Replace('. (Join-Path $PSScriptRoot ''..\..\..\libs\installer-engine\installer-engine.ps1'')', '. (Join-Path $PSScriptRoot ''installer-engine.ps1'')')
+        [System.IO.File]::WriteAllText($installPs1, $ps1Text, $utf8NoBom)
+    }
+}
+
 function Invoke-Stamp {
     # Fast base install (#1393, snapshot slot model): copy the payload SOURCE into
     # ~/.agent-bridge/snapshots/<ver>/, record markers, and deploy the self-
@@ -1645,7 +2010,9 @@ function Invoke-Stamp {
     Write-Host ''; Write-Host '=== agent-bridge stamp (defer runtime to first use) ===' -ForegroundColor Cyan; Write-Host ''
     if (-not $SrcVersion) { Write-Fail 'Cannot stamp: no version in pyproject.toml'; exit 1 }
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    foreach ($dir in @($InstallDir, $LocalBin)) {
+    $dirs = @($InstallDir)
+    if ($publishGlobalBinstubs) { $dirs += $LocalBin }
+    foreach ($dir in $dirs) {
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     }
     $snapDir = Join-Path (Join-Path $InstallDir 'snapshots') $SrcVersion
@@ -1656,13 +2023,19 @@ function Invoke-Stamp {
     Get-ChildItem -LiteralPath $PluginDir -Force | Where-Object { $exclude -notcontains $_.Name } | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $snapTmp $_.Name) -Recurse -Force
     }
+    Materialize-SnapshotVendoredLibs -SnapshotDir $snapTmp
+    Materialize-SnapshotInstallerEngine -SnapshotDir $snapTmp
     if (Test-Path $snapDir) { Remove-Item $snapDir -Recurse -Force -ErrorAction SilentlyContinue }
     Move-Item -LiteralPath $snapTmp -Destination $snapDir -Force
     [System.IO.File]::WriteAllText((Join-Path $InstallDir 'payload-dir'), $snapDir, $utf8NoBom)
     [System.IO.File]::WriteAllText((Join-Path $InstallDir 'stamped-version'), $SrcVersion, $utf8NoBom)
     Write-Ok "Snapshot: $snapDir"
     Write-Binstubs
-    Write-Ok 'Stamped: agent-bridge binstub on PATH; runtime provisions on first use.'
+    if ($publishGlobalBinstubs) {
+        Write-Ok 'Stamped: agent-bridge binstub on PATH; runtime provisions on first use.'
+    } else {
+        Write-Ok 'Stamped: scoped runtime metadata recorded; payload-local commands provision on first use.'
+    }
 }
 
 function Invoke-Install {
@@ -1754,13 +2127,13 @@ function Invoke-Install {
         # a clean rebuild: --reinstall-package drops the installed dist and
         # --refresh-package busts uv's *build cache* (else uv serves a stale
         # cached wheel for the same version and new modules never land -- the
-        # #186 CodespaceConfigSource regression). NOTE the dist name is
-        # `ssh-manager` (renamed from the old `agent-ssh-manager`); using the old
-        # name here silently no-ops the reinstall. #177/#186
-        $sshOut = & uv pip install --python $VenvPython "$SshManagerDir" --reinstall-package ssh-manager --refresh-package ssh-manager --quiet 2>&1
-        if ($LASTEXITCODE -ne 0) {
+        # #186 CodespaceConfigSource regression). Both selectors must name the
+        # `agent-ssh-manager` distribution declared by the vendored pyproject.
+        $sshResult = Invoke-UvPipInstallResilient -SourceDir $SshManagerDir @('--python', $VenvPython, "$SshManagerDir", '--reinstall-package', 'agent-ssh-manager', '--refresh-package', 'agent-ssh-manager', '--quiet')
+        $sshOut = $sshResult.Output
+        if ($sshResult.ExitCode -ne 0) {
             $ErrorActionPreference = $prevEAP
-            Write-Fail "ssh-manager install failed (exit $LASTEXITCODE)"
+            Write-Fail "ssh-manager install failed (exit $($sshResult.ExitCode))"
             if ($sshOut) { Write-Host ($sshOut | Out-String) }
             throw 'ssh-manager install failed'
         }
@@ -1772,10 +2145,11 @@ function Invoke-Install {
     # credential-relay (the relay framework agent-bridge runs in its daemon).
     $CredRelayDir = Resolve-CredentialRelay
     if ($CredRelayDir) {
-        $crOut = & uv pip install --python $VenvPython "$CredRelayDir" --reinstall-package agent-credential-relay --refresh-package agent-credential-relay --quiet 2>&1
-        if ($LASTEXITCODE -ne 0) {
+        $crResult = Invoke-UvPipInstallResilient -SourceDir $CredRelayDir @('--python', $VenvPython, "$CredRelayDir", '--reinstall-package', 'agent-credential-relay', '--refresh-package', 'agent-credential-relay', '--quiet')
+        $crOut = $crResult.Output
+        if ($crResult.ExitCode -ne 0) {
             $ErrorActionPreference = $prevEAP
-            Write-Fail "credential-relay install failed (exit $LASTEXITCODE)"
+            Write-Fail "credential-relay install failed (exit $($crResult.ExitCode))"
             if ($crOut) { Write-Host ($crOut | Out-String) }
             throw 'credential-relay install failed'
         }
@@ -1787,10 +2161,11 @@ function Invoke-Install {
     # zdd (zero-downtime cutover primitives: routing table + orchestrator).
     $ZddDir = Resolve-Zdd
     if ($ZddDir) {
-        $zddOut = & uv pip install --python $VenvPython "$ZddDir" --reinstall-package agent-zdd --refresh-package agent-zdd --quiet 2>&1
-        if ($LASTEXITCODE -ne 0) {
+        $zddResult = Invoke-UvPipInstallResilient -SourceDir $ZddDir @('--python', $VenvPython, "$ZddDir", '--reinstall-package', 'agent-zdd', '--refresh-package', 'agent-zdd', '--quiet')
+        $zddOut = $zddResult.Output
+        if ($zddResult.ExitCode -ne 0) {
             $ErrorActionPreference = $prevEAP
-            Write-Fail "zdd install failed (exit $LASTEXITCODE)"
+            Write-Fail "zdd install failed (exit $($zddResult.ExitCode))"
             if ($zddOut) { Write-Host ($zddOut | Out-String) }
             throw 'zdd install failed'
         }
@@ -1802,10 +2177,11 @@ function Invoke-Install {
     # single-instance-lease (one active daemon per host: lease + self-retire + reaper).
     $SilDir = Resolve-SingleInstanceLease
     if ($SilDir) {
-        $silOut = & uv pip install --python $VenvPython "$SilDir" --reinstall-package agent-single-instance-lease --refresh-package agent-single-instance-lease --quiet 2>&1
-        if ($LASTEXITCODE -ne 0) {
+        $silResult = Invoke-UvPipInstallResilient -SourceDir $SilDir @('--python', $VenvPython, "$SilDir", '--reinstall-package', 'agent-single-instance-lease', '--refresh-package', 'agent-single-instance-lease', '--quiet')
+        $silOut = $silResult.Output
+        if ($silResult.ExitCode -ne 0) {
             $ErrorActionPreference = $prevEAP
-            Write-Fail "single-instance-lease install failed (exit $LASTEXITCODE)"
+            Write-Fail "single-instance-lease install failed (exit $($silResult.ExitCode))"
             if ($silOut) { Write-Host ($silOut | Out-String) }
             throw 'single-instance-lease install failed'
         }
@@ -1817,10 +2193,11 @@ function Invoke-Install {
     # config-migrate (config schema versioning + migration).
     $CfgMigrateDir = Resolve-ConfigMigrate
     if ($CfgMigrateDir) {
-        $cmOut = & uv pip install --python $VenvPython "$CfgMigrateDir" --reinstall-package agent-config-migrate --refresh-package agent-config-migrate --quiet 2>&1
-        if ($LASTEXITCODE -ne 0) {
+        $cmResult = Invoke-UvPipInstallResilient -SourceDir $CfgMigrateDir @('--python', $VenvPython, "$CfgMigrateDir", '--reinstall-package', 'agent-config-migrate', '--refresh-package', 'agent-config-migrate', '--quiet')
+        $cmOut = $cmResult.Output
+        if ($cmResult.ExitCode -ne 0) {
             $ErrorActionPreference = $prevEAP
-            Write-Fail "config-migrate install failed (exit $LASTEXITCODE)"
+            Write-Fail "config-migrate install failed (exit $($cmResult.ExitCode))"
             if ($cmOut) { Write-Host ($cmOut | Out-String) }
             throw 'config-migrate install failed'
         }
@@ -1829,8 +2206,15 @@ function Invoke-Install {
     } else {
         throw 'Cannot locate config-migrate library. Reinstall the agent-bridge plugin from the marketplace (copilot plugin install agent-bridge@copilot-extensions), then rerun this installer.'
     }
-    $bridgeOut = & uv pip install --python $VenvPython "$PluginDir" --quiet 2>&1
-    $installResult = $LASTEXITCODE
+    # --refresh-package agent-procutil: agent-procutil has no dedicated
+    # install call of its own (resolved transitively while installing
+    # agent-bridge here), so it never gets an explicit cache-bust anywhere
+    # else. uv's local-path build cache is keyed by source path, not source
+    # content -- see the matching install.sh comment / #2863 for the
+    # confirmed incident this class of gap caused.
+    $bridgeResult = Invoke-UvPipInstallResilient @('--python', $VenvPython, "$PluginDir", '--reinstall-package', 'agent-bridge', '--refresh-package', 'agent-bridge', '--reinstall-package', 'agent-procutil', '--refresh-package', 'agent-procutil', '--reinstall-package', 'agent-plugin-resolve', '--refresh-package', 'agent-plugin-resolve', '--reinstall-package', 'agent-dropin-registry', '--refresh-package', 'agent-dropin-registry', '--reinstall-package', 'agent-plugin-activation', '--refresh-package', 'agent-plugin-activation', '--reinstall-package', 'agent-remote-login-shell', '--refresh-package', 'agent-remote-login-shell', '--quiet')
+    $bridgeOut = $bridgeResult.Output
+    $installResult = $bridgeResult.ExitCode
     $ErrorActionPreference = $prevEAP
     if ($installResult -ne 0) {
         Write-Fail "Package install failed (exit $installResult)"
@@ -1889,17 +2273,23 @@ function Invoke-Install {
     Register-ScheduledTask_
 
     # Ensure ~/.local/bin is on user PATH
-    $userPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
-    if ($userPath -and $userPath -notlike "*$LocalBin*") {
-        [System.Environment]::SetEnvironmentVariable('PATH', "$LocalBin;$userPath", 'User')
+    $userPath = Get-CopilotPersistentEnvironmentVariable -Name 'PATH' -Target 'User'
+    if ($publishGlobalBinstubs -and $userPath -and $userPath -notlike "*$LocalBin*") {
+        Set-CopilotPersistentEnvironmentVariable -Name 'PATH' -Value "$LocalBin;$userPath" -Target 'User'
         $env:PATH = "$LocalBin;$env:PATH"
         Write-Ok "Added $LocalBin to user PATH"
+    } elseif (-not $publishGlobalBinstubs) {
+        Write-Ok 'Scoped install left the user PATH unchanged'
     }
 
     Write-Host ''
     Write-Ok 'agent-bridge installed'
     Write-Host "  Install dir: $InstallDir"
-    Write-Host "  Binstub:     $Binstub"
+    if ($publishGlobalBinstubs) {
+        Write-Host "  Binstub:     $Binstub"
+    } else {
+        Write-Host '  Binstub:     global compatibility wrapper unchanged (scoped install)'
+    }
     Write-Host "  Config:      agent-bridge config show"
     $__ep = Get-ActiveEndpoint
     Write-Host "  API:         http://$($__ep.Bind):$($__ep.Port)"
@@ -1959,40 +2349,61 @@ function Invoke-Provision {
 function Invoke-Uninstall {
     Write-Host ''
     Write-Host '=== agent-bridge uninstall ===' -ForegroundColor Cyan
+    if ($DryRun) { Write-Host '(dry run -- nothing will be changed)' -ForegroundColor Yellow }
     Write-Host ''
 
-    Invoke-Stop
+    if ($DryRun) {
+        $proc = Get-RunningProcess
+        if ($proc) { Write-Host "[dry-run] would stop agent-bridge (pid=$($proc.Id))" }
+        else { Write-Skip 'agent-bridge not running' }
+    } else {
+        Invoke-Stop
+    }
 
-    # Remove scheduled task
+    # Scheduled task
     $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($existing) {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-        Write-Ok 'Scheduled task removed'
-    }
-
-    foreach ($stub in @($BinstubPs1, $BinstubCmd)) {
-        if (Test-Path $stub) {
-            Remove-Item -Force $stub
-            Write-Ok "Binstub removed: $stub"
+        if ($DryRun) {
+            Write-Host "[dry-run] would remove scheduled task: $TaskName"
+        } else {
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Ok 'Scheduled task removed'
         }
+    } else {
+        Write-Skip "Scheduled task not present: $TaskName"
     }
 
-    Remove-SiblingBinstubs
+    if ($publishGlobalBinstubs) {
+        foreach ($stub in @($BinstubPs1, $BinstubCmd)) {
+            if (Test-Path $stub) {
+                if ($DryRun) { Write-Host "[dry-run] would remove binstub: $stub" }
+                else { Remove-Item -Force $stub; Write-Ok "Binstub removed: $stub" }
+            }
+        }
+    } else {
+        Write-Ok 'Scoped install left the legacy global binstub unchanged'
+    }
+
+    if (-not $DryRun) { Remove-SiblingBinstubs }
 
     if (Test-Path $VenvDir) {
-        Remove-Item -Recurse -Force $VenvDir
-        Write-Ok 'Venv removed'
+        if ($DryRun) { Write-Host "[dry-run] would remove venv: $VenvDir" }
+        else { Remove-Item -Recurse -Force $VenvDir; Write-Ok 'Venv removed' }
+    } else {
+        Write-Skip "Venv not present: $VenvDir"
     }
 
     if ($Purge -and (Test-Path $InstallDir)) {
-        Write-Warn 'Purging config, DB, and auth'
-        Remove-Item -Recurse -Force $InstallDir
+        if ($DryRun) { Write-Host "[dry-run] would PURGE config/DB/auth at: $InstallDir" }
+        else { Write-Warn 'Purging config, DB, and auth'; Remove-Item -Recurse -Force $InstallDir }
     } else {
         Write-Skip "Preserved config/DB at $InstallDir (use -Purge to remove)"
     }
 
-    Write-Ok 'agent-bridge uninstalled'
+    if ($DryRun) { Write-Host 'agent-bridge uninstall dry run complete -- nothing was changed' -ForegroundColor Yellow }
+    else { Write-Ok 'agent-bridge uninstalled' }
 }
+
 
 function Get-PwshPath {
     $pwshPath = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe'
@@ -2014,15 +2425,34 @@ function Invoke-Start {
         exit 1
     }
 
-    # Decide what to do about anything already serving.
+    if (Test-ActiveIsForward) {
+        Write-Skip 'agent-bridge: this machine reaches a host bridge through a forward (active.json); not starting a local daemon over it'
+        return
+    }
+
+    # Resolve the already-healthy no-op FIRST, as its own early return --
+    # nothing is disrupted on this path, so the marker below must never be
+    # written for it (review finding on an earlier draft of this change:
+    # publishing the marker only after a Stop-DaemonProcesses call left a
+    # window where the daemon was already stopped without watchdog
+    # suppression covering it).
     $proc = Get-RunningProcess
+    if ($proc -and -not $Fresh -and (Test-HealthOnce)) {
+        Write-Warn "agent-bridge is already running (pid=$($proc.Id))"
+        return
+    }
+
+    # From here on every path genuinely disrupts something (a fresh drain, a
+    # wedged-process replace, or a clean cold start) -- mark the lifecycle
+        # before any of that begins. try/finally (not a trap, which PowerShell
+        # only fires for terminating errors, not a clean `return`) covers every
+        # remaining exit path uniformly.
+        Write-UpdateMarker
+        try {
     if ($proc) {
         if ($Fresh) {
             Write-Step "Draining existing daemon (pid=$($proc.Id)) to start fresh..."
             Stop-DaemonProcesses | Out-Null
-        } elseif (Test-HealthOnce) {
-            Write-Warn "agent-bridge is already running (pid=$($proc.Id))"
-            return
         } else {
             # Process exists but the port does not answer -- a wedged/zombie
             # daemon. Replace it rather than leaving the service unhealthy.
@@ -2033,6 +2463,7 @@ function Invoke-Start {
 
     $logFile = Join-Path $InstallDir 'agent-bridge.log'
     $errFile = Join-Path $InstallDir 'agent-bridge-err.log'
+
 
     # Prefer the scheduled task to start the daemon whenever one is registered
     # -- for BOTH headless (S4U/Password, session 0) and at-logon (interactive)
@@ -2137,6 +2568,9 @@ Set-Content -Path '$($PidFile -replace "'", "''")' -Value `$p.Id
 
     Write-Fail 'agent-bridge failed to start -- check agent-bridge.log / agent-bridge-err.log'
     exit 1
+    } finally {
+                Clear-UpdateMarker
+    }
 }
 
 function Invoke-Stop {
@@ -2236,9 +2670,13 @@ function Invoke-Status {
     # Show scheduled task
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($task) {
-        Write-Ok "Scheduled task: $($task.State)"
+        Write-Ok "Scheduled task: $($task.State) ($TaskName)"
     } else {
         Write-Step 'No scheduled task registered'
+    }
+
+    if (-not $publishGlobalBinstubs) {
+        Write-Step 'Global compatibility binstub left unchanged for the legacy install'
     }
 
     # Exit non-zero when not installed (used by module update orchestrator)
@@ -2327,9 +2765,33 @@ function Invoke-Update {
         return
     }
 
+    # Mark the live-service update lifecycle as in-progress (ce#5066) so a
+    # local liveness watchdog never force-restarts a daemon that is
+    # legitimately, briefly down for drain/stop/stage/start or a zero-downtime
+    # cutover -- ONLY when a local daemon transition can actually happen.
+    # Resolve the forward-route check FIRST: that branch never drains/
+    # stops/starts anything local, so marking it would advertise a live
+    # transition where none occurs (review finding on an earlier draft).
+    # Cleared in the existing try/finally below alongside Exit-InstallLock,
+    # so every exit path (success, a cutover-then-fallback, a failed
+    # update's rollback, or an unhandled terminating error) covers it
+    # uniformly -- PowerShell's `finally` runs even on `exit` within the
+    # same call stack, exactly like this codebase already relies on for the
+    # install lock.
+    $activeForward = Test-ActiveIsForward
+    if ($activeForward) {
+        Write-Step 'Forwarded host bridge route detected -- updating runtime files without draining/stopping/starting a local daemon'
+    }
+    if (-not $activeForward) {
+        Write-UpdateMarker
+    }
+    try {
+
+    $predecessorSignature = if ($activeForward) { '' } else { Get-ActiveSignature }
+
     # Stop running instance first -- a rebuild/repair of the venv (below) must
     # not race a live bridge holding python.exe open.
-    $wasRunning = $null -ne (Get-RunningProcess)
+    $wasRunning = (-not $activeForward) -and ($null -ne (Get-RunningProcess))
 
     # Thread B: the ZDD active/passive cutover is now the DEFAULT whenever a live
     # daemon is running -- activation always cuts over automatically (no opt-in).
@@ -2347,7 +2809,7 @@ function Invoke-Update {
     $prevVersion = ''
     if ($VersionedRuntime) {
         $prevVersion = Get-VersionedCurrent
-        $useCutover = $wasRunning
+        $useCutover = $wasRunning -and (-not $activeForward)
         # Cutover onto the *same* slot is impossible (there is only one dir of that
         # name and the live daemon holds it). A same-version refresh downgrades to
         # the classic stop-and-rebuild.
@@ -2356,7 +2818,7 @@ function Invoke-Update {
             $useCutover = $false
         }
     } else {
-        $useCutover = $wasRunning -and (Test-Path $VenvPython)
+        $useCutover = $wasRunning -and (-not $activeForward) -and (Test-Path $VenvPython)
     }
     if ($useCutover) {
         Write-Step 'Graceful cutover: building the new runtime; will cut over (no stop)'
@@ -2378,8 +2840,9 @@ function Invoke-Update {
             $drainTimeout = if ($env:AGENT_BRIDGE_DRAIN_TIMEOUT) {
                 [int]$env:AGENT_BRIDGE_DRAIN_TIMEOUT
             } else { 120 }
-            Invoke-Drain -TimeoutSec $drainTimeout
-            Invoke-Stop
+            if (-not (Invoke-UpdateDrainStop -Signature $predecessorSignature -TimeoutSec $drainTimeout)) {
+                $wasRunning = $false
+            }
         }
 
         # Repair venv if python binary is missing (or rebuild if unsigned for SAC).
@@ -2418,14 +2881,14 @@ function Invoke-Update {
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         if ($SshManagerDir) {
-            # Dist renamed agent-ssh-manager -> ssh-manager; --refresh-package
-            # busts uv's build cache so a same-version source change lands (#186).
-            $sshOut = & uv pip install --python $VenvPython --reinstall-package ssh-manager --refresh-package ssh-manager `
-                "$SshManagerDir" --quiet 2>&1
-            if ($LASTEXITCODE -ne 0) {
+            # Refresh the vendored agent-ssh-manager distribution's build cache
+            # so a same-version source change lands (#186).
+            $sshResult = Invoke-UvPipInstallResilient -SourceDir $SshManagerDir @('--python', $VenvPython, '--reinstall-package', 'agent-ssh-manager', '--refresh-package', 'agent-ssh-manager', "$SshManagerDir", '--quiet')
+            $sshOut = $sshResult.Output
+            if ($sshResult.ExitCode -ne 0) {
                 $ErrorActionPreference = $prevEAP
                 if ($sshOut) { Write-Host ($sshOut | Out-String) }
-                throw "ssh-manager update failed (exit $LASTEXITCODE)"
+                throw "ssh-manager update failed (exit $($sshResult.ExitCode))"
             }
         } elseif (Test-SshManagerInstalled) {
             Write-Step 'ssh-manager already installed in venv (marketplace layout)'
@@ -2436,12 +2899,12 @@ function Invoke-Update {
         # without a version bump (uv otherwise skips a same-version path dep).
         $CredRelayDir = Resolve-CredentialRelay
         if ($CredRelayDir) {
-            $crOut = & uv pip install --python $VenvPython --reinstall-package agent-credential-relay --refresh-package agent-credential-relay `
-                "$CredRelayDir" --quiet 2>&1
-            if ($LASTEXITCODE -ne 0) {
+            $crResult = Invoke-UvPipInstallResilient -SourceDir $CredRelayDir @('--python', $VenvPython, '--reinstall-package', 'agent-credential-relay', '--refresh-package', 'agent-credential-relay', "$CredRelayDir", '--quiet')
+            $crOut = $crResult.Output
+            if ($crResult.ExitCode -ne 0) {
                 $ErrorActionPreference = $prevEAP
                 if ($crOut) { Write-Host ($crOut | Out-String) }
-                throw "credential-relay update failed (exit $LASTEXITCODE)"
+                throw "credential-relay update failed (exit $($crResult.ExitCode))"
             }
         } elseif (Test-CredentialRelayInstalled) {
             Write-Step 'credential-relay already installed in venv (marketplace layout)'
@@ -2452,12 +2915,12 @@ function Invoke-Update {
         # version bump (uv otherwise skips a same-version path dep).
         $ZddDir = Resolve-Zdd
         if ($ZddDir) {
-            $zddOut = & uv pip install --python $VenvPython --reinstall-package agent-zdd --refresh-package agent-zdd `
-                "$ZddDir" --quiet 2>&1
-            if ($LASTEXITCODE -ne 0) {
+            $zddResult = Invoke-UvPipInstallResilient -SourceDir $ZddDir @('--python', $VenvPython, '--reinstall-package', 'agent-zdd', '--refresh-package', 'agent-zdd', "$ZddDir", '--quiet')
+            $zddOut = $zddResult.Output
+            if ($zddResult.ExitCode -ne 0) {
                 $ErrorActionPreference = $prevEAP
                 if ($zddOut) { Write-Host ($zddOut | Out-String) }
-                throw "zdd update failed (exit $LASTEXITCODE)"
+                throw "zdd update failed (exit $($zddResult.ExitCode))"
             }
         } elseif (Test-ZddInstalled) {
             Write-Step 'zdd already installed in venv (marketplace layout)'
@@ -2467,12 +2930,12 @@ function Invoke-Update {
         # single-instance-lease: force-reinstall so a local code change propagates.
         $SilDir = Resolve-SingleInstanceLease
         if ($SilDir) {
-            $silOut = & uv pip install --python $VenvPython --reinstall-package agent-single-instance-lease --refresh-package agent-single-instance-lease `
-                "$SilDir" --quiet 2>&1
-            if ($LASTEXITCODE -ne 0) {
+            $silResult = Invoke-UvPipInstallResilient -SourceDir $SilDir @('--python', $VenvPython, '--reinstall-package', 'agent-single-instance-lease', '--refresh-package', 'agent-single-instance-lease', "$SilDir", '--quiet')
+            $silOut = $silResult.Output
+            if ($silResult.ExitCode -ne 0) {
                 $ErrorActionPreference = $prevEAP
                 if ($silOut) { Write-Host ($silOut | Out-String) }
-                throw "single-instance-lease update failed (exit $LASTEXITCODE)"
+                throw "single-instance-lease update failed (exit $($silResult.ExitCode))"
             }
         } elseif (Test-SingleInstanceLeaseInstalled) {
             Write-Step 'single-instance-lease already installed in venv (marketplace layout)'
@@ -2482,21 +2945,23 @@ function Invoke-Update {
         # config-migrate: force-reinstall so a local code change propagates.
         $CfgMigrateDir = Resolve-ConfigMigrate
         if ($CfgMigrateDir) {
-            $cmOut = & uv pip install --python $VenvPython --reinstall-package agent-config-migrate --refresh-package agent-config-migrate `
-                "$CfgMigrateDir" --quiet 2>&1
-            if ($LASTEXITCODE -ne 0) {
+            $cmResult = Invoke-UvPipInstallResilient -SourceDir $CfgMigrateDir @('--python', $VenvPython, '--reinstall-package', 'agent-config-migrate', '--refresh-package', 'agent-config-migrate', "$CfgMigrateDir", '--quiet')
+            $cmOut = $cmResult.Output
+            if ($cmResult.ExitCode -ne 0) {
                 $ErrorActionPreference = $prevEAP
                 if ($cmOut) { Write-Host ($cmOut | Out-String) }
-                throw "config-migrate update failed (exit $LASTEXITCODE)"
+                throw "config-migrate update failed (exit $($cmResult.ExitCode))"
             }
         } elseif (Test-ConfigMigrateInstalled) {
             Write-Step 'config-migrate already installed in venv (marketplace layout)'
         } else {
             throw 'Cannot locate config-migrate library. Reinstall the agent-bridge plugin from the marketplace (copilot plugin install agent-bridge@copilot-extensions), then rerun this installer.'
         }
-        $bridgeOut = & uv pip install --python $VenvPython --reinstall-package agent-bridge `
-            "$PluginDir" --quiet 2>&1
-        $updateResult = $LASTEXITCODE
+        # --refresh-package agent-procutil: see the matching comment in the
+        # initial-install path above.
+        $bridgeResult = Invoke-UvPipInstallResilient @('--python', $VenvPython, '--reinstall-package', 'agent-bridge', '--refresh-package', 'agent-bridge', '--reinstall-package', 'agent-procutil', '--refresh-package', 'agent-procutil', '--reinstall-package', 'agent-plugin-resolve', '--refresh-package', 'agent-plugin-resolve', '--reinstall-package', 'agent-dropin-registry', '--refresh-package', 'agent-dropin-registry', '--reinstall-package', 'agent-plugin-activation', '--refresh-package', 'agent-plugin-activation', '--reinstall-package', 'agent-remote-login-shell', '--refresh-package', 'agent-remote-login-shell', "$PluginDir", '--quiet')
+        $bridgeOut = $bridgeResult.Output
+        $updateResult = $bridgeResult.ExitCode
         $ErrorActionPreference = $prevEAP
         if ($updateResult -ne 0) {
             if ($bridgeOut) { Write-Host ($bridgeOut | Out-String) }
@@ -2529,9 +2994,8 @@ function Invoke-Update {
                 $failedSlot = Join-Path (Join-Path $InstallDir 'versions') $SrcVersion
                 if (Test-Path $failedSlot) { Remove-Item -Recurse -Force $failedSlot -ErrorAction SilentlyContinue }
             }
-            if ($wasRunning -and -not $useCutover) {
-                Write-Step 'Restarting the previous version...'
-                Invoke-Start
+            if ($wasRunning -and -not $useCutover -and -not $activeForward) {
+                if (-not (Invoke-UpdateStart -Signature $predecessorSignature -Message 'Restarting the previous version...')) { $wasRunning = $false }
             }
             $prevLabel = if ($prevVersion) { "versions/$prevVersion" } else { 'the previous runtime' }
             Write-Warn "Update failed; kept the previous runtime (venv -> $prevLabel)."
@@ -2540,9 +3004,8 @@ function Invoke-Update {
             Write-Step 'Rolling back to the previous venv...'
             if (Restore-Venv) {
                 Write-Ok 'Previous venv restored'
-                if ($wasRunning) {
-                    Write-Step 'Restarting the previous service...'
-                    Invoke-Start
+                if ($wasRunning -and -not $activeForward) {
+                    if (-not (Invoke-UpdateStart -Signature $predecessorSignature -Message 'Restarting the previous service...')) { $wasRunning = $false }
                 }
             } else {
                 Write-Fail 'Rollback failed -- run "install.ps1 install" to rebuild the runtime'
@@ -2602,7 +3065,10 @@ function Invoke-Update {
     # collapsed. The classic path just (re)starts -- the old daemon was already
     # stopped above. Launch via the `venv` link ($LinkPython) so the process
     # resolves through the junction (never a versions/<v> absolute).
-    if ($useCutover) {
+    if ($activeForward) {
+        Write-Step 'Forwarded host bridge route still active -- not starting a local daemon'
+    }
+    elseif ($useCutover) {
         # Warm the freshly-built slot before the timed cutover (#864): the slot's
         # first full-app start is cold -- Python compiles the whole app graph and,
         # on a managed Windows box, Defender / Smart App Control scans the freshly
@@ -2622,12 +3088,12 @@ function Invoke-Update {
             Write-Ok 'Cutover complete (zero-downtime)'
         } else {
             Write-Warn 'Cutover failed -- falling back to a stop-and-restart swap'
-            Invoke-Stop
-            Invoke-Start
+            if (Invoke-UpdateDrainStop -Signature $predecessorSignature -TimeoutSec 30) {
+                Invoke-UpdateStart -Signature $predecessorSignature | Out-Null
+            }
         }
     } else {
-        Write-Step 'Starting service...'
-        Invoke-Start
+        Invoke-UpdateStart -Signature $predecessorSignature | Out-Null
     }
 
     # Versioned layout: prune old version slots now that the new one is healthy
@@ -2638,6 +3104,9 @@ function Invoke-Update {
     }
 
     Write-Ok 'Update complete'
+    } finally {
+            Clear-UpdateMarker
+    }
 }
 
 # -- Dispatch ----------------------------------------------------------------

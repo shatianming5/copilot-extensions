@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
 import types
 from pathlib import Path
 
+from agent_worktrees import __main__ as m
+from agent_worktrees import claim_history
 from agent_worktrees import config as cfg
-from agent_worktrees import git_ops, pr_ops, tracking
+from agent_worktrees import git_ops, obligations, pr_ops, tracking, worktree_identity
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -30,6 +33,141 @@ class TestSlugify:
         assert pr_ops.slugify("!!!") == "change"
 
 
+class TestExistingFeaturePush:
+    """#3561: push() no longer bypasses a real pre-push hook, so
+    _push_existing_feature's failure path needs to surface the real stderr
+    (a hook rejection) and, separately, offer retry guidance only when the
+    failure is actually retryable (a non-fast-forward race), not for every
+    failure -- a hook rejection is not fixed by rebase-and-retry."""
+
+    def test_reports_push_error(self, monkeypatch):
+        monkeypatch.setattr(pr_ops, "_rev", lambda *_args, **_kwargs: "deadbeef")
+        monkeypatch.setattr(
+            pr_ops.git_ops,
+            "push",
+            lambda *_args, **_kwargs: git_ops.PushResult(
+                ok=False, stderr="BLOCKED: release guard"
+            ),
+        )
+
+        result = pr_ops._push_existing_feature(
+            ".", "feature/change", "origin", None, None, None, {},
+            config=None, worktree_id="", title="", body=None, open_pr=None,
+            draft=False, attribution=None,
+        )
+
+        assert result["error"] == (
+            "Failed to (re)push 'feature/change' to 'origin'.\n"
+            "BLOCKED: release guard"
+        )
+
+    def test_reports_retry_guidance_for_non_fast_forward(self, monkeypatch):
+        monkeypatch.setattr(pr_ops, "_rev", lambda *_args, **_kwargs: "deadbeef")
+        monkeypatch.setattr(
+            pr_ops.git_ops,
+            "push",
+            lambda *_args, **_kwargs: git_ops.PushResult(
+                ok=False, stderr="[rejected] non-fast-forward"
+            ),
+        )
+
+        result = pr_ops._push_existing_feature(
+            ".", "feature/change", "origin", None, None, None, {},
+            config=None, worktree_id="", title="", body=None, open_pr=None,
+            draft=False, attribution=None,
+        )
+
+        assert result["error"] == (
+            "Failed to (re)push 'feature/change' to 'origin'.\n"
+            "The remote branch advanced; rebase and retry.\n"
+            "[rejected] non-fast-forward"
+        )
+
+
+class TestRequiredBodySections:
+    def test_requires_visible_content_under_each_heading(self):
+        body = (
+            "## Intent\nShip the change.\n\n"
+            "## Changes\n<!-- placeholder -->\n\n"
+            "## Validation\nTests pass.\n"
+        )
+        assert pr_ops.missing_required_body_sections(
+            body,
+            ("Intent", "Changes", "Validation"),
+        ) == ["Changes"]
+
+    def test_accepts_case_insensitive_markdown_headings(self):
+        body = (
+            "# intent\nShip the change.\n"
+            "### CHANGES\nUpdated behavior.\n"
+            "## Validation ##\nTests pass.\n"
+        )
+        assert pr_ops.missing_required_body_sections(
+            body,
+            ("Intent", "Changes", "Validation"),
+        ) == []
+
+    def test_multiline_comments_are_not_visible_content(self):
+        body = "## Changes\n<!--\nTODO\n-->\n"
+        assert pr_ops.missing_required_body_sections(
+            body,
+            ("Changes",),
+        ) == ["Changes"]
+
+    def test_unterminated_comment_is_hidden_through_eof(self):
+        body = "## Changes\n<!-- TODO"
+        assert pr_ops.missing_required_body_sections(
+            body,
+            ("Changes",),
+        ) == ["Changes"]
+
+    def test_nested_headings_remain_inside_required_section(self):
+        body = (
+            "## Changes\n"
+            "### Added\n"
+            "Implemented the feature.\n"
+            "## Validation\n"
+            "Tests pass.\n"
+        )
+        assert pr_ops.missing_required_body_sections(
+            body,
+            ("Changes", "Validation"),
+        ) == []
+
+    def test_fenced_markdown_does_not_supply_required_heading(self):
+        body = "```markdown\n## Changes\nFake content.\n```\n"
+        assert pr_ops.missing_required_body_sections(
+            body,
+            ("Changes",),
+        ) == ["Changes"]
+
+    def test_fence_with_trailing_text_does_not_close_block(self):
+        body = (
+            "```markdown\n"
+            "```not-a-close\n"
+            "## Changes\n"
+            "Fake content.\n"
+            "```\n"
+        )
+        assert pr_ops.missing_required_body_sections(
+            body,
+            ("Changes",),
+        ) == ["Changes"]
+
+    def test_html_comment_literal_inside_fence_does_not_hide_following_sections(self):
+        body = (
+            "```html\n"
+            "<!-- literal example\n"
+            "```\n"
+            "## Changes\n"
+            "Implemented the feature.\n"
+        )
+        assert pr_ops.missing_required_body_sections(
+            body,
+            ("Changes",),
+        ) == []
+
+
 class TestFeatureBranchName:
     def test_uses_suffix_and_slug(self):
         name = pr_ops.feature_branch_name(
@@ -41,6 +179,56 @@ class TestFeatureBranchName:
         name = pr_ops.feature_branch_name("", "Title", "wt-abcd")
         assert name.startswith("feature/")
         assert name.endswith("-abcd")
+
+
+class TestWorktreeSuffixHelper:
+    """`_worktree_suffix` (used for branch-name suffixes) must never surface
+    the raw worktree_id -- which embeds the authoring machine name and
+    creation timestamp -- since branch names can reach a public repo.
+    """
+
+    def test_worktree_suffix_matches_git_ops(self):
+        worktree_id = "example-host-20260917-125245-3a94"
+        assert pr_ops._worktree_suffix(worktree_id) == \
+            git_ops.worktree_suffix(worktree_id) == "3a94"
+
+    def test_no_dash_worktree_id_never_returned_verbatim(self):
+        """A worktree id with no dash has no trailing token to extract; the
+        suffix must still never be the raw id itself (a legacy/malformed
+        tracking id is exactly the kind of unusual input `create_pr` may
+        still see, so this can't be assumed away)."""
+        worktree_id = "nodashesatall"
+        suffix = pr_ops._worktree_suffix(worktree_id)
+        assert suffix != worktree_id
+        # Deterministic: the same input always yields the same digest.
+        assert pr_ops._worktree_suffix(worktree_id) == suffix
+
+
+class TestResolveHeadPattern:
+    def test_azure_devops_defaults_to_user_namespace_under_refspec(self):
+        prcfg = cfg.PRConfig(enabled=True, provider="azure-devops", head_scheme="refspec")
+        assert pr_ops.resolve_head_pattern(prcfg) == "user/{username}/{slug}-{suffix}"
+
+    def test_azure_devops_defaults_to_user_namespace_under_snapshot(self):
+        prcfg = cfg.PRConfig(enabled=True, provider="azure-devops", head_scheme="snapshot")
+        assert pr_ops.resolve_head_pattern(prcfg) == "user/{username}/{slug}-{suffix}"
+
+    def test_explicit_head_pattern_still_wins_for_azure_devops(self):
+        prcfg = cfg.PRConfig(
+            enabled=True,
+            provider="azure-devops",
+            head_scheme="snapshot",
+            head_pattern="submit/{slug}-{suffix}",
+        )
+        assert pr_ops.resolve_head_pattern(prcfg) == "submit/{slug}-{suffix}"
+
+    def test_github_and_gitea_keep_existing_scheme_defaults(self):
+        assert pr_ops.resolve_head_pattern(
+            cfg.PRConfig(enabled=True, provider="github", head_scheme="refspec")
+        ) == "pr/{slug}-{suffix}"
+        assert pr_ops.resolve_head_pattern(
+            cfg.PRConfig(enabled=True, provider="gitea", head_scheme="snapshot")
+        ) == "{prefix}/{slug}-{suffix}"
 
 
 class TestPRHeadName:
@@ -58,10 +246,52 @@ class TestPRHeadName:
         repo = tmp_path / "r"
         repo.mkdir()
         _git("init", cwd=repo)
-        _git("config", "user.email", "cjohnson@example.com", cwd=repo)
+        _git("config", "user.email", "contributor_user@example.com", cwd=repo)
         prcfg = cfg.PRConfig(enabled=True, head_pattern="user/{username}/{slug}-{suffix}")
         name = pr_ops.pr_head_name(prcfg, "Add auth", "wt-x-aaaa", cwd=str(repo))
-        assert name == "user/cjohnson/add-auth-aaaa"
+        assert name == "user/contributor-user/add-auth-aaaa"
+
+    def test_azure_devops_default_renders_username_tokens(self, tmp_path):
+        repo = tmp_path / "r"
+        repo.mkdir()
+        _git("init", cwd=repo)
+        _git("config", "user.email", "operator@example.com", cwd=repo)
+        prcfg = cfg.PRConfig(enabled=True, provider="azure-devops", head_scheme="refspec")
+        name = pr_ops.pr_head_name(prcfg, "Some title", "wt-x-a1b2", cwd=str(repo))
+        assert name == "user/operator/some-title-a1b2"
+
+    def test_snapshot_default_inserts_topic_when_supplied(self):
+        prcfg = cfg.PRConfig(enabled=True, branch_prefix="feature", head_scheme="snapshot")
+        name = pr_ops.pr_head_name(prcfg, "Add auth", "wt-x-aaaa", topic="Hot Fix!!")
+        assert name == "feature/add-auth-hot-fix-aaaa"
+
+    def test_refspec_default_inserts_topic_when_supplied(self):
+        prcfg = cfg.PRConfig(enabled=True, provider="github", head_scheme="refspec")
+        name = pr_ops.pr_head_name(prcfg, "Add auth", "wt-x-aaaa", topic="Mini Task")
+        assert name == "pr/add-auth-mini-task-aaaa"
+
+    def test_azure_devops_default_inserts_topic_when_supplied(self, tmp_path):
+        repo = tmp_path / "r"
+        repo.mkdir()
+        _git("init", cwd=repo)
+        _git("config", "user.email", "operator@example.com", cwd=repo)
+        prcfg = cfg.PRConfig(enabled=True, provider="azure-devops", head_scheme="refspec")
+        name = pr_ops.pr_head_name(
+            prcfg, "Some title", "wt-x-a1b2", cwd=str(repo), topic="Topic!! Name"
+        )
+        assert name == "user/operator/some-title-topic-name-a1b2"
+
+    def test_blank_topic_preserves_existing_default_output(self):
+        prcfg = cfg.PRConfig(enabled=True, provider="github", head_scheme="refspec")
+        assert pr_ops.pr_head_name(prcfg, "Add auth", "wt-x-aaaa", topic="") == \
+            "pr/add-auth-aaaa"
+        assert pr_ops.pr_head_name(prcfg, "Add auth", "wt-x-aaaa", topic="   ") == \
+            "pr/add-auth-aaaa"
+
+    def test_explicit_pattern_can_reference_topic(self):
+        prcfg = cfg.PRConfig(enabled=True, head_pattern="submit/{slug}-{topic}-{suffix}")
+        name = pr_ops.pr_head_name(prcfg, "Add auth", "wt-x-aaaa", topic="Hot Fix")
+        assert name == "submit/add-auth-hot-fix-aaaa"
 
     def test_sanitizes_unresolved_segments(self):
         # No cwd -> username falls back to "user"; no empty // segments.
@@ -95,6 +325,121 @@ class TestCreatePR:
         res = pr_ops.create_pr(wid, config2)
         assert res["success"] is False
         assert "not enabled" in res["error"]
+
+    def test_freezes_attribution_and_stamps_pr_id_at_fresh_construction(
+        self, pr_repo,
+    ):
+        # codename-attribution-by-default (rounds 26-39): create_pr's own
+        # fresh-construction site must stamp the frozen pair + pr_id.
+        config, wid, _wt_path, _ = pr_repo
+        res = pr_ops.create_pr(wid, config, title="Add feature")
+        assert res["success"] is True
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        pr = rec.active_pr()
+        assert pr is not None
+        # pr_repo's bare PRConfig() resolves the implicit "codename" default.
+        assert pr.attribution_mode == "codename"
+        assert pr.attribution_explicit is False
+        assert pr.pr_id
+        assert pr.pr_revision == 1
+
+    def test_freezes_explicit_per_call_override_verbatim(self, pr_repo):
+        # round-31 finding: the stamp must capture the caller's EFFECTIVE
+        # attribution, including a per-call override, stamped VERBATIM --
+        # never re-derived from prcfg directly.
+        config, wid, _wt_path, _ = pr_repo
+        res = pr_ops.create_pr(
+            wid, config, title="Add feature", attribution="codename",
+        )
+        assert res["success"] is True
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        pr = rec.active_pr()
+        assert pr is not None
+        assert pr.attribution_mode == "codename"
+        assert pr.attribution_explicit is True
+
+    def test_required_body_sections_fail_before_branch_publication(self, pr_repo):
+        import dataclasses
+
+        config, wid, wt_path, _ = pr_repo
+        repo = config.repos["ext"]
+        pr = dataclasses.replace(
+            repo.pr,
+            required_body_sections=("Intent", "Changes", "Validation"),
+        )
+        config = dataclasses.replace(
+            config,
+            repos={"ext": dataclasses.replace(repo, pr=pr)},
+        )
+
+        result = pr_ops.create_pr(
+            wid,
+            config,
+            title="Add feature",
+            body="## Intent\nShip it.\n",
+        )
+
+        assert result["success"] is False
+        assert "Changes, Validation" in result["error"]
+        assert not git_ops.local_branch_exists(
+            "feature/add-feature-aaaa",
+            cwd=str(wt_path),
+        )
+
+    def test_required_body_is_not_repeated_for_existing_pr_rerun(self, pr_repo):
+        import dataclasses
+
+        config, wid, _wt_path, _ = pr_repo
+        repo = config.repos["ext"]
+        config = dataclasses.replace(
+            config,
+            repos={
+                "ext": dataclasses.replace(
+                    repo,
+                    pr=dataclasses.replace(
+                        repo.pr,
+                        required_body_sections=("Intent",),
+                    ),
+                )
+            },
+        )
+        body = "## Intent\nShip it.\n"
+        assert pr_ops.create_pr(
+            wid, config, title="Add feature", body=body
+        )["success"]
+        record = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        record.pr.number = 42
+        tracking.save_record(record)
+
+        rerun = pr_ops.create_pr(wid, config, title="Add feature")
+
+        assert rerun["success"] is True
+        assert rerun["rerun"] is True
+
+    def test_provider_mismatch_fails_before_credential_resolution(
+        self, pr_repo, monkeypatch
+    ):
+        config, wid, _wt_path, _ = pr_repo
+        record = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        record.pr = tracking.PRRecord(
+            state="open",
+            branch="feature/existing",
+            number=42,
+            provider="github",
+            repo="example/project",
+        )
+        tracking.save_record(record)
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("credentials must not be resolved")
+            ),
+        )
+
+        result = pr_ops.create_pr(wid, config, title="Add feature")
+
+        assert result["success"] is False
+        assert "mismatched credentials" in result["error"]
 
     def test_creates_and_pushes_feature_branch(self, pr_repo):
         config, wid, wt_path, _remote_dir = pr_repo
@@ -170,6 +515,73 @@ class TestCreatePR:
         rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
         assert len(rec.prs) == 1
 
+    def test_branch_collision_error_suggests_explicit_distinguishing_suffix(self, pr_repo):
+        config, wid, wt_path, _ = pr_repo
+        _git("branch", "feature/add-feature-aaaa", cwd=wt_path)
+
+        res = pr_ops.create_pr(wid, config, title="Add feature")
+
+        assert res["success"] is False
+        assert (
+            "Feature branch 'feature/add-feature-aaaa' already exists locally or on 'origin'."
+        ) in res["error"]
+        assert "--topic <token>" in res["error"]
+        assert "--branch" in res["error"]
+        assert "'feature/add-feature-aaaa-2'" in res["error"]
+        assert "mini-task" in res["error"]
+
+    def test_topic_extends_generated_default_branch_name(self, pr_repo):
+        config, wid, wt_path, _remote_dir = pr_repo
+        res = pr_ops.create_pr(wid, config, title="Add feature", topic="Hot Fix!!")
+
+        assert res["success"] is True, res
+        assert res["branch"] == "feature/add-feature-hot-fix-aaaa"
+        assert git_ops.remote_branch_exists(
+            "origin", "feature/add-feature-hot-fix-aaaa", cwd=str(wt_path)
+        )
+
+    def test_explicit_head_pattern_without_topic_slot_ignores_topic_with_note(self, pr_repo):
+        import dataclasses
+
+        config, wid, _wt_path, _ = pr_repo
+        repo = dataclasses.replace(
+            config.repos["ext"],
+            pr=cfg.PRConfig(
+                enabled=True,
+                provider="gitea",
+                head_scheme="snapshot",
+                branch_prefix="feature",
+                head_pattern="submit/{slug}-{suffix}",
+            ),
+        )
+        config = dataclasses.replace(config, repos={"ext": repo})
+
+        res = pr_ops.create_pr(wid, config, title="Add feature", topic="Hot Fix")
+
+        assert res["success"] is True, res
+        assert res["branch"] == "submit/add-feature-aaaa"
+        assert res["topic_note"] == (
+            "Ignoring --topic because explicit pr.head_pattern does not "
+            "reference {topic}."
+        )
+
+    def test_branch_override_wins_over_topic(self, pr_repo):
+        config, wid, _wt_path, _ = pr_repo
+        res = pr_ops.create_pr(
+            wid,
+            config,
+            title="Add feature",
+            branch="feature/manual-branch",
+            topic="Ignored Topic",
+            dry_run=True,
+        )
+
+        assert res["success"] is True, res
+        assert res["branch"] == "feature/manual-branch"
+        assert res["topic_note"] == (
+            "Ignoring --topic because --branch fully overrides the head name."
+        )
+
     def test_dirty_worktree_blocks(self, pr_repo):
         config, wid, wt_path, _ = pr_repo
         (wt_path / "dirty.txt").write_text("uncommitted\n")
@@ -211,10 +623,1153 @@ class TestCreatePR:
         rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
         assert rec.title == "Curated Title"
 
+    def test_true_last_resort_requires_explicit_title(self, pr_repo, monkeypatch):
+        """When there is no --title, no persisted title, AND no derivable
+        commit-subject title (the actual last resort), create_pr must not
+        invent one -- it embeds the authoring machine name and creation
+        timestamp in worktree_id, and any synthetic placeholder could still
+        leak into the PR branch name, the PR title, and the squash commit
+        message on a public repo. Require the caller to supply --title
+        instead."""
+        config, wid, wt_path, _ = pr_repo
+        monkeypatch.setattr(pr_ops, "_title_from_commits", lambda *a, **k: None)
+        orig_head = _git("rev-parse", "HEAD", cwd=wt_path)
+
+        res = pr_ops.create_pr(wid, config)
+
+        assert res["success"] is False
+        assert "title" in res["error"].lower()
+        assert wid not in res["error"]
+        # Nothing was mutated: no branch created, no commits touched.
+        assert _git("rev-parse", "HEAD", cwd=wt_path) == orig_head
+        rec_path = cfg.tracking_dir() / f"{wid}.yaml"
+        if rec_path.exists():
+            rec = tracking.load_record(rec_path)
+            assert rec.pr is None
+
+    def test_true_last_resort_succeeds_with_explicit_title(self, pr_repo, monkeypatch):
+        """The same no-derivable-title scenario succeeds once the caller
+        supplies an explicit --title."""
+        config, wid, _wt_path, _ = pr_repo
+        monkeypatch.setattr(pr_ops, "_title_from_commits", lambda *a, **k: None)
+        res = pr_ops.create_pr(wid, config, title="Add feature")
+        assert res["success"] is True, res
+        assert res["branch"] == "feature/add-feature-aaaa"
+
+    def test_whitespace_only_title_does_not_bypass_the_requirement(
+        self, pr_repo, monkeypatch,
+    ):
+        """A whitespace-only --title is not a real title -- it must not slip
+        past the requirement and reach branch generation or the squash
+        message as a blank string. The error must also correctly describe a
+        whitespace-only input, not just an omitted one."""
+        config, wid, wt_path, _ = pr_repo
+        monkeypatch.setattr(pr_ops, "_title_from_commits", lambda *a, **k: None)
+        orig_head = _git("rev-parse", "HEAD", cwd=wt_path)
+
+        res = pr_ops.create_pr(wid, config, title="   \n\t  ")
+
+        assert res["success"] is False
+        assert "title" in res["error"].lower()
+        assert "no --title was given" not in res["error"].lower()
+        assert _git("rev-parse", "HEAD", cwd=wt_path) == orig_head
+
+    def test_control_characters_normalized_in_title_and_persisted_record(
+        self, pr_repo,
+    ):
+        """A --title containing control characters (CR, tabs) must not
+        survive raw into either the squash commit or the persisted tracking
+        record -- both must reflect the same normalized value."""
+        config, wid, wt_path, _ = pr_repo
+        res = pr_ops.create_pr(wid, config, title="Fix\r\tthe\nbug")
+        assert res["success"] is True, res
+        subject = _git("log", "-1", "--format=%s", f"worktree/{wid}", cwd=wt_path)
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        assert subject == rec.title
+        assert "\r" not in subject and "\t" not in subject
+
+    def test_whitespace_only_persisted_title_does_not_block_commit_derivation(
+        self, pr_repo,
+    ):
+        """A stale, whitespace-only `record.title` (e.g. persisted by an
+        older version of the tool) is truthy but not meaningful -- it must
+        not skip the commit-subject derivation fallback the way a genuinely
+        curated title would."""
+        config, wid, _wt_path, _ = pr_repo
+        yaml_path = cfg.tracking_dir() / f"{wid}.yaml"
+        rec = tracking.load_record(yaml_path)
+        rec.title = "   "
+        tracking.save_record(rec)
+
+        res = pr_ops.create_pr(wid, config)
+
+        assert res["success"] is True, res
+        # Fixture's newest worktree commit is "work 2" -- the derivation
+        # fallback ran and produced a real title, not a rejection.
+        assert res["branch"] == "feature/work-2-aaaa"
+
+    def test_whitespace_only_title_does_not_erase_persisted_title(
+        self, pr_repo,
+    ):
+        """A whitespace-only --title must not overwrite an existing,
+        genuinely curated persisted title with a blank one -- it is not a
+        real update."""
+        config, wid, wt_path, _ = pr_repo
+        yaml_path = cfg.tracking_dir() / f"{wid}.yaml"
+        rec = tracking.load_record(yaml_path)
+        rec.title = "A real curated title"
+        tracking.save_record(rec)
+
+        res = pr_ops.create_pr(wid, config, title="   \n\t  ")
+
+        assert res["success"] is True, res
+        rec_after = tracking.load_record(yaml_path)
+        assert rec_after.title == "A real curated title"
+        subject = _git("log", "-1", "--format=%s", f"worktree/{wid}", cwd=wt_path)
+        assert subject == "A real curated title"
+
+    def test_long_title_is_not_truncated_for_publication(self, pr_repo):
+        """A long --title must reach the squash commit message verbatim --
+        the mux/Picker display cap (tracking.TITLE_MAX) is a UI concern for
+        the status bar, not a limit on the actual PR/commit title."""
+        config, wid, wt_path, _ = pr_repo
+        long_title = "A" * (tracking.TITLE_MAX + 20)
+        res = pr_ops.create_pr(wid, config, title=long_title)
+        assert res["success"] is True, res
+        subject = _git("log", "-1", "--format=%s", f"worktree/{wid}", cwd=wt_path)
+        assert subject == long_title
+
+
+# ---------------------------------------------------------------------------
+# create_pr -- role-aware fork-PR flow (efforts/active/role-aware-fork-pr-flow)
+# ---------------------------------------------------------------------------
+
+class TestCreatePRForkFlow:
+    def _fork_config(self, config, tmp_path: Path, **fork_overrides):
+        import dataclasses
+        repo = config.repos["ext"]
+        fork = cfg.ForkConfig(enabled=True, remote="fork", **fork_overrides)
+        pr = dataclasses.replace(repo.pr, provider="github", fork=fork)
+        return dataclasses.replace(
+            config, repos={"ext": dataclasses.replace(repo, pr=pr)},
+        )
+
+    def _fake_provider(self, fork_owner: str, fork_clone_url: str):
+        class _FakeProvider:
+            name = "github"
+
+            def authority_endpoint(self, api_base=""):
+                return "github.com"
+
+            def ensure_fork(self, repo, *, api_base="", token=None):
+                return (fork_owner, fork_clone_url)
+
+            def resolve_fork_owner(self, *, api_base="", token=None):
+                return fork_owner
+
+        return _FakeProvider()
+
+    def test_fork_mode_needs_confirmation_and_does_nothing(self, pr_repo, tmp_path):
+        config, wid, wt_path, _remote_dir = pr_repo
+        config = self._fork_config(config, tmp_path)
+
+        res = pr_ops.create_pr(wid, config)
+
+        assert res["success"] is False
+        assert res["needs_confirmation"] == "fork_setup"
+        assert "fork" in res["message"].lower()
+        assert res["fork_remote"] == "fork"
+        # Nothing was mutated: no fork remote configured, no branch pushed.
+        assert not git_ops.has_remote("fork", cwd=str(wt_path))
+        assert not git_ops.local_branch_exists(
+            "feature/work-2-aaaa", cwd=str(wt_path)
+        )
+
+    def test_fork_mode_rejects_non_default_gh_host(
+        self, pr_repo, tmp_path, monkeypatch,
+    ):
+        """pr.fork's durable registry isn't scoped by GitHub authority, so a
+        non-default GH_HOST must be refused outright -- even on a caller's
+        very first, explicitly-confirmed call -- rather than risk a later
+        confirmation silently reusing across github.com vs. an Enterprise
+        host with the same owner/repo slug."""
+        config, wid, wt_path, _remote_dir = pr_repo
+        config = self._fork_config(config, tmp_path)
+        monkeypatch.setenv("GH_HOST", "github.example.com")
+
+        res = pr_ops.create_pr(wid, config, confirm_fork=True)
+
+        assert res["success"] is False, res
+        assert "non-default GitHub authority" in res["error"]
+        assert not git_ops.has_remote("fork", cwd=str(wt_path))
+
+    def test_fork_mode_rejects_non_default_api_base_even_without_gh_host(
+        self, pr_repo, tmp_path, monkeypatch,
+    ):
+        """The exact gap this check used to miss: an explicit pr.api_base
+        pointing at a GitHub Enterprise host, with ambient GH_HOST entirely
+        UNSET, must still be refused -- the effective authority GitHub role
+        resolution actually uses comes from pr.api_base first, not GH_HOST."""
+        import dataclasses
+
+        config, wid, wt_path, _remote_dir = pr_repo
+        config = self._fork_config(config, tmp_path)
+        repo = config.repos["ext"]
+        pr = dataclasses.replace(repo.pr, api_base="https://github.example.com/api/v3")
+        config = dataclasses.replace(
+            config, repos={"ext": dataclasses.replace(repo, pr=pr)},
+        )
+        monkeypatch.delenv("GH_HOST", raising=False)
+
+        res = pr_ops.create_pr(wid, config, confirm_fork=True)
+
+        assert res["success"] is False, res
+        assert "non-default GitHub authority" in res["error"]
+        assert "github.example.com" in res["error"]
+        assert not git_ops.has_remote("fork", cwd=str(wt_path))
+
+    def test_fork_mode_confirmed_pushes_to_fork_not_origin(
+        self, pr_repo, tmp_path, monkeypatch,
+    ):
+        config, wid, wt_path, _remote_dir = pr_repo
+        config = self._fork_config(config, tmp_path)
+
+        fork_dir = tmp_path / "fork.git"
+        git_ops.git("init", "--bare", "-b", "master", str(fork_dir))
+        fake = self._fake_provider("theirfork", str(fork_dir))
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider", lambda name: fake,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda *a, **k: None,
+        )
+
+        res = pr_ops.create_pr(wid, config, confirm_fork=True)
+
+        assert res["success"] is True, res
+        assert res["remote"] == "fork"
+        assert res["pr_head"] == "theirfork:feature/work-2-aaaa"
+        # The local 'fork' remote now points at the fake fork's clone URL.
+        assert git_ops.remote_url("fork", cwd=str(wt_path)) == str(fork_dir)
+        # The branch landed on the FORK, never on origin.
+        assert git_ops.remote_branch_exists(
+            "fork", "feature/work-2-aaaa", cwd=str(wt_path)
+        )
+        origin_refs = git_ops.git(
+            "ls-remote", "origin", cwd=str(wt_path)
+        ).stdout
+        assert "feature/work-2-aaaa" not in origin_refs
+
+    def test_fork_owner_override_wins_over_provider_login(
+        self, pr_repo, tmp_path, monkeypatch,
+    ):
+        config, wid, _wt_path, _remote_dir = pr_repo
+        config = self._fork_config(config, tmp_path, owner="explicit-owner")
+
+        fork_dir = tmp_path / "fork2.git"
+        git_ops.git("init", "--bare", "-b", "master", str(fork_dir))
+        fake = self._fake_provider("provider-login", str(fork_dir))
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider", lambda name: fake,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda *a, **k: None,
+        )
+
+        res = pr_ops.create_pr(wid, config, confirm_fork=True)
+
+        assert res["success"] is True, res
+        assert res["pr_head"] == "explicit-owner:feature/work-2-aaaa"
+
+    def test_fork_mode_off_by_default(self, pr_repo):
+        """A repo that never sets pr.fork/pr.roles is fully unaffected."""
+        config, wid, _wt_path, _remote_dir = pr_repo
+        res = pr_ops.create_pr(wid, config)
+        assert res["success"] is True, res
+        assert "needs_confirmation" not in res
+        assert "pr_head" not in res
+        assert res["remote"] == "origin"
+
+    def test_confirmed_fork_is_remembered_for_next_call(
+        self, pr_repo, tmp_path, monkeypatch,
+    ):
+        """A confirmed fork is durable: once create_pr(confirm_fork=True)
+        succeeds for a repo, a LATER create_pr call for that same repo (a
+        fresh PR iteration, no confirm_fork) must not re-ask -- the approval
+        was recorded in fork_pr's registry, not just honored for this call."""
+        config, wid, wt_path, _remote_dir = pr_repo
+        config = self._fork_config(config, tmp_path)
+
+        fork_dir = tmp_path / "fork-remembered.git"
+        git_ops.git("init", "--bare", "-b", "master", str(fork_dir))
+        fake = self._fake_provider("theirfork", str(fork_dir))
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider", lambda name: fake,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.fork_pr._resolve_fork_credential",
+            lambda slug, prcfg: (None, "remembered-login"),
+        )
+
+        from agent_worktrees import fork_pr
+        assert fork_pr.list_forks() == []
+
+        first = pr_ops.create_pr(
+            wid, config, confirm_fork=True, target_repo="acme/remembered-repo",
+        )
+        assert first["success"] is True, first
+        assert fork_pr.is_confirmed(
+            "acme/remembered-repo", account="remembered-login",
+        ) is True
+
+        # Simulate a later call (e.g. a different worktree of the same repo,
+        # or a fresh PR after the first merged) WITHOUT confirm_fork -- it
+        # must proceed straight to publishing, not re-ask. Give it a distinct
+        # branch so it doesn't collide with the first call's feature branch.
+        second = pr_ops.create_pr(
+            wid, config, new=True, target_repo="acme/remembered-repo",
+            branch="feature/work-2-aaaa-2",
+        )
+        assert second.get("needs_confirmation") is None, second
+        assert second["success"] is True, second
+        assert second["remote"] == "fork"
+
+    def test_preseeded_fork_skips_confirmation_entirely(
+        self, pr_repo, tmp_path, monkeypatch,
+    ):
+        """A repo pre-approved via the 'forks set' flow (e.g. during machine/
+        harness setup) never triggers needs_confirmation, even on the very
+        first create_pr call -- confirm_fork=True is never passed."""
+        config, wid, wt_path, _remote_dir = pr_repo
+        config = self._fork_config(config, tmp_path)
+
+        fork_dir = tmp_path / "fork-preseeded.git"
+        git_ops.git("init", "--bare", "-b", "master", str(fork_dir))
+        fake = self._fake_provider("preseeded-owner", str(fork_dir))
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider", lambda name: fake,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.fork_pr._resolve_fork_credential",
+            lambda slug, prcfg: (None, "preseeded-login"),
+        )
+
+        from agent_worktrees import fork_pr
+        repo = "acme/preseeded-repo"
+        fork_pr.record_confirmation(
+            repo, "preseeded-owner", account="preseeded-login",
+        )
+
+        res = pr_ops.create_pr(
+            wid, config, target_repo=repo,
+        )  # no confirm_fork at all
+
+        assert "needs_confirmation" not in res, res
+        assert res["success"] is True, res
+        assert res["pr_head"] == "preseeded-owner:feature/work-2-aaaa"
+
+    def test_owner_override_does_not_bypass_live_identity_check(
+        self, pr_repo, tmp_path, monkeypatch,
+    ):
+        """pr.fork.owner only overrides the login used to build the PR
+        head -- it must NOT exempt the underlying authenticated identity
+        from the live-owner pre-check. If the real identity silently
+        switches (e.g. ambient `gh` auth re-authenticates as someone else)
+        while the override keeps displaying the ORIGINALLY-approved name,
+        a silent skip must still catch that and re-prompt -- otherwise a
+        fork/push could go to an unapproved account while the PR head
+        keeps naming the approved one."""
+        config, wid, _wt_path, _remote_dir = pr_repo
+        config = self._fork_config(config, tmp_path, owner="alice")
+
+        fork_dir = tmp_path / "fork-override-identity.git"
+        git_ops.git("init", "--bare", "-b", "master", str(fork_dir))
+
+        class _MutableIdentityProvider:
+            name = "github"
+            real_owner = "alice-real-login"
+
+            def authority_endpoint(self, api_base=""):
+                return "github.com"
+
+            def ensure_fork(self, repo, *, api_base="", token=None):
+                return (self.real_owner, str(fork_dir))
+
+            def resolve_fork_owner(self, *, api_base="", token=None):
+                return self.real_owner
+
+        identity_provider = _MutableIdentityProvider()
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider", lambda name: identity_provider,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.fork_pr._resolve_fork_credential",
+            lambda slug, prcfg: (None, "override-login"),
+        )
+
+        from agent_worktrees import fork_pr
+        repo = "acme/override-identity-repo"
+
+        first = pr_ops.create_pr(
+            wid, config, confirm_fork=True, target_repo=repo,
+        )
+        assert first["success"] is True, first
+        assert first["pr_head"] == "alice:feature/work-2-aaaa"
+        entry = fork_pr.find_fork(repo, "override-login")
+        assert entry.owner == "alice"
+        assert entry.real_owner == "alice-real-login"
+
+        # A later call with no confirm_fork, identity unchanged -- the
+        # override must NOT skip the check so aggressively that a genuine
+        # match still works.
+        second = pr_ops.create_pr(
+            wid, config, target_repo=repo,
+            branch="feature/work-2-aaaa-override-2",
+        )
+        assert "needs_confirmation" not in second, second
+        assert second["success"] is True, second
+        assert second["pr_head"] == "alice:feature/work-2-aaaa-override-2"
+
+        # Now the REAL authenticated identity silently switches -- the
+        # override still names "alice" for display, but the actual account
+        # that would authenticate/fork/push is now someone else entirely.
+        identity_provider.real_owner = "bob-real-login"
+
+        third = pr_ops.create_pr(
+            wid, config, target_repo=repo,
+            branch="feature/work-2-aaaa-override-3",
+        )
+        assert third["success"] is False, third
+        assert third["needs_confirmation"] == "fork_setup", third
+        assert "alice-real-login" in third["message"]
+        assert "bob-real-login" in third["message"]
+        # The stored entry must still name the ORIGINAL identity -- nothing
+        # was silently re-approved for Bob.
+        entry2 = fork_pr.find_fork(repo, "override-login")
+        assert entry2.real_owner == "alice-real-login"
+
+    def test_clearing_owner_override_requires_reconfirmation(
+        self, pr_repo, tmp_path, monkeypatch,
+    ):
+        """A prior approval confirmed WITH an explicit pr.fork.owner
+        override (owner='alias', real_owner='alice') is a DIFFERENT
+        approval than a later call with that override CLEARED -- the PR
+        head will now display the real identity ('alice') instead of the
+        approved alias. This must re-prompt BEFORE any mutation (the
+        normal needs_confirmation path), not run the fork/remote bootstrap
+        first and only then fail with a misleading 'concurrent identity
+        change' error -- the real_owner itself never actually changed."""
+        config_with_override, wid, _wt_path, _remote_dir = pr_repo
+        config_with_override = self._fork_config(
+            config_with_override, tmp_path, owner="alias",
+        )
+
+        fork_dir = tmp_path / "fork-clear-override.git"
+        git_ops.git("init", "--bare", "-b", "master", str(fork_dir))
+        fake = self._fake_provider("alice", str(fork_dir))
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider", lambda name: fake,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.fork_pr._resolve_fork_credential",
+            lambda slug, prcfg: (None, "clear-override-login"),
+        )
+
+        from agent_worktrees import fork_pr
+        repo = "acme/clear-override-repo"
+        first = pr_ops.create_pr(
+            wid, config_with_override, confirm_fork=True, target_repo=repo,
+        )
+        assert first["success"] is True, first
+        entry = fork_pr.find_fork(repo, "clear-override-login")
+        assert entry.owner == "alias"
+        assert entry.real_owner == "alice"
+
+        # Same repo/account, override now cleared.
+        config_no_override = self._fork_config(config_with_override, tmp_path)
+        res = pr_ops.create_pr(
+            wid, config_no_override, target_repo=repo,
+            branch="feature/clear-override-2",
+        )  # no confirm_fork -- must re-ask, not mutate then error
+
+        assert res["success"] is False, res
+        assert res["needs_confirmation"] == "fork_setup", res
+        # Nothing was mutated: the original approval is untouched.
+        entry2 = fork_pr.find_fork(repo, "clear-override-login")
+        assert entry2.owner == "alias"
+        assert entry2.real_owner == "alice"
+
+    def test_configured_owner_mismatch_forces_reconfirmation(
+        self, pr_repo, tmp_path, monkeypatch,
+    ):
+        """An explicit pr.fork.owner deterministically decides the real fork
+        owner independent of identity (see _ensure_fork_and_remote) -- so a
+        stored confirmation recorded under a DIFFERENT owner is a different
+        approval, not the same one under a new name, and must re-prompt
+        rather than silently publish under the newly-configured owner."""
+        config, wid, _wt_path, _remote_dir = pr_repo
+        config = self._fork_config(config, tmp_path, owner="new-explicit-owner")
+
+        fork_dir = tmp_path / "fork-owner-mismatch.git"
+        git_ops.git("init", "--bare", "-b", "master", str(fork_dir))
+        fake = self._fake_provider("new-explicit-owner", str(fork_dir))
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider", lambda name: fake,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.fork_pr._resolve_fork_credential",
+            lambda slug, prcfg: (None, "mismatch-login"),
+        )
+
+        from agent_worktrees import fork_pr
+        repo = "acme/owner-mismatch-repo"
+        # A prior confirmation exists for this repo+account, but under a
+        # DIFFERENT owner than what pr.fork.owner now configures.
+        fork_pr.record_confirmation(
+            repo, "stale-owner", account="mismatch-login",
+        )
+
+        res = pr_ops.create_pr(
+            wid, config, target_repo=repo,
+        )  # no confirm_fork -- must re-ask, not reuse the stale owner
+
+        assert res["success"] is False, res
+        assert res["needs_confirmation"] == "fork_setup", res
+
+        # Confirming explicitly now proceeds, and re-records under the
+        # NEW owner (not silently kept at the old stale one).
+        res2 = pr_ops.create_pr(
+            wid, config, confirm_fork=True, target_repo=repo,
+            branch="feature/work-2-aaaa-mismatch",
+        )
+        assert res2["success"] is True, res2
+        assert res2["pr_head"] == "new-explicit-owner:feature/work-2-aaaa-mismatch"
+        entry = fork_pr.find_fork(repo, "mismatch-login")
+        assert entry.owner == "new-explicit-owner"
+
+    def test_live_resolved_owner_mismatch_forces_reconfirmation(
+        self, pr_repo, tmp_path, monkeypatch,
+    ):
+        """Even with NO pr.fork.owner override configured, a stored
+        confirmation's owner can still diverge from the actually resolved
+        fork owner (a typo at 'forks set' time, or a genuine upstream
+        change). A silent skip must re-validate against the LIVE result
+        rather than trusting the stale stored owner -- silently publishing
+        wherever the provider now resolves to is exactly the 'approved X,
+        got Y' gap a pre-approval contract exists to prevent."""
+        config, wid, _wt_path, _remote_dir = pr_repo
+        config = self._fork_config(config, tmp_path)  # no owner override
+
+        fork_dir = tmp_path / "fork-live-mismatch.git"
+        git_ops.git("init", "--bare", "-b", "master", str(fork_dir))
+        fake = self._fake_provider("real-owner", str(fork_dir))
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider", lambda name: fake,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.fork_pr._resolve_fork_credential",
+            lambda slug, prcfg: (None, "live-mismatch-login"),
+        )
+
+        from agent_worktrees import fork_pr
+        repo = "acme/live-owner-mismatch-repo"
+        # Stored confirmation names a DIFFERENT owner than the provider will
+        # actually resolve for this (correctly matched) account/scope.
+        fork_pr.record_confirmation(
+            repo, "stale-typo-owner", account="live-mismatch-login",
+        )
+
+        res = pr_ops.create_pr(
+            wid, config, target_repo=repo,
+        )  # no confirm_fork -- must re-ask, not trust the stale stored owner
+
+        assert res["success"] is False, res
+        assert res["needs_confirmation"] == "fork_setup", res
+        assert "real-owner" in res["message"]
+        assert "stale-typo-owner" in res["message"]
+        # Nothing was mutated: the mismatch was caught BEFORE
+        # _ensure_fork_and_remote's mutating fork-create/remote-repoint ran.
+        assert not git_ops.has_remote("fork", cwd=str(_wt_path))
+
+        # Explicit re-confirmation proceeds and self-heals the stored entry
+        # to the real, live-resolved owner.
+        res2 = pr_ops.create_pr(
+            wid, config, confirm_fork=True, target_repo=repo,
+            branch="feature/work-2-aaaa-live-mismatch",
+        )
+        assert res2["success"] is True, res2
+        assert res2["pr_head"] == "real-owner:feature/work-2-aaaa-live-mismatch"
+        entry = fork_pr.find_fork(repo, "live-mismatch-login")
+        assert entry.owner == "real-owner"
+
+        # And now a THIRD call, with no confirm_fork, proceeds silently --
+        # the stored entry matches the live result again.
+        res3 = pr_ops.create_pr(
+            wid, config, target_repo=repo,
+            branch="feature/work-2-aaaa-live-mismatch-2",
+        )
+        assert "needs_confirmation" not in res3, res3
+        assert res3["success"] is True, res3
+
+    def test_login_comparisons_are_case_insensitive(
+        self, pr_repo, tmp_path, monkeypatch,
+    ):
+        """GitHub logins are case-insensitive ('octocat' and 'OctoCat' name
+        the same account) -- a stored confirmation recorded under one
+        casing must still silently match when the live provider (or a
+        pr.fork.owner override) later resolves/names the SAME login with
+        different casing. A casing-only difference must never be treated
+        as a changed/unapproved identity."""
+        config, wid, _wt_path, _remote_dir = pr_repo
+        config = self._fork_config(config, tmp_path)  # no owner override
+
+        fork_dir = tmp_path / "fork-case-insensitive.git"
+        git_ops.git("init", "--bare", "-b", "master", str(fork_dir))
+        # The live provider resolves a DIFFERENT casing than what's stored.
+        fake = self._fake_provider("OctoCat", str(fork_dir))
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider", lambda name: fake,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.fork_pr._resolve_fork_credential",
+            lambda slug, prcfg: (None, "case-login"),
+        )
+
+        from agent_worktrees import fork_pr
+        repo = "acme/case-insensitive-repo"
+        fork_pr.record_confirmation(repo, "octocat", account="case-login")
+
+        res = pr_ops.create_pr(
+            wid, config, target_repo=repo,
+        )  # no confirm_fork -- a casing-only difference must still match
+
+        assert "needs_confirmation" not in res, res
+        assert res["success"] is True, res
+
+    def test_inconclusive_live_owner_check_fails_closed(
+        self, pr_repo, tmp_path, monkeypatch,
+    ):
+        """A FAILED/inconclusive non-mutating owner lookup (e.g. a transient
+        API error) must ALSO fail closed, not silently trust the stored
+        approval -- ensure_fork's own (separate) lookup moments later could
+        legitimately resolve a DIFFERENT owner and persist it without this
+        call ever having actually confirmed that was intended."""
+        config, wid, _wt_path, _remote_dir = pr_repo
+        config = self._fork_config(config, tmp_path)  # no owner override
+
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.fork_pr._resolve_fork_credential",
+            lambda slug, prcfg: (None, "inconclusive-login"),
+        )
+        # The non-mutating pre-check is inconclusive (simulates a transient
+        # failure), regardless of what ensure_fork's own lookup might do.
+        monkeypatch.setattr(
+            "agent_worktrees.fork_pr._resolve_live_fork_owner", lambda prcfg, token: None,
+        )
+
+        from agent_worktrees import fork_pr
+        repo = "acme/inconclusive-owner-repo"
+        fork_pr.record_confirmation(
+            repo, "stored-owner", account="inconclusive-login",
+        )
+
+        res = pr_ops.create_pr(
+            wid, config, target_repo=repo,
+        )  # no confirm_fork -- an unverifiable owner must still re-prompt
+
+        assert res["success"] is False, res
+        assert res["needs_confirmation"] == "fork_setup", res
+        assert not git_ops.has_remote("fork", cwd=str(_wt_path))
+
+    def test_concurrent_identity_switch_between_precheck_and_bootstrap_fails_closed(
+        self, pr_repo, tmp_path, monkeypatch,
+    ):
+        """A TOCTOU gap with ambient `gh` auth (token=None): the non-mutating
+        pre-check and the mutating fork bootstrap are two SEPARATE calls, so
+        if another process switches the active `gh` identity between them,
+        the pre-check can validate the OLD (stored) owner while bootstrap
+        actually creates/repoints the fork for a NEW, different owner. That
+        divergence must error out rather than silently re-persist the new
+        owner under the old (unconfirmed-this-call) approval."""
+        config, wid, _wt_path, _remote_dir = pr_repo
+        config = self._fork_config(config, tmp_path)  # no owner override
+
+        fork_dir = tmp_path / "fork-race.git"
+        git_ops.git("init", "--bare", "-b", "master", str(fork_dir))
+        # The pre-check (_resolve_live_fork_owner) and the actual bootstrap
+        # (_ensure_fork_and_remote -> provider.ensure_fork) both go through
+        # this SAME fake provider -- but resolve to DIFFERENT owners,
+        # simulating the identity having switched in between.
+        race_fake = self._fake_provider("race-condition-owner", str(fork_dir))
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider", lambda name: race_fake,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.fork_pr._resolve_fork_credential",
+            lambda slug, prcfg: (None, "race-login"),
+        )
+
+        from agent_worktrees import fork_pr
+        repo = "acme/race-condition-repo"
+        fork_pr.record_confirmation(repo, "original-owner", account="race-login")
+        # Pre-check reports the ORIGINAL (stored) owner still matches --
+        # a silent skip is about to be granted...
+        monkeypatch.setattr(
+            "agent_worktrees.fork_pr._resolve_live_fork_owner",
+            lambda prcfg, token: "original-owner",
+        )
+
+        res = pr_ops.create_pr(
+            wid, config, target_repo=repo,
+        )  # no confirm_fork -- the pre-check alone must not be trusted if
+        # the actual bootstrap below disagrees with it
+
+        assert res["success"] is False, res
+        assert "race-condition-owner" in res["error"]
+        assert "original-owner" in res["error"]
+        # The stored entry must still name the ORIGINAL owner -- the
+        # race-resolved owner must never be silently persisted without an
+        # explicit confirm_fork=True.
+        entry = fork_pr.find_fork(repo, "race-login")
+        assert entry.owner == "original-owner"
+
+    def test_forks_set_default_scope_matches_create_pr_gate(
+        self, pr_repo, tmp_path, monkeypatch,
+    ):
+        """'forks set' (no --account) must default to the SAME scope
+        create_pr's gate checks against -- both go through
+        _resolve_fork_credential, exercised here with NO mocking of that
+        resolver itself (only its collaborators), so a real divergence
+        between the two call sites would show up as a spurious re-prompt."""
+        from agent_worktrees import forks_cli
+
+        config, wid, wt_path, _remote_dir = pr_repo
+        config = self._fork_config(config, tmp_path)
+
+        fork_dir = tmp_path / "fork-consistency.git"
+        git_ops.git("init", "--bare", "-b", "master", str(fork_dir))
+        fake = self._fake_provider("consistency-owner", str(fork_dir))
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider", lambda name: fake,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda *a, **k: None,
+        )
+        # Pin the ambient collaborators (not _resolve_fork_credential
+        # itself) so the test is deterministic across machines/CI.
+        monkeypatch.setattr(
+            "agent_worktrees.repos.account_for_github_slug", lambda slug: None,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.git_ops.active_gh_account", lambda: "ambient-user",
+        )
+
+        repo = "acme/consistency-repo"
+        rc = forks_cli.cmd_forks_dispatch(["set", repo, "--owner", "consistency-owner"])
+        assert rc == 0
+
+        res = pr_ops.create_pr(wid, config, target_repo=repo)  # no confirm_fork
+        assert "needs_confirmation" not in res, res
+        assert res["success"] is True, res
+
+    def test_confirmation_does_not_cross_logins(
+        self, pr_repo, tmp_path, monkeypatch,
+    ):
+        """A confirmation recorded under one effective login must not be
+        honored once the repo resolves to a DIFFERENT one -- otherwise a
+        stale confirmation would silently authorize forking/pushing under an
+        identity the human never actually approved (e.g. an account-mapping
+        change, or ambient gh auth switching users)."""
+        config, wid, wt_path, _remote_dir = pr_repo
+        config = self._fork_config(config, tmp_path)
+
+        fork_dir = tmp_path / "fork-account-a.git"
+        git_ops.git("init", "--bare", "-b", "master", str(fork_dir))
+        fake = self._fake_provider("account-a-owner", str(fork_dir))
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider", lambda name: fake,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.fork_pr._resolve_fork_credential",
+            lambda slug, prcfg: (None, "login-a"),
+        )
+
+        confirmed = pr_ops.create_pr(
+            wid, config, confirm_fork=True, target_repo="acme/cross-account-repo",
+        )
+        assert confirmed["success"] is True, confirmed
+
+        # Now simulate the resolved login changing (an account-mapping edit,
+        # or ambient `gh auth switch` to a different user).
+        monkeypatch.setattr(
+            "agent_worktrees.fork_pr._resolve_fork_credential",
+            lambda slug, prcfg: (None, "login-b"),
+        )
+        asked_again = pr_ops.create_pr(
+            wid, config, new=True, target_repo="acme/cross-account-repo",
+            branch="feature/work-2-aaaa-cross",
+        )
+        assert asked_again.get("needs_confirmation") == "fork_setup", asked_again
+
+
+# ---------------------------------------------------------------------------
+# create_pr -- role resolution drives pr.roles (not a forced pr.fork.enabled)
+#
+# The tests above force ``pr.fork.enabled`` directly on the base PRConfig.
+# These instead exercise the actual integration seam create_pr relies on in
+# practice: a repo that only sets ``pr.roles`` (fork disabled at the base),
+# with the caller's role resolved from a *live* (here, faked) GitHub viewer
+# permission via ``_resolve_caller_role`` -> ``providers.actor_viewer_permission``
+# -> ``cfg.resolve_role_pr_config``. Closes the one seam
+# efforts/active/role-aware-fork-pr-flow's Phase 3 left unit-untested.
+# ---------------------------------------------------------------------------
+
+class TestCreatePRRoleResolution:
+    def _roles_config(self, config, **role_overrides):
+        import dataclasses
+        repo = config.repos["ext"]
+        pr = dataclasses.replace(
+            repo.pr, provider="github", roles=dict(role_overrides),
+        )
+        return dataclasses.replace(
+            config, repos={"ext": dataclasses.replace(repo, pr=pr)},
+        )
+
+    def _fake_permission_provider(self, viewer_permission: str, *, supported=True):
+        from types import SimpleNamespace
+
+        class _FakeProvider:
+            name = "github"
+
+            def __init__(self):
+                self.policy_calls = 0
+
+            def authority_endpoint(self, api_base=""):
+                return "github.com"
+
+            def get_repo_policy(self, repo, *, api_base="", token=None):
+                self.policy_calls += 1
+                return SimpleNamespace(
+                    supported=supported, viewer_permission=viewer_permission,
+                )
+
+            def create_pull(self, scope, *, token=None):
+                return SimpleNamespace(
+                    url="https://example/pulls/17",
+                    number=17,
+                    state="open",
+                    label_error="",
+                )
+
+            def pull_review_gate(
+                self, repo, number, *, api_base="", token=None,
+            ):
+                return True, True
+
+        return _FakeProvider()
+
+    def _patch_live_permission(self, monkeypatch, viewer_permission: str, **kw):
+        fake = self._fake_permission_provider(viewer_permission, **kw)
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider", lambda name: fake,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda *a, **k: None,
+        )
+        return fake
+
+    def test_live_write_permission_resolves_to_roles_write_fork(
+        self, pr_repo, monkeypatch,
+    ):
+        """A caller whose live GitHub permission reads 'write' gets the
+        `pr.roles.write` override applied -- including its `fork.enabled` --
+        purely from the live permission read, with no `pr.fork.enabled` set
+        anywhere on the base config."""
+        config, wid, wt_path, _remote_dir = pr_repo
+        config = self._roles_config(
+            config,
+            write=cfg.PRRoleOverride(
+                merge_actor="", fork=cfg.ForkConfig(enabled=True),
+            ),
+        )
+        self._patch_live_permission(monkeypatch, "write")
+
+        res = pr_ops.create_pr(wid, config, target_repo="acme/ext")
+
+        assert res["success"] is False
+        assert res["needs_confirmation"] == "fork_setup"
+        assert res["repo"] == "acme/ext"
+        # Nothing mutated: the base config never set pr.fork.enabled itself.
+        assert not git_ops.has_remote("fork", cwd=str(wt_path))
+
+    def test_live_maintain_permission_keeps_direct_push(
+        self, pr_repo, monkeypatch,
+    ):
+        """A caller whose live permission reads 'maintain' resolves to the
+        `pr.roles.maintain` override (fork disabled, direct push unchanged) --
+        proceeds without any fork confirmation."""
+        config, wid, _wt_path, _remote_dir = pr_repo
+        config = self._roles_config(
+            config,
+            write=cfg.PRRoleOverride(
+                merge_actor="", fork=cfg.ForkConfig(enabled=True),
+            ),
+            maintain=cfg.PRRoleOverride(
+                merge_actor="submitter-direct",
+                fork=cfg.ForkConfig(enabled=False),
+            ),
+        )
+        self._patch_live_permission(monkeypatch, "maintain")
+
+        res = pr_ops.create_pr(wid, config, target_repo="acme/ext")
+
+        assert res["success"] is True, res
+        assert "needs_confirmation" not in res
+        assert res["remote"] == "origin"
+
+    def test_maintain_auto_open_uses_effective_self_merge_flow(
+        self, pr_repo, monkeypatch,
+    ):
+        """Auto-open must use the already-resolved Maintain flow for its live
+        bypass note, not reclassify the conservative base config."""
+        import dataclasses
+
+        config, wid, _wt_path, _remote_dir = pr_repo
+        config = self._roles_config(
+            config,
+            maintain=cfg.PRRoleOverride(
+                merge_actor="submitter-direct",
+            ),
+        )
+        repo = config.repos["ext"]
+        config = dataclasses.replace(
+            config,
+            repos={
+                "ext": dataclasses.replace(
+                    repo,
+                    pr=dataclasses.replace(repo.pr, auto_open=True),
+                ),
+            },
+        )
+        fake = self._patch_live_permission(monkeypatch, "maintain")
+
+        res = pr_ops.create_pr(wid, config, target_repo="acme/ext")
+
+        assert res["pr_opened"] is True
+        assert "Maintainer bypass" in res["self_merge_note"]
+        assert fake.policy_calls == 1
+
+    def test_live_permission_with_no_matching_role_is_unaffected(
+        self, pr_repo, monkeypatch,
+    ):
+        """A live permission that resolves to a role absent from `pr.roles`
+        (e.g. 'read') leaves the base PRConfig untouched -- no fork, no
+        confirmation gate -- exactly like an unconfigured repo."""
+        config, wid, _wt_path, _remote_dir = pr_repo
+        config = self._roles_config(
+            config,
+            write=cfg.PRRoleOverride(
+                merge_actor="", fork=cfg.ForkConfig(enabled=True),
+            ),
+        )
+        self._patch_live_permission(monkeypatch, "read")
+
+        res = pr_ops.create_pr(wid, config, target_repo="acme/ext")
+
+        assert res["success"] is True, res
+        assert "needs_confirmation" not in res
+
+    def test_unresolvable_live_permission_falls_back_to_base_config(
+        self, pr_repo, monkeypatch,
+    ):
+        """A provider read that can't determine `viewer_permission`
+        (`supported=False`) must fail OPEN to the base, non-role-scoped
+        config -- never treated as a denial or as any particular role."""
+        config, wid, _wt_path, _remote_dir = pr_repo
+        config = self._roles_config(
+            config,
+            write=cfg.PRRoleOverride(
+                merge_actor="", fork=cfg.ForkConfig(enabled=True),
+            ),
+        )
+        self._patch_live_permission(monkeypatch, "", supported=False)
+
+        res = pr_ops.create_pr(wid, config, target_repo="acme/ext")
+
+        assert res["success"] is True, res
+        assert "needs_confirmation" not in res
+
 
 # ---------------------------------------------------------------------------
 # create_pr -- refspec head scheme (#1815)
 # ---------------------------------------------------------------------------
+
+class TestAuditAttributionRisk:
+    """pr-attribution-codenames Phase 5: audit_attribution_risk (config-only)."""
+
+    def _config(self, config, **pr_overrides):
+        import dataclasses
+        repo = config.repos["ext"]
+        pr = dataclasses.replace(repo.pr, **pr_overrides)
+        return dataclasses.replace(config, repos={"ext": dataclasses.replace(repo, pr=pr)})
+
+    def test_no_findings_for_default_config(self, pr_repo):
+        config, _wid, _wt, _ = pr_repo
+        assert pr_ops.audit_attribution_risk(config) == []
+
+    def test_no_findings_when_attribution_true(self, pr_repo):
+        config, _wid, _wt, _ = pr_repo
+        config = self._config(
+            config, source_attribution=True, head_pattern="user/{machine}/{slug}",
+            source_attribution_configured=True,
+        )
+        assert pr_ops.audit_attribution_risk(config) == []
+
+    def test_finding_for_risky_head_pattern_with_explicit_false(self, pr_repo):
+        config, _wid, _wt, _ = pr_repo
+        config = self._config(
+            config, head_pattern="{machine}/{slug}",
+            source_attribution_configured=True,
+        )
+        findings = pr_ops.audit_attribution_risk(config)
+        assert len(findings) == 1
+        assert "{machine}" in findings[0]
+        assert "absent" not in findings[0]
+
+    def test_finding_for_risky_head_pattern_with_genuinely_absent_key(self, pr_repo):
+        # A raw config that omits `source_attribution` entirely is parsed the
+        # same as an explicit `false` (`prcfg.source_attribution is False`),
+        # but `source_attribution_configured` distinguishes the two so the
+        # audit's finding text says "absent", not "False", for this case.
+        config, _wid, _wt, _ = pr_repo
+        config = self._config(
+            config, head_pattern="{machine}/{slug}",
+            source_attribution_configured=False,
+        )
+        findings = pr_ops.audit_attribution_risk(config)
+        assert len(findings) == 1
+        assert "absent" in findings[0]
+
+    def test_finding_under_codename_mode(self, pr_repo):
+        config, _wid, _wt, _ = pr_repo
+        config = self._config(
+            config, source_attribution="codename", head_pattern="{machine}/{slug}",
+            source_attribution_configured=True,
+        )
+        findings = pr_ops.audit_attribution_risk(config)
+        assert len(findings) == 1
+        assert "true" in findings[0]
+
+
+class TestAttributionAuditCLI:
+    """CLI-level regression tests for `cmd_attribution_audit`."""
+
+    def _args(self, *, use_json: bool = False) -> argparse.Namespace:
+        return argparse.Namespace(json=use_json, config=None)
+
+    def test_plain_mode_no_findings_ok(self, pr_repo, monkeypatch, capsys):
+        config, _wid, _wt, _ = pr_repo
+        monkeypatch.setattr(cfg, "load_config", lambda *a, **k: config)
+        rc = m.cmd_attribution_audit(self._args())
+        assert rc == 0
+        assert "No branch-name leak-class risk" in capsys.readouterr().out
+
+    def test_plain_mode_warns_and_returns_1_on_findings(
+        self, pr_repo, monkeypatch, capsys,
+    ):
+        import dataclasses
+        config, _wid, _wt, _ = pr_repo
+        repo = config.repos["ext"]
+        pr = dataclasses.replace(repo.pr, head_pattern="{machine}/{slug}")
+        config = dataclasses.replace(
+            config, repos={"ext": dataclasses.replace(repo, pr=pr)}
+        )
+        monkeypatch.setattr(cfg, "load_config", lambda *a, **k: config)
+        rc = m.cmd_attribution_audit(self._args())
+        assert rc == 1
+        assert "{machine}" in capsys.readouterr().out
+
+    def test_json_mode_reports_findings_but_exits_0(
+        self, pr_repo, monkeypatch, capfd,
+    ):
+        import dataclasses
+        import json
+        config, _wid, _wt, _ = pr_repo
+        repo = config.repos["ext"]
+        pr = dataclasses.replace(repo.pr, head_pattern="{machine}/{slug}")
+        config = dataclasses.replace(
+            config, repos={"ext": dataclasses.replace(repo, pr=pr)}
+        )
+        monkeypatch.setattr(cfg, "load_config", lambda *a, **k: config)
+        rc = m.cmd_attribution_audit(self._args(use_json=True))
+        assert rc == 0
+        payload = json.loads(capfd.readouterr().out)
+        assert payload["success"] is True
+        assert len(payload["findings"]) == 1
+        assert "{machine}" in payload["findings"][0]
+
+    def test_config_load_failure_reported(self, monkeypatch, capsys):
+        def _raise(*a, **k):
+            raise ValueError("no active project")
+        monkeypatch.setattr(cfg, "load_config", _raise)
+        rc = m.cmd_attribution_audit(self._args())
+        assert rc == 1
+        assert "no active project" in capsys.readouterr().out
+
+    def test_config_load_failure_reported_json(self, monkeypatch, capfd):
+        import json
+        def _raise(*a, **k):
+            raise ValueError("no active project")
+        monkeypatch.setattr(cfg, "load_config", _raise)
+        rc = m.cmd_attribution_audit(self._args(use_json=True))
+        assert rc == 1
+        payload = json.loads(capfd.readouterr().out)
+        assert payload["error"] == "no active project"
+
 
 class TestCreatePRRefspec:
     def _refspec_config(self, config, **pr_overrides):
@@ -402,6 +1957,87 @@ class TestCreatePRRefspec:
         }
 
 
+class TestCreatePRBranchLeakGuard:
+    """pr-attribution-codenames Phase 5: hard-block a leaking effective head."""
+
+    def _config(self, config, **pr_overrides):
+        import dataclasses
+        repo = config.repos["ext"]
+        pr = dataclasses.replace(repo.pr, **pr_overrides)
+        return dataclasses.replace(config, repos={"ext": dataclasses.replace(repo, pr=pr)})
+
+    def test_explicit_branch_with_raw_worktree_id_is_blocked(self, pr_repo):
+        config, wid, wt_path, _ = pr_repo
+        res = pr_ops.create_pr(
+            wid, config, title="Add feature", branch=f"worktree/{wid}",
+        )
+        assert res["success"] is False
+        assert "leak" in res["error"]
+        assert wid in res["error"]
+        # Nothing was pushed -- the branch never exists on the remote.
+        assert not git_ops.remote_branch_exists(
+            "origin", f"worktree/{wid}", cwd=str(wt_path)
+        )
+
+    def test_head_pattern_with_machine_token_is_blocked(self, pr_repo):
+        config, wid, _wt_path, _ = pr_repo
+        config = self._config(config, head_pattern="user/{machine}/{slug}")
+        res = pr_ops.create_pr(wid, config, title="Add feature")
+        assert res["success"] is False
+        assert "leak" in res["error"]
+        assert "machine name" in res["error"]
+
+    def test_source_attribution_true_allows_the_raw_head(self, pr_repo):
+        config, wid, _wt_path, _ = pr_repo
+        config = self._config(config, source_attribution=True)
+        res = pr_ops.create_pr(
+            wid, config, title="Add feature", branch=f"worktree/{wid}",
+        )
+        assert res["success"] is True, res
+
+    def test_codename_mode_still_blocks_a_leaking_branch(self, pr_repo):
+        config, wid, _wt_path, _ = pr_repo
+        config = self._config(config, source_attribution="codename")
+        res = pr_ops.create_pr(
+            wid, config, title="Add feature", branch=f"worktree/{wid}",
+        )
+        assert res["success"] is False
+        assert "leak" in res["error"]
+
+    def test_dry_run_still_reports_the_block(self, pr_repo):
+        config, wid, _wt_path, _ = pr_repo
+        res = pr_ops.create_pr(
+            wid, config, title="Add feature", branch=f"worktree/{wid}",
+            dry_run=True,
+        )
+        assert res["success"] is False
+        assert "leak" in res["error"]
+
+    def test_safe_default_head_pattern_is_unaffected(self, pr_repo):
+        # Regression: the ordinary snapshot/refspec default patterns never
+        # embed a private identifier, so they must still succeed unchanged.
+        config, wid, _wt_path, _ = pr_repo
+        res = pr_ops.create_pr(wid, config, title="Add feature")
+        assert res["success"] is True, res
+
+    def test_renamed_machine_still_blocks_the_recorded_identity(self, pr_repo):
+        # config.machine (live) can differ from record.machine (frozen at
+        # registration, e.g. after a machine rename/migration). An explicit
+        # --branch embedding the OLD recorded machine name must still be
+        # blocked even though the live config machine no longer matches it.
+        config, wid, _wt_path, _ = pr_repo
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        assert rec.machine == "test"
+        import dataclasses
+        renamed_config = dataclasses.replace(config, machine="new-machine-name")
+        res = pr_ops.create_pr(
+            wid, renamed_config, title="Add feature", branch="user/test/reused-head",
+        )
+        assert res["success"] is False
+        assert "machine name" in res["error"]
+        assert "'test'" in res["error"]
+
+
 # ---------------------------------------------------------------------------
 # set_pr / pr_status
 # ---------------------------------------------------------------------------
@@ -431,6 +2067,150 @@ class TestSetPRAndStatus:
         assert st["url"] == "https://example/pulls/7"
         assert st["number"] == 7
 
+    def test_set_pr_derives_repo_slug_from_github_url(self, pr_repo):
+        """Regression test: `set-pr --url ...` (the documented manual-
+        registration path for a PR opened outside create-pr's own flow) must
+        populate `pr.repo` with the hosting `owner/repo` slug parsed from the
+        URL -- without it, every downstream operation needing that slug
+        (e.g. pr-nudge's requested_reviewers call) silently fell back to the
+        worktree's generic local project name instead, a real 404 whenever
+        the PR's actual host repo has a different name/owner than the local
+        project."""
+        _config, wid, _wt_path, _ = pr_repo
+        res = pr_ops.set_pr(
+            wid,
+            url="https://github.com/SomeOwner/some-other-repo/pull/42",
+            number=42,
+            provider="github",
+        )
+        assert res["success"] is True
+        assert res["repo"] == "SomeOwner/some-other-repo"
+        st = pr_ops.pr_status(wid)
+        assert st["repo"] == "SomeOwner/some-other-repo"
+
+    def test_set_pr_derives_repo_slug_from_path_hosted_gitea_url(self, pr_repo):
+        """A self-hosted Gitea instance's `api_base` can carry an arbitrary
+        path prefix (`providers/gitea.py`'s own `create_pull` produces URLs
+        like `https://h/gitea/o/r/pulls/42`) -- a third path segment between
+        host and `owner/repo` the plain host-relative pattern never matches.
+        Stripping the configured `api_base` as a prefix first must still
+        resolve the correct slug."""
+        config, wid, _wt_path, _ = pr_repo
+        import dataclasses
+        repo = config.repos["ext"]
+        pr_cfg = dataclasses.replace(repo.pr, api_base="https://h/gitea")
+        config = dataclasses.replace(
+            config, repos={"ext": dataclasses.replace(repo, pr=pr_cfg)},
+        )
+        res = pr_ops.set_pr(
+            wid,
+            url="https://h/gitea/o/r/pulls/42",
+            number=42,
+            provider="gitea",
+            config=config,
+        )
+        assert res["success"] is True
+        assert res["repo"] == "o/r"
+
+    def test_set_pr_repo_change_clears_attribution_evidence(self, pr_repo):
+        """A parsed repo change (not just a number/provider change) must
+        also clear stale attribution/observation evidence -- the create/
+        reuse path already does this for an explicit --repo change:
+        without it, `refresh_source_attribution` can incorrectly
+        short-circuit as already published against the OLD repo's merge
+        evidence."""
+        _config, wid, _wt_path, _ = pr_repo
+        pr_ops.set_pr(
+            wid, url="https://github.com/OwnerA/repo-a/pull/1", number=1,
+            provider="github",
+        )
+        rec_path = cfg.tracking_dir() / f"{wid}.yaml"
+        rec = tracking.load_record(rec_path)
+        rec.active_pr().attribution_head = "deadbeef"
+        rec.active_pr().head_observed_at = "2026-01-01T00:00:00Z"
+        rec.active_pr().head_observed_api_base = "https://old-base"
+        tracking.save_record(rec)
+
+        res = pr_ops.set_pr(
+            wid, url="https://github.com/OwnerB/repo-b/pull/1", number=1,
+            provider="github",
+        )
+        assert res["success"] is True
+        assert res["repo"] == "OwnerB/repo-b"
+        rec = tracking.load_record(rec_path)
+        pr = rec.active_pr()
+        assert pr.attribution_head == ""
+        assert pr.head_observed_at == ""
+        assert pr.head_observed_api_base == ""
+
+    def test_set_pr_leaves_repo_unset_for_an_unparseable_url(self, pr_repo):
+        """An ADO-shaped (or any otherwise-unrecognized) URL has no `owner/
+        repo` concept this parser can extract -- `pr.repo` must stay unset
+        (not raise, not silently guess), same as before this field existed."""
+        _config, wid, _wt_path, _ = pr_repo
+        res = pr_ops.set_pr(
+            wid,
+            url="https://dev.azure.com/org/project/_git/repo/pullrequest/123",
+            number=123,
+            provider="azure_devops",
+        )
+        assert res["success"] is True
+        assert res.get("repo") == ""
+
+    def test_set_pr_freezes_attribution_and_stamps_pr_id(self, pr_repo):
+        # codename-attribution-by-default (round-27 finding): manual set-pr
+        # is a fresh-construction site too -- the shared stamping helper
+        # must be wired into it, not only into create_pr's own construction.
+        # pr_repo's config resolves the bare "codename" default with
+        # source_attribution_configured False.
+        _config, wid, _wt_path, _ = pr_repo
+        res = pr_ops.set_pr(
+            wid, url="https://example/pulls/7", number=7, provider="gitea"
+        )
+        assert res["success"] is True
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        pr = rec.active_pr()
+        assert pr is not None
+        assert pr.attribution_mode == "codename"
+        assert pr.attribution_explicit is False
+        assert pr.pr_id
+        assert pr.pr_revision == 1
+
+    def test_set_pr_freezes_using_resolved_config_not_ambient(self, pr_repo):
+        # PR #3037 review finding: cmd_set_pr already resolves its own
+        # config (honoring --config/project context), which must be
+        # threaded into set_pr's freeze step -- re-loading AMBIENT config
+        # here would use the wrong repo's policy from a neutral CWD or
+        # when --config targets a different project. Simulate an "ambient"
+        # config that would resolve to a DIFFERENT (raw True) policy than
+        # the one explicitly passed in, and assert the PASSED-IN config
+        # wins.
+        import dataclasses
+        config, wid, _wt_path, _ = pr_repo
+        explicit_config = dataclasses.replace(
+            config,
+            repos={
+                "ext": dataclasses.replace(
+                    config.repos["ext"],
+                    pr=dataclasses.replace(
+                        config.repos["ext"].pr,
+                        source_attribution=True,
+                        source_attribution_configured=True,
+                    ),
+                )
+            },
+        )
+        res = pr_ops.set_pr(
+            wid, url="https://example/pulls/7", number=7, provider="gitea",
+            config=explicit_config,
+        )
+        assert res["success"] is True
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        pr = rec.active_pr()
+        assert pr is not None
+        assert pr.attribution_mode == "true"
+        assert pr.attribution_explicit is True
+
     def test_set_pr_merges_with_create_pr(self, pr_repo):
         config, wid, _wt_path, _ = pr_repo
         created = pr_ops.create_pr(wid, config, title="Add feature")
@@ -441,6 +2221,22 @@ class TestSetPRAndStatus:
         assert res["branch"] == "feature/add-feature-aaaa"
         assert res["head_sha"] == created["head_sha"]
         assert res["number"] == 9
+
+    def test_set_pr_identity_change_clears_head_observation(self, pr_repo):
+        _config, wid, _wt_path, _ = pr_repo
+        pr_ops.set_pr(wid, number=7, provider="gitea")
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        rec.active_pr().head_sha = "same-head"
+        rec.active_pr().head_observed_at = "2026-09-05T06:01:02+00:00"
+        tracking.save_record(rec)
+
+        res = pr_ops.set_pr(wid, number=8)
+
+        assert res["head_sha"] == "same-head"
+        persisted = tracking.load_record(
+            cfg.tracking_dir() / f"{wid}.yaml"
+        ).active_pr()
+        assert persisted.head_observed_at == ""
 
     def test_set_pr_invalid_state(self, pr_repo):
         _config, wid, _wt_path, _ = pr_repo
@@ -460,6 +2256,35 @@ class TestSetPRAndStatus:
         res = pr_ops.set_pr("does-not-exist", number=1)
         assert res["success"] is False
         assert "No tracking record" in res["error"]
+
+    def test_set_pr_backfills_pr_id_before_branch_correction_no_duplicate(
+        self, pr_repo,
+    ):
+        # PR #3037 review finding: a legacy (no-pr_id) on-disk entry whose
+        # branch/number is corrected by a manual `set_pr` call must have
+        # its `pr_id` backfilled and PERSISTED in its own save BEFORE that
+        # correction is applied -- otherwise `_save_record_unlocked`'s
+        # merge can't recognize the renamed in-memory entry as the same
+        # as the pre-rename on-disk one (both blank `pr_id`, but now
+        # different branch values), and duplicate-appends the stale copy.
+        _config, wid, _wt_path, _ = pr_repo
+        yaml_path = cfg.tracking_dir() / f"{wid}.yaml"
+        record = tracking.load_record(yaml_path)
+        legacy_pr = tracking.PRRecord(
+            branch="legacy/original-branch", number=1, state="open",
+        )
+        assert not legacy_pr.pr_id
+        record.prs.append(legacy_pr)
+        tracking.save_record(record)
+
+        res = pr_ops.set_pr(wid, branch="legacy/corrected-branch", number=1)
+
+        assert res["success"] is True
+        persisted = tracking.load_record(yaml_path)
+        assert len(persisted.prs) == 1
+        only_pr = persisted.prs[0]
+        assert only_pr.pr_id
+        assert only_pr.branch == "legacy/corrected-branch"
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +2339,352 @@ class TestPatchId:
         d, base = self._repo(tmp_path)
         assert pr_ops._patch_id(base, "HEAD", cwd=str(d)) == ""  # no diff
         assert pr_ops._patch_id("", "HEAD", cwd=str(d)) == ""    # no base
+
+    def test_commit_patch_ids_batches_range(self, tmp_path, monkeypatch):
+        d, base = self._repo(tmp_path)
+        (d / "a.txt").write_text("one\ntwo\n")
+        self._git(d, "commit", "-aqm", "c1")
+        first = _git("rev-parse", "HEAD", cwd=d)
+        (d / "b.txt").write_text("bee\n")
+        self._git(d, "add", "-A")
+        self._git(d, "commit", "-qm", "c2")
+        second = _git("rev-parse", "HEAD", cwd=d)
+        expected = {
+            pr_ops._patch_id(base, first, cwd=str(d)): {first},
+            pr_ops._patch_id(first, second, cwd=str(d)): {second},
+        }
+        monkeypatch.setenv("GIT_DIR", str(tmp_path / "wrong.git"))
+        monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "wrong-index"))
+
+        patch_ids = pr_ops._commit_patch_ids(base, "HEAD", cwd=str(d))
+
+        assert patch_ids == expected
+
+
+class TestPrClaimHelpers:
+    """pr-merge-obligation-gate defense 2: `_ensure_pr_claim`/`_release_pr_claim`."""
+
+    def _rec(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cfg, "tracking_dir", lambda: tmp_path)
+        rec = tracking.WorktreeRecord(
+            worktree_id="wt-c", branch="worktree/wt-c",
+            worktree_path=str(tmp_path / "wt"), repo="o/r", machine="m",
+            platform="linux", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=None,
+        )
+        tracking.save_record(rec, tmp_path / "wt-c.yaml")
+        return rec
+
+    def test_ref_prefers_url_over_shorthand(self):
+        pr = tracking.PRRecord(number=9, repo="o/r", url="https://x/pull/9")
+        assert pr_ops._pr_claim_ref(pr) == "https://x/pull/9"
+
+    def test_ref_falls_back_to_shorthand(self):
+        pr = tracking.PRRecord(number=9, repo="o/r")
+        assert pr_ops._pr_claim_ref(pr) == "o/r#9"
+
+    def test_ref_empty_without_number_or_repo(self):
+        assert pr_ops._pr_claim_ref(tracking.PRRecord()) == ""
+
+    def test_numberless_creating_pr_is_never_claimed(self, tmp_path, monkeypatch):
+        """A failed/`--no-open` create-pr leaves a numberless `creating`
+        record -- it must never block finalize forever."""
+        rec = self._rec(tmp_path, monkeypatch)
+        pr_ops._ensure_pr_claim(rec, tracking.PRRecord(state="creating"))
+        assert rec.resources == []
+
+    def test_numbered_but_unconfirmed_state_is_never_claimed(self, tmp_path, monkeypatch):
+        """A bare `set-pr`-recorded number with no provider-observed state
+        yet must not be blindly trusted (set_pr persists state with NO
+        provider read)."""
+        rec = self._rec(tmp_path, monkeypatch)
+        pr_ops._ensure_pr_claim(rec, tracking.PRRecord(number=5, repo="o/r", state=""))
+        assert rec.resources == []
+
+    def test_confirmed_open_is_claimed(self, tmp_path, monkeypatch):
+        rec = self._rec(tmp_path, monkeypatch)
+        pr = tracking.PRRecord(number=5, repo="o/r", state="open")
+        pr_ops._ensure_pr_claim(rec, pr)
+        assert len(rec.resources) == 1
+        assert rec.resources[0].kind == "pr" and rec.resources[0].state == "active"
+        assert rec.resources[0].ref == "o/r#5"
+
+    def test_release_settles_to_released_not_abandoned(self, tmp_path, monkeypatch):
+        rec = self._rec(tmp_path, monkeypatch)
+        pr = tracking.PRRecord(number=5, repo="o/r", state="open")
+        pr_ops._ensure_pr_claim(rec, pr)
+        pr_ops._release_pr_claim(rec, pr)
+        assert rec.resources[0].state == "released"
+
+    def test_release_without_existing_claim_is_a_no_op(self, tmp_path, monkeypatch):
+        rec = self._rec(tmp_path, monkeypatch)
+        pr_ops._release_pr_claim(rec, tracking.PRRecord(number=5, repo="o/r"))
+        assert rec.resources == []
+
+    def test_ensure_pr_claim_returns_ref_on_a_real_new_claim(self, tmp_path, monkeypatch):
+        """Save-ordering contract: `_ensure_pr_claim` never feeds
+        claim_history itself (it always runs with `save=False`) -- it
+        returns the ref only for a genuinely NEW claim, so the caller can
+        record history after ITS OWN save is confirmed."""
+        rec = self._rec(tmp_path, monkeypatch)
+        pr = tracking.PRRecord(number=5, repo="o/r", state="open")
+        assert pr_ops._ensure_pr_claim(rec, pr) == "o/r#5"
+        assert claim_history.history_for_ref("o/r#5") == []
+
+    def test_ensure_pr_claim_returns_none_for_an_idempotent_no_op(self, tmp_path, monkeypatch):
+        """A reconciliation re-observing an already-active claim is not a
+        real transition -- must not be reported as a fresh 'claimed' event
+        by the caller."""
+        rec = self._rec(tmp_path, monkeypatch)
+        pr = tracking.PRRecord(number=5, repo="o/r", state="open")
+        pr_ops._ensure_pr_claim(rec, pr)
+        assert pr_ops._ensure_pr_claim(rec, pr) is None
+
+    def test_release_pr_claim_returns_ref_on_a_real_release(self, tmp_path, monkeypatch):
+        rec = self._rec(tmp_path, monkeypatch)
+        pr = tracking.PRRecord(number=5, repo="o/r", state="open")
+        pr_ops._ensure_pr_claim(rec, pr)
+        assert pr_ops._release_pr_claim(rec, pr) == "o/r#5"
+        assert claim_history.history_for_ref("o/r#5") == []
+
+    def test_release_pr_claim_returns_none_for_an_already_released_claim(
+        self, tmp_path, monkeypatch,
+    ):
+        rec = self._rec(tmp_path, monkeypatch)
+        pr = tracking.PRRecord(number=5, repo="o/r", state="open")
+        pr_ops._ensure_pr_claim(rec, pr)
+        pr_ops._release_pr_claim(rec, pr)
+        assert pr_ops._release_pr_claim(rec, pr) is None
+
+    def test_release_without_existing_claim_returns_none(self, tmp_path, monkeypatch):
+        rec = self._rec(tmp_path, monkeypatch)
+        assert pr_ops._release_pr_claim(rec, tracking.PRRecord(number=5, repo="o/r")) is None
+
+
+class TestAbandonPr:
+    """``pr-abandon``'s two-step confirm gate and close/claim-settle contract
+    -- the pragmatic #4411 follow-up (friction, not a real identity
+    primitive)."""
+
+    def _config(self):
+        return cfg.Config(
+            srcroot="/s", machine="m", platform="linux", repo_name="ext",
+            repos={"ext": cfg.RepoConfig(
+                anchor="/a", worktree_root="/w",
+                pr=cfg.PRConfig(enabled=True, provider="gitea"),
+            )},
+        )
+
+    def _record(self, tmp_path, monkeypatch, *, state="open", claimed=True):
+        monkeypatch.setattr(cfg, "tracking_dir", lambda: tmp_path)
+        rec = tracking.WorktreeRecord(
+            worktree_id="wt-a", branch="worktree/wt-a",
+            worktree_path=str(tmp_path / "wt"), repo="o/r", machine="m",
+            platform="linux", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=None,
+        )
+        rec.pr = tracking.PRRecord(
+            state=state, number=7, branch="pr/x", provider="gitea", repo="o/r")
+        if claimed:
+            tracking.add_resource_claim(
+                rec, tracking.ResourceClaim(
+                    kind="pr", ref=pr_ops._pr_claim_ref(rec.pr),
+                    created_at=tracking._now_iso(), state="active"),
+                save=False)
+        tracking.save_record(rec, tmp_path / "wt-a.yaml")
+        return rec
+
+    def _fake_provider(self, *, merged=False, state="open"):
+        from agent_worktrees.providers import PullResult
+
+        class _P:
+            name = "gitea"
+
+            def __init__(self):
+                self.closed = []
+                self.close_calls = 0
+
+            def get_pull(self, repo, number, *, api_base="", token=None):
+                return PullResult(number=number, state=state, merged=merged)
+
+            def close_pull(self, repo, number, *, api_base="", token=None, comment=""):
+                self.close_calls += 1
+                self.closed.append((repo, number, comment))
+                return ""
+
+        return _P()
+
+    def _patch(self, monkeypatch, fake):
+        import agent_worktrees.providers as prov
+        monkeypatch.setattr(prov, "get_provider", lambda name: fake)
+        monkeypatch.setattr(prov, "account_token_for_slug", lambda slug, prcfg: "t")
+
+    # ── the two-step confirm gate itself ─────────────────────────────────
+
+    def test_first_call_without_confirm_refuses_and_mutates_nothing(
+        self, tmp_path, monkeypatch,
+    ):
+        rec = self._record(tmp_path, monkeypatch)
+        fake = self._fake_provider()
+        self._patch(monkeypatch, fake)
+        result = pr_ops.abandon_pr(
+            "wt-a", self._config(), reason="superseded by #99", confirm=False,
+        )
+        assert result["success"] is False
+        assert result["needs_confirm"] is True
+        assert "--confirm" in result["error"]
+        assert "force-push" in result["error"]
+        assert fake.close_calls == 0
+        reloaded = tracking.load_record(rec.yaml_path)
+        assert reloaded.active_pr().state == "open"
+        assert reloaded.resources[0].state == "active"
+
+    def test_reason_required_even_without_confirm(self, tmp_path, monkeypatch):
+        self._record(tmp_path, monkeypatch)
+        result = pr_ops.abandon_pr("wt-a", self._config(), reason="", confirm=False)
+        assert result["success"] is False
+        assert "needs_confirm" not in result
+        assert "--reason" in result["error"]
+
+    def test_reason_required_even_with_confirm(self, tmp_path, monkeypatch):
+        self._record(tmp_path, monkeypatch)
+        result = pr_ops.abandon_pr("wt-a", self._config(), reason="  ", confirm=True)
+        assert result["success"] is False
+        assert "--reason" in result["error"]
+
+    # ── the confirmed path ────────────────────────────────────────────────
+
+    def test_confirm_closes_pr_and_settles_claim_abandoned(self, tmp_path, monkeypatch):
+        rec = self._record(tmp_path, monkeypatch)
+        fake = self._fake_provider(merged=False, state="open")
+        self._patch(monkeypatch, fake)
+        result = pr_ops.abandon_pr(
+            "wt-a", self._config(), reason="superseded by #99", confirm=True,
+        )
+        assert result["success"] is True
+        assert result["closed"] is True
+        assert result["already_closed"] is False
+        assert result["claim_released"] is True
+        assert fake.close_calls == 1
+        closed_repo, closed_number, comment = fake.closed[0]
+        assert closed_repo == "o/r" and closed_number == 7
+        assert "superseded by #99" in comment
+        reloaded = tracking.load_record(rec.yaml_path)
+        assert reloaded.active_pr().state == "closed"
+        assert reloaded.active_pr().closed_at
+        claims = [c for c in reloaded.resources if c.kind == "pr"]
+        assert len(claims) == 1
+        assert claims[0].state == obligations.ABANDONED
+        assert "superseded by #99" in claims[0].note
+        events = claim_history.history_for_ref(pr_ops._pr_claim_ref(rec.pr))
+        assert [e["event"] for e in events] == ["abandoned"]
+        assert events[0]["note"] == "superseded by #99"
+
+    def test_confirm_refuses_if_already_merged_live(self, tmp_path, monkeypatch):
+        """Never trust local pr.state alone -- a live-confirmed merge refuses
+        the abandon outright. The shared _reconcile_active_pr self-heal
+        runs first and settles the claim to `released` (a clean hand-back,
+        matching its own merged-PR contract) -- abandon_pr's own refusal is
+        on top of that, not instead of it."""
+        rec = self._record(tmp_path, monkeypatch)
+        fake = self._fake_provider(merged=True, state="closed")
+        self._patch(monkeypatch, fake)
+        result = pr_ops.abandon_pr(
+            "wt-a", self._config(), reason="superseded", confirm=True,
+        )
+        assert result["success"] is False
+        assert "already merged" in result["error"]
+        assert fake.close_calls == 0
+        reloaded = tracking.load_record(rec.yaml_path)
+        assert reloaded.active_pr().state == "merged"
+        assert reloaded.resources[0].state == "released"
+
+    def test_confirm_on_already_closed_pr_settles_claim_without_reclosing(
+        self, tmp_path, monkeypatch,
+    ):
+        rec = self._record(tmp_path, monkeypatch)
+        fake = self._fake_provider(merged=False, state="closed")
+        self._patch(monkeypatch, fake)
+        result = pr_ops.abandon_pr(
+            "wt-a", self._config(), reason="superseded", confirm=True,
+        )
+        assert result["success"] is True
+        assert result["already_closed"] is True
+        assert fake.close_calls == 0  # never re-closed an already-closed PR
+        reloaded = tracking.load_record(rec.yaml_path)
+        claims = [c for c in reloaded.resources if c.kind == "pr"]
+        assert claims[0].state == obligations.ABANDONED
+
+    def test_confirm_with_no_prior_claim_still_closes(self, tmp_path, monkeypatch):
+        """A PR tracked without ever having been claimed (e.g. a legacy
+        record) is still closeable. The shared reconcile self-heal claims
+        it just-in-time (it observes a confirmed-open PR), so abandon_pr's
+        own settle finds and abandons THAT claim -- not a precondition
+        failure."""
+        rec = self._record(tmp_path, monkeypatch, claimed=False)
+        fake = self._fake_provider(merged=False, state="open")
+        self._patch(monkeypatch, fake)
+        result = pr_ops.abandon_pr(
+            "wt-a", self._config(), reason="superseded", confirm=True,
+        )
+        assert result["success"] is True
+        assert result["claim_released"] is True
+        reloaded = tracking.load_record(rec.yaml_path)
+        assert reloaded.active_pr().state == "closed"
+        claims = [c for c in reloaded.resources if c.kind == "pr"]
+        assert claims[0].state == obligations.ABANDONED
+
+    def test_already_merged_tracked_state_refuses_before_any_network_call(
+        self, tmp_path, monkeypatch,
+    ):
+        self._record(tmp_path, monkeypatch, state="merged")
+        fake = self._fake_provider()
+        self._patch(monkeypatch, fake)
+        result = pr_ops.abandon_pr(
+            "wt-a", self._config(), reason="superseded", confirm=True,
+        )
+        assert result["success"] is False
+        assert "already merged" in result["error"]
+        assert fake.close_calls == 0
+
+    def test_comment_post_failure_is_a_warning_not_a_fatal_error(
+        self, tmp_path, monkeypatch,
+    ):
+        rec = self._record(tmp_path, monkeypatch)
+
+        class _WarnProvider(self._fake_provider().__class__):
+            def close_pull(self, repo, number, *, api_base="", token=None, comment=""):
+                return "comment post failed: unauthorized"
+
+        self._patch(monkeypatch, _WarnProvider())
+        result = pr_ops.abandon_pr(
+            "wt-a", self._config(), reason="superseded", confirm=True,
+        )
+        assert result["success"] is True
+        assert "comment post failed" in result["warning"]
+        reloaded = tracking.load_record(rec.yaml_path)
+        assert reloaded.active_pr().state == "closed"
+
+    def test_real_close_failure_is_fatal_and_leaves_claim_untouched(
+        self, tmp_path, monkeypatch,
+    ):
+        rec = self._record(tmp_path, monkeypatch)
+
+        class _FailProvider(self._fake_provider().__class__):
+            def close_pull(self, repo, number, *, api_base="", token=None, comment=""):
+                return "gh pr close failed: network error"
+
+        self._patch(monkeypatch, _FailProvider())
+        result = pr_ops.abandon_pr(
+            "wt-a", self._config(), reason="superseded", confirm=True,
+        )
+        assert result["success"] is False
+        assert "network error" in result["error"]
+        reloaded = tracking.load_record(rec.yaml_path)
+        assert reloaded.active_pr().state == "open"
+        assert reloaded.resources[0].state == "active"
 
 
 class TestReconcileActivePrSelfHeal:
@@ -584,6 +2755,26 @@ class TestReconcileActivePrSelfHeal:
         pr_ops._reconcile_active_pr(rec, self._config())
         assert rec.active_pr().state == "open"
 
+    def test_reactivated_released_claim_is_persisted_and_feeds_history(
+        self, tmp_path, monkeypatch,
+    ):
+        """A PR claim released then re-observed open must be reactivated,
+        SAVED, and feed claim_history -- not silently skipped just because
+        a (now-stale) claim entry already exists for that ref."""
+        rec = self._record(tmp_path, monkeypatch)
+        rec.resources = [
+            tracking.ResourceClaim(kind="pr", ref="o/r#7", state=obligations.RELEASED),
+        ]
+        tracking.save_record(rec)
+        fake = self._fake_provider(merged=False, contained=False)
+        self._patch(monkeypatch, fake)
+        pr_ops._reconcile_active_pr(rec, self._config())
+        assert rec.resources[0].state == obligations.ACTIVE
+        reloaded = tracking.load_record(rec.yaml_path)
+        assert reloaded.resources[0].state == obligations.ACTIVE
+        events = claim_history.history_for_ref("o/r#7")
+        assert [e["event"] for e in events] == ["claimed"]
+
     def test_unknown_containment_leaves_open(self, tmp_path, monkeypatch):
         rec = self._record(tmp_path, monkeypatch)
         fake = self._fake_provider(merged=False, contained=None)
@@ -606,6 +2797,220 @@ class TestReconcileActivePrSelfHeal:
         pr_ops._reconcile_active_pr(rec, self._config(), best_effort=True)
         assert tracking.load_record(rec.yaml_path).active_pr().state == "merged"
 
+    # ── pr-merge-obligation-gate defense 2: claim lifecycle ──────────────────
+
+    def test_confirmed_open_creates_active_pr_claim(self, tmp_path, monkeypatch):
+        """A provider-confirmed-still-open PR gets an active `pr` claim --
+        the structural gate that blocks finalize independent of pr.strategy."""
+        rec = self._record(tmp_path, monkeypatch)
+        assert rec.resources == []
+        fake = self._fake_provider(merged=False, contained=False)
+        self._patch(monkeypatch, fake)
+        pr_ops._reconcile_active_pr(rec, self._config())
+        claims = [c for c in rec.resources if c.kind == "pr"]
+        assert len(claims) == 1
+        assert claims[0].state == "active"
+        assert claims[0].ref == pr_ops._pr_claim_ref(rec.active_pr())
+        # Persisted, not just in-memory.
+        on_disk = [c for c in tracking.load_record(rec.yaml_path).resources
+                   if c.kind == "pr"]
+        assert len(on_disk) == 1 and on_disk[0].state == "active"
+
+    def test_confirmed_open_claim_is_idempotent(self, tmp_path, monkeypatch):
+        rec = self._record(tmp_path, monkeypatch)
+        fake = self._fake_provider(merged=False, contained=False)
+        self._patch(monkeypatch, fake)
+        pr_ops._reconcile_active_pr(rec, self._config())
+        pr_ops._reconcile_active_pr(rec, self._config())
+        assert len([c for c in rec.resources if c.kind == "pr"]) == 1
+
+    def test_merge_releases_pr_claim(self, tmp_path, monkeypatch):
+        """A merged PR's claim settles to `released` -- a clean hand-back,
+        not the sweep's `abandoned` (involuntary reclaim) disposition."""
+        rec = self._record(tmp_path, monkeypatch)
+        # Pre-existing active claim, as if `create-pr` claimed it earlier.
+        tracking.add_resource_claim(
+            rec, tracking.ResourceClaim(
+                kind="pr", ref=pr_ops._pr_claim_ref(rec.active_pr()),
+                created_at=tracking._now_iso(), state="active"),
+            save=False)
+        fake = self._fake_provider(merged=True, contained=None)
+        self._patch(monkeypatch, fake)
+        pr_ops._reconcile_active_pr(rec, self._config())
+        claims = [c for c in rec.resources if c.kind == "pr"]
+        assert len(claims) == 1 and claims[0].state == "released"
+
+    def test_zombie_heal_to_merged_also_releases_claim(self, tmp_path, monkeypatch):
+        rec = self._record(tmp_path, monkeypatch)
+        tracking.add_resource_claim(
+            rec, tracking.ResourceClaim(
+                kind="pr", ref=pr_ops._pr_claim_ref(rec.active_pr()),
+                created_at=tracking._now_iso(), state="active"),
+            save=False)
+        fake = self._fake_provider(merged=False, contained=True)
+        self._patch(monkeypatch, fake)
+        pr_ops._reconcile_active_pr(rec, self._config())
+        claims = [c for c in rec.resources if c.kind == "pr"]
+        assert len(claims) == 1 and claims[0].state == "released"
+
+    def test_closed_unmerged_never_releases_claim(self, tmp_path, monkeypatch):
+        """A closed-without-merge PR is abandoned WORK, not a clean
+        hand-back -- its claim stays active (blocking) until an operator
+        explicitly abandons it, mirroring sweep.py's own
+        never-silently-reclaim-an-unmerged-close contract."""
+        rec = self._record(tmp_path, monkeypatch)
+        tracking.add_resource_claim(
+            rec, tracking.ResourceClaim(
+                kind="pr", ref=pr_ops._pr_claim_ref(rec.active_pr()),
+                created_at=tracking._now_iso(), state="active"),
+            save=False)
+
+        from agent_worktrees.providers import PullResult
+
+        class _ClosedProvider:
+            name = "gitea"
+
+            def get_pull(self, repo, number, *, api_base="", token=None):
+                return PullResult(number=number, state="closed", merged=False,
+                                  head_sha="abc", base_ref="master")
+
+            def head_contained_in_base(self, *a, **k):
+                return None
+
+        self._patch(monkeypatch, _ClosedProvider())
+        pr_ops._reconcile_active_pr(rec, self._config())
+        claims = [c for c in rec.resources if c.kind == "pr"]
+        assert len(claims) == 1 and claims[0].state == "active"
+
+
+class TestRefreshHeadObservation:
+    def _config(self):
+        return cfg.Config(
+            srcroot="/s", machine="m", platform="linux", repo_name="ext",
+            repos={"ext": cfg.RepoConfig(
+                anchor="/a", worktree_root="/w",
+                pr=cfg.PRConfig(
+                    enabled=True,
+                    provider="gitea",
+                    api_base="https://gitea.example",
+                ),
+            )},
+        )
+
+    def _record(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cfg, "tracking_dir", lambda: tmp_path)
+        rec = tracking.WorktreeRecord(
+            worktree_id="wt-z", branch="worktree/wt-z",
+            worktree_path=str(tmp_path / "wt"), repo="o/r", machine="m",
+            platform="linux", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=None,
+        )
+        rec.pr = tracking.PRRecord(
+            state="open", number=7, branch="pr/x", provider="gitea", repo="o/r"
+        )
+        tracking.save_record(rec)
+        return rec
+
+    def test_records_matching_provider_clock_observation(self, tmp_path, monkeypatch):
+        from agent_worktrees.providers import PullResult
+        import agent_worktrees.providers as providers
+
+        rec = self._record(tmp_path, monkeypatch)
+
+        class _Provider:
+            def authority_endpoint(self, api_base=""):
+                return api_base.rstrip("/")
+
+            def observe_head(self, repo, number, *, api_base="", token=None):
+                return PullResult(
+                    number=number,
+                    head_sha="abc",
+                    observed_at="2026-09-05T06:01:02+00:00",
+                )
+
+        monkeypatch.setattr(providers, "get_provider", lambda name: _Provider())
+        monkeypatch.setattr(
+            providers, "account_token_for_slug", lambda slug, prcfg: "tok"
+        )
+
+        assert pr_ops.refresh_head_observation(
+            self._config(), rec, rec.active_pr(), "abc"
+        ) == ""
+        persisted = tracking.load_record(rec.yaml_path).active_pr()
+        assert persisted.head_sha == "abc"
+        assert persisted.head_observed_at == "2026-09-05T06:01:02+00:00"
+        assert persisted.head_observed_api_base == "https://gitea.example"
+
+    def test_mismatched_observation_fails_closed(self, tmp_path, monkeypatch):
+        from agent_worktrees.providers import PullResult
+        import agent_worktrees.providers as providers
+
+        rec = self._record(tmp_path, monkeypatch)
+        rec.active_pr().head_observed_at = "old-evidence"
+
+        class _Provider:
+            def authority_endpoint(self, api_base=""):
+                return api_base.rstrip("/")
+
+            def observe_head(self, repo, number, *, api_base="", token=None):
+                return PullResult(
+                    number=number,
+                    head_sha="different",
+                    observed_at="2026-09-05T06:01:02+00:00",
+                )
+
+        monkeypatch.setattr(providers, "get_provider", lambda name: _Provider())
+        monkeypatch.setattr(
+            providers, "account_token_for_slug", lambda slug, prcfg: "tok"
+        )
+
+        error = pr_ops.refresh_head_observation(
+            self._config(), rec, rec.active_pr(), "abc"
+        )
+        assert "instead of pushed head abc" in error
+        persisted = tracking.load_record(rec.yaml_path).active_pr()
+        assert persisted.head_sha == "abc"
+        assert persisted.head_observed_at == ""
+        assert persisted.head_observed_api_base == ""
+
+    def test_concurrent_reassociation_rejects_returned_observation(
+        self, tmp_path, monkeypatch
+    ):
+        from agent_worktrees.providers import PullResult
+        import agent_worktrees.providers as providers
+
+        rec = self._record(tmp_path, monkeypatch)
+
+        class _Provider:
+            def authority_endpoint(self, api_base=""):
+                return api_base.rstrip("/")
+
+            def observe_head(self, repo, number, *, api_base="", token=None):
+                current = tracking.load_record(rec.yaml_path)
+                current.active_pr().number = 8
+                tracking.save_record(current)
+                return PullResult(
+                    number=number,
+                    head_sha="abc",
+                    observed_at="2026-09-05T06:01:02+00:00",
+                )
+
+        monkeypatch.setattr(providers, "get_provider", lambda name: _Provider())
+        monkeypatch.setattr(
+            providers, "account_token_for_slug", lambda slug, prcfg: "tok"
+        )
+
+        error = pr_ops.refresh_head_observation(
+            self._config(), rec, rec.active_pr(), "abc"
+        )
+
+        assert "changed during provider observation" in error
+        persisted = tracking.load_record(rec.yaml_path).active_pr()
+        assert persisted.number == 8
+        assert persisted.head_observed_at == ""
+        assert persisted.head_observed_api_base == ""
+
 
 class TestPRFinalizeAndPush:
     def test_precondition_fails_before_push(self, pr_repo):
@@ -615,7 +3020,9 @@ class TestPRFinalizeAndPush:
         rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
         rec.pr = tracking.PRRecord(state="creating", branch="feature/never-pushed-aaaa")
         tracking.save_record(rec)
+        import dataclasses
         repo = config.default_repo
+        repo = dataclasses.replace(repo, pr=dataclasses.replace(repo.pr, strategy="detach"))
         ok, err = fin._pr_finalize_precondition(rec, repo, str(wt_path), repo.anchor)
         assert ok is False
         assert "not upstream" in err
@@ -625,7 +3032,9 @@ class TestPRFinalizeAndPush:
         config, wid, wt_path, _ = pr_repo
         pr_ops.create_pr(wid, config, title="Add feature")
         rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        import dataclasses
         repo = config.default_repo
+        repo = dataclasses.replace(repo, pr=dataclasses.replace(repo.pr, strategy="detach"))
         ok, err = fin._pr_finalize_precondition(rec, repo, str(wt_path), repo.anchor)
         assert ok is True, err
         assert err is None
@@ -642,7 +3051,9 @@ class TestPRFinalizeAndPush:
         _git("add", "-A", cwd=wt_path)
         _git("commit", "-m", "feedback", cwd=wt_path)
         rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        import dataclasses
         repo = config.default_repo
+        repo = dataclasses.replace(repo, pr=dataclasses.replace(repo.pr, strategy="detach"))
         ok, err = fin._pr_finalize_precondition(rec, repo, str(wt_path), repo.anchor)
         assert ok is False
         assert "unpushed" in err
@@ -673,7 +3084,743 @@ class TestPRFinalizeAndPush:
         assert rec.pr.head_sha == local_head
         assert rec.pr.state == "open"
 
-    def test_push_changes_from_worktree_branch_snapshot(self, pr_repo):
+    def test_push_changes_is_blocked_by_a_real_client_side_pre_push_hook(self, pr_repo):
+        """#3561: push() must not silently disable a repo's own release-guard
+        pre-push hook (e.g. this repo's check-changefile-presence.py). Install
+        a real, unconditionally-failing pre-push hook -- standing in for any
+        such guard -- and confirm push_changes is genuinely blocked by it, the
+        same way a raw ``git push`` already was before this fix."""
+        import stat
+
+        config, wid, wt_path, _remote_dir = pr_repo
+        pr_ops.create_pr(wid, config, title="Add feature")
+
+        # Install a real client-side pre-push hook in the anchor's common git
+        # dir (shared by every worktree, including wt_path) that always
+        # refuses -- standing in for a real release guard.
+        common_dir = Path(_git("rev-parse", "--git-common-dir", cwd=wt_path))
+        if not common_dir.is_absolute():
+            common_dir = wt_path / common_dir
+        hooks_dir = common_dir / "hooks"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hook_path = hooks_dir / "pre-push"
+        hook_path.write_text(
+            "#!/bin/sh\n"
+            "echo 'BLOCKED: missing changefile (simulated release guard)' >&2\n"
+            "exit 1\n"
+        )
+        hook_path.chmod(hook_path.stat().st_mode | stat.S_IEXEC)
+
+        before = _git("rev-parse", "origin/feature/add-feature-aaaa", cwd=wt_path)
+
+        _git("checkout", "feature/add-feature-aaaa", cwd=wt_path)
+        (wt_path / "c.txt").write_text("feedback\n")
+        _git("add", "-A", cwd=wt_path)
+        _git("commit", "-m", "address feedback", cwd=wt_path)
+
+        from agent_worktrees import finalize as fin
+        ok = fin.push_changes(wid, config)
+        assert ok is False  # the hook must actually block the push
+
+        after = _git("rev-parse", "origin/feature/add-feature-aaaa", cwd=wt_path)
+        assert after == before  # remote feature branch did NOT advance
+
+    def test_push_changes_blocks_a_leaking_recorded_branch(self, pr_repo):
+        # pr-attribution-codenames Phase 5 (round 2): create-pr's guard only
+        # covers the branch IT chooses -- a leaking name recorded some other
+        # way (e.g. `set-pr --branch`) must still be blocked when
+        # push-changes later republishes `record.pr.branch` directly.
+        from agent_worktrees import finalize as fin
+        config, wid, wt_path, _remote_dir = pr_repo
+        pr_ops.create_pr(wid, config, title="Add feature")
+
+        leaking_branch = f"worktree/{wid}"
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        rec.pr.branch = leaking_branch
+        tracking.save_record(rec)
+
+        # push-changes' snapshot-mode "on worktree/<id>" path resolves the
+        # branch to (re)snapshot from the active PR's recorded branch --
+        # simulate the ordinary post-create-pr state (HEAD back on the
+        # worktree branch with a feedback commit) rather than checking out
+        # the leaking name itself.
+        _git("checkout", f"worktree/{wid}", cwd=wt_path)
+        (wt_path / "c.txt").write_text("feedback\n")
+        _git("add", "-A", cwd=wt_path)
+        _git("commit", "-m", "address feedback", cwd=wt_path)
+
+        ok = fin.push_changes(wid, config)
+        assert ok is False
+        assert not git_ops.remote_branch_exists(
+            "origin", leaking_branch, cwd=str(wt_path)
+        )
+
+    def test_push_changes_blocks_recorded_machine_after_rename(self, pr_repo):
+        # config.machine (live) vs record.machine (frozen) -- push-changes
+        # must check both, exactly like create_pr (review round 3).
+        import dataclasses
+        from agent_worktrees import finalize as fin
+        config, wid, wt_path, _remote_dir = pr_repo
+        pr_ops.create_pr(wid, config, title="Add feature")
+
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        assert rec.machine == "test"
+        rec.pr.branch = "user/test/reused-head"
+        tracking.save_record(rec)
+
+        renamed_config = dataclasses.replace(config, machine="new-machine-name")
+        _git("checkout", f"worktree/{wid}", cwd=wt_path)
+        (wt_path / "c.txt").write_text("feedback\n")
+        _git("add", "-A", cwd=wt_path)
+        _git("commit", "-m", "address feedback", cwd=wt_path)
+
+        ok = fin.push_changes(wid, renamed_config)
+        assert ok is False
+        assert not git_ops.remote_branch_exists(
+            "origin", "user/test/reused-head", cwd=str(wt_path)
+        )
+
+    def test_push_changes_refreshes_marker_and_preserves_body(
+        self, pr_repo, monkeypatch
+    ):
+        import dataclasses
+
+        from agent_worktrees import finalize as fin
+        from agent_worktrees.providers import attribution
+
+        config, wid, wt_path, _ = pr_repo
+        repo = config.repos["ext"]
+        config = dataclasses.replace(
+            config,
+            repos={
+                "ext": dataclasses.replace(
+                    repo,
+                    pr=dataclasses.replace(repo.pr, source_attribution=True),
+                )
+            },
+        )
+        pr_ops.create_pr(wid, config, title="Add feature")
+        record = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        record.pr.number = 42
+        record.pr.repo = "example/project"
+        record.pr.provider = "gitea"
+        tracking.save_record(record)
+        captured: dict[str, str] = {}
+        publishes = {"count": 0}
+
+        class FakeProvider:
+            def publish_source_marker(
+                self, repo, number, marker, *, api_base="", token=None
+            ):
+                captured["marker"] = marker
+                publishes["count"] += 1
+                return ""
+
+        provider = FakeProvider()
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider",
+            lambda name: captured.setdefault("provider", name) and provider,
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda slug, prcfg: None,
+        )
+        wt_path.joinpath("c.txt").write_text("feedback\n")
+        _git("add", "-A", cwd=wt_path)
+        _git("commit", "-m", "address feedback", cwd=wt_path)
+
+        assert fin.push_changes(wid, config) is True
+
+        fields = attribution.parse_marker(captured["marker"])
+        assert fields is not None
+        assert captured["provider"] == "gitea"
+        assert fields["head"] == _git("rev-parse", "HEAD", cwd=wt_path)
+        assert "old-head" not in captured["marker"]
+        refreshed = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        assert refreshed.pr.attribution_head == fields["head"]
+        assert pr_ops.refresh_source_attribution(
+            wid,
+            config,
+            refreshed,
+            refreshed.pr,
+            fields["head"],
+        ) == ""
+        assert publishes["count"] == 1
+        refreshed.pr.provider = "github"
+        refreshed.pr.attribution_head = ""
+        mismatch = pr_ops.refresh_source_attribution(
+            wid,
+            config,
+            refreshed,
+            refreshed.pr,
+            fields["head"],
+        )
+        assert "credentials cannot be resolved safely" in mismatch
+        assert publishes["count"] == 1
+
+    def test_refresh_source_attribution_codename_mode_omits_raw_fields(
+        self, pr_repo, monkeypatch,
+    ):
+        """``source_attribution: codename`` on the refresh path (a later
+        push updating an existing PR's head) must publish only the
+        codename -- the same public-safe contract as the initial create-pr
+        body (effort pr-attribution-codenames Phase 4 requires both paths
+        covered identically)."""
+        import dataclasses
+
+        from agent_worktrees.providers import attribution
+
+        config, wid, _wt_path, _ = pr_repo
+        repo = config.repos["ext"]
+        config = dataclasses.replace(
+            config,
+            repos={
+                "ext": dataclasses.replace(
+                    repo,
+                    pr=dataclasses.replace(repo.pr, source_attribution="codename"),
+                )
+            },
+        )
+        record = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        record.codename = "harbor-lattice"
+        # codename-attribution-by-default: may_publish_codename requires a
+        # known codename_source before publishing -- this test is about
+        # marker content/format, not provenance, so stamp a safe "built-in".
+        record.codename_source = "built-in"
+        tracking.save_record(record)
+        pr = tracking.PRRecord(state="open", branch="feature/x", provider="gitea",
+                       repo="example/project", number=42)
+        record.prs = [pr]
+        tracking.save_record(record)
+        captured: dict[str, str] = {}
+
+        class FakeProvider:
+            def publish_source_marker(
+                self, repo, number, marker, *, api_base="", token=None
+            ):
+                captured["marker"] = marker
+                return ""
+
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider",
+            lambda name: FakeProvider(),
+        )
+        monkeypatch.setattr(
+            "agent_worktrees.providers.account_token_for_slug",
+            lambda slug, prcfg: None,
+        )
+
+        error = pr_ops.refresh_source_attribution(
+            wid, config, record, pr, "deadbeef" * 5,
+        )
+
+        assert error == ""
+        fields = attribution.parse_marker(captured["marker"])
+        assert fields == {"codename": "harbor-lattice"}
+
+    def test_refresh_source_attribution_codename_mode_skips_without_codename(
+        self, pr_repo, monkeypatch,
+    ):
+        """No assigned codename -> skip the refresh publish entirely, never
+        downgrade to the raw marker."""
+        import dataclasses
+
+        config, wid, _wt_path, _ = pr_repo
+        repo = config.repos["ext"]
+        config = dataclasses.replace(
+            config,
+            repos={
+                "ext": dataclasses.replace(
+                    repo,
+                    pr=dataclasses.replace(repo.pr, source_attribution="codename"),
+                )
+            },
+        )
+        record = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        assert record.codename is None
+        pr = tracking.PRRecord(state="open", branch="feature/x", provider="gitea",
+                       repo="example/project", number=42)
+        record.prs = [pr]
+        tracking.save_record(record)
+        publishes = {"count": 0}
+
+        class FakeProvider:
+            def publish_source_marker(
+                self, repo, number, marker, *, api_base="", token=None
+            ):
+                publishes["count"] += 1
+                return ""
+
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider",
+            lambda name: FakeProvider(),
+        )
+
+        error = pr_ops.refresh_source_attribution(
+            wid, config, record, pr, "deadbeef" * 5,
+        )
+
+        assert error == ""
+        assert publishes["count"] == 0
+
+    def test_refresh_source_attribution_codename_mode_skips_for_malformed_codename(
+        self, pr_repo, monkeypatch,
+    ):
+        """A tampered/corrupted codename must never be interpolated into
+        the refreshed marker as-is -- skip publishing instead."""
+        import dataclasses
+
+        config, wid, _wt_path, _ = pr_repo
+        repo = config.repos["ext"]
+        config = dataclasses.replace(
+            config,
+            repos={
+                "ext": dataclasses.replace(
+                    repo,
+                    pr=dataclasses.replace(repo.pr, source_attribution="codename"),
+                )
+            },
+        )
+        record = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        record.codename = "not a handle --> <script>"
+        pr = tracking.PRRecord(state="open", branch="feature/x", provider="gitea",
+                       repo="example/project", number=42)
+        record.prs = [pr]
+        tracking.save_record(record)
+        publishes = {"count": 0}
+
+        class FakeProvider:
+            def publish_source_marker(
+                self, repo, number, marker, *, api_base="", token=None
+            ):
+                publishes["count"] += 1
+                return ""
+
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider",
+            lambda name: FakeProvider(),
+        )
+
+        error = pr_ops.refresh_source_attribution(
+            wid, config, record, pr, "deadbeef" * 5,
+        )
+
+        assert error == ""
+        assert publishes["count"] == 0
+
+    def test_refresh_source_attribution_codename_mode_provenance_gating(
+        self, pr_repo, monkeypatch,
+    ):
+        """codename-attribution-by-default: the refresh path must apply the
+        SAME provenance gating as the initial create-pr publish (round-17
+        finding -- prior to this effort only one of the two paths checked
+        codename_source at all)."""
+        import dataclasses
+
+        config, wid, _wt_path, _ = pr_repo
+        repo = config.repos["ext"]
+
+        def _config_with(source_attribution_configured: bool):
+            return dataclasses.replace(
+                config,
+                repos={
+                    "ext": dataclasses.replace(
+                        repo,
+                        pr=dataclasses.replace(
+                            repo.pr, source_attribution="codename",
+                            source_attribution_configured=(
+                                source_attribution_configured
+                            ),
+                        ),
+                    )
+                },
+            )
+
+        _pr_counter = {"n": 0}
+
+        def _refresh(codename_source, *, source_attribution_configured):
+            _pr_counter["n"] += 1
+            # A distinct SYNTHETIC worktree id per scenario -- each call
+            # simulates an INDEPENDENT worktree/PR from scratch. Reusing
+            # the same on-disk record across scenarios would let the
+            # codename-provenance merge (correctly) preserve an
+            # already-known codename_source from an earlier scenario,
+            # which is exactly this effort's point but defeats this
+            # test's intent to exercise each provenance value in
+            # isolation.
+            scenario_wid = f"{wid}-scenario-{_pr_counter['n']}"
+            tracking.create_new_record(
+                scenario_wid, f"worktree/{scenario_wid}", "/tmp/" + scenario_wid,
+                "ext", "test", "linux", cfg.tracking_dir(),
+            )
+            record = tracking.load_record(cfg.tracking_dir() / f"{scenario_wid}.yaml")
+            record.codename = "harbor-lattice"
+            record.codename_source = codename_source
+            pr = tracking.PRRecord(
+                state="open", branch=f"feature/x-{_pr_counter['n']}",
+                provider="gitea", repo="example/project",
+                number=42 + _pr_counter["n"],
+            )
+            record.prs = [pr]
+            tracking.save_record(record)
+            publishes = {"count": 0}
+
+            class FakeProvider:
+                def publish_source_marker(
+                    self, repo, number, marker, *, api_base="", token=None
+                ):
+                    publishes["count"] += 1
+                    return ""
+
+            monkeypatch.setattr(
+                "agent_worktrees.providers.get_provider",
+                lambda name: FakeProvider(),
+            )
+            error = pr_ops.refresh_source_attribution(
+                scenario_wid, _config_with(source_attribution_configured),
+                record, pr,
+                "deadbeef" * 5,
+            )
+            assert error == ""
+            return publishes["count"]
+
+        # (a) codename_source "custom" under the IMPLICIT default fails
+        # closed -- the legacy-drift scenario (round-8 finding).
+        assert _refresh(
+            "custom", source_attribution_configured=False,
+        ) == 0
+        # (b) an EXPLICIT opt-in publishes a KNOWN "custom" record.
+        assert _refresh(
+            "custom", source_attribution_configured=True,
+        ) == 1
+        # (b2) that SAME explicit opt-in does NOT publish for a MISSING
+        # codename_source (round-32 finding: explicit opt-in narrows the
+        # allocation-vs-publish distinction, it does not bypass provenance
+        # verification).
+        assert _refresh(
+            None, source_attribution_configured=True,
+        ) == 0
+        # (c) codename_source "built-in" publishes under the IMPLICIT
+        # default.
+        assert _refresh(
+            "built-in", source_attribution_configured=False,
+        ) == 1
+        # (d) an unrecognized stored value fails closed exactly like
+        # "custom" would.
+        assert _refresh(
+            "not-a-real-value", source_attribution_configured=True,
+        ) == 0
+
+    def test_refresh_source_attribution_freezes_before_metadata_validation(
+        self, pr_repo,
+    ):
+        # PR #3037 review finding: the freeze-on-first-touch must run
+        # BEFORE the number/repo metadata-validation early return too, not
+        # only before the live-config guard -- a legacy PR with missing
+        # provider metadata (e.g. before `set-pr` has supplied it) must
+        # still be frozen on this touch; if `set-pr` supplies the metadata
+        # LATER after config has changed, that later touch must not be
+        # treated as the true first one.
+        config, wid, _wt_path, _ = pr_repo
+        record = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        pr = tracking.PRRecord(state="creating", branch="feature/x")
+        assert pr.number is None and not pr.repo  # incomplete metadata
+        assert pr.attribution_mode == ""
+        record.prs = [pr]
+        tracking.save_record(record)
+
+        error = pr_ops.refresh_source_attribution(
+            wid, config, record, pr, "deadbeef" * 5,
+        )
+        assert error == "active PR has no provider repo/number"
+
+        reloaded = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        frozen_pr = reloaded.active_pr()
+        assert frozen_pr is not None
+        # Frozen despite the incomplete metadata -- pr_repo's bare
+        # PRConfig() resolves the implicit "codename" default.
+        assert frozen_pr.attribution_mode == "codename"
+
+    def test_refresh_source_attribution_legacy_freeze_runs_before_live_config_guard(
+        self, pr_repo, monkeypatch,
+    ):
+        # round-37 finding: the freeze-on-first-touch must run BEFORE any
+        # early return that depends on live config -- a legacy PR (no
+        # attribution_mode stored) touched while source_attribution is
+        # LIVE `False` must be frozen to the false state on THAT touch
+        # (not left unmigrated because the function used to return early
+        # before ever reaching the freeze), and a LATER touch under a
+        # DIFFERENT live config must still honor the ORIGINAL frozen
+        # state, not the newer one.
+        import dataclasses
+
+        config, wid, _wt_path, _ = pr_repo
+        repo = config.repos["ext"]
+
+        def _config_with(source_attribution):
+            return dataclasses.replace(
+                config,
+                repos={
+                    "ext": dataclasses.replace(
+                        repo,
+                        pr=dataclasses.replace(
+                            repo.pr, source_attribution=source_attribution,
+                        ),
+                    )
+                },
+            )
+
+        record = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        pr = tracking.PRRecord(
+            state="open", branch="feature/x", provider="gitea",
+            repo="example/project", number=42,
+        )
+        assert pr.attribution_mode == ""  # genuinely legacy/unset
+        record.prs = [pr]
+        tracking.save_record(record)
+        publishes = {"count": 0}
+
+        class FakeProvider:
+            def publish_source_marker(
+                self, repo, number, marker, *, api_base="", token=None
+            ):
+                publishes["count"] += 1
+                return ""
+
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider",
+            lambda name: FakeProvider(),
+        )
+
+        # First touch under a LIVE False config.
+        error = pr_ops.refresh_source_attribution(
+            wid, _config_with(False), record, pr, "deadbeef" * 5,
+        )
+        assert error == ""
+        assert publishes["count"] == 0
+        reloaded = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        frozen_pr = reloaded.active_pr()
+        assert frozen_pr is not None
+        assert frozen_pr.attribution_mode == "false"  # frozen, not still ""
+
+        # Second touch (a NEW head, so publish would proceed if the mode
+        # allowed it) under a config that has since changed to "codename".
+        # The ORIGINAL frozen "false" must still govern -- no marker.
+        error2 = pr_ops.refresh_source_attribution(
+            wid, _config_with("codename"), reloaded, frozen_pr,
+            "cafebabe" * 5,
+        )
+        assert error2 == ""
+        assert publishes["count"] == 0
+        assert frozen_pr.attribution_mode == "false"
+
+    def test_frozen_codename_marker_survives_config_flipping_to_false(
+        self, pr_repo, monkeypatch,
+    ):
+        # Validation Plan (round-26/27 findings): the REVERSE direction of
+        # the test above -- a PR frozen under "codename" (built-in
+        # provenance, so it publishes) must KEEP publishing on later
+        # pushes even after the repo's live config changes to "false".
+        # attribution_explicit must also stay frozen (False, an implicit
+        # decision), never re-derived from the live config.
+        import dataclasses
+
+        config, wid, _wt_path, _ = pr_repo
+        repo = config.repos["ext"]
+
+        def _config_with(source_attribution):
+            return dataclasses.replace(
+                config,
+                repos={
+                    "ext": dataclasses.replace(
+                        repo,
+                        pr=dataclasses.replace(
+                            repo.pr, source_attribution=source_attribution,
+                        ),
+                    )
+                },
+            )
+
+        record = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        record.codename = "steady-anchor"
+        record.codename_source = "built-in"
+        pr = tracking.PRRecord(
+            state="open", branch="feature/x", provider="gitea",
+            repo="example/project", number=42,
+        )
+        assert pr.attribution_mode == ""  # genuinely legacy/unset
+        record.prs = [pr]
+        tracking.save_record(record)
+        publishes: list[str] = []
+
+        class FakeProvider:
+            def publish_source_marker(
+                self, repo, number, marker, *, api_base="", token=None
+            ):
+                publishes.append(marker)
+                return ""
+
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider",
+            lambda name: FakeProvider(),
+        )
+
+        # First touch under a LIVE "codename" (implicit) config -- freezes
+        # to codename mode, publishes the marker.
+        error = pr_ops.refresh_source_attribution(
+            wid, _config_with("codename"), record, pr, "deadbeef" * 5,
+        )
+        assert error == ""
+        assert len(publishes) == 1
+        assert "steady-anchor" in publishes[0]
+        reloaded = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        frozen_pr = reloaded.active_pr()
+        assert frozen_pr is not None
+        assert frozen_pr.attribution_mode == "codename"
+        assert frozen_pr.attribution_explicit is False
+
+        # Second touch (a NEW head) after the live config flips to False.
+        # The ORIGINAL frozen "codename" pair must still govern -- the
+        # marker keeps publishing, not suppressed by the newer config.
+        error2 = pr_ops.refresh_source_attribution(
+            wid, _config_with(False), reloaded, frozen_pr, "cafebabe" * 5,
+        )
+        assert error2 == ""
+        assert len(publishes) == 2
+        assert "steady-anchor" in publishes[1]
+        assert frozen_pr.attribution_mode == "codename"
+        assert frozen_pr.attribution_explicit is False
+
+    def test_explicit_config_addition_does_not_unsuppress_a_frozen_custom_source(
+        self, pr_repo, monkeypatch,
+    ):
+        # Validation Plan (round-27 finding): a PR opened under an
+        # IMPLICIT "codename" default against a "custom"-sourced record is
+        # correctly suppressed at open (round-22 gate: an implicit default
+        # never publishes a custom-vocabulary codename). Adding an
+        # EXPLICIT `source_attribution: codename` to the repo's config
+        # afterward must NOT retroactively unsuppress it -- `PRRecord.
+        # attribution_explicit` was frozen False at open time and is never
+        # re-derived from the live, now-True `source_attribution_configured`.
+        import dataclasses
+
+        config, wid, _wt_path, _ = pr_repo
+        repo = config.repos["ext"]
+
+        def _config_with(*, configured: bool):
+            return dataclasses.replace(
+                config,
+                repos={
+                    "ext": dataclasses.replace(
+                        repo,
+                        pr=dataclasses.replace(
+                            repo.pr,
+                            source_attribution="codename",
+                            source_attribution_configured=configured,
+                        ),
+                    )
+                },
+            )
+
+        record = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        record.codename = "quiet-harbor"
+        record.codename_source = "custom"  # unreviewed custom vocabulary
+        pr = tracking.PRRecord(
+            state="open", branch="feature/x", provider="gitea",
+            repo="example/project", number=42,
+        )
+        record.prs = [pr]
+        tracking.save_record(record)
+        publishes: list[str] = []
+
+        class FakeProvider:
+            def publish_source_marker(
+                self, repo, number, marker, *, api_base="", token=None
+            ):
+                publishes.append(marker)
+                return ""
+
+        monkeypatch.setattr(
+            "agent_worktrees.providers.get_provider",
+            lambda name: FakeProvider(),
+        )
+
+        # First touch: implicit codename default (not configured) against
+        # a custom-sourced codename -- suppressed, freezes explicit=False.
+        error = pr_ops.refresh_source_attribution(
+            wid, _config_with(configured=False), record, pr, "deadbeef" * 5,
+        )
+        assert error == ""
+        assert publishes == []
+        reloaded = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        frozen_pr = reloaded.active_pr()
+        assert frozen_pr is not None
+        assert frozen_pr.attribution_mode == "codename"
+        assert frozen_pr.attribution_explicit is False
+
+        # Second touch (a NEW head): the repo now EXPLICITLY sets
+        # source_attribution: codename. The frozen attribution_explicit
+        # must stay False -- the marker stays suppressed.
+        error2 = pr_ops.refresh_source_attribution(
+            wid, _config_with(configured=True), reloaded, frozen_pr,
+            "cafebabe" * 5,
+        )
+        assert error2 == ""
+        assert publishes == []
+        assert frozen_pr.attribution_explicit is False
+
+    def test_finish_auto_open_rerun_always_invokes_refresh_regardless_of_live_config(
+        self, pr_repo, monkeypatch,
+    ):
+        # round-38 finding: the CALLER GATE deciding whether to invoke
+        # refresh_source_attribution at all must not itself branch on live
+        # config -- a PR frozen under "true" whose live config later flips
+        # to "false" must still reach the frozen-pair logic inside the
+        # function on a create-pr re-run.
+        config, wid, _wt_path, _ = pr_repo
+        record = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        pr = tracking.PRRecord(
+            state="open", branch="feature/x", provider="gitea",
+            repo="example/project", number=42,
+            attribution_mode="true", attribution_explicit=True, pr_id="abc",
+            pr_revision=1,
+        )
+        record.prs = [pr]
+        tracking.save_record(record)
+        calls = {"count": 0}
+        real_refresh = pr_ops.refresh_source_attribution
+
+        def _spy(*a, **k):
+            calls["count"] += 1
+            return real_refresh(*a, **k)
+
+        monkeypatch.setattr(pr_ops, "refresh_source_attribution", _spy)
+
+        result: dict = {}
+        # Live config now says False -- the caller gate must NOT skip the
+        # call just because this snapshot says publication is off.
+        import dataclasses
+        repo = config.repos["ext"]
+        false_config = dataclasses.replace(
+            config,
+            repos={
+                "ext": dataclasses.replace(
+                    repo,
+                    pr=dataclasses.replace(
+                        repo.pr, source_attribution=False, auto_open=True,
+                    ),
+                )
+            },
+        )
+        pr_ops._finish_auto_open(
+            result, false_config, record, pr, title="Add feature", body=None,
+            worktree_id=wid, head_sha="deadbeef" * 5, open_pr=None,
+            draft=False, attribution=None,
+            prcfg=false_config.default_repo.pr,
+        )
+        assert calls["count"] == 1
+
+
         # New primary flow: create-pr leaves HEAD on worktree/<id> at the
         # squashed commit, so feedback commits land there. push-changes rebases
         # worktree/<id>, re-snapshots the feature branch to its tip, and pushes
@@ -759,6 +3906,29 @@ class TestPRFinalizeAndPush:
         ok = fin.push_changes(wid, config)
         assert ok is False
 
+    def test_push_changes_refspec_blocks_a_leaking_recorded_branch(self, pr_repo):
+        # Same guard as the snapshot-mode test above, exercised on the
+        # refspec publish path.
+        from agent_worktrees import finalize as fin
+        config, wid, wt_path, _ = pr_repo
+        config = self._refspec_config(config)
+        pr_ops.create_pr(wid, config, title="Add feature")
+
+        leaking_branch = f"worktree/{wid}"
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        rec.pr.branch = leaking_branch
+        tracking.save_record(rec)
+
+        (wt_path / "c.txt").write_text("feedback\n")
+        _git("add", "-A", cwd=wt_path)
+        _git("commit", "-m", "address feedback", cwd=wt_path)
+
+        ok = fin.push_changes(wid, config)
+        assert ok is False
+        assert not git_ops.remote_branch_exists(
+            "origin", leaking_branch, cwd=str(wt_path)
+        )
+
     def test_push_changes_refspec_dirty_refused(self, pr_repo):
         from agent_worktrees import finalize as fin
         config, wid, wt_path, _ = pr_repo
@@ -797,6 +3967,142 @@ class TestPRFinalizeAndPush:
         ok, err = fin._pr_finalize_precondition(rec, repo, str(wt_path), repo.anchor)
         assert ok is True, err
         assert err is None
+
+    def test_finalize_refuses_dirty_worktree_at_merged_head(self, pr_repo):
+        # #4400 review finding: _pr_finalize_precondition only inspects
+        # commits, never the working tree -- a modified/untracked file at an
+        # otherwise-safe merged head must still block finalize, or the
+        # destructive cleanup that follows would silently discard it.
+        from agent_worktrees import finalize as fin
+        config, wid, wt_path, _ = pr_repo
+        pr_ops.create_pr(wid, config, title="Add feature")
+        feature = "feature/add-feature-aaaa"
+        self._simulate_squash_merge(config, wid, feature)
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        rec.pr.state = "merged"
+        tracking.save_record(rec)
+        (wt_path / "uncommitted.txt").write_text("real work, never committed\n")
+
+        ok = fin.validate_and_finalize(wid, config)
+        assert ok is False
+        assert (wt_path / "uncommitted.txt").exists()
+
+    def test_finalize_reruns_precondition_after_lock_acquired(self, pr_repo, monkeypatch):
+        # #4400 round 14: the merged-head precondition previously ran only
+        # BEFORE the finalize lock was acquired -- a commit landing in that
+        # TOCTOU window (between the preflight and the destructive cleanup)
+        # would be silently discarded. validate_and_finalize must re-run the
+        # SAME precondition immediately after the lock is held.
+        from agent_worktrees import finalize as fin
+        from agent_worktrees import finalize_lock
+        config, wid, wt_path, _ = pr_repo
+        pr_ops.create_pr(wid, config, title="Add feature")
+        feature = "feature/add-feature-aaaa"
+        self._simulate_squash_merge(config, wid, feature)
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        rec.pr.state = "merged"
+        tracking.save_record(rec)
+
+        real_acquire = finalize_lock.FinalizeLock.acquire
+
+        def racing_acquire(lock_self):
+            real_acquire(lock_self)
+            # Simulate a commit landing in the TOCTOU window, after the
+            # preflight validated safety but before lock-protected cleanup.
+            (wt_path / "raced_in.txt").write_text("landed after preflight\n")
+            git_ops.git("add", "-A", cwd=str(wt_path))
+            git_ops.git("commit", "-m", "race window commit", cwd=str(wt_path))
+
+        monkeypatch.setattr(finalize_lock.FinalizeLock, "acquire", racing_acquire)
+
+        ok = fin.validate_and_finalize(wid, config)
+        assert ok is False
+        assert (wt_path / "raced_in.txt").exists()
+
+    def test_finalize_catches_race_commit_landing_during_process_termination(
+        self, pr_repo, monkeypatch,
+    ):
+        # #4400 round 15: round 14's re-check ran ONCE, immediately after the
+        # finalize lock was acquired -- but further code (record reload,
+        # pointer reconciliation, live-session checks, process termination)
+        # still ran AFTER that point and BEFORE the actual destructive
+        # removal, leaving a residual window. The re-check must run as the
+        # LAST possible step, immediately before the destructive git
+        # operation -- proven here by racing a commit in AFTER process
+        # termination, later than round 14's check point.
+        from agent_worktrees import finalize as fin
+        config, wid, wt_path, _ = pr_repo
+        pr_ops.create_pr(wid, config, title="Add feature")
+        feature = "feature/add-feature-aaaa"
+        self._simulate_squash_merge(config, wid, feature)
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        rec.pr.state = "merged"
+        tracking.save_record(rec)
+
+        real_terminate = fin.procs.terminate_processes_under
+
+        def racing_terminate(worktree_path):
+            result = real_terminate(worktree_path)
+            (wt_path / "raced_in_late.txt").write_text("landed during cleanup\n")
+            git_ops.git("add", "-A", cwd=str(wt_path))
+            git_ops.git("commit", "-m", "late race window commit", cwd=str(wt_path))
+            return result
+
+        monkeypatch.setattr(fin.procs, "terminate_processes_under", racing_terminate)
+
+        ok = fin.validate_and_finalize(wid, config)
+        assert ok is False
+        assert (wt_path / "raced_in_late.txt").exists()
+
+    def test_finalize_rechecks_precondition_before_reconciliation(
+        self, pr_repo, monkeypatch,
+    ):
+        # #4400 round 16: reconciliation (`_reconcile_merged_pointers`)
+        # rebases the worktree branch onto upstream -- and git's rebase
+        # silently DROPS a commit whose patch is already reachable/applied
+        # upstream, exactly the kind of commit a race could land right
+        # before this call, with no trace left to detect afterward. The
+        # precondition must re-run immediately before reconciliation is
+        # invoked, not only once after lock acquisition and once at the
+        # very end. Verified deterministically via call-order spies (a
+        # full git-level reproduction would need to reconstruct git's own
+        # patch-id "already applied" heuristic, which is unreliable to pin
+        # down across git versions) rather than assuming a specific git
+        # rebase outcome.
+        from agent_worktrees import finalize as fin
+        config, wid, _wt_path, _ = pr_repo
+        pr_ops.create_pr(wid, config, title="Add feature")
+        feature = "feature/add-feature-aaaa"
+        self._simulate_squash_merge(config, wid, feature)
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        rec.pr.state = "merged"
+        tracking.save_record(rec)
+
+        from agent_worktrees import finalize_open_pr_gate
+
+        call_order: list[str] = []
+        real_reconcile = fin._reconcile_merged_pointers
+        real_precheck = finalize_open_pr_gate.pr_precondition_recheck
+
+        def spy_reconcile(*a, **k):
+            call_order.append("reconcile")
+            return real_reconcile(*a, **k)
+
+        def spy_precheck(*a, **k):
+            call_order.append("precheck")
+            return real_precheck(*a, **k)
+
+        monkeypatch.setattr(fin, "_reconcile_merged_pointers", spy_reconcile)
+        monkeypatch.setattr(
+            finalize_open_pr_gate, "pr_precondition_recheck", spy_precheck,
+        )
+
+        ok = fin.validate_and_finalize(wid, config)
+        assert ok is True
+        assert "precheck" in call_order and "reconcile" in call_order
+        assert call_order.index("precheck") < call_order.index("reconcile"), (
+            f"precondition recheck must run BEFORE reconciliation, got {call_order}"
+        )
 
     def test_precondition_ok_after_merge_remote_branch_deleted(self, pr_repo):
         from agent_worktrees import finalize as fin
@@ -894,7 +4200,9 @@ class TestPRFinalizeAndPush:
         config = self._refspec_config(config)
         pr_ops.create_pr(wid, config, title="Add feature")
         rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        import dataclasses
         repo = config.default_repo
+        repo = dataclasses.replace(repo, pr=dataclasses.replace(repo.pr, strategy="detach"))
         ok, err = fin._pr_finalize_precondition(rec, repo, str(wt_path), repo.anchor)
         assert ok is True, err
         assert err is None
@@ -1103,21 +4411,97 @@ class TestMultiPR:
 
 
 # ---------------------------------------------------------------------------
+# self_merge_bypass_note (#3296 follow-up)
+# ---------------------------------------------------------------------------
+
+class TestSelfMergeBypassNote:
+    def _flow(self, *, merge_actor="submitter-direct"):
+        from agent_worktrees import pr_contract as pc
+        return pc.classify_pr_flow(
+            enabled=True, required=True, provider="github",
+            automerge_label="", merge_actor=merge_actor,
+        )
+
+    class _GhLikeProvider:
+        def __init__(self, gate_result):
+            self._gate_result = gate_result
+            self.calls = []
+
+        def pull_review_gate(self, repo, number, *, api_base="", token=None):
+            self.calls.append((repo, number))
+            return self._gate_result
+
+    def test_none_when_not_self_merge_profile(self):
+        provider = self._GhLikeProvider((True, True))
+        flow = self._flow(merge_actor="")  # not pr-self-merge
+        note = pr_ops.self_merge_bypass_note(flow, provider, "o/r", 7)
+        assert note is None
+        assert provider.calls == []  # never even consulted
+
+    def test_none_when_no_pr_number_yet(self):
+        provider = self._GhLikeProvider((True, True))
+        note = pr_ops.self_merge_bypass_note(self._flow(), provider, "o/r", None)
+        assert note is None
+        assert provider.calls == []
+
+    def test_none_when_provider_lacks_pull_review_gate(self):
+        class _NoGate:
+            pass
+
+        note = pr_ops.self_merge_bypass_note(self._flow(), _NoGate(), "o/r", 7)
+        assert note is None
+
+    def test_note_when_review_required_and_bypassable(self):
+        provider = self._GhLikeProvider((True, True))
+        note = pr_ops.self_merge_bypass_note(self._flow(), provider, "o/r", 7)
+        assert note is not None
+        assert "Maintainer bypass" in note
+        assert "pr-merge" in note
+        assert provider.calls == [("o/r", 7)]
+
+    def test_none_when_review_required_but_not_bypassable(self):
+        provider = self._GhLikeProvider((True, False))
+        note = pr_ops.self_merge_bypass_note(self._flow(), provider, "o/r", 7)
+        assert note is None
+
+    def test_none_when_no_review_required(self):
+        provider = self._GhLikeProvider((False, None))
+        note = pr_ops.self_merge_bypass_note(self._flow(), provider, "o/r", 7)
+        assert note is None
+
+    def test_none_when_bypassability_unknown(self):
+        provider = self._GhLikeProvider((True, None))
+        note = pr_ops.self_merge_bypass_note(self._flow(), provider, "o/r", 7)
+        assert note is None
+
+    def test_none_when_gate_read_raises(self):
+        class _Boom:
+            def pull_review_gate(self, repo, number, **kw):
+                raise RuntimeError("gh api failed")
+
+        note = pr_ops.self_merge_bypass_note(self._flow(), _Boom(), "o/r", 7)
+        assert note is None
+
+
+# ---------------------------------------------------------------------------
 # pr_status live block (verdict/conflict/merge from the provider snapshot)
 # ---------------------------------------------------------------------------
 
 class TestPRStatusLive:
-    def _config_with_binding(self, base_config):
+    def _config_with_binding(self, base_config, **pr_kwargs):
         """Clone the fixture config with a merge-consent binding on its repo."""
         repo = base_config.default_repo
-        pr = cfg.PRConfig(
+        defaults = dict(
             enabled=True, provider="gitea", branch_prefix="feature",
             head_scheme="snapshot", auto_open=False,
             api_base="https://h/gitea",
             automerge_label="auto-merge",
+            allow_stale_approval=True,
             hold_labels=("do-not-merge", "needs-rebase", "wip"),
             wip_title_prefixes=("wip:",),
         )
+        defaults.update(pr_kwargs)
+        pr = cfg.PRConfig(**defaults)
         new_repo = cfg.RepoConfig(
             anchor=repo.anchor, worktree_root=repo.worktree_root,
             default_branch=repo.default_branch, remote=repo.remote, pr=pr,
@@ -1133,6 +4517,9 @@ class TestPRStatusLive:
 
         class _Prov:
             name = "gitea"
+
+            def authority_endpoint(self, api_base=""):
+                return api_base.rstrip("/")
 
             def get_snapshot(self, repo, number, *, api_base="", token=None):
                 return snap
@@ -1157,19 +4544,296 @@ class TestPRStatusLive:
         assert res["live"]["merge_state"] == "clean"
         assert res["live"]["eligible"] is True
         assert res["live"]["reviews"] == 1
+        assert res["live"]["occupancy"] == "needs-consent"
+
+    def test_live_verdict_reports_comment_when_review_blocking_false(
+        self, pr_repo, monkeypatch
+    ):
+        """A repo config'd review_blocking=False (e.g. Copilot code review on
+        a pr-self-merge repo, which can only COMMENT) reports that comment as
+        the "COMMENTED" verdict instead of no verdict at all."""
+        from agent_worktrees import pr_contract as pc
+        config, wid, _wt, _ = pr_repo
+        config = self._config_with_binding(config, review_blocking=False)
+        pr_ops.set_pr(wid, number=7, state="open", provider="gitea")
+        snap = pc.PRSnapshot(
+            pr_state="open", merged=False, head_sha="h", base_ref="master",
+            author="alice", mergeable=True, title="Feature",
+            reviews=(pc.Review(1, "COMMENT", "bob"),),
+        )
+        self._mock_provider(monkeypatch, snap)
+        res = pr_ops.pr_status(wid, config=config)
+        assert res["live"]["verdict"] == "COMMENTED"
+
+    def test_cli_evidence_lookup_uses_configured_provider_for_manual_pr(
+        self, pr_repo, monkeypatch
+    ):
+        from agent_worktrees import __main__ as main
+        from agent_worktrees import providers
+
+        config, wid, _wt, _ = pr_repo
+        pr_ops.set_pr(wid, number=7, state="open")
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        tracked = rec.active_pr()
+        tracked.head_sha = "head"
+        tracked.head_observed_at = "2026-01-01T00:01:00Z"
+        tracked.head_observed_api_base = "https://h/gitea"
+        tracking.save_record(rec)
+
+        class _Prov:
+            def authority_endpoint(self, api_base=""):
+                return api_base.rstrip("/")
+
+        monkeypatch.setattr(main, "_infer_worktree_id_from_cwd", lambda config: wid)
+        monkeypatch.setattr(providers, "get_provider", lambda name: _Prov())
+
+        assert main._tracked_pr_head_evidence(
+            config,
+            rec.repo,
+            7,
+            "gitea",
+            "https://h/gitea",
+        ) == ("head", "2026-01-01T00:01:00Z")
+
+    def test_tracked_pr_pushed_head_ignores_confirmation_state(
+        self, pr_repo, monkeypatch
+    ):
+        """``_tracked_pr_pushed_head`` answers "what did we just push?" --
+        unlike ``_tracked_pr_head_evidence``, it must return the recorded
+        head_sha even when the provider never independently confirmed it
+        (``head_observed_at``/``head_observed_api_base`` still blank). This is
+        the exact state a push leaves behind when the provider's PR object is
+        stuck stale (ThomasMichon/copilot-extensions#4949) -- the one case
+        where a pre-merge safety check (``--match-head-commit``) matters most.
+        """
+        from agent_worktrees import __main__ as main
+
+        config, wid, _wt, _ = pr_repo
+        pr_ops.set_pr(wid, number=7, state="open")
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        tracked = rec.active_pr()
+        tracked.head_sha = "just-pushed-sha"
+        tracked.head_observed_at = ""
+        tracked.head_observed_api_base = ""
+        tracking.save_record(rec)
+
+        monkeypatch.setattr(main, "_infer_worktree_id_from_cwd", lambda config: wid)
+
+        assert main._tracked_pr_pushed_head(
+            config, rec.repo, 7, "gitea",
+        ) == "just-pushed-sha"
+
+    def test_tracked_pr_pushed_head_returns_empty_with_no_tracked_record(
+        self, pr_repo, monkeypatch
+    ):
+        from agent_worktrees import __main__ as main
+
+        config, _wid, _wt, _ = pr_repo
+        monkeypatch.setattr(main, "_infer_worktree_id_from_cwd", lambda config: None)
+
+        assert main._tracked_pr_pushed_head(config, "o/r", 7, "github") == ""
+
+    def test_tracked_pr_pushed_head_matches_repo_case_insensitively(
+        self, pr_repo, monkeypatch
+    ):
+        """GitHub (and most other provider) repo slugs are case-insensitive,
+        so an explicit ``Owner/Repo`` operand must still match a tracked
+        ``owner/repo`` record -- an exact string comparison would silently
+        omit the stale-head safeguard for the very PR it's meant to protect
+        (ThomasMichon/copilot-extensions#5034)."""
+        from agent_worktrees import __main__ as main
+
+        config, wid, _wt, _ = pr_repo
+        pr_ops.set_pr(wid, number=7, state="open")
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        rec.active_pr().head_sha = "just-pushed-sha"
+        tracking.save_record(rec)
+
+        monkeypatch.setattr(main, "_infer_worktree_id_from_cwd", lambda config: wid)
+
+        # rec.repo is lower-case ("o/r"); query with a differently-cased slug.
+        queried_repo = rec.repo.upper()
+        assert queried_repo != rec.repo
+        assert main._tracked_pr_pushed_head(
+            config, queried_repo, 7, "gitea",
+        ) == "just-pushed-sha"
+
+    def test_tracked_pr_pushed_head_falls_back_to_scanning_when_no_cwd_worktree(
+        self, pr_repo, monkeypatch
+    ):
+        """Mirrors a supported `--project <name> pr-merge <repo> <n> --now`
+        invocation from a neutral CWD: the process moves to the project's
+        anchor (never a tracked worktree), so CWD-based inference legitimately
+        finds nothing even though the project's tracking directory holds the
+        matching record under a different worktree's YAML file."""
+        from agent_worktrees import __main__ as main
+
+        config, wid, _wt, _ = pr_repo
+        pr_ops.set_pr(wid, number=7, state="open")
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        rec.active_pr().head_sha = "just-pushed-sha"
+        tracking.save_record(rec)
+
+        monkeypatch.setattr(main, "_infer_worktree_id_from_cwd", lambda config: None)
+
+        assert main._tracked_pr_pushed_head(
+            config, rec.repo, 7, "gitea",
+        ) == "just-pushed-sha"
+
+    def test_tracked_pr_pushed_head_falls_back_when_cwd_worktree_is_wrong_project(
+        self, pr_repo, monkeypatch
+    ):
+        """Mirrors a cross-project `--config <other>` invocation run from
+        INSIDE a different project's own worktree: CWD inference returns that
+        ambient worktree's id, which naturally has no record under the
+        explicitly supplied project's tracking directory -- this must still
+        fall through to the scan rather than returning '' outright."""
+        from agent_worktrees import __main__ as main
+
+        config, wid, _wt, _ = pr_repo
+        pr_ops.set_pr(wid, number=7, state="open")
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        rec.active_pr().head_sha = "just-pushed-sha"
+        tracking.save_record(rec)
+
+        monkeypatch.setattr(
+            main, "_infer_worktree_id_from_cwd",
+            lambda config: "some-other-projects-worktree-id",
+        )
+
+        assert main._tracked_pr_pushed_head(
+            config, rec.repo, 7, "gitea",
+        ) == "just-pushed-sha"
+
+    def test_tracked_pr_pushed_head_scan_fallback_refuses_ambiguous_match(
+        self, pr_repo, monkeypatch
+    ):
+        """Two tracked records claiming the same (repo, number, provider) is
+        a genuinely ambiguous state -- "no evidence" is the honest answer,
+        never a guess."""
+        from agent_worktrees import __main__ as main
+
+        config, wid, _wt, _ = pr_repo
+        pr_ops.set_pr(wid, number=7, state="open")
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        rec.active_pr().head_sha = "sha-one"
+        tracking.save_record(rec)
+
+        other_id = "test-wt-20260618-bbbb"
+        import copy
+        other = copy.deepcopy(rec)
+        other.worktree_id = other_id
+        other.prs = [
+            tracking.PRRecord(
+                repo=rec.repo, number=7, provider="gitea", head_sha="sha-two",
+            )
+        ]
+        tracking.save_record(other, cfg.tracking_dir() / f"{other_id}.yaml")
+
+        monkeypatch.setattr(main, "_infer_worktree_id_from_cwd", lambda config: None)
+
+        assert main._tracked_pr_pushed_head(config, rec.repo, 7, "gitea") == ""
+
+    def test_tracked_pr_pushed_head_refuses_ambiguous_even_when_cwd_matches(
+        self, pr_repo, monkeypatch
+    ):
+        """A CWD-derived record match must not short-circuit the ambiguity
+        check: if another tracked record claims the same (repo, number,
+        provider) with a *different* head_sha, that is still genuinely
+        ambiguous and must not resolve to the CWD record's (possibly stale)
+        value (ThomasMichon/copilot-extensions#5034)."""
+        from agent_worktrees import __main__ as main
+
+        config, wid, _wt, _ = pr_repo
+        pr_ops.set_pr(wid, number=7, state="open")
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        rec.active_pr().head_sha = "stale-sha"
+        tracking.save_record(rec)
+
+        other_id = "test-wt-20260618-cccc"
+        import copy
+        other = copy.deepcopy(rec)
+        other.worktree_id = other_id
+        other.prs = [
+            tracking.PRRecord(
+                repo=rec.repo, number=7, provider="gitea", head_sha="fresh-sha",
+            )
+        ]
+        tracking.save_record(other, cfg.tracking_dir() / f"{other_id}.yaml")
+
+        # CWD inference points squarely at the stale record.
+        monkeypatch.setattr(main, "_infer_worktree_id_from_cwd", lambda config: wid)
+
+        assert main._tracked_pr_pushed_head(config, rec.repo, 7, "gitea") == ""
+
+    def test_live_block_rejects_observation_from_other_endpoint(
+        self, pr_repo, monkeypatch
+    ):
+        from agent_worktrees import pr_contract as pc
+
+        config, wid, _wt, _ = pr_repo
+        config = self._config_with_binding(config)
+        pr_ops.set_pr(wid, number=7, state="open", provider="gitea")
+        rec = tracking.load_record(cfg.tracking_dir() / f"{wid}.yaml")
+        rec.active_pr().head_sha = "new"
+        rec.active_pr().head_observed_at = "2026-01-01T00:01:00Z"
+        rec.active_pr().head_observed_api_base = "https://other/gitea"
+        tracking.save_record(rec)
+        snap = pc.PRSnapshot(
+            pr_state="open", merged=False, head_sha="new", base_ref="master",
+            author="alice", mergeable=True, title="Feature",
+            reviews=(
+                pc.Review(
+                    1,
+                    "APPROVED",
+                    "bob",
+                    submitted_at="2026-01-01T00:02:00Z",
+                    commit_id="old",
+                ),
+            ),
+        )
+        self._mock_provider(monkeypatch, snap)
+
+        live = pr_ops.pr_status(wid, config=config)["live"]
+
+        assert live["approval_stale"] is True
+        assert live["approval_stale_authorized"] is False
+        assert live["verdict"] == ""
 
     def test_live_disabled_skips_provider(self, pr_repo, monkeypatch):
         config, wid, _wt, _ = pr_repo
         config = self._config_with_binding(config)
         pr_ops.set_pr(wid, number=7, state="open", provider="gitea")
 
-        def _boom(name):
-            raise AssertionError("provider must not be consulted when live=False")
-
-        from agent_worktrees import providers
-        monkeypatch.setattr(providers, "get_provider", _boom)
+        monkeypatch.setattr(
+            pr_ops,
+            "_reconcile_active_pr",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("reconciliation must not run when live=False")
+            ),
+        )
         res = pr_ops.pr_status(wid, live=False, config=config)
         assert "live" not in res
+
+    def test_live_enabled_still_reconciles(self, pr_repo, monkeypatch):
+        config, wid, _wt, _ = pr_repo
+        config = self._config_with_binding(config)
+        pr_ops.set_pr(
+            wid,
+            url="https://example/pulls/unresolved",
+            state="open",
+            provider="gitea",
+        )
+        calls = []
+        monkeypatch.setattr(
+            pr_ops,
+            "_reconcile_active_pr",
+            lambda record, loaded: calls.append(loaded),
+        )
+
+        pr_ops.pr_status(wid, live=True, config=config)
+
+        assert calls == [config]
 
     def test_live_best_effort_on_provider_error(self, pr_repo, monkeypatch):
         config, wid, _wt, _ = pr_repo
@@ -1203,6 +4867,109 @@ class TestPRStatusLive:
         res = pr_ops.pr_status(wid, config=config)
         assert "live" not in res
 
+    def test_live_self_merge_note_surfaced_when_bypassable(self, pr_repo, monkeypatch):
+        # #3296 follow-up: a pr-self-merge repo with a live, actor-bypassable
+        # required review must surface that explicitly in the live block --
+        # not just a bare eligible=False an agent has to puzzle out.
+        from agent_worktrees import pr_contract as pc
+
+        config, wid, _wt, _ = pr_repo
+        config = self._config_with_binding(
+            config, merge_actor="submitter-direct", automerge_label="",
+        )
+        pr_ops.set_pr(wid, number=7, state="open", provider="gitea")
+        snap = pc.PRSnapshot(
+            pr_state="open", merged=False, head_sha="h", base_ref="master",
+            author="alice", mergeable=True, title="Feature", reviews=(),
+        )
+
+        class _GhLikeProv:
+            name = "gitea"
+
+            def authority_endpoint(self, api_base=""):
+                return api_base.rstrip("/")
+
+            def get_snapshot(self, repo, number, *, api_base="", token=None):
+                return snap
+
+            def pull_review_gate(self, repo, number, *, api_base="", token=None):
+                return (True, True)
+
+        from agent_worktrees import providers
+        monkeypatch.setattr(providers, "get_provider", lambda name: _GhLikeProv())
+        monkeypatch.setattr(providers, "resolve_token", lambda prcfg: "tok")
+
+        res = pr_ops.pr_status(wid, config=config)
+        assert "Maintainer bypass" in res["live"]["self_merge_note"]
+
+    def test_live_self_merge_note_absent_when_not_bypassable(
+        self, pr_repo, monkeypatch,
+    ):
+        from agent_worktrees import pr_contract as pc
+
+        config, wid, _wt, _ = pr_repo
+        config = self._config_with_binding(
+            config, merge_actor="submitter-direct", automerge_label="",
+        )
+        pr_ops.set_pr(wid, number=7, state="open", provider="gitea")
+        snap = pc.PRSnapshot(
+            pr_state="open", merged=False, head_sha="h", base_ref="master",
+            author="alice", mergeable=True, title="Feature", reviews=(),
+        )
+
+        class _GhLikeProv:
+            name = "gitea"
+
+            def authority_endpoint(self, api_base=""):
+                return api_base.rstrip("/")
+
+            def get_snapshot(self, repo, number, *, api_base="", token=None):
+                return snap
+
+            def pull_review_gate(self, repo, number, *, api_base="", token=None):
+                return (True, False)
+
+        from agent_worktrees import providers
+        monkeypatch.setattr(providers, "get_provider", lambda name: _GhLikeProv())
+        monkeypatch.setattr(providers, "resolve_token", lambda prcfg: "tok")
+
+        res = pr_ops.pr_status(wid, config=config)
+        assert "self_merge_note" not in res["live"]
+
+    def test_live_self_merge_note_absent_on_non_self_merge_repo(
+        self, pr_repo, monkeypatch,
+    ):
+        # A gitea repo without submitter-direct merge_actor never surfaces the
+        # note even if the (hypothetical) provider had pull_review_gate.
+        from agent_worktrees import pr_contract as pc
+
+        config, wid, _wt, _ = pr_repo
+        config = self._config_with_binding(config)  # no merge_actor override
+        pr_ops.set_pr(wid, number=7, state="open", provider="gitea")
+        snap = pc.PRSnapshot(
+            pr_state="open", merged=False, head_sha="h", base_ref="master",
+            author="alice", mergeable=True, title="Feature", reviews=(),
+        )
+
+        class _GhLikeProv:
+            name = "gitea"
+
+            def authority_endpoint(self, api_base=""):
+                return api_base.rstrip("/")
+
+            def get_snapshot(self, repo, number, *, api_base="", token=None):
+                return snap
+
+            def pull_review_gate(self, repo, number, *, api_base="", token=None):
+                return (True, True)
+
+        from agent_worktrees import providers
+        monkeypatch.setattr(providers, "get_provider", lambda name: _GhLikeProv())
+        monkeypatch.setattr(providers, "resolve_token", lambda prcfg: "tok")
+
+        res = pr_ops.pr_status(wid, config=config)
+        assert "self_merge_note" not in res["live"]
+
 
 # ---------------------------------------------------------------------------
 # _worktree_to_dict PR exposure (#1107)
@@ -1234,6 +5001,95 @@ class TestWorktreeToDictPRs:
         assert d["pr_count"] == 2
         assert d["pr"]["number"] == 2  # active = the open one
         assert [p["number"] for p in d["prs"]] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# _worktree_to_dict claims_summary (#3307 worktrees-pivot-ux-overhaul Phase 4)
+# ---------------------------------------------------------------------------
+
+class TestWorktreeToDictClaimsSummary:
+    def _rec(self, *, prs=None, resources=None):
+        return tracking.WorktreeRecord(
+            worktree_id="wt-003", branch="worktree/wt-003",
+            worktree_path="/tmp/wt3", repo="acme/sample", machine="m",
+            platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=None,
+            prs=prs or [], resources=resources or [],
+        )
+
+    def test_no_claims_or_prs_omits_claims_summary(self):
+        from agent_worktrees.__main__ import _worktree_to_dict
+        d = _worktree_to_dict(self._rec())
+        assert "claims_summary" not in d
+
+    def test_ledger_claim_surfaces_in_summary(self):
+        from agent_worktrees.__main__ import _worktree_to_dict
+        rec = self._rec(resources=[
+            tracking.ResourceClaim(kind="codespace", ref="cs-123", state="active"),
+        ])
+        d = _worktree_to_dict(rec)
+        assert d["claims_summary"] == "CS cs-123"
+
+    def test_backfills_pr_claim_from_active_pr_when_ledger_has_none(self):
+        """A worktree whose PR predates the create-pr-time auto-claim (no
+        matching 'pr' kind in resources) still surfaces it -- no migration
+        needed."""
+        from agent_worktrees.__main__ import _worktree_to_dict
+        from agent_worktrees.tracking import PRRecord
+        rec = self._rec(prs=[PRRecord(state="open", branch="b", number=42)])
+        d = _worktree_to_dict(rec)
+        assert d["claims_summary"] == "#42"
+
+    def test_ledger_pr_claim_takes_precedence_over_backfill(self):
+        """A ledger already carrying a live 'pr' claim (the normal,
+        post-auto-claim path) is used as-is -- no duplicate/second entry."""
+        from agent_worktrees.__main__ import _worktree_to_dict
+        from agent_worktrees.tracking import PRRecord
+        rec = self._rec(
+            prs=[PRRecord(state="open", branch="b", number=42)],
+            resources=[tracking.ResourceClaim(
+                kind="pr", ref="acme/sample#42", state="active",
+            )],
+        )
+        d = _worktree_to_dict(rec)
+        assert d["claims_summary"] == "#42"
+
+    def test_no_backfill_for_merged_pr(self):
+        """A merged/closed PR is never backfilled -- summarize_claims would
+        filter it as non-live anyway (live_only=True default), so
+        backfilling one is pointless; confirms it stays absent."""
+        from agent_worktrees.__main__ import _worktree_to_dict
+        from agent_worktrees.tracking import PRRecord
+        rec = self._rec(prs=[PRRecord(state="merged", branch="b", number=7)])
+        d = _worktree_to_dict(rec)
+        assert "claims_summary" not in d
+
+    def test_pr_rank_beats_lower_priority_claim(self):
+        """PR outranks a codespace claim per the shared pecking order --
+        confirms the Worktrees pivot picks up the SAME ranking every
+        claims-showing pivot uses, not an invented one."""
+        from agent_worktrees.__main__ import _worktree_to_dict
+        rec = self._rec(resources=[
+            tracking.ResourceClaim(kind="codespace", ref="cs-1", state="active"),
+            tracking.ResourceClaim(kind="pr", ref="acme/sample#9", state="active"),
+        ])
+        d = _worktree_to_dict(rec)
+        assert d["claims_summary"] == "#9 \u00b7 CS cs-1"
+
+    def test_claims_links_pairs_label_with_url_own_repo_aware(self):
+        """#3307 follow-up: claims_links carries the same ranked claims as
+        claims_summary, each with a resolvable URL where available --
+        own_repo is threaded from rec.repo, so a same-repo PR never asserts
+        cross-repo even though the ref happens to carry a repo segment."""
+        from agent_worktrees.__main__ import _worktree_to_dict
+        rec = self._rec(resources=[
+            tracking.ResourceClaim(kind="pr", ref="acme/sample#9", state="active"),
+        ])
+        d = _worktree_to_dict(rec)
+        assert d["claims_links"] == [
+            {"label": "#9", "url": "https://github.com/acme/sample/pull/9"},
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1394,3 +5250,110 @@ class TestPRThreads:
         config, wid, _wt, _ = pr_repo
         res = pr_ops.pr_threads(wid, config=config)
         assert res["has_pr"] is False
+
+
+class TestCreatePRCLIPolicyError:
+    """Round-5 review finding: `cmd_create_pr --json` must serialize a
+    `CodenameAttributionPolicyError` from `pr_ops.create_pr`'s allocation
+    preflight as a clean JSON error, never a raw traceback."""
+
+    def test_json_policy_error_is_a_clean_json_error(
+        self, pr_repo, monkeypatch, capfd,
+    ):
+        import json
+
+        config, wid, _wt_path, _ = pr_repo
+
+        def _raise_policy_error(*_a, **_k):
+            raise m.codename_tracking.CodenameAttributionPolicyError(
+                "PR-active repo 'ext' has a custom codename wordlist "
+                "configured but pr.source_attribution is not explicit"
+            )
+
+        monkeypatch.setattr(m.pr_ops, "create_pr", _raise_policy_error)
+        args = m.build_parser().parse_args([
+            "create-pr", "--json", wid,
+        ])
+
+        rc = m.cmd_create_pr(args)
+
+        captured = capfd.readouterr()
+        assert rc == 1
+        assert "Traceback" not in captured.out + captured.err
+        assert "custom codename wordlist" in json.loads(captured.out)["error"]
+
+
+class TestCreatePRCLIArgs:
+    def test_topic_flag_is_parsed_and_forwarded(self, pr_repo, monkeypatch):
+        config, wid, _wt_path, _ = pr_repo
+        captured: dict[str, object] = {}
+
+        monkeypatch.setattr(m.cfg, "load_config", lambda *_a, **_k: config)
+        monkeypatch.setattr(m, "_infer_worktree_id", lambda candidate, _config: candidate)
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda candidate: candidate)
+
+        def _fake_create_pr(worktree_id, passed_config, **kwargs):
+            captured["worktree_id"] = worktree_id
+            captured["config"] = passed_config
+            captured["kwargs"] = kwargs
+            return {
+                "success": True,
+                "branch": "feature/add-feature-hot-fix-aaaa",
+                "remote": "origin",
+                "provider": "gitea",
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
+                "draft": False,
+            }
+
+        monkeypatch.setattr(m.pr_ops, "create_pr", _fake_create_pr)
+
+        args = m.build_parser().parse_args([
+            "create-pr", wid, "--title", "Add feature", "--topic", "Hot Fix",
+        ])
+
+        rc = m.cmd_create_pr(args)
+
+        assert rc == 0
+        assert captured["worktree_id"] == wid
+        assert captured["config"] is config
+        assert captured["kwargs"]["title"] == "Add feature"
+        assert captured["kwargs"]["topic"] == "Hot Fix"
+
+    def test_topic_flag_coexists_with_branch_override(self, pr_repo, monkeypatch):
+        config, wid, _wt_path, _ = pr_repo
+        captured: dict[str, object] = {}
+
+        monkeypatch.setattr(m.cfg, "load_config", lambda *_a, **_k: config)
+        monkeypatch.setattr(m, "_infer_worktree_id", lambda candidate, _config: candidate)
+        monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda candidate: candidate)
+
+        def _fake_create_pr(_worktree_id, _config, **kwargs):
+            captured["kwargs"] = kwargs
+            return {
+                "success": True,
+                "branch": kwargs["branch"],
+                "remote": "origin",
+                "provider": "gitea",
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
+                "draft": False,
+                "topic_note": "Ignoring --topic because --branch fully overrides the head name.",
+            }
+
+        monkeypatch.setattr(m.pr_ops, "create_pr", _fake_create_pr)
+
+        args = m.build_parser().parse_args([
+            "create-pr",
+            wid,
+            "--branch",
+            "feature/manual-branch",
+            "--topic",
+            "Hot Fix",
+        ])
+
+        rc = m.cmd_create_pr(args)
+
+        assert rc == 0
+        assert captured["kwargs"]["branch"] == "feature/manual-branch"
+        assert captured["kwargs"]["topic"] == "Hot Fix"

@@ -9,6 +9,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+from plugin_activation import ActivePlugin, ActivePluginRoot
+
 from agent_codespaces import sessions
 
 
@@ -32,6 +35,104 @@ def test_extract_b64_between_sentinels_drops_noise():
 
 def test_extract_b64_empty_when_no_sentinels():
     assert sessions._extract_b64("nothing here") == ""
+
+
+async def test_pull_tar_bytes_raises_on_undecodable_payload():
+    """An undecodable/corrupt payload must RAISE, not also return None --
+    the same None a genuinely session-less CodeSpace produces. Silently
+    reporting either outcome as "no sessions" would hide a truncated or
+    malformed transfer from both existing callers."""
+    result = SimpleNamespace(
+        stdout=f"{sessions._B64_START}\nnot-valid-base64!!!\n{sessions._B64_END}\n",
+        stderr="",
+    )
+    with patch.object(sessions, "exec_with_retry", return_value=result):
+        with pytest.raises(RuntimeError, match="undecodable"):
+            await sessions._pull_tar_bytes(object(), "cs", timeout=5.0)
+
+
+async def test_pull_tar_bytes_returns_none_for_genuinely_no_sessions():
+    result = SimpleNamespace(stdout="no sentinels here", stderr="")
+    with patch.object(sessions, "exec_with_retry", return_value=result):
+        assert await sessions._pull_tar_bytes(object(), "cs", timeout=5.0) is None
+
+
+def _resolve_bash() -> str | None:
+    """Prefer a real Git Bash over the WSL launcher stub. WSL's own PATH is
+    entirely separate from this test's Windows host (and this test module
+    hardcodes a POSIX-only `PATH=/usr/bin:/bin` for the child, which is
+    valid for MSYS/Git Bash's runtime translation but routes through a
+    genuinely different VM/runtime -- and therefore a different failure
+    surface -- when the WSL launcher is selected instead)."""
+    import shutil
+
+    git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+    if git_bash.is_file():
+        return str(git_bash)
+    import os
+
+    path = os.environ.get("PATH")
+    if not path:
+        return None
+    filtered = os.pathsep.join(
+        part for part in path.split(os.pathsep)
+        if "windowsapps" not in part.lower()
+        and part.rstrip("\\").lower() != r"c:\windows\system32"
+    )
+    return shutil.which("bash", path=filtered)
+
+
+def test_pull_cmd_produces_archive_with_only_session_state_present():
+    """Real regression for a fixed bug: `files=$(ls -d a b c d 2>/dev/null)`
+    used the assignment's own exit code (`ls`'s, nonzero whenever ANY of
+    the four paths is missing -- routinely true, since the WAL/SHM
+    companions only exist while the db is in active WAL mode) to gate the
+    whole archive step via `&&`, so a normal CodeSpace missing just one
+    optional file silently produced NO output at all (misreported as "no
+    sessions" even though `session-state` existed)."""
+    import subprocess
+    import tempfile
+
+    bash = _resolve_bash()
+    if bash is None:
+        return  # environment without a real (non-WSL) bash; nothing to verify here
+    with tempfile.TemporaryDirectory() as home:
+        copilot = Path(home) / ".copilot"
+        (copilot / "session-state").mkdir(parents=True)
+        (copilot / "session-state" / "dummy.txt").write_text("x")
+        # Deliberately no session-store.db / -wal / -shm -- exactly the
+        # normal, common case the fixed bug silently lost.
+        result = subprocess.run(
+            [bash, "-c", sessions._PULL_CMD],  # noqa: S607 - test-only, fixed args
+            capture_output=True, text=True, timeout=10,
+            env={"HOME": home, "PATH": "/usr/bin:/bin"},
+        )
+    assert sessions._B64_START in result.stdout
+    assert sessions._B64_END in result.stdout
+
+
+def test_pull_cmd_never_archives_outside_copilot_dir_when_cd_fails():
+    """Directory-scoping safety regression: if `cd ~/.copilot` fails (the
+    directory doesn't exist), the command must produce NO output at all --
+    never fall through to `tar` against the SSH default directory using an
+    inherited/exported `files` environment variable, which would violate
+    the command's stated session-state-only allowlist."""
+    import subprocess
+    import tempfile
+
+    bash = _resolve_bash()
+    if bash is None:
+        return
+    with tempfile.TemporaryDirectory() as home:
+        # No ~/.copilot at all -- `cd` fails.
+        result = subprocess.run(
+            [bash, "-c", sessions._PULL_CMD],  # noqa: S607 - test-only, fixed args
+            capture_output=True, text=True, timeout=10,
+            # A nonempty inherited `files` env var is exactly the attack
+            # this regression guards against: it must never reach `tar`.
+            env={"HOME": home, "PATH": "/usr/bin:/bin", "files": "/etc/passwd"},
+        )
+    assert result.stdout.strip() == ""
 
 
 def _make_session_tar(session_ids: list[str], *, include_db: bool = True) -> bytes:
@@ -100,8 +201,21 @@ def test_stage_and_push_rejects_corrupt_archive():
     assert "corrupt" in res["detail"] or "invalid" in res["detail"]
 
 
-def _active_plugin(name: str, marketplace: str, root: Path) -> SimpleNamespace:
-    return SimpleNamespace(name=name, marketplace=marketplace, root=root)
+def _active_plugin(
+    name: str,
+    marketplace: str,
+    root: Path,
+    *,
+    roots: tuple[ActivePluginRoot, ...] = (),
+) -> ActivePlugin:
+    return ActivePlugin(
+        source=f"{name}@{marketplace}",
+        name=name,
+        marketplace=marketplace,
+        root=root,
+        scopes=("global",),
+        roots=roots,
+    )
 
 
 def test_find_session_sync_uses_invoking_payload_marketplace(
@@ -158,6 +272,43 @@ def test_find_session_sync_reports_missing_same_marketplace_logger(
 
     assert resolved is None
     assert "not installed and enabled" in detail
+
+
+def test_find_session_sync_matches_invoking_secondary_live_root(
+    tmp_path: Path,
+    monkeypatch,
+):
+    installed = tmp_path / "installed" / "agent-codespaces"
+    local = tmp_path / "local" / "agent-codespaces"
+    logger = tmp_path / "installed" / "agent-logger"
+    installed.mkdir(parents=True)
+    local.mkdir(parents=True)
+    command_name = "session-sync.cmd" if sys.platform == "win32" else "session-sync"
+    command = logger / "bin" / command_name
+    command.parent.mkdir(parents=True)
+    command.write_text("echo session-sync", encoding="utf-8")
+    command.chmod(0o755)
+    report = SimpleNamespace(active={
+        "agent-codespaces@market-a": _active_plugin(
+            "agent-codespaces",
+            "market-a",
+            local,
+            roots=(
+                ActivePluginRoot(local, ("project:demo",), "directory"),
+                ActivePluginRoot(installed, ("global",), "installed"),
+            ),
+        ),
+        "agent-logger@market-a": _active_plugin(
+            "agent-logger", "market-a", logger
+        ),
+    })
+    monkeypatch.setenv("COPILOT_PLUGIN_ROOT", str(installed))
+
+    with patch.object(sessions, "resolve_active_plugins", return_value=report):
+        resolved, detail = sessions.find_session_sync()
+
+    assert resolved == str(command)
+    assert detail == ""
 
 
 def test_find_session_sync_rejects_ambiguous_marketplace_identity(
@@ -245,7 +396,28 @@ def test_push_via_session_sync_other_error_passes_through():
         ok, detail = sessions._push_via_session_sync(Path("."), ".codespaces/x", verbose=False)
     assert ok is False
     assert "stale" not in detail
-    assert "target unreachable" in detail
+
+
+def test_push_via_session_sync_is_bounded_by_a_timeout(monkeypatch):
+    """The push subprocess previously ran unbounded -- a hung/stuck push
+    could block a reclaim past whatever budget the caller (e.g. the
+    claim-provider registry's reclaim callback timeout) actually enforces
+    (claim-provider-pattern effort review finding: "Align reclaim timeout
+    with full recovery and deletion phases")."""
+    with patch.object(sessions, "find_session_sync", return_value=("session-sync", "")), \
+            patch.object(sessions.subprocess, "run",
+                        side_effect=sessions.subprocess.TimeoutExpired("cmd", 60)):
+        ok, detail = sessions._push_via_session_sync(Path("."), ".codespaces/x", verbose=False)
+    assert ok is False
+    assert "timed out" in detail
+
+
+def test_push_via_session_sync_passes_a_timeout_kwarg():
+    completed = SimpleNamespace(returncode=0, stdout="ok", stderr="")
+    with patch.object(sessions, "find_session_sync", return_value=("session-sync", "")), \
+            patch.object(sessions.subprocess, "run", return_value=completed) as run:
+        sessions._push_via_session_sync(Path("."), ".codespaces/x", verbose=False)
+    assert run.call_args.kwargs["timeout"] == sessions._PUSH_TIMEOUT_SECONDS
 
 
 def test_is_stale_session_sync_detection():

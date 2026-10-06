@@ -8,11 +8,14 @@ window -- reusing the exact conservative safety of the manual ``cleanup``.
 
 from __future__ import annotations
 
+import argparse
 import types
 from pathlib import Path
 from unittest.mock import patch
 
 from agent_worktrees import __main__ as cli
+from agent_worktrees import cleanup_gc_cli
+from agent_worktrees import output
 from agent_worktrees import tracking
 
 
@@ -54,6 +57,19 @@ class _FakeLock:
         return None
 
 
+class _FakeRecordLock:
+    """No-op stand-in for ``tracking._RecordLock`` (context manager)."""
+
+    def __init__(self, *a, **k):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 def _sweep(records, *, dry_run=True, mux=None, activity=None, now=None,
            active_sessions=None, turn_count=None, min_idle_secs=None,
            branch_merged=True, reaped=None):
@@ -69,15 +85,33 @@ def _sweep(records, *, dry_run=True, mux=None, activity=None, now=None,
     config = types.SimpleNamespace(default_repo=repo, repo_name="repo")
     ctx = types.SimpleNamespace(active_sessions=(active_sessions or set()),
                                 turn_count=(turn_count or {}))
+    by_id = {r.worktree_id: r for r in records}
 
     def _fake_reap(rec, info, r, tp):
         if reaped is not None:
             reaped.append(rec.worktree_id)
         return (0, [])
 
+    def _fake_load_record(path):
+        return by_id[Path(path).stem]
+
+    real_exists = Path.exists
+
+    def _fake_exists(self):
+        # yaml tracking-record paths under the fake tracking dir "exist" (the
+        # test never writes real YAML files); everything else (worktree dirs)
+        # keeps real filesystem behavior so git-state still resolves from
+        # `status` alone, per this helper's docstring.
+        if self.parent == Path("/tmp") and self.suffix == ".yaml":
+            return True
+        return real_exists(self)
+
     with patch("agent_worktrees.config.load_config", return_value=config), \
          patch("agent_worktrees.config.tracking_dir", return_value=Path("/tmp")), \
          patch("agent_worktrees.tracking.list_records", return_value=records), \
+         patch("agent_worktrees.tracking.load_record", side_effect=_fake_load_record), \
+         patch("agent_worktrees.tracking._RecordLock", _FakeRecordLock), \
+         patch("pathlib.Path.exists", _fake_exists), \
          patch("agent_worktrees.sessions._list_mux_sessions",
                return_value=(mux or {})), \
          patch("agent_worktrees.sessions._mux_session_activity",
@@ -85,6 +119,8 @@ def _sweep(records, *, dry_run=True, mux=None, activity=None, now=None,
          patch("agent_worktrees.sessions.scan_sessions_fast", return_value=ctx), \
          patch("agent_worktrees.__main__._build_active_paths", return_value=set()), \
          patch("agent_worktrees.__main__._normalize_path", side_effect=lambda p: p), \
+         patch("agent_worktrees.__main__._hosted_session_blocks_cleanup",
+               return_value=False), \
          patch("agent_worktrees.git_ops.is_branch_merged", return_value=branch_merged), \
          patch("agent_worktrees.git_ops.prune_worktrees", return_value=None), \
          patch("agent_worktrees.__main__._reap_worktree", side_effect=_fake_reap), \
@@ -157,6 +193,47 @@ def test_non_dry_run_reaps_via_reap_worktree():
     assert [x["id"] for x in report["removed"]] == ["go"]
 
 
+def test_reap_host_owned_worktree_retires_tracking_only(tmp_path, monkeypatch):
+    worktree = tmp_path / "host-worktree"
+    worktree.mkdir()
+    tracking_dir = tmp_path / "tracking"
+    tracking_dir.mkdir()
+    rec = _rec("host", path=str(worktree))
+    rec.checkout_managed = False
+    tracking.save_record(rec, tracking_dir / "host.yaml")
+    monkeypatch.setattr(
+        cli.git_ops, "remove_worktree",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not remove")),
+    )
+    monkeypatch.setattr(
+        cli.git_ops, "delete_branch",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not delete")),
+    )
+    monkeypatch.setattr(
+        cli.procs, "terminate_processes_under",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not kill")),
+    )
+    monkeypatch.setattr(cli.disposition_history, "remove", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli.activity, "log_event", lambda *_a, **_k: None)
+
+    failures, warnings = cli._reap_worktree(
+        rec,
+        types.SimpleNamespace(),
+        types.SimpleNamespace(anchor=str(tmp_path / "anchor")),
+        tracking_dir,
+    )
+
+    assert failures == 0
+    assert warnings == []
+    assert worktree.is_dir()
+    # Host-owned tracking-only retirement now archives rather than deletes
+    # (archival-is-a-terminus-not-a-deletion) -- the tracking record persists
+    # as a durable tombstone, distinct from the checkout it never owned.
+    path = tracking_dir / "host.yaml"
+    assert path.exists()
+    assert tracking.load_record(path).status == "archived"
+
+
 # --- kill-switch + grace resolution -----------------------------------------
 
 def test_auto_clean_enabled_default(monkeypatch):
@@ -193,3 +270,46 @@ def test_grace_invalid_env_falls_back(monkeypatch):
     from agent_worktrees import gc as gc_mod
     monkeypatch.setenv(cli._AUTO_CLEAN_GRACE_ENV, "not-a-number")
     assert cli._auto_clean_grace_secs() == float(gc_mod.SESSION_GC_GRACE_SECS)
+
+
+def test_cmd_sweep_managed_json(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        cleanup_gc_cli,
+        "sweep_managed_worktrees",
+        lambda **_kwargs: {"removed": [{"id": "svc"}], "skipped": []},
+    )
+    monkeypatch.setattr(
+        output,
+        "_json_output",
+        lambda payload: seen.setdefault("payload", payload),
+    )
+
+    assert cli.cmd_sweep_managed(argparse.Namespace(dry_run=False, json=True)) == 0
+    assert seen["payload"] == {
+        "removed": [{"id": "svc"}],
+        "skipped": [],
+    }
+
+
+def test_cmd_sweep_finished_sessions_json(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        cli,
+        "sweep_finished_session_worktrees",
+        lambda **_kwargs: {"removed": [{"id": "done"}], "skipped": []},
+    )
+    monkeypatch.setattr(
+        output,
+        "_json_output",
+        lambda payload: seen.setdefault("payload", payload),
+    )
+
+    assert (
+        cli.cmd_sweep_finished_sessions(argparse.Namespace(dry_run=False, json=True))
+        == 0
+    )
+    assert seen["payload"] == {
+        "removed": [{"id": "done"}],
+        "skipped": [],
+    }

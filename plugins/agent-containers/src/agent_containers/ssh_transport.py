@@ -1,9 +1,9 @@
 """OpenSSH transport for trusted fleet containers.
 
 Docker remains the lifecycle/bootstrap boundary. Agent traffic crosses a real
-OpenSSH connection whose ``ProxyCommand`` starts the container's ``sshd`` in
-inetd mode, avoiding published host ports while matching the CodeSpace SSH
-transport semantics.
+OpenSSH connection to the container's ``sshd`` in inetd mode. POSIX hosts use a
+direct ``ProxyCommand``; Windows uses a plugin-owned loopback byte broker so the
+Docker CLI can be launched explicitly without a visible console.
 """
 
 from __future__ import annotations
@@ -36,6 +36,10 @@ _ENV_EXCLUDE = {"HOME", "LOGNAME", "PWD", "SHELL", "SHLVL", "USER", "_"}
 
 def _creation_flags() -> int:
     return no_window_flags()
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
 def _validate_target(container: str, user: str) -> None:
@@ -292,21 +296,56 @@ def prepare_ssh_config(container: str, user: str) -> SSHConfig:
         _install_authorized_key(container, user, public_key)
         container_id = _container_id(container)
         alias = f"agent-container-{container}-{container_id[:12]}"
+        proxy_port: int | None = None
+        if _is_windows():
+            from .docker_proxy import ensure_broker
+
+            proxy_port = ensure_broker(
+                container,
+                container_id,
+                _SSH_DIR / f"{container}.proxy.json",
+            )
         config_file = _SSH_DIR / f"{container}.config"
         known_hosts = _SSH_DIR / "known_hosts"
-        content = "\n".join([
+        lines = [
             f"Host {alias}",
-            f"    HostName {alias}",
+            f"    HostName {'127.0.0.1' if proxy_port else alias}",
+        ]
+        if proxy_port:
+            lines.extend([
+                f"    Port {proxy_port}",
+                f"    HostKeyAlias {alias}",
+            ])
+        lines.extend([
             f"    User {user}",
+            f'    IdentityFile "{_config_path(private_key)}"',
             "    IdentitiesOnly yes",
             "    BatchMode yes",
             "    StrictHostKeyChecking accept-new",
             f'    UserKnownHostsFile "{_config_path(known_hosts)}"',
-            f"    ProxyCommand docker exec -i -u root {container} "
-            "/usr/sbin/sshd -i -e -o GatewayPorts=no",
+        ])
+        proxy_command = (
+            f"docker exec -i -u root {container} "
+            "/usr/sbin/sshd -i -e -o GatewayPorts=no"
+        )
+        if not proxy_port:
+            lines.append(f"    ProxyCommand {proxy_command}")
+        lines.extend([
             "    LogLevel ERROR",
             "",
         ])
+        content = "\n".join(lines)
+        # Defensive read-back (#2042): a rendered profile missing IdentityFile
+        # silently falls back to ssh's default key discovery, which may pick
+        # the wrong key (or none) for an external consumer that connects via
+        # this config file directly rather than through the in-process
+        # SSHConfig.identity_file this function also returns. Catch that class
+        # of regression at render time rather than only at connect time.
+        if f'IdentityFile "{_config_path(private_key)}"' not in content:
+            raise RuntimeError(
+                f"Rendered SSH profile for '{alias}' is missing its "
+                "IdentityFile entry -- refusing to write an unusable profile"
+            )
         try:
             current = config_file.read_text(encoding="utf-8")
         except OSError:
@@ -326,6 +365,13 @@ def prepare_ssh_config(container: str, user: str) -> SSHConfig:
         user=user,
         identity_file=str(private_key),
         config_file=str(config_file),
+        # Surfaced explicitly (not just embedded in the rendered config file's
+        # text) so a Windows caller (ssh_manager.create_ssh_subprocess) can
+        # detect it and route the ProxyCommand child through its windowless
+        # broker instead of letting OpenSSH spawn it directly -- a plain
+        # ``-F config_file`` consumer has no cheap way to see a file-embedded
+        # ProxyCommand without shelling out to ``ssh -G`` itself.
+        proxy_command=None if proxy_port else proxy_command,
     )
 
 
@@ -373,7 +419,8 @@ def write_remote_env(container: str, user: str, values: dict[str, str]) -> str |
     invalid = sorted(name for name in values if not _SAFE_ENV.fullmatch(name))
     if invalid:
         raise RuntimeError(f"Unsafe environment names for SSH launch: {invalid}")
-    launch_dir = f"{_remote_home(container, user)}/.agent-containers/launch"
+    _launch_rel = ".agent-containers/launch"  # marketplace-isolation: allow remote-container-path
+    launch_dir = f"{_remote_home(container, user)}/{_launch_rel}"
     remote_path = f"{launch_dir}/{uuid.uuid4().hex}.env"
     payload = "".join(
         f"export {name}={shlex.quote(value)}\n"
@@ -419,7 +466,8 @@ def cleanup_remote_env(container: str, user: str, remote_path: str | None) -> No
 def cleanup_remote_envs(container: str, user: str) -> None:
     """Remove abandoned launch-only env files before preparing a new launch."""
     _validate_target(container, user)
-    launch_dir = f"{_remote_home(container, user)}/.agent-containers/launch"
+    _launch_rel = ".agent-containers/launch"  # marketplace-isolation: allow remote-container-path
+    launch_dir = f"{_remote_home(container, user)}/{_launch_rel}"
     result = _run([
         "docker", "exec", "-u", user, container,
         "sh", "-c",
@@ -451,12 +499,19 @@ def build_ssh_command(
     remote_command: str,
     *,
     reverse_forwards: list[str] | None = None,
+    pty: bool = False,
 ) -> list[str]:
-    """Build the shared OpenSSH remote-exec argv for the ACP stdio channel."""
+    """Build the shared OpenSSH remote-exec argv for the ACP stdio channel.
+
+    ``pty=True`` requests a real PTY (used by the venue `copilot` verb, whose
+    remote command attaches an interactive tmux session -- an ordinary ACP
+    stdio dispatch never sets this).
+    """
     if not shutil.which("ssh"):
         raise RuntimeError("ssh is required for trusted-container transport")
     return build_remote_exec_args(
         config,
         remote_command,
         reverse_forwards=reverse_forwards,
+        pty=pty,
     )

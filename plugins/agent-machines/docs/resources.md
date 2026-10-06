@@ -8,13 +8,15 @@ per-repo scripts. They sit between the Copilot **surfaces** (which converge
 A requirement package declares them under a top-level `resources:` list:
 
 ```yaml
-schema_version: 2
+schema_version: 4
 package: your-repo/machine-defaults
+authority: 0                  # optional, -1000..1000
 gate: ["your-box"]
 resources:
   - type: package
     id: marlocarlo.psmux        # identity within (type, manager)
     manager: winget             # winget | apt | pipx | uv-tool | pip
+    authority: 10               # optional override of package authority
     version: "3.3.5"           # exact pin (optional)
     state: present              # present (default) | absent
     pin: true                   # hold at version where the manager supports it
@@ -27,7 +29,34 @@ resources:
     strategy: ensure-present    # enforce | ensure-present
     content: |
       set -g mouse on
+  - type: self-update
+    tier: watchdog              # watchdog | sweep
+    state: present              # present (default) | absent
+  - type: fleet-update
+    tier: sweep                 # sweep (the only tier today)
+    state: present              # present (default) | absent
 ```
+
+## Common resource fields
+
+Every resource type supports the same small set of cross-cutting fields:
+
+| Field | Meaning |
+| --- | --- |
+| `authority` | Optional schema-v4 authority override for deterministic field selection and reporting. |
+| `platforms` | Restrict to a subset of `windows` / `linux` / `wsl`. |
+| `gate` | Restrict to specific machines (defaults to the package gate). |
+| `owner` | Override the collision owner label (defaults to the package name). |
+| `maintenance_safe` | Optional boolean, default `false`. Includes the resource in `agent-machines restore --maintenance-safe` unattended restores. When omitted, the resource stays visible in maintenance-safe restores as a skipped result with an explicit reason. |
+
+`maintenance_safe` is an unattended-maintenance opt-in, not the default. The
+one built-in exception is a `type: package` resource that declares both
+`pin: true` and an explicit `version:`: when that package is **already
+installed** but at the wrong version, maintenance-safe restore treats
+realignment back to the declared pinned version as safe drift correction even
+without `maintenance_safe: true`. First install, removal, pin-only metadata
+changes, and package declarations without explicit `pin` + `version` still
+require `maintenance_safe: true` to participate in unattended runs.
 
 ## Resource types
 
@@ -188,6 +217,116 @@ sees drift and retries. A failed query or post-apply mismatch is an error rather
 than a success-shaped fallback. `state` is not supported: power settings are
 always declarations of desired AC/DC indexes.
 
+### `self-update`
+
+Declare machine-local opt-in for one unattended `agent-machines self-update`
+tier. Identity is `tier`, so `watchdog` and `sweep` are independent resources
+with independent authority and locking. The declaring package can live in any
+adopted repo -- most commonly your own knowledge/control repo, since this is
+never authored in `copilot-extensions` itself -- or, when no such repo is
+bound/reachable, in the home-relative user-scoped root
+`~/.agent-machines/config/` (`all/` or `machines/<machine>/`), which needs no
+adoption or registry at all. See the `agent-machines-setup` skill's *Enable a
+regular unattended maintenance schedule* section for the resolution order.
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `type` | yes | `self-update` |
+| `tier` | yes | `watchdog` or `sweep`. |
+| `state` | no | `present` (opted in; default) or `absent` (opted out). |
+| `platforms` | no | Restrict to a subset of `windows` / `linux` / `wsl`. |
+| `gate` | no | Restrict to specific machines (defaults to the package gate). |
+| `owner` | no | Override the collision owner label (defaults to the package name). |
+
+`watchdog` is the narrow hourly dtssh-launcher liveness tier; `sweep` is the
+broader daily pull + repo `update` + **maintenance-safe** restore tier.
+Declaring the resource controls both `agent-machines self-update run` and the
+machine-local scheduler presence reconciled by `agent-machines self-update
+install` and `agent-machines restore --apply` (Windows Scheduled Tasks; Linux /
+WSL `systemd --user` timers). The registered command always targets the stable
+`agent-machines` management binstub (`~/.local/bin/agent-machines` on POSIX,
+`agent-machines.cmd` on Windows), so runtime slot updates do not leave the
+scheduler pinned to an old version:
+
+- `run` resolves the selected tier first and is a clean no-op when it is
+  opted out.
+- `install` resolves the same authority-selected state first and attempts
+  Scheduled Task registration only for tiers whose resolved state is `present`.
+- `restore --apply` treats Scheduled Task presence as ordinary machine drift:
+  a newly opted-in tier is registered (or returns the same explicit
+  elevate-and-retry instruction), and a newly opted-out tier is removed without
+  a separate install/uninstall step.
+
+### `fleet-update`
+
+Declare machine-local opt-in for the unattended `agent-machines fleet-update`
+sweep. Identity is `tier`; today there is a single `sweep` tier.
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `type` | yes | `fleet-update` |
+| `tier` | yes | `sweep` (the only tier today). |
+| `state` | no | `present` (opted in; default) or `absent` (opted out). |
+| `platforms` | no | Restrict to a subset of `windows` / `linux` / `wsl`. |
+| `gate` | no | Restrict to specific machines (defaults to the package gate). |
+| `owner` | no | Override the collision owner label (defaults to the package name). |
+
+A distinct resource from `self-update` (different scheduler, state directory,
+and lock namespace, so a bug in one can never affect the other's already-
+deployed mechanism): `sweep` runs `worktree-manager update` once a day,
+independent of and in parallel with any `self-update` tiers. Declaring the
+resource controls both `agent-machines fleet-update run` and the machine-local
+scheduler presence reconciled by `agent-machines fleet-update install` (Windows
+Scheduled Tasks; Linux/WSL `systemd --user` timers). The registered command
+targets the stable `worktree-manager` binstub (`~/.local/bin/worktree-manager`
+on POSIX, `worktree-manager.cmd` on Windows) -- not the `agent-machines`
+binstub self-update uses -- so the fleet-wide plugin install/update
+orchestration the Worktree Manager already owns runs asynchronously on a
+schedule, rather than only inline during an interactive `worktree-manager
+update` invocation:
+
+- `run` resolves the selected tier first and is a clean no-op when it is
+  opted out.
+- `install` resolves the same authority-selected state first and attempts
+  Scheduled Task registration only for tiers whose resolved state is `present`.
+- `status` / `uninstall` mirror `self-update`'s equivalents.
+
+The created Windows tasks run only when the user is logged on, matching the
+interactive credential/token needs of the dtssh watchdog and restore sweep.
+
+### `copilot-cli-update`
+
+Manage the Copilot CLI's own built-in self-updater. Windows only for now
+(singleton identity -- there is one Copilot CLI per machine, so unlike
+`self-update`/`fleet-update` there is no per-instance key such as `tier`).
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `type` | yes | `copilot-cli-update` |
+| `auto_update` | one of `auto_update` / `pinned_version` | `false` disables the CLI's own update check on startup; `true` (or omitted) restores its default (enabled). |
+| `pinned_version` | one of `auto_update` / `pinned_version` | Exact `FileVersionInfo.FileVersion` to converge the installed binstub to (e.g. `"1.0.88"`). |
+| `platforms` | no | Restrict to a subset of `windows` / `linux` / `wsl` (the handler itself is Windows-only regardless). |
+| `gate` | no | Restrict to specific machines (defaults to the package gate). |
+| `owner` | no | Override the collision owner label (defaults to the package name). |
+
+The CLI's self-updater hot-swaps the installed binary directly on launch
+(rotating the prior binary aside as `copilot.exe.old-<pid>-<unixms>` next to
+it under the WinGet Links directory), entirely independent of any package
+manager. Once it has touched a winget-installed binary, winget itself can no
+longer reconcile it (`winget install` refuses with "Unable to remove Portable
+package as it has been modified") -- this is why pinning the CLI needs its own
+resource type rather than `type: package`.
+
+- `auto_update: false` persists a `COPILOT_AUTO_UPDATE` user environment
+  variable via the registry (`HKCU\Environment`), which the CLI reads to skip
+  its own update check. `auto_update: true` removes any override.
+- `pinned_version` converges the installed binstub to an exact version by
+  restoring a backup the self-updater already rotated aside. It never
+  fabricates or downloads a binary: with no matching backup, the resource
+  reports **blocked** (a real precondition this run cannot satisfy) rather
+  than a false success. If the binstub itself is not found at the resolved
+  location (e.g. a non-WinGet install), the resource reports **skipped**.
+
 ## Path anchors
 
 | Anchor | Resolves to |
@@ -198,46 +337,78 @@ always declarations of desired AC/DC indexes.
 
 ## Collision handling
 
-When two packages target the same resource identity, the resolver mirrors the
-validator's stance -- **detect-and-report, resolve only the unambiguously
-compatible**:
+When two packages target the same resource identity, authority is resolved per
+semantic field. A unique highest authority selects that field and emits
+structured selected/superseded provenance plus an informational
+`authority-supersession` finding. Equal-highest disagreement retains the
+existing error (or advisory for differing `ensure-present` file content).
+Declarations are not filtered wholesale, so unrelated fields and conservative
+compatibility data from lower-authority declarations remain effective:
 
 | Situation | Result |
 | --- | --- |
-| package `present` + `absent` | error |
-| package two different `version` pins | error |
+| package `present` + `absent` | highest authority wins; equal-highest disagreement errors |
+| package two different `version` pins | highest authority wins; equal-highest disagreement errors |
 | package `pin` flags differ | OR'd to pinned (compatible) |
 | package `process_guard.names` differ | names are case-folded and unioned (conservative, compatible) |
-| file two `enforce` with different `content` | error |
-| file conflicting `format` | error |
+| resource `maintenance_safe` flags differ | OR'd to maintenance-safe (compatible opt-in) |
+| file two `enforce` with different `content` | highest enforce authority wins; equal-highest disagreement errors |
+| file conflicting `format` | highest authority wins; equal-highest disagreement errors |
 | file `enforce` + `ensure-present` | enforce wins (advisory) |
-| file two `ensure-present` with different content | deterministic pick (advisory) |
-| file same `(path, block)` with different content | error |
+| file two `ensure-present` with different content | highest authority wins; equal-highest disagreement keeps the deterministic advisory |
+| file same `(path, block)` with different state or content | highest field authority wins; equal-highest disagreement errors |
+| file same `(path, block)` with different begin/end markers | error regardless of authority; marker migration is not implicit |
 | file distinct `block` ids in one file | compatible (coexist) |
 | file whole-file owner + managed block on one path | error |
-| registry `present` + `absent` | error |
-| registry conflicting `value` or `value_type` | error |
-| feature `present` + `absent` | error |
-| power setting conflicting `ac` or `dc` value | error |
+| registry `present` + `absent` | highest authority wins; equal-highest disagreement errors |
+| registry conflicting `value` or `value_type` | highest field authority wins; equal-highest disagreement errors |
+| feature `present` + `absent` | highest authority wins; equal-highest disagreement errors |
+| power setting conflicting `ac` or `dc` value | highest authority for that power source wins; equal-highest disagreement errors |
+| self-update `present` + `absent` | highest authority wins; equal-highest disagreement errors |
+| fleet-update `present` + `absent` | highest authority wins; equal-highest disagreement errors |
+| copilot-cli-update conflicting `auto_update` or `pinned_version` | highest authority wins; equal-highest disagreement errors |
 
-The deterministic pick is stable regardless of package order, so plans and drift
-keys are reproducible. Errors block `restore`; advisories do not.
+File `format` and `content` are selected from declarations participating in the
+winning strategy (`enforce` when present, otherwise `ensure-present`), so
+resolution never synthesizes a format/content pair that no compatible
+declaration supplied. Invalid JSON content is an error result, not a successful
+skip.
+
+Package `pin` remains an OR across every declaration, and
+`process_guard.names` remains a case-folded union across every declaration.
+Whole-file and managed-block ownership of the same path remains a hard error
+regardless of authority. The deterministic selection is stable regardless of
+package order, so plans and drift keys are reproducible. Errors block
+`restore`; advisories and authority information do not.
 
 ## CLI
 
 Resources appear in every verb:
 
-- `agent-machines plan` lists each resolved resource with a one-word summary and
-  its contributors.
+- `agent-machines plan` lists each resolved resource with a one-word summary
+  and contributors, then renders any source-qualified authority decisions.
 - `agent-machines validate` reports resource collisions alongside surface and
   bootstrap findings.
 - `agent-machines restore` applies resources between surfaces and modules;
   `--dry-run` (the default) previews the exact commands / writes, `--apply`
   performs them, and `--only <id|type|type:id>` restricts the run to a resource
   (and skips modules when nothing else is selected).
+- `agent-machines restore --maintenance-safe` still reconciles every `manage:`
+  Copilot settings/permissions entry, runs runtime spot checks for installed
+  runtime plugins, and applies only resources that explicitly declare
+  `maintenance_safe: true` plus the package pinned-version realignment exception
+  above. **Repo-local `modules:` are excluded entirely** (reported as `skipped`,
+  not run) unless `--only <module>` names one explicitly: a module executes an
+  arbitrary repo-local command with no per-module safety opt-in equivalent to a
+  resource's `maintenance_safe: true`, so the whole category stays out of a
+  blanket unattended run rather than risking an unreviewed side effect (package
+  installs, PATH/config edits, and similar). Excluded resources and modules
+  remain visible as `skipped` results with a reason; plain restore behavior is
+  otherwise unchanged.
 - `agent-machines restore --json` includes a `resources` list (each result has
-  `status: ok|changed|deferred|skipped|error`) and a `plan.resources` list. Any resource
-  error makes the top-level `ok` false and the command exit nonzero.
+  `status: ok|changed|deferred|skipped|error`), a `plan.resources` list, and
+  stable `authority_decisions`. Any resource error makes the top-level `ok`
+  false and the command exit nonzero.
 
 ## Adopter guide
 

@@ -153,6 +153,7 @@ param(
     [int]$HealthCheckSec      = 120,
     [int]$PressureCheckSec    = 5,
     [int]$SessionClassificationSec = 15,
+    [int]$OrphanProxyGraceSec = 120,
     [int]$ConsecutiveFailures = 2,
     [int]$GracePeriodSec      = 45,
     [int]$PreAuthWarnThreshold = 8,
@@ -279,8 +280,127 @@ function Get-HostConnections {
 # ── dtssh host process management ────────────────────────────────────────
 
 function Get-RunningHostProc {
-    Get-CimInstance Win32_Process -Filter "Name='dtssh.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match '\bhost\b' } | Select-Object -First 1
+    $aliasPattern = [regex]::Escape($Alias)
+    $portPattern = [regex]::Escape("$Port")
+    $hosts = @(Get-CimInstance Win32_Process -Filter "Name='dtssh.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match '\bhost\b' })
+    $exact = @($hosts |
+        Where-Object {
+            $_.CommandLine -match "(?:^|\s)--alias(?:\s+|=)`"?$aliasPattern(?:`"|\s|$)" -and
+            $_.CommandLine -match "(?:^|\s)--port(?:\s+|=)`"?$portPattern(?:`"|\s|$)"
+        })
+    if ($exact.Count -gt 0) { return $exact | Select-Object -First 1 }
+    if ($hosts.Count -eq 1) { return $hosts[0] }
+    return $null
+}
+
+function Stop-GuardedProcessTree {
+    param([int]$RootPid)
+    if ($RootPid -le 0) { return }
+
+    $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    $byId = @{}
+    $children = @{}
+    foreach ($proc in $processes) { $byId[[int]$proc.ProcessId] = $proc }
+    foreach ($proc in $processes) {
+        $parent = [int]$proc.ParentProcessId
+        $parentProc = $byId[$parent]
+        if ($parentProc -and $proc.CreationDate -lt $parentProc.CreationDate) {
+            continue
+        }
+        if (-not $children.ContainsKey($parent)) { $children[$parent] = @() }
+        $children[$parent] = @($children[$parent]) + $proc
+    }
+
+    $queue = [System.Collections.Generic.Queue[int]]::new()
+    $queue.Enqueue($RootPid)
+    $seen = [System.Collections.Generic.HashSet[int]]::new()
+    $ordered = [System.Collections.Generic.List[int]]::new()
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        if (-not $seen.Add($current)) { continue }
+        $ordered.Add($current)
+        if ($children.ContainsKey($current)) {
+            foreach ($child in $children[$current]) {
+                $queue.Enqueue([int]$child.ProcessId)
+            }
+        }
+    }
+
+    for ($i = $ordered.Count - 1; $i -ge 0; $i--) {
+        $targetPid = $ordered[$i]
+        $expected = $byId[$targetPid]
+        $current = Get-CimInstance Win32_Process -Filter "ProcessId=$targetPid" -ErrorAction SilentlyContinue
+        if (-not $expected -or -not $current -or $current.CreationDate -ne $expected.CreationDate) {
+            continue
+        }
+        Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Clear-OrphanedDtsshProxies {
+    try {
+        $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+        $byId = @{}
+        foreach ($proc in $processes) { $byId[[int]$proc.ProcessId] = $proc }
+
+        $now = Get-Date
+        foreach ($proxy in @($processes | Where-Object {
+            $_.Name -eq 'dtssh.exe' -and $_.CommandLine -match '\bproxy\b'
+        })) {
+            $parent = $byId[[int]$proxy.ParentProcessId]
+            if ($parent -and $parent.CreationDate -le $proxy.CreationDate) {
+                continue
+            }
+            if (($now - $proxy.CreationDate).TotalSeconds -lt $OrphanProxyGraceSec) {
+                continue
+            }
+
+            $current = Get-CimInstance Win32_Process `
+                -Filter "ProcessId=$($proxy.ProcessId)" -ErrorAction SilentlyContinue
+            if (
+                -not $current -or
+                $current.CreationDate -ne $proxy.CreationDate -or
+                $current.ExecutablePath -ne $proxy.ExecutablePath -or
+                $current.CommandLine -notmatch '\bproxy\b'
+            ) {
+                continue
+            }
+
+            Stop-GuardedProcessTree ([int]$proxy.ProcessId)
+            Write-Log "reaped orphaned dtssh proxy process tree (root pid $($proxy.ProcessId))"
+        }
+
+        foreach ($helper in @($processes | Where-Object { $_.Name -eq 'devtunnel.exe' })) {
+            $parent = $byId[[int]$helper.ParentProcessId]
+            if ($parent -and $parent.CreationDate -le $helper.CreationDate) {
+                continue
+            }
+            if (($now - $helper.CreationDate).TotalSeconds -lt $OrphanProxyGraceSec) {
+                continue
+            }
+
+            $current = Get-CimInstance Win32_Process `
+                -Filter "ProcessId=$($helper.ProcessId)" -ErrorAction SilentlyContinue
+            $currentParent = if ($current) {
+                Get-CimInstance Win32_Process `
+                    -Filter "ProcessId=$($current.ParentProcessId)" -ErrorAction SilentlyContinue
+            }
+            if (
+                -not $current -or
+                $current.CreationDate -ne $helper.CreationDate -or
+                $current.ExecutablePath -ne $helper.ExecutablePath -or
+                ($currentParent -and $currentParent.CreationDate -le $current.CreationDate)
+            ) {
+                continue
+            }
+
+            Stop-Process -Id ([int]$helper.ProcessId) -Force -ErrorAction SilentlyContinue
+            Write-Log "reaped orphaned devtunnel helper (pid $($helper.ProcessId))"
+        }
+    } catch {
+        Write-Log "orphaned dtssh process reap failed: $_" 'WARN'
+    }
 }
 
 function Clear-DedicatedSshd {
@@ -294,8 +414,8 @@ function Clear-DedicatedSshd {
         foreach ($spid in @($listeners.OwningProcess | Sort-Object -Unique | Where-Object { $_ })) {
             $sp = Get-Process -Id $spid -ErrorAction SilentlyContinue
             if ($sp -and $sp.Name -eq 'sshd') {
-                Stop-Process -Id $spid -Force -ErrorAction SilentlyContinue
-                Write-Log "reaped orphaned dedicated sshd (pid $spid) on :$Port"
+                Stop-GuardedProcessTree $spid
+                Write-Log "reaped dedicated sshd process tree (root pid $spid) on :$Port"
             }
         }
     } catch { Write-Log "sshd reap failed: $_" 'WARN' }
@@ -539,7 +659,7 @@ if ($NoMonitor) {
 
 # ── Single-instance (named mutex) ────────────────────────────────────────
 
-$mutexName = "Global\DtsshHostLauncher_$Alias"
+$mutexName = "Global\DtsshHostLauncher_$Alias" # marketplace-isolation: allow shared-instance-mutex
 $mutex = $null
 try {
     $created = $false
@@ -590,6 +710,7 @@ try {
         # Check local pressure frequently without querying the remote relay on
         # every pass. Released dtssh builds can leak a connection per completed
         # command, so the slower relay-health cadence cannot protect MaxStartups.
+        Clear-OrphanedDtsshProxies
         $estConns = Get-EstablishedConnCount $Port
 
         # Released dtssh builds can leak one host-side forwarded connection and

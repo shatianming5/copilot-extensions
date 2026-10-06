@@ -8,6 +8,8 @@ Subcommands:
   rm <fleet>            Remove all containers in a fleet (destructive)
   borrow <effort>       Lease a free container to an effort
   release <target>      Release a lease (by container or effort name)
+  stop <name>           Stop a single running container
+  remove <name>         Remove a single (stopped) container
   leases                Show active leases
   exec <name>           Run the ACP launch command through the venue transport
   ssh-stdio <name>      Serve restricted SSH protocol over provider stdio
@@ -30,7 +32,7 @@ from pathlib import Path, PurePosixPath
 
 from agent_procutil import no_window_flags
 
-from . import __version__
+from . import claim_provider_cli, rescue_capture_cli
 from .config import (
     RESTRICTED_PROFILE,
     SECURITY_PROFILE_LABEL,
@@ -40,8 +42,10 @@ from .config import (
     load_config,
 )
 from .resolver import (
+    _append_copilot_args,
     build_restricted_spawn_command,
     host_gh_token,
+    resolve_extra_copilot_args,
     resolve_live_exec_target,
 )
 from .ssh_transport import (
@@ -82,9 +86,9 @@ def main(argv: list[str] | None = None) -> int:
     up_p.add_argument(
         "--recreate",
         action="store_true",
-        help="Recreate restricted members that drifted from the fleet's current "
-        "image/policy (instead of refusing). Removes and re-provisions them on "
-        "the current image; active/unknown/leased members are deferred.",
+        help="Recreate restricted members drifted from the fleet's image/policy, "
+        "or any member whose security_profile no longer matches the fleet's "
+        "config (e.g. restricted->trusted); active/unknown/leased members are deferred.",
     )
     up_p.add_argument(
         "--force-abandon",
@@ -93,29 +97,33 @@ def main(argv: list[str] | None = None) -> int:
         "session-evidence rescue fails. Never overrides active or unknown liveness.",
     )
 
-    for name, helptext in (
-        ("down", "Stop (keep warm) all containers in a fleet"),
-        ("start", "Start all stopped containers in a fleet"),
-        ("rm", "Remove all containers in a fleet (destructive)"),
+    for name, helptext, argname in (
+        ("down", "Stop (keep warm) all containers in a fleet", "fleet"),
+        ("start", "Start all stopped containers in a fleet", "fleet"),
+        ("rm", "Remove all containers in a fleet (destructive)", "fleet"),
+        ("stop", "Stop a single running container", "name"),
+        ("remove", "Remove a single (stopped) container", "name"),
     ):
         p = sub.add_parser(name, help=helptext)
-        p.add_argument("fleet", help="Fleet name")
+        p.add_argument(argname, help="Fleet name" if argname == "fleet" else "Container name")
         if name in {"down", "rm"}:
             p.add_argument("--json", action="store_true", help="Emit operation result JSON")
-        if name in {"down", "rm"}:
             p.add_argument(
                 "--force-abandon",
                 action="store_true",
                 help="Accept unavailable/failed restricted session evidence. "
                 "Never overrides active or unknown liveness.",
             )
-        if name == "rm":
+        if name in {"rm", "remove"}:
             p.add_argument("--force", action="store_true", help="Force removal")
 
+    claim_provider_cli.add_claim_provider_parsers(sub)
+    rescue_capture_cli.add_rescue_capture_parser(sub)
     borrow_p = sub.add_parser("borrow", help="Lease a free container to an effort")
     borrow_p.add_argument("effort", help="Effort name (lease holder)")
     borrow_p.add_argument("--container", help="Borrow a specific container")
     borrow_p.add_argument("--fleet", help="Restrict to a fleet")
+    borrow_p.add_argument("--force", action="store_true", help="Force takeover")
 
     release_p = sub.add_parser("release", help="Release a lease")
     release_p.add_argument("target", help="Container name or effort name")
@@ -133,14 +141,17 @@ def main(argv: list[str] | None = None) -> int:
 
     exec_p = sub.add_parser("exec", help="Run the ACP launch command in a container")
     exec_p.add_argument("name", help="Container name")
-    exec_p.add_argument(
-        "--stdio", action="store_true",
-        help="Attach stdio (ACP transport) instead of a one-shot probe",
-    )
+    exec_p.add_argument("--stdio", action="store_true", help="Attach stdio transport.")
     exec_p.add_argument(
         "--force", action="store_true",
         help="Terminate a live SSH holder and take over this trusted container",
     )
+    exec_p.add_argument("copilot_args", nargs="*", help="Extra copilot args (after --).")
+
+    from .copilot_venue import add_copilot_subparser as _add_copilot_subparser
+    _add_copilot_subparser(sub)
+    from .forward_keeper import add_subparser as _add_forward_keeper_subparser
+    _add_forward_keeper_subparser(sub)
     ssh_stdio_p = sub.add_parser(
         "ssh-stdio",
         help="Serve an SSH-compatible restricted provider target over stdio",
@@ -257,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
     ns_recreate_p.add_argument("name", help="Container name")
     ns_recreate_p.add_argument("--expected-container-id", required=True)
     ns_recreate_p.add_argument("--timeout", type=float, default=600.0)
+    from .workspace import add_workspace_subparsers
+    add_workspace_subparsers(sub)
 
     # --- relay-profile (declarative credential-relay seam for agent-bridge #892 Inc 2)
     sub.add_parser(
@@ -276,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
+        if getattr(args, "func", None) is not None:
+            return args.func(args)
         if args.command == "fleet":
             return _cmd_fleet(args)
         if args.command == "up":
@@ -285,13 +300,28 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "borrow":
             return _cmd_borrow(args)
         if args.command == "release":
-            return _cmd_release(args)
+            from .lifecycle import cmd_release
+            return cmd_release(args.target)
+        if args.command in ("stop", "remove"):
+            from . import lifecycle
+            return (lifecycle.cmd_stop(args.name) if args.command == "stop"
+                    else lifecycle.cmd_remove(args.name, force=args.force))
         if args.command == "leases":
             return _cmd_leases()
         if args.command == "lifecycle-clear":
             return _cmd_lifecycle_clear(args)
         if args.command == "exec":
             return _cmd_exec(args)
+        if args.command == "copilot":
+            from .copilot_venue import cmd_copilot
+
+            return cmd_copilot(
+                args,
+                require_live_relay_port=_require_live_relay_port,
+                relay_healthy=_relay_healthy,
+                busy_exit=_BUSY_EXIT,
+                creation_flags=_creation_flags,
+            )
         if args.command == "ssh-stdio":
             from .provider_ssh import run_ssh_stdio
 
@@ -337,6 +367,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "session-host-cleanup":
             return _cmd_session_host_cleanup(args)
         if args.command == "version":
+            from . import __version__
+
             print(f"agent-containers {__version__}")
             return 0
         if args.command == "installer-readiness":
@@ -360,6 +392,9 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_namespace_ensure_ready(args)
         if args.command == "namespace-recreate":
             return _cmd_namespace_recreate(args)
+        if args.command.startswith("namespace-workspace-"):
+            from .workspace import dispatch_workspace_command
+            return dispatch_workspace_command(args)
         if args.command == "relay-profile":
             return _cmd_relay_profile()
     except RuntimeError as e:
@@ -432,7 +467,7 @@ def _trusted_session_host_context(name: str):
 
 def _cmd_session_host_prepare(args: argparse.Namespace) -> int:
     """Prepare endpoint + auth inputs; agent-bridge owns the Host lifecycle."""
-    from ._invoke import module_argv
+    from ._invoke import payload_command_argv
     from .container_shims import (
         deploy as deploy_shims,
     )
@@ -492,7 +527,7 @@ def _cmd_session_host_prepare(args: argparse.Namespace) -> int:
         "remote_command": remote_command,
         "remote_env": remote_env,
         "reverse_forwards": reverse_forwards,
-        "state_command": [*module_argv(), "session-host-state", args.name],
+        "state_command": [*payload_command_argv(), "session-host-state", args.name],
     }))
     return 0
 
@@ -626,6 +661,7 @@ def _cmd_relay_profile() -> int:
 
 
 def _cmd_fleet(args: argparse.Namespace) -> int:
+    from . import picker
     from .lease import deploy_hold_status, get_lease
     from .lifecycle import inspect_container, list_containers, restricted_policy_errors
     from .rescue import latest_rescue_status
@@ -705,6 +741,7 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
                 },
                 "rescue": latest_rescue_status(c.name),
             })
+            out[-1].update(picker.picker_fields(c.name, out[-1]["lease"]))
         print(json.dumps(out, indent=2, default=str))
         return 0
     if not containers:
@@ -804,42 +841,16 @@ def _cmd_fleet_op(args: argparse.Namespace) -> int:
 
 def _cmd_borrow(args: argparse.Namespace) -> int:
     from .lease import borrow
-
-    config = load_config()
-    lease = borrow(config, args.effort, container=args.container, fleet=args.fleet)
+    try:
+        lease = borrow(load_config(), args.effort, container=args.container,
+                        fleet=args.fleet, force=getattr(args, "force", False))
+    except RuntimeError as exc:
+        if not args.container:  # not a specific-target conflict; bookkeeping
+            raise
+        print(f"[BUSY] {exc} Use --force to take over.", file=sys.stderr)
+        return _BUSY_EXIT
     print(lease.container)
     return 0
-
-
-def _cmd_release(args: argparse.Namespace) -> int:
-    from .lease import ProviderAdmissionError, release
-    from .provider_ssh import remove_stale_worktree_sources
-
-    try:
-        released = release(args.target)
-    except ProviderAdmissionError as exc:
-        print(f"Release blocked: {exc}", file=sys.stderr)
-        return _BUSY_EXIT
-    try:
-        removed = remove_stale_worktree_sources(args.target)
-    except (OSError, RuntimeError) as exc:
-        if released:
-            print(f"Released: {args.target}")
-        print(
-            f"Picker source cleanup failed after release: {exc}",
-            file=sys.stderr,
-        )
-        return 1
-    if released:
-        print(f"Released: {args.target}")
-        if removed:
-            print(f"Removed Picker source registrations: {removed}")
-        return 0
-    if removed:
-        print(f"Removed stale Picker source registrations: {removed}")
-        return 0
-    print(f"No lease found for '{args.target}'", file=sys.stderr)
-    return 1
 
 
 def _cmd_leases() -> int:
@@ -946,18 +957,17 @@ def _relay_healthy(port: int, timeout: float = 0.5) -> bool:
 def _cmd_exec(args: argparse.Namespace) -> int:
     """Transport wrapper: launch a Copilot ACP agent in a container.
 
-    This is what agent-bridge spawns for a ``container:`` agent. It resolves the
-    container's per-fleet settings, fetches the host ``gh`` token at spawn time
-    (so it is never persisted in a SpawnTarget), and selects the transport from
-    the fleet's trust posture.
-
-    Trusted fleets use OpenSSH, with ``docker exec`` only as the SSH
-    ``ProxyCommand`` bootstrap. Restricted fleets retain the direct
-    deny-by-construction ``docker exec`` path and receive no SSH key projection.
-    With ``--stdio`` the wrapper explicitly pumps bytes between its own stdio
-    and the child because inherited pipes are unreliable under
-    ``CREATE_NO_WINDOW`` on Windows.
+    This is what agent-bridge spawns for a ``container:`` agent. It resolves
+    the container's per-fleet settings, fetches the host ``gh`` token at
+    spawn time (never persisted in a SpawnTarget), and selects the transport
+    from the fleet's trust posture: trusted fleets use OpenSSH (``docker
+    exec`` only as the ``ProxyCommand`` bootstrap); restricted fleets retain
+    the direct deny-by-construction ``docker exec`` path with no SSH key
+    projection. With ``--stdio`` the wrapper pumps bytes between its own
+    stdio and the child (inherited pipes are unreliable under
+    ``CREATE_NO_WINDOW`` on Windows).
     """
+    extra = resolve_extra_copilot_args(getattr(args, "copilot_args", None))
     target = resolve_live_exec_target(args.name, config=load_config())
 
     if target.actual_profile == RESTRICTED_PROFILE:
@@ -974,7 +984,7 @@ def _cmd_exec(args: argparse.Namespace) -> int:
                     target.fleet,
                     target.actual_profile,
                     target.user,
-                    target.acp_command,
+                    _append_copilot_args(target.acp_command, extra),
                     container_id=target.container_id,
                 )
         except ProviderAdmissionError as busy:
@@ -997,7 +1007,7 @@ def _cmd_exec(args: argparse.Namespace) -> int:
             target.fleet,
             target.actual_profile,
             target.user,
-            target.acp_command,
+            _append_copilot_args(target.acp_command, extra),
         )
     finally:
         target_lock.release()

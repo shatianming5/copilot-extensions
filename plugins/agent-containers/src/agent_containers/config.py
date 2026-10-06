@@ -23,15 +23,26 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import yaml
 
+from . import _peer_launch
 from .private_state import ensure_private_dir
 
 log = logging.getLogger("agent-containers")
 
+
+def _runtime_home() -> Path:
+    override = os.environ.get("AGENT_CONTAINERS_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    _legacy = ".agent-containers"  # marketplace-isolation: allow legacy compatibility root
+    return Path.home() / _legacy
+
+
 # Canonical runtime paths.
-RUNTIME_DIR = Path.home() / ".agent-containers"
+RUNTIME_DIR = _runtime_home()
 # Windows/WSL installations that share one Docker provider can point only their
 # mutable coordination state at one filesystem-visible directory. Runtime venvs
 # and platform-specific installation artifacts remain under ``RUNTIME_DIR``.
@@ -57,8 +68,10 @@ SECURITY_GID_LABEL = "agent-containers.security-gid"
 SECURITY_IMAGE_ID_LABEL = "agent-containers.security-image-id"
 
 # Default ACP launch command run inside the container. Mirrors the codespaces
-# resolver. ``--allow-all-tools`` is required for headless dispatch.
-DEFAULT_ACP_COMMAND = "copilot --acp --stdio --allow-all-tools"
+# resolver. ``--allow-all`` prevents interactive permission prompts during
+# headless dispatch, and ``--experimental`` is required for any installed SDK
+# extension to load.
+DEFAULT_ACP_COMMAND = "copilot --acp --stdio --allow-all --experimental"
 TRUSTED_PROFILE = "trusted"
 RESTRICTED_PROFILE = "restricted"
 SECURITY_PROFILES = {TRUSTED_PROFILE, RESTRICTED_PROFILE}
@@ -76,6 +89,18 @@ _SENSITIVE_ENV_RE = re.compile(
 
 def is_sensitive_environment_name(name: str) -> bool:
     return bool(_SENSITIVE_ENV_RE.search(name.upper()))
+
+
+def _strict_bool(value: Any, label: str) -> bool:
+    """Parse a YAML value as a real boolean; never coerce a truthy string.
+
+    ``bool("false")`` is ``True`` in Python -- a quoted ``"false"`` or a typo
+    in a fleet's config must be rejected, not silently flip an opt-in
+    privilege/launch-posture switch on.
+    """
+    if isinstance(value, bool):
+        return value
+    raise RuntimeError(f"{label} must be a boolean (true/false), got {value!r}")
 
 
 @dataclass
@@ -215,6 +240,29 @@ class FleetConfig:
     relay_enabled: bool | None = None
     # "clone" (Model A, default) or "mount" (Model B, future).
     code_model: str = "clone"
+    # Trusted, image-backed fleets only (validate_restricted rejects these on
+    # a restricted fleet, or alongside devcontainer_path). Real, host-backed
+    # persistence in place of the image's own ephemeral storage -- see
+    # visions/plugins/agent-containers's full-harness-projection-trusted.
+    # Each is the PARENT directory for the fleet -- `_image_run` mounts a
+    # per-member subdirectory keyed by the member's own container name, so a
+    # size > 1 fleet's members never collide on the same host path.
+    # `host_workspace_path` bind-mounts onto `workspace_folder`;
+    # `host_home_path` bind-mounts onto `home_folder` (both must be set
+    # together for the home mount -- `home_folder` exists because, unlike
+    # restricted fleets, a trusted image-backed fleet's HOME is never
+    # resolved by probing the image, so it must be declared).
+    host_workspace_path: str | None = None
+    host_home_path: str | None = None
+    home_folder: str | None = None
+    # Trusted, image-backed fleets only. Grants exactly the capability/mount
+    # set a containerized `systemd --user` instance needs (CAP_SYS_ADMIN + a
+    # writable /run + an in-container /sys/fs/cgroup remount at launch) so
+    # the venue's own maintenance timers (e.g. a plugin runtime's self-update
+    # sweep) can register and run natively instead of relying on an external
+    # host-side trigger. The IMAGE must itself provide `systemd`/
+    # `systemd-sysv`/`dbus-user-session` -- this only wires the launch.
+    systemd_capable: bool = False
 
     def prefix(self, fleet_name: str) -> str:
         return self.name_prefix or fleet_name
@@ -267,9 +315,38 @@ class FleetConfig:
         return "512m" if self.restricted else None
 
     def validate_restricted(self) -> None:
-        """Reject restricted settings that disable their own resource bounds."""
+        """Validate cross-field invariants; restricted fleets get extra bounds.
+
+        The devcontainer-exclusivity and home-pair checks below apply to
+        EVERY fleet regardless of security_profile -- they catch
+        configuration that would silently no-op or leave a mount half-wired,
+        not just a restricted-containment violation.
+        """
+        if self.devcontainer_path and (
+            self.host_workspace_path or self.host_home_path or self.systemd_capable
+        ):
+            raise RuntimeError(
+                "host_workspace_path/host_home_path/systemd_capable apply only "
+                "to image:-backed fleets -- a devcontainer_path fleet never "
+                "consumes them (reconcile_up() prioritizes devcontainer_path, "
+                "and the devcontainer launch path ignores these fields "
+                "entirely, so the configuration would silently no-op)"
+            )
+        if bool(self.host_home_path) != bool(self.home_folder):
+            raise RuntimeError(
+                "host_home_path and home_folder must be set together "
+                "(an incomplete pair silently falls back to ephemeral home "
+                "storage instead of failing loudly)"
+            )
         if not self.restricted:
             return
+        if self.host_workspace_path or self.host_home_path or self.systemd_capable:
+            raise RuntimeError(
+                "Restricted fleet cannot set host_workspace_path/host_home_path/"
+                "systemd_capable -- these are trusted-only capabilities "
+                "(host bind-mounts and CAP_SYS_ADMIN both defeat the restricted "
+                "containment contract)"
+            )
         if self.effective_cpus() <= 0 or not math.isfinite(self.effective_cpus()):
             raise RuntimeError("Restricted fleet 'cpus' must be a positive finite value")
         if self.effective_pids_limit() <= 0:
@@ -425,7 +502,8 @@ class ContainersConfig:
             if not fleet.acp_command:
                 raise RuntimeError(
                     "Restricted fleet requires an explicit per-fleet "
-                    "'acp_command'; the trusted --allow-all-tools default is disabled"
+                    "'acp_command'; the trusted --allow-all --experimental "
+                    "default is disabled"
                 )
             return self.effective_acp_command(
                 workspace_folder=workspace,
@@ -435,6 +513,19 @@ class ContainersConfig:
             workspace_folder=workspace,
             acp_command=(fleet.acp_command if fleet else None),
         )
+
+
+def _installation_owner() -> dict[str, Any] | None:
+    """Admit an explicit cell before config precedence can bypass peer lookup."""
+    raw = os.environ.get(_peer_launch.CONTEXT_ENV, "")
+    if not raw:
+        return None
+    try:
+        return _peer_launch.validate_owner("agent-containers", RUNTIME_DIR, raw)
+    except (OSError, ValueError, ImportError) as error:
+        raise _peer_launch.ContextRefused(
+            f"Containers installation context refused: {error}"
+        ) from error
 
 
 def _knowledge_overlay_config() -> Path | None:
@@ -448,31 +539,68 @@ def _knowledge_overlay_config() -> Path | None:
     config-READ axis, distinct from where personal state is written -- and returns
     its ``containers.yaml`` when present.
 
-    Purely additive + fail-open: it is consulted only as a **fallback** after the
+    It is consulted only as a **fallback** after the
     explicit env / cwd / machine-local locations miss (so a deliberate machine-local
     ``~/.agent-containers/containers.yaml`` still wins), and a missing binstub /
-    non-stateless / unbound repo / any error yields ``None``. Never raises.
+    non-stateless / unbound repo / any error yields ``None`` in legacy mode.
+    Explicit context admits only the same-cell peer; failed probes raise rather
+    than silently selecting defaults. A genuinely absent optional peer is allowed.
     """
     import json
     import shutil
     import subprocess
 
-    exe = shutil.which("agent-worktrees")
-    if not exe:
-        return None
+    own = _installation_owner()
+    if own is not None:
+        peer = Path(own["cellRoot"]) / "plugins" / "agent-worktrees"
+        if not peer.exists() and not peer.is_symlink():
+            return None
+        prefix = _peer_launch.launch_prefix(
+            "agent-containers", Path(own["pluginRoot"]),
+            os.environ[_peer_launch.CONTEXT_ENV], "agent-worktrees",
+        )
+    else:
+        exe = shutil.which("agent-worktrees")  # marketplace-isolation: allow legacy-compatibility
+        if not exe:
+            return None
+        prefix = [exe]
     try:
         proc = subprocess.run(
-            [exe, "state-root", "--json"],
+            [*prefix, "state-root", "--json"],
             capture_output=True, text=True, timeout=20,
+            **({"encoding": "utf-8", **_peer_launch.no_window_kwargs()} if own else {}),
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as error:
+        if own is not None:
+            raise _peer_launch.ContextRefused(
+                f"Same-cell worktrees config lookup failed: {error}"
+            ) from error
         return None
     if proc.returncode != 0 or not (proc.stdout or "").strip():
+        if own is not None:
+            raise _peer_launch.ContextRefused(
+                proc.stderr.strip() or "Same-cell worktrees config lookup failed"
+            )
         return None
     try:
         data = json.loads(proc.stdout)
-    except ValueError:
+        if not isinstance(data, dict):
+            raise ValueError("state-root response must be an object")
+    except ValueError as error:
+        if own is not None:
+            raise _peer_launch.ContextRefused(
+                f"Invalid same-cell worktrees config response: {error}"
+            ) from error
         return None
+    if own is not None and (
+        not isinstance(data.get("requires_external"), bool)
+        or not isinstance(data.get("bound"), bool)
+        or (data["requires_external"] and not data["bound"])
+        or not isinstance(data.get("state_root"), str)
+        or not Path(data["state_root"]).is_absolute()
+        or not Path(data["state_root"]).is_dir()
+    ):
+        raise _peer_launch.ContextRefused("Same-cell worktrees state root is invalid or unbound")
     if not data.get("requires_external") or not data.get("bound"):
         return None
     root = data.get("state_root")
@@ -484,6 +612,7 @@ def _knowledge_overlay_config() -> Path | None:
 
 def _config_path() -> Path | None:
     """Locate the containers.yaml config file, or None if not found."""
+    _installation_owner()
     env = os.environ.get("AGENT_CONTAINERS_CONFIG")
     if env:
         p = Path(env).expanduser()
@@ -665,6 +794,12 @@ def load_config(*, strict: bool = False) -> ContainersConfig:
                 else None
             ),
             code_model=raw.get("code_model", "clone"),
+            host_workspace_path=raw.get("host_workspace_path"),
+            host_home_path=raw.get("host_home_path"),
+            home_folder=raw.get("home_folder"),
+            systemd_capable=_strict_bool(
+                raw.get("systemd_capable", False), f"Fleet '{name}' systemd_capable"
+            ),
         )
         fleet.validate_restricted()
         config.fleets[name] = fleet

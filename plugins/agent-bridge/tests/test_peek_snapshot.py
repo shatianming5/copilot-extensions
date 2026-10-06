@@ -114,8 +114,66 @@ def test_target_kind_and_name():
     assert tx.codespace_name(cs) == "my-cs"
     assert tx.target_kind({"agent_name": "local-agent", "target_type": "local"}) == "local"
     assert tx.target_kind({"target_type": "command"}) == "local"
+    # A real container session persists target_type: "command" (the generic
+    # provider-driven type) -- only its agent_name prefix distinguishes it.
+    # Without checking that prefix, this fell through to "local" (#2042
+    # follow-up), defeating any non-local-kind gate regardless of what it
+    # checks.
+    assert tx.target_kind({
+        "agent_name": "container:my-container", "target_type": "command",
+    }) == "container"
 
 
 def test_exec_bash_on_target_unsupported_transport():
     with pytest.raises(tx.TargetExecError):
         tx.exec_bash_on_target({"target_type": "ssh"}, "echo hi", timeout=5)
+
+
+def test_cmd_peek_container_target_fails_closed_instead_of_reading_local(
+    monkeypatch,
+):
+    """A container (or any non-local, non-codespace) target must never fall
+    back to reading THIS host's local events.jsonl -- that transcript lives on
+    the remote target, not here. It must fail closed via TargetExecError
+    instead of silently returning a wrong-filesystem snapshot.
+    """
+    import argparse
+
+    from agent_bridge import __main__ as main_mod
+
+    session = {
+        "session_id": "s1",
+        "agent_name": "container:odsp-web-1",
+        # A real container session persists target_type: "command" (the
+        # generic provider-driven type) -- the container/codespace distinction
+        # lives only in the agent_name prefix. Using "command" here (not the
+        # unrealistic "container") is what actually exercises target_kind()'s
+        # prefix check end-to-end.
+        "target_type": "command",
+        "acp_session_id": _ACP,
+    }
+
+    class FakeClient:
+        def get_session(self, _target):
+            return session
+
+        def list_sessions(self):
+            return [session]
+
+    monkeypatch.setattr(main_mod, "_get_client", lambda: FakeClient())
+
+    def _forbidden_snapshot_local(*_args, **_kwargs):
+        raise AssertionError(
+            "snapshot_local must not be used for a non-local target"
+        )
+
+    monkeypatch.setattr(ps, "snapshot_local", _forbidden_snapshot_local)
+
+    args = argparse.Namespace(
+        target="s1", tail=400, recent=8, message_chars=400,
+        timeout=90.0, stale_hours=6.0, json=False,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        main_mod._cmd_peek(args)
+    assert exc_info.value.code == 1

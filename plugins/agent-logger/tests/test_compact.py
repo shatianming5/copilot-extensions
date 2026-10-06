@@ -125,9 +125,9 @@ def test_respects_repo_allowlist(tmp_path: Path, monkeypatch) -> None:
     # pushes the archive store wholesale, so this is a hard leak guard.
     src = tmp_path / "copilot"
     _session(src, "in", updated=NOW - timedelta(days=40), cwd="C:/repo/gone",
-             repository="tmichon_microsoft/dotfiles")
+             repository="owner_user_example/dotfiles")
     _session(src, "out", updated=NOW - timedelta(days=40), cwd="C:/repo/gone",
-             repository="github/copilot-agent-runtime")
+             repository="example-org/example-private-runtime")
     monkeypatch.setattr(compact_mod, "tracked_worktree_paths", lambda: None)
 
     home = tmp_path / "home"
@@ -140,6 +140,41 @@ def test_respects_repo_allowlist(tmp_path: Path, monkeypatch) -> None:
 
     selected, result = select_compactable(cfg, now=NOW)
     assert {r.id for r in selected} == {"in"}
+    assert result.skipped_out_of_scope == 1
+
+
+def test_respects_require_repo_opt_in(tmp_path: Path, monkeypatch) -> None:
+    # A repo-owned opt-in gate must apply to compaction too, not just sync --
+    # push_archives ships the whole archive store to the hub, so a session
+    # compaction should not have selected must never enter that store.
+    src = tmp_path / "copilot"
+    opted_in_repo = tmp_path / "srcroot" / "test-chamber"
+    opted_out_repo = tmp_path / "srcroot" / "dotfiles"
+    opted_in_repo.mkdir(parents=True)
+    opted_out_repo.mkdir(parents=True)
+    (opted_in_repo / ".copilot-extensions" / "agent-logger").mkdir(parents=True)
+    (opted_in_repo / ".copilot-extensions" / "agent-logger" / "config.yaml").write_text(
+        "sync:\n  opt_in: true\n", encoding="utf-8")
+    # dotfiles carries no config at all -> no opinion -> fails closed.
+    _session(src, "opted_in", updated=NOW - timedelta(days=40), cwd=str(opted_in_repo))
+    _session(src, "opted_out", updated=NOW - timedelta(days=40), cwd=str(opted_out_repo))
+    monkeypatch.setattr(compact_mod, "tracked_worktree_paths", lambda: None)
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    cfg = Config({"sync": {
+        "source": str(src),
+        "harness_repos": ["test-chamber", "dotfiles"],
+        "require_repo_opt_in": True,
+        # Real directories back the opt-in check; disable the separate
+        # tracked-worktree gate (on-disk existence would otherwise treat
+        # these real dirs as "tracked" and skip them for an unrelated
+        # reason before the opt-in gate is even exercised).
+        "compact": {"enabled": True, "require_untracked_worktree": False},
+    }}, home)
+
+    selected, result = select_compactable(cfg, now=NOW)
+    assert {r.id for r in selected} == {"opted_in"}
     assert result.skipped_out_of_scope == 1
 
 

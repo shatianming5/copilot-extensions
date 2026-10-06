@@ -3,39 +3,53 @@
 from __future__ import annotations
 
 import argparse
-import io
 import json
+import shutil
+import tempfile
 from pathlib import Path
-import sys
 from types import SimpleNamespace
 
 import pytest
 
 from agent_worktrees import __main__ as m
+from agent_worktrees import front_door_cli as _fdc
+from agent_worktrees import related_cli
+
+# Captured at collection time, before any per-test fixture (including this
+# file's autouse "assume interactive" guard) can monkeypatch the module
+# attribute -- the two predicate tests below exercise this real
+# implementation directly rather than whatever the fixture has substituted.
+_REAL_IS_NONINTERACTIVE_INVOCATION = m._is_noninteractive_invocation
 
 
-@pytest.mark.parametrize(
-    "stdin",
-    [None, io.StringIO(), object(), SimpleNamespace(isatty=True)],
-)
-def test_picker_rejects_noninteractive_stdin(monkeypatch, stdin):
-    from agent_worktrees import picker_tui
-
-    monkeypatch.setattr(sys, "stdin", stdin)
-
-    with pytest.raises(RuntimeError, match="interactive terminal"):
-        picker_tui.run_tui_picker(source=object())
+def _provider_registry_dir(tmp_path: Path) -> Path:
+    return tmp_path / ".agent-worktrees" / "control-plane-providers.d"
 
 
-def test_picker_rejects_closed_stdin(monkeypatch):
-    from agent_worktrees import picker_tui
-
-    stdin = io.StringIO()
-    stdin.close()
-    monkeypatch.setattr(sys, "stdin", stdin)
-
-    with pytest.raises(RuntimeError, match="interactive terminal"):
-        picker_tui.run_tui_picker(source=object())
+def _register_provider(
+    tmp_path: Path,
+    *,
+    provider: str = "worktree-manager",
+    command: list[str] | None = None,
+    minimum_version: str = "0.1.0-dev21",
+) -> tuple[str, ...]:
+    registry = _provider_registry_dir(tmp_path)
+    registry.mkdir(parents=True, exist_ok=True)
+    command = command or [f"/usr/bin/{provider}"]
+    (registry / f"{provider}.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "provider": provider,
+                "description": provider,
+                "command": command,
+                "minimum_version": minimum_version,
+                "provider_root": str(tmp_path / provider),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return tuple(command)
 
 
 def test_extract_project_flag_space():
@@ -191,15 +205,20 @@ def test_extract_project_flag_trailing_value_missing():
     assert rest == []
 
 
-def test_bare_no_project_routes_to_help(monkeypatch, capsys):
+def test_bare_no_project_uses_install_trigger(monkeypatch):
     monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: None)
     monkeypatch.setattr(m.inst, "read_projects_registry", lambda: {"projects": {}})
     monkeypatch.setattr(m, "_git_toplevel", lambda p: None)
+    seen = {}
+    monkeypatch.setattr(
+        m,
+        "cmd_manager_install_trigger",
+        lambda project: seen.__setitem__("project", project) or 0,
+    )
     rc = m.main([])
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "Could not resolve a project" in err
-    assert "register" in err
+    assert rc == 0
+    assert seen == {"project": None}
 
 
 def test_project_requiring_command_no_project_routes_to_help(monkeypatch, capsys):
@@ -226,8 +245,8 @@ def test_related_dispatch_activates_project_context_from_cwd(monkeypatch):
         return [anchor]
 
     monkeypatch.setattr(m, "_resolve_active_project", fake_resolve)
-    monkeypatch.setattr(m, "_related_anchor", lambda _rest: "/repo")
-    monkeypatch.setattr(m, "_related_config_source_anchors", fake_sources)
+    monkeypatch.setattr(related_cli, "_related_anchor", lambda _rest: "/repo")
+    monkeypatch.setattr(related_cli, "_related_config_source_anchors", fake_sources)
 
     try:
         assert m.cmd_related_dispatch(["list", "--json"]) == 0
@@ -238,6 +257,19 @@ def test_related_dispatch_activates_project_context_from_cwd(monkeypatch):
         }
     finally:
         m.cfg.set_active_project(None)
+
+
+def test_related_dispatch_can_require_managed_project(monkeypatch, capsys):
+    m.cfg.set_active_project(None)
+    monkeypatch.setattr(m, "_resolve_active_project", lambda _project: (None, None))
+    monkeypatch.setattr(
+        m,
+        "_related_anchor",
+        lambda _rest: pytest.fail("unmanaged lookup must stop before reading"),
+    )
+
+    assert m.cmd_related_dispatch(["list", "--json", "--require-managed"]) == 1
+    assert "not an adopted agent-worktrees project" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -265,19 +297,18 @@ def test_installer_registry_commands_run_without_project(
     assert len(called) == 1
 
 
-def test_project_flag_bypasses_help(monkeypatch):
+def test_project_flag_bare_invocation_uses_install_trigger_without_manager(monkeypatch):
     monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: None)
     called = {}
-
-    def fake_launch(argv):
-        called["launched"] = True
-        return 0
-
-    # With a project set via flag and no subcommand, should launch, not help.
-    monkeypatch.setattr(m, "cmd_launch", fake_launch)
+    monkeypatch.setattr(
+        m,
+        "cmd_manager_install_trigger",
+        lambda project: called.__setitem__("project", project) or 0,
+    )
     rc = m.main(["--project", "demo"])
     assert rc == 0
-    assert called.get("launched") is True
+    assert called == {"project": "demo"}
     assert m.cfg.active_project() == "demo"
     import os
     # identity is threaded in-process, never round-tripped through the env
@@ -356,19 +387,23 @@ def test_router_worktrees_folds_back_to_launch(monkeypatch):
     """`worktrees` strips + continues (== the bare `<repo> <verb>` alias); it
     must never dispatch to a sibling plugin."""
     monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: None)
     monkeypatch.setattr(
         m, "_route_to_sibling_plugin",
         lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("worktrees must not route to a sibling")),
     )
     called = {}
-    monkeypatch.setattr(m, "cmd_launch",
-                        lambda argv: called.__setitem__("launched", True) or 0)
+    monkeypatch.setattr(
+        m,
+        "cmd_manager_install_trigger",
+        lambda project: called.__setitem__("project", project) or 0,
+    )
     # `--project demo worktrees` strips to a bare launch, exactly like
     # `--project demo` with no subcommand.
     rc = m.main(["--project", "demo", "worktrees"])
     assert rc == 0
-    assert called.get("launched") is True
+    assert called == {"project": "demo"}
 
 
 def test_router_dispatches_codespaces_project_pinned(monkeypatch):
@@ -463,17 +498,21 @@ def test_router_worktree_singular_folds_back(monkeypatch):
     """`<repo> worktree …` (singular) folds back into this binstub, same as
     `worktrees`."""
     monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: None)
     monkeypatch.setattr(
         m, "_route_to_sibling_plugin",
         lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("worktree(s) must not route to a sibling")),
     )
     called = {}
-    monkeypatch.setattr(m, "cmd_launch",
-                        lambda argv: called.__setitem__("launched", True) or 0)
+    monkeypatch.setattr(
+        m,
+        "cmd_manager_install_trigger",
+        lambda project: called.__setitem__("project", project) or 0,
+    )
     rc = m.main(["--project", "demo", "worktree"])
     assert rc == 0
-    assert called.get("launched") is True
+    assert called == {"project": "demo"}
 
 
 def test_router_non_project_slug_omits_project(monkeypatch):
@@ -587,122 +626,45 @@ def test_route_to_sibling_no_project_omits_flag(monkeypatch, tmp_path):
     assert "--project" not in [str(c) for c in captured["cmd"]]
 
 
-def test_profiles_get_emits_self_diagonal(monkeypatch, capfd, tmp_path):
-    """`profiles get --json` emits this host's column incl. the locked self."""
+def test_picker_status_reports_manager_availability(monkeypatch, capsys):
+    """`picker status` reports whether the standalone Worktree Manager owns the
+    picker seam now that the bundled copy is gone."""
     import argparse
 
-    from agent_worktrees import config as cfg
-
-    cfg_path = tmp_path / "config.yaml"
-    monkeypatch.setattr(cfg, "default_config_path", lambda: cfg_path)
-    monkeypatch.setattr(m, "_profiles_host", lambda: ("Anomalous-Potato", "Win"))
-
-    rc = m.cmd_profiles(argparse.Namespace(profiles_action="get", json=True))
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: ("/usr/bin/worktree-manager",))
+    rc = m.cmd_picker(argparse.Namespace(picker_action="status", json=True))
     assert rc == 0
-    out = capfd.readouterr().out
-    assert '"machine": "Anomalous-Potato"' in out
-    assert '"kind": "agent"' in out
 
-
-def test_profiles_apply_writes_and_normalizes(monkeypatch, capfd, tmp_path):
-    """`profiles apply --set` persists the column with self forced in."""
-    import argparse
-    import json as _json
-
-    from agent_worktrees import config as cfg
-    from agent_worktrees import profiles as profiles_mod
-
-    cfg_path = tmp_path / "config.yaml"
-    monkeypatch.setattr(cfg, "default_config_path", lambda: cfg_path)
-    monkeypatch.setattr(m, "_profiles_host", lambda: ("Anomalous-Potato", "Win"))
-
-    rc = m.cmd_profiles(argparse.Namespace(
-        profiles_action="apply", json=True, no_mirror=True,
-        set=_json.dumps([{"machine": "Emancipation-Cube", "env": "Win", "kind": "shell"}]),
-    ))
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: None)
+    rc = m.cmd_picker(argparse.Namespace(picker_action="status", json=True))
     assert rc == 0
-    capfd.readouterr()
-    loaded = profiles_mod.load_selection(cfg_path)
-    assert profiles_mod.TargetSel("Anomalous-Potato", "Win", "agent") in loaded
-    assert profiles_mod.TargetSel("Emancipation-Cube", "Win", "shell") in loaded
+    rc = m.cmd_picker(argparse.Namespace(picker_action="status", json=False))
+    assert rc == 0
+    assert "install trigger" in capsys.readouterr().out
 
 
-def test_profiles_apply_rejects_bad_json(monkeypatch, tmp_path):
+def test_picker_mock_delegates_to_manager(monkeypatch):
+    """`picker mock` is now a Worktree Manager passthrough."""
     import argparse
 
-    from agent_worktrees import config as cfg
-
-    cfg_path = tmp_path / "config.yaml"
-    monkeypatch.setattr(cfg, "default_config_path", lambda: cfg_path)
-    monkeypatch.setattr(m, "_profiles_host", lambda: ("Anomalous-Potato", "Win"))
-
-    rc = m.cmd_profiles(argparse.Namespace(
-        profiles_action="apply", json=True, no_mirror=True, set="{not json"))
-    assert rc == 2
-
-
-def test_picker_enable_disable_persists(monkeypatch, tmp_path):
-    """`picker enable/disable` writes new_picker into the global config and
-    preserves other keys."""
-    import argparse
-
-    import yaml
-
-    from agent_worktrees import config as cfg
-
-    gpath = tmp_path / "global.yaml"
-    gpath.write_text("machine: anomalous-potato\nplatform: windows\n", encoding="utf-8")
-    monkeypatch.setattr(cfg, "global_config_path", lambda: gpath)
-
-    assert m.cmd_picker(argparse.Namespace(picker_action="enable", json=False)) == 0
-    data = yaml.safe_load(gpath.read_text(encoding="utf-8"))
-    assert data["new_picker"] is True
-    assert data["machine"] == "anomalous-potato"   # other keys preserved
-
-    assert m.cmd_picker(argparse.Namespace(picker_action="disable", json=False)) == 0
-    assert yaml.safe_load(gpath.read_text(encoding="utf-8"))["new_picker"] is False
-
-
-def test_picker_mock_launches_in_mock_mode(monkeypatch):
-    """`picker mock` launches the TUI in explicit mock mode (mock_mode=True) and
-    reports the decision without acting on it."""
-    import argparse
-
-    from agent_worktrees import picker_tui
-
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: ("/usr/bin/worktree-manager",))
+    monkeypatch.setattr(m.cfg, "active_project", lambda: "demo")
     seen = {}
-
-    def _fake_run(live=False, mock_mode=None):
-        seen["live"] = live
-        seen["mock_mode"] = mock_mode
-        return {"action": "cancel"}
-
-    monkeypatch.setattr(picker_tui, "run_tui_picker", _fake_run)
-    monkeypatch.setattr(m, "_in_ssh_session", lambda: False)
+    monkeypatch.setattr(
+        m,
+        "_exec_worktree_manager",
+        lambda mgr, project, *, subcommand=None: seen.update(
+            mgr=mgr, project=project, subcommand=subcommand
+        ) or 0,
+    )
 
     rc = m.cmd_picker(argparse.Namespace(picker_action="mock", json=True))
     assert rc == 0
-    assert seen["mock_mode"] is True
-
-
-def test_new_picker_enabled_precedence(monkeypatch):
-    import types
-
-    from agent_worktrees import picker_tui
-
-    monkeypatch.delenv("AGENT_WORKTREES_NEW_PICKER", raising=False)
-    monkeypatch.delenv("AGENT_WORKTREES_LEGACY_PICKER", raising=False)
-    # Default is on: opt-out (new_picker=False) -> legacy; unset/None -> on.
-    assert picker_tui.new_picker_enabled(types.SimpleNamespace(new_picker=True))
-    assert not picker_tui.new_picker_enabled(types.SimpleNamespace(new_picker=False))
-    assert picker_tui.new_picker_enabled(None)          # default everywhere
-    # A machine opted out still gets the new picker for one invocation via env.
-    monkeypatch.setenv("AGENT_WORKTREES_NEW_PICKER", "1")
-    assert picker_tui.new_picker_enabled(types.SimpleNamespace(new_picker=False))
-    monkeypatch.delenv("AGENT_WORKTREES_NEW_PICKER", raising=False)
-    # Legacy env always wins (rollback switch).
-    monkeypatch.setenv("AGENT_WORKTREES_LEGACY_PICKER", "1")
-    assert not picker_tui.new_picker_enabled(types.SimpleNamespace(new_picker=True))
+    assert seen == {
+        "mgr": ("/usr/bin/worktree-manager",),
+        "project": None,
+        "subcommand": ["picker", "mock", "demo"],
+    }
 
 
 def test_project_flag_sets_active_project_and_ignores_worktree_id(monkeypatch):
@@ -731,6 +693,7 @@ def test_bare_invocation_ignores_inherited_worktree_id(monkeypatch):
     WORKTREE_ID is neither consulted nor deleted (it is simply irrelevant)."""
     import os
     monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: None)
     monkeypatch.setenv("WORKTREE_ID", "keep-me")
     # Context comes from CWD resolution (not the retired $WORKTREE_PROJECT).
     monkeypatch.setattr(m, "_resolve_active_project", lambda proj: ("demo", None))
@@ -757,32 +720,124 @@ def test_reap_sessions_is_project_scoped_not_no_project():
     assert "reap-sessions" not in m._NO_PROJECT_COMMANDS
 
 
-def test_terminal_fragment_is_no_project_command():
-    """terminal-fragment is machine-global: it reads EVERY registered project's
-    config and takes ``--machine``, so it must dispatch WITHOUT a resolvable
-    project. The installer's Deploy-Shortcuts invokes it as
-    ``terminal-fragment --machine <key>`` from a context with no project, so a
-    missing entry here makes fragment generation fail (regression: PR #771)."""
-    assert "terminal-fragment" in m._NO_PROJECT_COMMANDS
+def test_cancel_handoff_is_no_project_command():
+    """cancel-handoff must run from a neutral cwd, like its note-handoff
+    counterpart -- an external caller (context-handoff's abort) may invoke it
+    before any project is adopted/activated in this process."""
+    assert "cancel-handoff" in m._NO_PROJECT_COMMANDS
 
 
-def test_bare_terminal_fragment_without_project_dispatches(monkeypatch, capsys):
-    """`agent-worktrees terminal-fragment --machine <key>` runs even when no
-    project resolves from cwd/env -- it must NOT balk with the project-resolution
-    error the installer's Deploy-Shortcuts would surface as a fragment failure."""
+@pytest.mark.guard
+def test_forks_is_no_project_command():
+    """'forks' manages a machine-global registry (forks.yaml), like its
+    'accounts' sibling -- it must run from a neutral cwd without resolving
+    a project, and must be excluded from project-scoped CLI help."""
+    assert "forks" in m._NO_PROJECT_COMMANDS
+    assert "forks" in m.front_door_cli._PROJECT_IRRELEVANT_COMMANDS
+    assert m._is_no_project_invocation(["forks", "list"])
+    assert m._is_no_project_invocation(["forks", "set", "owner/repo", "--owner", "me"])
+
+
+@pytest.mark.guard
+def test_identifiers_sweep_with_explicit_repo_is_no_project_invocation():
+    """'identifiers sweep --repo NAME' names its own sweep target explicitly
+    and never consults CWD, so it must run from a neutral cwd (e.g. invoked
+    for a different repo entirely) without resolving a project first.
+
+    The bare form (no --repo) still auto-resolves its target from CWD via
+    cfg.active_project(), so 'identifiers' itself is deliberately NOT an
+    unconditional _NO_PROJECT_COMMANDS entry -- only this explicit-target
+    invocation shape is exempted."""
+    assert "identifiers" not in m._NO_PROJECT_COMMANDS
+    assert m._is_no_project_invocation(["identifiers", "sweep", "--repo", "copilot-extensions"])
+    assert not m._is_no_project_invocation(["identifiers", "sweep"])
+
+
+def test_forks_dispatch_runs_from_neutral_cwd_without_resolving_project(
+    monkeypatch, tmp_path, capsys,
+):
+    """Functional (not just membership) proof: 'forks' must actually reach
+    forks_cli.cmd_forks_dispatch via main()'s own routing from a cwd with no
+    adopted project, never touching project resolution on the way there."""
+    m.cfg.set_active_project(None)
     monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
-    monkeypatch.setattr(m, "_git_toplevel", lambda p: None)
-    monkeypatch.setattr(m.inst, "read_projects_registry", lambda: {"projects": {}})
-    # No project context -> cmd_terminal_fragment falls back to current=None and
-    # builds an (empty) fragment from zero collected projects.
-    from agent_worktrees import terminal_fragment as tf
-    monkeypatch.setattr(tf, "collect_local_projects", lambda current_project=None: [])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        m,
+        "_git_toplevel",
+        lambda _path: pytest.fail("forks dispatch tried to resolve project context"),
+    )
+    monkeypatch.setattr(
+        m,
+        "_resolve_active_project",
+        lambda _project: pytest.fail("forks dispatch tried to resolve an active project"),
+    )
 
-    rc = m.main(["terminal-fragment", "--machine", "tmichon-book2"])
-    out = capsys.readouterr()
-    assert rc == 0
-    assert "Could not resolve a project" not in out.err
-    assert '"profiles"' in out.out          # emitted the fragment JSON
+    assert m.main(["forks", "list"]) == 0
+    assert "No forks confirmed yet." in capsys.readouterr().out
+
+
+@pytest.mark.guard
+def test_activity_prune_worker_is_no_project_command():
+    """'activity-prune-worker' is dispatched detached by
+    activity._dispatch_background_prune / the launcher boot-trace writers in
+    response to ANY command at all -- including one run from a cwd with no
+    adopted project. Unlike 'activity-log' (normally invoked from inside an
+    already-resolvable project context), every single invocation risks
+    firing this worker from a neutral cwd, so it must be able to dispatch
+    from one without main() routing it to cmd_help_unrouted first."""
+    assert "activity-prune-worker" in m._NO_PROJECT_COMMANDS
+    assert m._is_no_project_invocation(
+        ["activity-prune-worker", "/tmp/activity.jsonl", "7"]
+    )
+
+
+def test_activity_prune_worker_dispatch_runs_from_neutral_cwd(
+    monkeypatch, tmp_path, capsys,
+):
+    """Functional (not just membership) proof: main() must actually reach
+    activity.cmd_activity_prune_worker from a cwd with no adopted project,
+    never touching project resolution on the way there."""
+    log = tmp_path / "activity.jsonl"
+    old_ts = "2020-01-01T00:00:00+00:00"
+    new_ts = "2099-01-01T00:00:00+00:00"
+    log.write_text(
+        f'{{"ts": "{old_ts}", "event": "x"}}\n'
+        f'{{"ts": "{new_ts}", "event": "x"}}\n'
+    )
+    m.cfg.set_active_project(None)
+    monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        m,
+        "_git_toplevel",
+        lambda _path: pytest.fail(
+            "activity-prune-worker dispatch tried to resolve project context"
+        ),
+    )
+    monkeypatch.setattr(
+        m,
+        "_resolve_active_project",
+        lambda _project: pytest.fail(
+            "activity-prune-worker dispatch tried to resolve an active project"
+        ),
+    )
+
+    assert m.main(["activity-prune-worker", str(log), "7"]) == 0
+
+    kept = log.read_text(encoding="utf-8").strip().splitlines()
+    assert len(kept) == 1 and '"ts": "2099' in kept[0]
+
+
+def test_removed_terminal_profile_commands_not_registered():
+    parser = m.build_parser()
+
+    assert "profiles" not in m._LAZY_DISPATCH_TABLE
+    assert "terminal-fragment" not in m._LAZY_DISPATCH_TABLE
+    assert "profiles" not in m.COMMAND_MAP
+    assert "terminal-fragment" not in m.COMMAND_MAP
+    assert "profiles" not in parser._subparsers._group_actions[0].choices
+    assert "terminal-fragment" not in parser._subparsers._group_actions[0].choices
 
 
 def test_bare_reap_sessions_without_project_balks_not_crashes(monkeypatch, capsys):
@@ -815,6 +870,49 @@ def test_all_project_session_listing_runs_without_project(monkeypatch, capsys):
 
     assert rc == 0
     assert seen["all_projects"] is True
+    assert "Could not resolve a project" not in capsys.readouterr().err
+
+
+def test_session_scoped_get_runs_without_project(monkeypatch, capsys):
+    """Real regression this guards (PR #4570 review round 9): `get <key>
+    --session-id <sid>` resolves its own project via the session binding
+    inside cmd_get() itself -- a bare-resume caller sitting in a neutral/HOME
+    cwd (precisely the situation a session id exists to recover from) must
+    reach that resolution instead of being rejected here first."""
+    monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
+    monkeypatch.setattr(m, "_git_toplevel", lambda p: None)
+    seen = {}
+
+    def _ran(args):
+        seen["key"] = args.key
+        seen["session_id"] = args.session_id
+        return 0
+
+    monkeypatch.setitem(m.COMMAND_MAP, "get", _ran)
+
+    rc = m.main(["get", "worktree-id", "--session-id", "sess-1"])
+
+    assert rc == 0
+    assert seen["key"] == "worktree-id"
+    assert seen["session_id"] == "sess-1"
+    assert "Could not resolve a project" not in capsys.readouterr().err
+
+
+def test_session_tail_runs_without_project(monkeypatch, capsys):
+    monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
+    monkeypatch.setattr(m, "_git_toplevel", lambda p: None)
+    seen = {}
+
+    def _ran(args):
+        seen["session_id"] = args.session_id
+        return 0
+
+    monkeypatch.setitem(m.COMMAND_MAP, "session-tail", _ran)
+
+    rc = m.main(["session-tail", "sess-1", "--json"])
+
+    assert rc == 0
+    assert seen["session_id"] == "sess-1"
     assert "Could not resolve a project" not in capsys.readouterr().err
 
 
@@ -905,6 +1003,111 @@ def test_repos_short_help_flag_shows_usage(monkeypatch, capsys):
     assert "Repo classes:" in capsys.readouterr().out
 
 
+def test_clarify_registration_account_expands_home_relative_path(monkeypatch):
+    """The operator's interactive account choice must still get pinned when
+    the registration path is home-relative (e.g. '~/src/repo' from
+    'repos add') -- Path('~/src/repo').is_dir() is always False, so the raw
+    string must be expanduser()'d before reaching pin_git_credential."""
+    from agent_worktrees import git_ops, repos
+
+    monkeypatch.setattr(
+        repos, "resolve_registration_account",
+        lambda remote, explicit: repos.AccountResolution(
+            owner="github", login="github", source="owner-fallback",
+            authenticated=False, needs_clarify=True,
+        ),
+    )
+    monkeypatch.setattr(git_ops, "list_gh_accounts", lambda: ["acct-a"])
+    monkeypatch.setattr(m.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "acct-a")
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(
+        git_ops, "pin_git_credential",
+        lambda path, login, host="github.com": captured.update(path=path, login=login),
+    )
+
+    m._clarify_registration_account(
+        "https://github.com/github/proj.git", "proj", "", "~/src/proj",
+    )
+
+    assert captured["login"] == "acct-a"
+    assert captured["path"] != "~/src/proj"
+    assert not captured["path"].startswith("~")
+
+
+def test_repos_pin_credentials_json_output(monkeypatch, capfd):
+    from agent_worktrees import repos
+
+    captured = {}
+
+    def fake_backfill(name=None, *, plat=None):
+        captured["name"] = name
+        return [
+            repos.CredentialPinResult("proj-a", "pinned", "acct", "pinned to acct"),
+        ]
+
+    monkeypatch.setattr(repos, "backfill_credential_pins", fake_backfill)
+    rc = m.cmd_repos_dispatch(["pin-credentials", "--json"])
+    assert rc == 0
+    assert captured["name"] is None  # no name given -> sweep every repo
+    payload = json.loads(capfd.readouterr().out)
+    assert payload["results"] == [
+        {"name": "proj-a", "status": "pinned", "login": "acct", "detail": "pinned to acct"},
+    ]
+
+
+def test_repos_pin_credentials_restricts_to_named_repo(monkeypatch):
+    from agent_worktrees import repos
+
+    captured = {}
+
+    def fake_backfill(name=None, *, plat=None):
+        captured["name"] = name
+        return [repos.CredentialPinResult("proj-a", "pinned", "acct", "pinned to acct")]
+
+    monkeypatch.setattr(repos, "backfill_credential_pins", fake_backfill)
+    rc = m.cmd_repos_dispatch(["pin-credentials", "proj-a"])
+    assert rc == 0
+    assert captured["name"] == "proj-a"
+
+
+def test_repos_pin_credentials_exit_status_reflects_needs_clarify(monkeypatch):
+    """A needs_clarify result is a real actionable outcome, not a hard
+    error -- but the command must still surface it via a nonzero exit so
+    callers/CI can gate on it."""
+    from agent_worktrees import repos
+
+    monkeypatch.setattr(
+        repos, "backfill_credential_pins",
+        lambda name=None, *, plat=None: [
+            repos.CredentialPinResult(
+                "org-owned", "needs_clarify", None,
+                "owner 'github' has no resolvable account -- "
+                "run: repos account set github <login>",
+            ),
+        ],
+    )
+    rc = m.cmd_repos_dispatch(["pin-credentials"])
+    assert rc == 1
+
+
+def test_repos_pin_credentials_exit_status_ok_for_skip_reasons(monkeypatch):
+    """no_path / not_github / ssh_remote are informational skips, not
+    failures -- they must not force a nonzero exit."""
+    from agent_worktrees import repos
+
+    monkeypatch.setattr(
+        repos, "backfill_credential_pins",
+        lambda name=None, *, plat=None: [
+            repos.CredentialPinResult("a", "no_path", None, "no local checkout"),
+            repos.CredentialPinResult("b", "not_github", None, "non-GitHub remote"),
+            repos.CredentialPinResult("c", "ssh_remote", None, "SSH remote"),
+        ],
+    )
+    rc = m.cmd_repos_dispatch(["pin-credentials"])
+    assert rc == 0
+
+
 # ── worktree namespace ────────────────────────────────────────────────
 
 
@@ -985,20 +1188,116 @@ def test_bare_headless_project_lists_not_launches(monkeypatch):
     assert dispatched["v"] == ["list"]
 
 
-def test_bare_non_headless_project_launches(monkeypatch):
+def test_bare_non_headless_project_uses_install_trigger_without_manager(monkeypatch):
+    monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: None)
+    monkeypatch.setattr(m, "_resolve_active_project", lambda proj: ("demo", None))
+    monkeypatch.setattr(m, "_is_headless_project", lambda: False)
+    launched = {}
+    monkeypatch.setattr(
+        m,
+        "cmd_manager_install_trigger",
+        lambda project: launched.__setitem__("project", project) or 0,
+    )
+    rc = m.main([])
+    assert rc == 0
+    assert launched == {"project": "demo"}
+
+
+# ── non-interactive bare invocation must never open the Manager/Picker
+# (copilot-extensions#2670: a bare invocation with no attached terminal left
+# a resident agent_worktrees/worktree_manager process pair running for hours,
+# discoverable only via a process census) ─────────────────────────────────
+
+
+def test_bare_noninteractive_project_lists_not_launches(monkeypatch):
+    """A bare invocation with no attached terminal must never exec the
+    Manager or the bundled Picker, headless config or not."""
     monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
     monkeypatch.setattr(m, "_resolve_active_project", lambda proj: ("demo", None))
     monkeypatch.setattr(m, "_is_headless_project", lambda: False)
-    launched = {"v": False}
+    monkeypatch.setattr(m, "_is_noninteractive_invocation", lambda: True)
+    monkeypatch.setattr(m.cfg, "project_name", lambda: "demo")
+    monkeypatch.setattr(
+        m, "_exec_worktree_manager",
+        lambda mgr, project: pytest.fail("non-interactive must not exec Manager"),
+    )
+    monkeypatch.setattr(
+        m, "cmd_launch",
+        lambda argv: pytest.fail("non-interactive must not launch bundled Picker"),
+    )
+    monkeypatch.setattr(
+        m, "_usable_worktree_manager", lambda: ("/usr/bin/worktree-manager",),
+    )
 
-    def fake_launch(argv):
-        launched["v"] = True
+    dispatched = {"v": None}
+
+    def fake_dispatch(argv):
+        dispatched["v"] = argv
         return 0
 
-    monkeypatch.setattr(m, "cmd_launch", fake_launch)
+    monkeypatch.setattr(m, "cmd_worktree_dispatch", fake_dispatch)
     rc = m.main([])
     assert rc == 0
-    assert launched["v"] is True
+    assert dispatched["v"] == ["list"]
+
+
+def test_bare_noninteractive_no_project_shows_help(monkeypatch):
+    """A bare invocation with no attached terminal and no resolvable project
+    falls back to the safe help path, never the Manager."""
+    monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
+    monkeypatch.setattr(m, "_resolve_active_project", lambda proj: (None, None))
+    monkeypatch.setattr(m.cfg, "active_project", lambda: None)
+    monkeypatch.setattr(m, "_is_noninteractive_invocation", lambda: True)
+    monkeypatch.setattr(
+        m, "_usable_worktree_manager", lambda: ("/usr/bin/worktree-manager",),
+    )
+    monkeypatch.setattr(
+        m, "_exec_worktree_manager",
+        lambda mgr, project: pytest.fail("non-interactive must not exec Manager"),
+    )
+
+    helped = {"v": False}
+    monkeypatch.setattr(
+        m, "cmd_help_unrouted", lambda: helped.__setitem__("v", True) or 0,
+    )
+    rc = m.main([])
+    assert rc == 0
+    assert helped["v"] is True
+
+
+def test_is_noninteractive_invocation_reflects_stdin_isatty(monkeypatch):
+    """Direct unit coverage of the guard's own predicate, independent of the
+    dispatch tests above (which stub it out) and of this file's autouse
+    fixture (which also stubs it out for every other test).
+
+    Replaces the ``sys.stdin`` module attribute wholesale rather than
+    mutating the real stdin object's own ``isatty`` method in place: the
+    latter was found to leak a broken/stuck stdin across unrelated later
+    tests that spawn real subprocesses inheriting the process's actual
+    stdin handle (a hang in ``test_installer_binstub.py``, confirmed absent
+    on the pre-change baseline via ``git stash``).
+    """
+    import sys as _sys
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(_sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    assert _REAL_IS_NONINTERACTIVE_INVOCATION() is False
+    monkeypatch.setattr(_sys, "stdin", SimpleNamespace(isatty=lambda: False))
+    assert _REAL_IS_NONINTERACTIVE_INVOCATION() is True
+
+
+def test_is_noninteractive_invocation_degrades_to_interactive_on_error(monkeypatch):
+    """Any error resolving isatty() is treated as interactive (fail toward
+    prior behavior), matching this module's other degrade-safe checks."""
+    import sys as _sys
+    from types import SimpleNamespace
+
+    def _boom():
+        raise OSError("no stdin")
+
+    monkeypatch.setattr(_sys, "stdin", SimpleNamespace(isatty=_boom))
+    assert _REAL_IS_NONINTERACTIVE_INVOCATION() is False
 
 
 # ── the binstub seam (Phase 6 / DQ7 / DQ8) ────────────────────────────
@@ -1010,8 +1309,8 @@ def test_bare_prefers_manager_after_production_ux_transplant(monkeypatch):
     monkeypatch.setattr(m, "_resolve_active_project", lambda proj: ("demo", None))
     monkeypatch.setattr(m, "_is_headless_project", lambda: False)
     monkeypatch.setattr(m.cfg, "active_project", lambda: "demo")
-    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: "/usr/bin/worktree-manager")
-    monkeypatch.setattr(m, "_bundled_picker_available", lambda: True)
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: ("/usr/bin/worktree-manager",))
+    monkeypatch.setattr(m, "_bundled_picker_available", lambda: False)
 
     monkeypatch.setattr(
         m,
@@ -1029,7 +1328,7 @@ def test_bare_prefers_manager_after_production_ux_transplant(monkeypatch):
     monkeypatch.setattr(m, "_exec_worktree_manager", fake_exec)
     rc = m.main([])
     assert rc == 0
-    assert seam == {"mgr": "/usr/bin/worktree-manager", "project": "demo"}
+    assert seam == {"mgr": ("/usr/bin/worktree-manager",), "project": "demo"}
 
 
 def test_manager_handoff_binds_exact_engine_runtime(monkeypatch):
@@ -1040,18 +1339,23 @@ def test_manager_handoff_binds_exact_engine_runtime(monkeypatch):
         def wait(self, timeout=None):
             return 0
 
-    def fake_popen(argv, **kwargs):
+        def kill(self):
+            pass
+
+    def fake_spawn(argv, **kwargs):
         seen["argv"] = argv
         seen["env"] = kwargs["env"]
-        return _Proc()
+        return _Proc(), None
 
     monkeypatch.setattr(m.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(m.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        "agent_procutil.spawn_sync_in_kill_on_close_job", fake_spawn
+    )
     monkeypatch.setattr(m.sys, "executable", r"C:\runtime\python.exe")
 
     with pytest.raises(SystemExit) as exc:
         m._exec_worktree_manager(
-            r"C:\manager\worktree-manager.cmd", "demo"
+            (r"C:\manager\worktree-manager.cmd",), "demo"
         )
     assert exc.value.code == 0
     assert seen["argv"] == [
@@ -1062,23 +1366,74 @@ def test_manager_handoff_binds_exact_engine_runtime(monkeypatch):
     ) == [r"C:\runtime\python.exe", "-m", "agent_worktrees"]
 
 
-def test_bare_falls_back_to_picker_without_manager(monkeypatch):
-    """No Manager on PATH → the bundled Picker is the fallback while it ships."""
-    monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
-    monkeypatch.setattr(m, "_resolve_active_project", lambda proj: ("demo", None))
-    monkeypatch.setattr(m, "_is_headless_project", lambda: False)
-    monkeypatch.setattr(m, "_worktree_manager_path", lambda: None)
-    monkeypatch.setattr(m, "_bundled_picker_available", lambda: True)
+def test_exec_worktree_manager_closes_job_on_windows_clean_exit(monkeypatch):
+    """picker-performance-and-responsiveness follow-up: a plain
+    ``subprocess.Popen`` on Windows left the whole Worktree Manager launch
+    chain (a ``.cmd`` shim -> ``uv run`` -> venv interpreter -> the real
+    module, sometimes re-exec'd through yet another interpreter) parentless
+    and running forever if THIS process was torn down abruptly -- nothing
+    ever watched that descendant tree or signaled it to exit. Containing the
+    launch in a Windows kill-on-close Job Object (the same primitive
+    ``agent_machines.fleet_update`` already uses for this exact failure
+    class) fixes it: the OS kills everything still in the job the moment
+    this process's own handle to it closes, for ANY reason, clean or not.
 
-    launched = {"v": False}
-    monkeypatch.setattr(m, "cmd_launch", lambda argv: launched.__setitem__("v", True) or 0)
-    monkeypatch.setattr(m, "_exec_worktree_manager",
-                        lambda mgr, project: pytest.fail("should not exec manager"))
-    monkeypatch.setattr(m, "cmd_manager_install_trigger",
-                        lambda project: pytest.fail("picker present: no install trigger"))
-    rc = m.main([])
-    assert rc == 0
-    assert launched["v"] is True
+    This test proves the containment call happens and its handle is closed
+    once the child exits cleanly -- not just that some process got spawned."""
+    calls = {"closed": False}
+
+    class _Proc:
+        def wait(self, timeout=None):
+            return 0
+
+    class _FakeJobHandle:
+        def close(self):
+            calls["closed"] = True
+
+    def fake_spawn(argv, **kwargs):
+        return _Proc(), _FakeJobHandle()
+
+    monkeypatch.setattr(m.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(
+        "agent_procutil.spawn_sync_in_kill_on_close_job", fake_spawn
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        m._exec_worktree_manager(("worktree-manager",), None)
+    assert exc.value.code == 0
+    assert calls["closed"] is True, (
+        "the job handle must be closed once the direct child exits, so any "
+        "descendant that never broke away from the job (one that failed to "
+        "clean itself up) is reaped immediately rather than left orphaned"
+    )
+
+
+def test_exec_worktree_manager_falls_back_to_kill_without_a_job(monkeypatch):
+    """If Job creation/assignment itself failed, ``spawn_sync_in_kill_on_close_job``
+    already documents returning ``job_handle=None`` so the caller's own
+    cleanup path stays in charge -- this is that fallback path: a direct
+    ``proc.kill()``, not a silent no-op."""
+    calls = {"killed": False}
+
+    class _Proc:
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            calls["killed"] = True
+
+    def fake_spawn(argv, **kwargs):
+        return _Proc(), None
+
+    monkeypatch.setattr(m.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(
+        "agent_procutil.spawn_sync_in_kill_on_close_job", fake_spawn
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        m._exec_worktree_manager(("worktree-manager",), None)
+    assert exc.value.code == 0
+    assert calls["killed"] is True
 
 
 def test_bare_shows_install_trigger_when_picker_retired(monkeypatch):
@@ -1088,7 +1443,7 @@ def test_bare_shows_install_trigger_when_picker_retired(monkeypatch):
     monkeypatch.setattr(m, "_resolve_active_project", lambda proj: ("demo", None))
     monkeypatch.setattr(m, "_is_headless_project", lambda: False)
     monkeypatch.setattr(m.cfg, "active_project", lambda: "demo")
-    monkeypatch.setattr(m, "_worktree_manager_path", lambda: None)
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: None)
     monkeypatch.setattr(m, "_bundled_picker_available", lambda: False)
     monkeypatch.setattr(m, "cmd_launch",
                         lambda argv: pytest.fail("picker retired: must not launch"))
@@ -1107,7 +1462,7 @@ def test_bare_no_project_prefers_manager_without_project_flag(monkeypatch):
     monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
     monkeypatch.setattr(m, "_resolve_active_project", lambda proj: (None, None))
     monkeypatch.setattr(m.cfg, "active_project", lambda: None)
-    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: "/usr/bin/worktree-manager")
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: ("/usr/bin/worktree-manager",))
 
     seam = {"mgr": None, "project": "unset"}
     monkeypatch.setattr(
@@ -1117,7 +1472,7 @@ def test_bare_no_project_prefers_manager_without_project_flag(monkeypatch):
                         lambda **k: pytest.fail("should not balk when manager present"))
     rc = m.main([])
     assert rc == 0
-    assert seam == {"mgr": "/usr/bin/worktree-manager", "project": None}
+    assert seam == {"mgr": ("/usr/bin/worktree-manager",), "project": None}
 
 
 def test_bare_no_project_install_trigger_when_picker_retired(monkeypatch):
@@ -1126,7 +1481,7 @@ def test_bare_no_project_install_trigger_when_picker_retired(monkeypatch):
     monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
     monkeypatch.setattr(m, "_resolve_active_project", lambda proj: (None, None))
     monkeypatch.setattr(m.cfg, "active_project", lambda: None)
-    monkeypatch.setattr(m, "_worktree_manager_path", lambda: None)
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: None)
     monkeypatch.setattr(m, "_bundled_picker_available", lambda: False)
     monkeypatch.setattr(m, "cmd_help_unrouted",
                         lambda **k: pytest.fail("picker retired: show install trigger"))
@@ -1138,28 +1493,37 @@ def test_bare_no_project_install_trigger_when_picker_retired(monkeypatch):
     assert trig["project"] is None
 
 
-def test_install_trigger_shows_source_and_platform_command(monkeypatch, capsys):
-    """The install trigger prints the verifiable source URL and the correct
-    per-platform install command, and never auto-runs anything."""
+def test_install_trigger_reads_as_first_run_onboarding(monkeypatch, capsys):
+    """The absent-Manager install trigger is a calm first-run onboarding
+    message: trustworthy source, explicit bootstrap command, and all output on
+    stderr."""
     monkeypatch.setattr(m.platform, "system", lambda: "Linux")
     rc = m.cmd_manager_install_trigger("demo")
-    err = capsys.readouterr().err
+    captured = capsys.readouterr()
+    err = captured.err
     assert rc == 0
+    assert captured.out == ""
+    assert "interactive mode needs Worktree Manager" in err
+    assert "On a first run that's expected" in err
+    assert "update or repair" in err
     assert m._WORKTREE_MANAGER_REPO_URL in err
+    assert "Bootstrap / update Worktree Manager:" in err
     assert "bootstrap.sh" in err and "curl -fsSL" in err
     assert "bootstrap.ps1" not in err  # posix must not show the Windows one-liner
 
     monkeypatch.setattr(m.platform, "system", lambda: "Windows")
     rc = m.cmd_manager_install_trigger("demo")
-    err = capsys.readouterr().err
+    captured = capsys.readouterr()
+    err = captured.err
     assert rc == 0
+    assert captured.out == ""
     assert "bootstrap.ps1" in err and "irm " in err
     assert "bootstrap.sh" not in err
 
 
 def test_bundled_picker_available_detects_package():
-    """While picker_tui ships, the fallback resolves to the bundled Picker."""
-    assert m._bundled_picker_available() is True
+    """Phase 6: the bundled picker package is gone."""
+    assert m._bundled_picker_available() is False
 
 
 # ── _usable_worktree_manager health gate (DQ8: never dead-end bare launch) ────
@@ -1177,44 +1541,49 @@ def _fake_run(returncode, version="0.1.0-dev21"):
     return run
 
 
-def test_usable_manager_returns_path_when_healthy(monkeypatch):
+def test_usable_manager_returns_registered_command_when_healthy(monkeypatch, tmp_path):
     """A Manager that answers `--version` with exit 0 is preferred."""
-    monkeypatch.setattr(m, "_worktree_manager_path", lambda: "/usr/bin/worktree-manager")
+    command = _register_provider(tmp_path)
+    monkeypatch.setenv(m._CONTROL_PLANE_PROVIDERS_DIR_ENV, str(_provider_registry_dir(tmp_path)))
     monkeypatch.setattr(m.subprocess, "run", _fake_run(0))
-    assert m._usable_worktree_manager() == "/usr/bin/worktree-manager"
+    assert m._usable_worktree_manager() == command
 
 
-def test_usable_manager_none_when_absent(monkeypatch):
-    """No binstub on PATH → None, without probing."""
-    monkeypatch.setattr(m, "_worktree_manager_path", lambda: None)
+def test_usable_manager_none_when_unregistered(monkeypatch, tmp_path):
+    """No registered provider → None, without probing."""
+    monkeypatch.setenv(m._CONTROL_PLANE_PROVIDERS_DIR_ENV, str(_provider_registry_dir(tmp_path)))
     monkeypatch.setattr(m.subprocess, "run",
                         lambda *a, **k: pytest.fail("must not probe an absent manager"))
     assert m._usable_worktree_manager() is None
 
 
-def test_usable_manager_rejects_broken_binstub(monkeypatch):
+def test_usable_manager_rejects_broken_binstub(monkeypatch, tmp_path):
     """A stale/broken binstub (non-zero `--version`) is treated as absent so the
     seam can fall back -- the exact book2 failure (a pre-versioned stub that
     demands WORKTREE_PROJECT and errors on every call)."""
-    monkeypatch.setattr(m, "_worktree_manager_path", lambda: "/usr/bin/worktree-manager")
+    _register_provider(tmp_path)
+    monkeypatch.setenv(m._CONTROL_PLANE_PROVIDERS_DIR_ENV, str(_provider_registry_dir(tmp_path)))
     monkeypatch.setattr(m.subprocess, "run", _fake_run(1))
     assert m._usable_worktree_manager() is None
 
 
-def test_usable_manager_rejects_pre_transplant_version(monkeypatch):
-    monkeypatch.setattr(m, "_worktree_manager_path", lambda: "/usr/bin/worktree-manager")
+def test_usable_manager_rejects_pre_transplant_version(monkeypatch, tmp_path):
+    _register_provider(tmp_path)
+    monkeypatch.setenv(m._CONTROL_PLANE_PROVIDERS_DIR_ENV, str(_provider_registry_dir(tmp_path)))
     monkeypatch.setattr(m.subprocess, "run", _fake_run(0, "0.1.0-dev20"))
     assert m._usable_worktree_manager() is None
 
 
-def test_usable_manager_accepts_release_after_transplant(monkeypatch):
-    monkeypatch.setattr(m, "_worktree_manager_path", lambda: "/usr/bin/worktree-manager")
+def test_usable_manager_accepts_release_after_transplant(monkeypatch, tmp_path):
+    command = _register_provider(tmp_path)
+    monkeypatch.setenv(m._CONTROL_PLANE_PROVIDERS_DIR_ENV, str(_provider_registry_dir(tmp_path)))
     monkeypatch.setattr(m.subprocess, "run", _fake_run(0, "0.1.0"))
-    assert m._usable_worktree_manager() == "/usr/bin/worktree-manager"
+    assert m._usable_worktree_manager() == command
 
 
-def test_usable_manager_rejects_unparseable_version(monkeypatch):
-    monkeypatch.setattr(m, "_worktree_manager_path", lambda: "/usr/bin/worktree-manager")
+def test_usable_manager_rejects_unparseable_version(monkeypatch, tmp_path):
+    _register_provider(tmp_path)
+    monkeypatch.setenv(m._CONTROL_PLANE_PROVIDERS_DIR_ENV, str(_provider_registry_dir(tmp_path)))
     monkeypatch.setattr(
         m.subprocess,
         "run",
@@ -1228,9 +1597,10 @@ def test_usable_manager_rejects_unparseable_version(monkeypatch):
     assert m._usable_worktree_manager() is None
 
 
-def test_usable_manager_rejects_unrunnable_binstub(monkeypatch):
+def test_usable_manager_rejects_unrunnable_binstub(monkeypatch, tmp_path):
     """A binstub that cannot even be spawned is treated as absent, not a crash."""
-    monkeypatch.setattr(m, "_worktree_manager_path", lambda: "/usr/bin/worktree-manager")
+    _register_provider(tmp_path)
+    monkeypatch.setenv(m._CONTROL_PLANE_PROVIDERS_DIR_ENV, str(_provider_registry_dir(tmp_path)))
 
     def boom(cmd, **kw):
         raise OSError("cannot exec")
@@ -1239,14 +1609,156 @@ def test_usable_manager_rejects_unrunnable_binstub(monkeypatch):
     assert m._usable_worktree_manager() is None
 
 
-def test_bare_falls_back_to_picker_when_manager_broken(monkeypatch):
+def test_usable_manager_discovers_synthetic_registered_provider(monkeypatch, tmp_path):
+    command = _register_provider(
+        tmp_path, provider="alt-manager", command=["/opt/alt-manager/bin/alt-manager"]
+    )
+    monkeypatch.setenv(m._CONTROL_PLANE_PROVIDERS_DIR_ENV, str(_provider_registry_dir(tmp_path)))
+    monkeypatch.setenv(m._CONTROL_PLANE_PROVIDER_ENV, "alt-manager")
+    monkeypatch.setattr(m.subprocess, "run", _fake_run(0))
+    assert m._usable_worktree_manager() == command
+
+
+def test_usable_manager_ignores_unregistered_path_command(monkeypatch, tmp_path):
+    monkeypatch.setenv(m._CONTROL_PLANE_PROVIDERS_DIR_ENV, str(_provider_registry_dir(tmp_path)))
+    monkeypatch.setattr(m.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        lambda *a, **k: pytest.fail("must not probe an unregistered PATH command"),
+    )
+    assert m._usable_worktree_manager() is None
+
+
+@pytest.mark.guard
+def test_manifest_with_leaked_pytest_tmp_path_command_is_rejected():
+    """copilot-extensions#5122: a test that fails to isolate
+    ``control_plane_providers_dir()`` can overwrite the real registry with its
+    own ``tmp_path``, wedging every project's interactive launch on the
+    machine until someone notices and hand-repairs the JSON file. A manifest
+    whose own file lives in the real, production registry (no pytest-sandbox
+    marker in its path) but whose ``command`` carries one anyway is an
+    unmistakable signature of exactly that -- parsing must reject it (and say
+    why) rather than select a dead path.
+
+    Uses a literal, non-``tmp_path`` ``source_path`` (this suite's own tests
+    otherwise run under a real pytest sandbox, which would make *any*
+    ``source_path`` carry a marker and silently defeat the check it's meant
+    to exercise)."""
+    payload = {
+        "schema_version": 1,
+        "provider": "worktree-manager",
+        "description": "worktree-manager",
+        "command": [
+            r"C:\Users\someone\AppData\Local\Temp\pytest-of-someone\pytest-42"
+            r"\test_foo0\localbin\worktree-manager.cmd"
+        ],
+        "minimum_version": "0.1.0-dev21",
+        "provider_root": "",
+    }
+    with pytest.raises(_fdc._LeakedTestTmpPathManifestError, match="pytest-of-"):
+        _fdc._parse_control_plane_provider_manifest(
+            payload,
+            source_path=r"C:\Users\someone\.agent-worktrees\control-plane-providers.d\worktree-manager.json",
+        )
+
+
+@pytest.mark.guard
+def test_manifest_with_leaked_pytest_tmp_path_provider_root_is_rejected():
+    """Same signature, but only ``provider_root`` (not ``command``) carries
+    the leaked path -- both fields must be checked, not just the one the
+    original incident happened to hit."""
+    payload = {
+        "schema_version": 1,
+        "provider": "worktree-manager",
+        "description": "worktree-manager",
+        "command": ["/usr/bin/worktree-manager"],
+        "minimum_version": "0.1.0-dev21",
+        "provider_root": "/home/someone/.cache/pytest-of-someone/pytest-42/test_foo0/root",
+    }
+    with pytest.raises(_fdc._LeakedTestTmpPathManifestError, match="pytest-of-"):
+        _fdc._parse_control_plane_provider_manifest(
+            payload,
+            source_path="/home/someone/.agent-worktrees/control-plane-providers.d/worktree-manager.json",
+        )
+
+
+@pytest.mark.guard
+def test_manifest_without_leaked_path_is_unaffected():
+    """A normal, legitimate install path must never trip the new guard."""
+    payload = {
+        "schema_version": 1,
+        "provider": "worktree-manager",
+        "description": "worktree-manager",
+        "command": ["/usr/bin/worktree-manager"],
+        "minimum_version": "0.1.0-dev21",
+        "provider_root": "/home/someone/.worktree-manager",
+    }
+    manifest = _fdc._parse_control_plane_provider_manifest(
+        payload,
+        source_path="/home/someone/.agent-worktrees/control-plane-providers.d/worktree-manager.json",
+    )
+    assert manifest.command == ("/usr/bin/worktree-manager",)
+
+
+@pytest.mark.guard
+def test_manifest_inside_a_pytest_sandbox_pointing_at_itself_is_not_leaked(monkeypatch, tmp_path):
+    """The general discovery path, exercised end-to-end: a manifest whose own
+    file AND whose ``command``/``provider_root`` all live under the SAME real
+    pytest ``tmp_path`` (exactly what every other test in this suite does via
+    ``_register_provider``) is a normal, correctly-isolated test fixture --
+    the new guard must never flag it, since ``source_path`` itself carries a
+    pytest-sandbox marker too."""
+    command = _register_provider(tmp_path)
+    monkeypatch.setenv(m._CONTROL_PLANE_PROVIDERS_DIR_ENV, str(_provider_registry_dir(tmp_path)))
+    manifests = _fdc._discover_control_plane_provider_manifests()
+    assert manifests["worktree-manager"].command == command
+
+
+@pytest.mark.guard
+def test_discover_rejects_a_leaked_manifest_end_to_end(monkeypatch, capsys):
+    """Discovery-level repro of the real incident, not just the unit-level
+    parser check above: a manifest FILE living somewhere that does NOT itself
+    carry a pytest-sandbox marker (standing in for the real, production
+    registry -- ``tmp_path`` always carries one, since it is itself rooted
+    under ``pytest-of-<user>/pytest-<n>``, so it can't play that role) but
+    whose ``command`` does is rejected by ``_discover_control_plane_provider_manifests``
+    with a visible warning, and never silently swallowed as a generic parse
+    error that a passing test could mask."""
+    registry = Path(tempfile.mkdtemp(prefix="agent-worktrees-pr-registry-"))
+    try:
+        (registry / "worktree-manager.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "provider": "worktree-manager",
+                    "description": "worktree-manager",
+                    "command": [
+                        str(registry / "pytest-of-someone" / "pytest-42"
+                            / "test_foo0" / "localbin" / "worktree-manager.cmd")
+                    ],
+                    "minimum_version": "0.1.0-dev21",
+                    "provider_root": "",
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv(m._CONTROL_PLANE_PROVIDERS_DIR_ENV, str(registry))
+        manifests = _fdc._discover_control_plane_provider_manifests()
+    finally:
+        shutil.rmtree(registry, ignore_errors=True)
+    assert manifests == {}
+    assert "pytest-of-" in capsys.readouterr().out
+
+
+def test_bare_falls_back_to_picker_when_manager_broken(monkeypatch, tmp_path):
     """End-to-end: a broken Manager on PATH must NOT dead-end bare launch --
     the seam falls back to the bundled Picker (DQ8 invariant)."""
     monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
     monkeypatch.setattr(m, "_resolve_active_project", lambda proj: ("demo", None))
     monkeypatch.setattr(m, "_is_headless_project", lambda: False)
     monkeypatch.setattr(m.cfg, "active_project", lambda: "demo")
-    monkeypatch.setattr(m, "_worktree_manager_path", lambda: "/usr/bin/worktree-manager")
+    _register_provider(tmp_path)
+    monkeypatch.setenv(m._CONTROL_PLANE_PROVIDERS_DIR_ENV, str(_provider_registry_dir(tmp_path)))
     monkeypatch.setattr(m.subprocess, "run", _fake_run(1))  # broken stub
     monkeypatch.setattr(m, "_bundled_picker_available", lambda: True)
     monkeypatch.setattr(m, "_exec_worktree_manager",
@@ -1276,7 +1788,7 @@ def test_update_hands_off_to_usable_manager(monkeypatch, tmp_path):
     settings.write_text("{}")
     monkeypatch.setattr(m, "_INVOCATION_CWD", invocation)
     monkeypatch.delenv(m._UPDATE_CONTEXT_ENV, raising=False)
-    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: "/usr/bin/worktree-manager")
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: ("/usr/bin/worktree-manager",))
     monkeypatch.setattr(m.cfg, "active_project", lambda: "demo")
     seam = {}
 
@@ -1297,7 +1809,7 @@ def test_update_hands_off_to_usable_manager(monkeypatch, tmp_path):
     rc = m.cmd_update(_update_args())
     assert rc == 0
     assert seam == {
-        "mgr": "/usr/bin/worktree-manager",
+        "mgr": ("/usr/bin/worktree-manager",),
         "project": "demo",
         "subcommand": ["update"],
         "update_context": str(invocation),
@@ -1307,7 +1819,7 @@ def test_update_hands_off_to_usable_manager(monkeypatch, tmp_path):
 
 def test_update_threads_flags_through_seam(monkeypatch):
     """Forwardable flags (--force, --skip-modules ...) survive the hand-off."""
-    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: "/usr/bin/worktree-manager")
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: ("/usr/bin/worktree-manager",))
     monkeypatch.setattr(m.cfg, "active_project", lambda: None)
     seam = {}
     monkeypatch.setattr(
@@ -1354,7 +1866,7 @@ def test_bare_headless_ignores_manager(monkeypatch):
     monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
     monkeypatch.setattr(m, "_resolve_active_project", lambda proj: ("ext", None))
     monkeypatch.setattr(m, "_is_headless_project", lambda: True)
-    monkeypatch.setattr(m, "_worktree_manager_path", lambda: "/usr/bin/worktree-manager")
+    monkeypatch.setattr(m, "_usable_worktree_manager", lambda: ("/usr/bin/worktree-manager",))
     monkeypatch.setattr(m, "_exec_worktree_manager",
                         lambda mgr, project: pytest.fail("headless must not exec manager"))
     monkeypatch.setattr(m, "cmd_worktree_dispatch", lambda argv: 0)
@@ -1420,6 +1932,16 @@ def test_claimant_liveness_parser_and_registration():
     assert m._WORKTREE_VERBS.get("claimant-liveness") == "claimant-liveness"
 
 
+def test_session_tail_parser_and_registration():
+    args = m.build_parser().parse_args(["session-tail", "sess-1", "--limit", "4", "--json"])
+    assert args.command == "session-tail"
+    assert args.session_id == "sess-1"
+    assert args.limit == 4
+    assert args.json is True
+    assert m.COMMAND_MAP["session-tail"] is m.cmd_session_tail
+    assert "session-tail" in m._NO_PROJECT_COMMANDS
+
+
 def test_claimant_liveness_json_output(monkeypatch, capfd):
     import argparse
 
@@ -1432,6 +1954,152 @@ def test_claimant_liveness_json_output(monkeypatch, capfd):
     out = _json.loads(capfd.readouterr().out)
     assert out["alive"] is False
     assert out["owner_ref"] == "emancipation-cube/test-chamber/wt-A"
+
+
+def test_codename_lookup_parser_and_registration():
+    args = m.build_parser().parse_args(
+        ["codename-lookup", "sturdy-crate", "--json"])
+    assert args.command == "codename-lookup"
+    assert args.codename == "sturdy-crate"
+    assert args.json is True
+    assert m.COMMAND_MAP["codename-lookup"] is m.cmd_codename_lookup
+    assert m._WORKTREE_VERBS.get("codename-lookup") == "codename-lookup"
+
+
+def test_codename_lookup_json_found(monkeypatch, capfd):
+    import argparse
+    import json as _json
+
+    monkeypatch.setattr(m, "resolve_worktree_id_by_codename",
+                        lambda name: "wt-A" if name == "sturdy-crate" else None)
+    rc = m.cmd_codename_lookup(argparse.Namespace(
+        codename="sturdy-crate", json=True))
+    assert rc == 0
+    out = _json.loads(capfd.readouterr().out)
+    assert out["found"] is True
+    assert out["worktree_id"] == "wt-A"
+    assert out["codename"] == "sturdy-crate"
+
+
+def test_codename_lookup_json_not_found(monkeypatch, capfd):
+    import argparse
+    import json as _json
+
+    monkeypatch.setattr(m, "resolve_worktree_id_by_codename", lambda name: None)
+    rc = m.cmd_codename_lookup(argparse.Namespace(
+        codename="unknown-name", json=True))
+    assert rc == 0
+    out = _json.loads(capfd.readouterr().out)
+    assert out["found"] is False
+    assert out["worktree_id"] is None
+
+
+def test_codename_lookup_plain_mode(monkeypatch, capsys):
+    import argparse
+
+    monkeypatch.setattr(m, "resolve_worktree_id_by_codename", lambda name: "wt-A")
+    rc = m.cmd_codename_lookup(argparse.Namespace(
+        codename="sturdy-crate", json=False))
+    assert rc == 0
+    assert "found -> wt-A" in capsys.readouterr().out
+
+
+class TestResolveCodenameAnywhere:
+    """pr-attribution-codenames Phase 3: local-then-cross-machine resolution
+    shared by ``resolve --codename`` and ``embody --codename``."""
+
+    def test_local_match_returns_id_no_remote_call(self, monkeypatch):
+        monkeypatch.setattr(m, "resolve_worktree_id_by_codename",
+                            lambda name: "wt-local")
+        called = []
+        import agent_worktrees.codename_reverse_lookup as crl
+        monkeypatch.setattr(
+            crl, "resolve_codename_cross_machine_unique",
+            lambda *a, **k: called.append(1),
+        )
+        wt_id, error = m._resolve_codename_anywhere("sturdy-crate")
+        assert wt_id == "wt-local"
+        assert error is None
+        assert called == []
+
+    def test_remote_match_fails_closed_with_machine_name(self, monkeypatch):
+        monkeypatch.setattr(m, "resolve_worktree_id_by_codename", lambda name: None)
+        import agent_worktrees.codename_reverse_lookup as crl
+        monkeypatch.setattr(
+            crl, "resolve_codename_cross_machine_unique",
+            lambda name, **k: crl.RemoteCodenameMatch(
+                machine="borealis", worktree_id="wt-remote"),
+        )
+        wt_id, error = m._resolve_codename_anywhere("sturdy-crate")
+        assert wt_id is None
+        assert "borealis" in error
+        assert "wt-remote" in error
+        assert "not supported" in error
+
+    def test_no_match_anywhere(self, monkeypatch):
+        monkeypatch.setattr(m, "resolve_worktree_id_by_codename", lambda name: None)
+        import agent_worktrees.codename_reverse_lookup as crl
+        monkeypatch.setattr(
+            crl, "resolve_codename_cross_machine_unique", lambda name, **k: None,
+        )
+        wt_id, error = m._resolve_codename_anywhere("nope")
+        assert wt_id is None
+        assert "No worktree found" in error
+
+    def test_ambiguous_collision_surfaced(self, monkeypatch):
+        monkeypatch.setattr(m, "resolve_worktree_id_by_codename", lambda name: None)
+        import agent_worktrees.codename_reverse_lookup as crl
+
+        def _raise(name, **k):
+            raise crl.AmbiguousCodenameError(name, [
+                crl.RemoteCodenameMatch(machine="borealis", worktree_id="wt-1"),
+                crl.RemoteCodenameMatch(machine="ember", worktree_id="wt-2"),
+            ])
+        monkeypatch.setattr(crl, "resolve_codename_cross_machine_unique", _raise)
+        wt_id, error = m._resolve_codename_anywhere("sturdy-crate")
+        assert wt_id is None
+        assert "borealis" in error and "ember" in error
+
+
+def test_embody_codename_remote_fails_closed(monkeypatch, capfd):
+    import argparse
+    import json as _json
+
+    monkeypatch.setattr(m, "_resolve_codename_anywhere", lambda name: (
+        None,
+        "Codename 'sturdy-crate' resolves to worktree 'wt-remote' on "
+        "machine 'borealis', not this machine. Resolve/embody it there "
+        "directly (e.g. SSH to 'borealis') -- remote launch is not supported.",
+    ))
+    rc = m.cmd_embody(argparse.Namespace(
+        codename="sturdy-crate", worktree_id=None, new=False,
+    ))
+    assert rc == 1
+    out = _json.loads(capfd.readouterr().out)
+    assert "borealis" in out["error"]
+    assert "wt-remote" in out["error"]
+
+
+def test_embody_codename_local_match_proceeds_past_selector_gate(monkeypatch, capfd):
+    import argparse
+    import json as _json
+
+    # A local match should NOT hit the "requires --worktree-id/--codename/
+    # --new" gate -- verify raw_id is populated by checking the function
+    # proceeds past it to config.load_config() (mocked to fail with a
+    # distinct marker message) rather than returning the selector-gate error.
+    monkeypatch.setattr(m, "_resolve_codename_anywhere",
+                        lambda name: ("wt-local", None))
+
+    def _raise(*a, **k):
+        raise RuntimeError("stop-here-marker")
+    monkeypatch.setattr(m.cfg, "load_config", _raise)
+    rc = m.cmd_embody(argparse.Namespace(
+        codename="sturdy-crate", worktree_id=None, new=False,
+    ))
+    assert rc == 1
+    out = _json.loads(capfd.readouterr().out)
+    assert out["error"] == "stop-here-marker"
 
 
 def test_pr_research_dispatch_json(monkeypatch, capsys):

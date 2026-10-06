@@ -77,6 +77,42 @@ class TestRunWait:
         assert not res.matched
         assert res.payload["timed_out"] is True
 
+    def test_checks_succeeded_fires_after_baseline_adopts(self):
+        # Symmetric to checks_failed: unknown checks at arm time are adopted
+        # (pending), then a flip to success on a later poll wakes the caller
+        # -- but only under an explicit/`any` until, since it's excluded from
+        # DEFAULT_UNTIL.
+        snap0 = _snap(pr_state="open", checks_state="pending")
+        snap1 = _snap(pr_state="open", checks_state="success")
+        res = self._run([snap0, snap1], until=["any"])
+        assert res.matched
+        assert res.payload["transitions"] == ["checks_succeeded"]
+        assert res.payload["checks_state"] == "success"
+
+    def test_checks_succeeded_fires_again_after_a_rerun(self):
+        # A re-armed wait carrying an already-"success" baseline (e.g. a
+        # --since cursor from a prior poll) must still fire on a FRESH
+        # success that follows an intervening re-run (pending) -- a static
+        # baseline that never observed the "pending" in between would
+        # otherwise suppress this real, new completion forever.
+        snap0 = _snap(pr_state="open", checks_state="pending")
+        snap1 = _snap(pr_state="open", checks_state="success")
+        res = self._run(
+            [snap0, snap1],
+            baseline=pc.Baseline(checks_state="success"),
+            until=["any"],
+        )
+        assert res.matched
+        assert res.payload["transitions"] == ["checks_succeeded"]
+
+    def test_checks_succeeded_not_fired_under_default_until(self):
+        # DEFAULT_UNTIL excludes checks_succeeded -- CI alone going green
+        # isn't actionable when a real review may still be expected.
+        snap0 = _snap(pr_state="open", checks_state="success")
+        res = self._run([snap0], timeout=0.5)
+        assert not res.matched
+        assert res.payload["timed_out"] is True
+
     def test_auto_baseline_open_does_not_fire_on_existing_review(self):
         # A pre-existing approval at arm time must NOT fire under auto-baseline;
         # the second poll (a NEW approval) should.
@@ -182,15 +218,18 @@ class TestDecorateEvents:
             "transitions": ["approved"], "pr_state": "open", "merged": False,
             "mergeable": True, "head_sha": "abc", "base_ref": "master",
             "checks_state": "",
-            "cursor": "r3",
+            "cursor": "r3..habc",
             # Additive merge-readiness block. No consent label bound here, so it
             # degrades to a verdict/merge-state readout with no action to take.
             "merge": {
-                "verdict": "APPROVED", "merge_state": "clean", "conflict": False,
+                "verdict": "APPROVED", "approval_stale": False,
+                "approval_stale_authorized": False,
+                "merge_state": "clean", "conflict": False,
                 "mergeable": True, "consent_present": False,
                 "consent_action": "skip", "consent_label": "", "eligible": False,
                 "needs_consent": False, "clear_to_merge": False, "held": [],
                 "wip": False,
+                "occupancy": "needs-consent",
                 "reason": "no auto-merge label configured (binding absent)",
             },
         }
@@ -255,6 +294,74 @@ class TestDecorateEvents:
         assert res.payload["merge"]["needs_consent"] is True
         assert res.payload["merge"]["consent_action"] == "apply"
 
+    def test_run_wait_forwards_stale_approval_policy(self):
+        snap = _snap(
+            pr_state="open",
+            mergeable=True,
+            head_sha="new",
+            updated_at="2026-01-01T00:01:59Z",
+            reviews=(
+                pc.Review(
+                    3,
+                    "APPROVED",
+                    "bob",
+                    submitted_at="2026-01-01T00:02:00Z",
+                    commit_id="old",
+                ),
+            ),
+        )
+        clock = _Clock()
+        res = prw.run_wait(
+            repo="o/r",
+            pr=1,
+            until=["approved"],
+            baseline=pc.Baseline.from_cursor("r0"),
+            fetch=lambda: snap,
+            timeout=100.0,
+            interval=1.0,
+            automerge_label="auto-merge",
+            allow_stale_approval=True,
+            stale_approval_head_sha="new",
+            stale_approval_head_observed_at="2026-01-01T00:01:00Z",
+            now=clock.now,
+            sleep=lambda s: None,
+        )
+        assert res.matched
+        assert res.payload["merge"]["approval_stale"] is True
+        assert res.payload["merge"]["approval_stale_authorized"] is True
+        assert res.payload["merge"]["consent_action"] == "apply"
+
+    def test_decorate_events_review_blocking_false_reports_comment_verdict(self):
+        """A repo whose bound reviewer can only COMMENT (e.g. Copilot code
+        review on an owner-authored PR) reports that comment as the
+        "COMMENTED" verdict when review_blocking is False."""
+        snap = _snap(pr_state="open", mergeable=True, head_sha="abc",
+                     reviews=(pc.Review(3, "COMMENT", "bob"),))
+        payload = prw.decorate_events(
+            [{"event": "commented"}], "o/r", 7, snap, review_blocking=False,
+        )
+        assert payload["merge"]["verdict"] == "COMMENTED"
+
+    def test_decorate_events_review_blocking_true_default_ignores_comment(self):
+        snap = _snap(pr_state="open", mergeable=True, head_sha="abc",
+                     reviews=(pc.Review(3, "COMMENT", "bob"),))
+        payload = prw.decorate_events([{"event": "commented"}], "o/r", 7, snap)
+        assert payload["merge"]["verdict"] == ""
+
+    def test_run_wait_forwards_review_blocking_into_payload(self):
+        snap = _snap(pr_state="open", mergeable=True, head_sha="abc",
+                     reviews=(pc.Review(3, "COMMENT", "bob"),))
+        clock = _Clock()
+        res = prw.run_wait(
+            repo="o/r", pr=1, until=["commented"],
+            baseline=pc.Baseline.from_cursor("r0"),
+            fetch=lambda: snap, timeout=100.0, interval=1.0,
+            review_blocking=False,
+            now=clock.now, sleep=lambda s: None,
+        )
+        assert res.matched
+        assert res.payload["merge"]["verdict"] == "COMMENTED"
+
 
 # ---------------------------------------------------------------------------
 # build_fetch -- config-driven provider/token resolution
@@ -302,7 +409,7 @@ class TestBuildFetch:
         monkeypatch.setattr(
             ghmod, "run_cli",
             lambda args, **kw: _proc(stdout=json.dumps(pr))
-            if (len(args) > 2 and args[2].endswith("/pulls/5"))
+            if (len(args) > 2 and args[-1].endswith("/pulls/5"))
             else _proc(stdout="[]"),
         )
         prcfg = cfg.PRConfig(provider="github")
@@ -332,7 +439,7 @@ def _pr_payload(**over):
         "number": 9, "state": "open", "merged": False, "mergeable": True,
         "title": "A change", "draft": False,
         "head": {"sha": "deadbeef"}, "base": {"ref": "master"},
-        "user": {"login": "cjohnson"},
+        "user": {"login": "contributor_user"},
         "labels": [{"name": "auto-merge"}, {"name": "source:mantis-counter"}],
     }
     base_pr.update(over)
@@ -367,7 +474,7 @@ class TestGiteaGetSnapshot:
         assert snap.mergeable is True
         assert snap.head_sha == "deadbeef"
         assert snap.base_ref == "master"
-        assert snap.author == "cjohnson"
+        assert snap.author == "contributor_user"
         assert snap.title == "A change"
         assert snap.draft is False
         assert snap.labels == ("auto-merge", "source:mantis-counter")

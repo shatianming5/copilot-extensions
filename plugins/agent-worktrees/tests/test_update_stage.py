@@ -104,6 +104,68 @@ def test_fingerprint_changes_with_content(tmp_path: Path):
     assert fp1 != fp2
 
 
+def test_fingerprint_detects_source_only_change(tmp_path: Path):
+    """#2609 regression: a plugin bug fix landing purely in ``src/`` .py
+    source, with no touch to plugin.json/pyproject.toml or any other curated
+    meta-file, must still change the fingerprint -- otherwise the staging
+    path's "did the payload actually change" check silently misses a real,
+    already-downloaded update and the venv is never reinstalled."""
+    home = tmp_path / "home"
+    d = _make_marketplace(
+        home,
+        {
+            "plugin.json": '{"version":"1"}',
+            "src/agent_worktrees/__main__.py": "def cmd_launch():\n    return 1\n",
+        },
+    )
+    fp1 = us.fingerprint(d)
+    (d / "src" / "agent_worktrees" / "__main__.py").write_text(
+        "def cmd_launch():\n    return 2  # a real bug fix, no version bump\n",
+        encoding="utf-8",
+    )
+    fp2 = us.fingerprint(d)
+    assert fp1 != fp2
+
+
+def test_fingerprint_detects_vendored_lib_source_change(tmp_path: Path):
+    """The same gap applied to a vendored path-dependency's own src/ tree
+    (e.g. libs/dropin-registry/src/...) -- a fix there is just as invisible
+    to the curated meta-file list."""
+    home = tmp_path / "home"
+    d = _make_marketplace(
+        home,
+        {
+            "plugin.json": '{"version":"1"}',
+            "libs/dropin-registry/src/dropin_registry/model.py": "X = 1\n",
+        },
+    )
+    fp1 = us.fingerprint(d)
+    (d / "libs" / "dropin-registry" / "src" / "dropin_registry" / "model.py").write_text(
+        "X = 2\n", encoding="utf-8"
+    )
+    fp2 = us.fingerprint(d)
+    assert fp1 != fp2
+
+
+def test_fingerprint_ignores_pycache(tmp_path: Path):
+    """A stale .pyc left behind by a previous interpreter run must not make
+    two otherwise-identical checkouts fingerprint differently."""
+    home = tmp_path / "home"
+    d = _make_marketplace(
+        home,
+        {
+            "plugin.json": '{"version":"1"}',
+            "src/agent_worktrees/__main__.py": "X = 1\n",
+        },
+    )
+    fp1 = us.fingerprint(d)
+    pycache = d / "src" / "agent_worktrees" / "__pycache__"
+    pycache.mkdir(parents=True)
+    (pycache / "__main__.cpython-312.pyc").write_bytes(b"\x00\x01\x02compiled-bytecode")
+    fp2 = us.fingerprint(d)
+    assert fp1 == fp2
+
+
 # ---------------------------------------------------------------------------
 # stage() end to end (copilot mocked)
 # ---------------------------------------------------------------------------
@@ -156,6 +218,122 @@ def test_stage_no_change_when_download_noop(tmp_path: Path, monkeypatch):
     assert result["plugin_changed"] is False
 
 
+def test_stage_first_run_computes_before_fingerprint_fresh(tmp_path: Path, monkeypatch):
+    """No prior status file yet -- there is nothing to reuse, so the BEFORE
+    fingerprint must be a real, freshly-computed hash (not skipped)."""
+    home = tmp_path / "home"
+    _make_marketplace(home, {"plugin.json": '{"version":"dev1"}'})
+    status = tmp_path / "status.json"
+    lock = tmp_path / "lock"
+    calls = []
+    real_fingerprint = us.fingerprint
+
+    def counting_fingerprint(d):
+        calls.append(d)
+        return real_fingerprint(d)
+
+    monkeypatch.setattr(us, "fingerprint", counting_fingerprint)
+    monkeypatch.setattr(us, "_run_copilot_update", lambda: (True, "already at latest"))
+    result = us.stage(status=status, lock=lock, home=home)
+    assert result["before_fingerprint_source"] == "computed"
+    # Both the BEFORE and AFTER hash were computed for real (2 calls).
+    assert len(calls) == 2
+
+
+def test_stage_reuses_prior_after_fingerprint_as_before(tmp_path: Path, monkeypatch):
+    """The core optimization: a second stage run, immediately following one
+    that recorded a real (non-skipped) AFTER-fingerprint for the SAME
+    plugin_dir, must reuse it as this run's BEFORE-fingerprint instead of
+    re-walking the whole payload tree a second time."""
+    home = tmp_path / "home"
+    _make_marketplace(home, {"plugin.json": '{"version":"dev1"}'})
+    status = tmp_path / "status.json"
+    lock = tmp_path / "lock"
+    monkeypatch.setattr(us, "_run_copilot_update", lambda: (True, "already at latest"))
+
+    first = us.stage(status=status, lock=lock, home=home)
+    assert first["before_fingerprint_source"] == "computed"
+
+    calls = []
+    real_fingerprint = us.fingerprint
+
+    def counting_fingerprint(d):
+        calls.append(d)
+        return real_fingerprint(d)
+
+    monkeypatch.setattr(us, "fingerprint", counting_fingerprint)
+    second = us.stage(status=status, lock=lock, home=home)
+    assert second["before_fingerprint_source"] == "cached"
+    # Only the AFTER hash was computed this run (the BEFORE hash was reused).
+    assert len(calls) == 1
+    assert second["plugin_changed"] is False
+
+
+def test_stage_does_not_reuse_fingerprint_across_a_locked_skip(
+    tmp_path: Path, monkeypatch
+):
+    """A prior run that recorded ``skipped: locked`` (a peer stage owned the
+    lock) never actually computed a fresh AFTER-fingerprint -- reusing it
+    would silently skip real verification. Must fall back to a fresh hash."""
+    home = tmp_path / "home"
+    _make_marketplace(home, {"plugin.json": '{"version":"dev1"}'})
+    status = tmp_path / "status.json"
+    lock = tmp_path / "lock"
+    status.write_text(json.dumps({
+        "stage_done": True, "skipped": "locked", "plugin_changed": False,
+        "plugin_dir": str(us.discover_plugin_dir(home)[0]),
+        "fingerprint": "stale-would-be-wrong",
+    }), encoding="utf-8")
+    monkeypatch.setattr(us, "_run_copilot_update", lambda: (True, "already at latest"))
+
+    result = us.stage(status=status, lock=lock, home=home)
+    assert result["before_fingerprint_source"] == "computed"
+
+
+def test_stage_does_not_reuse_fingerprint_for_a_different_plugin_dir(
+    tmp_path: Path, monkeypatch
+):
+    """A prior recorded fingerprint for a DIFFERENT plugin_dir (e.g. a prior
+    ``direct`` layout, or a relocated install) must never be trusted for the
+    current one."""
+    home = tmp_path / "home"
+    _make_marketplace(home, {"plugin.json": '{"version":"dev1"}'})
+    status = tmp_path / "status.json"
+    lock = tmp_path / "lock"
+    status.write_text(json.dumps({
+        "stage_done": True, "plugin_changed": False,
+        "plugin_dir": str(tmp_path / "somewhere-else"),
+        "fingerprint": "stale-would-be-wrong",
+    }), encoding="utf-8")
+    monkeypatch.setattr(us, "_run_copilot_update", lambda: (True, "already at latest"))
+
+    result = us.stage(status=status, lock=lock, home=home)
+    assert result["before_fingerprint_source"] == "computed"
+
+
+def test_stage_reused_before_fingerprint_still_detects_a_real_change(
+    tmp_path: Path, monkeypatch
+):
+    """The cached path must still correctly flag plugin_changed when the
+    download actually rewrites the payload -- caching BEFORE never weakens
+    the AFTER-hash's ability to detect a genuine change."""
+    home = tmp_path / "home"
+    d = _make_marketplace(home, {"plugin.json": '{"version":"dev1"}'})
+    status = tmp_path / "status.json"
+    lock = tmp_path / "lock"
+    monkeypatch.setattr(us, "_run_copilot_update", lambda: (True, "already at latest"))
+    us.stage(status=status, lock=lock, home=home)  # seed the cache
+
+    def fake_update():
+        (d / "plugin.json").write_text('{"version":"dev2"}', encoding="utf-8")
+        return True, "updated to dev2"
+
+    monkeypatch.setattr(us, "_run_copilot_update", fake_update)
+    result = us.stage(status=status, lock=lock, home=home)
+    assert result["before_fingerprint_source"] == "cached"
+    assert result["plugin_changed"] is True
+
+
 def test_stage_detects_venv_drift_when_payload_ahead(tmp_path: Path, monkeypatch):
     # #2826: the payload already advanced on a prior run (dev2) but the runtime
     # venv is still dev1. The download is a no-op ("already at latest"), so the
@@ -188,9 +366,27 @@ def test_stage_no_drift_when_versions_match(tmp_path: Path, monkeypatch):
     assert result["plugin_changed"] is False
 
 
-def test_stage_selected_context_blocks_legacy_runtime_apply(
+def test_cmd_stage_update_indicator_state_json(monkeypatch, capsys):
+    monkeypatch.setattr(us, "indicator_state", lambda **kwargs: "available")
+
+    rc = us.cmd_stage_update(
+        type("Args", (), {"status": None, "json": True, "indicator_state": True})()
+    )
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "version": 1,
+        "indicator_state": "available",
+    }
+
+
+@pytest.mark.parametrize("mode_status", ["ready", "deactivation-required"])
+@pytest.mark.parametrize("inherited_context", [None, "/caller/install.json"])
+def test_stage_namespaced_runtime_uses_validated_installer_environment(
     tmp_path: Path,
     monkeypatch,
+    mode_status,
+    inherited_context,
 ):
     from agent_worktrees import reconcile
 
@@ -198,6 +394,8 @@ def test_stage_selected_context_blocks_legacy_runtime_apply(
     payload = _make_marketplace(home, {"plugin.json": '{"version":"dev1"}'})
     cell_root = tmp_path / "cell" / "plugins" / "agent-worktrees"
     cell_root.mkdir(parents=True)
+    context = cell_root / "install.json"
+    context.write_text("{}", encoding="utf-8")
     (cell_root / "deploy-manifest.json").write_text(
         json.dumps({"source": {"version": "dev1"}}),
         encoding="utf-8",
@@ -212,18 +410,66 @@ def test_stage_selected_context_blocks_legacy_runtime_apply(
         return True, "updated to dev2"
 
     monkeypatch.setattr(us, "_run_copilot_update", fake_update)
+    if inherited_context is None:
+        monkeypatch.delenv("COPILOT_EXTENSIONS_CONTEXT", raising=False)
+    else:
+        monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", inherited_context)
+    monkeypatch.setenv("COPILOT_PLUGIN_ROOT", "/caller/payload")
+    monkeypatch.setenv("PYTHONPATH", "/caller/python")
     monkeypatch.setattr(
         reconcile,
-        "_selected_runtime_root",
-        lambda name, plugin_dir, **kwargs: (cell_root, True),
+        "resolve_runtime_installation",
+        lambda name, plugin_dir, **kwargs: reconcile.RuntimeInstallationResolution(
+            runtime_root=cell_root,
+            context=context,
+            actual_mode="namespaced",
+            desired_mode=(
+                "namespaced" if mode_status == "ready" else "legacy"
+            ),
+            status=mode_status,
+            reason=(
+                "namespaced-active"
+                if mode_status == "ready"
+                else "policy-disabled-active"
+            ),
+        ),
     )
 
     result = us.stage(status=status, lock=lock, home=home)
 
-    assert result["plugin_changed"] is False
-    assert result["venv_drift"] is False
-    assert result["runtime_apply_blocked"] == "installation-context-read-only"
-    assert result["context_runtime_root"] == str(cell_root)
+    assert result["plugin_changed"] is True
+    assert result["venv_drift"] is True
+    assert result["runtime_root"] == str(cell_root)
+    assert result["environment"] == {
+        "COPILOT_EXTENSIONS_CONTEXT": str(context)
+    }
+    assert result["unset_environment"] == list(reconcile._RUNTIME_ENV_UNSET)
+    assert "runtime_apply_blocked" not in result
+
+
+def test_stage_legacy_default_uses_conventional_runtime_environment(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from agent_worktrees import reconcile
+
+    home = tmp_path / "home"
+    _make_marketplace(home, {"plugin.json": '{"version":"dev1"}'})
+    _make_runtime_manifest(home, "dev1")
+    monkeypatch.delenv("COPILOT_EXTENSIONS_CONTEXT", raising=False)
+    monkeypatch.setattr(
+        us, "_run_copilot_update", lambda: (True, "already at latest")
+    )
+
+    result = us.stage(
+        status=tmp_path / "status.json",
+        lock=tmp_path / "lock",
+        home=home,
+    )
+
+    assert result["runtime_root"] == str(home / ".agent-worktrees")
+    assert result["environment"] == {}
+    assert result["unset_environment"] == list(reconcile._RUNTIME_ENV_UNSET)
 
 
 def test_stage_unexpected_drift_check_failure_is_reported(
@@ -240,7 +486,7 @@ def test_stage_unexpected_drift_check_failure_is_reported(
     )
     monkeypatch.setattr(
         reconcile,
-        "_selected_runtime_root",
+        "runtime_installer_environment",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             RuntimeError("unexpected validator failure")
         ),
@@ -301,6 +547,20 @@ def test_indicator_current_and_available(tmp_path: Path):
     status.write_text(json.dumps({"stage_done": True, "plugin_changed": True}),
                       encoding="utf-8")
     assert us.indicator_state(status=status, lock=lock) == "available"
+
+
+def test_indicator_paused_ignores_stale_available_status(
+    tmp_path: Path, monkeypatch
+):
+    status = tmp_path / "status.json"
+    lock = tmp_path / "lock"
+    status.write_text(json.dumps({"stage_done": True, "plugin_changed": True}),
+                      encoding="utf-8")
+    lock.write_text(json.dumps({"pid": os.getpid(), "started": us.time.time()}),
+                    encoding="utf-8")
+    monkeypatch.setenv("WORKTREE_NO_UPDATE", "1")
+
+    assert us.indicator_state(status=status, lock=lock) == "paused"
 
 
 def test_indicator_locked_skip_reads_as_checking(tmp_path: Path):

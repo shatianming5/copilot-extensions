@@ -29,7 +29,7 @@ Use the exact `argv[0]` from the agent-worktrees session command catalog for
 every shell operation below. Replace `<agent-worktrees catalog argv[0]>` with
 that raw path, quote it at each shell call site, and never search `PATH`.
 
-Manage the repos registry at `~/.agent-worktrees/repos.yaml` — the
+Manage the repos registry at `~/.agent-worktrees/repos.yaml` — the <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 **canonical** catalog of known repositories across platforms. This
 registry supersedes the legacy `~/.git-repos` file; import an existing
 one with `<agent-worktrees catalog argv[0]> repos migrate`.
@@ -140,9 +140,9 @@ repos clone <remote> [--name N] [--target PATH]
 repos srcroot [--set PATH] [--platform windows|wsl|linux]
 repos migrate [--default-class reference|singleton|worktree]
 repos status [--tag T] [--class C] [--json]
-repos sync [--tag T] [--class C]
+repos sync [<repo> ...] [--tag T] [--class C]
 repos account [list|set <owner> <login>|unset <owner>]   # org->login map
-repos account-for <owner|owner/name>                     # print resolved login
+repos account-for <owner|owner/name|reponame>            # print resolved login
 repos allow-edits <repo> --reason <why> [--minutes N]    # break-glass grant
 repos allow-edits --list                                 # show active grants
 repos allow-edits <repo> --revoke                        # end a grant early
@@ -157,7 +157,7 @@ unavoidable -- maintaining the target agent's OWN instructions/skills, or a
 direct action to unblock -- `allow-edits` records a **time-boxed, per-repo**
 grant (default 10m, max 60m; `--reason` required) that the guard reads to
 temporarily permit edits. The store lives at
-`~/.agent-worktrees/allow-edits.json` with epoch-millisecond timestamps so a
+`~/.agent-worktrees/allow-edits.json` with epoch-millisecond timestamps so a <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 JS/TS or shell hook can read it without unit ambiguity. It's a deliberate,
 logged last resort -- prefer delegation (`related resolve <repo>`).
 
@@ -219,15 +219,30 @@ If the repo has no local path but has a remote, suggest cloning it.
 ```bash
 <agent-worktrees catalog argv[0]> repos status                 # branch, dirty, ahead/behind
 <agent-worktrees catalog argv[0]> repos sync --tag multi-machine system    # fetch + ff-merge (skips dirty)
+<agent-worktrees catalog argv[0]> repos sync copilot-extensions            # fast-forward just that one repo
 ```
 
 `sync` only fast-forwards the default branch and **skips** any repo whose
 working tree is dirty or whose checkout is on a non-default branch — it
-never force-updates or creates merge commits.
+never force-updates or creates merge commits. Naming one or more repos
+(`repos sync <repo> [<repo> ...]`) narrows the sync to exactly those,
+combinable with `--tag`/`--class` -- **names must come first** (positionals
+before flags): `--tag`'s value runs to the next `--`-flag (to keep an
+unquoted, multi-word tag like the `multi-machine system` example above
+working), so a name placed after `--tag` would be swallowed into its value
+instead. A named repo that isn't registered at all is reported as its own
+`not registered` result. `anchor_write_guard` never blocks `git pull
+--ff-only` (or a bare `git fetch`, which never mutates the working tree)
+against an anchor -- `--ff-only` makes git structurally refuse instead of
+ever creating a merge commit or applying a configured `pull.rebase`. A bare
+`git pull` (no `--ff-only`) remains blocked like any other agent-authored
+mutation, since a diverged anchor's default merge WOULD create a genuine
+new local commit; `repos sync` is the always-available equivalent when
+typing `--ff-only` isn't convenient.
 
 ## Data File
 
-The registry lives at `~/.agent-worktrees/repos.yaml`. Full annotated example:
+The registry lives at `~/.agent-worktrees/repos.yaml`. Full annotated example: <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 [`references/repos.yaml`](references/repos.yaml). At a glance:
 
 ```yaml
@@ -263,7 +278,7 @@ Top-level `account_map` (GitHub **owner/org → gh login**) is the decoupled
 identity layer: it maps an owner that is **not** itself a `gh` account — an org
 like `github` or `example-org` — to the login that can access it. Manage it
 with `repos account set/list/unset`; the identities it points at (host, scopes,
-login flow) are catalogued separately in `~/.agent-worktrees/accounts.yaml`
+login flow) are catalogued separately in `~/.agent-worktrees/accounts.yaml` <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 (`accounts …`).
 
 ### Repo-scoped identity (multi-account)
@@ -278,18 +293,29 @@ inline, so agents never hand-switch:
   none. None = today's ambient-`gh` behavior (additive, safe). The `account_map`
   step is what makes an **org-owned** repo (`github/…`, `example-org/…`)
   resolve to the correct login instead of the org name. GitHub-only in v1;
-  ADO/gitea remotes resolve no account.
-- **Query primitive**: `repos account-for <owner|owner/name>` prints the
-  resolved login (exit 1 if none). Other tools (e.g. **agent-codespaces**, to
-  pick the `gh` account for `gh codespace …`) shell out to it rather than
+  an ADO/Gitea remote resolves no account *unless* its own registered entry
+  has an explicit `account:` override, which still applies. A bare
+  *registered repo name* (as opposed to an owner or `owner/name` slug)
+  resolves through the registry to that entry's own `account:` first, else
+  its remote owner (`resolve_slug_owner`), so it is never mistaken for a
+  literal owner/account key.
+- **Query primitive**: `repos account-for <owner|owner/name|reponame>` prints
+  the resolved login (exit 1 if none). Other tools (e.g. **agent-codespaces**,
+  to pick the `gh` account for `gh codespace …`) shell out to it rather than
   importing agent-worktrees.
 - **gh/PR ops** (`create-pr`, `pr-merge`, `pr-ready`, `pr-status`, `pr-watch`,
-  `pr-complete`, label/GraphQL): the resolved account mints a token
+  `pr-complete`, `pr-nudge`, label/GraphQL): the resolved account mints a token
   (`gh auth token --user <account>` → `GH_TOKEN`); an explicit
   `pr.token_command`/`pr.token_env` still wins. No global switch.
 - **git push/fetch**: the account credential is injected per-invocation via
-  `http.extraheader` (never persisted to `.git/config`), with a plain-push
-  retry fallback.
+  `http.extraheader` (this tool's own commands only), with a plain-push
+  retry fallback. Registration additionally **persists** a repo-local
+  `credential.https://<host>` override in `.git/config` (`username` + a
+  `gh auth token`-backed `helper`) once the account resolves unambiguously,
+  so a plain `git fetch`/`git pull` run by anything *other* than this tool
+  (an IDE, CI, an unattended maintenance task) also authenticates as the
+  correct account rather than whichever `gh` account happens to be
+  ambiently active. See `pin-credentials` below.
 
 `repos list` and `related resolve` surface the resolved account (`explicit` vs
 `derived`). Prefer `account_map` for a whole org; set an explicit per-repo
@@ -306,9 +332,28 @@ it lists the authenticated `gh` logins and persists your pick as an
 (a personal/EMU repo) is left silent, and nothing prompts once an
 `account:`/`account_map` already resolves. (dotfiles #537)
 
+**Backfilling the credential pin.** Repos registered before the pin existed,
+or whose account only became resolvable later (a fresh `account_map` entry),
+don't automatically get the `.git/config` override above. Run
+`repos pin-credentials [name] [--all] [--json]` to retrofit it: omit the name
+(or pass `--all`) to sweep every registered repo, or name one to restrict.
+Reports one of:
+
+- `pinned` — the override was written.
+- `needs_clarify` — resolve with `repos account set <owner> <login>` first.
+- `skipped` — `gh` unavailable, not a git checkout, **or** `login` is
+  already the active `gh` account (the inherited default helper already
+  works there; forcing this override risks a scope-limited OAuth token
+  turning a working push into a 403).
+- `no_path` — no local checkout on this machine.
+- `not_github` / `not_registered` — non-GitHub remote / unknown repo name.
+- `ssh_remote` / `not_https` — the checkout's remote is SSH, or plain
+  `http://`; the pin only ever affects `credential.https://<host>` and is a
+  no-op for either transport.
+
 ### Accounts catalog (`accounts.yaml`)
 
-`~/.agent-worktrees/accounts.yaml` catalogs the gh account **identities** the
+`~/.agent-worktrees/accounts.yaml` catalogs the gh account **identities** the <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 `account_map` points at — login, host, expected OAuth scopes, and the
 (re)login flow — so a scope-preflight can tell you *which* account to fix and
 *how*. Manage with `accounts list|show|set|remove`:

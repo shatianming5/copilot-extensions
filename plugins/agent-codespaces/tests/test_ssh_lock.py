@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent_codespaces import __main__ as cli
-from agent_codespaces.__main__ import _BUSY_EXIT, main
+from agent_codespaces.__main__ import _BUSY_EXIT, _COORDINATION_EXIT, main
 from agent_codespaces.resolver import _build_spawn_command
 
 
@@ -177,7 +177,7 @@ def _patch_ssh_dependencies(monkeypatch, tmp_path, manager):
     monkeypatch.setattr(cli, "load_merged_config", _fake_config)
     monkeypatch.setattr(cli, "_clear_status_quietly", lambda _name: None)
     monkeypatch.setattr(cli, "_relay_listening", lambda _port: True)
-    monkeypatch.setattr("agent_codespaces.relay_token.token_for", lambda _name: "tok")
+    monkeypatch.setattr("agent_codespaces.relay_token.token_for", lambda _name, **kw: "tok")
     return locks
 
 
@@ -193,11 +193,11 @@ class TestDiagnosticRemoteCmd:
             calls.append(name)
 
         monkeypatch.setattr(cli, "_provision_relay_helpers", lambda *_a: record("relay"))
-        monkeypatch.setattr(cli, "_verify_remote_auth", lambda *_a: record("auth"))
+        monkeypatch.setattr(cli, "_verify_remote_auth", lambda *_a, **_kw: record("auth"))
         monkeypatch.setattr(
-            cli, "_provision_dotfiles", lambda *_a: record("dotfiles")
+            cli, "_provision_dotfiles", lambda *_a, **_kw: record("dotfiles")
         )
-        monkeypatch.setattr(cli, "_provision_harness", lambda *_a: record("harness"))
+        monkeypatch.setattr(cli, "_provision_harness", lambda *_a, **_kw: record("harness"))
         monkeypatch.setattr(
             cli, "_register_codespace_plugins", lambda *_a: record("register")
         )
@@ -237,9 +237,9 @@ class TestDiagnosticRemoteCmd:
             return []
 
         monkeypatch.setattr(cli, "_provision_relay_helpers", lambda *_a: record("relay"))
-        monkeypatch.setattr(cli, "_verify_remote_auth", lambda *_a: record("auth"))
-        monkeypatch.setattr(cli, "_provision_dotfiles", lambda *_a: record("dotfiles"))
-        monkeypatch.setattr(cli, "_provision_harness", lambda *_a: record("harness"))
+        monkeypatch.setattr(cli, "_verify_remote_auth", lambda *_a, **_kw: record("auth"))
+        monkeypatch.setattr(cli, "_provision_dotfiles", lambda *_a, **_kw: record("dotfiles"))
+        monkeypatch.setattr(cli, "_provision_harness", lambda *_a, **_kw: record("harness"))
         monkeypatch.setattr(cli, "_register_codespace_plugins", empty_list)
         monkeypatch.setattr(cli, "_provision_repo_hooks", lambda *_a: record("hooks"))
         monkeypatch.setattr(cli, "_stage_plugins", empty_list)
@@ -269,6 +269,30 @@ class TestAuthCacheWarmup:
             relay_env="export LC_GIT_CREDENTIAL_RELAY=9857;",
         )
 
+    @pytest.mark.asyncio
+    async def test_warmup_uses_ado_helper_for_scoped_and_bare_tokens(self):
+        commands: list[str] = []
+
+        class CapturingManager:
+            async def exec_command(self, _name, command, **_kwargs):
+                commands.append(command)
+                return _FakeCommandResult()
+
+        await cli._warm_remote_auth_cache(
+            CapturingManager(),
+            "cs-auth",
+            _fake_config(),
+            relay_env="export LC_GIT_CREDENTIAL_RELAY=9857;",
+        )
+
+        warmup = commands[-1]
+        assert "azure-auth-helper" not in warmup
+        assert (
+            "ado-auth-helper get-access-token "
+            "--resource 499b84ac-1321-427f-aa17-267ca6975798"
+        ) in warmup
+        assert "ado-auth-helper get-access-token >/dev/null" in warmup
+
     def test_auth_cache_warmup_can_be_requested_for_diagnostic_remote_cmd(
         self, tmp_path, monkeypatch
     ):
@@ -280,7 +304,7 @@ class TestAuthCacheWarmup:
             calls.append(name)
 
         monkeypatch.setattr(cli, "_provision_relay_helpers", lambda *_a: record("relay"))
-        monkeypatch.setattr(cli, "_verify_remote_auth", lambda *_a: record("auth"))
+        monkeypatch.setattr(cli, "_verify_remote_auth", lambda *_a, **_kw: record("auth"))
         monkeypatch.setattr(cli, "_warm_remote_auth_cache", lambda *_a, **_kw: record("warm"))
 
         rc = main([
@@ -388,3 +412,116 @@ class TestSshClaimEnforcement:
         with pytest.raises(_Stop):
             main(["ssh", "cs-free", "--no-relay"])
         assert seen == {"cs": "cs-free", "owner": "/wt/mine"}
+
+    def test_coordination_rejection_precedes_status_clear_and_connect(
+        self,
+        monkeypatch,
+        capsys,
+    ):
+        monkeypatch.delenv("AGENT_CODESPACES_DISABLE_CLAIM", raising=False)
+        monkeypatch.setattr(
+            "agent_codespaces.__main__.load_merged_config",
+            lambda: SimpleNamespace(credentials=SimpleNamespace(relay_port=9857)),
+        )
+        monkeypatch.setattr(
+            "agent_codespaces.lifecycle.account_for_codespace", lambda name: None,
+        )
+        from agent_codespaces import lease as lease_mod
+
+        monkeypatch.setattr(
+            lease_mod,
+            "resolve_owner_worktree",
+            lambda explicit=None, session_id=None: "/wt/mine",
+        )
+        monkeypatch.setattr(
+            lease_mod, "active_worktree_ids", lambda: {"/wt/mine"}
+        )
+        monkeypatch.setattr(
+            lease_mod,
+            "claim",
+            lambda *a, **k: (_ for _ in ()).throw(
+                lease_mod.CoordinationRejected(
+                    "knowledge_binding_required: repair binding"
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            cli,
+            "_clear_status_quietly",
+            lambda name: pytest.fail("rejected operation cleared status"),
+        )
+
+        rc = main(["ssh", "cs-blocked", "--no-relay"])
+        assert rc == _COORDINATION_EXIT
+        assert "knowledge_binding_required" in capsys.readouterr().err
+
+
+class TestSshSessionHooks:
+    """``_ssh_session`` keyword hooks used by the detached ``copilot`` launch."""
+
+    def _run(self, tmp_path, monkeypatch, *, settle: bool):
+        calls: list[str] = []
+        manager = _FakeManager(calls)
+        _patch_ssh_dependencies(monkeypatch, tmp_path, manager)
+
+        async def record(name, value=None):
+            calls.append(name)
+            return value
+
+        monkeypatch.setattr(cli, "_provision_relay_helpers", lambda *_a: record("relay"))
+        monkeypatch.setattr(cli, "_verify_remote_auth", lambda *_a, **_kw: record("auth"))
+        monkeypatch.setattr(cli, "_provision_dotfiles", lambda *_a, **_kw: record("dotfiles"))
+        monkeypatch.setattr(cli, "_provision_harness", lambda *_a, **_kw: record("harness"))
+        monkeypatch.setattr(
+            cli, "_register_codespace_plugins",
+            lambda *_a: record("register", ["/stage/example-agent"]),
+        )
+        monkeypatch.setattr(cli, "_provision_repo_hooks", lambda *_a: record("hooks"))
+        monkeypatch.setattr(cli, "_stage_plugins", lambda *_a, **_k: record("stage", []))
+        monkeypatch.setattr(cli, "_warm_remote_auth_cache", lambda *_a, **_kw: record("warm"))
+        monkeypatch.setattr(
+            "agent_codespaces.lease.claim_for_connect", lambda *_a, **_k: "holder-ref",
+        )
+
+        async def settle_spy(*_a, **_k):
+            calls.append("settle")
+            return True
+
+        monkeypatch.setattr(cli, "_settle_codespace_on_disconnect", settle_spy)
+        seen: dict = {}
+
+        def builder(plugin_dirs):
+            seen["plugin_dirs"] = list(plugin_dirs)
+            return "agent-worktrees embody --anchor --json"
+
+        def sink(result):
+            seen["result"] = result
+            return 0
+
+        ns = SimpleNamespace(
+            name="cs-hook", stdio=False, remote_cmd="placeholder", timeout=30.0,
+            connect_timeout=None, no_provision=False, no_relay=False,
+            auth_cache_warmup=True, repo="example/repo", effort=None, session_id=None,
+            stage_plugins=[], force=False, force_claim=False,
+        )
+        rc = cli._ssh_session(
+            ns, remote_cmd_builder=builder, result_sink=sink, settle_on_disconnect=settle,
+        )
+        return rc, calls, seen
+
+    def test_builder_gets_full_provisioning_and_staged_plugin_dirs(self, tmp_path, monkeypatch, capsys):
+        rc, calls, seen = self._run(tmp_path, monkeypatch, settle=True)
+        assert rc == 0
+        for step in ("dotfiles", "harness", "register", "hooks", "warm", "exec_command"):
+            assert step in calls, step
+        assert seen["plugin_dirs"] == ["/stage/example-agent"]
+        assert seen["result"].stdout == "ok"
+        assert capsys.readouterr().out == ""  # the sink, not stdout, got the result
+
+    def test_settle_on_disconnect_false_keeps_the_claim_active(self, tmp_path, monkeypatch):
+        _rc, calls, _seen = self._run(tmp_path, monkeypatch, settle=False)
+        assert "settle" not in calls
+
+    def test_settle_on_disconnect_default_still_settles(self, tmp_path, monkeypatch):
+        _rc, calls, _seen = self._run(tmp_path, monkeypatch, settle=True)
+        assert "settle" in calls

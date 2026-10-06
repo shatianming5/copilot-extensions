@@ -59,6 +59,7 @@ def test_parse_choice_with_internal_commas():
             "name": "decision",
             "type": "choice",
             "options": ["revise", "post-approved", "hold-all"],
+            "allow_other": True,
         },
     ]
 
@@ -84,11 +85,15 @@ def test_parse_rejects_empty_choice():
 
 
 def test_parse_multichoice_and_allow_other():
+    # Every choice/multichoice field carries allow_other by default now (not
+    # just the one with an explicit trailing ``*``) -- confirms the ``*``
+    # sentinel is a harmless no-op, not the only way to get it.
     fields = steering.parse_request_input(
         "tags:multichoice[perf,api,ux],severity:choice[low,high,*]"
     )
     assert fields == [
-        {"name": "tags", "type": "multichoice", "options": ["perf", "api", "ux"]},
+        {"name": "tags", "type": "multichoice", "options": ["perf", "api", "ux"],
+         "allow_other": True},
         {"name": "severity", "type": "choice", "options": ["low", "high"],
          "allow_other": True},
     ]
@@ -108,7 +113,8 @@ def test_parse_choice_gated_followup():
         "verdict:choice[Approve,Waiting for author,Reject]?comments=Accept"
     )
     assert fields == [
-        {"name": "comments", "type": "choice", "options": ["Accept", "Reject"]},
+        {"name": "comments", "type": "choice", "options": ["Accept", "Reject"],
+         "allow_other": True},
         {
             "name": "reason",
             "type": "textarea",
@@ -118,6 +124,7 @@ def test_parse_choice_gated_followup():
             "name": "verdict",
             "type": "choice",
             "options": ["Approve", "Waiting for author", "Reject"],
+            "allow_other": True,
             "show_when": {"field": "comments", "equals": "Accept"},
         },
     ]
@@ -154,6 +161,7 @@ def test_parse_question_mark_inside_choice_option():
             "name": "decision",
             "type": "choice",
             "options": ["Proceed", "Needs another look?"],
+            "allow_other": True,
         }
     ]
 
@@ -169,8 +177,12 @@ def test_build_card_omits_empty_and_clips_title():
     assert len(card["title"]) == steering.CARD_TITLE_MAX
 
 
-def test_validate_steer_rejects_bad_choice():
-    form = steering.parse_request_input("decision:choice[a,b]")
+def test_validate_steer_strict_field_without_allow_other_rejects_bad_value():
+    # parse_request_input() always sets allow_other now, so build the strict
+    # form directly to keep covering validate_steer_fields' own defensive
+    # code path for a field explicitly constructed without it (e.g. a
+    # hand-built card from a surface that predates/opts out of the default).
+    form = [{"name": "decision", "type": "choice", "options": ["a", "b"]}]
     steering.validate_steer_fields({"decision": "a"}, form)  # ok
     steering.validate_steer_fields({"other": "z"}, form)  # unknown passes
     with pytest.raises(steering.SteeringError):
@@ -183,13 +195,27 @@ def test_validate_steer_allow_other_accepts_free_text():
     steering.validate_steer_fields({"severity": "somewhere in between"}, form)
 
 
+def test_parse_choice_allows_other_without_star_sentinel():
+    # The * sentinel is no longer required to get a free-text "Other…" answer
+    # -- every choice/multichoice field allows one by default.
+    form = steering.parse_request_input("decision:choice[a,b]")
+    steering.validate_steer_fields({"decision": "nope, something else entirely"}, form)
+
+
 def test_validate_steer_multichoice_members():
     import json as _json
 
-    form = steering.parse_request_input("tags:multichoice[perf,api]")
+    # Same rationale as the strict-choice test above: construct the form
+    # directly to keep covering the explicitly-strict code path.
+    form = [{"name": "tags", "type": "multichoice", "options": ["perf", "api"]}]
     steering.validate_steer_fields({"tags": _json.dumps(["perf", "api"])}, form)  # ok
     with pytest.raises(steering.SteeringError):
         steering.validate_steer_fields({"tags": _json.dumps(["perf", "nope"])}, form)
+
+
+def test_parse_multichoice_allows_other_without_star_sentinel():
+    form = steering.parse_request_input("tags:multichoice[perf,api]")
+    steering.validate_steer_fields({"tags": '["perf", "nope"]'}, form)
 
 
 def test_validate_steer_multichoice_allow_other_free_member():
@@ -228,6 +254,54 @@ def test_set_card_with_form_marks_awaiting_steer(q):
     assert task.lease_expires_at is None
 
 
+def test_resume_without_a_steer_answer_does_not_clear_awaiting_steer(q):
+    """An ordinary wake-driven resume (a review-loop poll tick, or a false/
+    spurious wake with no real external change) is not an operator response,
+    so it must never silently clear ``awaiting_steer``. Only
+    :meth:`TaskQueue.submit_steer` -- an actual answer -- may do that.
+    Regression for a real production incident: a card correctly
+    marked the task blocked, but each of 58+ consecutive false wakes called
+    plain ``resume`` and wiped the flag, so the still-unanswered card
+    silently vanished from Blocked-queue tracking after the very first wake."""
+    t = _held(q)
+    form = steering.parse_request_input("decision:choice[revise,post-approved]")
+    q.set_card(t.id, "w1", card=steering.build_card(request_input=form))
+
+    task = q.resume(t.id, "w1")
+
+    assert task.awaiting_steer is True  # no operator answer -> still blocked
+    assert task.card["request_input"] == form  # card itself is unchanged
+    assert task.status == Status.STARTED
+
+
+def test_headless_cold_wake_resume_does_not_clear_awaiting_steer(q):
+    """The exact code path a real review-loop headless worker hits: a wake
+    resumes a *cold* headless owner (no live ``owner_session_id``, a
+    ``fleet-body:``/``local-body:`` spawn reservation) via the
+    ``reembody_headless_on_wake`` branch inside ``_transition``, which builds
+    its own ``extra`` dict independent of the one ``resume()`` passes in.
+    That branch must not clear ``awaiting_steer`` either -- this is the
+    branch a real review-loop's false-wake loop actually hit, distinct from
+    (and not covered by) the plain-resume regression above."""
+    t = q.create("review PR 42")
+    reservation, _ = q.reserve_spawn(t.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="fleet-body:worker-host:bridge-session-1",
+    )
+    q.claim_one("fleet-owner", task_id=t.id)
+    q.start(t.id, "fleet-owner")
+    form = steering.parse_request_input("decision:choice[revise,post-approved]")
+    q.set_card(t.id, "fleet-owner", card=steering.build_card(request_input=form))
+
+    task = q.resume(t.id, "fleet-owner")
+
+    assert task.awaiting_steer is True  # no operator answer -> still blocked
+    assert task.status == Status.SUSPENDED  # cold headless owner re-parked
+    assert task.resume_requested is True
+
+
+
 def test_set_card_without_form_is_not_awaiting(q):
     t = _held(q)
     card = steering.build_card(status="just an FYI")
@@ -248,6 +322,93 @@ def test_set_card_requires_held(q):
         q.set_card(t.id, "w1", card={"status": "x"})
 
 
+def _held_with_label(q, *, label, worker="w1", target_machine=None):
+    t = q.create(
+        "review PR 42",
+        labels=[label],
+        target_machine=target_machine,
+    )
+    q.claim_one(worker, machine=target_machine)
+    q.start(t.id, worker)
+    return t
+
+
+def test_set_card_request_input_default_permissive(q):
+    """No registration has declared a denylist -- a label carries no
+    inherent restriction (the facility's own default posture, see
+    docs/spawn-supervisor.md's Steering-card permission gate)."""
+    t = _held_with_label(q, label="intelligence-dampener-review")
+    card = steering.build_card(request_input=steering.parse_request_input("note"))
+    task = q.set_card(t.id, "w1", card=card)
+    assert task.awaiting_steer is True
+
+
+def test_set_card_request_input_blocked_by_registration(q):
+    q.register_registration(
+        "supervised-lane",
+        {"all_repos": True, "labels": ["intelligence-dampener-review"],
+         "steering_disallowed_labels": ["intelligence-dampener-review"]},
+    )
+    t = _held_with_label(q, label="intelligence-dampener-review")
+    card = steering.build_card(request_input=steering.parse_request_input("note"))
+    with pytest.raises(TaskError, match="steering_disallowed_labels"):
+        q.set_card(t.id, "w1", card=card)
+
+
+def test_set_card_without_request_input_is_never_blocked(q):
+    """A plain status-note card carries no ``request_input`` and never blocks
+    the task's own resume path, so it is never gated -- only the
+    ``awaiting_steer``-inducing form is."""
+    q.register_registration(
+        "supervised-lane",
+        {"all_repos": True, "labels": ["intelligence-dampener-review"],
+         "steering_disallowed_labels": ["intelligence-dampener-review"]},
+    )
+    t = _held_with_label(q, label="intelligence-dampener-review")
+    task = q.set_card(t.id, "w1", card=steering.build_card(status="just an FYI"))
+    assert task.awaiting_steer is False
+
+
+def test_set_card_request_input_blocked_regardless_of_registration_machine(q):
+    """Deliberately NOT scoped by machine (see ``_steering_disallowed_labels``'s
+    docstring): a registration pinned to one machine still blocks a task
+    targeting a *different* machine -- and, more importantly, blocks an
+    *unpinned* task any worker on any machine could otherwise claim to
+    bypass a machine-scoped denylist (the bug a PR review caught: a task
+    with no ``target_machine`` was previously skipped by the old
+    machine-scope check entirely)."""
+    q.register_registration(
+        "supervised-lane",
+        {"all_repos": True, "labels": ["intelligence-dampener-review"],
+         "steering_disallowed_labels": ["intelligence-dampener-review"]},
+        machine="ember",
+    )
+    pinned = _held_with_label(
+        q, label="intelligence-dampener-review", target_machine="atlas-core"
+    )
+    unpinned = _held_with_label(
+        q, label="intelligence-dampener-review", worker="w2", target_machine=None
+    )
+    card = steering.build_card(request_input=steering.parse_request_input("note"))
+    with pytest.raises(TaskError, match="steering_disallowed_labels"):
+        q.set_card(pinned.id, "w1", card=card)
+    with pytest.raises(TaskError, match="steering_disallowed_labels"):
+        q.set_card(unpinned.id, "w2", card=card)
+
+
+def test_set_card_request_input_unrelated_label_is_not_blocked(q):
+    q.register_registration(
+        "supervised-lane",
+        {"all_repos": True, "labels": ["intelligence-dampener-review"],
+         "steering_disallowed_labels": ["intelligence-dampener-review"]},
+    )
+    t = _held_with_label(q, label="general")
+    card = steering.build_card(request_input=steering.parse_request_input("note"))
+    task = q.set_card(t.id, "w1", card=card)
+    assert task.awaiting_steer is True
+
+
+
 # -- queue: submit_steer + take_steer ---------------------------------------
 
 
@@ -256,13 +417,13 @@ def test_steer_roundtrip_clears_awaiting_and_delivers(q):
     form = steering.parse_request_input("decision:choice[revise,post-approved]")
     q.set_card(t.id, "w1", card=steering.build_card(request_input=form))
 
-    task = q.submit_steer(t.id, fields={"decision": "post-approved"}, sender="tmichon")
+    task = q.submit_steer(t.id, fields={"decision": "post-approved"}, sender="operator")
     assert task.awaiting_steer is False  # operator answered -> no longer blocked
 
     taken = q.take_steer(t.id, "w1")
     assert taken is not None
     assert taken["fields"] == {"decision": "post-approved"}
-    assert taken["sender"] == "tmichon"
+    assert taken["sender"] == "operator"
 
     # inbox is now drained
     assert q.take_steer(t.id, "w1") is None
@@ -324,7 +485,7 @@ def test_suspend_rejects_steer_that_arrived_after_card(q):
 def test_submit_steer_rejects_terminal_task(q):
     t = _held(q)
     q.complete(t.id, "w1")
-    with pytest.raises(TaskError):
+    with pytest.raises(TaskError, match="completed"):
         q.submit_steer(t.id, fields={"x": "y"})
 
 
@@ -347,7 +508,7 @@ def test_submit_steer_not_owner_gated(q):
     assert task.awaiting_steer is False
 
 
-def test_submit_steer_reembodies_suspended_headless_owner(q):
+def test_submit_steer_requests_resume_of_suspended_headless_owner(q):
     t = q.create("review PR 42")
     reservation, _ = q.reserve_spawn(t.id)
     q.record_spawn(
@@ -376,10 +537,8 @@ def test_submit_steer_reembodies_suspended_headless_owner(q):
     assert task.resume_requested is True
     assert q.get_reservation(reservation.key).state == "spawned"
     assert q.list_wakes(t.id) == []
-    q.release_suspended(t.id, "fleet-owner", reason="body stopped")
-    q.claim_one("replacement", task_id=t.id)
-    q.start(t.id, "replacement")
-    steers = q.take_steer(t.id, "replacement", all_pending=True)
+    q.resume(t.id, "fleet-owner", reuse_session=True)
+    steers = q.take_steer(t.id, "fleet-owner", all_pending=True)
     assert [steer["fields"] for steer in steers] == [
         {"decision": "continue"},
         {"detail": "use option B"},
@@ -437,7 +596,10 @@ def api(tmp_path):
 
 
 def _held_over_http(api, worker="w1"):
-    tid = api.post("/tasks", json={"title": "review PR 42"}).json()["id"]
+    tid = api.post(
+        "/tasks",
+        json={"title": "review PR 42", "require_verification": True},
+    ).json()["id"]
     api.post("/claim", json={"worker_id": worker, "repo": TEST_REPO})
     api.post(
         f"/tasks/{tid}/start",
@@ -489,7 +651,7 @@ def test_card_and_steer_roundtrip_over_http(api, monkeypatch):
 
     r = api.post(
         f"/tasks/{tid}/steer",
-        json={"fields": {"decision": "post-approved"}, "sender": "tmichon"},
+        json={"fields": {"decision": "post-approved"}, "sender": "operator"},
     )
     assert r.status_code == 200
     assert r.json()["awaiting_steer"] is False
@@ -498,7 +660,9 @@ def test_card_and_steer_roundtrip_over_http(api, monkeypatch):
     _wait_for_wake_status(api, tid, "delivered")
     assert len(wake_calls) == 1
     assert wake_calls[0][:2] == ("w1", tid)
+    assert wake_calls[0][2].startswith(f"Task {tid} received steering.")
     assert f"steer take {tid}" in wake_calls[0][2]
+    assert "re-read the task for any direction or ambient-state changes" in wake_calls[0][2]
     [wake] = api.get(f"/tasks/{tid}/wakes").json()
     assert wake["status"] == "delivered"
     assert wake["attempts"] == 1
@@ -512,7 +676,7 @@ def test_card_and_steer_roundtrip_over_http(api, monkeypatch):
     took = r.json()
     assert took["task_id"] == tid
     assert took["steers"][0]["fields"] == {"decision": "post-approved"}
-    assert took["steers"][0]["sender"] == "tmichon"
+    assert took["steers"][0]["sender"] == "operator"
 
     # inbox drained
     assert api.post(f"/tasks/{tid}/steer/take", json={"worker_id": "w1"}).json()["steer"] is None
@@ -530,6 +694,56 @@ def test_card_on_unheld_task_is_409(api):
     tid = api.post("/tasks", json={"title": "x"}).json()["id"]
     r = api.post(f"/tasks/{tid}/card", json={"worker_id": "w1", "card": {"status": "x"}})
     assert r.status_code == 409
+
+
+def test_confirm_and_reopen_roundtrip_over_http(api):
+    tid = _held_over_http(api)
+    r = api.post(f"/tasks/{tid}/complete", json={"worker_id": "w1", "result_ref": "pr/1"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "submitted"
+
+    r = api.post(f"/tasks/{tid}/confirm", json={"actor": "evaluator"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "completed"
+
+    # A completed task's confirm is idempotent (replay), not an error --
+    # matching the same idempotent-replay contract every other terminal
+    # transition already carries (e.g. abandon).
+    replay = api.post(f"/tasks/{tid}/confirm", json={})
+    assert replay.status_code == 200
+    assert replay.json()["status"] == "completed"
+    # But a genuinely different action against an already-completed task
+    # (re-completing, reopening) is rejected -- completed really is final.
+    assert api.post(f"/tasks/{tid}/reopen", json={}).status_code == 409
+
+    log = api.get(f"/tasks/{tid}/events").json()
+    assert any(e["to_status"] == "completed" for e in log)
+
+
+def test_reopen_returns_to_queued_with_a_steer(api):
+    tid = _held_over_http(api)
+    api.post(f"/tasks/{tid}/complete", json={"worker_id": "w1"})
+
+    r = api.post(
+        f"/tasks/{tid}/reopen",
+        json={"reason": "not done", "steer_fields": {"note": "fix X too"}, "sender": "op"},
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "queued"
+
+    log = api.get(f"/tasks/{tid}/steer-log").json()
+    assert len(log) == 1
+    assert log[0]["fields"] == {"note": "fix X too"}
+    assert log[0]["sender"] == "op"
+
+    # Reopened work is claimable again like any other queued task.
+    claimed = api.post("/claim", json={"worker_id": "w2", "repo": TEST_REPO}).json()
+    assert claimed["id"] == tid
+
+
+def test_reopen_on_non_submitted_task_is_409(api):
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    assert api.post(f"/tasks/{tid}/reopen", json={}).status_code == 409
 
 
 def test_steer_take_wrong_owner_is_409(api):
@@ -568,6 +782,118 @@ def test_steer_wake_failure_keeps_answer_durable(api, monkeypatch):
     log = api.get(f"/tasks/{tid}/steer-log").json()
     assert log[0]["fields"] == {"decision": "revise"}
     assert log[0]["taken"] is False
+
+
+# -- card_draft (not-yet-submitted operator answer, distinct from a steer) --
+
+
+def test_save_card_draft_never_touches_awaiting_steer_or_status(q):
+    """Confirm/Save/Reset semantics: a draft is a durable scratchpad, not a
+    steer -- it must never resolve awaiting_steer or move the task."""
+    t = _held(q)
+    q.set_card(t.id, "w1", card=steering.build_card(
+        request_input=[{"name": "feedback", "type": "textarea"}]
+    ))
+    before = q.get(t.id)
+    assert before.awaiting_steer is True
+    assert before.status == Status.SUSPENDED
+
+    after = q.save_card_draft(t.id, fields={"feedback": "looks good, one nit"})
+
+    assert after.card_draft == {"fields": {"feedback": "looks good, one nit"}, "ts": after.card_draft["ts"]}
+    assert after.awaiting_steer is True
+    assert after.status == Status.SUSPENDED
+
+
+def test_save_card_draft_overwrites_latest_only(q):
+    t = _held(q)
+    q.set_card(t.id, "w1", card=steering.build_card(
+        request_input=[{"name": "feedback", "type": "textarea"}]
+    ))
+    q.save_card_draft(t.id, fields={"feedback": "first pass"})
+    after = q.save_card_draft(t.id, fields={"feedback": "revised"})
+    assert after.card_draft["fields"] == {"feedback": "revised"}
+
+
+def test_save_card_draft_rejects_terminal_task(q):
+    t = _held(q)
+    q.complete(t.id, "w1")
+    with pytest.raises(TaskError):
+        q.save_card_draft(t.id, fields={"x": "y"})
+
+
+def test_save_card_draft_not_owner_gated(q):
+    """Mirrors submit_steer: the operator, not the worker, owns the draft."""
+    t = _held(q, worker="w1")
+    q.set_card(t.id, "w1", card=steering.build_card(request_input=[{"name": "f", "type": "text"}]))
+    after = q.save_card_draft(t.id, fields={"f": "value"})
+    assert after.card_draft["fields"] == {"f": "value"}
+
+
+def test_clear_card_draft_is_noop_when_no_draft(q):
+    t = _held(q)
+    after = q.clear_card_draft(t.id)
+    assert after.card_draft is None
+
+
+def test_clear_card_draft_removes_existing_draft(q):
+    t = _held(q)
+    q.set_card(t.id, "w1", card=steering.build_card(
+        request_input=[{"name": "feedback", "type": "textarea"}]
+    ))
+    q.save_card_draft(t.id, fields={"feedback": "wip"})
+    after = q.clear_card_draft(t.id)
+    assert after.card_draft is None
+    # still blocked -- clearing a draft is not a steer either
+    assert after.awaiting_steer is True
+
+
+def test_clear_card_draft_missing_task_raises(q):
+    with pytest.raises(TaskError):
+        q.clear_card_draft("nope")
+
+
+def test_submit_steer_clears_existing_draft(q):
+    """Once the real answer lands, the scratchpad has served its purpose."""
+    t = _held(q)
+    q.set_card(t.id, "w1", card=steering.build_card(
+        request_input=[{"name": "feedback", "type": "textarea"}]
+    ))
+    q.save_card_draft(t.id, fields={"feedback": "wip"})
+    after = q.submit_steer(t.id, fields={"feedback": "final"}, sender="operator")
+    assert after.card_draft is None
+    assert after.awaiting_steer is False
+
+
+def test_card_draft_save_and_clear_over_http(api):
+    tid = _held_over_http(api)
+    card = {
+        "request_input": [{"name": "feedback", "type": "textarea"}],
+    }
+    api.post(f"/tasks/{tid}/card", json={"worker_id": "w1", "card": card})
+
+    r = api.post(f"/tasks/{tid}/card-draft", json={"fields": {"feedback": "wip answer"}})
+    assert r.status_code == 200
+    assert r.json()["card_draft"]["fields"] == {"feedback": "wip answer"}
+    assert r.json()["awaiting_steer"] is True
+
+    got = api.get(f"/tasks/{tid}").json()
+    assert got["card_draft"]["fields"] == {"feedback": "wip answer"}
+
+    r = api.delete(f"/tasks/{tid}/card-draft")
+    assert r.status_code == 200
+    assert r.json()["card_draft"] is None
+
+
+def test_card_draft_save_on_missing_task_is_404(api):
+    r = api.post("/tasks/nope/card-draft", json={"fields": {"x": "y"}})
+    assert r.status_code == 404
+
+
+def test_card_draft_clear_on_missing_task_is_404(api):
+    r = api.delete("/tasks/nope/card-draft")
+    assert r.status_code == 404
+
 
 
 def test_steer_atomically_resumes_suspended_task_before_wake(api, monkeypatch):

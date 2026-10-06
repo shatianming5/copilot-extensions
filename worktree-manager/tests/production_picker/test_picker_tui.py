@@ -23,7 +23,7 @@ import pytest
 # suite with a module-level ImportError.
 pytest.importorskip("textual", reason="textual not installed (optional TUI dep)")
 
-from worktree_manager.production_picker.picker_tui import derive, new_picker_enabled  # noqa: E402
+from worktree_manager.production_picker.picker_tui import derive  # noqa: E402
 from worktree_manager.production_picker.picker_tui import capture as pcap  # noqa: E402
 from worktree_manager.production_picker.picker_tui.engine import (  # noqa: E402
     PickerApp,
@@ -64,6 +64,20 @@ def _task_menu(scr):
 def _task_menu_open(scr):
     """True when the F4 TaskMenuScreen (registered-pivot action menu) is stacked."""
     return _task_menu(scr) is not None
+
+
+async def _open_task_menu_and_wait(scr, pilot):
+    """Open the task action sub-menu, then poll briefly for the modal to
+    actually mount. A single ``pilot.pause()`` right after ``push_screen`` is
+    occasionally not enough to observe the new screen on the stack under
+    system load -- a pre-existing, load-sensitive flake independent of any
+    particular test's own content (reproduces identically on an unmodified
+    checkout); poll instead of assuming one pump always suffices."""
+    scr._open_task_menu()
+    for _ in range(50):
+        await pilot.pause()
+        if _task_menu(scr) is not None:
+            return
 
 
 def _cfg_menu(scr):
@@ -150,6 +164,20 @@ def _msgview_open(scr):
     return _msgview_screen(scr) is not None
 
 
+def _sessionsview_screen(scr):
+    """The SessionsViewScreen instance on the app's screen stack, or None."""
+    from worktree_manager.production_picker.picker_tui.engine import SessionsViewScreen
+    for s in scr.app.screen_stack:
+        if isinstance(s, SessionsViewScreen):
+            return s
+    return None
+
+
+def _sessionsview_open(scr):
+    """True when the "Sessions" sub-menu (SessionsViewScreen) is stacked."""
+    return _sessionsview_screen(scr) is not None
+
+
 def _fixture_source():
     derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
     local = ("anomalous-potato", "Win")
@@ -175,6 +203,56 @@ def _fixture_source():
     src.for_machine = derive.for_machine
     src.load = lambda: [derive.norm(w, *local) for w in raws]
     return src
+
+
+async def _wait_for_initial_setup(pilot, scr, *, timeout: float = 5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        current = getattr(scr, "_setup_epoch", 0)
+        failed = getattr(scr, "_setup_failed_epoch", 0)
+        if current != 0 and getattr(scr, "_setup_applied_epoch", 0) == current:
+            return
+        if current != 0 and failed == current:
+            raise AssertionError(
+                "initial setup failed before the test reached a ready screen: "
+                f"{getattr(scr, 'debug', 'unknown failure')}"
+            )
+        await pilot.pause()
+        await asyncio.sleep(0.01)
+    current = getattr(scr, "_setup_epoch", 0)
+    applied = getattr(scr, "_setup_applied_epoch", 0)
+    failed = getattr(scr, "_setup_failed_epoch", 0)
+    raise AssertionError(
+        "timed out waiting for setup epoch "
+        f"{current} to finish (applied={applied}, failed={failed})"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _wait_for_non_live_run_test(monkeypatch):
+    original_run_test = PickerApp.run_test
+
+    class _ReadyRunTest:
+        def __init__(self, app, inner):
+            self._app = app
+            self._inner = inner
+
+        async def __aenter__(self):
+            pilot = await self._inner.__aenter__()
+            if not getattr(self._app, "_live", False):
+                await _wait_for_initial_setup(
+                    pilot,
+                    self._app.query_one(PickerScreen),
+                )
+            return pilot
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return await self._inner.__aexit__(exc_type, exc, tb)
+
+    def _run_test(app, *args, **kwargs):
+        return _ReadyRunTest(app, original_run_test(app, *args, **kwargs))
+
+    monkeypatch.setattr(PickerApp, "run_test", _run_test)
 
 
 def test_provider_source_tab_scopes_by_canonical_source_id():
@@ -236,7 +314,7 @@ def test_provider_source_tab_scopes_by_canonical_source_id():
     ]
 
     screen = PickerScreen(src, live=False)
-    screen.setup()
+    screen.setup_sync_for_tests()
     screen.machine_idx = 2
 
     assert screen._scope_data() == [provider_row]
@@ -294,7 +372,7 @@ def test_setup_uses_one_source_snapshot_for_tabs_and_loader():
     )
 
     screen = PickerScreen(src, live=True)
-    screen.setup()
+    screen.setup_sync_for_tests()
 
     assert snapshot_calls == 1
     assert ("tabs", snapshot) in seen
@@ -349,7 +427,7 @@ def test_provider_selection_does_not_collide_with_machine_id4():
     ]
 
     screen = PickerScreen(src, live=False)
-    screen.setup()
+    screen.setup_sync_for_tests()
     screen.ready_source_ids = lambda: {
         "machine-ssh:anomalous-potato:win",
         provider_id,
@@ -689,6 +767,7 @@ def test_worktrees_view_component_renders_body():
             async with app.run_test(size=(118, 40)) as pilot:
                 scr = app.query_one(PickerScreen)
                 scr.machine_idx = scr.local_index()
+                scr.real_ops = True
                 await pilot.pause()
 
                 # (a) The component exists and owns the body render.
@@ -710,6 +789,185 @@ def test_worktrees_view_component_renders_body():
                     getattr(v, "stop", None) and v.stop[0] == "L"
                     and getattr(v, "pin_section", None) is not None
                     for v in vrows)
+
+    asyncio.run(run())
+
+
+def _resources_source():
+    """One worktree carrying two held claims (a PR + a child worktree) and one
+    released claim, plus a worktree with no claims at all -- exercises #6443/
+    upstream #1979's asset-hint tile line and the action-menu asset detail."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-hasassets", "title": "Has assets",
+         "status": "active", "started_at": "2026-06-27T17:00:00",
+         "resources": [
+             {"kind": "pr", "ref": "https://example/pulls/9",
+              "state": "active"},
+             {"kind": "worktree", "ref": "host/repo/wt-child",
+              "state": "at-rest", "note": "child harness worktree"},
+             {"kind": "ssh", "ref": "released-remote", "state": "released"},
+         ]},
+        {"id": "anomalous-potato-win-noassets", "title": "No assets",
+         "status": "active", "started_at": "2026-06-27T16:00:00"},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+    return src
+
+
+def test_asset_hint_line_renders_only_held_claim_kinds():
+    """#6443/upstream #1979, superseded by the "Title: Activity" simplification:
+    the tile's detail line no longer spells out the per-kind hint at all --
+    any held claim (active/at-rest; a released claim doesn't count) collapses
+    to a single ``*`` on the title's own line. The bounded per-kind computation
+    itself (``asset_hints``) is unchanged and still excludes released claims --
+    it just isn't rendered inline anymore (see ``test_sub_menu_header_...``
+    for where the full per-claim detail now lives)."""
+    src = _resources_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            recs = {r["title"]: r for r in scr.list_records()}
+
+            with_assets = recs["Has assets"]
+            assert with_assets["asset_hints"]["hints"] == ["PR", "WT"]
+            vrows = scr.build_body(118)
+            idx = vrows.index(next(
+                v for v in vrows if getattr(v, "data", None) is with_assets))
+            detail_line = vrows[idx + 1].text.plain
+            assert detail_line.rstrip().endswith("*")
+            assert "PR" not in detail_line and "WT" not in detail_line
+            assert "released-remote" not in detail_line
+
+            no_assets = recs["No assets"]
+            assert no_assets["asset_hints"] == {
+                "hints": [], "overflow": 0, "details": []}
+            no_assets_idx = vrows.index(next(
+                v for v in vrows if getattr(v, "data", None) is no_assets))
+            no_assets_detail = vrows[no_assets_idx + 1].text.plain
+            assert not no_assets_detail.rstrip().endswith("*")
+
+    asyncio.run(run())
+
+
+def test_sub_menu_header_shows_full_asset_detail():
+    """#6443/upstream #1979: full per-claim detail (kind + ref/note) is
+    available in the row's action menu even though the tile line only shows
+    bounded type/count hints -- the width-constrained-tile escape hatch."""
+    src = _resources_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            recs = scr.list_records()
+            idx = next(i for i, r in enumerate(recs)
+                       if r["title"] == "Has assets")
+            scr.sel = ("L", idx)
+            scr._dispatch_key("enter")
+            await pilot.pause()
+            menu = _sub_menu(scr)
+            assert menu is not None
+            # The menu's own header is now bounded to a count + pointer (the
+            # fold-the-claims-list follow-up) -- the full per-claim detail
+            # moved to the "View details" card below.
+            header = menu._header().plain
+            assert "2 held claims" in header
+            assert "View details" in header
+            assert "pr [active]: https://example/pulls/9" not in header
+            assert "released-remote" not in header
+            assert menu._actions[-1] == "View details"
+
+            from worktree_manager.production_picker.picker_tui.engine import (
+                WtDetailsScreen,
+            )
+            menu.dismiss(("View details", False, False))
+            await pilot.pause()
+            details = next(
+                s for s in scr.app.screen_stack if isinstance(s, WtDetailsScreen))
+            body = details._body().plain
+            assert "pr [active]: https://example/pulls/9" in body
+            assert "worktree [at-rest]: host/repo/wt-child — child harness worktree" in body
+            assert "released-remote" not in body
+
+    asyncio.run(run())
+
+
+def _many_claims_source(n=40):
+    """A worktree carrying an unusually large number of held claims -- the
+    exact overflow scenario the fold-the-claims-list follow-up fixes: the old
+    inline "assets:" header listing would have pushed the Actions menu's
+    always-needed verb list past the modal's max-height, with no scrollbar to
+    recover it."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-manyclaims", "title": "Many claims",
+         "status": "active", "started_at": "2026-06-27T17:00:00",
+         "resources": [
+             {"kind": "pr", "ref": f"https://example/pulls/{i}", "state": "active"}
+             for i in range(n)
+         ]},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+    return src
+
+
+def test_sub_menu_header_never_grows_unbounded_with_many_claims():
+    """A worktree with dozens of held claims must not blow the Actions menu's
+    header past a handful of fixed lines: the core verb list (and "View
+    details" itself) stays reachable without a scrollbar, and the FULL claim
+    list is only ever rendered inside the "View details" card."""
+    src = _many_claims_source(40)
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            recs = scr.list_records()
+            idx = next(i for i, r in enumerate(recs) if r["title"] == "Many claims")
+            scr.sel = ("L", idx)
+            scr._dispatch_key("enter")
+            await pilot.pause()
+            menu = _sub_menu(scr)
+            assert menu is not None
+            header_lines = menu._header().plain.splitlines()
+            # Title + a handful of meta lines + the bounded claims-count line --
+            # never one line per claim (40 claims would be 40+ lines).
+            assert len(header_lines) <= 8
+            assert "40 held claims" in menu._header().plain
+            assert "View details" in menu._actions
+
+            from worktree_manager.production_picker.picker_tui.engine import (
+                WtDetailsScreen,
+            )
+            menu.dismiss(("View details", False, False))
+            await pilot.pause()
+            details = next(
+                s for s in scr.app.screen_stack if isinstance(s, WtDetailsScreen))
+            body = details._body().plain
+            assert body.count("pr [active]:") == 40
 
     asyncio.run(run())
 
@@ -1619,6 +1877,92 @@ def test_jump_to_worktree_unknown_id_is_safe(tmp_path):
     asyncio.run(run())
 
 
+def test_internal_jump_host_prefers_worktree_id_context():
+    """picker-venue-pivots Phase 4: a registered pivot row may keep its
+    display-side `worktree` token as a short/beacon id while supplying the
+    full tracked worktree id separately as `worktree_id`; `jump-host` must
+    prefer that stable id for the actual drill-in."""
+    src = _bridge_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.t0 = 0
+            scr.show_hidden = True
+            scr.machine_idx = 0
+            await pilot.pause()
+            ok, msg = scr._internal_pivot_action(
+                "jump-host",
+                {
+                    "id": "codespace-row-id",
+                    "worktree": "2222",
+                    "worktree_id": "emancipation-cube-win-bridge-2222",
+                },
+            )
+            assert ok is True
+            assert "jumped to" in msg
+            landed = scr.list_records()[scr.sel[1]]
+            assert (landed.get("raw") or {}).get("id") == "emancipation-cube-win-bridge-2222"
+
+    asyncio.run(run())
+
+
+def test_jump_to_worktree_clears_a_hiding_filter(tmp_path):
+    """PR #2911 review: "Jump to host"/"Jump to caller" must resolve the
+    target by stable id against the FULL set, then clear an active "/"
+    filter that would otherwise hide it -- not silently fail/land on a
+    default just because the destination doesn't match the current query."""
+    src = _bridge_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.t0 = 0
+            scr.show_hidden = True
+            scr.machine_idx = 0            # All
+            await pilot.pause()
+            # A query matching only "Local wt" -- "Bridge wt" (the jump
+            # target) would otherwise be hidden by it.
+            scr.list_view.query = "local"
+            ok, _msg = scr._jump_to_worktree("emancipation-cube-win-bridge-2222")
+            assert ok is True
+            assert scr.list_view.query == ""   # the hiding filter was cleared
+            assert scr.sel[0] == "L"
+            landed = scr._wt_visible_records()[scr.sel[1]]
+            assert (landed.get("raw") or {}).get("id") == "emancipation-cube-win-bridge-2222"
+
+    asyncio.run(run())
+
+
+def test_jump_to_worktree_keeps_filter_when_target_already_visible(tmp_path):
+    """PR #2911 review: a jump whose target already matches the active "/"
+    filter must NOT clear the operator's query out from under them -- only a
+    query that actually HIDES the target justifies clearing it."""
+    src = _bridge_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.t0 = 0
+            scr.show_hidden = True
+            scr.machine_idx = 0            # All
+            await pilot.pause()
+            # "bridge" matches the jump target itself -- it is already
+            # visible under this query, so the query must survive the jump.
+            scr.list_view.query = "bridge"
+            ok, _msg = scr._jump_to_worktree("emancipation-cube-win-bridge-2222")
+            assert ok is True
+            assert scr.list_view.query == "bridge"   # untouched
+            assert scr.sel[0] == "L"
+            landed = scr._wt_visible_records()[scr.sel[1]]
+            assert (landed.get("raw") or {}).get("id") == "emancipation-cube-win-bridge-2222"
+
+    asyncio.run(run())
+
+
 def test_open_worktree_cli_exits_with_resume_decision():
     """#2253: the ``open-cli`` internal action opens the entry's target worktree
     into a CLI session -- it exits the picker with a standard resume decision for
@@ -1661,6 +2005,466 @@ def test_open_worktree_cli_unknown_id_is_safe():
             assert app.result is None      # never exited
 
     asyncio.run(run())
+
+def test_open_venue_exits_with_open_venue_decision():
+    """picker-venue-pivots Phase 3: the "open-venue" internal action opens a
+    remote venue row (a CodeSpace/container) into a Copilot session -- it
+    exits the picker with an ``open-venue`` decision naming the provider +
+    venue, so __main__ maps it onto ``<provider> copilot <venue>``."""
+    src = _bridge_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            await pilot.pause()
+            ok, msg = scr._internal_pivot_action(
+                "open-venue",
+                {"provider": "agent-codespaces", "id": "my-codespace", "title": "my task"},
+            )
+            assert ok is True
+            assert "my-codespace" in msg
+            assert app.result is not None
+            assert app.result["action"] == "open-venue"
+            assert app.result["provider"] == "agent-codespaces"
+            assert app.result["venue"] == "my-codespace"
+            assert app.result["title"] == "my task"
+
+    asyncio.run(run())
+
+
+def test_embody_cli_internal_action_exits_with_resume_decision(monkeypatch):
+    """Phase 7: the dedicated ``embody-cli`` internal verb runs
+    ``agent-dispatch embody --interactive`` and exits into the returned
+    worktree's normal resume flow, even before the picker has reloaded a row
+    for that fresh worktree."""
+    from worktree_manager.production_picker.picker_tui import engine_worktree_actions
+    from worktree_manager.production_picker.picker_tui import tasks as tasks_mod
+
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            await pilot.pause()
+
+            def _sync_run_bg(_label, work, done=None, **_kwargs):
+                result = work()
+                if done is not None:
+                    done(result)
+
+            monkeypatch.setattr(scr, "_run_bg", _sync_run_bg)
+            monkeypatch.setattr(
+                tasks_mod,
+                "_resolve_argv",
+                lambda _template, _ctx: ["agent-dispatch", "embody", "t1", "--interactive"],
+            )
+            monkeypatch.setattr(tasks_mod, "_child_process_env", lambda: {})
+            class _Proc:
+                returncode = 0
+
+                def communicate(self, timeout=None):
+                    return ('{"worktree":"fresh-task-worktree","project":"adopted-project"}', "")
+
+            monkeypatch.setattr(
+                engine_worktree_actions.subprocess,
+                "Popen",
+                lambda *args, **kwargs: _Proc(),
+            )
+
+            ok, msg = scr._internal_pivot_action(
+                "embody-cli",
+                {
+                    "task_id": "t1",
+                    "title": "Fresh task",
+                    "machine": src.LOCAL[0],
+                    "repo_name": "other-repo",
+                },
+            )
+            assert ok is True
+            assert "interactive CLI session" in msg
+            assert app.result is not None
+            assert app.result["action"] == "resume"
+            assert app.result["worktree_id"] == "fresh-task-worktree"
+            assert app.result["machine"] == src.LOCAL[0]
+            assert app.result["env"] == src.LOCAL[1]
+            assert app.result["is_local"] is True
+            assert app.result["project"] == "adopted-project"
+
+    asyncio.run(run())
+
+
+def test_launch_in_new_window_offered_only_for_local_open_or_resume_rows():
+    """"Launch in new window" (Phase 9, #5210; a `LaunchRequest.new_window`
+    modifier since the retired `copilot --headed`) rides alongside
+    Open/Resume, but ONLY for a local row -- a new window pops on THIS
+    machine, meaningless for a remote (SSH) worktree."""
+    from worktree_manager.production_picker.picker_tui.engine_worktree_actions import (
+        PickerScreenWorktreeActionsMixin as M,
+    )
+
+    local_mux_live = {
+        "source_kind": "machine-ssh", "is_local": True, "mux_live": True,
+        "cleanup_bucket": "wip",
+    }
+    acts = M._session_action_verbs(local_mux_live)
+    assert "Open" in acts
+    assert "Launch in new window" in acts
+
+    remote_mux_live = dict(local_mux_live, is_local=False)
+    acts = M._session_action_verbs(remote_mux_live)
+    assert "Open" in acts
+    assert "Launch in new window" not in acts
+
+    local_resumable = {
+        "source_kind": "machine-ssh", "is_local": True, "sessionless": False,
+        "cleanup_bucket": "unused",
+    }
+    acts = M._session_action_verbs(local_resumable)
+    assert "Resume" in acts
+    assert "Launch in new window" in acts
+
+    # A row offering neither Open nor Resume (e.g. reclaimable) never offers
+    # "Launch in new window" either -- there's no live-or-resumable session
+    # yet to attach a new window to.
+    reclaimable = {
+        "source_kind": "machine-ssh", "is_local": True,
+        "session_lock_live": True,
+    }
+    acts = M._session_action_verbs(reclaimable)
+    assert "Open" not in acts and "Resume" not in acts
+    assert "Launch in new window" not in acts
+
+
+def test_launch_in_new_window_runs_in_background_without_exiting_picker(
+    monkeypatch,
+):
+    """Selecting "Launch in new window" (Phase 9, #5210) must call
+    `_run_launch` in-process with `LaunchRequest.new_window=True` and report
+    through ``self.debug`` -- unlike every other Actions-menu verb, it must
+    NOT exit the Picker (no ``_decide`` call, ``app.result`` stays unset).
+    Reusing `_run_launch` (the same function every other launch decision
+    dispatches through, post-exit) is the whole point of Phase 9: "new
+    window" is a modifier on the ordinary launch plan, not a parallel
+    code path that could skip the mux-daemon registration
+    `launch-session.{ps1,sh}` performs."""
+    from worktree_manager import __main__ as manager_main
+    from worktree_manager.picker_app import LaunchRequest
+    from worktree_manager.production_picker import context as picker_context
+
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            await pilot.pause()
+
+            def _sync_run_bg(_label, work, done=None, **_kwargs):
+                result = work()
+                if done is not None:
+                    done(result)
+
+            monkeypatch.setattr(scr, "_run_bg", _sync_run_bg)
+            monkeypatch.setattr(picker_context, "project", lambda: "my-project")
+            calls = []
+
+            def fake_run_launch(request):
+                calls.append(request)
+                return 0
+
+            monkeypatch.setattr(manager_main, "_run_launch", fake_run_launch)
+
+            rec = next(
+                r for r in scr.list_records()
+                if (r.get("raw") or {}).get("id") == "anomalous-potato-win-20260627-aaaa"
+            )
+            scr._wt_submenu_dispatch(rec, ("Launch in new window", False, False))
+
+            assert app.result is None  # the Picker was never exited
+            assert len(calls) == 1
+            request = calls[0]
+            assert isinstance(request, LaunchRequest)
+            assert request.project == "my-project"
+            assert request.worktree_id == "anomalous-potato-win-20260627-aaaa"
+            assert request.new_window is True
+            assert scr.debug == "Opened in a new window"
+
+    asyncio.run(run())
+
+
+def test_launch_in_new_window_failure_is_reported_via_debug_not_raised(
+    monkeypatch,
+):
+    from worktree_manager import __main__ as manager_main
+    from worktree_manager.production_picker import context as picker_context
+
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            await pilot.pause()
+
+            def _sync_run_bg(_label, work, done=None, **_kwargs):
+                result = work()
+                if done is not None:
+                    done(result)
+
+            monkeypatch.setattr(scr, "_run_bg", _sync_run_bg)
+            monkeypatch.setattr(picker_context, "project", lambda: "my-project")
+
+            def boom(request):
+                print("error: could not open a new window: no visible terminal spawner found")
+                return 1
+
+            monkeypatch.setattr(manager_main, "_run_launch", boom)
+
+            rec = next(
+                r for r in scr.list_records()
+                if (r.get("raw") or {}).get("id") == "anomalous-potato-win-20260627-aaaa"
+            )
+            scr._wt_submenu_dispatch(rec, ("Launch in new window", False, False))
+
+            assert app.result is None
+            assert "Launch in new window failed" in scr.debug
+            assert "no visible terminal spawner found" in scr.debug
+
+    asyncio.run(run())
+
+
+def test_launch_in_new_window_does_not_leak_stdout_into_the_live_tui(
+    monkeypatch, capfd,
+):
+    """`_run_launch` is CLI-shaped and `print()`s its own errors; unlike
+    every other call site (which only runs after the TUI has exited),
+    `headed_actions` calls it WHILE the Picker is still rendering, so any
+    such output must be captured and surfaced via ``self.debug`` instead of
+    reaching the real terminal and corrupting the live render."""
+    from worktree_manager import __main__ as manager_main
+    from worktree_manager.production_picker import context as picker_context
+
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            await pilot.pause()
+
+            def _sync_run_bg(_label, work, done=None, **_kwargs):
+                result = work()
+                if done is not None:
+                    done(result)
+
+            monkeypatch.setattr(scr, "_run_bg", _sync_run_bg)
+            monkeypatch.setattr(picker_context, "project", lambda: "my-project")
+
+            def noisy(request):
+                print("Creating psmux session: wt-anomalous-potato-win-20260627-aaaa")
+                return 0
+
+            monkeypatch.setattr(manager_main, "_run_launch", noisy)
+
+            rec = next(
+                r for r in scr.list_records()
+                if (r.get("raw") or {}).get("id") == "anomalous-potato-win-20260627-aaaa"
+            )
+            scr._wt_submenu_dispatch(rec, ("Launch in new window", False, False))
+
+            assert scr.debug == "Opened in a new window"
+            # The captured message never reached the real stdout.
+            assert "Creating psmux session" not in capfd.readouterr().out
+
+    asyncio.run(run())
+
+
+def test_open_venue_missing_identity_is_safe():
+    """No provider/venue in ctx (a malformed row) is a reported no-op --
+    never a crash, never an exit."""
+
+    src = _bridge_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            await pilot.pause()
+            ok, msg = scr._internal_pivot_action("open-venue", {"id": "box-1"})
+            assert ok is False
+            assert "provider" in msg
+            assert app.result is None
+
+    asyncio.run(run())
+
+
+def test_embody_cli_internal_action_reports_transaction_failure(monkeypatch):
+    from worktree_manager.production_picker.picker_tui import engine_worktree_actions
+    from worktree_manager.production_picker.picker_tui import tasks as tasks_mod
+
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            await pilot.pause()
+
+            def _sync_run_bg(_label, work, done=None, **_kwargs):
+                result = work()
+                if done is not None:
+                    done(result)
+
+            monkeypatch.setattr(scr, "_run_bg", _sync_run_bg)
+            monkeypatch.setattr(
+                tasks_mod,
+                "_resolve_argv",
+                lambda _template, _ctx: ["agent-dispatch", "embody", "t1", "--interactive"],
+            )
+            monkeypatch.setattr(tasks_mod, "_child_process_env", lambda: {})
+            class _Proc:
+                returncode = 1
+
+                def communicate(self, timeout=None):
+                    return ("", "agent-dispatch: task 't1' is 'started'\n")
+
+            monkeypatch.setattr(
+                engine_worktree_actions.subprocess,
+                "Popen",
+                lambda *args, **kwargs: _Proc(),
+            )
+
+            ok, msg = scr._internal_pivot_action(
+                "embody-cli",
+                {
+                    "task_id": "t1",
+                    "title": "Busy task",
+                    "machine": src.LOCAL[0],
+                    "env": src.LOCAL[1],
+                    "source_kind": "machine-ssh",
+                },
+            )
+            assert ok is True
+            assert "interactive CLI session" in msg
+            assert app.result is None
+            assert "started" in scr.debug
+
+    asyncio.run(run())
+
+
+def test_embody_cli_internal_action_ssh_dispatches_for_remote_machine(monkeypatch):
+    from worktree_manager.production_picker.picker_tui import data_ssh
+    from worktree_manager.production_picker.picker_tui import engine_worktree_actions
+    from worktree_manager.production_picker.picker_tui import tasks as tasks_mod
+    src = _bridge_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            await pilot.pause()
+
+            def _sync_run_bg(_label, work, done=None, **_kwargs):
+                result = work()
+                if done is not None:
+                    done(result)
+
+            monkeypatch.setattr(scr, "_run_bg", _sync_run_bg)
+            monkeypatch.setattr(tasks_mod, "_child_process_env", lambda: {})
+            monkeypatch.setattr(
+                data_ssh,
+                "_find_source",
+                lambda *args, **kwargs: types.SimpleNamespace(
+                    source_kind="machine-ssh",
+                    local=False,
+                    ready=True,
+                    alias="emancipation-cube",
+                    shell="bash",
+                ),
+            )
+            monkeypatch.setattr(data_ssh, "_remote_arg", lambda _shell, token: str(token))
+            monkeypatch.setattr(
+                data_ssh,
+                "_wrap_remote",
+                lambda _shell, alias, inner: [
+                    "ssh",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=5",
+                    alias,
+                    inner,
+                ],
+            )
+            captured = {}
+
+            class _Proc:
+                returncode = 0
+
+                def __init__(self, argv):
+                    captured["argv"] = list(argv)
+
+                def communicate(self, timeout=None):
+                    return ('banner text\r\n{"worktree":"remote-task-worktree","project":"peer-project"}', "")
+
+            def _fake_popen(argv, **kwargs):
+                captured["argv"] = list(argv)
+                return _Proc(argv)
+
+            monkeypatch.setattr(engine_worktree_actions.subprocess, "Popen", _fake_popen)
+
+            ok, _msg = scr._internal_pivot_action(
+                "embody-cli",
+                {
+                    "task_id": "t1",
+                    "title": "Remote task",
+                    "machine": "emancipation-cube",
+                    "env": "Win",
+                    "source_kind": "machine-ssh",
+                },
+            )
+            assert ok is True
+            assert captured["argv"][:4] == [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+            ]
+            assert "ConnectTimeout=5" in captured["argv"]
+            assert "emancipation-cube" in captured["argv"]
+            assert "agent-dispatch embody t1 --interactive --machine emancipation-cube" in captured["argv"][-1]
+            assert app.result is not None
+            assert app.result["action"] == "resume"
+            assert app.result["worktree_id"] == "remote-task-worktree"
+            assert app.result["is_local"] is False
+            assert app.result["project"] == "peer-project"
+
+    asyncio.run(run())
+
+
+def test_task_action_ctx_includes_provider_from_list_cmd():
+    """picker-venue-pivots Phase 3: ``ctx["provider"]`` is the registered
+    pivot's own ``list`` argv[0] (e.g. ``"agent-codespaces"``), reused by the
+    ``open-venue`` internal action so it never hardcodes a provider list of
+    its own."""
+    from worktree_manager.production_picker.picker_tui.engine_pivot_actions import (
+        PickerScreenPivotActionsMixin,
+    )
+
+    inst = PickerScreenPivotActionsMixin.__new__(PickerScreenPivotActionsMixin)
+    inst._pivot_machine_id = lambda: "host"
+    reg = types.SimpleNamespace(
+        id_field="id", title_field="title", worktree_field="worktree",
+        list_cmd=("agent-codespaces", "pool", "--picker-json"),
+    )
+    rec = {"id": "my-codespace", "title": "my task", "worktree": "3bac"}
+
+    ctx = inst._task_action_ctx(reg, rec)
+
+    assert ctx["provider"] == "agent-codespaces"
+    assert ctx["id"] == "my-codespace"
 
 
 def test_jump_to_caller_targets_caller_worktree():
@@ -2467,7 +3271,7 @@ def test_run_tui_picker_writes_crash_log(monkeypatch, tmp_path):
 
     import pytest
 
-    from agent_worktrees import config as cfg
+    from worktree_manager.production_picker import project_config as cfg
     import worktree_manager.production_picker.picker_tui as pkg
     from worktree_manager.production_picker.picker_tui import engine as eng
 
@@ -2562,10 +3366,48 @@ def test_bucket_sections_key_off_state():
            rec("wip", 2), rec("unused", 3)]
     active, recent, completed = derive.bucket(wts)
     assert [w["state"] for w in active] == ["ACTIVE"]
-    # Both FINALs land in Completed regardless of age (1h and 60h).
-    assert sorted(w["state"] for w in completed) == ["FINAL", "FINAL"]
+    # Both completed rows land in Completed regardless of age (1h and 60h).
+    # No ``closure`` descriptor here, so ``_state()`` degrades to MERGED
+    # rather than trusting a raw FINAL claim -- ``bucket()`` still treats
+    # FINAL and MERGED alike as "completed".
+    assert sorted(w["state"] for w in completed) == ["MERGED", "MERGED"]
     # Recent is whatever is neither in-session nor final.
     assert sorted(w["state"] for w in recent) == ["UNUSED", "WIP"]
+
+
+def test_bucket_recent_sorts_by_last_resumed_not_creation_age():
+    """#3307 Phase 3: Recent orders by most-recently-used
+    (``last_resumed_at``), not by ``started_at``/creation age. A worktree
+    created weeks ago but resumed an hour ago must sort ABOVE one created
+    yesterday and never resumed since."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    old_created_recently_used = derive.norm(
+        {"id": "x-old-created", "status": "active", "state": "wip",
+         "started_at": "2026-05-01T09:00:00",
+         "last_resumed_at": "2026-06-27T17:00:00"},
+        "m", "Win")
+    new_created_never_resumed = derive.norm(
+        {"id": "x-new-created", "status": "active", "state": "unused",
+         "started_at": "2026-06-26T17:00:00"},
+        "m", "Win")
+    _active, recent, _completed = derive.bucket(
+        [new_created_never_resumed, old_created_recently_used])
+    assert [w["id"] for w in recent] == ["x-old-created", "x-new-created"]
+
+
+def test_bucket_recent_falls_back_to_started_at_when_never_resumed():
+    """No ``last_resumed_at`` at all (never resumed since creation) falls
+    back to ``started_at``, same as the pre-Phase-3 behavior -- so two
+    never-resumed rows still sort newest-created-first."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    older = derive.norm(
+        {"id": "x-older", "status": "active", "state": "wip",
+         "started_at": "2026-06-25T09:00:00"}, "m", "Win")
+    newer = derive.norm(
+        {"id": "x-newer", "status": "active", "state": "wip",
+         "started_at": "2026-06-26T09:00:00"}, "m", "Win")
+    _active, recent, _completed = derive.bucket([older, newer])
+    assert [w["id"] for w in recent] == ["x-newer", "x-older"]
 
 
 def test_sessionless_flag_only_when_count_known_zero():
@@ -2585,6 +3427,50 @@ def test_sessionless_flag_only_when_count_known_zero():
     assert n(session_count=0, turn_count=3)["sessionless"] is False   # had turns
     assert n(session_count=0, mux_attached=True)["sessionless"] is False
     assert n(session_count=0, kind="bridge")["sessionless"] is False  # managed
+
+
+def test_sess_turns_combines_session_count_and_turn_count():
+    """#3307 Phase 6, renamed LENGTH (operator feedback 2026-09-29): the
+    combined column renders "<session_count>s <turn_count>t", falling back
+    to "-" for the session half when ``session_count`` is absent (a
+    fixture or a too-old remote) rather than fabricating a count -- the
+    turn half always renders. Unit-suffixed so it never reads ambiguously
+    like a date (the prior "N/M" form's exact complaint)."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+
+    def n(**extra):
+        base = {"id": "anomalous-potato-win-zzzz", "status": "active",
+                "state": "wip", "started_at": "2026-06-27T17:00:00"}
+        base.update(extra)
+        return derive.norm(base, "m", "Win")
+
+    assert n(session_count=3, turn_count=47)["sess_turns"] == "3s 47t"
+    assert n(session_count=0, turn_count=0)["sess_turns"] == "0s 0t"
+    assert n(turn_count=5)["sess_turns"] == "-s 5t"          # count unknown
+    assert n()["sess_turns"] == "-s 0t"                      # neither known
+
+
+def test_pair_marker_names_this_rows_own_role():
+    """#3307 follow-up: the citadel pair marker names THIS row's own
+    pair_role inline (e.g. "⚭knowledge Title") rather than a bare icon --
+    naming the SIBLING's repo needs a cross-project lookup not yet built
+    (tracked separately). Falls back to a bare icon + space if pair_role is
+    somehow absent despite a pair_id (defensive, shouldn't happen)."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+
+    def n(**extra):
+        base = {"id": "anomalous-potato-win-zzzz", "status": "active",
+                "state": "wip", "started_at": "2026-06-27T17:00:00",
+                "title": "Implement Retry Logic"}
+        base.update(extra)
+        return derive.norm(base, "m", "Win")
+
+    assert n(pair_id="p1", pair_role="knowledge")["title"] == (
+        "⚭knowledge Implement Retry Logic")
+    assert n(pair_id="p1", pair_role="harness")["title"] == (
+        "⚭harness Implement Retry Logic")
+    assert n(pair_id="p1")["title"] == "⚭ Implement Retry Logic"
+    assert n()["title"] == "Implement Retry Logic"
 
 
 def _sessionless_source():
@@ -2641,77 +3527,43 @@ def test_picker_buckets_sessionless_into_unowned():
 
     asyncio.run(run())
 
-
 def test_reconcile_prs_counts_terminal_transitions(monkeypatch):
-    """#1423: reconcile_prs reconciles each non-terminal active PR and counts
-    those that moved to a terminal state, skipping no-PR / already-terminal."""
-    from pathlib import Path
-
+    """Group C compatibility wrapper reads the batch summary's PR count."""
     from worktree_manager.production_picker.picker_tui import data_local
 
-    class FakePR:
-        def __init__(self, number, state):
-            self.number, self.state = number, state
+    monkeypatch.setattr(
+        data_local,
+        "reconcile_local_batch",
+        lambda **_kwargs: type(
+            "Batch",
+            (),
+            {"summary": {"pr_terminal_count": 1}},
+        )(),
+    )
 
-    class FakeRec:
-        def __init__(self, pr):
-            self._pr = pr
-
-        def active_pr(self):
-            return self._pr
-
-    open_pr = FakePR(1, "open")
-    recs = [FakeRec(open_pr), FakeRec(FakePR(2, "merged")), FakeRec(None)]
-    monkeypatch.setattr(data_local.cfg, "load_config", lambda: object())
-    monkeypatch.setattr(data_local.cfg, "tracking_dir", lambda: Path("."))
-    monkeypatch.setattr(data_local.cfg, "detect_platform", lambda: "windows")
-    monkeypatch.setattr(data_local.tracking, "list_records",
-                        lambda p, platform_filter=None: recs)
-
-    def fake_reconcile(rec, config, *, best_effort=False):
-        if rec.active_pr() is open_pr:        # provider reports it merged
-            open_pr.state = "merged"
-
-    monkeypatch.setattr("agent_worktrees.pr_ops._reconcile_active_pr",
-                        fake_reconcile)
     assert data_local.reconcile_prs() == 1
 
 
-def test_picker_background_pr_reconcile_reloads_on_change():
-    """#1423: when the background reconcile reports a change, the non-live path
-    reloads local data so the render reflects the corrected PR state."""
+def test_reconcile_local_batch_uses_group_c_engine_call(monkeypatch):
+    from worktree_manager.production_picker.picker_tui import data_local
+
+    batch = types.SimpleNamespace(rows=[], summary={"record_count": 1})
+    seen = []
+    monkeypatch.setattr(data_local.context, "project", lambda: "example")
+    monkeypatch.setattr(
+        data_local.engine_group_c,
+        "picker_reconcile_local",
+        lambda project, **_kwargs: seen.append(project) or batch,
+    )
+
+    assert data_local.reconcile_local_batch() is batch
+    assert seen == ["example"]
+
+
+def test_picker_setup_does_not_spawn_legacy_reconcile_hooks():
+    """Phase 3d Step 6 folds local reconcile into the classify load itself."""
     src = _fixture_source()
-    calls = {"reconcile": 0, "load": 0}
-    orig_load = src.load
-
-    def load2():
-        calls["load"] += 1
-        return orig_load()
-
-    def reconcile_prs():
-        calls["reconcile"] += 1
-        return 1
-
-    src.load = load2
-    src.reconcile_prs = reconcile_prs
-
-    async def run():
-        app = PickerApp(src, live=False)
-        async with app.run_test(size=(118, 36)) as pilot:
-            scr = app.query_one(PickerScreen)
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline and not scr._pr_reconciled:
-                await pilot.pause()
-            assert calls["reconcile"] == 1
-            assert calls["load"] >= 2       # setup load + post-reconcile reload
-
-    asyncio.run(run())
-
-
-def test_picker_background_pr_reconcile_no_change_no_reload():
-    """A reconcile that changes nothing must not trigger a reload."""
-    src = _fixture_source()
-    calls = {"load": 0}
+    calls = {"reconcile": 0, "bound": 0, "load": 0}
     orig_load = src.load
 
     def load2():
@@ -2719,16 +3571,17 @@ def test_picker_background_pr_reconcile_no_change_no_reload():
         return orig_load()
 
     src.load = load2
-    src.reconcile_prs = lambda: 0
+    src.reconcile_local_batch = lambda: calls.__setitem__("reconcile", calls["reconcile"] + 1)
 
     async def run():
         app = PickerApp(src, live=False)
         async with app.run_test(size=(118, 36)) as pilot:
             scr = app.query_one(PickerScreen)
             deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline and not scr._pr_reconciled:
+            while time.monotonic() < deadline and scr._setup_applied_epoch == 0:
                 await pilot.pause()
-            assert calls["load"] == 1       # only the setup load
+            assert scr._bound_live_reconciled is True
+            assert calls == {"reconcile": 0, "bound": 0, "load": 1}
 
     asyncio.run(run())
 
@@ -2784,11 +3637,13 @@ def test_maybe_repoll_gating(monkeypatch):
 
 def test_bucket_fallback_no_classify_finalized_is_clean_not_wip():
     """An old remote (no --classify -> no state) must not show FINAL + unmerged."""
-    # status finalized, no git classification -> display FINAL, bucket clean.
+    # status finalized, no git classification -> no closure descriptor either,
+    # so state degrades to MERGED (never FINAL). cleanup_bucket is independent
+    # of state and still reads clean/SAFE.
     w = derive.norm(
         {"id": "emancipation-cube-wsl-1234", "status": "finalized",
          "started_at": "2026-06-25T10:00:00"}, "Emancipation-Cube", "WSL")
-    assert w["state"] == "FINAL"
+    assert w["state"] == "MERGED"
     assert w["cleanup_bucket"] == "clean"          # not 'wip'/'unmerged'
     assert derive.BUCKET_DISPO[w["cleanup_bucket"]] == "SAFE"
 
@@ -2800,16 +3655,20 @@ def test_bucket_fallback_no_classify_finalized_is_clean_not_wip():
     assert derive.BUCKET_DISPO[w2["cleanup_bucket"]] == ""   # no chip
 
 
-def test_new_picker_flag_gating(monkeypatch):
-    monkeypatch.delenv("AGENT_WORKTREES_NEW_PICKER", raising=False)
-    monkeypatch.delenv("AGENT_WORKTREES_LEGACY_PICKER", raising=False)
-    # Default everywhere: the Textual picker is on with no config/env.
-    assert new_picker_enabled() is True
-    monkeypatch.setenv("AGENT_WORKTREES_NEW_PICKER", "1")
-    assert new_picker_enabled() is True
-    # Legacy override always wins (the rollback switch).
-    monkeypatch.setenv("AGENT_WORKTREES_LEGACY_PICKER", "1")
-    assert new_picker_enabled() is False
+def test_held_claims_buckets_have_disposition_chips():
+    # The held-claims/held-claims-cross-machine cleanup buckets emitted by
+    # agent-worktrees' prune.cleanup_disposition must each have their own
+    # disposition-chip entry here -- a held-claims-blocked worktree must
+    # never render with no chip at all, and the cross-machine variant needs
+    # its own reason naming the claim's target as remote.
+    assert derive.BUCKET_DISPO["held-claims"] == "REVIEW"
+    assert derive.BUCKET_DISPO["held-claims-cross-machine"] == "REVIEW"
+    assert derive.BUCKET_REASON["held-claims-cross-machine"] != (
+        derive.BUCKET_REASON["held-claims"])
+    w = derive.norm(
+        {"id": "wt-xm", "status": "finalized", "cleanup_bucket": "held-claims-cross-machine",
+         "started_at": "2026-06-25T10:00:00"}, "machine", "WSL")
+    assert w["cleanup_bucket"] == "held-claims-cross-machine"
 
 
 def test_tui_renders_local_worktrees():
@@ -2824,7 +3683,10 @@ def test_tui_renders_local_worktrees():
             # Canonical state vocabulary (test-chamber #1290).
             assert "ACTIVE" in out
             assert "UNUSED" in out
-            assert "FINAL" in out
+            # "Done work" is COMPLETED with no closure descriptor in this
+            # fixture, so ``_state()`` degrades to MERGED rather than
+            # trusting a raw FINAL claim.
+            assert "MERGED" in out
             # Real machine identity from the source.
             assert "anomalous-potato" in out
 
@@ -2941,8 +3803,19 @@ def test_tui_live_multi_machine():
             scr = app.query_one(PickerScreen)
             # Switch to the "All" tab so every ready machine interleaves.
             scr.machine_idx = 0
-            # Drive a render tick so live records stream in from the loader.
-            scr._tick()
+            # Live mode now paints a chrome-only first frame, then starts the
+            # background loader after that refresh boundary.
+            await pilot.pause()
+            await pilot.pause()
+            for _ in range(20):
+                scr._tick()
+                await pilot.pause()
+                scr.machine_idx = 0
+                out = pcap.screen_to_text(scr)
+                if "Local wip" in out and "Remote work" in out:
+                    break
+            scr.machine_idx = 0
+            scr.refresh()
             await pilot.pause()
             out = pcap.screen_to_text(scr)
             assert "Worktree Manager" in out
@@ -2996,6 +3869,7 @@ def test_resume_decision_exits_with_worktree():
         async with app.run_test(size=(118, 36)) as pilot:
             scr = app.query_one(PickerScreen)
             scr.machine_idx = scr.local_index()
+            scr.real_ops = True
             scr.sel = ("L", 0)
             scr._activate()                 # opens the sub-menu, no exit
             await pilot.pause()
@@ -3023,6 +3897,7 @@ def test_open_submenu_no_mux_toggle():
         async with app.run_test(size=(118, 36)) as pilot:
             scr = app.query_one(PickerScreen)
             scr.machine_idx = scr.local_index()
+            scr.real_ops = True
             scr.sel = ("L", 0)
             scr._open_submenu()
             await pilot.pause()
@@ -3144,10 +4019,117 @@ def test_submenu_nomux_offered_for_resume_and_open():
     m = SubMenuScreen(rec, ["Resume", "Messages", "Stop"])
     assert m._has_nomux is True
     assert m._nomux_index == 3
+    assert m._has_ahp is True
+    assert m._ahp_index == 4
+    assert m.no_mux is False
+    assert m.ahp is False
     # No launch verb -> not offered.
     assert SubMenuScreen(rec, ["Messages", "Sync"])._has_nomux is False
     # Bare resume WITHOUT Open/Resume -> not offered (it already makes a mux).
     assert SubMenuScreen(rec, ["Bare resume", "Messages"])._has_nomux is False
+
+
+def test_remote_submenu_does_not_offer_ahp():
+    from worktree_manager.production_picker.picker_tui.engine import SubMenuScreen
+
+    rec = {
+        "raw": {"id": "wtX"},
+        "id4": "wtX",
+        "title": "t",
+        "is_local": False,
+    }
+    menu = SubMenuScreen(rec, ["Resume", "Messages"])
+
+    assert menu._has_nomux is True
+    assert menu._has_ahp is False
+    assert menu._ahp_index is None
+
+
+def test_ahp_owned_worktree_offers_explicit_disposal_action():
+    src = _verb_fixture_source()
+    screen = PickerScreen(src, live=False)
+    screen.setup_sync_for_tests()
+    rec = screen.list_records()[0]
+    rec["execution_leg"] = {
+        "provider": "ahp",
+        "state": "active",
+        "binding_revision": 2,
+        "blob": {"session_id": "session-1"},
+    }
+
+    actions, _extensions = screen._wt_submenu_verbs(rec)
+
+    assert "Dispose hosted session" in actions
+
+
+def test_open_submenu_ahp_toggle_is_arrow_reachable():
+    src = _verb_fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            recs = scr.list_records()
+            by_id4 = {w["id4"]: i for i, w in enumerate(recs)}
+            scr.sel = ("L", by_id4["stop"])
+            scr._open_submenu()
+            await pilot.pause()
+            menu = _sub_menu(scr)
+            assert menu.ahp is False
+            for _ in range(menu._ahp_index):
+                await pilot.press("down")
+            await pilot.press("space")
+            assert menu.ahp is True
+            for _ in range(menu._ahp_index):
+                await pilot.press("up")
+            await pilot.press("enter")
+            await pilot.pause()
+        assert app.result["options"]["ahp"] is True
+        assert "no_mux" not in app.result["options"]
+
+    asyncio.run(run())
+
+
+def test_open_submenu_modifiers_can_be_combined():
+    """Phase 3b's backend/presentation split is real in the picker: the
+    local Resume/Open submenu can enable BOTH No Mux and AHP before launching,
+    proving the toggles are independent rather than a single exclusive mode."""
+    src = _verb_fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            recs = scr.list_records()
+            by_id4 = {w["id4"]: i for i, w in enumerate(recs)}
+            scr.sel = ("L", by_id4["stop"])
+            scr._open_submenu()
+            await pilot.pause()
+            menu = _sub_menu(scr)
+            assert menu is not None
+            assert menu._actions[0] == "Resume"
+            assert menu._nomux_index is not None
+            assert menu._ahp_index is not None
+            for _ in range(menu._nomux_index):
+                await pilot.press("down")
+            await pilot.press("space")
+            assert menu.no_mux is True
+            await pilot.press("down")
+            await pilot.press("space")
+            assert menu.ahp is True
+            for _ in range(menu._ahp_index):
+                await pilot.press("up")
+            await pilot.press("enter")
+            await pilot.pause()
+        assert app.result["action"] == "resume"
+        assert app.result["options"]["no_mux"] is True
+        assert app.result["options"]["ahp"] is True
+
+    asyncio.run(run())
 
 
 def test_open_submenu_no_mux_toggle_on_resume():
@@ -3287,6 +4269,109 @@ def test_msgview_local_load_populates_and_closes(monkeypatch):
     asyncio.run(run())
 
 
+def test_sessions_verb_gated_on_registered_session_count():
+    """#3307 Phase 7: the "Sessions" sub-menu verb is offered whenever a
+    worktree has at least one registered session (``session_count``),
+    independent of current liveness -- unlike "Messages" (gated off
+    ``sessionless``), a stopped worktree's session HISTORY is still worth
+    browsing. The cold-start ("none", session_count=0) row never offers it."""
+    src = _verb_fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            recs = scr.list_records()
+            by_id4 = {w["id4"]: i for i, w in enumerate(recs)}
+
+            for key in ("live", "stop"):
+                scr.sel = ("L", by_id4[key])
+                scr._open_submenu()
+                await pilot.pause()
+                menu = _sub_menu(scr)
+                assert menu is not None
+                assert "Sessions" in menu._actions, key
+                scr.app.pop_screen()
+                await pilot.pause()
+
+            scr.sel = ("L", by_id4["none"])
+            scr._open_submenu()
+            await pilot.pause()
+            menu = _sub_menu(scr)
+            assert menu is not None
+            assert "Sessions" not in menu._actions
+
+    asyncio.run(run())
+
+
+def test_sessionsview_local_load_populates_and_closes(monkeypatch):
+    """Enter on 'Sessions' loads the worktree's full session registry through
+    the provider CLI and renders id/state/started/ended/turns/head -- the
+    #3307 Phase 7 dedicated history browse, distinct from Messages' abbreviated
+    per-session list."""
+    from worktree_manager import engine_client
+    from worktree_manager.production_picker import context
+
+    monkeypatch.setattr(context, "project", lambda: "example")
+    monkeypatch.setattr(
+        engine_client,
+        "list_worktree_sessions",
+        lambda *_a, **_k: [
+            {"id": "sess-head-0001", "is_head": True, "state": "active",
+             "turn_count": 7, "started_at_marker": "2026-06-27T17:00:00",
+             "ended_at_marker": None},
+            {"id": "sess-pred-0002", "is_head": False, "state": "handed-off",
+             "turn_count": 3, "started_at_marker": "2026-06-27T16:00:00",
+             "ended_at_marker": "2026-06-27T17:00:00"},
+        ],
+    )
+
+    src = _verb_fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            by_id4 = {w["id4"]: i for i, w in enumerate(scr.list_records())}
+            scr.sel = ("L", by_id4["stop"])
+            scr._open_submenu()
+            await pilot.pause()
+            menu = _sub_menu(scr)
+            assert menu is not None
+            for _ in range(menu._actions.index("Sessions")):
+                await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not _sub_menu_open(scr)
+            assert scr.sessionsview is not None
+            assert _sessionsview_open(scr)
+            for _ in range(200):
+                if scr.sessionsview and not scr.sessionsview["loading"]:
+                    break
+                await pilot.pause()
+                time.sleep(0.01)
+            assert scr.sessionsview["loading"] is False
+            assert scr.sessionsview["error"] is None
+            ids = [s["id"] for s in scr.sessionsview["sessions"]]
+            assert ids == ["sess-head-0001", "sess-pred-0002"]
+            await pilot.pause()
+            out = _sessionsview_screen(scr)._panel().renderable.plain
+            assert "sess-head" in out
+            assert "sess-pred" in out
+            assert "\u25cf" in out          # head marker rendered
+            # Esc through the real keyboard pipeline closes it.
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not _sessionsview_open(scr)
+            assert scr.sessionsview is None
+
+    asyncio.run(run())
+
+
 def test_wrap_text_wraps_and_hard_splits():
     """Word-wrap respects width, keeps whole words, and hard-splits a word
     longer than the width."""
@@ -3362,7 +4447,10 @@ def test_submenu_stop_starts_single_item_restart_run(monkeypatch):
 
 
 def test_new_worktree_decision_exits():
-    """New worktree… opens the options dialog; Create exits with a decision."""
+    """New worktree… opens the merged options+prompt dialog; Create exits
+    with a decision directly -- no second screen (Phase A, folded the
+    optional seed prompt into this one dialog's own content stack:
+    header -> prompt -> options -> buttons)."""
     src = _fixture_source()
 
     async def run():
@@ -3378,18 +4466,187 @@ def test_new_worktree_decision_exits():
             dlg = _scope_dlg(scr)
             assert dlg is not None
             from worktree_manager.production_picker.picker_tui.engine import FocusGroup
-            # optmenu opens focused on the Create button group (native focus).
+            # optmenu opens focused on the Create button group (native focus) --
+            # Create stays the default stop even with the prompt field present.
             assert dlg.query_one("#scope-buttons", FocusGroup).has_focus
             assert all(not o["on"] for o in dlg._dlg["opts"])
-            await pilot.press("enter")      # confirm Create, no options
+            await pilot.press("enter")      # confirm Create, no options, blank prompt
             await pilot.pause()
         assert app.result is not None
         assert app.result["action"] == "new"
         assert app.result["is_local"] is True
         assert app.result["options"] == {
             "anchor": False, "bare": False,
-            "no_mux": False, "local_model": False,
+            "no_mux": False, "ahp": False, "local_model": False,
+            "seed_prompt": "",
         }
+
+    asyncio.run(run())
+
+
+def test_new_worktree_dialog_focus_stops_prompt_list_buttons():
+    """The merged dialog's content stack is header -> prompt -> options ->
+    buttons, with exactly three Tab stops (prompt box, options list,
+    buttons) -- Create is the default stop, and Tab cycles forward through
+    the other two and wraps. Enter from the prompt box jumps straight to
+    Create (not the options list) -- the prompt is almost always left blank
+    or typed-and-done, so the common "just launch" case shouldn't need an
+    extra Tab/Shift+Tab after it."""
+    from textual.widgets import SelectionList
+    from worktree_manager.production_picker.picker_tui.engine import FocusGroup
+    from worktree_manager.production_picker.picker_tui.field_widgets import (
+        _AutoExpandTextArea,
+    )
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.htab = 0
+            scr.btn_idx = 0
+            scr.sel = ("BTN", 0)
+            scr._activate()
+            await pilot.pause()
+            dlg = _scope_dlg(scr)
+            assert dlg is not None
+            buttons = dlg.query_one("#scope-buttons", FocusGroup)
+            prompt_box = dlg.query_one("#q-0", _AutoExpandTextArea)
+            options = dlg.query_one("#scope-opts", SelectionList)
+            assert buttons.has_focus          # default: Create
+            await pilot.press("tab")
+            assert prompt_box.has_focus       # wraps forward to the prompt box
+            await pilot.press("tab")
+            assert options.has_focus          # then the options list
+            await pilot.press("tab")
+            assert buttons.has_focus          # then back to the buttons
+
+            # Enter from the prompt box jumps straight to the button row,
+            # with Create highlighted -- not the options list.
+            prompt_box.focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            assert buttons.has_focus
+            assert buttons._idx == 0
+
+    asyncio.run(run())
+
+
+def test_new_worktree_bare_drops_seed_prompt(monkeypatch):
+    """#4778-ish (picker-new-session-prompt-and-composer Phase A item 3): a
+    Bare worktree gets no Copilot bootstrap at all -- nothing to seed -- so
+    confirming Create with Bare checked must silently drop whatever was
+    typed into the SAME dialog's prompt box, never forwarding it toward a
+    launch that could never deliver it. ``_SEED_PROMPT_ENABLED`` is on by
+    default now that both delivery seams (engine_client's --seed forward +
+    launch-session.{ps1,sh}'s post-create `embody` call) are closed; this
+    monkeypatch is now a no-op defensive pin, not a feature-gate override."""
+    from worktree_manager.production_picker.picker_tui import engine_maintenance_actions as ema
+    from worktree_manager.production_picker.picker_tui.field_widgets import (
+        _AutoExpandTextArea,
+    )
+    monkeypatch.setattr(ema, "_SEED_PROMPT_ENABLED", True)
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.htab = 0
+            scr.btn_idx = 0
+            scr.sel = ("BTN", 0)
+            scr._activate()
+            await pilot.pause()
+            dlg = _scope_dlg(scr)
+            dlg.query_one("#q-0", _AutoExpandTextArea).text = "fix the flaky test"
+            labels = [o["label"] for o in dlg._dlg["opts"]]
+            bare = labels.index("Bare")
+            await pilot.press("tab")            # buttons -> prompt
+            await pilot.press("tab")            # prompt -> options
+            for _ in range(bare):
+                await pilot.press("down")
+            await pilot.press("space")          # toggle Bare on
+            await pilot.press("tab")            # options -> buttons
+            await pilot.press("enter")          # confirm Create
+            await pilot.pause()
+        assert app.result is not None
+        assert app.result["action"] == "new"
+        assert app.result["options"]["bare"] is True
+        assert app.result["options"]["seed_prompt"] == ""
+
+    asyncio.run(run())
+
+
+def test_new_worktree_no_mux_drops_seed_prompt(monkeypatch):
+    """A No-Mux worktree launches Copilot directly, bypassing the mux pane
+    that `agent-worktrees embody`'s pending_seed delivery depends on
+    entirely -- a typed prompt would be persisted but never delivered (or
+    delivered unexpectedly later, if a mux session is created afterward).
+    Confirming Create with No Mux checked must silently drop it, mirroring
+    the Bare path."""
+    from worktree_manager.production_picker.picker_tui import engine_maintenance_actions as ema
+    from worktree_manager.production_picker.picker_tui.field_widgets import (
+        _AutoExpandTextArea,
+    )
+    monkeypatch.setattr(ema, "_SEED_PROMPT_ENABLED", True)
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.htab = 0
+            scr.btn_idx = 0
+            scr.sel = ("BTN", 0)
+            scr._activate()
+            await pilot.pause()
+            dlg = _scope_dlg(scr)
+            dlg.query_one("#q-0", _AutoExpandTextArea).text = "fix the flaky test"
+            labels = [o["label"] for o in dlg._dlg["opts"]]
+            no_mux = labels.index("No Mux")
+            await pilot.press("tab")            # buttons -> prompt
+            await pilot.press("tab")            # prompt -> options
+            for _ in range(no_mux):
+                await pilot.press("down")
+            await pilot.press("space")          # toggle No Mux on
+            await pilot.press("tab")            # options -> buttons
+            await pilot.press("enter")          # confirm Create
+            await pilot.pause()
+        assert app.result is not None
+        assert app.result["action"] == "new"
+        assert app.result["options"]["no_mux"] is True
+        assert app.result["options"]["seed_prompt"] == ""
+
+    asyncio.run(run())
+
+
+def test_new_worktree_seed_prompt_carries_through(monkeypatch):
+    """A typed prompt in the SAME dialog's prompt box reaches the launch
+    decision's ``options["seed_prompt"]`` when no incompatible option is
+    checked (``_SEED_PROMPT_ENABLED`` forced on -- see
+    ``test_new_worktree_bare_drops_seed_prompt``)."""
+    from worktree_manager.production_picker.picker_tui import engine_maintenance_actions as ema
+    from worktree_manager.production_picker.picker_tui.field_widgets import (
+        _AutoExpandTextArea,
+    )
+    monkeypatch.setattr(ema, "_SEED_PROMPT_ENABLED", True)
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.htab = 0
+            scr.btn_idx = 0
+            scr.sel = ("BTN", 0)
+            scr._activate()
+            await pilot.pause()
+            dlg = _scope_dlg(scr)
+            dlg.query_one("#q-0", _AutoExpandTextArea).text = "fix the flaky test"
+            await pilot.press("enter")          # confirm Create, no options
+            await pilot.pause()
+        assert app.result["action"] == "new"
+        assert app.result["options"]["seed_prompt"] == "fix the flaky test"
 
     asyncio.run(run())
 
@@ -3415,7 +4672,8 @@ def test_new_worktree_no_mux_option():
             labels = [o["label"] for o in dlg._dlg["opts"]]
             assert "No Mux" in labels
             nm = labels.index("No Mux")
-            await pilot.press("tab")            # Create button group -> options
+            await pilot.press("tab")            # Create button group -> prompt box
+            await pilot.press("tab")            # prompt box -> options
             options = dlg.query_one("#scope-opts", SelectionList)
             assert options.has_focus
             for _ in range(nm):
@@ -3425,8 +4683,100 @@ def test_new_worktree_no_mux_option():
             await pilot.press("tab")            # options -> button group
             await pilot.press("enter")          # confirm Create
             await pilot.pause()
+            # No Mux bypasses the mux pane `embody`'s delivery depends on
+            # entirely, so the (blank) prompt is dropped -- this must go
+            # straight to the launch decision, same as Bare.
         assert app.result["action"] == "new"
         assert app.result["options"]["no_mux"] is True
+
+    asyncio.run(run())
+
+
+def test_new_worktree_ahp_option_defaults_off_and_toggles():
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.htab = 0
+            scr.btn_idx = 0
+            scr.sel = ("BTN", 0)
+            scr._activate()
+            await pilot.pause()
+            dlg = _scope_dlg(scr)
+            labels = [o["label"] for o in dlg._dlg["opts"]]
+            ahp = labels.index("AHP")
+            assert dlg._dlg["opts"][ahp]["on"] is False
+            await pilot.press("tab")            # buttons -> prompt
+            await pilot.press("tab")            # prompt -> options
+            for _ in range(ahp):
+                await pilot.press("down")
+            await pilot.press("space")
+            await pilot.press("tab")
+            await pilot.press("enter")
+            await pilot.pause()
+        assert app.result["options"]["ahp"] is True
+        assert app.result["options"]["no_mux"] is False
+
+    asyncio.run(run())
+
+
+def test_new_worktree_modifiers_can_be_combined():
+    """Create-options AHP and No Mux are independent axes, so a new worktree
+    can request the hosted backend without the mux presentation."""
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.htab = 0
+            scr.btn_idx = 0
+            scr.sel = ("BTN", 0)
+            scr._activate()
+            await pilot.pause()
+            dlg = _scope_dlg(scr)
+            labels = [o["label"] for o in dlg._dlg["opts"]]
+            no_mux = labels.index("No Mux")
+            ahp = labels.index("AHP")
+            await pilot.press("tab")            # buttons -> prompt
+            await pilot.press("tab")            # prompt -> options
+            for _ in range(no_mux):
+                await pilot.press("down")
+            await pilot.press("space")
+            for _ in range(ahp - no_mux):
+                await pilot.press("down")
+            await pilot.press("space")
+            await pilot.press("tab")
+            await pilot.press("enter")
+            await pilot.pause()
+            # No Mux bypasses the mux pane `embody`'s delivery depends on
+            # entirely, so the (blank) prompt is dropped here too.
+        assert app.result["options"]["no_mux"] is True
+        assert app.result["options"]["ahp"] is True
+
+    asyncio.run(run())
+
+
+def test_remote_new_worktree_options_hide_ahp():
+    """A remote target never composes the prompt field at all (its typed
+    text could never deliver -- the engine's resolve CLI rejects --seed
+    alongside --machine), not just drops it after the fact."""
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.create_target = lambda: ("remote-host", "WSL")
+            scr._open_optmenu()
+            await pilot.pause()
+            dlg = _scope_dlg(scr)
+            assert dlg is not None
+            labels = [o["label"] for o in dlg._dlg["opts"]]
+            assert "AHP" not in labels
+            assert dlg._show_prompt is False
 
     asyncio.run(run())
 
@@ -3449,7 +4799,8 @@ def test_new_worktree_anchor_option_shows_selected_state():
             from textual.widgets import Static
             prompt = dlg.query_one("#scope-prompt", Static)
             assert "Selected: none" in prompt.render().plain
-            await pilot.press("tab")
+            await pilot.press("tab")            # buttons -> prompt box
+            await pilot.press("tab")            # prompt box -> options
             await pilot.press("space")
             await pilot.pause()
             assert dlg._dlg["opts"][0]["label"] == "Anchor repo"
@@ -3458,8 +4809,45 @@ def test_new_worktree_anchor_option_shows_selected_state():
             await pilot.press("tab")
             await pilot.press("enter")
             await pilot.pause()
+            # Anchor resolves via `--base`, which the engine's own resolve
+            # CLI rejects alongside `--seed` -- the (blank) prompt is
+            # dropped here too, same as Bare/No Mux.
         assert app.result["action"] == "new"
         assert app.result["options"]["anchor"] is True
+        assert app.result["options"]["seed_prompt"] == ""
+
+    asyncio.run(run())
+
+
+def test_new_worktree_remote_target_skips_seed_prompt(monkeypatch):
+    """A remote-machine target resolves via `--machine`, which the engine's
+    own resolve CLI also rejects alongside `--seed`. The prompt field is
+    never even composed for a remote target -- same class of gap as
+    Anchor/Bare/No Mux, closed earlier instead (at dialog-build time, not
+    confirm time) since remote-ness is already known before the dialog
+    opens."""
+    from worktree_manager.production_picker.picker_tui import engine_maintenance_actions as ema
+    monkeypatch.setattr(ema, "_SEED_PROMPT_ENABLED", True)
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.create_target = lambda: ("remote-host", "WSL")
+            scr._open_optmenu()
+            await pilot.pause()
+            dlg = _scope_dlg(scr)
+            assert dlg is not None
+            from worktree_manager.production_picker.picker_tui.engine import FocusGroup
+            assert dlg.query_one("#scope-buttons", FocusGroup).has_focus
+            assert dlg._show_prompt is False
+            await pilot.press("enter")          # confirm Create, no options
+            await pilot.pause()
+        assert app.result is not None
+        assert app.result["action"] == "new"
+        assert app.result["machine"] == "remote-host"
+        assert app.result["options"]["seed_prompt"] == ""
 
     asyncio.run(run())
 
@@ -3497,6 +4885,10 @@ def test_scope_dialog_highlight_is_focus_gated():
             assert highlight_rgb() != AMBER
 
             # Tab into the list: focus arrives, the cursor highlight lights up.
+            # (The New-worktree dialog's prompt box is the first Tab-wrap stop
+            # now that it's folded into this same dialog -- two Tabs reach the
+            # options list: buttons -> prompt -> list.)
+            await pilot.press("tab")
             await pilot.press("tab")
             await pilot.pause()
             assert sl.has_focus is True
@@ -3852,7 +5244,7 @@ def test_update_indicator_focus_glyph_and_refresh():
 
     src = _fixture_source()
     s = PickerScreen(src, live=False)
-    s.setup()
+    s.setup_sync_for_tests()
     s.htab = 0
     s.frame = 0
 
@@ -3861,6 +5253,13 @@ def test_update_indicator_focus_glyph_and_refresh():
     assert ("UPD", 0) not in s.stops()
     assert not s._update_actionable()
     assert "\u2713" in s._update_seg(False).plain          # ✓
+
+    # paused: truthful informational state with no refresh action.
+    s.update_state = "paused"
+    assert ("UPD", 0) not in s.stops()
+    assert not s._update_actionable()
+    assert "\u2016" in s._update_seg(False).plain          # ‖
+    assert "Updates paused" in "".join(row.plain for row in s.topbar(118))
 
     # available: focusable refresh stop, refresh glyph.
     s.update_state = "available"
@@ -3886,6 +5285,288 @@ def test_update_indicator_focus_glyph_and_refresh():
     assert captured == {"action": "refresh"}
 
 
+def test_orphan_chip_appears_in_status_text_when_orphans_present():
+    """worktree-claims-transitive-finalization Phase 4 item 2: a re-homed
+    obligation awaiting ``claims cleanup`` has no worktree row of its own,
+    so it surfaces as a status-line chip instead -- labeled "(local, 'o')"
+    so it is never mistaken for a fleet-wide/cross-machine count (the
+    orphanage registry is per-machine local state)."""
+    s = PickerScreen(_fixture_source(), live=False)
+    s.setup_sync_for_tests()
+    s.htab = 0
+    assert s._orphans == []
+    assert "orphaned" not in s.status_text(False).plain
+
+    s._orphans = [{"kind": "codespace", "ref": "cs-1"}]
+    text = s.status_text(False).plain
+    assert "1 orphaned (local, 'o')" in text
+    assert "\u26a0" in text   # ⚠
+    # The compact form (used when the full status doesn't fit) still
+    # preserves the local scope and the 'o' shortcut -- never a bare
+    # "⚠N" that a narrow terminal could mistake for a fleet-wide count.
+    compact = s.status_text(True).plain
+    assert "\u26a01(local,'o')" in compact
+
+
+def test_poll_orphan_state_fetches_from_source_orphans(monkeypatch):
+    """``_poll_orphan_state`` reads the data source's optional ``orphans()``
+    hook off the render thread (via ``_run_bg``) and caches the result."""
+    s = PickerScreen(_fixture_source(), live=False)
+    s.setup_sync_for_tests()
+
+    def _sync_run_bg(_label, work, done=None, **_kwargs):
+        result = work()
+        if done is not None:
+            done(result)
+
+    monkeypatch.setattr(s, "_run_bg", _sync_run_bg)
+    s.src.orphans = lambda: [{"kind": "codespace", "ref": "cs-9"}]
+
+    s._poll_orphan_state(force=True)
+    assert s._orphans == [{"kind": "codespace", "ref": "cs-9"}]
+
+
+def test_poll_orphan_state_is_a_noop_when_source_lacks_orphans_hook(monkeypatch):
+    """A fixture/provider source with no ``orphans()`` attribute at all (the
+    common case -- most tests' ``_fixture_source()`` has none) must never
+    raise; the chip simply never appears."""
+    s = PickerScreen(_fixture_source(), live=False)
+    s.setup_sync_for_tests()
+    assert not hasattr(s.src, "orphans")
+
+    def _sync_run_bg(_label, work, done=None, **_kwargs):
+        result = work()
+        if done is not None:
+            done(result)
+
+    monkeypatch.setattr(s, "_run_bg", _sync_run_bg)
+    s._poll_orphan_state(force=True)
+    assert s._orphans == []
+
+
+def test_poll_orphan_state_discards_an_older_in_flight_result(monkeypatch):
+    """Each ``_poll_orphan_state`` call starts its own independent
+    background thread, so an older (slower) request can finish AFTER a
+    newer one. The older request's result must never clobber the newer
+    snapshot -- the generation guard in ``_done`` must reject it."""
+    s = PickerScreen(_fixture_source(), live=False)
+    s.setup_sync_for_tests()
+
+    pending_done = []
+
+    def _deferred_run_bg(_label, work, done=None, **_kwargs):
+        # Run `work()` immediately (as the real thread would, eventually),
+        # but stash `done` so the TEST controls completion order instead of
+        # the real (indeterminate) thread-scheduling order.
+        result = work()
+        pending_done.append((result, done))
+
+    monkeypatch.setattr(s, "_run_bg", _deferred_run_bg)
+
+    s.src.orphans = lambda: [{"kind": "codespace", "ref": "cs-OLD"}]
+    s._poll_orphan_state(force=True)               # generation 1, queued
+    s.src.orphans = lambda: [{"kind": "codespace", "ref": "cs-NEW"}]
+    s._poll_orphan_state(force=True)                # generation 2, queued
+
+    assert len(pending_done) == 2
+    # The NEWER request (generation 2) completes first...
+    pending_done[1][1](pending_done[1][0])
+    assert s._orphans == [{"kind": "codespace", "ref": "cs-NEW"}]
+    # ...then the OLDER, slower request (generation 1) finally completes --
+    # its stale result must be discarded, not re-applied over the newer one.
+    pending_done[0][1](pending_done[0][0])
+    assert s._orphans == [{"kind": "codespace", "ref": "cs-NEW"}]
+
+
+def test_poll_orphan_state_respects_the_cache_ttl_unless_forced(monkeypatch):
+    s = PickerScreen(_fixture_source(), live=False)
+    s.setup_sync_for_tests()
+    calls = []
+    s.src.orphans = lambda: (calls.append(1), [])[1]
+
+    def _sync_run_bg(_label, work, done=None, **_kwargs):
+        result = work()
+        if done is not None:
+            done(result)
+
+    monkeypatch.setattr(s, "_run_bg", _sync_run_bg)
+    s._poll_orphan_state()
+    s._poll_orphan_state()   # within the TTL -- no second fetch
+    assert len(calls) == 1
+    s._poll_orphan_state(force=True)
+    assert len(calls) == 2
+
+
+def test_poll_orphan_state_always_fetches_on_a_fresh_low_uptime_clock(monkeypatch):
+    """Regression: a just-booted host/container's ``time.monotonic()`` can
+    read well under ``_ORPHAN_POLL_SECS`` (120s). The cache must key off
+    "never polled yet" (``None``), not a bare ``0.0`` timestamp -- comparing
+    a real small monotonic reading against literal ``0.0`` wrongly looks
+    "already fresh" and skips the very first fetch."""
+    from worktree_manager.production_picker.picker_tui import engine_runtime
+
+    s = PickerScreen(_fixture_source(), live=False)
+    s.setup_sync_for_tests()
+    calls = []
+    s.src.orphans = lambda: (calls.append(1), [])[1]
+
+    def _sync_run_bg(_label, work, done=None, **_kwargs):
+        result = work()
+        if done is not None:
+            done(result)
+
+    monkeypatch.setattr(s, "_run_bg", _sync_run_bg)
+    monkeypatch.setattr(engine_runtime.time, "monotonic", lambda: 5.0)
+
+    s._poll_orphan_state()
+    assert len(calls) == 1
+
+
+def test_o_key_opens_orphanage_screen_listing_the_cached_entries():
+    from worktree_manager.production_picker.picker_tui.orphanage import OrphanageScreen
+
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            await pilot.pause()
+            scr._orphans = [
+                {"kind": "codespace", "ref": "cs-1", "source_worktree": "wt-old"},
+            ]
+            scr.sel = ("L", 0)
+            scr._dispatch_key("o")
+            await pilot.pause()
+            screens = [s for s in scr.app.screen_stack if isinstance(s, OrphanageScreen)]
+            assert screens
+            body = screens[0]._body().plain
+            assert "cs-1" in body
+            assert "wt-old" in body
+
+    asyncio.run(run())
+
+
+def test_o_key_is_a_noop_when_nothing_is_orphaned():
+    """Never opens an empty/pointless modal -- matches the chip's own
+    conditional appearance (``if self._orphans``)."""
+    from worktree_manager.production_picker.picker_tui.orphanage import OrphanageScreen
+
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            await pilot.pause()
+            assert scr._orphans == []
+            scr.sel = ("L", 0)
+            scr._dispatch_key("o")
+            await pilot.pause()
+            assert not any(
+                isinstance(s, OrphanageScreen) for s in scr.app.screen_stack)
+
+    asyncio.run(run())
+
+
+def test_manager_update_seg_is_distinct_from_the_engine_update_seg(monkeypatch):
+    """The Manager's own update-availability state (manager_update_state)
+    renders via a SEPARATE segment from the engine/marketplace one
+    (update_state) -- conflating the two previously made the topbar's
+    checkmark next to the version string mean "the engine plugin's staged
+    payload is current", not "the Manager itself is current", which read as
+    a false assurance when the Manager was actually stale."""
+    from worktree_manager.production_picker.picker_tui.engine import PickerScreen
+
+    s = PickerScreen(_fixture_source(), live=False)
+    s.setup_sync_for_tests()
+    s.htab = 0
+
+    # idle: no segment (matches the engine segment's own idle behavior).
+    s.manager_update_state = "idle"
+    assert s._manager_update_seg(False) is None
+
+    # current: a plain checkmark, no focus stop (purely informational).
+    s.manager_update_state = "current"
+    assert "\u2713" in s._manager_update_seg(False).plain    # ✓
+    assert ("MUP", 0) not in s.stops()
+
+    # available: a short, focusable "↻ Update available" button -- kept
+    # terse (no embedded version number or literal command) to match the
+    # engine segment's own style and never overflow the topbar.
+    s.manager_update_state = "available"
+    seg = s._manager_update_seg(False)
+    assert "\u21bb" in seg.plain                            # ↻
+    assert "Update available" in seg.plain
+    assert "worktree-manager update" not in seg.plain
+    assert ("MUP", 0) in s.stops()
+
+    # Enter on the Manager's own update icon records a distinct
+    # `action: manager-update` decision (never conflated with `refresh`).
+    captured = {}
+    s._decide = lambda d: captured.update(d)
+    s.sel = ("MUP", 0)
+    s._activate()
+    assert captured == {"action": "manager-update"}
+
+
+def test_manager_update_seg_appears_in_the_topbar_next_to_the_version():
+    from worktree_manager.production_picker.picker_tui.engine import PickerScreen
+
+    s = PickerScreen(_fixture_source(), live=False)
+    s.setup_sync_for_tests()
+    s.htab = 0
+    s.manager_update_state = "current"
+    s.update_state = "idle"
+    text = "".join(row.plain for row in s.topbar(140))
+    assert "\u2713" in text
+
+
+def test_manager_and_engine_update_segs_are_distinguishable_when_both_current():
+    """The Manager's own update segment and the engine/marketplace update
+    segment are two independent "current" verdicts for two genuinely
+    different things (the Manager binary itself vs. the engine/marketplace
+    payload). The Manager's own segment must always carry its distinguishing
+    `mgr` qualifier, so the two never render as indistinguishable repeated
+    bare checkmarks."""
+    from worktree_manager.production_picker.picker_tui.engine import PickerScreen
+
+    s = PickerScreen(_fixture_source(), live=False)
+    s.setup_sync_for_tests()
+    s.htab = 0
+    s.manager_update_state = "current"
+    s.update_state = "current"
+    text = "".join(row.plain for row in s.topbar(140))
+    # The engine segment's own bare checkmark is still present...
+    assert "\u2713" in text
+    # ...but the Manager's own segment is never a bare, unqualified checkmark
+    # -- it always carries its "mgr" qualifier, so the two never render as
+    # two identical, unlabeled glyphs.
+    assert "mgr\u2713" in text
+    # Exactly one bare (unqualified) checkmark remains: the engine's own.
+    assert text.count("\u2713") == 2  # "mgr✓" contributes one, the engine's own the other
+    assert text.replace("mgr\u2713", "").count("\u2713") == 1
+
+
+def test_manager_update_seg_stays_short_when_available():
+    """Regression: the Manager's own "available" text used to name the
+    remote version and the literal `worktree-manager update` command inline,
+    which regularly overflowed the topbar and forced the version/engine
+    segments to drop out entirely. It must now stay short."""
+    from worktree_manager.production_picker.picker_tui.engine import PickerScreen
+
+    s = PickerScreen(_fixture_source(), live=False)
+    s.setup_sync_for_tests()
+    s.htab = 0
+    s.manager_update_state = "available"
+    s.update_state = "idle"
+    text = "".join(row.plain for row in s.topbar(140))
+    assert "Update available" in text
+    assert "worktree-manager update" not in text
+    # The version string still fits alongside the short button at a normal width.
+    assert "v" in text
+
+
 def test_update_icon_is_its_own_region_not_the_pivots():
     """#g5 split-regions bug: the update refresh icon and the View pivots shared
     zone 'V' and double-highlighted. Focusing the update icon ("UPD", 0) must
@@ -3894,7 +5575,7 @@ def test_update_icon_is_its_own_region_not_the_pivots():
     from worktree_manager.production_picker.picker_tui.engine import PickerScreen
 
     s = PickerScreen(_fixture_source(), live=False)
-    s.setup()
+    s.setup_sync_for_tests()
     s.htab = 0
     s.update_state = "available"      # the update icon is a real focus stop
 
@@ -4191,52 +5872,6 @@ def test_nf_compose_is_the_sole_path(monkeypatch):
         asyncio.run(_composes())
 
 
-def test_nf_compose_skeleton_mounts_identical_segments(monkeypatch):
-    """NF2/NF3 (#88): with the toggle on, PickerScreen composes the leaf segment
-    widgets (header split into title + pivots; body split into fixed chrome +
-    scrolling data). At the top of an unscrolled list the composed tree is
-    byte-identical to ``render()``."""
-    from worktree_manager.production_picker.picker_tui.engine import (
-        _PickerBodyData, _PickerButtons, _PickerMachine, _PickerSegment)
-    monkeypatch.setenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", "0")
-    src = _fixture_source()
-
-    def _rstrip_blank(lines):
-        out = list(lines)
-        while out and out[-1].strip() == "":
-            out.pop()
-        return out
-
-    async def run():
-        app = PickerApp(src, live=False)
-        async with app.run_test(size=(118, 36)) as pilot:
-            await pilot.pause()
-            scr = app.query_one(PickerScreen)
-            segs = {w.id: w for w in scr.query(_PickerSegment)}
-            assert set(segs) == {"nf-title", "nf-chrome", "nf-footer"}
-            machine = scr.query_one("#nf-machine", _PickerMachine)
-            buttons = scr.query_one("#nf-buttons", _PickerButtons)
-            body_data = scr.query_one("#nf-body-data", _PickerBodyData)
-            frame = scr._frame_segments()
-            # Title + pivots recompose the header segment.
-            title_p = segs["nf-title"].render().plain
-            pivots_p = scr.query_one("#nf-pivots").render().plain
-            assert (title_p + "\n" + pivots_p
-                    == scr._join_lines(frame["header"], frame["W"]).plain)
-            for key, sid in (("chrome", "nf-chrome"), ("footer", "nf-footer")):
-                expect = scr._join_lines(frame[key], frame["W"]).plain
-                assert segs[sid].render().plain == expect
-            # Body: machine + buttons (fixed chrome) + scrolling data recompose
-            # the monolith body at the top of an unscrolled list.
-            combined = (machine.render().plain.split("\n")
-                        + buttons.render().plain.split("\n")
-                        + body_data.render().plain.split("\n"))
-            body_p = scr._join_lines(frame["body"], frame["W"]).plain.split("\n")
-            assert _rstrip_blank(combined) == _rstrip_blank(body_p)
-
-    asyncio.run(run())
-
-
 def test_nf_focus_bridge_tab_moves_between_regions(monkeypatch):
     """NF3 (#88): with the toggle on, the chrome + data regions are focusable
     widgets. Native Tab cycles through them via ``region_heads``, and native
@@ -4275,70 +5910,6 @@ def test_nf_focus_bridge_tab_moves_between_regions(monkeypatch):
     asyncio.run(run())
 
 
-def test_nf_pointer_click_selects_data_row(monkeypatch):
-    """NF4 (#88): clicking a data row in the compose tree points sel at that row
-    (pointer parity the manual model never had), and focuses the data region."""
-    from worktree_manager.production_picker.picker_tui.engine import _PickerBodyData
-    monkeypatch.setenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", "0")
-    src = _fixture_source()
-
-    async def run():
-        app = PickerApp(src, live=False)
-        async with app.run_test(size=(118, 24)) as pilot:
-            await pilot.pause()
-            await pilot.pause()
-            scr = app.query_one(PickerScreen)
-            scr.machine_idx = scr.local_index()
-            await pilot.pause()
-            bd = scr.query_one("#nf-body-data", _PickerBodyData)
-            W = scr.size.width or 100
-            _c, data = scr._build_body_split(W)
-            h = max(1, bd.size.height or 1)
-            # Find a visible offset that maps to a real worktree row.
-            target = None
-            for y in range(h):
-                stop = scr._data_stop_at(data, h, y)
-                if stop and stop[0] == "L":
-                    target = (y, stop)
-                    break
-            assert target is not None, "no data row visible to click"
-            y, stop = target
-            await pilot.click(bd, offset=(10, y))
-            await pilot.pause()
-            assert scr.sel == stop
-            assert app.focused.id == "nf-body-data"
-
-    asyncio.run(run())
-
-
-def test_nf_pointer_double_click_opens_row(monkeypatch):
-    """NF4 (#88): double-clicking a worktree row activates it (opens the submenu)
-    -- the pointer parallel to Enter."""
-    from worktree_manager.production_picker.picker_tui.engine import _PickerBodyData, SubMenuScreen
-    monkeypatch.setenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", "0")
-    src = _fixture_source()
-
-    async def run():
-        app = PickerApp(src, live=False)
-        async with app.run_test(size=(118, 24)) as pilot:
-            await pilot.pause()
-            await pilot.pause()
-            scr = app.query_one(PickerScreen)
-            scr.machine_idx = scr.local_index()
-            await pilot.pause()
-            bd = scr.query_one("#nf-body-data", _PickerBodyData)
-            W = scr.size.width or 100
-            _c, data = scr._build_body_split(W)
-            h = max(1, bd.size.height or 1)
-            y = next(yy for yy in range(h)
-                     if (scr._data_stop_at(data, h, yy) or (None,))[0] == "L")
-            await pilot.click(bd, offset=(10, y), times=2)
-            await pilot.pause()
-            assert any(isinstance(s, SubMenuScreen) for s in app.screen_stack)
-
-    asyncio.run(run())
-
-
 def test_size_mb_handles_non_hex_id():
     """NF5 parity (#88): the cleanup pseudo-size ``_size_mb`` must never raise on
     a non-hex ``id4``. Real/demo worktree suffixes are hex (kept byte-identical
@@ -4357,45 +5928,14 @@ def test_size_mb_handles_non_hex_id():
     assert _size_mb({"id4": "cl00"}) == _size_mb({"id4": "cl00"})
 
 
-def test_nf_maintenance_pivot_renders_under_toggle(monkeypatch):
-    """NF5 parity (#88): with the toggle on, switching to the Maintenance pivot
-    renders its body (select-all / group headers / data rows) and the '~N MiB'
-    size counter through the compose/segment path without raising -- the native
-    path that the flip makes the default. Guards the ``_size_mb`` hardening end
-    to end (the fixture uses non-hex ids)."""
-    from worktree_manager.production_picker.picker_tui.engine import _PickerBodyData
-    monkeypatch.setenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", "0")
-    src = _maint_source()
-
-    async def run():
-        app = PickerApp(src, live=False)
-        async with app.run_test(size=(118, 36)) as pilot:
-            await pilot.pause()
-            scr = app.query_one(PickerScreen)
-            scr.machine_idx = scr.local_index()
-            scr.htab = 1                          # Maintenance pivot
-            scr.sel = scr.default_sel()
-            scr.refresh()
-            await pilot.pause()
-            assert scr._kind() == "maintenance"
-            # The maintenance status counter (status_text -> _size_mb) renders.
-            assert "MiB" in scr.status_text(False).plain
-            # The composed data region renders the maintenance rows without error.
-            bd = scr.query_one("#nf-body-data", _PickerBodyData)
-            assert bd.render().plain  # non-empty; no ValueError raised
-
-    asyncio.run(run())
-
-
 def test_native_list_body_mounts_and_navigates(monkeypatch):
-    """NF5-5 (#88): with AGENT_WORKTREES_PICKER_NATIVE_LIST=1, the data body is a
-    native OptionList (`_PickerNativeData`) instead of the text-line body. Its
-    data rows are selectable options (column/section header rows are disabled),
-    Tab lands focus on it, and native up/down move the cursor -- mirrored into the
-    engine's `sel` (the swappable native-list slice; default OFF keeps the
-    text-line body)."""
+    """NF5-5 (#88): the data body is a native OptionList (`_PickerNativeData`).
+
+    Its data rows are selectable options (column/section header rows are
+    disabled), Tab lands focus on it, and native up/down move the cursor --
+    mirrored into the engine's `sel`.
+    """
     from worktree_manager.production_picker.picker_tui.engine import _PickerNativeData
-    monkeypatch.setenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", "1")
     src = _fixture_source()
 
     async def run():
@@ -4438,7 +5978,6 @@ def test_native_list_multiselect_and_activation(monkeypatch):
     Space toggles the focused row's multi-select, Shift+Down range-selects, and
     Enter activates the row (opens its submenu)."""
     from worktree_manager.production_picker.picker_tui.engine import SubMenuScreen
-    monkeypatch.setenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", "1")
     src = _fixture_source()
 
     async def run():
@@ -4477,56 +6016,847 @@ def test_native_list_multiselect_and_activation(monkeypatch):
     asyncio.run(run())
 
 
-def test_native_list_default_with_opt_out(monkeypatch):
-    """NF5-5 (#88): the native OptionList body is now the **default**; setting
-    ``AGENT_WORKTREES_PICKER_NATIVE_LIST`` to a falsey value opts back to the
-    text-line ``_PickerBodyData`` (the rollback hatch)."""
-    from worktree_manager.production_picker.picker_tui.engine import (
-        _PickerBodyData, _PickerNativeData)
+async def _focus_wt_list(app, pilot, scr):
+    """Shared test helper: Tab until the native Worktrees list body has focus,
+    landing ``scr.sel`` in the ``"L"`` zone."""
+    nl = scr.query_one("#nf-body-data")
+    for _ in range(len(scr.region_heads()) + 1):
+        await pilot.press("tab")
+        await pilot.pause()
+        if app.focused is nl:
+            break
+    return nl
+
+
+def test_wt_row_always_visible_covers_every_live_signal():
+    """PR #2911 review: the record-shape-contract predicate must recognize
+    EVERY live-session signal ``_state()``/``_sess()`` treat as ACTIVE, not
+    just a subset -- a row live only via one of the less-common signals
+    (e.g. ``session_bound_live``, the cache path in test_picker_cache.py)
+    must still survive a non-matching filter query."""
+    for field in ("mux_live", "session_lock_live", "session_bound_live",
+                  "session_bridge_live", "session_ahp_live",
+                  "execution_leg_live", "session_bare_orphan"):
+        assert derive.wt_row_always_visible({field: True}) is True
+    assert derive.wt_row_always_visible({}) is False
+    assert derive.wt_row_always_visible({"mux_live": False}) is False
+
+
+def test_wt_row_always_visible_covers_classified_active_state():
+    """PR #2911 review: a row can classify ``state == "ACTIVE"`` (e.g. a
+    canonical raw ``state: "active"``) with none of the live-signal booleans
+    set -- the Active section's trustworthiness is this predicate's whole
+    point, not just its literal live-signal subset."""
+    assert derive.wt_row_always_visible({"state": "ACTIVE"}) is True
+    assert derive.wt_row_always_visible({"state": "WIP"}) is False
+
+
+def test_command_bar_filters_the_worktrees_list(monkeypatch):
+    """#2228 Phase 4: "/" opens the command bar, typed characters narrow the
+    Worktrees list by title (case-insensitive substring), and Enter commits
+    the filter (leaves compose mode) without activating a row -- the native
+    OptionList's own Enter binding must NOT fire while composing (it would
+    otherwise open the focused row's submenu instead)."""
+    from worktree_manager.production_picker.picker_tui.engine import SubMenuScreen
     src = _fixture_source()
 
-    async def _body_is(native):
+    async def run():
         app = PickerApp(src, live=False)
         async with app.run_test(size=(118, 24)) as pilot:
             await pilot.pause()
+            await pilot.pause()
             scr = app.query_one(PickerScreen)
-            w = scr.query_one("#nf-body-data")
-            assert isinstance(
-                w, _PickerNativeData if native else _PickerBodyData)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            assert len(scr._wt_visible_records()) == 3
+            await _focus_wt_list(app, pilot, scr)
+            await pilot.press("/")
+            await pilot.pause()
+            assert scr.cmd_mode is True
+            for ch in "fix":
+                await pilot.press(ch)
+                await pilot.pause()
+            assert scr.list_view.query == "fix"
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Fix the thing"]
+            await pilot.press("enter")
+            await pilot.pause()
+            assert scr.cmd_mode is False
+            # Enter committed the filter -- it did NOT also activate the row.
+            assert not any(isinstance(s, SubMenuScreen) for s in app.screen_stack)
+            # The query itself survives leaving compose mode (Enter commits,
+            # it doesn't clear -- only Escape clears).
+            assert scr.list_view.query == "fix"
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Fix the thing"]
 
-    # Default (env unset): native list.
-    monkeypatch.delenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", raising=False)
-    asyncio.run(_body_is(True))
-    # Opt-out: legacy text-line body.
-    for off in ("0", "false", "off", "no"):
-        monkeypatch.setenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", off)
-        asyncio.run(_body_is(False))
+    asyncio.run(run())
 
 
-def test_native_list_maintenance_grid_parity(monkeypatch):
-    """NF5-5 (#88): the native list holds byte-identical grid parity on the
-    Maintenance pivot too (group sections + the select-all/data-row structure),
-    not just Worktrees -- both bodies derive from the same `_build_data_vrows`
-    source, so the swap stays a drop-in across pivots."""
-    from worktree_manager.production_picker.picker_tui import capture as _pcap
+def test_command_bar_escape_clears_filter_before_backing_out(monkeypatch):
+    """"Esc clears the filter, then backs out" (README interaction model):
+    the first Esc after a committed filter clears it and stays on the list;
+    only a second Esc (nothing left to clear/collapse) reaches quit-confirm."""
+    src = _fixture_source()
 
-    async def to_maint(scr, pilot):
-        scr.machine_idx = scr.local_index()
-        scr.htab = scr.htabs.index("Maintenance")
-        scr.sel = scr.default_sel()
-        scr.refresh()
-        await pilot.pause()
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            await _focus_wt_list(app, pilot, scr)
+            await pilot.press("/")
+            for ch in "fix":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert len(scr._wt_visible_records()) == 1
+            await pilot.press("escape")
+            await pilot.pause()
+            assert scr.list_view.query == ""
+            assert len(scr._wt_visible_records()) == 3
+            assert not _quit_modal_open(scr)
 
-    def grid(native):
-        if native:
-            monkeypatch.setenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", "1")
-        else:
-            monkeypatch.delenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", raising=False)
-        lines = _pcap.capture(_maint_source(), live=False, size=(118, 30),
-                              prepare=to_maint)["text"].split("\n")
-        return [ln.rstrip() for ln in lines[1:]]   # drop the volatile topbar
+    asyncio.run(run())
 
-    assert grid(True) == grid(False)
+
+def test_command_bar_idle_escape_preserves_focus_by_key(monkeypatch):
+    """PR #2911 review: the idle-Escape filter-clear path (distinct from the
+    composing-Escape path in `_dispatch_key`'s cmd_mode branch) must ALSO
+    remap focus by the row's stable key -- clearing the filter re-expands
+    the list, and a plain index-out-of-range check would leave `sel`
+    pointing at whatever row now sits at the old index instead of the one
+    actually focused."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-20260627-aaaa", "title": "Alt match",
+         "status": "active", "started_at": "2026-06-27T17:00:00",
+         "turn_count": 1, "state": "wip"},
+        {"id": "anomalous-potato-win-20260627-bbbb", "title": "Zzz match",
+         "status": "active", "started_at": "2026-06-27T16:00:00",
+         "turn_count": 1, "state": "wip"},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            await _focus_wt_list(app, pilot, scr)
+            await pilot.press("/")
+            for ch in "zzz":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Zzz match"]
+            assert scr.sel == ("L", 0)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert scr.list_view.query == ""
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Alt match", "Zzz match"]
+            # Zzz match moved from index 0 (filtered) to index 1 (unfiltered) --
+            # focus must have followed it there, not stayed at index 0.
+            focused = scr._wt_visible_records()[scr.sel[1]]
+            assert focused["title"] == "Zzz match"
+
+    asyncio.run(run())
+
+
+def test_command_bar_never_hides_a_live_worktree(monkeypatch):
+    """Cross-effort record-shape contract (README, Phase 4): a filter must
+    never silently drop a live worktree just because its title doesn't match
+    the query -- an operator mid-session on it must never see it vanish."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-20260627-live", "title": "Unrelated title",
+         "status": "active", "started_at": "2026-06-27T17:00:00",
+         "turn_count": 3, "state": "wip",
+         "mux_session": True, "mux_attached": True, "mux_clients": 1},
+        {"id": "anomalous-potato-win-20260627-fixx", "title": "Fix the thing",
+         "status": "active", "started_at": "2026-06-27T17:00:00",
+         "turn_count": 1, "state": "wip"},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            await _focus_wt_list(app, pilot, scr)
+            await pilot.press("/")
+            for ch in "fix":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+            titles = {w["title"] for w in scr._wt_visible_records()}
+            assert titles == {"Unrelated title", "Fix the thing"}
+
+    asyncio.run(run())
+
+
+def test_command_bar_filter_matches_state_and_status_markers(monkeypatch):
+    """worktree-finality-and-obligations Phase 5: the "/" filter must match
+    the closure-descriptor-aware derived ``state`` label (e.g. "merged") and
+    the raw ``status_markers`` compact tokens (e.g. "c1" for a held claim),
+    not just title/id text -- parity with what the row actually displays."""
+    from worktree_manager.production_picker import prune
+
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-20260627-aaaa", "title": "Fix the thing",
+         "status": "active", "started_at": "2026-06-27T17:00:00",
+         "turn_count": 4, "state": "wip"},
+        {"id": "anomalous-potato-win-20260626-cccc", "title": "Blocked wt",
+         "status": "finalized", "completed_at": "2026-06-26T10:00:00",
+         "started_at": "2026-06-25T10:00:00", "turn_count": 9,
+         "state": "completed",
+         "closure": {
+             "version": prune.DESCRIPTOR_VERSION, "label": "MERGED",
+             "style": "merged-blocked", "compact": "MERGED C1",
+             "claims": {"held": 1}, "follow_ups": {"open": 0},
+             "closure": {"final": False}, "action": {"disposition": "blocked"},
+         }},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            await _focus_wt_list(app, pilot, scr)
+            # Match by derived state label, not title/id text.
+            await pilot.press("/")
+            for ch in "merged":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Blocked wt"]
+            await pilot.press("escape")
+            await pilot.pause()
+            # Match by the raw status_markers compact token.
+            await pilot.press("/")
+            for ch in "c1":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Blocked wt"]
+
+    asyncio.run(run())
+
+
+def test_legend_screen_opens_on_question_mark_and_closes_on_escape(monkeypatch):
+    """worktree-finality-and-obligations Phase 5: "?" opens the read-only
+    Legend card (state labels, compact markers, maintenance disposition) from
+    any zone; Escape closes it, same as WtDetailsScreen/QuitConfirmScreen."""
+    from worktree_manager.production_picker.picker_tui.engine_legend import (
+        LegendScreen,
+    )
+
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            await pilot.press("?")
+            await pilot.pause()
+            legend = next(
+                s for s in scr.app.screen_stack if isinstance(s, LegendScreen))
+            body = legend._body().plain
+            # State-label legend, not row-specific: every canonical state the
+            # Worktrees list can render is explained, using the SAME labels
+            # C_STATE/derive._STATE_LABEL already key colors/text off.
+            for label in ("ACTIVE", "DIRTY", "WIP", "FINAL", "MERGED",
+                          "UNUSED", "CONVO", "ORPHAN", "GONE"):
+                assert label in body
+            # Compact marker vocabulary + maintenance disposition chips.
+            assert "C<N>" in body and "F<N>" in body
+            assert "U*" in body and "OC*" in body
+            assert "SAFE" in body and "REVIEW" in body and "UNSAFE" in body
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not any(
+                isinstance(s, LegendScreen) for s in scr.app.screen_stack)
+
+    asyncio.run(run())
+
+
+def test_command_bar_filter_never_narrows_list_records_or_selection(monkeypatch):
+    """PR #2911 review: the filter/sort narrowing must apply ONLY to the
+    render/navigation view (`current_list_visible`/`_wt_visible_records`) --
+    `list_records()` (and everything built on it: selection reconciliation,
+    cleanup/sync scope, action menus) must keep seeing the FULL unfiltered
+    set. A worktree selected before typing a non-matching query must not be
+    silently dropped from `wt_sel` by a reload/reconcile pass just because
+    it's currently hidden by the filter."""
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            nl = await _focus_wt_list(app, pilot, scr)
+            # Select "Old idle wt" (a Recent-section row not matched by "fix").
+            idx = next(i for i, w in enumerate(scr.list_records())
+                       if w["title"] == "Old idle wt")
+            scr.wt_sel.toggle(scr._row_key(scr.list_records()[idx]))
+            assert len(scr.wt_sel) == 1
+            await pilot.press("/")
+            for ch in "fix":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+            # The full set is unaffected by the filter...
+            assert len(scr.list_records()) == 3
+            # ...and the reload-time reconciliation pass (#2258 P3-7) must not
+            # drop the selection just because its row is currently hidden.
+            scr._reconcile_wt_sel()
+            assert len(scr.wt_sel) == 1
+            _ = nl
+
+    asyncio.run(run())
+
+
+def test_command_bar_space_toggles_the_visible_row_not_a_full_list_index(monkeypatch):
+    """PR #2911 review: `Space` (``_toggle_wt``) receives a VISIBLE-list
+    index (``sel[1]``) -- it must resolve that index against
+    ``_wt_visible_records()``, not the full ``list_records()``, or a filter
+    that reorders the index space would toggle the WRONG row."""
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            await _focus_wt_list(app, pilot, scr)
+            await pilot.press("/")
+            for ch in "fix":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+            # Only "Fix the thing" is visible now, at visible-index 0.
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Fix the thing"]
+            scr.sel = ("L", 0)
+            await pilot.press("space")
+            await pilot.pause()
+            selected = [w for w in scr.list_records()
+                        if scr._row_key(w) in scr.wt_sel.ids]
+            assert [w["title"] for w in selected] == ["Fix the thing"]
+            # And _selected_record() (Enter's per-row target) must agree.
+            assert scr._selected_record()["title"] == "Fix the thing"
+
+    asyncio.run(run())
+
+
+def test_command_bar_owns_ctrl_arrow_keys_while_composing(monkeypatch):
+    """PR #2911 review: ``BINDING_KEYS`` (Ctrl+Left/Right, the machine-switch
+    shortcut) was checked before ``cmd_mode``, so it still bubbled to
+    Textual's own binding system while composing -- switching the machine
+    tab mid-query instead of the key landing in the command bar. The
+    composing check must run first everywhere ``BINDING_KEYS``/native-key
+    bubbling is checked."""
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            await _focus_wt_list(app, pilot, scr)
+            await pilot.press("/")
+            machine_idx_before = scr.machine_idx
+            await pilot.press("ctrl+left")
+            await pilot.pause()
+            assert scr.cmd_mode is True
+            assert scr.machine_idx == machine_idx_before
+
+    asyncio.run(run())
+
+
+def test_command_bar_sort_cycles_worktrees_order(monkeypatch):
+    """"s" cycles the Worktrees list's sort key (#2228 Phase 4). The fixture's
+    Active section holds one row, so this exercises the Recent section (two
+    rows sorted by age by default; alpha by title once cycled)."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-20260620-bbbb", "title": "Zeta idle",
+         "status": "active", "started_at": "2026-06-20T10:00:00",
+         "turn_count": 0, "state": "unused"},
+        {"id": "anomalous-potato-win-20260619-cccc", "title": "Alpha idle",
+         "status": "active", "started_at": "2026-06-19T10:00:00",
+         "turn_count": 0, "state": "unused"},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            # Default (age): most-recent-first -> Zeta (newer) before Alpha.
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Zeta idle", "Alpha idle"]
+            await _focus_wt_list(app, pilot, scr)
+            await pilot.press("s")
+            await pilot.pause()
+            assert scr.list_view.sort_label(derive.WT_SORT_KEYS) == "title"
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Alpha idle", "Zeta idle"]
+
+    asyncio.run(run())
+
+
+def test_command_bar_sort_cycle_preserves_focus_and_anchor(monkeypatch):
+    """PR #2911 review: cycling the sort key reorders the rows, so a
+    focused/anchored row's numeric INDEX would otherwise point at a
+    different row after the reorder. `s` must remap `sel`/`last_l`/
+    `wt_anchor` by the row's stable key, not leave them as stale indices."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-20260620-bbbb", "title": "Zeta idle",
+         "status": "active", "started_at": "2026-06-20T10:00:00",
+         "turn_count": 0, "state": "unused"},
+        {"id": "anomalous-potato-win-20260619-cccc", "title": "Alpha idle",
+         "status": "active", "started_at": "2026-06-19T10:00:00",
+         "turn_count": 0, "state": "unused"},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            # Default (age) order: Zeta (index 0), Alpha (index 1). Focus and
+            # anchor Zeta -- it will move to index 1 once sorted by title.
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Zeta idle", "Alpha idle"]
+            scr.sel = ("L", 0)
+            scr.wt_anchor = 0
+            scr.refresh()
+            await pilot.pause()
+            await _focus_wt_list(app, pilot, scr)
+            scr.sel = ("L", 0)
+            scr.wt_anchor = 0
+            await pilot.press("s")
+            await pilot.pause()
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Alpha idle", "Zeta idle"]
+            focused = scr._wt_visible_records()[scr.sel[1]]
+            assert focused["title"] == "Zeta idle"
+            assert scr.last_l == scr.sel[1]
+            assert scr._wt_visible_records()[scr.wt_anchor]["title"] == "Zeta idle"
+
+    asyncio.run(run())
+
+
+def test_command_bar_sort_cycle_remaps_last_l_from_outside_the_list(monkeypatch):
+    """PR #2911 review follow-up: ``last_l`` (the Tab-out/in remembered row)
+    must remap by stable key even when focus is NOT currently on the list
+    (e.g. on a machine/button row) when ``s`` cycles the sort -- it was
+    previously only refreshed inside the "focus is in the list" branch."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-20260620-bbbb", "title": "Zeta idle",
+         "status": "active", "started_at": "2026-06-20T10:00:00",
+         "turn_count": 0, "state": "unused"},
+        {"id": "anomalous-potato-win-20260619-cccc", "title": "Alpha idle",
+         "status": "active", "started_at": "2026-06-19T10:00:00",
+         "turn_count": 0, "state": "unused"},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            # Zeta remembered as the last-focused row, but focus is now on
+            # the machine row -- not "L" -- when the sort cycles.
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Zeta idle", "Alpha idle"]
+            scr.last_l = 0
+            scr.sel = ("M", 0)
+            scr.refresh()
+            await pilot.pause()
+            scr._dispatch_key("s")
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Alpha idle", "Zeta idle"]
+            assert scr._wt_visible_records()[scr.last_l]["title"] == "Zeta idle"
+
+    asyncio.run(run())
+
+
+def test_command_bar_filter_preserves_focused_row_by_key(monkeypatch):
+    """PR #2911 review follow-up: typing into the filter reorders/shrinks the
+    list, so a focused row's numeric index can end up pointing at a
+    DIFFERENT row that happens to now sit at the same position. Focus must
+    follow the row's stable key, not the stale index."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-20260627-aaaa", "title": "Alt match",
+         "status": "active", "started_at": "2026-06-27T17:00:00",
+         "turn_count": 1, "state": "wip"},
+        {"id": "anomalous-potato-win-20260627-bbbb", "title": "Zzz match",
+         "status": "active", "started_at": "2026-06-27T16:00:00",
+         "turn_count": 1, "state": "wip"},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            # Both are Active (state wip), age order -> Alt match (0), Zzz
+            # match (1). Focus Zzz match (index 1).
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Alt match", "Zzz match"]
+            await _focus_wt_list(app, pilot, scr)
+            scr.sel = ("L", 1)
+            scr.refresh()
+            await pilot.pause()
+            await pilot.press("/")
+            # "match" keeps both rows, but "zzz" narrows to Zzz match alone --
+            # exercising the id-based remap without ever hitting the
+            # index-out-of-range fallback.
+            for ch in "zzz":
+                await pilot.press(ch)
+                await pilot.pause()
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Zzz match"]
+            focused = scr._wt_visible_records()[scr.sel[1]]
+            assert focused["title"] == "Zzz match"
+
+    asyncio.run(run())
+
+
+def test_command_bar_filter_lands_at_equivalent_index_when_row_vanishes(monkeypatch):
+    """PR #2911 review: when the focused row itself is filtered OUT (not
+    merely moved), focus lands at the equivalent index in the shrunk list
+    -- Phase 3's own rule for a deleted row ("focus stays at the equivalent
+    index") -- rather than either a stale index naming a different row, or
+    jumping off the list entirely while rows still remain."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-20260627-aaaa", "title": "Alt row",
+         "status": "active", "started_at": "2026-06-27T17:00:00",
+         "turn_count": 1, "state": "wip"},
+        {"id": "anomalous-potato-win-20260627-bbbb", "title": "Fix row",
+         "status": "active", "started_at": "2026-06-27T16:00:00",
+         "turn_count": 1, "state": "wip"},
+        {"id": "anomalous-potato-win-20260627-cccc", "title": "Fix again",
+         "status": "active", "started_at": "2026-06-27T15:00:00",
+         "turn_count": 1, "state": "wip"},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Alt row", "Fix row", "Fix again"]
+            await _focus_wt_list(app, pilot, scr)
+            scr.sel = ("L", 0)  # focused on "Alt row"
+            scr.refresh()
+            await pilot.pause()
+            await pilot.press("/")
+            for ch in "fix":
+                await pilot.press(ch)
+                await pilot.pause()
+            # "Alt row" is filtered OUT entirely -- the equivalent index (0)
+            # in the shrunk two-row list is "Fix row", not a reset off the list.
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Fix row", "Fix again"]
+            assert scr.sel == ("L", 0)
+            assert scr._wt_visible_records()[scr.sel[1]]["title"] == "Fix row"
+
+    asyncio.run(run())
+
+
+def test_command_bar_last_l_clamps_to_equivalent_index_when_row_vanishes(monkeypatch):
+    """PR #2911 review follow-up: when the REMEMBERED (last_l, Tab-out/in)
+    row is filtered out entirely, it must clamp to the equivalent index in
+    the shrunk visible list -- not reset to 0 regardless of where it was."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-20260627-aaaa", "title": "Fix first",
+         "status": "active", "started_at": "2026-06-27T17:00:00",
+         "turn_count": 1, "state": "wip"},
+        {"id": "anomalous-potato-win-20260627-bbbb", "title": "Alt row",
+         "status": "active", "started_at": "2026-06-27T16:30:00",
+         "turn_count": 1, "state": "wip"},
+        {"id": "anomalous-potato-win-20260627-cccc", "title": "Fix third",
+         "status": "active", "started_at": "2026-06-27T16:00:00",
+         "turn_count": 1, "state": "wip"},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Fix first", "Alt row", "Fix third"]
+            # Remember "Alt row" (index 1) as last_l without it being focused.
+            scr.last_l = 1
+            await _focus_wt_list(app, pilot, scr)
+            scr.sel = ("M", 0)
+            scr.refresh()
+            await pilot.pause()
+            await pilot.press("/")
+            for ch in "fix":
+                await pilot.press(ch)
+                await pilot.pause()
+            # "Alt row" is filtered out -- the shrunk two-row list's
+            # equivalent index (clamped 1) is "Fix third", not index 0.
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Fix first", "Fix third"]
+            assert scr._wt_visible_records()[scr.last_l]["title"] == "Fix third"
+
+    asyncio.run(run())
+
+
+def test_command_bar_anchor_clamps_to_equivalent_index_when_row_vanishes(monkeypatch):
+    """PR #2911 review: when the ANCHORED row (wt_anchor, the Shift+arrow
+    range-select origin) is filtered out entirely, it must clamp to the
+    equivalent index -- not drop to None, which would silently re-seed the
+    range from current focus on the next Shift+arrow (changing the
+    selected range unexpectedly)."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-20260627-aaaa", "title": "Fix first",
+         "status": "active", "started_at": "2026-06-27T17:00:00",
+         "turn_count": 1, "state": "wip"},
+        {"id": "anomalous-potato-win-20260627-bbbb", "title": "Alt row",
+         "status": "active", "started_at": "2026-06-27T16:30:00",
+         "turn_count": 1, "state": "wip"},
+        {"id": "anomalous-potato-win-20260627-cccc", "title": "Fix third",
+         "status": "active", "started_at": "2026-06-27T16:00:00",
+         "turn_count": 1, "state": "wip"},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Fix first", "Alt row", "Fix third"]
+            scr.wt_anchor = 1   # "Alt row"
+            await _focus_wt_list(app, pilot, scr)
+            scr.sel = ("M", 0)
+            scr.refresh()
+            await pilot.pause()
+            await pilot.press("/")
+            for ch in "fix":
+                await pilot.press(ch)
+                await pilot.pause()
+            assert [w["title"] for w in scr._wt_visible_records()] == ["Fix first", "Fix third"]
+            assert scr.wt_anchor is not None
+            assert scr._wt_visible_records()[scr.wt_anchor]["title"] == "Fix third"
+
+    asyncio.run(run())
+
+
+def test_command_bar_appends_named_printable_keys(monkeypatch):
+    """PR #2911 review: a NAMED printable key token (Textual's "slash" for
+    "/" is the one this module already documents) must still land in the
+    query -- the composer must not silently drop any printable character
+    just because its Textual key NAME isn't a bare one-character string."""
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            await _focus_wt_list(app, pilot, scr)
+            await pilot.press("/")
+            # A second literal "/" while composing: Textual delivers it as
+            # the named "slash" token, not a bare "/" key -- must still
+            # append via event.character, not be silently dropped.
+            scr._dispatch_key("slash", "/")
+            assert scr.list_view.query == "/"
+
+    asyncio.run(run())
+
+
+def test_describe_status_marker_expands_known_tokens():
+    """Bug-fix phase: raw ``status_markers`` wire tokens must expand to a
+    short human phrase for rendering (derive.py's ``status_markers`` string
+    itself stays the compact wire format; only the tile's render layer
+    prettifies it)."""
+    assert derive.describe_status_marker("C1") == ("1 held claim", False)
+    assert derive.describe_status_marker("C3") == ("3 held claims", False)
+    assert derive.describe_status_marker("F1") == ("1 follow-up", False)
+    assert derive.describe_status_marker("F2") == ("2 follow-ups", False)
+    assert derive.describe_status_marker("U*") == ("merge unconfirmed", True)
+    assert derive.describe_status_marker("OC*") == ("claims unconfirmed", True)
+    # An unrecognized future token degrades to itself, still flagged a
+    # warning if it carries the unconfirmed-fact ``*`` suffix.
+    assert derive.describe_status_marker("NEW*") == ("NEW*", True)
+    assert derive.describe_status_marker("NEW") == ("NEW", False)
+
+
+def test_describe_status_marker_handles_oversized_numeric_token():
+    """PR #2897 review: ``compact`` (the source of these tokens) is only
+    validated as a ``str`` by ``prune.interpret_descriptor_payload`` -- a
+    malformed/remote descriptor could hand a ``C``/``F`` token an absurdly
+    long digit run. The numeric suffix is length-bounded before conversion
+    (not just wrapped in a ``try``/``except``), so an over-length run
+    degrades to the verbatim fallback on every supported Python version, not
+    only on 3.11+ where ``int()`` itself would raise."""
+    huge = "C" + "9" * 5000
+    text, is_warn = derive.describe_status_marker(huge)
+    assert text == huge
+    assert is_warn is False
+
+
+def test_truncate_text_is_cell_width_aware():
+    """PR #2897 review: budgeting must measure DISPLAY cells, not characters
+    -- a double-width character (e.g. a wide CJK glyph, counted as 2 cells by
+    a real terminal) must not be undercounted, or the asset-priority
+    guarantee in ``status_line_segments`` silently breaks for any wide
+    fallback asset-hint code."""
+    # "界" is a double-width character: 2 of them are 4 cells, not 2.
+    assert derive.truncate_text("界界界", 4) == "界…"
+    assert derive.truncate_text("abcdef", 4) == "abc…"
+    # No truncation needed -- returned as-is either way.
+    assert derive.truncate_text("ab", 4) == "ab"
+    from rich.cells import cell_len
+    # A 1-cell budget that can't even fit a double-width first character must
+    # still respect the budget (review follow-up) -- degrade to the ellipsis
+    # (itself exactly 1 cell) rather than returning 2 cells' worth.
+    assert cell_len(derive.truncate_text("界界", 1)) <= 1
+    assert derive.truncate_text("abc", 1) == "a"
+    assert derive.truncate_text("x", 0) == ""
+
+
+def test_status_line_segments_reserve_wide_asset_width_correctly():
+    """PR #2897 review: a wide-character asset-hint fallback code (e.g. an
+    unrecognized resource ``kind`` whose 4-char fallback code happens to be
+    double-width) must still get its FULL display width reserved -- a
+    ``len()``-based reservation would undercount it and let the marker text
+    truncate it away anyway, defeating the asset-priority guarantee."""
+    segs = derive.status_line_segments("C1 U* OC*", ["界界界界"], 0, 10)
+    rendered = "".join(t for t, _ in segs)
+    assert "界界界界" in rendered
+    from rich.cells import cell_len
+    assert cell_len(rendered) <= 10
 
 
 def test_native_list_sticky_header(monkeypatch):
@@ -4538,7 +6868,6 @@ def test_native_list_sticky_header(monkeypatch):
 
     from worktree_manager.production_picker.picker_tui import derive
     from worktree_manager.production_picker.picker_tui.engine import _PickerStickyHeader
-    monkeypatch.setenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", "1")
 
     def _tall_src():
         derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
@@ -4578,24 +6907,23 @@ def test_native_list_sticky_header(monkeypatch):
             await pilot.pause()
             assert int(nl.scroll_offset.y) > 0
             assert st.display is True
-            assert "──" in st._line.plain   # a section rule is pinned
+            assert "──" in st._section_line.plain   # a section rule is pinned
 
     asyncio.run(run())
 
 
 def test_native_list_sticky_no_reflow_flicker(monkeypatch):
-    """#169: once the native list is scrolled, the sticky section-header region
-    stays present at a CONSTANT height across section boundaries -- it must not
-    collapse (display False) when a section header reaches the top and re-appear
-    a row later, because that 1-row toggle reflowed the OptionList and read as a
-    flicker. It is hidden only at the very top (unscrolled), so grid parity is
-    unchanged."""
+    """#169: once the native list is scrolled, the sticky column-header +
+    section-band region stays present at a CONSTANT height across section
+    boundaries -- it must not collapse (display False) when a section header
+    reaches the top and re-appear a row later, because that toggle reflowed
+    the OptionList and read as a flicker. It is hidden only at the very top
+    (unscrolled), so grid parity is unchanged."""
     import datetime
     import types
 
     from worktree_manager.production_picker.picker_tui import derive
     from worktree_manager.production_picker.picker_tui.engine import _PickerStickyHeader
-    monkeypatch.setenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", "1")
 
     def _multi_section_src():
         # Mixed statuses / ages so bucket() yields several sections (Active /
@@ -4663,6 +6991,334 @@ def test_native_list_sticky_no_reflow_flicker(monkeypatch):
     asyncio.run(run())
 
 
+def test_native_list_sticky_column_header(monkeypatch):
+    """Phase 9 item 1 (#3307, worktrees-pivot-ux-overhaul): the column-header
+    row (``ID STATE AGE ...``) pins above the list, independently of the
+    current-section band, once IT has scrolled out of view -- previously only
+    the section band pinned, so the column header scrolled away for good."""
+    import datetime
+    import types
+
+    from worktree_manager.production_picker.picker_tui import derive
+    from worktree_manager.production_picker.picker_tui.engine import _PickerStickyHeader
+
+    def _tall_src():
+        derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+        local = ("anomalous-potato", "Win")
+        raws = [{"id": f"anomalous-potato-win-2026062{i % 9}-r{i:02d}",
+                 "title": f"Row {i}", "status": "active",
+                 "started_at": "2026-06-27T17:00:00", "turn_count": i,
+                 "state": "active" if i % 2 else "wip"} for i in range(20)]
+        s = types.SimpleNamespace()
+        s.LOCAL = local
+        s.LOCAL_LABEL = "lc"
+        s.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+        s.bucket = derive.bucket
+        s.for_machine = derive.for_machine
+        s.load = lambda: [derive.norm(w, *local) for w in raws]
+        return s
+
+    async def run():
+        app = PickerApp(_tall_src(), live=False)
+        async with app.run_test(size=(118, 16)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            scr.sel = ("L", 0)
+            scr.refresh()
+            await pilot.pause()
+            st = scr.query_one("#nf-body-sticky", _PickerStickyHeader)
+            nl = scr.query_one("#nf-body-data")
+            assert nl._colhdr_index is not None   # the pivot has a column header
+            nl.focus()
+            await pilot.pause()
+            for _ in range(10):
+                await pilot.press("down")
+            await pilot.pause()
+            assert int(nl.scroll_offset.y) > nl._colhdr_index
+            assert st.display is True
+            assert st._colhdr_line is not None
+            assert "STATE" in st._colhdr_line.plain
+            # The section band pins independently, in the SECOND row.
+            assert st._section_line is not None
+            assert "──" in st._section_line.plain
+
+    asyncio.run(run())
+
+
+def test_native_list_focus_top_row_forces_scroll_home(monkeypatch):
+    """Phase 9 item 1 (#3307): moving focus back to the list's topmost row
+    force-scrolls the viewport all the way to the top, so the pinned
+    column-header/section rows are no longer needed and disappear -- not only
+    the minimal scroll Textual's own ``scroll_to_highlight`` performs (which
+    used to leave the header hidden until a mouse-wheel scroll went further)."""
+    import datetime
+    import types
+
+    from worktree_manager.production_picker.picker_tui import derive
+    from worktree_manager.production_picker.picker_tui.engine import _PickerStickyHeader
+
+    def _tall_src():
+        derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+        local = ("anomalous-potato", "Win")
+        raws = [{"id": f"anomalous-potato-win-2026062{i % 9}-r{i:02d}",
+                 "title": f"Row {i}", "status": "active",
+                 "started_at": "2026-06-27T17:00:00", "turn_count": i,
+                 "state": "active" if i % 2 else "wip"} for i in range(20)]
+        s = types.SimpleNamespace()
+        s.LOCAL = local
+        s.LOCAL_LABEL = "lc"
+        s.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+        s.bucket = derive.bucket
+        s.for_machine = derive.for_machine
+        s.load = lambda: [derive.norm(w, *local) for w in raws]
+        return s
+
+    async def run():
+        app = PickerApp(_tall_src(), live=False)
+        async with app.run_test(size=(118, 16)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            scr.sel = ("L", 0)
+            scr.refresh()
+            await pilot.pause()
+            st = scr.query_one("#nf-body-sticky", _PickerStickyHeader)
+            nl = scr.query_one("#nf-body-data")
+            nl.focus()
+            await pilot.pause()
+            for _ in range(10):
+                await pilot.press("down")
+            await pilot.pause()
+            # Scrolled: the pin is showing.
+            assert int(nl.scroll_offset.y) > 0
+            assert st.display is True
+            # Arrow all the way back up to the very first row.
+            for _ in range(10):
+                await pilot.press("up")
+            await pilot.pause()
+            # Force-scrolled all the way home, not just enough to see that row.
+            assert int(nl.scroll_offset.y) == 0
+            assert st.display is False
+
+    asyncio.run(run())
+
+
+def test_native_list_scroll_survives_same_pivot_rebuild(monkeypatch):
+    """Scroll-reset-on-repaint (context-handoff bug #4): a same-pivot data
+    rebuild -- e.g. the cosmetic live-pulse tick (`pulse` is part of
+    ``_PickerNativeData._signature()``) -- must NOT jump the scrolled list back
+    to the top. ``OptionList.clear_options()`` unconditionally zeroes
+    ``scroll_y``, so every full ``_rebuild()`` used to discard the operator's
+    scroll position even when nothing about the visible pivot/tab/machine
+    changed."""
+    import datetime
+    import types
+
+    from worktree_manager.production_picker.picker_tui import derive
+
+    def _multi_section_src():
+        derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+        local = ("anomalous-potato", "Win")
+        raws = []
+        for i in range(30):
+            if i % 3 == 0:
+                started, status = "2026-06-27T17:00:00", "active"
+            elif i % 3 == 1:
+                started, status = "2026-06-20T17:00:00", "idle"
+            else:
+                started, status = "2026-05-01T17:00:00", "done"
+            raws.append({"id": f"anomalous-potato-win-2026062{i % 9}-r{i:02d}",
+                         "title": f"Row {i}", "status": status,
+                         "started_at": started, "turn_count": i,
+                         "state": "active" if i % 2 else "wip"})
+        s = types.SimpleNamespace()
+        s.LOCAL = local
+        s.LOCAL_LABEL = "lc"
+        s.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+        s.bucket = derive.bucket
+        s.for_machine = derive.for_machine
+        s.load = lambda: [derive.norm(w, *local) for w in raws]
+        return s
+
+    async def run():
+        app = PickerApp(_multi_section_src(), live=False)
+        async with app.run_test(size=(118, 16)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            scr.sel = ("L", 0)
+            scr.refresh()
+            await pilot.pause()
+            nl = scr.query_one("#nf-body-data")
+            nl.focus()
+            await pilot.pause()
+
+            for _ in range(15):
+                await pilot.press("down")
+                await pilot.pause()
+            y_before = int(getattr(nl.scroll_offset, "y", 0) or 0)
+            assert y_before > 0   # actually scrolled -- the repro precondition
+
+            # Same pivot/tab/machine, only the cosmetic pulse flips (mirrors the
+            # real ~0.5-2.5s live tick, #2019 `_tick`) -- must be a no-op full
+            # rebuild that preserves the scroll offset.
+            scr.pulse = 1 - scr.pulse
+            nl.refresh_data()
+            await pilot.pause()
+            assert int(getattr(nl.scroll_offset, "y", 0) or 0) == y_before
+
+    asyncio.run(run())
+
+
+def test_native_list_mouse_wheel_scroll_survives_pulse_tick_while_cursor_unmoved():
+    """Follow-up to a live report: arrow down to the bottom of the list, then
+    scroll UP with the mouse wheel WITHOUT moving the cursor away from the
+    bottom row -- a subsequent same-pivot rebuild (the periodic live-pulse
+    tick, exactly like the sibling test above) must not snap the scroll
+    position back down to the cursor's row. ``clear_options()`` unconditionally
+    resets ``highlighted`` to ``None``; re-establishing it in ``_rebuild()``
+    used to go through the normal (scrolling) path even when the cursor's
+    logical row hadn't actually changed, discarding a scroll the operator made
+    independently of focus. Scroll must only jump to follow a GENUINE focus
+    move (arrow keys/click changing ``sel``), never an incidental cursor
+    re-sync after an unrelated rebuild."""
+    import datetime
+    import types
+
+    from worktree_manager.production_picker.picker_tui import derive
+
+    def _multi_section_src():
+        derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+        local = ("anomalous-potato", "Win")
+        raws = []
+        for i in range(30):
+            if i % 3 == 0:
+                started, status = "2026-06-27T17:00:00", "active"
+            elif i % 3 == 1:
+                started, status = "2026-06-20T17:00:00", "idle"
+            else:
+                started, status = "2026-05-01T17:00:00", "done"
+            raws.append({"id": f"anomalous-potato-win-2026062{i % 9}-r{i:02d}",
+                         "title": f"Row {i}", "status": status,
+                         "started_at": started, "turn_count": i,
+                         "state": "active" if i % 2 else "wip"})
+        s = types.SimpleNamespace()
+        s.LOCAL = local
+        s.LOCAL_LABEL = "lc"
+        s.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+        s.bucket = derive.bucket
+        s.for_machine = derive.for_machine
+        s.load = lambda: [derive.norm(w, *local) for w in raws]
+        return s
+
+    async def run():
+        app = PickerApp(_multi_section_src(), live=False)
+        async with app.run_test(size=(118, 16)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            scr.sel = ("L", 0)
+            scr.refresh()
+            await pilot.pause()
+            nl = scr.query_one("#nf-body-data")
+            nl.focus()
+            await pilot.pause()
+
+            # Arrow all the way to the bottom (a genuine focus move: scroll
+            # is expected -- and required -- to follow it).
+            for _ in range(29):
+                await pilot.press("down")
+                await pilot.pause()
+            y_at_cursor = int(getattr(nl.scroll_offset, "y", 0) or 0)
+            assert y_at_cursor > 0
+
+            # Now scroll UP with the mouse wheel, independent of the cursor
+            # (the cursor/``sel`` does not change -- only the viewport does).
+            wheeled_y = max(0, y_at_cursor - 5)
+            nl.scroll_y = wheeled_y
+            await pilot.pause()
+            assert int(getattr(nl.scroll_offset, "y", 0) or 0) == wheeled_y
+
+            # A same-pivot rebuild (the cosmetic live-pulse tick) fires next,
+            # exactly as it periodically does in the real app -- it must not
+            # snap the viewport back down to the (unchanged) cursor row.
+            scr.pulse = 1 - scr.pulse
+            nl.refresh_data()
+            await pilot.pause()
+            assert int(getattr(nl.scroll_offset, "y", 0) or 0) == wheeled_y
+
+    asyncio.run(run())
+
+
+def test_live_column_repaints_when_async_mux_reconcile_lands():
+    """Render-perf follow-up (#3307, 2026-09-30 operator report): "this column
+    shows PROC, even for MUX sessions, suggesting mux-detection isn't
+    working". Root cause was never mux *detection* (the reconcile CLI already
+    reports ``mux_attached`` correctly) but STALENESS: the cache-only first
+    paint renders before the async Group C mux reconcile lands, so a
+    genuinely-live row starts out ``PROC`` (from ``session_bound_live`` alone)
+    and, since mux attachment doesn't change ``state`` (both collapse to
+    ACTIVE) or any other field ``_PickerNativeData._signature()`` fingerprinted,
+    the later correction to ``MUX(1)`` never triggered a rebuild -- the row
+    stayed stuck on its stale first-paint glyph indefinitely. Fixed by adding
+    ``sess`` itself to the per-row fingerprint."""
+    import datetime
+    import types
+
+    from worktree_manager.production_picker.picker_tui import derive
+
+    def _src(raws):
+        derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+        local = ("anomalous-potato", "Win")
+        s = types.SimpleNamespace()
+        s.LOCAL = local
+        s.LOCAL_LABEL = "lc"
+        s.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+        s.bucket = derive.bucket
+        s.for_machine = derive.for_machine
+        s.load = lambda: [derive.norm(w, *local) for w in raws]
+        return s
+
+    raw = {"id": "anomalous-potato-win-live1", "title": "Live row",
+           "status": "active", "started_at": "2026-06-27T17:00:00",
+           "turn_count": 4, "state": "wip", "session_bound_live": True}
+
+    async def run():
+        # First paint: the mux reconcile hasn't landed yet -- bound-live only.
+        app = PickerApp(_src([dict(raw)]), live=False)
+        async with app.run_test(size=(118, 20)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            recs = scr.list_records()
+            assert len(recs) == 1
+            assert recs[0]["sess"] == "PROC"
+            nl = scr.query_one("#nf-body-data")
+            idx, _rec, _li = nl._l_rows[recs[0]["selection_id"]]
+            assert "PROC" in str(nl.get_option_at_index(idx).prompt)
+
+            # The async Group C reconcile lands: mux_attached flips true, with
+            # id/title/state/age_secs all UNCHANGED -- exactly what a real
+            # in-place data refresh looks like.
+            live_raw = dict(raw, mux_attached=True, mux_clients=1)
+            scr.data = [derive.norm(live_raw, *scr.src.LOCAL)]
+            scr.refresh()
+            await pilot.pause()
+
+            recs = scr.list_records()
+            assert recs[0]["sess"] == "MUX(1)"
+            idx, _rec, _li = nl._l_rows[recs[0]["selection_id"]]
+            assert "MUX(1)" in str(nl.get_option_at_index(idx).prompt)
+            assert "PROC" not in str(nl.get_option_at_index(idx).prompt)
+
+    asyncio.run(run())
+
+
 def test_native_list_no_rowwrap_and_incremental_repaint(monkeypatch):
     """#171 (proper fix): holding up/down must not wrap worktree rows, and each
     nav step must repaint only the changed rows (O(1)), not rebuild the list.
@@ -4685,7 +7341,6 @@ def test_native_list_no_rowwrap_and_incremental_repaint(monkeypatch):
     from rich.text import Text as _Text
 
     from worktree_manager.production_picker.picker_tui import derive
-    monkeypatch.setenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", "1")
     # Freeze the 0.1s pulse tick: ``pulse`` is part of the native-list signature
     # (it drives the live ● indicator), so a tick coinciding with a keypress
     # legitimately forces a full rebuild -- pinning it keeps the incremental-path
@@ -4776,13 +7431,71 @@ def test_native_list_no_rowwrap_and_incremental_repaint(monkeypatch):
     asyncio.run(run())
 
 
+def test_native_list_refreshes_on_same_count_content_swap():
+    """PR #2911 review: a same-cardinality reload that swaps a row's content
+    (title/state) must still rebuild the native list -- ``nrows`` alone can't
+    see it, so the signature needs a content fingerprint too."""
+    import datetime
+    import types
+
+    from worktree_manager.production_picker.picker_tui import derive
+
+    def _src():
+        derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+        local = ("anomalous-potato", "Win")
+        raws = [{"id": "anomalous-potato-win-20260627-r00", "title": "Original title",
+                 "status": "idle", "started_at": "2026-06-27T17:00:00",
+                 "turn_count": 0, "state": "idle"}]
+        s = types.SimpleNamespace()
+        s.LOCAL = local
+        s.LOCAL_LABEL = "lc"
+        s.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+        s.bucket = derive.bucket
+        s.for_machine = derive.for_machine
+        s.load = lambda: [derive.norm(w, *local) for w in raws]
+        return s
+
+    def _find_row(nl, needle):
+        for i in range(nl.option_count):
+            p = nl.get_option_at_index(i).prompt
+            text = p.plain if hasattr(p, "plain") else str(p)
+            if needle in text:
+                return text
+        return None
+
+    async def run():
+        app = PickerApp(_src(), live=False)
+        async with app.run_test(size=(100, 14)) as pilot:
+            await pilot.pause()
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            scr.sel = ("L", 0)
+            scr.refresh()
+            await pilot.pause()
+            nl = scr.query_one("#nf-body-data")
+            assert _find_row(nl, "Original title") is not None
+
+            # Simulate a same-cardinality reload in place: the row count is
+            # unchanged (still 1), but its content (title/state) is swapped --
+            # exactly the case the signature's nrows-only probe used to miss.
+            for rec in scr.data:
+                rec["title"] = "Renamed title"
+                rec["state"] = "active"
+            scr.refresh()
+            await pilot.pause()
+
+            assert _find_row(nl, "Renamed title") is not None
+            assert _find_row(nl, "Original title") is None
+
+    asyncio.run(run())
+
+
 def test_native_list_checkbox_click_toggles(monkeypatch):
     """NF5-5 (#88): clicking the checkbox gutter (first cells) of a native-list
     row toggles its multi-select *without* activating it; clicking the row body
     activates (opens the submenu). The mouse multi-select the always-visible
     checkbox affords."""
     from worktree_manager.production_picker.picker_tui.engine import SubMenuScreen
-    monkeypatch.setenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", "1")
     src = _fixture_source()
 
     async def run():
@@ -5266,6 +7979,59 @@ def _write_tasks_manifest(directory):
     (directory / "agent-dispatch.json").write_text(json.dumps(manifest), encoding="utf-8")
 
 
+def _write_tasks_manifest_with_create(directory, *, confirm=False):
+    """A Tasks manifest with a pivot-level ``create_action`` (Phase B,
+    picker-new-session-prompt-and-composer) -- one text field (``title``) and
+    one textarea field (``prompt``), mirroring the Tasks-pane effort's own
+    planned field shape closely enough to exercise the generic mechanism."""
+    import json
+    manifest = {
+        "label": "Tasks",
+        "after": "Worktrees",
+        "list": [sys.executable],
+        "entry": {"id": "id", "title": "title"},
+        "empty_hint": "No proposed tasks.",
+        "create_action": {
+            "label": "New task",
+            "fields": [
+                {"name": "title", "type": "text"},
+                {"name": "prompt", "type": "textarea"},
+            ],
+            "run": [sys.executable, "create", "{field.title}",
+                    "--prompt", "{field.prompt}"],
+            "confirm": confirm,
+        },
+    }
+    (directory / "agent-dispatch.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _write_tasks_manifest_with_dynamic_create(directory, *, options_py_expr):
+    """A Tasks manifest whose ``create_action`` has a ``criteria`` field
+    sourced from a live ``options_command`` (Phase B item 3): a short Python
+    one-liner standing in for ``agent-dispatch registrar vocabulary --json``,
+    so the test exercises the real subprocess-resolution + JSON-parsing path
+    without depending on agent-dispatch being installed."""
+    import json
+    manifest = {
+        "label": "Tasks",
+        "after": "Worktrees",
+        "list": [sys.executable],
+        "entry": {"id": "id", "title": "title"},
+        "empty_hint": "No proposed tasks.",
+        "create_action": {
+            "label": "New task",
+            "fields": [
+                {"name": "title", "type": "text"},
+                {"name": "criteria", "type": "multichoice",
+                 "options_command": [sys.executable, "-c", options_py_expr]},
+            ],
+            "run": [sys.executable, "create", "{field.title}",
+                    "--criteria-json", "{field.criteria}"],
+        },
+    }
+    (directory / "agent-dispatch.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
 class _FakeRuntime:
     def __init__(self, rows):
         self.rows = rows
@@ -5626,6 +8392,569 @@ def test_banner_line_helper_levels():
     assert "\u2139" in info.plain
 
 
+def _column_render_holder():
+    """Resolve the render component owning ``_fitted_columns``/``_column_header``
+    (see ``test_banner_line_helper_levels`` for the same resolve-by-shape
+    pattern -- avoids hardcoding the exact class name)."""
+    import worktree_manager.production_picker.picker_tui.engine as eng_mod
+    for obj in vars(eng_mod).values():
+        if isinstance(obj, type) and hasattr(obj, "_fitted_columns") and hasattr(obj, "_column_header"):
+            return obj.__new__(obj)
+    raise AssertionError("no _fitted_columns/_column_header holder found")
+
+
+def test_fitted_columns_drops_low_priority_when_narrow():
+    """Phase 3 follow-up (#agent-dispatch-tasks-pane-ux-overhaul): narrowing the
+    render width below the declared columns' total drops the highest-priority-
+    number column(s) first, keeping the flex (``title``) column."""
+    from worktree_manager.production_picker.picker_tui.pivots import Column
+
+    inst = _column_render_holder()
+    reg = types.SimpleNamespace(columns=(
+        Column(key="title", header="TITLE", width=None, priority=1),
+        Column(key="id", header="ID", width=8, priority=2),
+        Column(key="artifacts", header="ARTIFACTS", width=20, priority=8),
+    ))
+    wide = inst._fitted_columns(reg, 80)
+    assert [c.key for c in wide] == ["title", "id", "artifacts"]
+
+    narrow = inst._fitted_columns(reg, 20)
+    keys = [c.key for c in narrow]
+    assert "title" in keys
+    assert "artifacts" not in keys  # highest priority number drops first
+    assert len(narrow) < len(reg.columns)
+
+
+def test_column_header_renders_dropped_count_indicator():
+    """``_column_header``'s ``dropped`` param renders a compact ``+N`` at the
+    end of the header row -- distinguishing a genuinely empty column from one
+    the fit algorithm merely dropped at a narrow viewport -- and is silently
+    omitted when there isn't spare width (never wraps the header)."""
+    from worktree_manager.production_picker.picker_tui.pivots import Column
+
+    inst = _column_render_holder()
+    cols = (Column(key="title", header="TITLE", width=10),)
+
+    no_drop = inst._column_header(cols, 40, 0)
+    assert "+" not in no_drop.plain
+
+    with_drop = inst._column_header(cols, 40, 2)
+    assert "+2" in with_drop.plain
+    assert with_drop.cell_len == 40  # still fills the full row width
+
+    # No spare width for the indicator: omitted rather than truncated/wrapped.
+    tight = inst._column_header(cols, 11, 2)
+    assert "+" not in tight.plain
+    assert tight.cell_len == 11
+
+
+def test_column_row_shows_worktree_short_id_not_a_front_truncated_prefix():
+    """Phase 4 item 1 finding (agent-dispatch-tasks-pane-ux-overhaul): the
+    real ``agent-dispatch-board`` emits the claiming worktree's FULL id (e.g.
+    ``build-host-1-20260916-140200-a1c4``, ~30+ chars) in ``target_worktree``
+    -- the demo preview fixture used already-4-char ids (``a1c4``), which
+    happen to fit the WT column's declared width and masked that the generic
+    per-cell ``_clip`` truncates from the FRONT, so a real id rendered as a
+    meaningless prefix fragment (e.g. ``buil…``) instead of the vision's
+    promised "claiming worktree's 4-digit id". ``_enrich_pivot_rows`` must
+    fill ``_worktree_short`` (the trailing 4 chars, matching the Worktrees
+    list's own ``id4`` convention), and ``_column_row`` must render the
+    ``worktree_field`` column from it instead of the raw value."""
+    from worktree_manager.production_picker.picker_tui.pivots import Column
+
+    inst = _column_render_holder()
+    cols = (Column(key="target_worktree", header="WT", width=5, align="l"),)
+    real_id = "build-host-1-20260916-140200-a1c4"
+    rec = {"target_worktree": real_id, "_worktree_short": real_id[-4:]}
+
+    cell = inst._column_row(cols, rec, 20, False, "target_worktree")
+
+    assert "a1c4" in cell.plain
+    assert "buil" not in cell.plain
+
+
+def test_column_row_falls_back_to_raw_value_for_a_non_worktree_column():
+    """A column whose key isn't the pivot's ``worktree_field`` (or a pivot with
+    none) renders the raw value unchanged -- the short-id substitution is
+    scoped to exactly the one column it fixes."""
+    from worktree_manager.production_picker.picker_tui.pivots import Column
+
+    inst = _column_render_holder()
+    cols = (Column(key="title", header="TITLE", width=10, align="l"),)
+    rec = {"title": "Some task title", "_worktree_short": "a1c4"}
+
+    cell = inst._column_row(cols, rec, 20, False, "target_worktree")
+
+    assert "a1c4" not in cell.plain
+    assert cell.plain.strip().startswith("Some task")
+
+
+def test_enrich_pivot_rows_fills_worktree_short_from_the_real_field():
+    """``_enrich_pivot_rows`` must compute ``_worktree_short`` without
+    mutating the raw ``worktree_field`` value -- other consumers
+    (``_task_action_ctx``'s ``{worktree}`` template substitution, the
+    Worktree Status card action, etc.) need the real, full id to operate on
+    the actual worktree, not a 4-char fragment."""
+    import worktree_manager.production_picker.picker_tui.engine as eng_mod
+
+    holder = None
+    for obj in vars(eng_mod).values():
+        if isinstance(obj, type) and hasattr(obj, "_enrich_pivot_rows"):
+            holder = obj
+            break
+    assert holder is not None
+    inst = holder.__new__(holder)
+    inst.data = []
+    reg = types.SimpleNamespace(worktree_field="target_worktree")
+    real_id = "build-host-1-20260916-140200-a1c4"
+    rows = [{"target_worktree": real_id}, {"target_worktree": None}]
+
+    inst._enrich_pivot_rows(reg, rows)
+
+    assert rows[0]["_worktree_short"] == "a1c4"
+    assert rows[0]["target_worktree"] == real_id  # untouched
+    assert rows[1]["_worktree_short"] == ""
+
+
+def _pickerscreen_holder():
+    """Resolve the ``PickerScreen`` class (shape-resolve, matching
+    ``_column_render_holder``'s pattern) so tests don't hardcode a name that
+    could shift if the class is renamed/split."""
+    import worktree_manager.production_picker.picker_tui.engine as eng_mod
+    for obj in vars(eng_mod).values():
+        if isinstance(obj, type) and hasattr(obj, "_worktree_claiming_task"):
+            return obj
+    raise AssertionError("no _worktree_claiming_task holder found")
+
+
+class _FakeClaimRuntime:
+    def __init__(self, state, rows):
+        self._state, self._rows = state, rows
+
+    def get(self, _machine):
+        return (self._state, self._rows, "")
+
+
+def test_worktree_claiming_task_matches_by_full_id():
+    """Phase 4 REVERSE cross-link (agent-dispatch-tasks-pane-ux-overhaul):
+    a Worktrees row whose id exactly matches a cached registered-pivot task
+    row's ``worktree_field`` value is found, along with the pivot's own
+    declared ``group_field`` (real-review finding: not a hardcoded
+    ``"group"`` -- a manifest may name its phase field anything)."""
+    holder = _pickerscreen_holder()
+    inst = holder.__new__(holder)
+    reg = types.SimpleNamespace(name="agent-dispatch", worktree_field="target_worktree",
+                                 group_field="group")
+    task_row = {"id": "t1", "target_worktree": "host-win-20260916-233618-927b",
+                "group": "Started"}
+    inst.pivots = [{"kind": "registered", "pivot": reg}]
+    inst._pivot_runtimes = {"agent-dispatch": _FakeClaimRuntime("ready", [task_row])}
+    inst._pivot_machine_id = lambda: "host"
+
+    rec = {"id": "host-win-20260916-233618-927b", "id4": "927b"}
+    assert inst._worktree_claiming_task(rec) == (task_row, "group")
+
+
+def test_worktree_claiming_task_matches_a_short_fixture_style_id4():
+    """A cached task row whose ``worktree_field`` is already a short,
+    4-char id (the demo preview fixture's style, e.g. ``a1c4``) matches a
+    Worktrees row by its ``id4`` -- distinct from a real board's full id,
+    which is matched by exact equality instead (see the sibling test
+    above)."""
+    holder = _pickerscreen_holder()
+    inst = holder.__new__(holder)
+    reg = types.SimpleNamespace(name="agent-dispatch", worktree_field="target_worktree",
+                                 group_field="group")
+    task_row = {"id": "t1", "target_worktree": "927b", "group": "Blocked"}
+    inst.pivots = [{"kind": "registered", "pivot": reg}]
+    inst._pivot_runtimes = {"agent-dispatch": _FakeClaimRuntime("ready", [task_row])}
+    inst._pivot_machine_id = lambda: "host"
+
+    rec = {"id": "host-win-20260916-233618-927b", "id4": "927b"}
+    assert inst._worktree_claiming_task(rec) == (task_row, "group")
+
+
+def test_worktree_claiming_task_never_conflates_a_trailing_id4_collision():
+    """Real-review finding: two distinct full worktree ids that merely
+    SHARE the same trailing 4 hex chars must never be conflated -- a task
+    claiming ``other-host-20260101-000000-927b`` is not the task claiming
+    THIS worktree (``host-win-20260916-233618-927b``) just because both
+    end in ``927b``. Matching must be exact-equality only (full id, or a
+    short id4-style value), never a suffix/``endswith`` comparison."""
+    holder = _pickerscreen_holder()
+    inst = holder.__new__(holder)
+    reg = types.SimpleNamespace(name="agent-dispatch", worktree_field="target_worktree",
+                                 group_field="group")
+    collision_task = {"id": "t3", "target_worktree": "other-host-20260101-000000-927b",
+                       "group": "Started"}
+    inst.pivots = [{"kind": "registered", "pivot": reg}]
+    inst._pivot_runtimes = {"agent-dispatch": _FakeClaimRuntime("ready", [collision_task])}
+    inst._pivot_machine_id = lambda: "host"
+
+    rec = {"id": "host-win-20260916-233618-927b", "id4": "927b"}
+    assert inst._worktree_claiming_task(rec) is None
+
+
+def test_worktree_claiming_task_returns_none_when_unclaimed_or_not_ready():
+    """No match (a different worktree's task, or the pivot not yet loaded)
+    returns ``None`` rather than a false positive or an exception."""
+    holder = _pickerscreen_holder()
+    inst = holder.__new__(holder)
+    reg = types.SimpleNamespace(name="agent-dispatch", worktree_field="target_worktree",
+                                 group_field="group")
+    other_task = {"id": "t2", "target_worktree": "other-host-20260101-000000-aaaa",
+                  "group": "Queued"}
+    inst.pivots = [{"kind": "registered", "pivot": reg}]
+    inst._pivot_machine_id = lambda: "host"
+
+    inst._pivot_runtimes = {"agent-dispatch": _FakeClaimRuntime("ready", [other_task])}
+    rec = {"id": "host-win-20260916-233618-927b", "id4": "927b"}
+    assert inst._worktree_claiming_task(rec) is None
+
+    inst._pivot_runtimes = {"agent-dispatch": _FakeClaimRuntime("loading", [])}
+    assert inst._worktree_claiming_task(rec) is None
+
+
+def test_worktree_claiming_task_uses_the_rows_own_machine_not_the_selected_tab():
+    """Real-review finding: browsing the cross-machine "All" scope shows
+    worktree rows from every machine, but the currently-selected pivot tab
+    (``_pivot_machine_id``) names only ONE of them -- always querying that
+    one would silently omit the badge for every OTHER machine's worktrees.
+    Resolve the scope from the worktree row's own ``machine`` display name
+    (translated through ``_machine_key_map``, same as ``_pivot_machine_id``
+    does for the selected tab) instead."""
+
+    class _ScopeAwareRuntime:
+        def __init__(self, rows_by_scope):
+            self._rows_by_scope = rows_by_scope
+
+        def get(self, scope):
+            rows = self._rows_by_scope.get(scope)
+            return ("ready", rows, "") if rows is not None else ("idle", [], "")
+
+    holder = _pickerscreen_holder()
+    inst = holder.__new__(holder)
+    reg = types.SimpleNamespace(name="agent-dispatch", worktree_field="target_worktree",
+                                 group_field="group")
+    remote_task = {"id": "t4", "target_worktree": "remote-win-20260101-000000-abcd",
+                    "group": "Started"}
+    inst.pivots = [{"kind": "registered", "pivot": reg}]
+    inst._pivot_runtimes = {"agent-dispatch": _ScopeAwareRuntime({"remote-key": [remote_task]})}
+    inst._machine_key_map = lambda: {"Remote-Display": "remote-key"}
+    # The selected tab is "All" (or some unrelated machine) -- irrelevant here.
+    inst._pivot_machine_id = lambda: "local-key"
+
+    rec = {"id": "remote-win-20260101-000000-abcd", "id4": "abcd", "machine": "Remote-Display"}
+    assert inst._worktree_claiming_task(rec) == (remote_task, "group")
+
+
+def test_worktree_claiming_task_uses_account_scope_for_account_scoped_pivots():
+    """Real-review finding: an ``account_scoped`` registration's runtime
+    caches its rows under the empty scope key (matching
+    ``PickerScreen._pivot_scope_key``'s own convention), never per-machine
+    -- looking it up with the machine id instead would always miss, so a
+    matching task would silently never show its badge."""
+
+    class _ScopeAwareRuntime:
+        def __init__(self, rows_by_scope):
+            self._rows_by_scope = rows_by_scope
+
+        def get(self, scope):
+            rows = self._rows_by_scope.get(scope)
+            return ("ready", rows, "") if rows is not None else ("idle", [], "")
+
+    holder = _pickerscreen_holder()
+    inst = holder.__new__(holder)
+    reg = types.SimpleNamespace(name="agent-codespaces", worktree_field="target_worktree",
+                                 account_scoped=True, group_field="group")
+    task_row = {"id": "cs1", "target_worktree": "host-win-20260916-233618-927b",
+                "group": "Started"}
+    inst.pivots = [{"kind": "registered", "pivot": reg}]
+    inst._pivot_runtimes = {"agent-codespaces": _ScopeAwareRuntime({"": [task_row]})}
+    inst._pivot_machine_id = lambda: "host"
+
+    rec = {"id": "host-win-20260916-233618-927b", "id4": "927b"}
+    assert inst._worktree_claiming_task(rec) == (task_row, "group")
+
+
+def test_detail_line_shows_task_phase_badge_for_a_claimed_worktree():
+    """The Worktrees-list detail line renders a `` · <Phase>`` badge, in the
+    same task_phase palette the Tasks pivot's own PHASE column uses, when a
+    registered pivot's task claims this worktree row -- reading the phase
+    from the pivot's OWN declared ``group_field``, not a hardcoded key."""
+    import worktree_manager.production_picker.picker_tui.engine as eng_mod
+
+    class _Eng:
+        def _worktree_claiming_task(self, _rec):
+            return ({"custom_phase_key": "Started"}, "custom_phase_key")
+
+    view = eng_mod.WorktreesView(_Eng())
+    rec = {"title": "Fix the thing", "state": "wip"}
+    line = view._detail_line(rec, 80)
+
+    assert "Started" in line.plain
+
+
+def test_detail_line_omits_badge_when_the_pivot_declares_no_group_field():
+    """A matched task from a pivot with no declared ``group_field`` shows no
+    badge -- there is no real phase value to read, and the raw
+    ``worktree_field`` value would be meaningless here (it's just this same
+    worktree's own id again)."""
+    import worktree_manager.production_picker.picker_tui.engine as eng_mod
+
+    class _Eng:
+        def _worktree_claiming_task(self, _rec):
+            return ({"target_worktree": "host-win-...-927b"}, None)
+
+    view = eng_mod.WorktreesView(_Eng())
+    rec = {"title": "Fix the thing", "state": "wip"}
+    line = view._detail_line(rec, 80)
+
+    assert "·" not in line.plain
+
+
+def test_detail_line_omits_badge_for_an_unclaimed_worktree():
+    """No claiming task -> the detail line renders exactly as before (no
+    stray `` · `` separator, no layout change)."""
+    import worktree_manager.production_picker.picker_tui.engine as eng_mod
+
+    class _Eng:
+        def _worktree_claiming_task(self, _rec):
+            return None
+
+    view = eng_mod.WorktreesView(_Eng())
+    rec = {"title": "Fix the thing", "state": "wip"}
+    line = view._detail_line(rec, 80)
+
+    assert "·" not in line.plain
+
+
+def test_detail_line_never_falls_back_to_bare_state():
+    """#3307 follow-up: a row with no live-pulse intent and no disposition
+    activity shows no second-line suffix at all -- STATE is its own column
+    and must never be duplicated here as a fake "activity"."""
+    import worktree_manager.production_picker.picker_tui.engine as eng_mod
+
+    class _Eng:
+        def _worktree_claiming_task(self, _rec):
+            return None
+
+    view = eng_mod.WorktreesView(_Eng())
+    rec = {"title": "Fix the thing", "state": "wip"}
+    line = view._detail_line(rec, 80)
+
+    assert line.plain.strip() == "Fix the thing"
+
+
+def test_detail_line_shows_session_head_mismatch_warning():
+    """#3307 Phase 7 (dotfiles#1298): a worktree flagged
+    ``session_head_mismatch`` (the asserted head disagrees with the session
+    most-recently touched on disk) shows a visible "head mismatch" warning
+    on the detail line -- an unflagged row shows nothing extra."""
+    import worktree_manager.production_picker.picker_tui.engine as eng_mod
+
+    class _Eng:
+        def _worktree_claiming_task(self, _rec):
+            return None
+
+    view = eng_mod.WorktreesView(_Eng())
+    flagged = {"title": "Fix the thing", "state": "wip",
+               "session_head_mismatch": True}
+    line = view._detail_line(flagged, 80)
+    assert "head mismatch" in line.plain
+    assert "\u26a0" in line.plain
+
+    unflagged = {"title": "Fix the thing", "state": "wip",
+                 "session_head_mismatch": False}
+    assert "head mismatch" not in view._detail_line(unflagged, 80).plain
+
+
+def test_detail_line_prefers_live_intent_then_activity():
+    """Fallback order: live-pulse intent (fresh session) beats the
+    disposition-asserted ``activity`` field, which is shown when no live
+    pulse is present."""
+    import worktree_manager.production_picker.picker_tui.engine as eng_mod
+
+    class _Eng:
+        def _worktree_claiming_task(self, _rec):
+            return None
+
+    view = eng_mod.WorktreesView(_Eng())
+    with_both = {"title": "Fix the thing", "state": "wip",
+                 "live_pulse": "fresh", "live_intent": "running tests",
+                 "activity": "should not show"}
+    assert "running tests" in view._detail_line(with_both, 80).plain
+    assert "should not show" not in view._detail_line(with_both, 80).plain
+
+    activity_only = {"title": "Fix the thing", "state": "wip",
+                      "activity": "running the retry-budget tests"}
+    assert "running the retry-budget tests" in view._detail_line(activity_only, 80).plain
+
+
+def test_row_and_detail_line_alt_shading_skips_focused_or_selected():
+    """#3307 follow-up: the alternating-row background applies to a plain
+    row, but never overrides the focus/selection highlight (which already
+    carries its own background)."""
+    import worktree_manager.production_picker.picker_tui.engine as eng_mod
+    from worktree_manager.production_picker.picker_tui.styles import C_ALT_BG
+
+    class _Eng:
+        pulse = 0
+
+        def _checkbox(self, _is_sel):
+            return None
+
+        def _row_key(self, rec):
+            return rec["id"]
+
+        def _worktree_claiming_task(self, _rec):
+            return None
+
+    eng = _Eng()
+    eng.wt_sel = set()
+    view = eng_mod.WorktreesView(eng)
+    rec = {"id": "wt-1", "id4": "wt-1", "state": "wip", "title": "t",
+           "age": "1h", "used": "1h", "sess": "·", "sess_turns": "-/0",
+           "claims_summary": ""}
+    cols = [("id4", "id", 4, "l")]
+
+    plain_alt = view._row_text(rec, 0, None, 20, cols, None, None, alt=True)
+    styles_alt = {span.style for span in plain_alt.spans}
+    assert C_ALT_BG in styles_alt
+
+    plain_no_alt = view._row_text(rec, 0, None, 20, cols, None, None, alt=False)
+    assert C_ALT_BG not in {span.style for span in plain_no_alt.spans}
+
+    focused_alt = view._row_text(rec, 0, ("L", 0), 20, cols, None, None, alt=True)
+    assert C_ALT_BG not in {span.style for span in focused_alt.spans}
+
+    detail_alt = view._detail_line(rec, 80, alt=True)
+    assert C_ALT_BG in {span.style for span in detail_alt.spans}
+    detail_no_alt = view._detail_line(rec, 80, alt=False)
+    assert C_ALT_BG not in {span.style for span in detail_no_alt.spans}
+
+
+def test_claims_cell_never_mid_value_truncates():
+    """#3307 follow-up (operator feedback): a claims_summary value longer
+    than the column's declared width is never ellipsis-clipped mid-value --
+    only the WHOLE row is truncated, and only if it doesn't fit the
+    terminal at all."""
+    from worktree_manager.production_picker.picker_tui.engine_helpers import row_text
+
+    long_claim = "container agent-containers-standing-desk"
+    rec = {"id4": "abcd", "claims_summary": long_claim}
+    cols = [("id4", "id", 4, "l"), ("claims_summary", "claims", 12, "l")]
+
+    # Plenty of room: the full value renders, not "container a…".
+    t = row_text(rec, cols, 80, False)
+    assert long_claim in t.plain
+    assert "…" not in t.plain
+
+    # No room at all: the WHOLE ROW truncates at the very end (never
+    # mid-value -- the claim's own text is never itself sliced with "…"
+    # somewhere in its middle).
+    narrow = row_text(rec, cols, 20, False)
+    assert narrow.cell_len <= 20
+    assert narrow.plain.endswith("…")
+
+
+def test_claims_cell_renders_real_hyperlinks_from_claims_links():
+    """#3307 follow-up: claims_links (engine-computed [{label,url}]) builds
+    a real per-claim hyperlink span, falling back to the plain
+    claims_summary string when absent (an older engine or another pivot)."""
+    from worktree_manager.production_picker.picker_tui.engine_helpers import row_text
+
+    cols = [("id4", "id", 4, "l"), ("claims_summary", "claims", 20, "l")]
+    with_links = {
+        "id4": "abcd",
+        "claims_summary": "PR #83",
+        "claims_links": [{"label": "PR #83",
+                           "url": "https://github.com/acme/sample/pull/83"}],
+    }
+    t = row_text(with_links, cols, 80, False)
+    link_styles = [span.style for span in t.spans if "link " in str(span.style)]
+    assert any("https://github.com/acme/sample/pull/83" in s for s in link_styles)
+
+    without_links = {"id4": "abcd", "claims_summary": "PR #83"}
+    t2 = row_text(without_links, cols, 80, False)
+    assert "PR #83" in t2.plain
+    assert not any("link " in str(span.style) for span in t2.spans)
+
+
+def test_fitted_columns_reserves_room_for_drop_indicator():
+    """Regression: the flex (``title``) column absorbs 100% of any remaining
+    width by design, so a caller that simply computed
+    ``dropped = len(reg.columns) - len(fitted)`` and rendered ``_column_header``
+    with it would ALWAYS get zero spare width when anything was dropped --
+    the ``+N`` indicator would never actually be visible in practice. When a
+    column is dropped, ``_fitted_columns`` must leave the caller's later
+    ``_column_header`` call room to show it."""
+    from worktree_manager.production_picker.picker_tui.pivots import Column
+
+    inst = _column_render_holder()
+    reg = types.SimpleNamespace(columns=(
+        Column(key="title", header="TITLE", width=None, priority=1),
+        Column(key="id", header="ID", width=8, priority=2),
+        Column(key="artifacts", header="ARTIFACTS", width=20, priority=8),
+    ))
+    width = 20
+    fitted = inst._fitted_columns(reg, width)
+    dropped = len(reg.columns) - len(fitted)
+    assert dropped > 0
+
+    header = inst._column_header(fitted, width, dropped)
+    assert f"+{dropped}" in header.plain
+    assert header.cell_len == width
+
+
+def test_registered_pivot_narrow_width_renders_drop_indicator(tmp_path, monkeypatch):
+    """End-to-end: a real ``PickerApp`` render of a columns pivot at a width too
+    narrow for every declared column shows the ``+N`` drop indicator in the
+    rendered header row -- not just in the two unit tests above."""
+    import json as _json
+
+    from worktree_manager.production_picker.picker_tui import pivots as pivots_mod
+
+    d = tmp_path / "pivots"
+    d.mkdir()
+    manifest = {
+        "label": "CodeSpaces",
+        "after": "Worktrees",
+        "list": [sys.executable],
+        "entry": {"id": "id", "title": "display"},
+        "columns": [
+            {"key": "display", "header": "TITLE"},
+            {"key": "id", "header": "ID", "width": 8},
+            {"key": "status", "header": "STATE", "width": 10},
+            {"key": "cores", "header": "CORES", "width": 10},
+        ],
+    }
+    (d / "agent-codespaces.json").write_text(_json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setenv(pivots_mod.PIVOTS_DIR_ENV, str(d))
+
+    rows = [{"id": "cs1", "display": "my-feature", "status": "RUNNING", "cores": 32}]
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        # A narrow render width forces the fit algorithm to drop columns.
+        async with app.run_test(size=(40, 30)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            reg = scr.registered_pivots[0]
+            scr._pivot_runtimes[reg.name] = _FakeRuntime(rows)
+            scr.htab = scr.htabs.index("CodeSpaces")
+            scr.sel = scr.default_sel()
+            scr.refresh()
+            await pilot.pause()
+
+            plain = pcap.screen_to_text(scr)
+            assert "TITLE" in plain
+            assert "+" in plain  # the column-drop indicator rendered somewhere
+
+    asyncio.run(run())
+
+
 def test_screenshot_pivot_selection_and_wait(tmp_path, monkeypatch):
     """The snapshot tool can target a specific pivot and wait for its registered
     ``list`` to load, so a headless capture shows the CodeSpaces tab with real
@@ -5729,7 +9058,6 @@ def test_registered_pivot_account_scope_and_subtitle(tmp_path, monkeypatch):
 
     asyncio.run(run())
 
-
 def test_registered_pivot_action_menu_runs_and_invalidates(tmp_path, monkeypatch):
     from worktree_manager.production_picker.picker_tui import pivots as pivots_mod
 
@@ -5755,8 +9083,7 @@ def test_registered_pivot_action_menu_runs_and_invalidates(tmp_path, monkeypatch
 
             # Enter opens the action sub-menu (ModalScreen) with the manifest's
             # actions.
-            scr._open_task_menu()
-            await pilot.pause()
+            await _open_task_menu_and_wait(scr, pilot)
             menu = _task_menu(scr)
             assert menu is not None
             assert [a.label for a in menu._actions] == [
@@ -5921,8 +9248,7 @@ def test_registered_pivot_conditional_actions_filter_by_when(tmp_path, monkeypat
             # Row 0 (in-use): Details + Release, NOT Recycle.
             scr.sel = ("T", 0)
             await pilot.pause()
-            scr._open_task_menu()
-            await pilot.pause()
+            await _open_task_menu_and_wait(scr, pilot)
             menu = _task_menu(scr)
             assert menu is not None
             assert [a.label for a in menu._actions] == ["Details", "Release"]
@@ -5932,11 +9258,313 @@ def test_registered_pivot_conditional_actions_filter_by_when(tmp_path, monkeypat
             # Row 1 (stale): Details + Recycle, NOT Release.
             scr.sel = ("T", 1)
             await pilot.pause()
-            scr._open_task_menu()
-            await pilot.pause()
+            await _open_task_menu_and_wait(scr, pilot)
             menu = _task_menu(scr)
             assert menu is not None
             assert [a.label for a in menu._actions] == ["Details", "Recycle"]
+
+    asyncio.run(run())
+
+
+def test_registered_pivot_create_action_button_appears_and_absent(tmp_path, monkeypatch):
+    """Phase B engine wiring: a pivot that declares ``create_action`` gets a
+    data-driven "New …" button (the BTN stop/row); a pivot that doesn't
+    (``_write_tasks_manifest``, no ``create_action`` key) gets none -- the
+    gap the effort doc's Journal flagged (``button_set()`` returned ``[]`` for
+    every registered pivot, unconditionally)."""
+    from worktree_manager.production_picker.picker_tui import pivots as pivots_mod
+
+    d = tmp_path / "pivots"
+    d.mkdir()
+    _write_tasks_manifest_with_create(d)
+    monkeypatch.setenv(pivots_mod.PIVOTS_DIR_ENV, str(d))
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            scr.htab = scr.htabs.index("Tasks")
+            await pilot.pause()
+            assert scr.button_set() == ["NC"]
+            assert ("BTN", 0) in scr.stops()
+
+    asyncio.run(run())
+
+    d2 = tmp_path / "pivots-no-create"
+    d2.mkdir()
+    _write_tasks_manifest(d2)
+    monkeypatch.setenv(pivots_mod.PIVOTS_DIR_ENV, str(d2))
+    src2 = _fixture_source()
+
+    async def run_absent():
+        app = PickerApp(src2, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            scr.htab = scr.htabs.index("Tasks")
+            await pilot.pause()
+            assert scr.button_set() == []
+            assert ("BTN", 0) not in scr.stops()
+
+    asyncio.run(run_absent())
+
+
+def test_registered_pivot_create_action_opens_and_submits(tmp_path, monkeypatch):
+    """The data-driven "New …" button opens ``CreateActionScreen`` built from
+    the manifest's static ``create_action.fields``; Confirm substitutes
+    ``{field.<name>}`` tokens into ``run`` and executes it via the pivot
+    runtime -- the exact same single-subprocess ``format_form_template`` +
+    ``run_resolved`` path the row-scoped ``kind:"form"`` action already uses
+    (no new orchestration needed at the picker layer)."""
+    from worktree_manager.production_picker.picker_tui import pivots as pivots_mod
+    from worktree_manager.production_picker.picker_tui.engine import (
+        CreateActionScreen,
+        _AutoExpandTextArea,
+    )
+    from textual.widgets import Input
+
+    d = tmp_path / "pivots"
+    d.mkdir()
+    _write_tasks_manifest_with_create(d)
+    monkeypatch.setenv(pivots_mod.PIVOTS_DIR_ENV, str(d))
+
+    rows = [{"id": "t1", "title": "existing task"}]
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            rt = _seed_fake_tasks(scr, rows)
+            scr.htab = scr.htabs.index("Tasks")
+
+            scr.sel = ("BTN", 0)
+            await pilot.pause()
+            scr._activate()
+            await pilot.pause()
+            assert isinstance(app.screen, CreateActionScreen)
+            screen = app.screen
+            # Two fields -> TabbedContent; q-0 (text) then q-1 (textarea). Both
+            # the real documented keyboard flow (Ctrl+Right to switch tabs,
+            # Enter to accept + advance) work for a text field too.
+            screen.query_one("#q-0", Input).value = "Fix the flaky test"
+            await pilot.press("ctrl+right")      # text tab -> textarea tab
+            await pilot.pause()
+            screen.query_one("#q-1", _AutoExpandTextArea).text = "investigate and fix it"
+            await pilot.press("enter")          # advance textarea -> button row
+            await pilot.pause()
+            await pilot.press("enter")          # activate Create (confirm=False)
+            await pilot.pause()
+
+            assert rt.resolved == [
+                str(Path(sys.executable).resolve()), "create", "Fix the flaky test",
+                "--prompt", "investigate and fix it",
+            ]
+            assert rt.invalidated is True
+
+    asyncio.run(run())
+
+
+def test_registered_pivot_create_action_resolves_dynamic_options(tmp_path, monkeypatch):
+    """Phase B item 3: a ``create_action`` field declaring ``options_command``
+    has its options resolved LIVE (off the render flow, via ``_run_bg``)
+    right before the modal opens -- the modal must not appear until the
+    subprocess result lands, and must then show those live values, not an
+    empty/static list."""
+    from worktree_manager.production_picker.picker_tui import pivots as pivots_mod
+    from worktree_manager.production_picker.picker_tui.engine import CreateActionScreen
+
+    d = tmp_path / "pivots"
+    d.mkdir()
+    _write_tasks_manifest_with_dynamic_create(
+        d, options_py_expr="import json; print(json.dumps(['alpha', 'beta']))"
+    )
+    monkeypatch.setenv(pivots_mod.PIVOTS_DIR_ENV, str(d))
+
+    rows = [{"id": "t1", "title": "existing task"}]
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            _seed_fake_tasks(scr, rows)
+            scr.htab = scr.htabs.index("Tasks")
+
+            scr.sel = ("BTN", 0)
+            await pilot.pause()
+            scr._activate()
+            # The subprocess runs off-thread -- give it a bounded number of
+            # pump cycles to land its call_from_thread callback, mirroring
+            # the project's existing _bg_threads-draining pattern. The
+            # deadline is deliberately wider than OPTIONS_COMMAND_TIMEOUT
+            # (5s) -- under full-suite CPU contention, spawning the child
+            # interpreter itself can approach that bound.
+            deadline = time.monotonic() + 15
+            while not isinstance(app.screen, CreateActionScreen) and time.monotonic() < deadline:
+                await pilot.pause()
+            assert isinstance(app.screen, CreateActionScreen)
+            screen = app.screen
+            criteria_field = next(q for q in screen._q if q["name"] == "criteria")
+            assert criteria_field["options"] == ["alpha", "beta"]
+
+    asyncio.run(run())
+
+
+def test_registered_pivot_create_action_dynamic_options_failure_degrades_to_free_text(
+    tmp_path, monkeypatch
+):
+    """A failing/empty ``options_command`` must never block the modal from
+    opening -- the field degrades to its forced ``allow_other`` free-text
+    fallback (empty ``options``), exactly the contract
+    ``pivot_create_action.parse_create_action`` establishes."""
+    from worktree_manager.production_picker.picker_tui import pivots as pivots_mod
+    from worktree_manager.production_picker.picker_tui.engine import CreateActionScreen
+
+    d = tmp_path / "pivots"
+    d.mkdir()
+    _write_tasks_manifest_with_dynamic_create(
+        d, options_py_expr="import sys; sys.exit(1)"
+    )
+    monkeypatch.setenv(pivots_mod.PIVOTS_DIR_ENV, str(d))
+
+    rows = [{"id": "t1", "title": "existing task"}]
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            _seed_fake_tasks(scr, rows)
+            scr.htab = scr.htabs.index("Tasks")
+
+            scr.sel = ("BTN", 0)
+            await pilot.pause()
+            scr._activate()
+            deadline = time.monotonic() + 15
+            while not isinstance(app.screen, CreateActionScreen) and time.monotonic() < deadline:
+                await pilot.pause()
+            assert isinstance(app.screen, CreateActionScreen)
+            screen = app.screen
+            criteria_field = next(q for q in screen._q if q["name"] == "criteria")
+            assert criteria_field["options"] == []
+            assert criteria_field["allow_other"] is True
+
+    asyncio.run(run())
+
+
+def test_registered_pivot_create_action_cancel_does_not_submit(tmp_path, monkeypatch):
+    """Escape (or the Cancel button) dismisses with ``None`` -- the pivot
+    runtime never runs anything, mirroring the Bare/No-Mux/Anchor "nothing to
+    submit" skip paths elsewhere in this effort."""
+    from worktree_manager.production_picker.picker_tui import pivots as pivots_mod
+    from worktree_manager.production_picker.picker_tui.engine import CreateActionScreen
+
+    d = tmp_path / "pivots"
+    d.mkdir()
+    _write_tasks_manifest_with_create(d)
+    monkeypatch.setenv(pivots_mod.PIVOTS_DIR_ENV, str(d))
+
+    rows = [{"id": "t1", "title": "existing task"}]
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            rt = _seed_fake_tasks(scr, rows)
+            scr.htab = scr.htabs.index("Tasks")
+
+            scr.sel = ("BTN", 0)
+            await pilot.pause()
+            scr._activate()
+            await pilot.pause()
+            assert isinstance(app.screen, CreateActionScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, CreateActionScreen)
+            assert not hasattr(rt, "resolved")
+
+    asyncio.run(run())
+
+
+def test_registered_pivot_create_action_confirm_gate(tmp_path, monkeypatch):
+    """``create_action.confirm: true`` shows an inline are-you-sure before the
+    collected values are actually dismissed/submitted -- Cancel on that
+    prompt returns to the fields with nothing lost; Create on it submits."""
+    from worktree_manager.production_picker.picker_tui import pivots as pivots_mod
+    from worktree_manager.production_picker.picker_tui.engine import (
+        CreateActionScreen,
+        FocusGroup,
+    )
+    from textual.widgets import Input
+
+    d = tmp_path / "pivots"
+    d.mkdir()
+    _write_tasks_manifest_with_create(d, confirm=True)
+    monkeypatch.setenv(pivots_mod.PIVOTS_DIR_ENV, str(d))
+
+    rows = [{"id": "t1", "title": "existing task"}]
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 36)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            rt = _seed_fake_tasks(scr, rows)
+            scr.htab = scr.htabs.index("Tasks")
+
+            scr.sel = ("BTN", 0)
+            await pilot.pause()
+            scr._activate()
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, CreateActionScreen)
+            screen.query_one("#q-0", Input).value = "A title"
+            await pilot.press("ctrl+right")      # text tab -> textarea tab
+            await pilot.pause()
+            await pilot.press("enter")          # textarea -> button row
+            await pilot.press("enter")          # activate Create -> confirm gate
+            await pilot.pause()
+            # Still the same screen instance (inline prompt, no second push),
+            # and nothing has run yet.
+            assert app.screen is screen
+            assert not hasattr(rt, "resolved")
+            group = screen.query_one("#create-confirm-prompt-buttons", FocusGroup)
+            assert group.value == "no"          # Cancel is the initial choice
+
+            # Exercise the Cancel path FIRST: activating the initial "Cancel"
+            # choice must return to the fields -- the screen stays open, the
+            # confirm prompt is gone, nothing ran, and the title typed
+            # earlier is still there (nothing was lost).
+            await pilot.press("enter")          # activate Cancel ("no")
+            await pilot.pause()
+            assert app.screen is screen
+            assert not screen._confirming
+            assert not hasattr(rt, "resolved")
+            assert screen.query_one("#q-0", Input).value == "A title"
+
+            # Re-trigger Create -> confirm gate, this time actually confirm.
+            await pilot.press("enter")          # activate Create -> confirm gate
+            await pilot.pause()
+            group = screen.query_one("#create-confirm-prompt-buttons", FocusGroup)
+            assert group.value == "no"          # still starts on Cancel
+            await pilot.press("left")           # Cancel -> Create ("yes")
+            assert group.value == "yes"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not isinstance(app.screen, CreateActionScreen)
+            assert rt.resolved == [
+                str(Path(sys.executable).resolve()), "create", "A title",
+                "--prompt", "",
+            ]
 
     asyncio.run(run())
 
@@ -6007,8 +9635,7 @@ def test_steering_card_and_form_actions_gate_and_drive(tmp_path, monkeypatch):
             # Awaiting-steer row: Card + Steer are shown (plus Abandon).
             scr.sel = ("T", 0)
             await pilot.pause()
-            scr._open_task_menu()
-            await pilot.pause()
+            await _open_task_menu_and_wait(scr, pilot)
             menu = _task_menu(scr)
             assert [a.label for a in menu._actions] == ["View card", "Steer", "Abandon"]
             await pilot.press("escape")
@@ -6017,8 +9644,7 @@ def test_steering_card_and_form_actions_gate_and_drive(tmp_path, monkeypatch):
             # Non-awaiting row: only Abandon (card/steer gated out).
             scr.sel = ("T", 1)
             await pilot.pause()
-            scr._open_task_menu()
-            await pilot.pause()
+            await _open_task_menu_and_wait(scr, pilot)
             menu = _task_menu(scr)
             assert [a.label for a in menu._actions] == ["Abandon"]
             await pilot.press("escape")
@@ -6055,13 +9681,16 @@ def test_steering_card_and_form_actions_gate_and_drive(tmp_path, monkeypatch):
 
 
 def test_steer_submit_is_offloaded_off_the_render_flow(tmp_path, monkeypatch):
-    """The Confirm subprocess (agent-dispatch steer submit) must NOT block the
-    Textual event loop -- it runs on a background worker via _run_bg, so the UI
-    stays live during the coordinator round-trip. Proven deterministically with a
-    runtime whose run_resolved blocks on an Event: right after Confirm the submit
-    has NOT run yet (deferred to the worker) and the status line shows the working
-    marker -- the loop was NOT blocked by the 5s gate. Releasing the gate lets the
-    worker finish and apply on the loop."""
+    """Phase 3c UI-thread boundary: the Confirm subprocess (agent-dispatch
+    steer submit) must NOT block the Textual event loop.
+
+    It runs on a background worker via ``_run_bg``, so the UI stays live during
+    the coordinator round-trip. Proven deterministically with a runtime whose
+    ``run_resolved`` blocks on an Event: right after Confirm the submit has NOT
+    run yet (deferred to the worker) and the status line shows the working
+    marker -- the loop was NOT blocked by the 5s gate. Releasing the gate lets
+    the worker finish and apply on the loop.
+    """
     import threading
 
     from worktree_manager.production_picker.picker_tui import pivots as pivots_mod
@@ -6136,18 +9765,124 @@ def test_steer_submit_is_offloaded_off_the_render_flow(tmp_path, monkeypatch):
     asyncio.run(run())
 
 
+def test_run_bg_logs_when_waking_the_render_flow_fails(caplog):
+    """`_run_bg` must never let a worker's outcome vanish with zero signal.
+
+    The outcome (`_apply`) is always posted into the screen's `Inbox` --
+    recorded there regardless of what happens next. But if *waking* the
+    render flow to drain it fails (the owning widget/app already torn down,
+    ``post_message`` raising for some other exotic reason), the outcome would
+    otherwise sit in the inbox forever with nothing to ever drain it, and the
+    operator sees nothing change -- no status line update, no error -- for an
+    action that may have genuinely succeeded (e.g. a steer submission that
+    reached the coordinator). This proves the wake failure is at least
+    logged (by ``Inbox.post`` itself) so it is diagnosable, and that the
+    outcome is still recorded in the inbox rather than silently dropped.
+    """
+    import logging as _logging
+    import threading as _threading
+    import time as _time
+
+    from worktree_manager.production_picker.picker_tui import engine as engine_mod
+    from worktree_manager.production_picker.picker_tui.inbox import Inbox
+
+    class _BrokenOwner:
+        def post_message(self, message):
+            raise RuntimeError("owner already torn down")
+
+    class _Screen:
+        pass
+
+    screen = _Screen()
+    screen.inbox = Inbox(_BrokenOwner())
+    screen._busy_label = None
+    screen._bg_cancel = _threading.Event()
+    screen._bg_threads = set()
+
+    with caplog.at_level(_logging.WARNING, logger="agent-worktrees.picker"):
+        engine_mod.PickerScreen._run_bg(
+            screen, "steer", lambda: (True, "ok"),
+        )
+        deadline = _time.monotonic() + 2
+        while screen._bg_threads and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+        for _ in range(100):
+            if caplog.records:
+                break
+            _time.sleep(0.02)
+
+    assert any(
+        "failed to wake the owning render flow" in r.message
+        for r in caplog.records
+    )
+    # The outcome itself was NOT lost -- it is sitting in the inbox, ready
+    # for whatever next drains it (a tick, a retried wake, ...).
+    assert len(screen.inbox.pending_slots()) == 1
+
+
+def test_run_bg_drops_quietly_when_the_picker_already_cancelled_it(caplog):
+    """When ``on_unmount`` has already set ``_bg_cancel`` (the picker itself is
+    tearing down -- a launch decision, cancel, or quit), a worker still
+    finishing its blocking ``work()`` at that moment must NOT attempt to post
+    into the inbox at all, and must NOT log a WARNING: this is an expected,
+    intentional exit, not an unforeseen wake failure. Distinguishes this case
+    from ``test_run_bg_logs_when_waking_the_render_flow_fails``, which covers
+    a genuinely unexpected wake failure."""
+    import logging as _logging
+    import threading as _threading
+    import time as _time
+
+    from worktree_manager.production_picker.picker_tui import engine as engine_mod
+
+    class _FakeApp:
+        def __init__(self):
+            self.called = False
+
+        def call_from_thread(self, fn):
+            self.called = True
+            fn()
+
+    class _Screen:
+        pass
+
+    screen = _Screen()
+    app = _FakeApp()
+    screen.app = app
+    screen._busy_label = None
+    screen._bg_cancel = _threading.Event()
+    screen._bg_cancel.set()  # picker already tore down before work() finished
+    screen._bg_threads = set()
+
+    with caplog.at_level(_logging.DEBUG, logger="agent-worktrees.picker"):
+        engine_mod.PickerScreen._run_bg(
+            screen, "steer", lambda: (True, "ok"),
+        )
+        deadline = _time.monotonic() + 2
+        while screen._bg_threads and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+
+    assert app.called is False
+    assert not any(
+        r.levelno >= _logging.WARNING for r in caplog.records
+    )
+
+
 def test_actions_menu_liveness_verify_is_offloaded(tmp_path, monkeypatch):
-    """The worktree Actions menu opens IMMEDIATELY from cached liveness (never
-    frozen), shows a footer spinner while it re-verifies mux/session liveness (a
-    cross-process probe) off the render flow, and refines its verbs in place when
-    the probe lands. With a gated verify: the menu is already open + loading right
-    after _open_submenu (the loop wasn't frozen by the 5s probe); releasing the
-    gate clears the loading state and the verbs are refined."""
+    """Phase 3c UI-thread boundary: the worktree Actions menu opens
+    IMMEDIATELY from cached liveness (never frozen).
+
+    It shows a footer spinner while it re-verifies mux/session liveness (a
+    cross-process probe) off the render flow, and refines its verbs in place
+    when the probe lands. With a gated verify: the menu is already open +
+    loading right after ``_open_submenu`` (the loop wasn't frozen by the 5s
+    probe); releasing the gate clears the loading state and the verbs are
+    refined.
+    """
     import threading
 
-    from worktree_manager.production_picker import config as _cfg
-    from worktree_manager.production_picker import sessions as _sessions
-    from worktree_manager.production_picker import tracking as _tracking
+    from worktree_manager.production_picker import project_config as _cfg
+    from worktree_manager.production_picker import context as _context
+    from worktree_manager.production_picker import engine_group_c as _engine_group_c
 
     src = _fixture_source()
     wt_id = "anomalous-potato-win-20260627-aaaa"
@@ -6155,18 +9890,25 @@ def test_actions_menu_liveness_verify_is_offloaded(tmp_path, monkeypatch):
     tdir.mkdir()
     (tdir / f"{wt_id}.yaml").write_text("id: x\n", encoding="utf-8")
     monkeypatch.setattr(_cfg, "tracking_dir", lambda: tdir)
-    monkeypatch.setattr(_tracking, "stamp_mux_live", lambda *a, **k: None)
-
+    monkeypatch.setattr(_context, "project", lambda: "example")
     gate = threading.Event()
     calls = {"n": 0}
 
-    def _gated_verify(ns):
+    def _gated_verify(project, *, worktree_ids=None, timeout=None):
         calls["n"] += 1
         gate.wait(5)                    # block as the real mux/session probe would
         return types.SimpleNamespace(
-            mux_live=True, mux_clients=1, live_session_ids=["s"], bare=False)
+            rows=[{
+                "id": wt_id,
+                "mux_session": True,
+                "mux_attached": True,
+                "mux_clients": 1,
+                "session_lock_live": True,
+            }],
+            summary={},
+        )
 
-    monkeypatch.setattr(_sessions, "verify_worktree_active", _gated_verify)
+    monkeypatch.setattr(_engine_group_c, "picker_reconcile_local", _gated_verify)
 
     async def run():
         app = PickerApp(src, live=False)
@@ -6203,9 +9945,9 @@ def test_actions_menu_liveness_verify_is_offloaded(tmp_path, monkeypatch):
 
 def test_actions_worker_finishes_quietly_after_resume_exits(tmp_path, monkeypatch):
     """A slow menu probe may finish after Resume has detached the picker screen."""
-    from worktree_manager.production_picker import config as _cfg
-    from worktree_manager.production_picker import sessions as _sessions
-    from worktree_manager.production_picker import tracking as _tracking
+    from worktree_manager.production_picker import project_config as _cfg
+    from worktree_manager.production_picker import context as _context
+    from worktree_manager.production_picker import engine_group_c as _engine_group_c
 
     src = _verb_fixture_source()
     wt_id = "anomalous-potato-win-20260627-stop"
@@ -6213,18 +9955,25 @@ def test_actions_worker_finishes_quietly_after_resume_exits(tmp_path, monkeypatc
     tdir.mkdir()
     (tdir / f"{wt_id}.yaml").write_text("id: x\n", encoding="utf-8")
     monkeypatch.setattr(_cfg, "tracking_dir", lambda: tdir)
-    monkeypatch.setattr(_tracking, "stamp_mux_live", lambda *a, **k: None)
-
+    monkeypatch.setattr(_context, "project", lambda: "example")
     gate = threading.Event()
     started = threading.Event()
     thread_errors = []
     original_excepthook = threading.excepthook
 
-    def _gated_verify(ns):
+    def _gated_verify(project, *, worktree_ids=None, timeout=None):
         started.set()
         gate.wait()
         return types.SimpleNamespace(
-            mux_live=False, mux_clients=0, live_session_ids=[], bare=False)
+            rows=[{
+                "id": wt_id,
+                "mux_session": False,
+                "mux_attached": False,
+                "mux_clients": 0,
+                "session_lock_live": False,
+            }],
+            summary={},
+        )
 
     def _capture_thread_error(args):
         if args.thread.name == "pivot-action:Actions":
@@ -6232,7 +9981,7 @@ def test_actions_worker_finishes_quietly_after_resume_exits(tmp_path, monkeypatc
             return
         original_excepthook(args)
 
-    monkeypatch.setattr(_sessions, "verify_worktree_active", _gated_verify)
+    monkeypatch.setattr(_engine_group_c, "picker_reconcile_local", _gated_verify)
     monkeypatch.setattr(threading, "excepthook", _capture_thread_error)
 
     async def run():
@@ -6242,10 +9991,12 @@ def test_actions_worker_finishes_quietly_after_resume_exits(tmp_path, monkeypatc
             async with app.run_test(size=(118, 36)) as pilot:
                 scr = app.query_one(PickerScreen)
                 scr.machine_idx = scr.local_index()
+                scr.real_ops = True
                 await pilot.pause()
                 recs = scr.list_records()
-                scr.sel = ("L", next(
-                    i for i, rec in enumerate(recs) if rec["id4"] == "stop"))
+                stop_index = next(i for i, rec in enumerate(recs) if rec["id4"] == "stop")
+                scr.data[stop_index]["raw"] = {"id": wt_id}
+                scr.sel = ("L", stop_index)
                 scr._open_submenu()
                 assert await asyncio.to_thread(started.wait, 1)
                 worker = next(
@@ -6908,6 +10659,224 @@ def test_tick_services_deferred_nav_refresh():
     asyncio.run(run())
 
 
+def test_tick_pure_cosmetic_pulse_narrows_segment_refresh_to_chrome_and_body():
+    """pivot-streaming-transport Phase 4: a cosmetic-only idle tick (no busy
+    state, no pending nav -- the ``frame % 5 == 0`` branch firing alone) must
+    refresh ONLY the two segments that can actually depend on the clock-driven
+    pulse (``nf-chrome``'s pulsing status dot, ``nf-body-data``'s own internal
+    pulse fast-path, #4719) -- never the other five (title/pivots/machine/
+    buttons/footer), which have no pulse/spin dependency when nothing else is
+    busy. A competing busy condition must still refresh every segment,
+    unchanged from before Phase 4."""
+    src = _fixture_source()
+    all_segments = ("nf-title", "nf-pivots", "nf-chrome", "nf-machine",
+                     "nf-buttons", "nf-body-data", "nf-footer")
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+
+            widgets = {seg_id: scr.query_one(f"#{seg_id}") for seg_id in all_segments}
+            touched = set()
+
+            def _make_tracker(seg_id, widget, attr):
+                original = getattr(widget, attr)
+
+                def _tracked(*a, **k):
+                    touched.add(seg_id)
+                    return original(*a, **k)
+                return _tracked
+
+            def _patch_all():
+                for seg_id, widget in widgets.items():
+                    attr = "refresh_data" if seg_id == "nf-body-data" else "refresh"
+                    monkeypatch_targets.append((widget, attr, getattr(widget, attr)))
+                    object.__setattr__(widget, attr, _make_tracker(seg_id, widget, attr))
+
+            monkeypatch_targets = []
+            _patch_all()
+            try:
+                # Pure cosmetic pulse: no busy condition, no pending nav, only
+                # the periodic frame%5==0 branch can fire.
+                scr._busy_label = None
+                scr._nav_dirty = False
+                scr.frame = 4  # next _tick() increments to 5 -> frame % 5 == 0
+                touched.clear()
+                scr._tick()
+                assert touched == {"nf-chrome", "nf-body-data"}, (
+                    f"pure pulse tick touched unexpected segments: {touched}")
+
+                # A competing busy condition must still refresh every segment
+                # -- the narrowing never applies when anything else (busy)
+                # triggered the tick's refresh too.
+                scr._busy_label = "doing a thing"
+                scr._nav_dirty = False
+                scr.frame = 9
+                touched.clear()
+                scr._tick()
+                assert touched == set(all_segments), (
+                    f"busy-driven tick unexpectedly narrowed segments: {touched}")
+            finally:
+                scr._busy_label = None
+                for widget, attr, original in monkeypatch_targets:
+                    object.__setattr__(widget, attr, original)
+
+    asyncio.run(run())
+
+
+def test_tick_narrowed_cause_never_marks_the_whole_screen_region_dirty():
+    """pivot-streaming-transport Phase 4 (correction over #5418/#5433):
+    narrowing WHICH child segment widgets get refreshed is, on its own,
+    provably unable to change Textual's full-vs-incremental compositor
+    choice -- ``Widget.refresh()`` called with no explicit regions marks the
+    CALLING widget's own entire area dirty (``Widget._set_dirty()``), and
+    the calling widget for a bare ``self.refresh(cause=...)`` is the SCREEN
+    itself. ``_compositor.render_update()`` chooses ``render_full_update()``
+    specifically when the screen's own full region is in its dirty set, so a
+    screen-level refresh call alone already forces a full repaint regardless
+    of which children were also touched. This test proves the actual fix:
+    for an audited narrowed cause, the screen's own full region is NEVER
+    added to its dirty set -- only a busy/unaudited (``cause=None``) refresh
+    adds it, exactly like before Phase 4."""
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+            full_region = scr.outer_size.region
+
+            # Pure cosmetic pulse (narrowed): the screen's own region must
+            # NEVER be added to its dirty set.
+            scr._dirty_regions.clear()
+            scr._busy_label = None
+            scr._nav_dirty = False
+            scr.frame = 4
+            scr._tick()
+            assert full_region not in scr._dirty_regions, (
+                "a narrowed pulse tick marked the whole screen region dirty "
+                "-- this defeats the entire Phase 4 narrowing (Textual's "
+                "render_update() would still choose a full repaint)")
+
+            # Pure nav (narrowed): same guarantee.
+            scr._dirty_regions.clear()
+            scr.sel = ("L", 1)
+            scr._wt_track_focus()
+            scr._nav_dirty = True
+            scr.frame = 1
+            scr._tick()
+            assert full_region not in scr._dirty_regions, (
+                "a narrowed nav tick marked the whole screen region dirty")
+
+            # A competing busy condition (unnarrowed, cause=None) MUST still
+            # mark the whole screen dirty -- this guarantee only narrows
+            # audited causes, never the general case.
+            scr._dirty_regions.clear()
+            scr._busy_label = "doing a thing"
+            scr._nav_dirty = False
+            scr.frame = 2
+            scr._tick()
+            assert full_region in scr._dirty_regions, (
+                "a busy (unnarrowed) tick failed to mark the whole screen "
+                "dirty -- this would be an unrelated regression in the "
+                "ordinary, non-narrowed refresh path")
+
+    asyncio.run(run())
+
+
+def test_tick_pure_nav_narrows_segment_refresh_to_body_and_footer():
+    """pivot-streaming-transport Phase 4: a pure in-list nav tick (``_nav_
+    dirty`` set, no busy condition) must refresh ONLY ``nf-body-data`` and
+    ``nf-footer`` -- the two segments empirically confirmed (a headless
+    harness diffing each segment's actual rendered content across a real nav
+    move, including the one-time ``wt_sel`` 0->1 boot-edge-case from
+    ``_wt_track_focus()``'s "selection follows focus" rule, #2258 P3-1) to
+    ever depend on ``sel`` moving within the Worktrees list body.
+    ``nf-title``/``nf-pivots``/``nf-chrome``/``nf-machine``/``nf-buttons``
+    never change for an in-list move (``build_chrome()``'s own ``sel``
+    checks only compare against the ``"M"``/``"BTN"`` zones, never an
+    in-zone index). ``nf-body-sticky`` was never part of this method's
+    refresh set in the first place (it manages its own repaint via
+    ``set_lines()``'s own content-equality check, called separately) -- not
+    narrowed away, correctly absent both before and after this change. A
+    competing busy condition must still refresh every segment."""
+    src = _fixture_source()
+    all_segments = ("nf-title", "nf-pivots", "nf-chrome", "nf-machine",
+                     "nf-buttons", "nf-body-data", "nf-footer")
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            scr.machine_idx = scr.local_index()
+            await pilot.pause()
+
+            widgets = {seg_id: scr.query_one(f"#{seg_id}") for seg_id in all_segments}
+            touched = set()
+
+            def _make_tracker(seg_id, widget, attr):
+                original = getattr(widget, attr)
+
+                def _tracked(*a, **k):
+                    touched.add(seg_id)
+                    return original(*a, **k)
+                return _tracked
+
+            monkeypatch_targets = []
+            for seg_id, widget in widgets.items():
+                attr = "refresh_data" if seg_id == "nf-body-data" else "refresh"
+                monkeypatch_targets.append((widget, attr, getattr(widget, attr)))
+                object.__setattr__(widget, attr, _make_tracker(seg_id, widget, attr))
+            try:
+                # Pure nav: a real in-list cursor move (through the actual
+                # production call path, not a hand-set flag) sets
+                # `_nav_dirty`; no busy condition. No `await` happens between
+                # patching and this synchronous `_tick()` call, so the real
+                # background render timer (which also drives `_tick()` on its
+                # own schedule) cannot interleave -- asyncio only switches
+                # tasks at an await point.
+                scr._busy_label = None
+                scr.sel = ("L", 1)
+                scr._wt_track_focus()
+                scr._nav_dirty = True
+                scr.frame = 1  # not a multiple of 5 -- isolates the nav path
+                touched.clear()
+                scr._tick()
+                assert touched == {"nf-body-data", "nf-footer"}, (
+                    f"pure nav tick touched unexpected segments: {touched}")
+
+                # A second, steady-state nav move (wt_sel already tracks
+                # focus from the move above) narrows identically.
+                scr.sel = ("L", 2)
+                scr._wt_track_focus()
+                scr._nav_dirty = True
+                scr.frame = 2
+                touched.clear()
+                scr._tick()
+                assert touched == {"nf-body-data", "nf-footer"}, (
+                    f"steady-state nav tick touched unexpected segments: {touched}")
+
+                # A competing busy condition must still refresh every segment.
+                scr._busy_label = "doing a thing"
+                scr._nav_dirty = True
+                scr.frame = 3
+                touched.clear()
+                scr._tick()
+                assert touched == set(all_segments), (
+                    f"busy+nav tick unexpectedly narrowed segments: {touched}")
+            finally:
+                scr._busy_label = None
+                for widget, attr, original in monkeypatch_targets:
+                    object.__setattr__(widget, attr, original)
+
+    asyncio.run(run())
+
+
 def test_registered_pivot_grouped_columns_and_task_correlation(tmp_path, monkeypatch):
     """A grouped, account-scoped columns pivot: rows render under a
     section header, and the claiming worktree id is correlated to the owning
@@ -6979,6 +10948,25 @@ def test_palette_style_reuses_worktree_state_palette():
     assert _palette_style("state", "???") == ""
 
 
+def test_palette_style_task_phase_distinguishes_paused_from_suspended():
+    """Phase 7 follow-up (2026-09-29): a durable operator-set pause hold
+    ("Paused") must render with its own colour, never the same as a
+    system-Suspended task's teal or a Blocked task's amber."""
+    from worktree_manager.production_picker.picker_tui.engine import (
+        C_STATE,
+        _palette_style,
+    )
+    assert _palette_style("task_phase", "PAUSED") == C_STATE["ORPHAN"]
+    assert _palette_style("task_phase", "paused") == C_STATE["ORPHAN"]
+    assert _palette_style("task_phase", "SUSPENDED") == C_STATE["CONVO"]
+    assert _palette_style("task_phase", "PAUSED") != _palette_style(
+        "task_phase", "SUSPENDED"
+    )
+    assert _palette_style("task_phase", "PAUSED") != _palette_style(
+        "task_phase", "BLOCKED"
+    )
+
+
 def test_codespaces_state_column_is_colour_coded(tmp_path, monkeypatch):
     """The CodeSpaces STATE column renders each status in the reused Worktrees
     palette (a RUNNING cell carries the ACTIVE colour in the ANSI capture)."""
@@ -7024,3 +11012,125 @@ def test_codespaces_state_column_is_colour_coded(tmp_path, monkeypatch):
             assert _rgb(C_STATE["ACTIVE"]) in ansi
 
     asyncio.run(run())
+
+
+# ── idle-liveness self-exit (copilot-extensions#2761 follow-up) ──────────────
+# A bare Picker invocation whose owning terminal is torn down mid-session
+# (rather than never having one at all, which `run_tui_picker`'s isatty()
+# gate already rejects at spawn) previously had nothing to bound its
+# lifetime: no real input ever arrives again, and the process sits resident
+# indefinitely. These tests exercise the App-level idle-check independent of
+# any real terminal teardown (which is not reproducible in a headless test
+# harness) by manipulating the tracked activity timestamp directly.
+
+
+def test_idle_timeout_exits_with_no_result_when_stale(monkeypatch):
+    """A Picker whose last recorded input activity is older than the
+    configured idle timeout self-exits with no launch decision -- the same
+    outcome as the user confirming "quit" without selecting anything."""
+    from worktree_manager.production_picker.picker_tui import engine as eng
+
+    monkeypatch.setattr(eng, "IDLE_TIMEOUT_SECS", 60.0)
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)):
+            app._last_input_activity = time.monotonic() - 3600
+            app._check_idle_timeout()
+            assert app.result is None
+
+    asyncio.run(run())
+
+
+def test_idle_timeout_does_not_exit_when_recently_active(monkeypatch):
+    """A Picker with recent activity must never be exited by the idle check,
+    regardless of how frequently the periodic timer polls it."""
+    from worktree_manager.production_picker.picker_tui import engine as eng
+
+    monkeypatch.setattr(eng, "IDLE_TIMEOUT_SECS", 60.0)
+    src = _fixture_source()
+    exited = []
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)):
+            app.exit = lambda *a, **k: exited.append(True)
+            app._last_input_activity = time.monotonic()
+            app._check_idle_timeout()
+
+    asyncio.run(run())
+    assert exited == []
+
+
+def test_idle_timeout_disabled_by_nonpositive_value(monkeypatch):
+    """`AGENT_WORKTREES_PICKER_IDLE_TIMEOUT_SECONDS <= 0` disables the check
+    entirely, mirroring `_poll_secs`'s own disable idiom -- a Picker must
+    never self-exit no matter how long it sits with no configured timeout."""
+    from worktree_manager.production_picker.picker_tui import engine as eng
+
+    monkeypatch.setattr(eng, "IDLE_TIMEOUT_SECS", 0.0)
+    src = _fixture_source()
+    exited = []
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)):
+            app.exit = lambda *a, **k: exited.append(True)
+            app._last_input_activity = time.monotonic() - 10_000_000
+            app._check_idle_timeout()
+
+    asyncio.run(run())
+    assert exited == []
+
+
+def test_real_key_press_resets_idle_activity_clock():
+    """A genuine key event -- what the App's own `on_event` override is
+    supposed to treat as activity -- must push the tracked timestamp forward,
+    proving the idle clock is wired to real input and not just app startup."""
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            app._last_input_activity = time.monotonic() - 10_000
+            before = app._last_input_activity
+            await pilot.press("down")
+            assert app._last_input_activity > before
+
+    asyncio.run(run())
+
+
+def test_background_poll_timer_does_not_count_as_activity():
+    """The screen's own frequent internal repaint tick (`_tick`, 100ms) must
+    NOT reset the idle-activity clock -- only real input events may, or the
+    idle timeout could never fire in a picker just sitting open and
+    rendering."""
+    src = _fixture_source()
+
+    async def run():
+        app = PickerApp(src, live=False)
+        async with app.run_test(size=(118, 40)) as pilot:
+            scr = app.query_one(PickerScreen)
+            app._last_input_activity = time.monotonic() - 10_000
+            before = app._last_input_activity
+            # Let the screen's own internal 100ms tick fire several times.
+            scr._tick()
+            scr._tick()
+            await pilot.pause()
+            assert app._last_input_activity == before
+
+    asyncio.run(run())
+
+
+def test_idle_timeout_secs_env_override(monkeypatch):
+    """`AGENT_WORKTREES_PICKER_IDLE_TIMEOUT_SECONDS` overrides the default,
+    and a malformed value degrades to the documented default rather than
+    raising -- mirroring `_poll_secs`'s own malformed-value behavior."""
+    from worktree_manager.production_picker.picker_tui import engine as eng
+
+    monkeypatch.setenv("AGENT_WORKTREES_PICKER_IDLE_TIMEOUT_SECONDS", "120")
+    assert eng._idle_timeout_secs() == 120.0
+
+    monkeypatch.setenv("AGENT_WORKTREES_PICKER_IDLE_TIMEOUT_SECONDS", "not-a-number")
+    assert eng._idle_timeout_secs() == 1800.0

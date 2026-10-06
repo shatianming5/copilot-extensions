@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -155,16 +157,20 @@ class TestDataModels:
         repo = cfg.RepoConfig(anchor="/tmp/repo", worktree_root="/tmp/wt")
         assert repo.pr.enabled is False
         assert repo.pr.provider == "gitea"
-        assert repo.pr.strategy == "detach"
+        assert repo.pr.strategy == "keep-alive"
         assert repo.pr.branch_prefix == "feature"
 
     def test_pr_config_defaults(self):
         pr = cfg.PRConfig()
         assert pr.enabled is False
         assert pr.provider == "gitea"
-        assert pr.source_attribution is False
+        # codename-attribution-by-default: implicit default is now
+        # "codename" (public-safe marker), not False.
+        assert pr.source_attribution == "codename"
         # Auto-complete completion defaults.
         assert pr.approval_required is True
+        assert pr.allow_stale_approval is False
+        assert pr.dismiss_stale_reviews is None
         assert pr.squash is True
         assert pr.delete_source_branch is True
         assert pr.bypass_policy is False
@@ -173,7 +179,7 @@ class TestDataModels:
         assert pr.branch_update_strategy == "rebase"
         assert pr.merge_strategy == "squash"
         assert pr.prefer_auto_merge is True
-
+        assert pr.notes == ""
 
 # ---------------------------------------------------------------------------
 # pr-workflow config parsing
@@ -201,6 +207,50 @@ class TestPRConfigParsing:
         conf = cfg.load_config(cfgfile)
         assert conf.repos["ext"].pr.enabled is False
 
+    def test_codename_block_wires_through_load_config(self, tmp_path: Path):
+        """Integration regression: the codename block must actually reach
+        RepoConfig via load_config's _build_repo_config wiring, not just
+        parse_codename() in isolation -- a typo in that wiring would let
+        every loaded RepoConfig silently retain CodenameConfig defaults
+        while codename_config.py's own unit tests kept passing."""
+        cfgfile = tmp_path / "config.yaml"
+        self._write(
+            cfgfile,
+            "    codename:\n"
+            "      wordlist_path: config/codenames.yaml\n",
+        )
+        codename = cfg.load_config(cfgfile).repos["ext"].codename
+        assert codename.wordlist_path == "config/codenames.yaml"
+
+    def test_codename_absent_defaults_to_no_wordlist(self, tmp_path: Path):
+        cfgfile = tmp_path / "config.yaml"
+        self._write(cfgfile)
+        codename = cfg.load_config(cfgfile).repos["ext"].codename
+        assert codename.wordlist_path == ""
+
+    def test_pr_notes_parsed(self, tmp_path: Path):
+        cfgfile = tmp_path / "config.yaml"
+        self._write(
+            cfgfile,
+            "    pr:\n"
+            "      enabled: true\n"
+            "      merge_actor: submitter-direct\n"
+            "      notes: >-\n"
+            "        Maintainers bypass required review in pull_request mode,\n"
+            "        not always/exempt, to keep an audit trail.\n",
+        )
+        conf = cfg.load_config(cfgfile)
+        assert conf.repos["ext"].pr.notes == (
+            "Maintainers bypass required review in pull_request mode, "
+            "not always/exempt, to keep an audit trail."
+        )
+
+    def test_pr_notes_defaults_empty(self, tmp_path: Path):
+        cfgfile = tmp_path / "config.yaml"
+        self._write(cfgfile, "    pr:\n      enabled: true\n")
+        conf = cfg.load_config(cfgfile)
+        assert conf.repos["ext"].pr.notes == ""
+
     def test_pr_block_parsed(self, tmp_path: Path):
         cfgfile = tmp_path / "config.yaml"
         self._write(
@@ -210,7 +260,8 @@ class TestPRConfigParsing:
             "      provider: github\n"
             "      strategy: keep-alive\n"
             "      branch_prefix: pr\n"
-            "      source_attribution: true\n",
+            "      source_attribution: true\n"
+            "      required_body_sections: [Intent, Changes, Validation]\n",
         )
         conf = cfg.load_config(cfgfile)
         pr = conf.repos["ext"].pr
@@ -220,6 +271,168 @@ class TestPRConfigParsing:
         assert pr.strategy == "keep-alive"
         assert pr.branch_prefix == "pr"
         assert pr.source_attribution is True
+        assert pr.required_body_sections == ("Intent", "Changes", "Validation")
+
+    def test_pr_source_attribution_configured_true_when_key_present(
+        self, tmp_path: Path,
+    ):
+        cfgfile = tmp_path / "config.yaml"
+        self._write(
+            cfgfile,
+            "    pr:\n"
+            "      enabled: true\n"
+            "      source_attribution: false\n",
+        )
+        conf = cfg.load_config(cfgfile)
+        pr = conf.repos["ext"].pr
+        assert pr.source_attribution is False
+        assert pr.source_attribution_configured is True
+
+    def test_pr_source_attribution_configured_false_when_key_absent(
+        self, tmp_path: Path,
+    ):
+        # The migration audit (Phase 5) needs to tell this apart from an
+        # explicit `false` -- an absent key parses to the implicit
+        # "codename" default (codename-attribution-by-default), while
+        # only an EXPLICIT `false` produces the raw boolean `False`; only
+        # the genuinely-absent case leaves `source_attribution_configured`
+        # `False`.
+        cfgfile = tmp_path / "config.yaml"
+        self._write(cfgfile, "    pr:\n      enabled: true\n")
+        conf = cfg.load_config(cfgfile)
+        pr = conf.repos["ext"].pr
+        assert pr.source_attribution == "codename"
+        assert pr.source_attribution_configured is False
+
+    def test_pr_source_attribution_configured_false_when_pr_block_absent(
+        self, tmp_path: Path,
+    ):
+        # Review round 4: `_parse_pr` early-returns `PRConfig()` when the
+        # whole `pr:` block is missing entirely -- must not fall back to a
+        # `True` default for `source_attribution_configured` there either.
+        # (codename-attribution-by-default: the bare `PRConfig()` default
+        # for `source_attribution` itself is now "codename", not False --
+        # see the design-decision note in Context re: both code paths
+        # moving together.)
+        cfgfile = tmp_path / "config.yaml"
+        self._write(cfgfile)
+        conf = cfg.load_config(cfgfile)
+        pr = conf.repos["ext"].pr
+        assert pr.source_attribution == "codename"
+        assert pr.source_attribution_configured is False
+
+    def test_pr_source_attribution_default_and_configured_do_not_drift(
+        self, tmp_path: Path,
+    ):
+        # codename-attribution-by-default: the implicit-default value
+        # (now "codename") and source_attribution_configured (whether the
+        # raw key was literally present) are independent axes -- flipping
+        # the former must never move the latter. Cover all four
+        # combinations: omitted key / explicit "codename" / explicit
+        # `false` / explicit `true`.
+        omitted = tmp_path / "omitted.yaml"
+        self._write(omitted, "    pr:\n      enabled: true\n")
+        pr = cfg.load_config(omitted).repos["ext"].pr
+        assert pr.source_attribution == "codename"
+        assert pr.source_attribution_configured is False
+
+        explicit_codename = tmp_path / "explicit_codename.yaml"
+        self._write(
+            explicit_codename,
+            "    pr:\n      enabled: true\n      source_attribution: codename\n",
+        )
+        pr = cfg.load_config(explicit_codename).repos["ext"].pr
+        assert pr.source_attribution == "codename"
+        assert pr.source_attribution_configured is True
+
+        explicit_false = tmp_path / "explicit_false.yaml"
+        self._write(
+            explicit_false,
+            "    pr:\n      enabled: true\n      source_attribution: false\n",
+        )
+        pr = cfg.load_config(explicit_false).repos["ext"].pr
+        assert pr.source_attribution is False
+        assert pr.source_attribution_configured is True
+
+        explicit_true = tmp_path / "explicit_true.yaml"
+        self._write(
+            explicit_true,
+            "    pr:\n      enabled: true\n      source_attribution: true\n",
+        )
+        pr = cfg.load_config(explicit_true).repos["ext"].pr
+        assert pr.source_attribution is True
+        assert pr.source_attribution_configured is True
+
+    def test_pr_source_attribution_codename_mode_parsed(self, tmp_path: Path):
+        cfgfile = tmp_path / "config.yaml"
+        self._write(
+            cfgfile,
+            "    pr:\n"
+            "      enabled: true\n"
+            "      source_attribution: codename\n",
+        )
+        conf = cfg.load_config(cfgfile)
+        assert conf.repos["ext"].pr.source_attribution == "codename"
+
+    def test_pr_source_attribution_codename_mode_case_insensitive(self, tmp_path: Path):
+        cfgfile = tmp_path / "config.yaml"
+        self._write(
+            cfgfile,
+            "    pr:\n"
+            "      enabled: true\n"
+            "      source_attribution: Codename\n",
+        )
+        conf = cfg.load_config(cfgfile)
+        assert conf.repos["ext"].pr.source_attribution == "codename"
+
+    def test_pr_source_attribution_unrecognized_string_falls_back_to_false(
+        self, tmp_path: Path,
+    ):
+        """A typo (or any other string) must not silently become the raw
+        marker mode -- it falls back to the safe default (no marker)."""
+        cfgfile = tmp_path / "config.yaml"
+        self._write(
+            cfgfile,
+            "    pr:\n"
+            "      enabled: true\n"
+            "      source_attribution: alwyas\n",
+        )
+        conf = cfg.load_config(cfgfile)
+        assert conf.repos["ext"].pr.source_attribution is False
+
+    def test_pr_source_attribution_quoted_true_does_not_enable_raw_mode(
+        self, tmp_path: Path,
+    ):
+        """A quoted string like `"true"` must NOT be promoted to the raw
+        attribution mode -- only the YAML-native boolean `true` (parsed as
+        a real Python bool before this function runs) may enable it. This
+        is the more dangerous direction than a typo falling back to False,
+        so it gets its own explicit coverage."""
+        cfgfile = tmp_path / "config.yaml"
+        self._write(
+            cfgfile,
+            "    pr:\n"
+            "      enabled: true\n"
+            '      source_attribution: "true"\n',
+        )
+        conf = cfg.load_config(cfgfile)
+        assert conf.repos["ext"].pr.source_attribution is False
+
+    def test_pr_source_attribution_truthy_non_bool_does_not_enable_raw_mode(
+        self, tmp_path: Path,
+    ):
+        """A truthy non-bool YAML value (e.g. the integer `1`) must not
+        enable raw attribution either -- only an actual YAML boolean `true`
+        may."""
+        cfgfile = tmp_path / "config.yaml"
+        self._write(
+            cfgfile,
+            "    pr:\n"
+            "      enabled: true\n"
+            "      source_attribution: 1\n",
+        )
+        conf = cfg.load_config(cfgfile)
+        assert conf.repos["ext"].pr.source_attribution is False
 
     def test_pr_autocomplete_block_parsed(self, tmp_path: Path):
         cfgfile = tmp_path / "config.yaml"
@@ -232,6 +445,8 @@ class TestPRConfigParsing:
             "      api_base: https://your-org.visualstudio.com\n"
             "      automerge_label: auto-complete\n"
             "      approval_required: false\n"
+            "      allow_stale_approval: true\n"
+            "      dismiss_stale_reviews: false\n"
             "      bypass_policy: true\n"
             "      bypass_reason: self-serve\n"
             "      squash: true\n"
@@ -242,10 +457,97 @@ class TestPRConfigParsing:
         assert pr.provider == "azure-devops"
         assert pr.automerge_label == "auto-complete"
         assert pr.approval_required is False
+        assert pr.allow_stale_approval is True
+        assert pr.dismiss_stale_reviews is False
         assert pr.bypass_policy is True
         assert pr.bypass_reason == "self-serve"
         assert pr.squash is True
         assert pr.delete_source_branch is False
+
+    def test_pr_roles_and_fork_absent_defaults_empty(self, tmp_path: Path):
+        cfgfile = tmp_path / "config.yaml"
+        self._write(cfgfile, "    pr:\n      enabled: true\n")
+        pr = cfg.load_config(cfgfile).repos["ext"].pr
+        assert pr.roles == {}
+        assert pr.fork == cfg.ForkConfig()
+        assert pr.fork.enabled is False
+
+    def test_pr_fork_block_parsed(self, tmp_path: Path):
+        cfgfile = tmp_path / "config.yaml"
+        self._write(
+            cfgfile,
+            "    pr:\n"
+            "      enabled: true\n"
+            "      fork:\n"
+            "        enabled: true\n"
+            "        remote: myfork\n"
+            "        owner: someone\n",
+        )
+        pr = cfg.load_config(cfgfile).repos["ext"].pr
+        assert pr.fork == cfg.ForkConfig(enabled=True, remote="myfork", owner="someone")
+
+    def test_pr_roles_block_parsed(self, tmp_path: Path):
+        cfgfile = tmp_path / "config.yaml"
+        self._write(
+            cfgfile,
+            "    pr:\n"
+            "      enabled: true\n"
+            "      merge_actor: submitter-direct\n"
+            "      roles:\n"
+            "        maintain:\n"
+            "          merge_actor: submitter-direct\n"
+            "        write:\n"
+            "          merge_actor: \"\"\n"
+            "          fork:\n"
+            "            enabled: true\n"
+            "        bogus-role:\n"
+            "          merge_actor: submitter-direct\n",
+        )
+        pr = cfg.load_config(cfgfile).repos["ext"].pr
+        # An unrecognized role key is dropped, not raised.
+        assert set(pr.roles) == {"maintain", "write"}
+        assert pr.roles["maintain"].merge_actor == "submitter-direct"
+        assert pr.roles["maintain"].fork is None
+        assert pr.roles["write"].merge_actor == ""
+        assert pr.roles["write"].fork == cfg.ForkConfig(enabled=True)
+
+    def test_resolve_role_pr_config_no_role_returns_base(self, tmp_path: Path):
+        cfgfile = tmp_path / "config.yaml"
+        self._write(
+            cfgfile,
+            "    pr:\n"
+            "      enabled: true\n"
+            "      merge_actor: submitter-direct\n"
+            "      roles:\n"
+            "        write:\n"
+            "          merge_actor: \"\"\n",
+        )
+        pr = cfg.load_config(cfgfile).repos["ext"].pr
+        assert cfg.resolve_role_pr_config(pr, None) is pr
+        assert cfg.resolve_role_pr_config(pr, "unconfigured-role") is pr
+
+    def test_resolve_role_pr_config_layers_matching_role(self, tmp_path: Path):
+        cfgfile = tmp_path / "config.yaml"
+        self._write(
+            cfgfile,
+            "    pr:\n"
+            "      enabled: true\n"
+            "      merge_actor: submitter-direct\n"
+            "      reviewer: copilot\n"
+            "      roles:\n"
+            "        write:\n"
+            "          merge_actor: \"\"\n"
+            "          fork:\n"
+            "            enabled: true\n"
+            "            remote: myfork\n",
+        )
+        pr = cfg.load_config(cfgfile).repos["ext"].pr
+        resolved = cfg.resolve_role_pr_config(pr, "Write")  # case-insensitive
+        assert resolved.merge_actor == ""
+        assert resolved.fork == cfg.ForkConfig(enabled=True, remote="myfork")
+        # Everything not overridden by the role is inherited unchanged.
+        assert resolved.reviewer == "copilot"
+        assert resolved.enabled is True
 
     def test_pr_required_parsed(self, tmp_path: Path):
         cfgfile = tmp_path / "config.yaml"
@@ -585,6 +887,295 @@ class TestControlPlaneRelatedPRTier:
             },
         }  # entries without a pr block are omitted
 
+    def test_cp_related_pr_map_includes_knowledge_overlay(
+        self, tmp_path, monkeypatch
+    ):
+        from agent_worktrees import related as _related
+        from agent_worktrees import repos
+        from agent_worktrees import state_root
+
+        cp = tmp_path / "harness"
+        knowledge = tmp_path / "knowledge"
+        cp.mkdir()
+        knowledge.mkdir()
+        _related.write_related(cp, _related.RelatedConfig(related={
+            "ext": _related.RelatedEntry(name="ext", role="tooling", pr={
+                "enabled": True,
+                "required": True,
+                "provider": "azure-devops",
+            }),
+        }))
+        _related.write_related(knowledge, _related.RelatedConfig(related={
+            "ext": _related.RelatedEntry(name="ext", role="tooling", pr={
+                "enabled": True,
+                "required": True,
+                "provider": "azure-devops",
+                "merge_actor": "submitter-direct",
+            }),
+        }))
+
+        def _paths(path):
+            value = str(path)
+            return {"windows": value, "linux": value, "wsl": value}
+
+        monkeypatch.setattr(repos, "list_repos", lambda class_filter=None: [
+            repos.RepoEntry(name="harness", repo_class="worktree", paths=_paths(cp)),
+        ])
+        monkeypatch.setattr(_related, "find_control_plane_anchor", lambda: str(cp))
+        monkeypatch.setattr(
+            _related, "installed_plugin_related_anchors", lambda *a, **k: [])
+        monkeypatch.setattr(
+            state_root,
+            "config_source_anchors",
+            lambda config, **kwargs: [
+                state_root.ConfigSource(anchor=str(cp), origin="harness"),
+                state_root.ConfigSource(anchor=str(knowledge), origin="knowledge"),
+            ],
+        )
+        seen = {}
+
+        def _load_project_config(project, **kwargs):
+            seen["project"] = project
+            seen["kwargs"] = kwargs
+            return object()
+
+        monkeypatch.setattr(cfg, "load_project_config", _load_project_config)
+
+        got = cfg._control_plane_related_pr_map()
+
+        assert seen == {
+            "project": "harness",
+            "kwargs": {"include_control_plane_related_pr": False},
+        }
+        assert got["ext"]["merge_actor"] == "submitter-direct"
+
+    def test_cp_related_pr_map_does_not_load_unproven_project(
+        self, tmp_path, monkeypatch
+    ):
+        from agent_worktrees import related as _related
+        from agent_worktrees import repos
+
+        cp = tmp_path / "unregistered-control-plane"
+        cp.mkdir()
+        _related.write_related(cp, _related.RelatedConfig(related={
+            "ext": _related.RelatedEntry(name="ext", role="tooling", pr={
+                "enabled": True,
+                "merge_actor": "submitter-direct",
+            }),
+        }))
+        monkeypatch.setattr(_related, "find_control_plane_anchor", lambda: str(cp))
+        monkeypatch.setattr(
+            _related, "installed_plugin_related_anchors", lambda *a, **k: [])
+        monkeypatch.setattr(repos, "list_repos", lambda class_filter=None: [])
+        monkeypatch.setattr(
+            cfg,
+            "load_config",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("unproven project must not be loaded")
+            ),
+        )
+
+        got = cfg._control_plane_related_pr_map()
+
+        assert got["ext"]["merge_actor"] == "submitter-direct"
+
+
+class TestCachedLoadConfigScope:
+    """``cached_load_config_scope()`` memoizes ``load_config()`` -- opt-in only,
+    so every other caller keeps the ordinary always-fresh (cache-miss) behavior."""
+
+    def _write_machine(self, path: Path, anchor: Path) -> None:
+        path.write_text(
+            "repo_name: ext\n"
+            "srcroot: /tmp/src\n"
+            "machine: anomalous-potato\n"
+            "platform: wsl\n"
+            "repos:\n"
+            "  ext:\n"
+            f"    anchor: {anchor}\n"
+            "    worktree_root: /tmp/src/.worktrees/ext\n"
+            "    default_branch: main\n"
+            "    remote: origin\n"
+        )
+
+    def test_outside_scope_every_call_is_a_miss(self, tmp_path, monkeypatch):
+        anchor = tmp_path / "ext"
+        anchor.mkdir()
+        cfgfile = tmp_path / "config.yaml"
+        self._write_machine(cfgfile, anchor)
+        calls = []
+        orig = cfg._load_config_uncached
+        monkeypatch.setattr(
+            cfg, "_load_config_uncached",
+            lambda *a, **k: (calls.append(1), orig(*a, **k))[1],
+        )
+        cfg.load_config(cfgfile)
+        cfg.load_config(cfgfile)
+        assert len(calls) == 2  # no scope active -> always a fresh call
+
+    def test_inside_scope_repeat_calls_are_memoized(self, tmp_path, monkeypatch):
+        anchor = tmp_path / "ext"
+        anchor.mkdir()
+        cfgfile = tmp_path / "config.yaml"
+        self._write_machine(cfgfile, anchor)
+        calls = []
+        orig = cfg._load_config_uncached
+        monkeypatch.setattr(
+            cfg, "_load_config_uncached",
+            lambda *a, **k: (calls.append(1), orig(*a, **k))[1],
+        )
+        with cfg.cached_load_config_scope():
+            first = cfg.load_config(cfgfile)
+            second = cfg.load_config(cfgfile)
+        assert len(calls) == 1  # second call hit the cache
+        assert first is second  # same Config instance, not just equal
+
+    def test_scope_keys_by_full_call_signature(self, tmp_path, monkeypatch):
+        anchor = tmp_path / "ext"
+        anchor.mkdir()
+        cfgfile = tmp_path / "config.yaml"
+        self._write_machine(cfgfile, anchor)
+        calls = []
+        orig = cfg._load_config_uncached
+        monkeypatch.setattr(
+            cfg, "_load_config_uncached",
+            lambda *a, **k: (calls.append((a, k)), orig(*a, **k))[1],
+        )
+        with cfg.cached_load_config_scope():
+            cfg.load_config(cfgfile)
+            cfg.load_config(cfgfile, include_control_plane_related_pr=False)
+            cfg.load_config(cfgfile, project="other")
+        # Three distinct signatures -> three real loads, none reused across
+        # differently-parameterized calls.
+        assert len(calls) == 3
+
+    def test_scope_does_not_leak_across_scopes(self, tmp_path, monkeypatch):
+        anchor = tmp_path / "ext"
+        anchor.mkdir()
+        cfgfile = tmp_path / "config.yaml"
+        self._write_machine(cfgfile, anchor)
+        calls = []
+        orig = cfg._load_config_uncached
+        monkeypatch.setattr(
+            cfg, "_load_config_uncached",
+            lambda *a, **k: (calls.append(1), orig(*a, **k))[1],
+        )
+        with cfg.cached_load_config_scope():
+            cfg.load_config(cfgfile)
+        with cfg.cached_load_config_scope():
+            cfg.load_config(cfgfile)
+        assert len(calls) == 2  # a fresh scope never inherits a prior one's cache
+
+    def test_scope_exception_still_resets_the_cache(self, tmp_path):
+        from agent_worktrees import config_cache
+
+        with pytest.raises(RuntimeError):
+            with cfg.cached_load_config_scope():
+                assert config_cache._current_session.get() is not None
+                raise RuntimeError("boom")
+        assert config_cache._current_session.get() is None
+
+
+class TestConfigCacheSession:
+    """The explicit, caller-owned, TTL-bounded, cross-thread-shareable cache."""
+
+    def _write_machine(self, path: Path, anchor: Path) -> None:
+        path.write_text(
+            "repo_name: ext\n"
+            "srcroot: /tmp/src\n"
+            "machine: anomalous-potato\n"
+            "platform: wsl\n"
+            "repos:\n"
+            "  ext:\n"
+            f"    anchor: {anchor}\n"
+            "    worktree_root: /tmp/src/.worktrees/ext\n"
+            "    default_branch: main\n"
+            "    remote: origin\n"
+        )
+
+    def test_session_shares_cache_across_threads(self, tmp_path, monkeypatch):
+        # A plain object reference is shared by both threads explicitly
+        # entering its .scope() -- unlike cached_load_config_scope(), this
+        # is NOT limited to one thread.
+        anchor = tmp_path / "ext"
+        anchor.mkdir()
+        cfgfile = tmp_path / "config.yaml"
+        self._write_machine(cfgfile, anchor)
+        calls = []
+        orig = cfg._load_config_uncached
+        monkeypatch.setattr(
+            cfg, "_load_config_uncached",
+            lambda *a, **k: (calls.append(1), orig(*a, **k))[1],
+        )
+        session = cfg.ConfigCacheSession()
+        results = []
+
+        def worker():
+            with session.scope():
+                results.append(cfg.load_config(cfgfile))
+
+        with session.scope():
+            first = cfg.load_config(cfgfile)
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+        assert len(calls) == 1  # the second thread's call hit the shared cache
+        assert results[0] is first
+
+    def test_session_expires_entries_past_ttl(self, tmp_path, monkeypatch):
+        anchor = tmp_path / "ext"
+        anchor.mkdir()
+        cfgfile = tmp_path / "config.yaml"
+        self._write_machine(cfgfile, anchor)
+        calls = []
+        orig = cfg._load_config_uncached
+        monkeypatch.setattr(
+            cfg, "_load_config_uncached",
+            lambda *a, **k: (calls.append(1), orig(*a, **k))[1],
+        )
+        session = cfg.ConfigCacheSession(ttl=0.05)
+        with session.scope():
+            cfg.load_config(cfgfile)
+            time.sleep(0.1)
+            cfg.load_config(cfgfile)
+        assert len(calls) == 2  # the second call missed -- its entry had aged out
+
+    def test_session_none_ttl_never_expires(self, tmp_path, monkeypatch):
+        anchor = tmp_path / "ext"
+        anchor.mkdir()
+        cfgfile = tmp_path / "config.yaml"
+        self._write_machine(cfgfile, anchor)
+        calls = []
+        orig = cfg._load_config_uncached
+        monkeypatch.setattr(
+            cfg, "_load_config_uncached",
+            lambda *a, **k: (calls.append(1), orig(*a, **k))[1],
+        )
+        session = cfg.ConfigCacheSession(ttl=None)
+        with session.scope():
+            cfg.load_config(cfgfile)
+            time.sleep(0.1)
+            cfg.load_config(cfgfile)
+        assert len(calls) == 1  # no TTL -- the second call is still a hit
+
+    def test_session_invalidate_clears_entries(self, tmp_path, monkeypatch):
+        anchor = tmp_path / "ext"
+        anchor.mkdir()
+        cfgfile = tmp_path / "config.yaml"
+        self._write_machine(cfgfile, anchor)
+        calls = []
+        orig = cfg._load_config_uncached
+        monkeypatch.setattr(
+            cfg, "_load_config_uncached",
+            lambda *a, **k: (calls.append(1), orig(*a, **k))[1],
+        )
+        session = cfg.ConfigCacheSession()
+        with session.scope():
+            cfg.load_config(cfgfile)
+            session.invalidate()
+            cfg.load_config(cfgfile)
+        assert len(calls) == 2  # invalidate() forced a fresh call
+
 
 class TestLayeredConfig:
     """Three-tier merge: global < in-repo < machine-local; optional machine file."""
@@ -603,9 +1194,9 @@ class TestLayeredConfig:
         )
 
     def test_inrepo_dir_form_read(self, tmp_path: Path):
-        # Preferred location: <anchor>/.agent-worktrees/config.yaml (dir form).
+        # Preferred location: <anchor>/.copilot-extensions/agent-worktrees/config.yaml.
         anchor = tmp_path / "ext"
-        (anchor / cfg.INREPO_CONFIG_DIRNAME).mkdir(parents=True)
+        cfg.inrepo_config_path(anchor).parent.mkdir(parents=True)
         cfg.inrepo_config_path(anchor).write_text(
             "default_branch: main\nremote: upstream\n"
             "pr:\n  required: true\n  strategy: keep-alive\n"
@@ -620,13 +1211,22 @@ class TestLayeredConfig:
 
     def test_dir_form_wins_over_legacy_single_file(self, tmp_path: Path):
         anchor = tmp_path / "ext"
-        (anchor / cfg.INREPO_CONFIG_DIRNAME).mkdir(parents=True)
+        cfg.inrepo_config_path(anchor).parent.mkdir(parents=True)
         cfg.inrepo_config_path(anchor).write_text("pr:\n  provider: github\n")
         (anchor / cfg.INREPO_CONFIG_FILENAME).write_text("pr:\n  provider: gitea\n")
         cfgfile = tmp_path / "config.yaml"
         self._machine(cfgfile, anchor)
         repo = cfg.load_config(cfgfile).repos["ext"]
         assert repo.pr.provider == "github"  # dir form takes precedence
+
+    def test_legacy_directory_form_backcompat(self, tmp_path: Path):
+        anchor = tmp_path / "ext"
+        cfg.legacy_inrepo_config_path(anchor).parent.mkdir(parents=True)
+        cfg.legacy_inrepo_config_path(anchor).write_text("pr:\n  provider: github\n")
+        cfgfile = tmp_path / "config.yaml"
+        self._machine(cfgfile, anchor)
+        repo = cfg.load_config(cfgfile).repos["ext"]
+        assert repo.pr.provider == "github"
 
     def test_legacy_single_file_backcompat(self, tmp_path: Path):
         # Old .agent-worktrees.yaml (pr-only) still honored when no dir form.
@@ -648,7 +1248,7 @@ class TestLayeredConfig:
         # the in-repo session_env (deep-merge), so both keys reach the session --
         # the vault-owns-SUDO_ASKPASS pattern.
         anchor = tmp_path / "ext"
-        (anchor / cfg.INREPO_CONFIG_DIRNAME).mkdir(parents=True)
+        cfg.inrepo_config_path(anchor).parent.mkdir(parents=True)
         cfg.inrepo_config_path(anchor).write_text(
             "session_env:\n  COPILOT_FEATURE_FLAGS: extensions\n"
         )
@@ -675,6 +1275,33 @@ class TestLayeredConfig:
         (cdir / "z.yaml").write_text("repos:\n  ext:\n    remote: from-dropin\n")
         repo = cfg.load_config(cfgfile).repos["ext"]
         assert repo.remote == "from-config-yaml"
+
+    def test_marketplace_overlay_merges_on_top_of_base(self, tmp_path: Path, monkeypatch):
+        anchor = tmp_path / "ext"
+        cfg.inrepo_config_path(anchor).parent.mkdir(parents=True)
+        cfg.inrepo_config_path(anchor).write_text(
+            "remote: origin\npr:\n  provider: github\n  required: false\n",
+            encoding="utf-8",
+        )
+        overlay = (
+            anchor
+            / cfg.MARKETPLACE_OVERLAYS_DIR
+            / "mp-test"
+            / "config.yaml"
+        )
+        overlay.parent.mkdir(parents=True)
+        overlay.write_text("pr:\n  required: true\n", encoding="utf-8")
+        cfgfile = tmp_path / "config.yaml"
+        self._machine(cfgfile, anchor)
+        monkeypatch.setattr(
+            cfg.registry_paths,
+            "installation_context",
+            lambda: {"marketplaceId": "mp-test"},
+        )
+        repo = cfg.load_config(cfgfile).repos["ext"]
+        assert repo.remote == "origin"
+        assert repo.pr.provider == "github"
+        assert repo.pr.required is True
 
     def test_config_d_dropins_sorted_last_wins(self, tmp_path: Path):
         anchor = tmp_path / "ext"
@@ -792,7 +1419,8 @@ class TestLayeredConfig:
         anchor = tmp_path / "owner"
         anchor.mkdir()
         (anchor / cfg.INREPO_CONFIG_FILENAME).write_text(
-            "stateless: true\nrequires_external_state_root: true\n",
+            "stateless: true\nrequires_external_state_root: true\n"
+            "knowledge_only: false\n",
             encoding="utf-8",
         )
         from agent_worktrees import repos as repos_mod
@@ -830,7 +1458,36 @@ class TestLayeredConfig:
 
         assert conf.repo_name == "owner"
         assert conf.default_repo.stateless is True
+        assert conf.default_repo.knowledge_only is False
         assert cfg.active_project() == "provider"
+
+    def test_knowledge_only_defaults_false_and_parses_true(
+        self, tmp_path: Path, monkeypatch
+    ):
+        anchor = tmp_path / "companion"
+        anchor.mkdir()
+        from agent_worktrees import repos as repos_mod
+
+        registry = repos_mod.ReposRegistry(
+            repos={
+                "companion": repos_mod.RepoEntry(
+                    name="companion",
+                    repo_class="knowledge",
+                    paths={"windows": str(anchor), "wsl": str(anchor),
+                           "linux": str(anchor)},
+                )
+            }
+        )
+        monkeypatch.setattr(repos_mod, "read_registry", lambda: registry)
+        cfg.set_active_project("companion")
+
+        missing = tmp_path / "no-machine-config.yaml"
+        assert cfg.load_config(missing).default_repo.knowledge_only is False
+
+        (anchor / cfg.INREPO_CONFIG_FILENAME).write_text(
+            "knowledge_only: true\n", encoding="utf-8",
+        )
+        assert cfg.load_config(missing).default_repo.knowledge_only is True
 
     def test_foreign_repo_machine_local_only(self, tmp_path: Path):
         # A foreign repo with no in-repo config loads purely from machine-local.
@@ -847,6 +1504,258 @@ class TestLayeredConfig:
         repo = cfg.load_config(cfgfile).repos["ext"]
         assert repo.default_branch == "develop"
         assert repo.pr.required is True
+
+
+class TestInRepoConfigCommittedRefResolution:
+    """The in-repo config must be read from what's actually COMMITTED on the
+    resolved default branch, not from whatever the anchor's working tree
+    happens to have checked out (a stale/wrong local branch on the anchor
+    must never shadow it -- the anchor is a read-only mirror by design)."""
+
+    @staticmethod
+    def _resolve(anchor: Path) -> dict:
+        from agent_worktrees import inrepo_config_source
+        return inrepo_config_source.load_inrepo_config_from_committed_ref(
+            anchor,
+            (
+                cfg.inrepo_config_path(Path()),
+                cfg.legacy_inrepo_config_path(Path()),
+                Path(cfg.INREPO_CONFIG_FILENAME),
+            ),
+        )
+
+    def test_whole_resolution_shares_one_time_budget(self, monkeypatch, tmp_path):
+        """Every probe taking its full timeout still can't push one resolution
+        past the shared budget (the per-probe cap alone allowed ~8 x 15 s)."""
+        import types
+
+        from agent_worktrees import git_ops, inrepo_config_source as src
+
+        clock = {"t": 1000.0}
+        timeouts: list[float] = []
+
+        def slow_git(*args, timeout, **_kw):
+            timeouts.append(timeout)
+            clock["t"] += timeout  # worst case: each launch uses all the time it is given
+            if args[0] == "symbolic-ref":
+                return types.SimpleNamespace(returncode=0, stdout="refs/remotes/origin/main\n")
+            if args[0] == "show-ref":
+                return types.SimpleNamespace(returncode=0, stdout="")
+            if args[1].startswith("origin/main:") and len(timeouts) == 2:
+                return types.SimpleNamespace(returncode=0, stdout="default_branch: dev\n")
+            return types.SimpleNamespace(returncode=1, stdout="")
+
+        monkeypatch.setattr(git_ops, "git", slow_git)
+        monkeypatch.setattr(src.time, "monotonic", lambda: clock["t"])
+        self._resolve(tmp_path)
+        assert sum(timeouts) <= src._RESOLUTION_BUDGET
+        assert all(t <= src._OFFLINE_GIT_TIMEOUT for t in timeouts)
+
+    def test_resolutions_in_one_load_share_the_budget(self, monkeypatch, tmp_path):
+        """Several repos resolved in one load_config() spend one budget, not one each."""
+        import types
+
+        from agent_worktrees import git_ops, inrepo_config_source as src
+
+        clock = {"t": 1000.0}
+        timeouts: list[float] = []
+
+        def slow_git(*args, timeout, **_kw):
+            timeouts.append(timeout)
+            clock["t"] += timeout
+            if args[0] == "symbolic-ref":
+                return types.SimpleNamespace(returncode=0, stdout="refs/remotes/origin/main\n")
+            return types.SimpleNamespace(returncode=1, stdout="")
+
+        monkeypatch.setattr(git_ops, "git", slow_git)
+        monkeypatch.setattr(src.time, "monotonic", lambda: clock["t"])
+        with src.resolution_budget():
+            for _ in range(5):  # e.g. five configured repos
+                self._resolve(tmp_path)
+        assert sum(timeouts) <= src._RESOLUTION_BUDGET
+
+    def test_load_config_wires_one_budget_across_its_resolutions(self, monkeypatch, tmp_path):
+        """load_config() itself opens the shared budget: a load resolving several
+        repos stays within one budget with no caller-provided scope."""
+        import types
+
+        from agent_worktrees import git_ops, inrepo_config_source as src
+
+        clock = {"t": 1000.0}
+        timeouts: list[float] = []
+
+        def slow_git(*args, timeout, **_kw):
+            timeouts.append(timeout)
+            clock["t"] += timeout
+            if args[0] == "symbolic-ref":
+                return types.SimpleNamespace(returncode=0, stdout="refs/remotes/origin/main\n")
+            return types.SimpleNamespace(returncode=1, stdout="")
+
+        def _load_resolving_five_repos(*_a, **_kw):
+            for _ in range(5):  # e.g. five configured repos
+                self._resolve(tmp_path)
+            return types.SimpleNamespace(repos={})
+
+        monkeypatch.setattr(git_ops, "git", slow_git)
+        monkeypatch.setattr(src.time, "monotonic", lambda: clock["t"])
+        monkeypatch.setattr(cfg, "_load_config_uncached", _load_resolving_five_repos)
+        cfg.load_config(include_control_plane_related_pr=False)
+        assert len(timeouts) >= 2  # probes ran (a later repo may find the budget spent)
+        assert sum(timeouts) <= src._RESOLUTION_BUDGET
+
+    @staticmethod
+    def _git(*args: str, cwd: Path):
+        import subprocess
+        return subprocess.run(
+            ["git", "-c", "user.email=t@example.com", "-c", "user.name=Test",
+             "-c", "init.defaultBranch=main", *args],
+            cwd=str(cwd), capture_output=True, text=True, check=True,
+        )
+
+    def _make_remote_with_branch_configs(
+        self, tmp_path: Path, *, configs: dict[str, str]
+    ) -> Path:
+        """A bare 'remote' with one branch per ``configs`` key, each carrying
+        its own committed ``.agent-worktrees/config.yaml`` content."""
+        remote = tmp_path / "remote.git"
+        self._git("init", "--bare", "-b", "main", str(remote), cwd=tmp_path)
+        work = tmp_path / "work"
+        self._git("init", "-b", "main", str(work), cwd=tmp_path)
+        self._git("remote", "add", "origin", str(remote), cwd=work)
+        first = True
+        for branch, text in configs.items():
+            if first:
+                self._git("checkout", "-b", branch, cwd=work) if branch != "main" else None
+                first = False
+            else:
+                self._git("checkout", "-B", branch, cwd=work)
+            cfgdir = work / ".agent-worktrees"
+            cfgdir.mkdir(exist_ok=True)
+            (cfgdir / "config.yaml").write_text(text, encoding="utf-8")
+            self._git("add", "-A", cwd=work)
+            self._git("commit", "-m", f"config for {branch}", cwd=work)
+            self._git("push", "origin", branch, cwd=work)
+        return remote
+
+    def _clone_with_fetched_refs(
+        self, tmp_path: Path, remote: Path, *, checkout: str, fetch: tuple[str, ...]
+    ) -> Path:
+        """A clone (the 'anchor') checked out on ``checkout``. A normal clone
+        sets up ``origin/HEAD`` (needed for the offline head-branch probe)
+        and a remote-tracking ref for every branch on the remote; branches
+        NOT named in ``fetch`` have their remote-tracking ref pruned
+        afterward, to simulate one this anchor genuinely never fetched."""
+        clone = tmp_path / "anchor"
+        self._git(
+            "clone", "--branch", checkout, str(remote), str(clone), cwd=tmp_path,
+        )
+        proc = self._git(
+            "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin",
+            cwd=clone,
+        )
+        all_remote_branches = {
+            ref.split("/", 1)[1]
+            for ref in proc.stdout.splitlines()
+            if ref and "/" in ref and ref.split("/", 1)[1] != "HEAD"
+        }
+        for branch in all_remote_branches - set(fetch):
+            self._git(
+                "update-ref", "-d", f"refs/remotes/origin/{branch}", cwd=clone
+            )
+        return clone
+
+    def test_stale_anchor_checkout_does_not_shadow_committed_default_branch(
+        self, tmp_path: Path
+    ):
+        """THE regression: the anchor's checked-out `main` is stale (still
+        says `default_branch: main` on disk), but `origin/main`'s actually
+        committed config already says `default_branch: dev`. Resolution must
+        honor the committed value, never the stale working-tree copy."""
+        remote = self._make_remote_with_branch_configs(
+            tmp_path,
+            configs={"main": "default_branch: dev\nremote: origin\n"},
+        )
+        anchor = self._clone_with_fetched_refs(
+            tmp_path, remote, checkout="main", fetch=("main",)
+        )
+        # Simulate a stale on-disk copy that still says the OLD value --
+        # the exact shape of an anchor that hasn't pulled recent commits.
+        (anchor / ".agent-worktrees" / "config.yaml").write_text(
+            "default_branch: main\nremote: origin\n", encoding="utf-8"
+        )
+        data = self._resolve(anchor)
+        assert data.get("default_branch") == "dev"
+
+    def test_hops_to_declared_branch_when_it_carries_newer_settings(
+        self, tmp_path: Path
+    ):
+        """`origin/main` declares `default_branch: dev`; `origin/dev` (fetched)
+        carries its OWN, different settings. Resolution must read from `dev`,
+        not stop at what `main` alone declares."""
+        remote = self._make_remote_with_branch_configs(
+            tmp_path,
+            configs={
+                "main": "default_branch: dev\nremote: origin\n",
+                "dev": "default_branch: dev\nremote: origin\nstrategy: detach\n",
+            },
+        )
+        anchor = self._clone_with_fetched_refs(
+            tmp_path, remote, checkout="main", fetch=("main", "dev")
+        )
+        data = self._resolve(anchor)
+        assert data.get("strategy") == "detach"
+
+    def test_does_not_hop_when_declared_branch_not_fetched(self, tmp_path: Path):
+        """`origin/main` declares `default_branch: dev`, but `dev` was never
+        fetched as a remote-tracking ref -- resolution stays on `main`'s own
+        committed config rather than guessing at an unresolvable hop."""
+        remote = self._make_remote_with_branch_configs(
+            tmp_path,
+            configs={
+                "main": "default_branch: dev\nremote: origin\n",
+                "dev": "default_branch: dev\nremote: origin\nstrategy: detach\n",
+            },
+        )
+        anchor = self._clone_with_fetched_refs(
+            tmp_path, remote, checkout="main", fetch=("main",)  # dev NOT fetched
+        )
+        data = self._resolve(anchor)
+        assert data.get("default_branch") == "dev"
+        assert "strategy" not in data
+
+    def test_falls_back_to_worktree_when_no_remote_at_all(self, tmp_path: Path):
+        """A plain non-git anchor (or one with no remote) resolves nothing via
+        the committed-ref path; `_load_inrepo_config` falls back to disk."""
+        anchor = tmp_path / "ext"
+        cfg.inrepo_config_path(anchor).parent.mkdir(parents=True)
+        cfg.inrepo_config_path(anchor).write_text(
+            "default_branch: main\n", encoding="utf-8"
+        )
+        assert self._resolve(anchor) == {}
+        assert cfg._load_inrepo_config(str(anchor)).get("default_branch") == "main"
+
+    def test_end_to_end_through_load_config(self, tmp_path: Path):
+        """The fix reaches all the way through `load_config`: a repo whose
+        anchor is stuck on a stale checkout still resolves the CURRENT
+        committed `default_branch` for the loaded `RepoConfig`."""
+        remote = self._make_remote_with_branch_configs(
+            tmp_path,
+            configs={"main": "default_branch: dev\nremote: origin\n"},
+        )
+        anchor = self._clone_with_fetched_refs(
+            tmp_path, remote, checkout="main", fetch=("main",)
+        )
+        (anchor / ".agent-worktrees" / "config.yaml").write_text(
+            "default_branch: main\nremote: origin\n", encoding="utf-8"
+        )
+        cfgfile = tmp_path / "machine-config.yaml"
+        cfgfile.write_text(
+            "repo_name: ext\nmachine: m\nplatform: linux\n"
+            "repos:\n  ext:\n"
+            f"    anchor: {anchor}\n    worktree_root: {tmp_path / 'wt'}\n"
+        )
+        repo = cfg.load_config(cfgfile).repos["ext"]
+        assert repo.default_branch == "dev"
 
 
 class TestGlobalConfigUserOwned:
@@ -983,7 +1892,7 @@ class TestKnowledgeConfigOverlay:
 
     def test_overlay_grafts_prefs_for_stateless_harness(self, tmp_path, monkeypatch):
         h = self._mk_harness(tmp_path, stateless=True)
-        k = self._mk_knowledge(tmp_path, "headless: true\nnew_picker: false\n")
+        k = self._mk_knowledge(tmp_path, "headless: true\nauto_fast_forward: false\n")
         self._registry(monkeypatch, harness=h, knowledge=k)
         # machine-local: binds the knowledge repo, does NOT set the prefs.
         mfile = tmp_path / "machine.yaml"
@@ -993,8 +1902,8 @@ class TestKnowledgeConfigOverlay:
             f"repos:\n  harness:\n    anchor: {h}\n    worktree_root: /tmp/wt\n",
             encoding="utf-8")
         conf = cfg.load_config(mfile)
-        assert conf.headless is True        # from the knowledge overlay
-        assert conf.new_picker is False     # from the knowledge overlay
+        assert conf.headless is True                # from the knowledge overlay
+        assert conf.auto_fast_forward is False       # from the knowledge overlay
 
     def test_overlay_may_arm_profile_assignment(self, tmp_path, monkeypatch):
         h = self._mk_harness(tmp_path, stateless=True)
@@ -1142,14 +2051,14 @@ class TestFindMachineEntry:
         # A machine keyed by a friendly name declares its raw COMPUTERNAME via
         # `hostname:`; it must be findable by key, alias, hostname, or display_name.
         e = {
-            "host-augloop1": cfg.MachineEntry(
-                key="host-augloop1", display_name="augloop1",
-                environment="Windows 11", alias="augloop1",
+            "host-box1": cfg.MachineEntry(
+                key="host-box1", display_name="box1",
+                environment="Windows 11", alias="box1",
                 hostname="cpc-tmich-oixui",
             ),
         }
-        assert cfg.find_machine_entry(e, "host-augloop1") is not None   # key
-        assert cfg.find_machine_entry(e, "augloop1") is not None           # alias/display
+        assert cfg.find_machine_entry(e, "host-box1") is not None   # key
+        assert cfg.find_machine_entry(e, "box1") is not None           # alias/display
         assert cfg.find_machine_entry(e, "cpc-tmich-oixui") is not None    # hostname field
         assert cfg.find_machine_entry(e, "CPC-tmich-OIXUI") is not None    # hostname, case-insensitive
 
@@ -1170,14 +2079,14 @@ class TestDetectMachine:
         # Key is the friendly name; COMPUTERNAME is declared via `hostname:`.
         self._write(tmp_path, (
             "machines:\n"
-            "  host-augloop1:\n"
-            "    display_name: augloop1\n"
-            "    alias: augloop1\n"
+            "  host-box1:\n"
+            "    display_name: box1\n"
+            "    alias: box1\n"
             "    hostname: cpc-tmich-oixui\n"
             "    environment: Windows 11\n"
         ))
         monkeypatch.setattr(cfg.socket, "gethostname", lambda: "CPC-tmich-OIXUI")
-        assert cfg.detect_machine(tmp_path) == "augloop1"
+        assert cfg.detect_machine(tmp_path) == "box1"
 
     def test_detect_via_key(self, tmp_path: Path, monkeypatch):
         self._write(tmp_path, (
@@ -1223,6 +2132,44 @@ def test_adoption_defaults_resolved_from_registries(monkeypatch):
     )
     out = cfg._resolve_adoption_defaults_from_registry("proj", "linux")
     assert out == {"default_branch": "main", "base_repo": True}
+
+
+def test_peek_base_repo_applies_machine_override(monkeypatch, tmp_path):
+    machine = tmp_path / "machine.yaml"
+    global_path = tmp_path / "global.yaml"
+    machine.write_text(
+        "repo_name: proj\nrepos:\n  proj:\n    base_repo: false\n",
+        encoding="utf-8",
+    )
+    global_path.write_text("", encoding="utf-8")
+    anchor = tmp_path / "repo"
+    anchor.mkdir()
+    monkeypatch.setattr(cfg, "default_config_path", lambda: machine)
+    monkeypatch.setattr(cfg, "global_config_path", lambda: global_path)
+    monkeypatch.setattr(
+        cfg, "_resolve_anchor_from_registry", lambda _name, _platform: str(anchor)
+    )
+    monkeypatch.setattr(
+        cfg,
+        "_resolve_adoption_defaults_from_registry",
+        lambda _name, _platform: {"base_repo": True},
+    )
+    monkeypatch.setattr(cfg, "_load_inrepo_config", lambda _anchor: {})
+    monkeypatch.setattr(cfg, "detect_platform", lambda: "windows")
+
+    assert cfg.peek_base_repo() is False
+
+
+def test_peek_base_repo_returns_none_when_project_is_unknown(monkeypatch, tmp_path):
+    machine = tmp_path / "machine.yaml"
+    global_path = tmp_path / "global.yaml"
+    machine.write_text("", encoding="utf-8")
+    global_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(cfg, "default_config_path", lambda: machine)
+    monkeypatch.setattr(cfg, "global_config_path", lambda: global_path)
+    monkeypatch.setattr(cfg, "_project_name_safe", lambda: "")
+
+    assert cfg.peek_base_repo() is None
 
 
 def test_load_config_fills_branch_and_base_repo_from_registry(
@@ -1290,3 +2237,18 @@ def test_overlay_branch_overrides_registry_fallback(
     )
     c = cfg.load_config(ml)
     assert c.default_repo.default_branch == "develop"  # overlay wins
+
+
+def test_own_checked_in_config_resolves_strategy_keep_alive():
+    """Regression guard: this repo's own ``.agent-worktrees/config.yaml`` must
+    resolve ``pr.strategy`` to ``keep-alive``, not the unsafe ``detach``
+    fallback. A duplicate later ``strategy:`` mapping key under the same
+    ``pr:`` block silently wins under YAML's last-value-wins rule and would
+    reintroduce the exact stranded-open-PR bug this default flip fixed --
+    this test fails loudly if that regresses, instead of only being caught
+    by an ad hoc PR review."""
+    import yaml
+
+    config_path = Path(__file__).resolve().parents[3] / ".agent-worktrees" / "config.yaml"
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert data["pr"]["strategy"] == "keep-alive"

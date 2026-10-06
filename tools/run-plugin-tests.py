@@ -21,8 +21,14 @@ Design notes:
 * **uv-based.** Uses ``uv`` for the venv + editable install so plugins that
   vendor path dependencies via ``[tool.uv.sources]`` (agent-containers,
   agent-codespaces, ...) resolve correctly -- plain ``pip`` cannot.
-* **Cached venvs** live under ``.test-venvs/<plugin>`` (git-ignored) and are
-  reused across runs; ``--reinstall`` rebuilds one.
+* **Cached venvs** live under ``.test-venvs/<platform>/<plugin>`` (git-ignored)
+  and are reused across runs; ``--reinstall`` rebuilds one.
+* **Host admission.** Potentially heavy runs share one per-user host lease
+  across every checkout/worktree, so concurrent agents fail fast or wait for a
+  bounded interval instead of multiplying load.
+* **State isolation.** Default suites receive runner-owned home, XDG, Copilot,
+  plugin-state, and temporary roots. Credential-dependent end-to-end checks
+  must opt into host state explicitly.
 * **Windows-safe temp.** Passes a randomized ``--basetemp`` so pytest's tmp
   cleanup does not trip the ``pytest-current`` junction ``PermissionError`` on
   Windows (teardown noise that would otherwise mask a green run).
@@ -39,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -58,9 +65,48 @@ from plugin_test_containment import (
 
 REPO = Path(__file__).resolve().parents[1]
 PLUGINS = REPO / "plugins"
-VENV_ROOT = REPO / ".test-venvs"
+VENV_ROOT = REPO / ".test-venvs" / sys.platform
 PORTFOLIO_PLUGIN = "pytest_portfolio_guard"
 RUNNER_DEPENDENCIES = ("pytest-timeout>=2.3,<3",)
+LEASE_LIB = REPO / "libs" / "single-instance-lease" / "src"
+TOOLS_DIR = REPO / "tools"
+
+# Plugins whose OWN test suites assert properties about OTHER plugins (a
+# repo-wide contract, not something scoped to their own diff) -- see
+# ``changed_plugins``'s own docstring for why these must always be scheduled
+# alongside any change, not merely when their own files are touched.
+_CROSS_PLUGIN_CONTRACT_TESTERS = {"copilot-extensions-harness"}
+
+# The runner is a repository tool, so consume the canonical shared source
+# directly rather than growing another lock implementation.
+sys.path.insert(0, str(LEASE_LIB))
+from single_instance_lease import AlreadyRunningError, SingleInstance  # noqa: E402
+
+# Shared with tools/_devcontainer_host_admission.py -- the devcontainer
+# wrapper's own hyphenated-filename-adjacent helper -- so both agree on
+# the SAME lock dir/service name without duplicating the constants by
+# hand (this script's own hyphenated filename can't be imported as a
+# module, which is why the shared module lives one level up instead).
+sys.path.insert(0, str(TOOLS_DIR))
+from _admission_protocol import ADMISSION_SERVICE as _ADMISSION_SERVICE  # noqa: E402
+from _admission_protocol import admission_dir as _admission_dir  # noqa: E402
+
+
+def _acquire_admission(wait_seconds: float) -> SingleInstance:
+    """Acquire the host test slot, waiting for at most ``wait_seconds``."""
+    if not math.isfinite(wait_seconds) or wait_seconds < 0:
+        raise ValueError("admission wait must be a non-negative, finite number")
+    lease = SingleInstance(_admission_dir(), service=_ADMISSION_SERVICE)
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            lease.acquire()
+            return lease
+        except AlreadyRunningError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(0.25, remaining))
 
 
 def _plugin_dir(name: str) -> Path:
@@ -97,7 +143,26 @@ def all_plugins_with_suites() -> list[str]:
 
 
 def changed_plugins(base: str) -> list[str]:
-    """Plugins whose files changed vs ``base`` (default origin/main)."""
+    """Plugins whose files changed vs ``base`` (default origin/main), plus any
+    cross-plugin contract-testing plugin (``_CROSS_PLUGIN_CONTRACT_TESTERS``)
+    whenever anything changed at all.
+
+    Some plugins' own test suites assert properties about OTHER plugins --
+    e.g. ``copilot-extensions-harness``'s ``test_session_context_declarations.py``
+    walks every marketplace plugin's manifest and hooks. A PR touching only
+    that OTHER plugin never appears in this function's own diff-based
+    detection, so on a PR (which schedules only the ``--changed`` set,
+    unlike a push to dev/main which uses ``--all``) the cross-plugin
+    contract test never runs at all -- not merely skipped for lack of a
+    relevant change, but never scheduled, so a real regression it would have
+    caught can merge with no red check anywhere
+    (ThomasMichon/copilot-extensions#4166 -- delegation-guidance's migration
+    broke copilot-extensions-harness's own contract test, invisible until
+    the next push-triggered --all run on dev days later, by which point it
+    had stalled the whole promotion pipeline for every unrelated PR).
+    Always including these testers keeps that class of contract test in the
+    loop for any real change, at the cost of one extra (currently cheap,
+    ~30-40s) job per PR."""
     try:
         out = subprocess.run(
             ["git", "-C", str(REPO), "diff", "--name-only", f"{base}...HEAD"],
@@ -118,6 +183,8 @@ def changed_plugins(base: str) -> list[str]:
             parts = path.split("/")
             if len(parts) >= 2 and parts[0] == "plugins":
                 names.add(parts[1])
+        if names:
+            names |= _CROSS_PLUGIN_CONTRACT_TESTERS
     except OSError:
         return []
     return sorted(n for n in names if _has_suite(n))
@@ -231,27 +298,49 @@ def run_plugin(
     max_files_per_subsuite: int,
     guards: bool = False,
     collect_only: bool = False,
+    prepare_only: bool = False,
     allow_explicit_tiers: bool = False,
+    allow_host_state: bool = False,
 ) -> int:
     if not _has_suite(name):
         print(f"[SKIP] {name}: no test suite")
         return 0
+    if prepare_only:
+        # Builds/updates the venv ONLY -- never imports a single test
+        # module or conftest.py, unlike `--collect-only` (which still
+        # runs pytest's own collection, executing module-level code and
+        # collection hooks). This is the mode a network-enabled
+        # "dependency preparation" pass can safely run before network
+        # access is removed for the real test pass.
+        print(f"[RUN ] {name}: preparing venv only (--prepare-only) ...")
+        _ensure_venv(name, uv, reinstall=reinstall)
+        print(f"[PASS] {name} (prepared)")
+        return 0
     label = "collect-only" if collect_only else ("guard tests" if guards else "pytest")
-    print(f"[RUN ] {name}: preparing venv + {label} ...")
+    state_mode = "host state (explicit opt-in)" if allow_host_state else "isolated state"
+    print(f"[RUN ] {name}: preparing venv + {label} [{state_mode}] ...")
     py = _ensure_venv(name, uv, reinstall=reinstall)
     sandbox_parent = Path(os.environ.get("TEMP", tempfile.gettempdir()))
     sandbox_parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
-        prefix=f"ce-{name[:12]}-",
+        # Deliberately short: this sandbox root sits at the top of a path
+        # whose depth (home/.agent-logger/snapshots/<ver>/libs/<lib>/
+        # build/bdist.win-amd64/wheel/...) can approach Windows' 260-char
+        # MAX_PATH for a plugin with deep installer-provisioned content
+        # (coverage-guided-ci effort, 2026-10-05) -- every char saved here
+        # is real headroom, and this prefix is purely a disposable
+        # per-run temp dir, never read by anything outside this process.
+        prefix=f"ce-{name[:4]}-",
         dir=sandbox_parent,
         ignore_cleanup_errors=True,
     ) as raw_sandbox:
         sandbox = Path(raw_sandbox)
-        basetemp = sandbox / "pytest"
+        basetemp = sandbox / "t"
         env = isolated_environment(
             os.environ,
             sandbox,
             allow_explicit_tiers=allow_explicit_tiers,
+            allow_host_state=allow_host_state,
         )
         tools_path = str(REPO / "tools")
         env["PYTHONPATH"] = tools_path
@@ -277,7 +366,7 @@ def run_plugin(
                 max_temp_mb=limits.max_temp_mb,
                 poll_seconds=limits.poll_seconds,
             )
-            group_temp = basetemp / f"group-{index}"
+            group_temp = basetemp / f"g{index}"
             group_temp.parent.mkdir(parents=True, exist_ok=True)
             cmd = [
                 str(py),
@@ -335,6 +424,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--collect-only", dest="collect_only", action="store_true",
                     help="build the venv and collect tests but do not run them "
                          "(cheap import/collection smoke)")
+    ap.add_argument("--prepare-only", dest="prepare_only", action="store_true",
+                    help="build/update the venv(s) ONLY -- never imports a single test "
+                         "module or conftest.py (unlike --collect-only, which still runs "
+                         "pytest's own collection); for a network-enabled dependency-"
+                         "preparation pass ahead of a network-disconnected real run")
+    ap.add_argument(
+        "--admission-wait",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="wait up to SECONDS for the host-wide heavy-test slot (default: fail fast)",
+    )
+    ap.add_argument(
+        "--allow-host-state",
+        action="store_true",
+        help="explicitly let tests use the caller's HOME/config/state; intended only "
+             "for opt-in end-to-end checks that require host credentials",
+    )
     ap.add_argument("--exclude", action="append", default=[], metavar="PLUGIN",
                     help="drop a plugin from the resolved set (repeatable)")
     ap.add_argument("--list", dest="list_only", action="store_true",
@@ -375,6 +482,12 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("test_timeout must be positive")
         if args.max_files_per_sub_suite <= 0:
             raise ValueError("max_files_per_sub_suite must be positive")
+        if not math.isfinite(args.admission_wait) or args.admission_wait < 0:
+            raise ValueError("admission_wait must be a non-negative, finite number")
+        if args.allow_host_state and not args.allow_explicit_tiers:
+            raise ValueError(
+                "--allow-host-state requires --allow-explicit-tiers"
+            )
     except ValueError as exc:
         ap.error(str(exc))
 
@@ -406,28 +519,80 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[ERROR] {msg} Install uv: https://docs.astral.sh/uv/", file=sys.stderr)
         return 2
 
-    print(f"Test targets: {', '.join(targets)}")
-    failed: list[str] = []
-    for name in targets:
-        try:
-            rc = run_plugin(name, uv, reinstall=args.reinstall, kexpr=args.kexpr,
-                            limits=limits, guards=args.guards,
-                            plugin_timeout=args.plugin_timeout,
-                            test_timeout=args.test_timeout,
-                            max_files_per_subsuite=args.max_files_per_sub_suite,
-                            collect_only=args.collect_only,
-                            allow_explicit_tiers=args.allow_explicit_tiers)
-        except (ContainmentError, subprocess.CalledProcessError) as exc:
-            print(f"[FAIL] {name}: runner setup failed ({exc})", file=sys.stderr)
-            rc = 1
-        if rc != 0:
-            failed.append(name)
+    lease: SingleInstance | None = None
+    # Every mode that reaches this point touches `_ensure_venv()` below --
+    # a real run, `--guards`, `--collect-only`, and `--prepare-only`
+    # alike -- and so can rebuild or delete the SHARED on-disk venv (via
+    # `--reinstall` or a drifted dependency fingerprint) a concurrent
+    # admitted run may be relying on mid-execution. Only `--list` is
+    # exempt, and it already returned above without reaching here. The
+    # devcontainer wrapper's own internal `--prepare-only` call is
+    # unaffected in practice: it runs inside a container with a fresh,
+    # always-uncontested tmpfs `$HOME`, so acquiring a lease there is a
+    # no-op, not a behavior change.
+    if args.admission_wait:
+        print(f"Waiting up to {args.admission_wait:g}s for the host test slot ...")
+    try:
+        lease = _acquire_admission(args.admission_wait)
+    except AlreadyRunningError as exc:
+        print(
+            f"[BUSY] Another heavy plugin test run is active: {exc}. "
+            "Use --admission-wait SECONDS to wait for it.",
+            file=sys.stderr,
+        )
+        return 3
 
-    if failed:
-        print(f"\nFAILED plugins: {', '.join(failed)}")
-        return 1
-    print(f"\nAll {len(targets)} plugin suite(s) passed.")
-    return 0
+    try:
+        print(f"Test targets: {', '.join(targets)}")
+        failed: list[str] = []
+        for name in targets:
+            try:
+                rc = run_plugin(
+                    name,
+                    uv,
+                    reinstall=args.reinstall,
+                    kexpr=args.kexpr,
+                    limits=limits,
+                    plugin_timeout=args.plugin_timeout,
+                    test_timeout=args.test_timeout,
+                    max_files_per_subsuite=args.max_files_per_sub_suite,
+                    guards=args.guards,
+                    collect_only=args.collect_only,
+                    prepare_only=args.prepare_only,
+                    allow_explicit_tiers=args.allow_explicit_tiers,
+                    allow_host_state=args.allow_host_state,
+                )
+            except (ContainmentError, subprocess.CalledProcessError) as exc:
+                print(f"[FAIL] {name}: runner setup failed ({exc})", file=sys.stderr)
+                rc = 1
+            except Exception as exc:  # noqa: BLE001 -- see docstring below
+                # Deliberately broad: a single plugin's own test run must
+                # never be able to wedge the entire --all/--changed matrix.
+                # Any unexpected failure mode in the contained subprocess
+                # path (e.g. a transient OS-level resource exhaustion after
+                # many sequential heavy runs, or a containment primitive
+                # raising something other than ContainmentError /
+                # CalledProcessError) is recorded as a failure for THIS
+                # plugin only, so every remaining plugin still gets a real
+                # attempt. KeyboardInterrupt/SystemExit are BaseException,
+                # not Exception, so Ctrl-C and an explicit exit still work.
+                print(
+                    f"[FAIL] {name}: unexpected runner error "
+                    f"({type(exc).__name__}: {exc})",
+                    file=sys.stderr,
+                )
+                rc = 1
+            if rc != 0:
+                failed.append(name)
+
+        if failed:
+            print(f"\nFAILED plugins: {', '.join(failed)}")
+            return 1
+        print(f"\nAll {len(targets)} plugin suite(s) passed.")
+        return 0
+    finally:
+        if lease is not None:
+            lease.release()
 
 
 if __name__ == "__main__":

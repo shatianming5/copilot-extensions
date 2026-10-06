@@ -20,12 +20,255 @@
 #   --force          Overwrite config without drift confirmation
 #   --remove-config  On uninstall: also delete config and session metadata
 #   --machine NAME   Machine name (auto-detected if omitted)
+#   --zero-downtime  Deprecated no-op; update now auto-detects and cuts over
+#                    a live status-monitor whenever possible
 # =============================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# A structured caller supplies both the validated context and its exact root.
+# Validate them again before any installer staging or runtime mutation.
+CONTEXTUAL_INSTALL=false
+context_governance_unchanged() {
+    return 0
+}
+__aw_action="${1:-status}"
+__aw_install_dir_arg=""
+__aw_args=("$@")
+for ((__aw_i = 1; __aw_i < ${#__aw_args[@]}; __aw_i++)); do
+    if [[ "${__aw_args[$__aw_i]}" == "--install-dir" ]]; then
+        ((__aw_i + 1 < ${#__aw_args[@]})) || {
+            printf '%s\n' "ERROR: --install-dir requires a value" >&2
+            exit 1
+        }
+        __aw_install_dir_arg="${__aw_args[$((__aw_i + 1))]}"
+    fi
+done
+if [[ -n "${COPILOT_EXTENSIONS_CONTEXT:-}" ]]; then
+    CONTEXTUAL_INSTALL=true
+    case "$__aw_action" in
+        install|update|status) ;;
+        *)
+            printf '%s\n' \
+                "ERROR: structured installation context does not support action '$__aw_action'" >&2
+            exit 1
+            ;;
+    esac
+    [[ -n "$__aw_install_dir_arg" && "$__aw_install_dir_arg" == /* ]] || {
+        printf '%s\n' \
+            "ERROR: structured installation context requires an absolute --install-dir" >&2
+        exit 1
+    }
+    [[ -f "$COPILOT_EXTENSIONS_CONTEXT" ]] || {
+        printf '%s\n' "ERROR: structured installation context is unavailable" >&2
+        exit 1
+    }
+    __aw_context_helper="$SCRIPT_DIR/installation-context/installation-context.sh"
+    __aw_json_query="$SCRIPT_DIR/installation-context/json-query.awk"
+    [[ -f "$__aw_context_helper" && -f "$__aw_json_query" ]] || {
+        printf '%s\n' "ERROR: installation-context validator is unavailable" >&2
+        exit 1
+    }
+    __aw_durable_home="$COPILOT_EXTENSIONS_CONTEXT"
+    for _ in 1 2 3 4 5; do
+        __aw_durable_home="$(dirname -- "$__aw_durable_home")"
+    done
+    __aw_validated_context="$(
+        bash "$__aw_context_helper" validate \
+            --context "$COPILOT_EXTENSIONS_CONTEXT" \
+            --durable-home "$__aw_durable_home" \
+            --expected-plugin-id agent-worktrees \
+            --expected-payload-root "${COPILOT_PLUGIN_STAGED_FROM:-$PLUGIN_DIR}"
+    )" || exit $?
+    __aw_context_root="$(
+        LC_ALL=C awk -f "$__aw_json_query" \
+            -v mode=get -v query_path=pluginRoot \
+            - <<<"$__aw_validated_context"
+    )" || {
+        printf '%s\n' "ERROR: validated context omitted pluginRoot" >&2
+        exit 1
+    }
+    __aw_context_root="$(cd -P -- "$__aw_context_root" && pwd)"
+    __aw_install_root="$(cd -P -- "$__aw_install_dir_arg" && pwd)"
+    [[ "$__aw_install_root" == "$__aw_context_root" ]] || {
+        printf '%s\n' \
+            "ERROR: --install-dir does not match validated installation context" >&2
+        exit 1
+    }
+    __aw_context_value() {
+        LC_ALL=C awk -f "$__aw_json_query" -v mode=get -v "query_path=$2" <<<"$1"
+    }
+    __aw_status_args=(
+        status
+        --payload-root "${COPILOT_PLUGIN_STAGED_FROM:-$PLUGIN_DIR}"
+        --plugin-id agent-worktrees
+        --legacy-root "$HOME/.agent-worktrees"
+        --context "$COPILOT_EXTENSIONS_CONTEXT"
+        --durable-home "$__aw_durable_home"
+    )
+    __aw_context_status="$(
+        bash "$__aw_context_helper" "${__aw_status_args[@]}"
+    )" || exit $?
+    __aw_status="$(__aw_context_value "$__aw_context_status" status)"
+    __aw_reason="$(__aw_context_value "$__aw_context_status" reason)"
+    __aw_actual_mode="$(__aw_context_value "$__aw_context_status" actualMode)"
+    __aw_status_root="$(__aw_context_value "$__aw_context_status" runtimeRoot)"
+    __aw_status_context="$(__aw_context_value "$__aw_context_status" context)"
+    if [[ "$__aw_actual_mode" != namespaced ||
+          "$__aw_status_root" != "$__aw_install_root" ||
+          "$__aw_status_context" != "$COPILOT_EXTENSIONS_CONTEXT" ]] ||
+       { [[ "$__aw_status" != ready || "$__aw_reason" != namespaced-active ]] &&
+         [[ "$__aw_status" != deactivation-required ]]; }; then
+        printf '%s\n' \
+            "ERROR: installation governance does not authorize this context runtime" >&2
+        exit 1
+    fi
+    __aw_activation_generation="$(
+        __aw_context_value "$__aw_context_status" activationGeneration
+    )"
+    __aw_namespace_generation="$(
+        __aw_context_value "$__aw_validated_context" namespaceGeneration
+    )"
+    __aw_install_generation="$(
+        __aw_context_value "$__aw_validated_context" generation
+    )"
+    [[ "$(
+        __aw_context_value "$__aw_context_status" installGeneration
+    )" == "$__aw_install_generation" ]] || {
+        printf '%s\n' \
+            "ERROR: installation receipt generation does not match governance" >&2
+        exit 1
+    }
+    context_governance_unchanged() {
+        local current current_status current_reason current_mode current_root
+        local current_context current_activation current_namespace current_install
+        local current_validated current_validated_install
+        current="$(bash "$__aw_context_helper" "${__aw_status_args[@]}")" ||
+            return 1
+        current_status="$(__aw_context_value "$current" status)"
+        current_reason="$(__aw_context_value "$current" reason)"
+        current_mode="$(__aw_context_value "$current" actualMode)"
+        current_root="$(__aw_context_value "$current" runtimeRoot)"
+        current_context="$(__aw_context_value "$current" context)"
+        current_activation="$(__aw_context_value "$current" activationGeneration)"
+        current_namespace="$(__aw_context_value "$current" namespaceGeneration)"
+        current_install="$(__aw_context_value "$current" installGeneration)"
+        current_validated="$(
+            bash "$__aw_context_helper" validate \
+                --context "$COPILOT_EXTENSIONS_CONTEXT" \
+                --durable-home "$__aw_durable_home" \
+                --expected-plugin-id agent-worktrees \
+                --expected-payload-root "${COPILOT_PLUGIN_STAGED_FROM:-$PLUGIN_DIR}"
+        )" || return 1
+        current_namespace="$(
+            __aw_context_value "$current_validated" namespaceGeneration
+        )"
+        current_validated_install="$(
+            __aw_context_value "$current_validated" generation
+        )"
+        [[ "$current_status" == "$__aw_status" &&
+           "$current_reason" == "$__aw_reason" &&
+           "$current_mode" == namespaced &&
+           "$current_root" == "$__aw_install_root" &&
+           "$current_context" == "$COPILOT_EXTENSIONS_CONTEXT" &&
+           "$current_activation" == "$__aw_activation_generation" &&
+           "$current_namespace" == "$__aw_namespace_generation" &&
+           "$current_install" == "$__aw_install_generation" &&
+           "$current_validated_install" == "$__aw_install_generation" ]]
+    }
+
+    # The standard self-stage block is intentionally byte-identical across
+    # plugins and stages beneath the legacy root. Context installs stage here
+    # instead, inside the selected installation, then mark the child staged so
+    # the standard block remains inert.
+    if [[ -z "${COPILOT_PLUGIN_INSTALL_STAGED:-}" ]]; then
+        cd "$HOME"
+        __aw_stage_root="$__aw_install_root/.install-stage"
+        __aw_stage="$__aw_stage_root/$(date -u +%Y%m%dT%H%M%S)-$$"
+        mkdir -p "$__aw_stage"
+        cp -a "$PLUGIN_DIR" "$__aw_stage/"
+        __aw_staged_payload="$__aw_stage/$(basename "$PLUGIN_DIR")"
+        for __aw_sibling in "$__aw_stage_root"/*; do
+            [[ -d "$__aw_sibling" && "$__aw_sibling" != "$__aw_stage" ]] ||
+                continue
+            __aw_owner="${__aw_sibling##*-}"
+            if [[ "$__aw_owner" =~ ^[0-9]+$ ]] &&
+                    kill -0 "$__aw_owner" 2>/dev/null; then
+                continue
+            fi
+            rm -rf "$__aw_sibling" 2>/dev/null || true
+        done
+        __aw_deadline=480
+        __aw_deadline_raw="${AGENT_WORKTREES_INSTALL_DEADLINE_SEC:-${COPILOT_PLUGIN_INSTALL_DEADLINE_SEC:-}}"
+        if [[ "$__aw_deadline_raw" =~ ^-?[0-9]+$ ]]; then
+            __aw_deadline="$__aw_deadline_raw"
+        fi
+        export COPILOT_PLUGIN_INSTALL_STAGED=context-install
+        export COPILOT_PLUGIN_STAGED_FROM="$PLUGIN_DIR"
+        set -m
+        (
+            cd "$__aw_staged_payload"
+            exec bash \
+                "$__aw_staged_payload/scripts/$(basename "${BASH_SOURCE[0]}")" \
+                "$@"
+        ) &
+        __aw_child=$!
+        set +m
+        __aw_watcher=""
+        __aw_stop_context_child() {
+            local __aw_signal_rc="$1"
+            kill -- -"$__aw_child" 2>/dev/null ||
+                kill "$__aw_child" 2>/dev/null || true
+            wait "$__aw_child" 2>/dev/null || true
+            if [[ -n "$__aw_watcher" ]]; then
+                kill "$__aw_watcher" 2>/dev/null || true
+                wait "$__aw_watcher" 2>/dev/null || true
+            fi
+            rm -rf "$__aw_stage"
+            trap - INT TERM
+            exit "$__aw_signal_rc"
+        }
+        trap '__aw_stop_context_child 130' INT
+        trap '__aw_stop_context_child 143' TERM
+        if [[ "$__aw_deadline" -gt 0 ]]; then
+            (
+                __aw_waited=0
+                while kill -0 "$__aw_child" 2>/dev/null; do
+                    sleep 1
+                    __aw_waited=$((__aw_waited + 1))
+                    if [[ "$__aw_waited" -ge "$__aw_deadline" ]]; then
+                        : >"$__aw_stage/.watchdog-fired"
+                        kill -- -"$__aw_child" 2>/dev/null ||
+                            kill "$__aw_child" 2>/dev/null || true
+                        printf '[%sZ] WATCHDOG-KILL agent-worktrees context install exceeded %ss deadline (child pid %s); killed tree. Stage: %s\n' \
+                            "$(date -u +%Y-%m-%dT%H:%M:%S)" \
+                            "$__aw_deadline" "$__aw_child" "$__aw_stage" \
+                            >>"$__aw_install_root/reconcile.err.log" 2>/dev/null ||
+                            true
+                        break
+                    fi
+                done
+            ) &
+            __aw_watcher=$!
+        else
+            __aw_watcher=""
+        fi
+        if wait "$__aw_child"; then __aw_rc=0; else __aw_rc=$?; fi
+        if [[ -n "$__aw_watcher" ]]; then
+            kill "$__aw_watcher" 2>/dev/null || true
+            wait "$__aw_watcher" 2>/dev/null || true
+        fi
+        if [[ -e "$__aw_stage/.watchdog-fired" ]]; then
+            __aw_rc=124
+        fi
+        rm -rf "$__aw_stage"
+        trap - INT TERM
+        exit "$__aw_rc"
+    fi
+fi
 
 # === install-contract:v4 self-stage -- keep byte-identical across plugins ===
 # dotfiles #935: a plugin installer reads its own payload (src/, libs/,
@@ -177,6 +420,8 @@ FORCE=false
 REMOVE_CONFIG=false
 MACHINE=""
 PROJECT_NAME_ARG=""
+INSTALL_DIR_ARG=""
+ZERO_DOWNTIME=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -184,36 +429,44 @@ while [[ $# -gt 0 ]]; do
         --remove-config) REMOVE_CONFIG=true; shift ;;
         --machine)       MACHINE="$2"; shift 2 ;;
         --project-name)  PROJECT_NAME_ARG="$2"; shift 2 ;;
+        --install-dir)   INSTALL_DIR_ARG="$2"; shift 2 ;;
+        --zero-downtime) ZERO_DOWNTIME=true; shift ;;
         *)               echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
 
 # ── Infer project name ──────────────────────────────────────────────────
-# Priority: --project-name arg > WORKTREE_PROJECT env > existing config
+# Priority: --project-name arg > existing config
 # CWD is NOT auto-adopted -- pass --project-name to adopt explicitly.
 
 PROJECT_NAME=""
 
 if [[ -n "$PROJECT_NAME_ARG" ]]; then
     PROJECT_NAME="$PROJECT_NAME_ARG"
-elif [[ -n "${WORKTREE_PROJECT:-}" ]]; then
-    PROJECT_NAME="$WORKTREE_PROJECT"
 else
-    # Try to infer from CWD basename matching an existing config dir
+    # Try to infer from CWD basename matching an existing config dir. Never
+    # infer the reserved runtime name itself: ~/.agent-worktrees/config.yaml is
+    # the TOOL's OWN runtime config (always present once installed), not a
+    # user-created project -- inferring it whenever the CWD happens to be a
+    # directory literally named `agent-worktrees` (e.g. this plugin's own
+    # checkout/payload dir) is a guaranteed false positive, not something to
+    # warn about on every routine invocation. Skip inference for it entirely
+    # so the noisy message below is reserved for a genuine explicit
+    # --project-name mistake.
     _cwd_name="$(basename "$PWD")"
-    if [[ -f "$HOME/.$_cwd_name/config.yaml" ]]; then
+    if [[ "$_cwd_name" != "agent-worktrees" && -f "$HOME/.$_cwd_name/config.yaml" ]]; then
         PROJECT_NAME="$_cwd_name"
     fi
 fi
 # Reserved-name guard: `agent-worktrees` is the runtime's own global command
 # (the project-agnostic shim from bin/agent-worktrees, deployed by
-# deploy_tool_binstub), never a per-project launcher. If inference or an
-# explicit flag resolves the name to it (e.g. the installer run from a dir
-# literally named `agent-worktrees`, whose ~/.agent-worktrees/config.yaml always
-# exists), a project deploy would overwrite the global shim with a
-# self-`--project` binstub -- historically the seed of a fork-storm. Never treat
-# the reserved runtime name as a project. (echo, not warn(): the output helpers
-# are not defined until later in the script.)
+# deploy_tool_binstub), never a per-project launcher. Auto-inference above
+# already never resolves to it, so reaching here means an EXPLICIT
+# --project-name agent-worktrees was passed -- a genuine mistake worth
+# flagging, since a project deploy would overwrite the global shim with a
+# self-`--project` binstub -- historically the seed of a fork-storm. Never
+# treat the reserved runtime name as a project. (echo, not warn(): the output
+# helpers are not defined until later in the script.)
 if [[ "$PROJECT_NAME" == "agent-worktrees" ]]; then
     echo "  ! Ignoring reserved runtime name 'agent-worktrees' as a project (global command is owned by the tool binstub)" >&2
     PROJECT_NAME=""
@@ -253,7 +506,11 @@ fi
 # ── Metadata ─────────────────────────────────────────────────────────────
 
 SERVICE_NAME="Worktree Session Manager"
-INSTALL_DIR="$HOME/.agent-worktrees"
+INSTALL_DIR="${INSTALL_DIR_ARG:-$HOME/.agent-worktrees}"
+if [[ "$INSTALL_DIR" != /* ]]; then
+    echo "ERROR: --install-dir must be absolute" >&2
+    exit 1
+fi
 BIN_DIR="$INSTALL_DIR/bin"
 LOCAL_BIN="$HOME/.local/bin"
 SERVICE_YAML="$SCRIPT_DIR/service.yaml"
@@ -346,25 +603,144 @@ _versioned_activate() {
     local vr="$SCRIPT_DIR/versioned_runtime.py"
     local py="$VENV_PYTHON"
     [[ -x "$py" ]] || return 0
-    if ! PYTHONPATH= "$VENV_PYTHON" -c 'import agent_worktrees' 2>/dev/null; then
+    # A bare `import agent_worktrees` is NOT a sufficient health check: the
+    # `agent_worktrees` directory merely EXISTING makes it importable as a PEP
+    # 420 namespace package even when it holds zero `.py` files (e.g. an
+    # interrupted/partial `uv pip install` that never actually placed the
+    # package). That false pass let a broken slot get marked complete and
+    # activated with no working CLI. Importing the `__main__` submodule
+    # instead forces Python to resolve a real `__main__.py` and walk its full
+    # transitive import chain (config, project_state, the internal `libs/*`
+    # packages, etc.), so a partial install that dropped any of those pieces
+    # fails the gate here instead of silently activating.
+    #
+    # `import agent_worktrees.__main__` alone only exercises __main__'s EAGER
+    # imports -- the CLI defers ~35 submodules behind `_LAZY_DISPATCH_TABLE`/
+    # `_load_full_command_surface()`, so a slot missing one of those would
+    # still pass and only fail on its first real invocation. Call
+    # `_load_full_command_surface()` too so the completion marker means the
+    # complete CLI is importable, not just its entry point.
+    #
+    # Run with `-I` (isolated mode: ignores PYTHONPATH/other PYTHON* env vars
+    # AND excludes the working directory / script dir from sys.path) so a
+    # stale checkout's `src` dir or another on-disk `agent_worktrees` copy
+    # can't satisfy the import while $VENV_PYTHON points at the partial slot
+    # under test -- the explicit `PYTHONPATH=` clear below is kept as
+    # defense-in-depth.
+    local health_out
+    if ! health_out="$(PYTHONPATH= "$VENV_PYTHON" -I -c 'import agent_worktrees.__main__ as m; m._load_full_command_surface()' 2>&1)"; then
         err "Fresh runtime slot failed its health gate (versions/$SRC_VERSION) -- not activating"
+        [[ -n "$health_out" ]] && err "  $health_out"
+        # This slot may already carry a completion marker from an OLDER,
+        # less-strict installer run (dotfiles #7561): _test_slot_already_complete
+        # trusts a valid marker + matching payload hash and skips reinstalling,
+        # so without this the same stale-but-broken slot would keep failing this
+        # gate forever on every future run. Remove just the marker file (never
+        # the slot's other files -- safe even if this happens to be the
+        # CURRENTLY ACTIVE slot, since a JSON marker is never held open by a
+        # running interpreter the way its own module files can be) so a future
+        # run stops trusting it and either rebuilds it fresh or falls back to
+        # last-known-good (resolve_python's tiered fallback in
+        # versioned_runtime.py already treats a markerless slot as unhealthy).
+        # Filename matches versioned_runtime.py's own COMPLETE_MARKER constant.
+        local stale_marker="$VENV_DIR/.install-complete.json"
+        if [[ -f "$stale_marker" ]]; then
+            rm -f "$stale_marker"
+            ok "Invalidated stale completion marker (versions/$SRC_VERSION)"
+        fi
         return 1
     fi
+    # Determine the just-superseded slot by calling the CANONICAL resolver
+    # (resolve-runtime.sh) directly, rather than reimplementing its tiered
+    # marker/last-known-good/newest-slot validity logic here (review finding,
+    # round 5): reading `current`/last-known-good as raw strings only checks
+    # for EMPTINESS, not whether the resolver actually considers that slot
+    # valid/complete -- a nonempty but incomplete marker or last-known-good
+    # value makes the resolver reject it and fall through to a further tier,
+    # while this heuristic would have stopped at the first nonempty value and
+    # protected the WRONG (or no) slot. Calling the resolver directly is
+    # authoritative by construction: it IS the exact code path a real
+    # resolve()/launch would use, so whatever slot it returns here is exactly
+    # what a plan resolved moments earlier would have pinned.
+    #
+    # MUST run BEFORE _versioned_mark_complete (review finding, round 6):
+    # marking $SRC_VERSION complete makes IT a valid tier-3 candidate too: if
+    # both the marker and last-known-good are invalid at this exact moment,
+    # a resolve AFTER mark-complete could have the newest-slot scan pick the
+    # brand-new $SRC_VERSION itself (its own version number sorts newest)
+    # instead of the actually-previously-pinned older slot, leaving that real
+    # prev undetected and unprotected.
+    local prev=""
+    local _saved_rt_root="${AGENT_RT_ROOT-}"
+    local _resolver_src="$SCRIPT_DIR/resolve-runtime.sh"
+    if [[ -f "$_resolver_src" ]]; then
+        AGENT_RT_ROOT="$INSTALL_DIR"
+        # install.sh runs under `set -euo pipefail`; resolve-runtime.sh has
+        # bare (non-&&/||-guarded) commands that can return non-zero on a
+        # normal miss (e.g. an invalid marker), which would abort THIS script
+        # under -e once sourced in-process. Suspend -e for the source call
+        # only, best-effort; never let a resolver hiccup fail the install.
+        set +e
+        # shellcheck source=resolve-runtime.sh
+        . "$_resolver_src"
+        set -e
+        if [[ -n "${AW_PY-}" ]]; then
+            # AW_PY = .../versions/<ver>/{bin/python,Scripts/python.exe}; the
+            # version is two directory levels up from the interpreter.
+            prev="$(basename "$(dirname "$(dirname "$AW_PY")")")"
+        fi
+        if [[ -n "$_saved_rt_root" ]]; then
+            AGENT_RT_ROOT="$_saved_rt_root"
+        else
+            unset AGENT_RT_ROOT
+        fi
+    fi
     _versioned_mark_complete
-    local prev
-    prev="$("$py" "$vr" --root "$INSTALL_DIR" --link-name ".venv" current 2>/dev/null || echo "")"
+    # Touch the just-superseded slot's mtime IMMEDIATELY after resolving it,
+    # BEFORE activate() runs (review finding on #4451): installs run
+    # concurrently by design, so a delay here (activate + status-monitor-
+    # restart + last-known-good write all used to run first) leaves a window
+    # where a CONCURRENT installer can activate the NEXT generation and run
+    # its own gc -- which protects only ITS OWN $prev (the version we are
+    # about to activate, not the one before it) -- reaping this $prev before
+    # this invocation's own touch/gc ever runs. Touching as early as possible
+    # minimizes that exposure window. `gc`'s --min-age-days floor measures a
+    # slot's age from its directory mtime (~= install time, versioned_runtime
+    # .py's _slot_age_days), NOT from when it stopped being current. Without
+    # this touch, a slot installed more than --min-age-days ago (the common
+    # case -- most versions live for days between releases) gets ZERO
+    # protection from the floor the moment it's superseded. Resetting $prev's
+    # mtime here makes the floor measure what it needs to: time-since-
+    # superseded, so a plan resolved against it moments before this
+    # activation survives the immediately-following gc. Best-effort; a touch
+    # failure never blocks activation.
+    if [[ -n "$prev" ]]; then
+        touch "$INSTALL_DIR/versions/$prev" 2>/dev/null || true
+    fi
+    local monitor_was_live=0
+    if ! $CONTEXTUAL_INSTALL && PYTHONPATH= "$VENV_PYTHON" - <<'PY' >/dev/null 2>&1; then
+from agent_worktrees.status_monitor_cutover import monitor_live_now
+raise SystemExit(0 if monitor_live_now() else 1)
+PY
+        monitor_was_live=1
+    fi
     if ! "$py" "$vr" --root "$INSTALL_DIR" --link-name ".venv" activate "$SRC_VERSION" --no-link; then
         err "Failed to activate runtime version (marker -> versions/$SRC_VERSION)"
         return 1
     fi
     ok "Runtime version $SRC_VERSION active (marker -> versions/$SRC_VERSION)"
-    # Consolidated-status-daemon Phase 1 (#1696): the cutover just superseded any
-    # running status-monitor, which self-retires but only RESPAWNS on the next
-    # session start -- leaving live sessions' status bars frozen until then. Reap
-    # the superseded monitor + spawn the current one now (from the NEW slot's
-    # python), so every live session's bar is re-served with no session restart.
-    # Best-effort, never fatal.
-    "$VENV_PYTHON" -m agent_worktrees status-monitor-restart 2>&1 | sed 's/^/  → monitor: /' || true
+    # Graceful status-monitor cutover: now that the new slot is active, ask the
+    # newly-activated runtime to cut over a live resident monitor in-process
+    # (or, for a pre-cutover daemon with no routed control endpoint yet, fall
+    # back once to the legacy restart path). Best-effort, never fatal.
+    if ! $CONTEXTUAL_INSTALL; then
+        AGENT_WORKTREES_MONITOR_WAS_LIVE="$monitor_was_live" \
+            PYTHONPATH= \
+            "$VENV_PYTHON" - <<'PY' 2>&1 | sed 's/^/  → monitor: /' || true
+from agent_worktrees.status_monitor_cutover import installer_after_update
+raise SystemExit(installer_after_update())
+PY
+    fi
     # #742: record the just-activated version as `last-known-good` so a future
     # marker-absent resolution (resolve-runtime.sh tier 2) prefers it over a
     # newest-slot guess. Atomic (temp + rename); best-effort, never fatal.
@@ -372,11 +748,17 @@ _versioned_activate() {
         mv -f "$INSTALL_DIR/last-known-good.tmp.$$" "$INSTALL_DIR/last-known-good" 2>/dev/null \
             || rm -f "$INSTALL_DIR/last-known-good.tmp.$$" 2>/dev/null
     fi
-    if [[ -n "$prev" ]]; then
-        "$VENV_PYTHON" "$vr" --root "$INSTALL_DIR" --link-name ".venv" gc --protect-pids --keep "$prev" 2>&1 | sed 's/^/  → gc: /' || true
-    else
-        "$VENV_PYTHON" "$vr" --root "$INSTALL_DIR" --link-name ".venv" gc --protect-pids 2>&1 | sed 's/^/  → gc: /' || true
-    fi
+    local -a gc_keep_args=()
+    [[ -n "$prev" ]] && gc_keep_args+=(--keep "$prev")
+    # --min-age-days is a recency floor protecting a STORED (not-running)
+    # path-pinned reference -- launch-session.ps1/.sh's `resolve` bakes the
+    # runtime interpreter's path into a plan BEFORE this activation runs;
+    # if that plan hasn't launched its pane yet, its baked path names a
+    # slot that is neither `current` nor `--keep`-protected nor attributable
+    # to a live process (the resolving process already exited). 0.05 days
+    # (~72min) matches agent-mcp's init.sh precedent for the same class of
+    # not-yet-live reference. See #4432 for the concrete failure this closes.
+    "$VENV_PYTHON" "$vr" --root "$INSTALL_DIR" --link-name ".venv" gc --protect-pids "${gc_keep_args[@]}" --min-age-days 0.05 2>&1 | sed 's/^/  → gc: /' || true
     return 0
 }
 # === end install-contract:v3 versioned-venv ===
@@ -387,7 +769,7 @@ ok()      { echo "  ✓ $*"; }
 changed() { echo "  → $*"; }
 skipped() { echo "  ○ $*"; }
 warn()    { echo "  ! $*"; }
-err()     { echo "  ✗ $*"; }
+err()     { echo "  ✗ $*" >&2; }
 header()  { echo ""; echo "═══ $* $(printf '═%.0s' $(seq 1 $((56 - ${#1}))))"; }
 
 _bootstrap_python() {
@@ -404,9 +786,17 @@ _bootstrap_python() {
 }
 
 _payload_hash() {
-    # Cheap payload fingerprint for the completion marker (#935): sha256 of
-    # pyproject.toml + the vendored-lib version set. Detects a dev-checkout that
-    # changed the payload WITHOUT bumping the version. Empty on any error.
+    # Payload fingerprint for the completion marker (#935, hardened #2609):
+    # sha256 of pyproject.toml + the vendored-lib manifests + every actual
+    # source file under src/ (this plugin's own package) and libs/*/src/ (its
+    # vendored path-dependencies). #2609: hashing only the manifests missed
+    # any content change that didn't also bump the version string or touch a
+    # dependency list -- exactly a plugin bug fix landing in .py source with
+    # no pyproject.toml edit -- so `update`/`update --force` reported
+    # "already at latest" and left the venv silently stale even though the
+    # marketplace payload had genuinely changed. Deterministic (sorted
+    # relative paths) and content-based. Empty on any error, which the
+    # completion-marker check already treats as "unknown, force a rebuild".
     local __parts=""
     if [[ -f "$PLUGIN_DIR/pyproject.toml" ]]; then __parts="$(cat "$PLUGIN_DIR/pyproject.toml")"; fi
     if [[ -d "$PLUGIN_DIR/libs" ]]; then
@@ -415,6 +805,20 @@ _payload_hash() {
             __parts="$__parts"$'\n'"$(cat "$__f")"
         done < <(find "$PLUGIN_DIR/libs" -name pyproject.toml 2>/dev/null | sort)
     fi
+    local __src_roots=("$PLUGIN_DIR/src")
+    if [[ -d "$PLUGIN_DIR/libs" ]]; then
+        local __libdir
+        while IFS= read -r __libdir; do
+            [[ -d "$__libdir/src" ]] && __src_roots+=("$__libdir/src")
+        done < <(find "$PLUGIN_DIR/libs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+    fi
+    local __root
+    for __root in "${__src_roots[@]}"; do
+        [[ -d "$__root" ]] || continue
+        while IFS= read -r __f; do
+            __parts="$__parts"$'\n'"${__f#"$PLUGIN_DIR"}"$'\n'"$(cat "$__f" 2>/dev/null)"
+        done < <(find "$__root" -type f ! -name '*.pyc' ! -name '*.pyo' ! -path '*/__pycache__/*' 2>/dev/null | sort)
+    done
     printf '%s' "$__parts" | sha256sum 2>/dev/null | awk '{print $1}' || true
 }
 
@@ -449,6 +853,33 @@ _versioned_mark_complete() {
     local args=("$vr" --root "$INSTALL_DIR" --link-name "$(basename "$LINK_DIR")" mark-complete "$SRC_VERSION")
     if [[ -n "$ph" ]]; then args+=(--payload-hash "$ph"); fi
     "$py" "${args[@]}" 2>&1 | sed 's/^/  ...    /' || true
+}
+
+_test_slot_already_complete() {
+    # "Create forward, never touch an already-activated slot" gate (#2174): an
+    # already-completed slot whose content hash still matches the current
+    # payload must be a true no-op -- deploy_venv/deploy_package must never
+    # reinstall into it. Without this, `update` unconditionally reinstalled
+    # into VENV_DIR on every invocation, including the CURRENTLY ACTIVE, live
+    # slot (current-version / last-known-good already point at it, and a
+    # long-lived process such as the status-monitor daemon may be running out
+    # of it) -- an in-place reinstall then collides with any file the running
+    # interpreter holds open. Returns 0 (true) only when the exact target
+    # version's slot is present, healthy (has a valid completion marker), and
+    # its recorded payload hash matches the CURRENT source tree -- i.e.
+    # nothing to do. No-op (1/false, forcing the normal build path) in legacy
+    # mode or when the bootstrap python / versioned_runtime.py helper is
+    # unavailable, so a missing prerequisite never silently skips a real
+    # build.
+    [[ "$VERSIONED_RUNTIME" == 1 ]] || return 1
+    local vr="$SCRIPT_DIR/versioned_runtime.py"
+    local py
+    py="$(_bootstrap_python)" || return 1
+    [[ -n "$py" ]] || return 1
+    local ph
+    ph="$(_payload_hash)"
+    [[ -n "$ph" ]] || return 1
+    "$py" "$vr" --root "$INSTALL_DIR" --link-name "$(basename "$LINK_DIR")" is-complete "$SRC_VERSION" --expect-hash "$ph" >/dev/null 2>&1
 }
 
 # === install-contract:v4 source-kind -- keep byte-identical across plugins ===
@@ -573,6 +1004,31 @@ deploy_package() {
         fi
     fi
 
+    # Vendored zero-downtime cutover lib (agent-zdd / module zdd). Install it
+    # before the main package so the bare `python -m pip` fallback path on
+    # Windows (which ignores `[tool.uv.sources]`) never tries to resolve this
+    # unpublished dependency from the package index.
+    local zdd_dir="$PLUGIN_DIR/libs/zdd"
+    if [[ -f "$zdd_dir/pyproject.toml" ]]; then
+        if ! uv pip install --python "$VENV_PYTHON" --reinstall-package agent-zdd \
+                "$zdd_dir" --quiet; then
+            err "zdd library install failed"
+            return 1
+        fi
+    fi
+
+    # Vendored remote-login-shell lib (agent-remote-login-shell / module
+    # remote_login_shell, copilot-extensions#5207). Same materialized-release
+    # guard as zdd above.
+    local remote_login_shell_dir="$PLUGIN_DIR/libs/remote-login-shell"
+    if [[ -f "$remote_login_shell_dir/pyproject.toml" ]]; then
+        if ! uv pip install --python "$VENV_PYTHON" --reinstall-package agent-remote-login-shell \
+                "$remote_login_shell_dir" --quiet; then
+            err "remote-login-shell library install failed"
+            return 1
+        fi
+    fi
+
     if ! uv pip install --python "$VENV_PYTHON" --reinstall-package agent-worktrees "$PLUGIN_DIR" --quiet; then
         err "Package install failed"
         return 1
@@ -661,10 +1117,30 @@ PY
 
 # Mirror pip's configured index to uv on a governed box (public PyPI TLS-blocked):
 # uv does not read pip.conf, so derive index-url from pip config / the pip.conf
-# files and export it. No-op where pip has no index (e.g. pristine -- the index
+# files and export it. Preserve uv's own configured index; the pip-derived value
+# is only a fallback. No-op where pip has no index (e.g. pristine -- the index
 # then arrives via env / the clean-room fixture).
 _ensure_uv_index() {
     [[ -n "${UV_INDEX_URL:-}${UV_DEFAULT_INDEX:-}" ]] && return 0
+    local uv_config configured
+    local -a uv_configs
+    if [[ -n "${UV_CONFIG_FILE:-}" ]]; then
+        uv_configs=("$UV_CONFIG_FILE")
+    else
+        uv_configs=("${XDG_CONFIG_HOME:-$HOME/.config}/uv/uv.toml" /etc/uv/uv.toml /etc/xdg/uv/uv.toml)
+    fi
+    for uv_config in "${uv_configs[@]}"; do
+        [[ -n "$uv_config" && -f "$uv_config" ]] || continue
+        configured="$(awk '
+            /^[[:space:]]*index-url[[:space:]]*=/ { print 1; exit }
+            /^[[:space:]]*\[\[index\]\][[:space:]]*(#.*)?$/ { in_index=1; next }
+            /^[[:space:]]*\[/ { in_index=0 }
+            in_index && /^[[:space:]]*default[[:space:]]*=[[:space:]]*true[[:space:]]*(#.*)?$/ { print 1; exit }
+        ' "$uv_config")"
+        if [[ "$configured" == "1" ]]; then
+            return 0
+        fi
+    done
     local idx=""
     if command -v pip >/dev/null 2>&1; then idx="$(pip config get global.index-url 2>/dev/null | tr -d '[:space:]' || true)"; fi
     if [[ -z "$idx" ]] && command -v pip3 >/dev/null 2>&1; then idx="$(pip3 config get global.index-url 2>/dev/null | tr -d '[:space:]' || true)"; fi
@@ -722,35 +1198,18 @@ deploy_runtime_resolvers() {
 }
 
 deploy_wrappers() {
+    # The interactive mux launch-session/pane-wrapper scripts are no longer
+    # deployed here: Phase 3b Sub-slice 2a Step 2 (efforts/active/worktree-
+    # manager-control-plane/phase-3b-mux-relocation.md) completed the cutover
+    # to the relocated Worktree Manager copy as the one true implementation;
+    # agent-worktrees' own cmd_launch resolves that install live (or the
+    # direct, non-mux fallback) instead of an in-plugin copy.
     mkdir -p "$BIN_DIR"
-    local src="$PLUGIN_DIR/bin/launch-session.sh"
-    if [[ ! -f "$src" ]]; then
-        err "Wrapper source not found: $src"
-        return 1
-    fi
-    # Atomic replace -- write to temp then mv, so a concurrent session
-    # reading launch-session.sh isn't corrupted mid-write.
-    local tmp
-    tmp="$(mktemp "$BIN_DIR/launch-session.sh.XXXXXX")"
-    cp "$src" "$tmp"
-    chmod +x "$tmp"
-    mv -f "$tmp" "$BIN_DIR/launch-session.sh"
-    ok "Wrapper: launch-session.sh"
-
-    # Deploy pane wrapper (handles exit codes inside tmux/psmux panes)
-    local pane_src="$PLUGIN_DIR/bin/pane-wrapper.sh"
-    if [[ -f "$pane_src" ]]; then
-        tmp="$(mktemp "$BIN_DIR/pane-wrapper.sh.XXXXXX")"
-        cp "$pane_src" "$tmp"
-        chmod +x "$tmp"
-        mv -f "$tmp" "$BIN_DIR/pane-wrapper.sh"
-        ok "Wrapper: pane-wrapper.sh"
-    fi
 
     deploy_runtime_resolvers || return 1
 
-    # Deploy hook scripts: sessionStart (session-conduct + session-machine + bootstrap-check + project-hooks + register-nudge + register-session + anchor-hygiene-check + marketplace-overrides + provision-check) + preToolUse guards (statelessness_guard + cross_repo_guard + anchor_write_guard) + postToolUse nudges (nudge_status + bind-nudge)
-    for script in session-conduct.ps1 session-conduct.sh session-machine.ps1 session-machine.sh bootstrap-check.ps1 bootstrap-check.sh project-hooks.ps1 project-hooks.sh register-nudge.ps1 register-nudge.sh register-session.ps1 register-session.sh deregister-session.ps1 deregister-session.sh anchor-hygiene-check.ps1 anchor-hygiene-check.sh marketplace-overrides.ps1 marketplace-overrides.sh provision-check.ps1 provision-check.sh statelessness_guard.py cross_repo_guard.py anchor_write_guard.py nudge_status.py bind-nudge.sh bind-nudge.ps1; do
+    # Deploy hook scripts, including the consolidated pre/post client and its fallback modules.
+    for script in session-conduct.ps1 session-conduct.sh session-machine.ps1 session-machine.sh bootstrap-check.ps1 bootstrap-check.sh bootstrap-killswitch-guard.ps1 bootstrap-killswitch-guard.sh project-hooks.ps1 project-hooks.sh register-nudge.ps1 register-nudge.sh register-session.ps1 register-session.sh deregister-session.ps1 deregister-session.sh anchor-hygiene-check.ps1 anchor-hygiene-check.sh provision-check.ps1 provision-check.sh statelessness_guard.py cross_repo_guard.py anchor_write_guard.py pr_supersede_guard.py registry_root.py nudge_status.py bind_nudge.py hook_client.py bind-nudge.sh bind-nudge.ps1; do
         local script_src="$SCRIPT_DIR/$script"
         if [[ -f "$script_src" ]]; then
             tmp="$(mktemp "$BIN_DIR/$script.XXXXXX")"
@@ -774,22 +1233,24 @@ deploy_wrappers() {
         done
     fi
 
-    # Deploy default setup scripts to ~/.agent-worktrees/scripts/ (used when a
-    # repo lacks its own tools/setup/setup.sh). The agent-bridge launch plan
-    # invokes ~/.agent-worktrees/scripts/default-setup.{ps1,sh}, so these MUST
-    # be deployed here to keep the install flow and that launch instruction in
-    # sync -- otherwise spawning a worktree agent fails at LAUNCH_ACP because
-    # the setup script is missing. Mirrors installer.py deploy_wrappers().
+    # Deploy normalized setup and optional machine-settings reconciliation.
+    # Mirrors installer.py deploy_wrappers().
     mkdir -p "$INSTALL_DIR/scripts"
-    # agent-host.sh: sourced by default-setup.sh and bin/launch-session.sh.
-    for setup in default-setup.ps1 default-setup.sh agent-host.sh; do
+    for setup in \
+        default-setup.ps1 \
+        default-setup.sh \
+        agent-host.sh \
+        launch-command.ps1 \
+        launch-command.sh \
+        reconcile-machine-settings.ps1 \
+        reconcile-machine-settings.sh; do
         local setup_src="$SCRIPT_DIR/$setup"
         if [[ -f "$setup_src" ]]; then
             tmp="$(mktemp "$INSTALL_DIR/scripts/$setup.XXXXXX")"
             cp "$setup_src" "$tmp"
             chmod +x "$tmp"
             mv -f "$tmp" "$INSTALL_DIR/scripts/$setup"
-            ok "Default setup: $setup"
+            ok "Session script: $setup"
         fi
     done
 }
@@ -851,31 +1312,18 @@ deploy_binstub() {
         warn "Refusing to deploy project binstub for reserved runtime name 'agent-worktrees' (global command owned by deploy_tool_binstub)"
         return 0
     fi
-    # Generate project-specific binstub that routes through the Python CLI.
-    # The CLI dispatches: no args → launch session, known subcommand → handler.
-    # Falls back to launch-session.sh if venv is missing (recovery path).
+    # Generate a project entry point pinned to this payload. The payload owns
+    # runtime/context selection for both interactive and subcommand paths.
     local tmp
     tmp="$(mktemp "$LOCAL_BIN/$PROJECT_NAME.XXXXXX")"
     cat > "$tmp" <<'BINSTUB_HEAD'
 #!/usr/bin/env bash
+# agent-worktrees project binstub
 BINSTUB_HEAD
     cat >> "$tmp" <<BINSTUB_BODY
 export PYTHONUTF8=1
-# Context resolves from CWD / --project (git-like); the binstub names its
-# project via --project, not an ambient env var.
-# Resolve the active versioned runtime directly (the .venv junction is retired
-# -- #637/#1085/#1106); NEVER exec this binstub itself, which would recurse
-# into an unbounded process storm.
-_root="\$HOME/.agent-worktrees"
-AW_PY=""
-[[ -f "\$_root/bin/resolve-runtime.sh" ]] && source "\$_root/bin/resolve-runtime.sh"
-_py="\$AW_PY"
-if [[ -n "\$_py" && -x "\$_py" ]]; then
-    exec "\$_py" -m agent_worktrees --project "$PROJECT_NAME" "\$@"
-fi
-# Recovery (venv missing): launch-session reads WORKTREE_PROJECT
-export WORKTREE_PROJECT="$PROJECT_NAME"
-exec "\$HOME/.agent-worktrees/bin/launch-session.sh" "\$@"
+export AGENT_WORKTREES_LAUNCH_ID="$PROJECT_NAME-\$\$-\$RANDOM-\$(date +%s)"
+exec "$PLUGIN_DIR/bin/payload/agent-worktrees" --project "$PROJECT_NAME" "\$@"
 BINSTUB_BODY
     chmod +x "$tmp"
     mv -f "$tmp" "$LOCAL_BIN/$PROJECT_NAME"
@@ -958,7 +1406,6 @@ repos:
     # worktree_root defaults to $worktree_root -- a sibling
     # <anchor>.worktrees dir, matching Copilot CLI's /worktree layout.
     # Uncomment and set an absolute path to override.
-    default_branch: master
     remote: origin
 EOF
     changed "Written config: $config_path"
@@ -984,6 +1431,27 @@ write_deploy_manifest() {
         [[ -n "$(git -C "$repo_root" status --porcelain -- plugins/agent-worktrees/ 2>/dev/null)" ]] && dirty="true"
     fi
 
+    # Content fingerprint (#2174): a `marketplace` deploy never has a git
+    # `commit` to compare against (it isn't a git checkout the launcher's
+    # repo_dir can `git log`), so the staleness check falls back to comparing
+    # this fingerprint against a fresh one of the current payload dir. Reuse
+    # the canonical Python implementation (`update_stage.fingerprint`) via the
+    # just-deployed venv rather than reimplementing the hash in bash, so the
+    # two sides can never drift apart. Best-effort: a failure here must never
+    # fail the deploy -- the staleness check already treats a missing
+    # fingerprint as "unknown" and behaves exactly as it did before this field
+    # existed.
+    local payload_fingerprint="null"
+    if [[ -x "$VENV_PYTHON" ]]; then
+        local fp
+        fp="$("$VENV_PYTHON" -c "
+from agent_worktrees.update_stage import fingerprint
+from pathlib import Path
+print(fingerprint(Path('$stable_plugin')))
+" 2>/dev/null || true)"
+        [[ -n "$fp" ]] && payload_fingerprint="\"$fp\""
+    fi
+
     local tmp="$manifest_path.tmp"
     cat > "$tmp" <<EOF
 {
@@ -999,7 +1467,8 @@ write_deploy_manifest() {
     "version": "$ver",
     "commit": $commit,
     "branch": $branch,
-    "dirty": $dirty
+    "dirty": $dirty,
+    "payload_fingerprint": $payload_fingerprint
   },
   "venv": "$LINK_DIR",
   "runtime": "python"
@@ -1198,7 +1667,7 @@ if Path(machines_path).exists():
             if upsert_profile(launcher_profile):
                 changed = True
 
-# Set global color scheme to Aperture Science
+# Set global color scheme to Example Research
 terminal = config.setdefault('terminal', {})
 current_scheme = terminal.get('colorScheme', {})
 if current_scheme.get('name') != scheme['name'] or current_scheme.get('foreground') != scheme['foreground']:
@@ -1233,7 +1702,7 @@ ids = {p.get('id', '') for p in profiles}
 has_local = local_id in ids
 has_ssh = any(pid.startswith('ssh:') for pid in ids)
 scheme_name = config.get('terminal', {}).get('colorScheme', {}).get('name', '')
-if has_local and scheme_name == 'Aperture Science':
+if has_local and scheme_name == 'Example Research':
     if has_ssh:
         print('ok_with_ssh')
     else:
@@ -1326,7 +1795,7 @@ ssh_count = sum(1 for pid in ids if pid.startswith('ssh:'))
 launcher_count = sum(1 for pid in ids if pid.startswith(launcher_prefix))
 scheme_name = config.get('terminal', {}).get('colorScheme', {}).get('name', '')
 
-if has_local and scheme_name == 'Aperture Science':
+if has_local and scheme_name == 'Example Research':
     if has_ssh and has_launchers:
         print(f'ok:{ssh_count}:{launcher_count}')
     elif has_ssh:
@@ -1386,27 +1855,6 @@ deploy_git_hooks_path() {
     changed "Set git core.hooksPath = tools/hooks"
 }
 
-deploy_terminal_scripts() {
-    # Deploy the terminal-integration scripts to BIN_DIR. agent-worktrees no
-    # longer owns ~/.tmux.conf: the launcher applies the status bar + behaviors
-    # per-session from session-options.sh, and apply-mux-keybinds.sh is an
-    # opt-in server-global tuning script the user (or a restore flow) may run.
-    local src_dir="$PLUGIN_DIR/terminal"
-    local script src tmp
-    for script in session-options.sh apply-mux-keybinds.sh; do
-        src="$src_dir/$script"
-        if [[ ! -f "$src" ]]; then
-            echo "  ⚠ terminal script not found at $src" >&2
-            continue
-        fi
-        tmp="$(mktemp "$BIN_DIR/$script.XXXXXX")"
-        cp "$src" "$tmp"
-        chmod +x "$tmp"
-        mv -f "$tmp" "$BIN_DIR/$script"
-        ok "Terminal script: $script"
-    done
-}
-
 resolve_executable_command_path() {
     # Resolve only an executable file from PATH. Bash's `command -v` may return
     # an alias or function, neither of which a Python subprocess can execute.
@@ -1434,7 +1882,7 @@ deploy_copilot_plugin() {
     local copilot_path
     if ! copilot_path="$(resolve_executable_command_path copilot)"; then
         if command -v copilot >/dev/null 2>&1; then
-            err "Copilot CLI resolves only to a non-executable shell command; an executable PATH command is required" >&2
+            err "Copilot CLI resolves only to a non-executable shell command; an executable PATH command is required"
             return 1
         fi
         warn "Copilot CLI not found - skipping plugin install"
@@ -1570,8 +2018,12 @@ case "$ACTION" in
         _ensure_uv_index
         mkdir -p "$INSTALL_DIR" "$BIN_DIR" "$LOCAL_BIN"
         deploy_runtime_resolvers || exit 1
-        deploy_venv || exit 1
-        deploy_package || exit 1
+        if _test_slot_already_complete; then
+            skipped "Slot $SRC_VERSION already complete and unchanged -- skipping venv/package (re)install"
+        else
+            deploy_venv || exit 1
+            deploy_package || exit 1
+        fi
         _versioned_activate || exit 1
         deploy_tool_binstub
         write_deploy_manifest
@@ -1594,26 +2046,50 @@ case "$ACTION" in
             echo "  Project:  (none - runtime only; pass --project-name to adopt a repo)"
         fi
 
-        # Prereq checks
-        missing_prereqs=()
-        command -v git >/dev/null 2>&1 || missing_prereqs+=("git")
-        command -v uv >/dev/null 2>&1 || missing_prereqs+=("uv")
-        if [[ ${#missing_prereqs[@]} -gt 0 ]]; then
-            err "Missing prerequisites: ${missing_prereqs[*]}"
+        # Prereq checks. A cell-local first use has no earlier legacy
+        # `provision` pass, so it must acquire uv here just as the lean
+        # self-provisioning path does.
+        command -v git >/dev/null 2>&1 || {
+            err "Missing prerequisite: git"
+            exit 1
+        }
+        if $CONTEXTUAL_INSTALL; then
+            _ensure_uv || exit 1
+            _ensure_uv_index
+        elif ! command -v uv >/dev/null 2>&1; then
+            err "Missing prerequisite: uv"
             exit 1
         fi
 
-        # Create directories (runtime always; project only if adopting)
-        mkdir -p "$INSTALL_DIR" "$BIN_DIR" "$LOCAL_BIN"
-        if $HAS_PROJECT; then
-            mkdir -p "$PROJECT_DIR" "$WORKTREES_DIR"
+        # Create only installation-local paths for a structured context.
+        if $CONTEXTUAL_INSTALL; then
+            mkdir -p "$INSTALL_DIR" "$BIN_DIR"
+        else
+            mkdir -p "$INSTALL_DIR" "$BIN_DIR" "$LOCAL_BIN"
+            if $HAS_PROJECT; then
+                mkdir -p "$PROJECT_DIR" "$WORKTREES_DIR"
+            fi
         fi
 
         # -- Shared runtime (venv first: package install targets the venv) --
-        deploy_venv || exit 1
-        deploy_package || exit 1
-        _versioned_activate || exit 1
+        if _test_slot_already_complete; then
+            skipped "Slot $SRC_VERSION already complete and unchanged -- skipping venv/package (re)install"
+        else
+            deploy_venv || exit 1
+            deploy_package || exit 1
+        fi
         deploy_wrappers || exit 1
+        if $CONTEXTUAL_INSTALL && ! context_governance_unchanged; then
+            err "Installation governance changed before runtime cutover"
+            exit 1
+        fi
+        _versioned_activate || exit 1
+        if $CONTEXTUAL_INSTALL; then
+            remove_legacy_scripts
+            write_deploy_manifest
+            ok "Context runtime installed at $INSTALL_DIR"
+            exit 0
+        fi
         remove_legacy_scripts
         remove_legacy_binstubs
         reconcile_binstubs
@@ -1627,10 +2103,6 @@ case "$ACTION" in
         deploy_copilot_plugin
         ensure_copilot_experimental
         assert_path
-        # Machine-wide terminal integration: deploy the per-session options +
-        # opt-in keybind scripts. We do NOT touch ~/.tmux.conf -- the launcher
-        # applies the status bar per-session at runtime.
-        deploy_terminal_scripts
 
         # -- Project-specific (only when adopting) --
         if $HAS_PROJECT; then
@@ -1770,11 +2242,13 @@ case "$ACTION" in
             err "Package not importable in venv"
         fi
 
-        # Wrapper
-        if [[ -f "$BIN_DIR/launch-session.sh" ]]; then
-            ok "launch-session.sh deployed"
+        # Interactive mux launch (relocated to Worktree Manager since Phase
+        # 3b Sub-slice 2a Step 2; no in-plugin wrapper is deployed anymore).
+        wm_root="${WORKTREE_MANAGER_ROOT:-$HOME/.worktree-manager}"
+        if [[ -f "$wm_root/current-version" ]]; then
+            ok "Interactive launch: Worktree Manager found at $wm_root"
         else
-            err "launch-session.sh missing"
+            skipped "Interactive launch: no Worktree Manager found; direct non-mux fallback"
         fi
 
         # Tool binstubs
@@ -1814,13 +2288,6 @@ case "$ACTION" in
             fi
         else
             skipped "Project status skipped (no project specified)"
-        fi
-
-        # Terminal-integration scripts (per-session options; opt-in keybinds)
-        if [[ -x "$BIN_DIR/session-options.sh" ]]; then
-            ok "terminal scripts at $BIN_DIR (session-options.sh)"
-        else
-            echo "  ! terminal scripts missing -- run 'update' to deploy" >&2
         fi
 
         assert_path
@@ -1868,16 +2335,42 @@ case "$ACTION" in
     update)
         header "Updating $SERVICE_NAME"
 
+        if $CONTEXTUAL_INSTALL; then
+            _ensure_uv || exit 1
+            _ensure_uv_index
+            mkdir -p "$INSTALL_DIR" "$BIN_DIR"
+            if _test_slot_already_complete; then
+                skipped "Slot $SRC_VERSION already complete and unchanged -- skipping venv/package (re)install"
+            else
+                deploy_venv || exit 1
+                deploy_package || exit 1
+            fi
+            deploy_wrappers || exit 1
+            if ! context_governance_unchanged; then
+                err "Installation governance changed before runtime cutover"
+                exit 1
+            fi
+            _versioned_activate || exit 1
+            remove_legacy_scripts
+            write_deploy_manifest
+            ok "Context runtime updated at $INSTALL_DIR"
+            exit 0
+        fi
+
         if [[ ! -d "$BIN_DIR" ]]; then
             err "Not installed -- run 'install' first"
             exit 1
         fi
 
         # -- Shared runtime (venv first: package install targets the venv) --
-        deploy_venv || exit 1
-        deploy_package || exit 1
-        _versioned_activate || exit 1
+        if _test_slot_already_complete; then
+            skipped "Slot $SRC_VERSION already complete and unchanged -- skipping venv/package (re)install"
+        else
+            deploy_venv || exit 1
+            deploy_package || exit 1
+        fi
         deploy_wrappers || exit 1
+        _versioned_activate || exit 1
         remove_legacy_scripts
         remove_legacy_binstubs
         reconcile_binstubs
@@ -1886,11 +2379,6 @@ case "$ACTION" in
         deploy_tool_binstub
         deploy_copilot_plugin
         ensure_copilot_experimental
-        # Machine-wide terminal integration: redeploy the per-session options +
-        # opt-in keybind scripts regardless of project context. agent-worktrees
-        # no longer owns ~/.tmux.conf (the launcher configures each session at
-        # runtime), so a project-less update just refreshes these scripts.
-        deploy_terminal_scripts
 
         # -- Project-specific (only when a project is known) --
         if $HAS_PROJECT; then
@@ -1919,7 +2407,7 @@ case "$ACTION" in
         ;;
 
     *)
-        echo "Usage: $0 {install|stamp|provision|uninstall|start|stop|status|update-config|update} [--project-name NAME] [--force] [--remove-config] [--machine NAME]" >&2
+        echo "Usage: $0 {install|stamp|provision|uninstall|start|stop|status|update-config|update} [--project-name NAME] [--install-dir DIR] [--force] [--remove-config] [--machine NAME]" >&2
         exit 1
         ;;
 esac

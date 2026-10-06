@@ -298,7 +298,7 @@ def _validate_repo_fragment(repo: object, *, location: str) -> str | None:
             for key in session_env
         ):
             return f"{location}.session_env keys must be non-empty strings"
-    for name in ("validate_paths", "service_paths"):
+    for name in ("validate_paths", "service_paths", "bootstrap_services"):
         if name in repo:
             error = _validate_string_list(
                 repo[name], location=f"{location}.{name}"
@@ -309,6 +309,18 @@ def _validate_repo_fragment(repo: object, *, location: str) -> str | None:
         error = _validate_pr(repo["pr"], location=f"{location}.pr")
         if error:
             return error
+    if "codename" in repo:
+        error = _validate_codename(repo["codename"], location=f"{location}.codename")
+        if error:
+            return error
+    return None
+
+
+def _validate_codename(raw: object, *, location: str) -> str | None:
+    if not isinstance(raw, dict):
+        return f"{location} must be a mapping"
+    if "wordlist_path" in raw and not isinstance(raw["wordlist_path"], str):
+        return f"{location}.wordlist_path must be a string"
     return None
 
 
@@ -319,8 +331,8 @@ def _validate_pr(raw: object, *, location: str) -> str | None:
         "enabled",
         "required",
         "auto_open",
-        "source_attribution",
         "approval_required",
+        "allow_stale_approval",
         "squash",
         "delete_source_branch",
         "bypass_policy",
@@ -346,10 +358,28 @@ def _validate_pr(raw: object, *, location: str) -> str | None:
         "branch_update_strategy",
         "merge_strategy",
     }
-    list_or_string_fields = {"labels", "hold_labels", "wip_title_prefixes"}
+    list_or_string_fields = {
+        "labels",
+        "hold_labels",
+        "required_body_sections",
+        "wip_title_prefixes",
+    }
     for name in boolean_fields:
         if name in raw and not isinstance(raw[name], bool):
             return f"{location}.{name} must be a boolean"
+    if "dismiss_stale_reviews" in raw:
+        value = raw["dismiss_stale_reviews"]
+        if value is not None and not isinstance(value, bool):
+            return f"{location}.dismiss_stale_reviews must be a boolean or null"
+    if "source_attribution" in raw:
+        value = raw["source_attribution"]
+        is_valid_bool = isinstance(value, bool)
+        is_valid_str = isinstance(value, str) and value.strip().lower() == "codename"
+        if not (is_valid_bool or is_valid_str):
+            return (
+                f"{location}.source_attribution must be a boolean or the "
+                'string "codename"'
+            )
     for name in string_fields:
         if name in raw and not isinstance(raw[name], str):
             return f"{location}.{name} must be a string"
@@ -424,7 +454,7 @@ def _validate_config(raw: object) -> str | None:
                 )
                 if error:
                     return error
-    for name in ("headless", "auto_fast_forward", "new_picker"):
+    for name in ("headless", "auto_fast_forward"):
         if name in raw and not isinstance(raw[name], bool):
             return f"{name} must be a boolean"
     return None
@@ -640,7 +670,12 @@ def _managed_decision(
                 detail=f"pointer plugin_root could not be read: {exc}",
             )
         )
-    if canonical_root != active.root:
+    applicable_roots = {
+        selected.root
+        for selected in active.live_roots
+        if allowed_scopes.intersection(selected.scopes)
+    }
+    if canonical_root not in applicable_roots:
         return EntryDecision.inactive(
             _finding(
                 entry,
@@ -648,7 +683,10 @@ def _managed_decision(
                 target=target,
                 entry_class="managed-plugin",
                 owner=source,
-                detail=f"pointer root differs from active plugin root {active.root}",
+                detail=(
+                    "pointer root differs from active roots for this scope: "
+                    + ", ".join(str(root) for root in sorted(applicable_roots))
+                ),
             )
         )
 
@@ -659,7 +697,7 @@ def _managed_decision(
         return verdict
     canonical_target = cast(Path, canonical_target)
     try:
-        canonical_target.relative_to(active.root)
+        canonical_target.relative_to(canonical_root)
     except ValueError:
         return EntryDecision.inactive(
             _finding(

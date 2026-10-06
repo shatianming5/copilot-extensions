@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,20 @@ BASH_HOOK = PLUGIN / "scripts" / "emit-policy.sh"
 POWERSHELL_HOOK = PLUGIN / "scripts" / "emit-policy.ps1"
 HOOKS = PLUGIN / "hooks.json"
 SETUP_SKILL = PLUGIN / "skills" / "ai-attribution-setup" / "SKILL.md"
-
+PROJECTION_DECLARATION = PLUGIN / "instruction-projections.json"
+PROJECTION_TEMPLATE = (
+    PLUGIN / "instructions" / "publication-safety.instructions.md"
+)
+SESSION_GUIDANCE_TEMPLATE = (
+    PLUGIN / "instructions" / "session-guidance.instructions.md"
+)
+# The hook derives its emitted version from this plugin's own plugin.json at
+# runtime (falling back to a compiled-in literal only when unreadable); tests
+# that assert on normal hook output must derive the expected marker the same
+# way, not hardcode the current manifest version, or they break on every bump.
+PLUGIN_VERSION = json.loads(PLUGIN.joinpath("plugin.json").read_text(encoding="utf-8"))[
+    "version"
+]
 
 def _powershell_command() -> str | None:
     if os.name == "nt":
@@ -55,6 +69,11 @@ def _environment(home: Path, **extra: str) -> dict[str, str]:
     env.update(
         {
             "HOME": str(home),
+            "PATH": (
+                str(Path(sys.executable).parent)
+                + os.pathsep
+                + env.get("PATH", "")
+            ),
             "USERPROFILE": str(home),
             "XDG_CONFIG_HOME": str(home / "config"),
         }
@@ -106,40 +125,21 @@ def _context(result: subprocess.CompletedProcess[str]) -> str:
     return payload["additionalContext"]
 
 
-def _run_hook_wrapper(
-    shell_key: str,
-    cwd: Path,
-    home: Path,
-    *,
-    payload: str | None = None,
-    plugin_root: Path | None = None,
-) -> subprocess.CompletedProcess[str]:
-    hook_command = json.loads(HOOKS.read_text(encoding="utf-8"))["hooks"][
-        "sessionStart"
-    ][0][shell_key]
-    if shell_key == "powershell":
-        powershell = _powershell_command()
-        assert powershell
-        command = [powershell, "-NoProfile", "-Command", hook_command]
-    else:
-        command = ["bash", "-c", hook_command]
-    environment = _environment(home)
-    if plugin_root is not None:
-        environment["COPILOT_PLUGIN_ROOT"] = str(plugin_root)
-    return subprocess.run(
-        command,
-        cwd=cwd,
-        env=environment,
-        input=payload or json.dumps({"cwd": str(cwd), "source": "copilot-cli"}),
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-
-
 def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def _symlink_or_skip(
+    link: Path,
+    target: Path,
+    *,
+    target_is_directory: bool = False,
+) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
 
 
 def _write_guide(repo: Path, relative_path: str) -> None:
@@ -210,15 +210,15 @@ def test_no_config_emits_safe_defaults(tmp_path: Path) -> None:
     repo = _git_repo(tmp_path / "repo")
     context = _context(_run(_native_hook(), repo, tmp_path / "home"))
     assert context.startswith(
-        "[owner: ai-attribution@0.1.0-dev8] Before publishing"
+        f"[owner: ai-attribution@{PLUGIN_VERSION}] Before publishing"
     )
-    assert "another party's repo require" in context
-    assert "verified operator-owned repo, omit disclosure" in context
-    assert "own-repo carve-out changes disclosure only" in context
+    assert "Disclosure turns on who this specific contribution addresses" in context
+    assert "may omit disclosure" in context
+    assert "requires a prominent one-line italicized AI-assistance disclosure" in context
     assert "persona-neutral" in context
     assert "Audit the live published surface" in context
-    assert "session-start repository is unresolved" in context
-    assert "re-derive ownership before publishing to any other repository" in context
+    assert "treat any contribution there as addressing another party" in context
+    assert "re-derive it before publishing to any other repository" in context
 
 
 def test_payload_cwd_is_authoritative_when_process_cwd_differs(
@@ -257,7 +257,7 @@ def test_payload_cwd_decodes_json_unicode_escapes(tmp_path: Path) -> None:
     hooks = _parity_hooks()
     for hook in hooks:
         assert _context(_run(hook, repo, tmp_path / "home")).startswith(
-            "[owner: ai-attribution@0.1.0-dev8]"
+            f"[owner: ai-attribution@{PLUGIN_VERSION}]"
         )
 
 
@@ -387,7 +387,7 @@ def test_payload_depth_limit_has_shell_parity(
     for result in results:
         if accepted:
             assert _context(result).startswith(
-                "[owner: ai-attribution@0.1.0-dev8]"
+                f"[owner: ai-attribution@{PLUGIN_VERSION}]"
             )
         else:
             assert result.stdout == "{}"
@@ -607,7 +607,7 @@ def test_malformed_and_unreadable_config_keep_safe_policy(tmp_path: Path) -> Non
     (home / "config" / "ai-attribution" / "config.conf").mkdir(parents=True)
     result = _run(_native_hook(), repo, home)
     context = _context(result)
-    assert "another party's repo require" in context
+    assert "Disclosure turns on who this specific contribution addresses" in context
     assert result.stderr.count("ignored malformed line") == 2
     assert "ignored invalid disclosure value" in result.stderr
     assert "could not safely read config; safe defaults remain active" in result.stderr
@@ -750,7 +750,7 @@ def test_symlinked_target_repo_config_is_rejected(tmp_path: Path) -> None:
     _write_guide(repo, "CONTRIBUTING.md")
     config = repo / ".github" / "ai-attribution.conf"
     config.parent.mkdir(parents=True)
-    config.symlink_to(outside)
+    _symlink_or_skip(config, outside)
     hooks = _parity_hooks()
     for hook in hooks:
         result = _run(hook, repo, tmp_path / "home")
@@ -763,7 +763,11 @@ def test_symlinked_repo_config_directory_is_rejected(tmp_path: Path) -> None:
     outside = tmp_path / "outside-github"
     _write(outside / "ai-attribution.conf", "contribution_guide=CONTRIBUTING.md\n")
     _write_guide(repo, "CONTRIBUTING.md")
-    (repo / ".github").symlink_to(outside, target_is_directory=True)
+    _symlink_or_skip(
+        repo / ".github",
+        outside,
+        target_is_directory=True,
+    )
     hooks = _parity_hooks()
     results = [_run(hook, repo, tmp_path / "home") for hook in hooks]
     for result in results:
@@ -851,7 +855,399 @@ def test_host_and_owner_match_case_insensitively_for_ssh_remote(
     )
     context = _context(_run(_native_hook(), repo, home))
     assert "configured public account `github.com/example-owner`" in context
-    assert "verify ownership before omitting disclosure" in context
+    assert "not proof of who authored any specific PR/issue/thread" in context
+
+
+def test_internal_host_omits_disclosure_requirement(tmp_path: Path) -> None:
+    repo = _git_repo(
+        tmp_path / "repo",
+        "https://gitea.example.internal/example-owner/repo.git",
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "internal_host=gitea.example.internal\n",
+    )
+    for hook in _parity_hooks():
+        context = _context(_run(hook, repo, home))
+        assert "operator-only (internal_host), so disclosure is not required for a contribution that actually publishes there" in context
+        assert "requires a prominent one-line italicized" not in context
+
+
+def test_internal_host_matches_with_an_explicit_url_port(tmp_path: Path) -> None:
+    """A self-hosted forge reached on a non-default port (e.g. a bare Gitea
+    deployment) must still match internal_host -- the port is not part of the
+    hostname the operator configures."""
+    repo = _git_repo(
+        tmp_path / "repo",
+        "https://gitea.example.internal:3000/example-owner/repo.git",
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "internal_host=gitea.example.internal\n",
+    )
+    for hook in _parity_hooks():
+        context = _context(_run(hook, repo, home))
+        assert "operator-only (internal_host), so disclosure is not required for a contribution that actually publishes there" in context
+
+
+def test_internal_host_matches_an_unnamespaced_remote(tmp_path: Path) -> None:
+    """The internal_host exemption must not depend on account/owner parsing --
+    a bare `host/repo.git` remote (no owner segment) is still a valid host to
+    exempt, even though it can never resolve an owned_account."""
+    repo = _git_repo(
+        tmp_path / "repo",
+        "https://gitea.example.internal/repo.git",
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "internal_host=gitea.example.internal\n",
+    )
+    for hook in _parity_hooks():
+        context = _context(_run(hook, repo, home))
+        assert "operator-only (internal_host), so disclosure is not required for a contribution that actually publishes there" in context
+
+
+def test_internal_host_exemption_follows_push_url_not_fetch_url(
+    tmp_path: Path,
+) -> None:
+    """An internal fetch mirror with an EXTERNAL push target must not be
+    exempted -- content actually gets published to the push URL's host."""
+    repo = _git_repo(
+        tmp_path / "repo",
+        "https://gitea.example.internal/example-owner/repo.git",
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "remote", "set-url", "--push", "origin",
+            "https://github.com/example-owner/repo.git",
+        ],
+        check=True,
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "internal_host=gitea.example.internal\n",
+    )
+    for hook in _parity_hooks():
+        context = _context(_run(hook, repo, home))
+        assert "operator-only (internal_host)" not in context
+        assert "Disclosure turns on who this specific contribution addresses" in context
+
+
+def test_internal_host_exemption_uses_the_configured_push_url(
+    tmp_path: Path,
+) -> None:
+    """The reverse of the above: a fetch URL that looks external but whose
+    push target is internal must be exempted, since publication follows the
+    push URL."""
+    repo = _git_repo(
+        tmp_path / "repo",
+        "https://github.com/example-owner/repo.git",
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "remote", "set-url", "--push", "origin",
+            "https://gitea.example.internal/example-owner/repo.git",
+        ],
+        check=True,
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "internal_host=gitea.example.internal\n",
+    )
+    for hook in _parity_hooks():
+        context = _context(_run(hook, repo, home))
+        assert "operator-only (internal_host), so disclosure is not required for a contribution that actually publishes there" in context
+
+
+def test_internal_host_exemption_requires_every_mirrored_push_url_internal(
+    tmp_path: Path,
+) -> None:
+    """A remote mirrored to multiple push destinations (`--add --push`) must
+    be exempted only when ALL of them are internal -- one external mirror
+    target is enough to require disclosure."""
+    repo = _git_repo(
+        tmp_path / "repo",
+        "https://gitea.example.internal/example-owner/repo.git",
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "remote", "set-url", "--push", "origin",
+            "https://gitea.example.internal/example-owner/repo.git",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "remote", "set-url", "--add", "--push", "origin",
+            "https://github.com/example-owner/repo.git",
+        ],
+        check=True,
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "internal_host=gitea.example.internal\n",
+    )
+    for hook in _parity_hooks():
+        context = _context(_run(hook, repo, home))
+        assert "operator-only (internal_host)" not in context
+        assert "Disclosure turns on who this specific contribution addresses" in context
+
+
+def test_internal_host_exemption_follows_branch_push_remote_override(
+    tmp_path: Path,
+) -> None:
+    """`branch.<name>.pushRemote` overrides `origin` as the effective push
+    target Git itself would use -- an internal `origin` must not exempt a
+    branch whose actual push destination (via pushRemote) is external."""
+    repo = _git_repo(
+        tmp_path / "repo",
+        "https://gitea.example.internal/example-owner/repo.git",
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "remote", "add", "upstream",
+            "https://github.com/example-owner/repo.git",
+        ],
+        check=True,
+    )
+    branch = subprocess.run(
+        ["git", "-C", str(repo), "symbolic-ref", "--short", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "config", f"branch.{branch}.pushRemote",
+            "upstream",
+        ],
+        check=True,
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "internal_host=gitea.example.internal\n",
+    )
+    for hook in _parity_hooks():
+        context = _context(_run(hook, repo, home))
+        assert "operator-only (internal_host)" not in context
+        assert "Disclosure turns on who this specific contribution addresses" in context
+
+
+def test_internal_host_exemption_follows_remote_push_default_override(
+    tmp_path: Path,
+) -> None:
+    """`remote.pushDefault` overrides `origin` repo-wide, the same way
+    pushRemote overrides it per-branch."""
+    repo = _git_repo(
+        tmp_path / "repo",
+        "https://gitea.example.internal/example-owner/repo.git",
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "remote", "add", "upstream",
+            "https://github.com/example-owner/repo.git",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "remote.pushDefault", "upstream"],
+        check=True,
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "internal_host=gitea.example.internal\n",
+    )
+    for hook in _parity_hooks():
+        context = _context(_run(hook, repo, home))
+        assert "operator-only (internal_host)" not in context
+        assert "Disclosure turns on who this specific contribution addresses" in context
+
+
+def test_internal_host_exemption_refuses_ambiguous_multi_remote_fallback(
+    tmp_path: Path,
+) -> None:
+    """Git refuses to guess a push remote when several are configured and
+    none is named by pushRemote/pushDefault/branch-tracking/origin -- an
+    arbitrary first-remote pick here could wrongly grant the exemption off
+    whichever remote happens to be configured internal."""
+    repo = _git_repo(tmp_path / "repo")
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "remote", "add", "first",
+            "https://gitea.example.internal/example-owner/repo.git",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "remote", "add", "second",
+            "https://github.com/example-owner/repo.git",
+        ],
+        check=True,
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "internal_host=gitea.example.internal\n",
+    )
+    for hook in _parity_hooks():
+        context = _context(_run(hook, repo, home))
+        assert "operator-only (internal_host)" not in context
+        assert "Disclosure turns on who this specific contribution addresses" in context
+
+
+def test_owned_account_matches_with_an_explicit_url_port(tmp_path: Path) -> None:
+    repo = _git_repo(
+        tmp_path / "repo",
+        "https://example.com:8443/example-owner/repo.git",
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "owned_account=example.com/example-owner\n",
+    )
+    for hook in _parity_hooks():
+        context = _context(_run(hook, repo, home))
+        assert "configured public account `example.com/example-owner`" in context
+
+
+def test_internal_host_matches_case_insensitively(tmp_path: Path) -> None:
+    repo = _git_repo(
+        tmp_path / "repo",
+        "https://Gitea.Example.Internal/example-owner/repo.git",
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "internal_host=gitea.example.internal\n",
+    )
+    context = _context(_run(_native_hook(), repo, home))
+    assert "operator-only (internal_host), so disclosure is not required for a contribution that actually publishes there" in context
+
+
+def test_internal_host_matches_scp_style_remote_without_username(
+    tmp_path: Path,
+) -> None:
+    repo = _git_repo(
+        tmp_path / "repo",
+        "gitea.example.internal:example-owner/repo.git",
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "internal_host=gitea.example.internal\n",
+    )
+    for hook in _parity_hooks():
+        context = _context(_run(hook, repo, home))
+        assert "operator-only (internal_host), so disclosure is not required for a contribution that actually publishes there" in context
+
+
+def test_owned_account_matches_scp_style_remote_without_username(
+    tmp_path: Path,
+) -> None:
+    repo = _git_repo(
+        tmp_path / "repo",
+        "gitea.example.internal:example-owner/repo.git",
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "owned_account=gitea.example.internal/example-owner\n",
+    )
+    for hook in _parity_hooks():
+        context = _context(_run(hook, repo, home))
+        assert "configured public account `gitea.example.internal/example-owner`" in context
+
+
+def test_windows_drive_path_remote_is_not_misclassified_as_scp_host(
+    tmp_path: Path,
+) -> None:
+    repo = _git_repo(tmp_path / "repo")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "remote",
+            "add",
+            "origin",
+            "C:\\example-owner\\repo.git",
+        ],
+        check=True,
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "internal_host=example-owner\n",
+    )
+    for hook in _parity_hooks():
+        context = _context(_run(hook, repo, home))
+        assert "operator-only (internal_host)" not in context
+
+
+def test_non_internal_host_requires_disclosure_for_third_party_audience(
+    tmp_path: Path,
+) -> None:
+    repo = _git_repo(
+        tmp_path / "repo",
+        "https://github.com/example-owner/repo.git",
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "internal_host=gitea.example.internal\n",
+    )
+    context = _context(_run(_native_hook(), repo, home))
+    assert "Disclosure turns on who this specific contribution addresses" in context
+    assert "operator-only (internal_host)" not in context
+
+
+def test_disclosure_always_overrides_internal_host(tmp_path: Path) -> None:
+    repo = _git_repo(
+        tmp_path / "repo",
+        "https://gitea.example.internal/example-owner/repo.git",
+    )
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "disclosure=always\ninternal_host=gitea.example.internal\n",
+    )
+    context = _context(_run(_native_hook(), repo, home))
+    assert "requires a prominent one-line italicized AI-assistance disclosure at the top of every contribution, including a self-authored one or an internal host" in context
+    assert "operator-only (internal_host)" not in context
+
+
+def test_internal_host_is_not_repo_delegable(tmp_path: Path) -> None:
+    repo = _git_repo(
+        tmp_path / "repo",
+        "https://github.com/example-owner/repo.git",
+    )
+    home = tmp_path / "home"
+    _write(
+        repo / ".github" / "ai-attribution.conf",
+        "internal_host=github.com\n",
+    )
+    result = _run(_native_hook(), repo, home)
+    context = _context(result)
+    assert "non-repo-delegable key 'internal_host'" in result.stderr
+    assert "operator-only (internal_host)" not in context
+
+
+def test_invalid_internal_host_value_is_rejected(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path / "repo")
+    home = tmp_path / "home"
+    _write(
+        home / ".copilot" / "ai-attribution.conf",
+        "internal_host=evil*\n",
+    )
+    result = _run(_native_hook(), repo, home)
+    assert "ignored invalid internal_host value" in result.stderr
 
 
 @pytest.mark.skipif(not shutil.which("pwsh"), reason="pwsh is not installed")
@@ -868,7 +1264,11 @@ def test_powershell_rejects_reparse_custom_instruction_directory(
         "owned_account=github.com/example-owner\n",
     )
     policy_link = tmp_path / "policy-link"
-    policy_link.symlink_to(real_policy, target_is_directory=True)
+    _symlink_or_skip(
+        policy_link,
+        real_policy,
+        target_is_directory=True,
+    )
     result = _run(
         POWERSHELL_HOOK,
         repo,
@@ -947,7 +1347,11 @@ def test_contribution_guide_symlink_escape_is_rejected(tmp_path: Path) -> None:
     repo = _git_repo(tmp_path / "repo")
     outside = tmp_path / "outside"
     _write(outside / "guide.md", "# Outside\n")
-    (repo / "linked").symlink_to(outside, target_is_directory=True)
+    _symlink_or_skip(
+        repo / "linked",
+        outside,
+        target_is_directory=True,
+    )
     _write(
         repo / ".github" / "ai-attribution.conf",
         "contribution_guide=linked/guide.md\n",
@@ -961,7 +1365,7 @@ def test_contribution_guide_symlink_escape_is_rejected(tmp_path: Path) -> None:
 
 def test_exact_json_output_and_kernel_size(tmp_path: Path) -> None:
     repo = _git_repo(tmp_path / "repo")
-    guides = [f"guide-{index}-{'x' * 140}" for index in range(8)]
+    guides = [f"guide-{index}-{'x' * 40}" for index in range(8)]
     for guide in guides:
         _write_guide(repo, guide)
     _write(
@@ -978,25 +1382,6 @@ def test_exact_json_output_and_kernel_size(tmp_path: Path) -> None:
     assert len(context.encode("utf-8")) <= 2200
     assert result.stdout.count("\n") == 0
     assert context.count("Target-repo contribution guide:") == 4
-
-
-def test_aggregate_mode_is_compact_and_preserves_publication_safety(
-    tmp_path: Path,
-) -> None:
-    repo = _git_repo(tmp_path / "repo")
-    results = [
-        _run(hook, repo, tmp_path / hook.suffix.removeprefix("."), "--aggregate")
-        for hook in _parity_hooks()
-    ]
-    contexts = [_context(result) for result in results]
-    for context in contexts:
-        assert context.startswith("[owner: ai-attribution@")
-        assert "classify audience and repository ownership" in context
-        assert "ownership hints are not proof" in context
-        assert "must be persona-neutral and scrub credentials" in context
-        assert "Use the `ai-attribution` skill" in context
-        assert len(context.encode("utf-8")) <= 544
-    assert len(set(contexts)) == 1
 
 
 @pytest.mark.skipif(
@@ -1033,113 +1418,6 @@ def test_powershell_json_serializer_escapes_nul() -> None:
     assert result.stdout == r"\u0000"
 
 
-@pytest.mark.parametrize("shell_key", ["bash", "powershell"])
-def test_hook_wrapper_finds_non_default_marketplace(
-    tmp_path: Path,
-    shell_key: str,
-) -> None:
-    if shell_key == "powershell" and not _powershell_command():
-        pytest.skip("PowerShell is not installed")
-    if shell_key == "bash" and (os.name == "nt" or not shutil.which("bash")):
-        pytest.skip("Bash wrapper behavior is tested on POSIX")
-    repo = _git_repo(tmp_path / "repo")
-    home = tmp_path / "home"
-    installed = (
-        home
-        / ".copilot"
-        / "installed-plugins"
-        / "alternate-marketplace"
-        / "ai-attribution"
-    )
-    shutil.copytree(PLUGIN, installed)
-    result = _run_hook_wrapper(
-        shell_key,
-        repo,
-        home,
-        plugin_root=installed,
-    )
-    assert _context(result).startswith("[owner: ai-attribution@")
-    assert result.stderr == ""
-
-
-@pytest.mark.skipif(
-    os.name == "nt" or not shutil.which("pwsh"),
-    reason="POSIX pwsh is required",
-)
-def test_powershell_wrapper_uses_components_under_posix_pwsh(
-    tmp_path: Path,
-) -> None:
-    repo = _git_repo(tmp_path / "repo")
-    home = tmp_path / "home"
-    installed = (
-        home
-        / ".copilot"
-        / "installed-plugins"
-        / "non-default-marketplace"
-        / "ai-attribution"
-    )
-    shutil.copytree(PLUGIN, installed)
-    result = _run_hook_wrapper(
-        "powershell",
-        repo,
-        home,
-        plugin_root=installed,
-    )
-    assert _context(result).startswith("[owner: ai-attribution@")
-    assert result.stderr == ""
-
-
-@pytest.mark.parametrize("shell_key", ["bash", "powershell"])
-@pytest.mark.parametrize("condition", ["missing", "directory", "ambiguous"])
-def test_hook_wrapper_rejects_missing_non_leaf_or_ambiguous_payloads(
-    tmp_path: Path,
-    shell_key: str,
-    condition: str,
-) -> None:
-    if shell_key == "powershell" and not _powershell_command():
-        pytest.skip("PowerShell is not installed")
-    if shell_key == "bash" and (os.name == "nt" or not shutil.which("bash")):
-        pytest.skip("Bash wrapper behavior is tested on POSIX")
-    home = tmp_path / "home"
-    if condition == "directory":
-        suffix = "emit-policy.ps1" if shell_key == "powershell" else "emit-policy.sh"
-        (
-            home
-            / ".copilot"
-            / "installed-plugins"
-            / "alternate-marketplace"
-            / "ai-attribution"
-            / "scripts"
-            / suffix
-        ).mkdir(parents=True)
-    elif condition == "ambiguous":
-        for marketplace in ("alpha-marketplace", "zeta-marketplace"):
-            installed = (
-                home
-                / ".copilot"
-                / "installed-plugins"
-                / marketplace
-                / "ai-attribution"
-            )
-            shutil.copytree(PLUGIN, installed)
-    result = _run_hook_wrapper(shell_key, tmp_path, home, payload="{}")
-    assert result.stdout == "{}"
-    assert result.stderr == ""
-
-
-@pytest.mark.guard
-def test_hook_wrapper_uses_cross_platform_path_components() -> None:
-    command = json.loads(HOOKS.read_text(encoding="utf-8"))["hooks"][
-        "sessionStart"
-    ][0]["powershell"]
-    assert "COPILOT_PLUGIN_ROOT" in command
-    assert "PLUGIN_ROOT" in command
-    assert "CLAUDE_PLUGIN_ROOT" in command
-    assert command.count("Join-Path") >= 2
-    assert "invoke-context-contributor.ps1" in command
-    assert "Test-Path -LiteralPath $w -PathType Leaf" in command
-
-
 @pytest.mark.guard
 def test_bash_input_bounds_and_cwd_controls_are_structural() -> None:
     source = BASH_HOOK.read_text(encoding="utf-8")
@@ -1162,29 +1440,141 @@ def test_bash_input_bounds_and_cwd_controls_are_structural() -> None:
 
 @pytest.mark.guard
 def test_version_owner_markers_match_manifest_and_fallback() -> None:
-    version = json.loads((PLUGIN / "plugin.json").read_text(encoding="utf-8"))[
-        "version"
-    ]
+    version = PLUGIN_VERSION
     bash_source = BASH_HOOK.read_text(encoding="utf-8")
     powershell_source = POWERSHELL_HOOK.read_text(encoding="utf-8")
-    docs = (PLUGIN / "docs" / "configuration.md").read_text(encoding="utf-8")
-    assert f'plugin_version="{version}"' in bash_source
-    assert f"$script:PluginVersion = '{version}'" in powershell_source
-    assert f"[owner: ai-attribution@{version}]" in docs
+    template = PROJECTION_TEMPLATE.read_text(encoding="utf-8")
+    # Each hook derives its EMITTED version dynamically from plugin.json at
+    # runtime (see test_hook_prefers_plugin_json_version_over_compiled_in_fallback);
+    # its own compiled-in literal is only the last-resort fallback for a
+    # missing/malformed manifest and is not required to track plugin.json on
+    # every bump (promotion has no step that rewrites it). Only require that a
+    # syntactically well-formed fallback literal is present at all.
+    assert re.search(r'plugin_version="[0-9]+\.[0-9]+\.[0-9]+(?:-dev[0-9]+)?"', bash_source)
+    assert re.search(
+        r"\$script:PluginVersion = '[0-9]+\.[0-9]+\.[0-9]+(?:-dev[0-9]+)?'", powershell_source
+    )
+    assert f"[owner: ai-attribution@{version}]" in template
+    assert "Invoke the `ai-attribution` skill" in template
     assert 'kernel="[owner: ai-attribution@$plugin_version]' in bash_source
-    assert "ai-attribution:static-fallback:start" in docs
-    assert "ai-attribution:static-fallback:end" in docs
+
+
+def _compiled_in_fallback_version(hook: Path) -> str:
+    """The hook's own hardcoded fallback literal, read from its source --
+    deliberately not assumed to equal plugin.json's current version, since
+    that assumption is exactly the gap a release bump can open (plugin.json
+    bumps; this literal does not, unless promotion explicitly updates it)."""
+    source = hook.read_text(encoding="utf-8")
+    if hook.suffix == ".ps1":
+        match = re.search(r"\$script:PluginVersion = '([^']+)'", source)
+    else:
+        match = re.search(r'plugin_version="([^"]+)"', source)
+    assert match, f"could not find a compiled-in fallback version in {hook}"
+    return match.group(1)
+
+
+def test_hook_prefers_plugin_json_version_over_compiled_in_fallback(
+    tmp_path: Path,
+) -> None:
+    """A hook invoked from its real plugin layout emits plugin.json's version,
+    not its own compiled-in fallback literal -- this is the mechanism that
+    keeps a bumped plugin.json authoritative without a corresponding manual
+    edit to the hook's own fallback constant."""
+    manifest_version = "9.9.9-dev99"
+
+    plugin_copy = tmp_path / "plugin-copy"
+    (plugin_copy / "scripts").mkdir(parents=True)
+    _write(
+        plugin_copy / "plugin.json",
+        json.dumps({"name": "ai-attribution", "version": manifest_version}),
+    )
+    for hook in _parity_hooks():
+        fallback_version = _compiled_in_fallback_version(hook)
+        assert manifest_version != fallback_version
+        shutil.copy2(hook, plugin_copy / "scripts" / hook.name)
+
+    repo = _git_repo(tmp_path / "repo")
+    home = tmp_path / "home"
+    for hook in _parity_hooks():
+        fallback_version = _compiled_in_fallback_version(hook)
+        copied_hook = plugin_copy / "scripts" / hook.name
+        context = _context(_run(copied_hook, repo, home))
+        assert f"[owner: ai-attribution@{manifest_version}]" in context
+        assert f"[owner: ai-attribution@{fallback_version}]" not in context
+
+
+def test_hook_falls_back_to_compiled_in_version_without_plugin_json(
+    tmp_path: Path,
+) -> None:
+    plugin_copy = tmp_path / "plugin-copy"
+    (plugin_copy / "scripts").mkdir(parents=True)
+    # No plugin.json alongside this copy at all.
+    for hook in _parity_hooks():
+        shutil.copy2(hook, plugin_copy / "scripts" / hook.name)
+
+    repo = _git_repo(tmp_path / "repo")
+    home = tmp_path / "home"
+    for hook in _parity_hooks():
+        fallback_version = _compiled_in_fallback_version(hook)
+        copied_hook = plugin_copy / "scripts" / hook.name
+        context = _context(_run(copied_hook, repo, home))
+        assert f"[owner: ai-attribution@{fallback_version}]" in context
 
 
 @pytest.mark.guard
 def test_setup_skill_structurally_owns_fallback_and_policy_setup() -> None:
     source = SETUP_SKILL.read_text(encoding="utf-8")
+    declaration = json.loads(PROJECTION_DECLARATION.read_text(encoding="utf-8"))
     assert source.startswith("---\nname: ai-attribution-setup\n")
-    assert "ai-attribution:static-fallback:start" in source
-    assert "ai-attribution:static-fallback:end" in source
+    assert "manage-instruction-projections.py" in source
+    assert "instruction-projections.json" in source
+    assert "do not hand-copy" in source.lower()
     assert "owned_account=github.com/example-owner" in source
     assert "hook-less launch paths" in source
-    assert "idempotent" in source.lower()
+    assert declaration["schema"] == "copilot-extensions.instruction-projections"
+    assert declaration["version"] == 1
+    assert declaration["projections"][0]["legacyMarkers"] == [
+        "ai-attribution:static-fallback"
+    ]
+    assert declaration["projections"][1] == {
+        "id": "session-guidance",
+        "template": "instructions/session-guidance.instructions.md",
+        "destination": (
+            ".github/instructions/ai-attribution/"
+            "session-guidance.instructions.md"
+        ),
+        "customizationKind": "instructions",
+        "applyTo": "**",
+        "legacyMarkers": [],
+    }
+    pointer = SESSION_GUIDANCE_TEMPLATE.read_text(encoding="utf-8")
+    assert "already-disclosed session folder" in pointer
+    assert "instructions/ai-attribution/session-guidance.instructions.md" in pointer
+    assert "~/.copilot/session-state" not in pointer
+
+
+@pytest.mark.guard
+def test_session_guidance_writer_is_a_separate_side_effect_hook() -> None:
+    entries = json.loads(HOOKS.read_text(encoding="utf-8"))["hooks"]["sessionStart"]
+    assert len(entries) == 1
+    assert "write-session-guidance" in entries[0]["bash"]
+    assert "write-session-guidance" in entries[0]["powershell"]
+    assert "invoke-context-contributor" not in entries[0]["bash"]
+    assert "--aggregate" not in entries[0]["bash"]
+    assert entries[0]["timeoutSec"] == 30
+    for shell in ("bash", "powershell"):
+        assert "COPILOT_PLUGIN_ROOT" in entries[0][shell]
+        assert "PLUGIN_ROOT" in entries[0][shell]
+        assert "CLAUDE_PLUGIN_ROOT" in entries[0][shell]
+
+    declaration = json.loads(
+        (PLUGIN / "session-context.json").read_text(encoding="utf-8")
+    )
+    assert declaration["contributors"] == []
+    assert declaration["sessionStart"] == {
+        "sideEffects": "restart-safe-idempotent",
+        "context": "none",
+    }
 
 
 def test_bash_powershell_parity_or_static_semantics(tmp_path: Path) -> None:

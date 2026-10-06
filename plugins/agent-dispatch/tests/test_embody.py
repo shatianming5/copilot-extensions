@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import types
@@ -9,6 +10,14 @@ import types
 import pytest
 
 from agent_dispatch import embody, procutil
+
+
+def _completed(stdout: str, *, returncode: int = 0, stderr: str = ""):
+    return types.SimpleNamespace(
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
 
 
 def test_autopilot_prompt_mentions_task_verbs_and_deferred_completion():
@@ -22,6 +31,8 @@ def test_autopilot_prompt_mentions_task_verbs_and_deferred_completion():
     # The full deferred-completion worker loop, driven under the worktree
     # identity (owner-less claim/start/complete so the task owner stays
     # machine/worktree and live-session tracking can join it).
+    assert "agent-dispatch charter show operating-procedures" in prompt
+    assert "agent-dispatch charter show autopilot" in prompt
     assert "agent-dispatch claim --task abc123" in prompt
     assert "agent-dispatch start abc123" in prompt
     assert "agent-dispatch steer take abc123 --all" in prompt
@@ -29,16 +40,140 @@ def test_autopilot_prompt_mentions_task_verbs_and_deferred_completion():
     # The progress-beat rhythm (Phase 7 Channel B): report at transitions.
     assert "agent-dispatch progress abc123" in prompt
     assert "--summary" in prompt
-    # Autopilot + the deferred-completion guarantee (do not complete early).
+    # Autopilot + the deferred-completion guarantee.
     assert "autopilot" in prompt.lower()
-    assert "not mark it complete before" in prompt.lower()
+    assert "only once the charters say the goal is genuinely met" in prompt.lower()
     # Contract-net evaluation window (dev55): claim under the tight evaluation
     # lease, assess, then accept (start) / decline (yield --exclude-self) / retire
     # (abandon --duplicate-of).
     assert "agent-dispatch claim --task abc123 --evaluation" in prompt
-    assert "evaluat" in prompt.lower()
+    assert "evaluation lease" in prompt.lower()
     assert "agent-dispatch yield abc123 --exclude-self worktree" in prompt
     assert "agent-dispatch abandon abc123 --duplicate-of" in prompt
+
+
+def test_headless_autopilot_prompt_uses_explicit_worker_identity():
+    prompt = embody.autopilot_worker_prompt(
+        "abc123",
+        worker_id="headless-1234",
+        all_repos=True,
+        explicit_worker_identity=True,
+    )
+    assert (
+        "agent-dispatch claim --task abc123 --evaluation "
+        "--worker headless-1234 --all-repos"
+    ) in prompt
+    assert "agent-dispatch start abc123 headless-1234" in prompt
+    assert "agent-dispatch steer take abc123 headless-1234 --all" in prompt
+    assert "agent-dispatch progress abc123 headless-1234" in prompt
+    assert "agent-dispatch complete abc123 headless-1234" in prompt
+    assert "agent-dispatch yield abc123 headless-1234 --note <why>" in prompt
+    assert "--exclude-self worktree" not in prompt
+
+
+def test_conclude_disposable_worker_requests_exact_managed_removal(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        embody, "_agent_worktrees_launch_prefix", lambda: ["/usr/bin/agent-worktrees"]
+    )
+    monkeypatch.setattr(
+        embody.subprocess,
+        "run",
+        lambda cmd, **_kwargs: calls.append(cmd)
+        or _completed('{"action":"removed","managed_gc_eligible":false}'),
+    )
+
+    result = embody.conclude_disposable_worker("wt-review", "session-review")
+
+    assert calls[0] == [
+        "/usr/bin/agent-worktrees",
+        "conclude-disposable",
+        "--worktree",
+        "wt-review",
+        "--policy",
+        "disposable-cli",
+        "--owner",
+        "agent-dispatch",
+        "--remove",
+        "--json",
+        "--session",
+        "session-review",
+    ]
+    assert result["action"] == "removed"
+
+
+def test_conclude_dispatch_attempt_requests_exact_managed_removal(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        embody, "_agent_worktrees_launch_prefix", lambda: ["/usr/bin/agent-worktrees"]
+    )
+    monkeypatch.setattr(
+        embody.subprocess,
+        "run",
+        lambda cmd, **_kwargs: calls.append(cmd)
+        or _completed('{"action":"removed","managed_gc_eligible":false}'),
+    )
+
+    result = embody.conclude_dispatch_attempt(
+        "wt-review",
+        "session-review",
+        "dispatch-task:task-1:1",
+    )
+
+    assert calls[0] == [
+        "/usr/bin/agent-worktrees",
+        "conclude-disposable",
+        "--worktree",
+        "wt-review",
+        "--policy",
+        "dispatch-attempt",
+        "--reservation",
+        "dispatch-task:task-1:1",
+        "--owner",
+        "agent-dispatch",
+        "--remove",
+        "--json",
+        "--session",
+        "session-review",
+    ]
+    assert result["action"] == "removed"
+
+
+def test_conclude_disposable_worker_preservation_skip_is_returned(monkeypatch):
+    monkeypatch.setattr(
+        embody, "_agent_worktrees_launch_prefix", lambda: ["/usr/bin/agent-worktrees"]
+    )
+    monkeypatch.setattr(
+        embody.subprocess,
+        "run",
+        lambda _cmd, **_kwargs: _completed(
+            '{"action":"skipped","managed_gc_eligible":false}'
+        ),
+    )
+
+    result = embody.conclude_disposable_worker("wt-live", "session-live")
+
+    assert result["action"] == "skipped"
+
+
+def test_conclude_disposable_worker_surfaces_managed_removal_failure(monkeypatch):
+    monkeypatch.setattr(
+        embody, "_agent_worktrees_launch_prefix", lambda: ["/usr/bin/agent-worktrees"]
+    )
+    monkeypatch.setattr(
+        embody.subprocess,
+        "run",
+        lambda _cmd, **_kwargs: _completed(
+            '{"error":"worktree became live"}',
+            returncode=1,
+        ),
+    )
+
+    with pytest.raises(
+        embody.DisposableConclusionError,
+        match="worktree became live",
+    ):
+        embody.conclude_disposable_worker("wt-raced", "session-raced")
 
 
 def test_autopilot_prompt_threads_shared_moniker_route():
@@ -81,17 +216,60 @@ def test_autopilot_prompt_carries_explicit_all_repos_claim_mode():
 
 def test_autopilot_prompt_carries_goal_loop_contract():
     prompt = embody.autopilot_worker_prompt("abc123", worker_id="w9")
-    # The seed reads the durable goal + done-criteria + prior progress log and
-    # resumes rather than restarting (the resumable-goal contract).
-    assert "agent-dispatch show abc123" in prompt
-    assert "goal" in prompt.lower()
-    assert "done_criteria" in prompt or "done-criteria" in prompt.lower()
-    assert "progress_log" in prompt
-    assert "resume" in prompt.lower()
-    # An explicit loop: work -> progress -> re-check done-criteria -> repeat.
-    assert "loop" in prompt.lower()
-    # A plain one-shot task (no goal) still behaves as before.
-    assert "one-shot" in prompt.lower()
+    # The seed now points at the charters instead of re-inlining the goal loop.
+    assert "agent-dispatch charter show operating-procedures" in prompt
+    assert "agent-dispatch charter show autopilot" in prompt
+    assert "goal/progress loop" not in prompt.lower()
+    assert "done_criteria" not in prompt
+    assert "progress_log" not in prompt
+    assert "DUPLICATE check" not in prompt
+
+
+def test_autopilot_prompt_concise_pulls_charter_instead_of_inlining_it():
+    from agent_dispatch.worker_charter import AUTOPILOT_CHARTER_NAME, charter_text
+
+    default_prompt = embody.autopilot_worker_prompt("abc123", worker_id="w9")
+    concise_prompt = embody.autopilot_worker_prompt(
+        "abc123", worker_id="w9", concise=True
+    )
+    # Both seeds now point at the charters rather than re-inline policy prose;
+    # the concise form only relaxes the charter read to "only if needed".
+    assert len(concise_prompt) < len(default_prompt)
+    assert "Start by reading this session's worker charters now" in default_prompt
+    assert "If this session has not already read the worker charters" in concise_prompt
+    assert "Otherwise skip this step" in concise_prompt
+    assert "agent-dispatch charter show operating-procedures" in concise_prompt
+    assert f"agent-dispatch charter show {AUTOPILOT_CHARTER_NAME}" in concise_prompt
+    # Still carries the task-specific mechanics a worker needs immediately.
+    assert "abc123" in concise_prompt
+    assert "agent-dispatch show abc123" in concise_prompt
+    assert "agent-dispatch claim --task abc123 --evaluation" in concise_prompt
+    assert "agent-dispatch complete abc123" in concise_prompt
+    # None of the discursive policy prose (now charter-only) leaks in.
+    assert "DUPLICATE check" not in concise_prompt
+    assert "IS-THIS-FOR-ME" not in concise_prompt
+    # The charter itself still documents that same policy prose.
+    charter = charter_text(AUTOPILOT_CHARTER_NAME)
+    assert "contract-net" in charter.lower()
+    assert "DUPLICATE check" in charter
+
+
+def test_autopilot_prompt_concise_respects_route_and_explicit_identity():
+    prompt = embody.autopilot_worker_prompt(
+        "abc123",
+        worker_id="headless-1234",
+        route=" --shared",
+        explicit_worker_identity=True,
+        concise=True,
+    )
+    assert "agent-dispatch --shared charter show operating-procedures" in prompt
+    assert "agent-dispatch --shared charter show autopilot" in prompt
+    assert "agent-dispatch --shared show abc123" in prompt
+    assert (
+        "agent-dispatch --shared claim --task abc123 --evaluation "
+        "--worker headless-1234" in prompt
+    )
+    assert "http://" not in prompt
 
 
 def test_embody_available_false_without_cli(monkeypatch):
@@ -190,6 +368,385 @@ def test_spawn_embodied_worker_builds_embody_new_command(monkeypatch):
     assert "--verify-timeout" not in cmd
 
 
+def test_spawn_embodied_worker_can_target_existing_worktree(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(
+        embody, "_agent_worktrees_launch_prefix", lambda: ["/usr/bin/agent-worktrees"]
+    )
+    monkeypatch.setattr(embody.subprocess, "run", fake_run)
+
+    embody.spawn_embodied_worker(
+        "task-9", worker_id="embody-1", worktree_id="wt-reviewer",
+    )
+
+    cmd = captured["cmd"]
+    assert "--new" not in cmd
+    assert cmd[cmd.index("--worktree-id") + 1] == "wt-reviewer"
+
+
+def test_create_worktree_returns_id_and_path(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout='{"worktree": {"id": "wt-new", "path": "/tmp/wt-new"}}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        embody, "_agent_worktrees_launch_prefix", lambda: ["/usr/bin/agent-worktrees"]
+    )
+    monkeypatch.setattr(embody.subprocess, "run", fake_run)
+
+    result = embody.create_worktree(
+        project="widgets",
+        interface="acp",
+        task_id="task-1",
+        reservation_key="dispatch-task:task-1:1",
+        attempt=1,
+        driver="agent-dispatch",
+        supervisor="supervisor-1",
+    )
+
+    assert result == {"session": None, "worktree": "wt-new", "path": "/tmp/wt-new"}
+    assert captured["cmd"] == [
+        "/usr/bin/agent-worktrees",
+        "--project",
+        "widgets",
+        "create",
+        "--no-owner",
+        "--origin",
+        "delegate",
+        "--interface",
+        "acp",
+        "--dispatch-task-id",
+        "task-1",
+        "--dispatch-reservation-key",
+        "dispatch-task:task-1:1",
+        "--dispatch-attempt",
+        "1",
+        "--dispatch-driver",
+        "agent-dispatch",
+        "--dispatch-supervisor",
+        "supervisor-1",
+        "--json",
+    ]
+
+
+def test_create_worktree_binds_headless_agent_profile(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout='{"worktree": {"id": "wt-new", "path": "/tmp/wt-new"}}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        embody, "_agent_worktrees_launch_prefix", lambda: ["/usr/bin/agent-worktrees"]
+    )
+    monkeypatch.setattr(embody.subprocess, "run", fake_run)
+
+    embody.create_worktree(
+        project="widgets",
+        interface="acp",
+        task_id="task-1",
+        reservation_key="dispatch-task:task-1:1",
+        attempt=1,
+        driver="agent-dispatch",
+        supervisor="supervisor-1",
+        agent="task-worker",
+    )
+
+    assert captured["cmd"][-2:] == ["--agent", "task-worker"]
+
+
+def test_prepare_reusable_worktree_replaces_confirmed_missing(monkeypatch):
+    monkeypatch.setattr(
+        embody,
+        "resolve_worktree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            embody.WorktreeNotFound("missing")
+        ),
+    )
+    monkeypatch.setattr(
+        embody,
+        "create_worktree",
+        lambda **_kwargs: {
+            "worktree": "wt-fresh",
+            "path": "/tmp/wt-fresh",
+        },
+    )
+
+    prepared = embody.prepare_reusable_worktree(
+        {"id": "task-1", "repo": "example.com/acme/widgets"},
+        {
+            "key": "dispatch-task:task-1:1",
+            "attempt": 1,
+            "worktree": "wt-missing",
+        },
+        interface="acp",
+        driver="agent-dispatch",
+        supervisor="supervisor-1",
+    )
+
+    assert prepared == {
+        "worktree": "wt-fresh",
+        "path": "/tmp/wt-fresh",
+        "created": True,
+        "replaced": True,
+        "ownership": "created",
+    }
+
+
+def test_prepare_reusable_worktree_holds_on_indeterminate_resolution(
+    monkeypatch,
+):
+    created = []
+    monkeypatch.setattr(
+        embody,
+        "resolve_worktree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            embody.EmbodyUnavailable("registry unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        embody,
+        "create_worktree",
+        lambda **_kwargs: created.append(True),
+    )
+
+    with pytest.raises(embody.EmbodyUnavailable, match="registry unavailable"):
+        embody.prepare_reusable_worktree(
+            {"id": "task-1", "repo": "example.com/acme/widgets"},
+            {
+                "key": "dispatch-task:task-1:1",
+                "attempt": 1,
+                "worktree": "wt-unknown",
+            },
+            interface="cli",
+            driver="agent-dispatch",
+            supervisor="supervisor-1",
+        )
+
+    assert created == []
+
+
+def test_resolve_worktree_bypasses_display_cache(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout='{"worktrees":[{"id":"wt-review","path":"/tmp/wt-review"}]}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        embody,
+        "_agent_worktrees_launch_prefix",
+        lambda: ["/usr/bin/agent-worktrees"],
+    )
+    monkeypatch.setattr(embody.subprocess, "run", fake_run)
+
+    resolved = embody.resolve_worktree("wt-review", project="widgets")
+
+    assert resolved == {
+        "worktree": "wt-review",
+        "path": "/tmp/wt-review",
+    }
+    assert captured["cmd"] == [
+        "/usr/bin/agent-worktrees",
+        "--project",
+        "widgets",
+        "list",
+        "--json",
+        "--fresh",
+    ]
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["finalizing", "finalized", "complete", "completed", "orphaned"],
+)
+def test_resolve_worktree_rejects_terminal_checkout(monkeypatch, status):
+    monkeypatch.setattr(
+        embody,
+        "_agent_worktrees_launch_prefix",
+        lambda: ["/usr/bin/agent-worktrees"],
+    )
+    monkeypatch.setattr(
+        embody.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "worktrees": [
+                        {
+                            "id": "wt-finalized",
+                            "path": "/tmp/wt-finalized",
+                            "status": status,
+                        }
+                    ]
+                }
+            ),
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(embody.WorktreeNotFound, match="terminal"):
+        embody.resolve_worktree("wt-finalized", project="widgets")
+
+
+def test_resolve_worktree_accepts_own_dispatch_attempt(monkeypatch):
+    monkeypatch.setattr(
+        embody,
+        "_agent_worktrees_launch_prefix",
+        lambda: ["/usr/bin/agent-worktrees"],
+    )
+    monkeypatch.setattr(
+        embody.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "worktrees": [
+                        {
+                            "id": "wt-mine",
+                            "path": "/tmp/wt-mine",
+                            "dispatch_attempt": {"task_id": "task-1"},
+                        }
+                    ]
+                }
+            ),
+            stderr="",
+        ),
+    )
+
+    resolved = embody.resolve_worktree("wt-mine", project="widgets", task_id="task-1")
+
+    assert resolved == {"worktree": "wt-mine", "path": "/tmp/wt-mine"}
+
+
+def test_resolve_worktree_rejects_worktree_owned_by_different_task(monkeypatch):
+    monkeypatch.setattr(
+        embody,
+        "_agent_worktrees_launch_prefix",
+        lambda: ["/usr/bin/agent-worktrees"],
+    )
+    monkeypatch.setattr(
+        embody.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "worktrees": [
+                        {
+                            "id": "wt-shared",
+                            "path": "/tmp/wt-shared",
+                            "dispatch_attempt": {"task_id": "task-other"},
+                        }
+                    ]
+                }
+            ),
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(embody.WorktreeNotFound, match="now owned by"):
+        embody.resolve_worktree("wt-shared", project="widgets", task_id="task-1")
+
+
+def test_prepare_reusable_worktree_replaces_worktree_owned_by_different_task(
+    monkeypatch,
+):
+    """Live incident: an exclusive lane's carried worktree/session had, in the
+    meantime, become a *different* task's own worktree (its tracking record's
+    ``dispatch_attempt.task_id`` no longer matched) -- every spawn attempt kept
+    retrying that foreign, unresolvable session identically instead of ever
+    recovering. This must be treated exactly like a positively-missing
+    worktree: fall back to creating a fresh one."""
+    monkeypatch.setattr(
+        embody,
+        "resolve_worktree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            embody.WorktreeNotFound(
+                "worktree 'wt-shared' is now attributed to a different task"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        embody,
+        "create_worktree",
+        lambda **_kwargs: {"worktree": "wt-fresh", "path": "/tmp/wt-fresh"},
+    )
+
+    prepared = embody.prepare_reusable_worktree(
+        {"id": "task-1", "repo": "example.com/acme/widgets"},
+        {
+            "key": "dispatch-task:task-1:2",
+            "attempt": 2,
+            "worktree": "wt-shared",
+            "session_handle": "local-body:session-belongs-to-other-task",
+        },
+        interface="acp",
+        driver="agent-dispatch",
+        supervisor="supervisor-1",
+    )
+
+    assert prepared["worktree"] == "wt-fresh"
+    assert prepared["replaced"] is True
+    assert prepared["ownership"] == "created"
+
+
+def test_prepare_reusable_worktree_replaces_finalized_checkout(monkeypatch):
+    monkeypatch.setattr(
+        embody,
+        "resolve_worktree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            embody.WorktreeNotFound("worktree is terminal")
+        ),
+    )
+    monkeypatch.setattr(
+        embody,
+        "create_worktree",
+        lambda **_kwargs: {
+            "worktree": "wt-fresh",
+            "path": "/tmp/wt-fresh",
+        },
+    )
+
+    prepared = embody.prepare_reusable_worktree(
+        {"id": "task-1", "repo": "example.com/acme/widgets"},
+        {
+            "key": "dispatch-task:task-1:2",
+            "attempt": 2,
+            "worktree": "wt-finalized",
+            "session_handle": "local-body:session-unknown",
+        },
+        interface="acp",
+        driver="agent-dispatch",
+        supervisor="supervisor-1",
+    )
+
+    assert prepared["worktree"] == "wt-fresh"
+    assert prepared["replaced"] is True
+    assert prepared["ownership"] == "created"
+
+
 def test_spawn_embodied_worker_passes_verify_timeout(monkeypatch):
     captured = {}
     monkeypatch.setattr(
@@ -278,7 +835,7 @@ def test_fleet_spawn_threads_project_before_embody(monkeypatch):
     captured = {}
     monkeypatch.setattr(embody.shutil, "which", lambda _n: "/usr/bin/ssh")
     monkeypatch.setattr(
-        embody.subprocess, "run",
+        embody, "run_ssh_command",
         lambda cmd, **kw: (captured.__setitem__("cmd", cmd)
                            or types.SimpleNamespace(returncode=0, stdout="{}", stderr="")),
     )
@@ -290,6 +847,101 @@ def test_fleet_spawn_threads_project_before_embody(monkeypatch):
     remote_cmd = captured["cmd"][-1]
     assert "--project test-chamber embody" in remote_cmd
     assert remote_cmd.index("--project") < remote_cmd.index("embody")
+
+
+def test_fleet_headless_ssh_fallback_passes_caller(monkeypatch):
+    """copilot-extensions#2202: the SSH fallback (no local carrier capability)
+    must still stamp --caller, mirroring the primary LocalBridgeRemoteClient
+    path's caller_id=owner just above it -- otherwise a headless fleet body
+    spawned this way has no caller identity for agent-worktrees to classify
+    its worktree (if any) as delegate-owned rather than Picker-visible user."""
+    from agent_dispatch import bridge_remote
+
+    class _UnavailableClient:
+        def create_session(self, *args, **kwargs):
+            raise bridge_remote.RemoteBridgeUnavailable("no local carrier")
+
+    monkeypatch.setattr(
+        embody.bridge_remote, "LocalBridgeRemoteClient", _UnavailableClient
+    )
+    monkeypatch.setattr(embody.shutil, "which", lambda _n: "/usr/bin/ssh")
+    captured = {}
+    monkeypatch.setattr(
+        embody, "run_ssh_command",
+        lambda cmd, **kw: (captured.__setitem__("cmd", cmd)
+                           or subprocess.CompletedProcess(cmd, 0, "", "")),
+    )
+
+    embody.spawn_fleet_headless_worker(
+        "pool-a", "t1", origin="coord", owner="fleet-t1-abc",
+        worker_id="fleet-t1-abc",
+    )
+
+    remote_cmd = captured["cmd"][-1]
+    assert "--caller fleet-t1-abc" in remote_cmd
+
+
+def test_fleet_headless_falls_back_to_ssh_on_far_side_426(monkeypatch):
+    """A far-side carrier still on the old REMOTE_OPERATION_VERSION rejects a
+    chartered request with 426 unsupported_version, even though the LOCAL
+    daemon's own capability gate already passed -- this must fall through to
+    the SSH create --charter fallback (which independently supports charter
+    once deployed) rather than failing the spawn outright."""
+    from agent_dispatch import bridge_remote
+
+    class _RejectingClient:
+        def create_session(self, *args, **kwargs):
+            raise bridge_remote.RemoteBridgeOperationError(
+                "remote operation version is not supported",
+                status=426,
+                code="unsupported_version",
+            )
+
+    monkeypatch.setattr(
+        embody.bridge_remote, "LocalBridgeRemoteClient", _RejectingClient
+    )
+    monkeypatch.setattr(embody.shutil, "which", lambda _n: "/usr/bin/ssh")
+    captured = {}
+    monkeypatch.setattr(
+        embody, "run_ssh_command",
+        lambda cmd, **kw: (captured.__setitem__("cmd", cmd)
+                           or subprocess.CompletedProcess(cmd, 0, "", "")),
+    )
+
+    result = embody.spawn_fleet_headless_worker(
+        "pool-a", "t1", origin="coord", owner="fleet-t1-abc",
+        worker_id="fleet-t1-abc", charter="cab-charter",
+    )
+
+    assert result.returncode == 0
+    remote_cmd = captured["cmd"][-1]
+    assert "--charter cab-charter" in remote_cmd
+
+
+def test_fleet_headless_426_without_charter_fails_outright(monkeypatch):
+    """A 426 unrelated to a charter request (no charter was even sent) is a
+    real capability mismatch, not the specific carrier-skew case the SSH
+    fallback exists for -- it must still fail rather than silently retry."""
+    from agent_dispatch import bridge_remote
+
+    class _RejectingClient:
+        def create_session(self, *args, **kwargs):
+            raise bridge_remote.RemoteBridgeOperationError(
+                "remote operation version is not supported",
+                status=426,
+                code="unsupported_version",
+            )
+
+    monkeypatch.setattr(
+        embody.bridge_remote, "LocalBridgeRemoteClient", _RejectingClient
+    )
+
+    result = embody.spawn_fleet_headless_worker(
+        "pool-a", "t1", origin="coord", owner="fleet-t1-abc",
+        worker_id="fleet-t1-abc",
+    )
+
+    assert result.returncode == 1
 
 
 def test_spawn_worker_for_uses_embody_backend(monkeypatch):
@@ -316,7 +968,7 @@ def test_spawn_worker_for_uses_embody_backend(monkeypatch):
     assert calls["route"] == ""  # default local discovery, no baked endpoint
 
 
-def test_spawn_worker_for_embody_degrades_to_bridge(monkeypatch):
+def test_spawn_worker_for_embody_degrades_to_bridge(monkeypatch, capsys):
     """When agent-worktrees is absent, the embody backend falls back to bridge."""
     from agent_dispatch import __main__ as m
     from agent_dispatch import bridge
@@ -338,6 +990,11 @@ def test_spawn_worker_for_embody_degrades_to_bridge(monkeypatch):
     )
     m._do_spawn(args, {"id": "T8"})
     assert bridge_calls["task_id"] == "T8"
+    # The degraded fallback must be loud about what it drops (WARNING), never
+    # a silent downgrade of the evaluation/duplicate-check guardrails.
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "contract-net evaluation" in err
 
 
 # -- remote registered-agent probe (fleet preflight) -------------------------
@@ -367,9 +1024,140 @@ def test_remote_registered_agent_names_parses_over_ssh(monkeypatch):
         )
 
     monkeypatch.setattr(embody.shutil, "which", lambda _n: "/usr/bin/ssh")
-    monkeypatch.setattr(embody.subprocess, "run", fake_run)
+    monkeypatch.setattr(embody, "run_ssh_command", fake_run)
     assert embody.remote_registered_agent_names("Pool-A") == {"sweep-worker"}
     # SSH to the lower-cased alias, running the JSON agents listing.
     assert seen["cmd"][0] == "/usr/bin/ssh"
     assert "pool-a" in seen["cmd"]
     assert seen["cmd"][-1] == "agent-bridge --json agents"
+
+
+def test_remote_registered_agent_record_uses_hidden_lookup_flag(monkeypatch):
+    from agent_dispatch import bridge
+
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(
+            cmd, 0, '{"name":"task-worker","managed":false}', ""
+        )
+
+    monkeypatch.setattr(embody.shutil, "which", lambda _n: "/usr/bin/ssh")
+    monkeypatch.setattr(embody, "run_ssh_command", fake_run)
+
+    record = embody.remote_registered_agent_record("Pool-A", "task-worker")
+
+    assert record == {"name": "task-worker", "managed": False}
+    assert seen["cmd"][-1] == (
+        "agent-bridge --json agent-show task-worker --include-unaddressable"
+    )
+    assert bridge._AGENT_NOT_FOUND is not record
+
+
+def test_spawn_embodied_worker_scrubs_env(monkeypatch):
+    """Every direct agent-worktrees spawn must pass an explicitly scrubbed
+    environment, not inherit agent-dispatch's ambient one verbatim (the class
+    of leak already fixed for peer-plugin delegation in peer_launch.py)."""
+    sentinel = {"SCRUBBED": "1"}
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(
+        embody, "_agent_worktrees_launch_prefix", lambda: ["/usr/bin/agent-worktrees"]
+    )
+    monkeypatch.setattr(embody, "agent_worktrees_environment", lambda: sentinel)
+    monkeypatch.setattr(embody.subprocess, "run", fake_run)
+
+    embody.spawn_embodied_worker("task-9", worker_id="embody-1")
+    assert captured["env"] is sentinel
+
+
+def test_create_worktree_scrubs_env(monkeypatch):
+    sentinel = {"SCRUBBED": "1"}
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout='{"worktree": {"id": "wt-new", "path": "/tmp/wt-new"}}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        embody, "_agent_worktrees_launch_prefix", lambda: ["/usr/bin/agent-worktrees"]
+    )
+    monkeypatch.setattr(embody, "agent_worktrees_environment", lambda: sentinel)
+    monkeypatch.setattr(embody.subprocess, "run", fake_run)
+
+    embody.create_worktree(
+        project="widgets",
+        interface="acp",
+        task_id="task-1",
+        reservation_key="dispatch-task:task-1:1",
+        attempt=1,
+        driver="agent-dispatch",
+        supervisor="supervisor-1",
+    )
+    assert captured["env"] is sentinel
+
+
+def test_resolve_worktree_scrubs_env(monkeypatch):
+    sentinel = {"SCRUBBED": "1"}
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return types.SimpleNamespace(
+            returncode=0, stdout='{"worktrees": []}', stderr=""
+        )
+
+    monkeypatch.setattr(
+        embody, "_agent_worktrees_launch_prefix", lambda: ["/usr/bin/agent-worktrees"]
+    )
+    monkeypatch.setattr(embody, "agent_worktrees_environment", lambda: sentinel)
+    monkeypatch.setattr(embody.subprocess, "run", fake_run)
+
+    with pytest.raises(embody.WorktreeNotFound):
+        embody.resolve_worktree("wt-1")
+    assert captured["env"] is sentinel
+
+
+def test_conclude_disposable_worker_scrubs_env(monkeypatch):
+    sentinel = {"SCRUBBED": "1"}
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(
+        embody, "_agent_worktrees_launch_prefix", lambda: ["/usr/bin/agent-worktrees"]
+    )
+    monkeypatch.setattr(embody, "agent_worktrees_environment", lambda: sentinel)
+    monkeypatch.setattr(embody.subprocess, "run", fake_run)
+
+    embody.conclude_disposable_worker("wt-1", "session-1")
+    assert captured["env"] is sentinel
+
+
+def test_conclude_dispatch_attempt_scrubs_env(monkeypatch):
+    sentinel = {"SCRUBBED": "1"}
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(
+        embody, "_agent_worktrees_launch_prefix", lambda: ["/usr/bin/agent-worktrees"]
+    )
+    monkeypatch.setattr(embody, "agent_worktrees_environment", lambda: sentinel)
+    monkeypatch.setattr(embody.subprocess, "run", fake_run)
+
+    embody.conclude_dispatch_attempt("wt-1", "session-1", "dispatch-task:task-1:1")
+    assert captured["env"] is sentinel

@@ -82,6 +82,40 @@ def test_list_local_body_sessions_degrades_when_passive_probe_detaches(monkeypat
     assert tracking.list_local_body_sessions() == []
 
 
+def test_list_local_body_sessions_default_ensures_daemon(monkeypatch):
+    monkeypatch.setattr(
+        tracking, "agent_bridge_launch_prefix", lambda: ["python", "-m", "agent_bridge"]
+    )
+    captured = {}
+
+    def fake_run_capture(argv, *, timeout, env=None):
+        captured["env"] = env
+        return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(tracking, "_run_capture", fake_run_capture)
+    tracking.list_local_body_sessions()
+    # Default behavior is unchanged: no special env override, so the
+    # subprocess inherits ambient environment (including whatever ensures
+    # the daemon per agent-bridge's own default).
+    assert captured["env"] is None
+
+
+def test_list_local_body_sessions_ensure_daemon_false_disables_boot(monkeypatch):
+    monkeypatch.setattr(
+        tracking, "agent_bridge_launch_prefix", lambda: ["python", "-m", "agent_bridge"]
+    )
+    captured = {}
+
+    def fake_run_capture(argv, *, timeout, env=None):
+        captured["env"] = env
+        return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(tracking, "_run_capture", fake_run_capture)
+    tracking.list_local_body_sessions(ensure_daemon=False)
+    assert captured["env"] is not None
+    assert captured["env"].get("AGENT_BRIDGE_NO_ENSURE") == "1"
+
+
 def test_enrich_local_body_tasks_ignores_nonlocal_handles(monkeypatch):
     monkeypatch.setattr(
         tracking,
@@ -100,7 +134,7 @@ def test_enrich_local_body_tasks_ignores_nonlocal_handles(monkeypatch):
 def test_resolve_live_session_shells_bridge_json_resolve(monkeypatch):
     captured = {}
 
-    def fake_run(cmd, *, timeout):
+    def fake_run(cmd, *, timeout, env=None):
         captured["cmd"] = cmd
         captured["timeout"] = timeout
         return types.SimpleNamespace(
@@ -213,7 +247,7 @@ def test_machine_from_owner_parses_and_handles_malformed():
 
 def test_remote_resolve_argv_shells_ssh_to_the_owner_machine(monkeypatch):
     monkeypatch.setattr(tracking.shutil, "which", lambda _n: "/usr/bin/ssh")
-    argv = tracking._bridge_resolve_argv("wt-x", machine="emancipation-cube")
+    argv = tracking._bridge_resolve_argv("wt-x", machine="  Emancipation-Cube  ")
     assert argv is not None
     assert argv[0] == "/usr/bin/ssh"
     assert "emancipation-cube" in argv
@@ -233,6 +267,13 @@ def test_resolve_live_session_runs_over_ssh_for_remote_owner(monkeypatch):
     captured = {}
 
     monkeypatch.setattr(tracking.shutil, "which", lambda _n: "/usr/bin/ssh")
+    monkeypatch.setattr(
+        tracking.bridge_remote.LocalBridgeRemoteClient,
+        "resolve_live_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            tracking.bridge_remote.RemoteBridgeUnavailable("not installed")
+        ),
+    )
 
     def fake_run(cmd, *, timeout):
         captured["cmd"] = cmd
@@ -243,13 +284,185 @@ def test_resolve_live_session_runs_over_ssh_for_remote_owner(monkeypatch):
             stderr="",
         )
 
-    monkeypatch.setattr(tracking, "run_background_capture", fake_run)
+    monkeypatch.setattr(tracking, "run_ssh_capture", fake_run)
 
-    got = tracking.resolve_live_session("wt-x", machine="emancipation-cube")
+    got = tracking.resolve_live_session("wt-x", machine="  Emancipation-Cube  ")
     assert got == {"session_id": "s-remote", "worktree_id": "wt-x"}
     assert captured["cmd"][0] == "/usr/bin/ssh"
     assert "emancipation-cube" in captured["cmd"]
     assert captured["timeout"] == 6.0
+
+
+def _reset_satellite_cache(monkeypatch):
+    monkeypatch.setattr(tracking, "_satellite_cache", None)
+    monkeypatch.setattr(tracking, "_satellite_cache_at", 0.0)
+
+
+def test_satellite_roster_empty_without_shared_url(monkeypatch):
+    from agent_dispatch import config
+
+    _reset_satellite_cache(monkeypatch)
+    monkeypatch.setattr(config, "shared_url", lambda: None)
+    assert tracking._satellite_roster() == {}
+
+
+def test_satellite_roster_reads_directory_over_hosted_rendezvous(monkeypatch):
+    from agent_dispatch import config, federation_runner
+
+    _reset_satellite_cache(monkeypatch)
+    monkeypatch.setattr(config, "shared_url", lambda: "https://gw.example/dispatch")
+
+    class _FakeRendezvous:
+        def discover_peers(self, *, role=None):
+            assert role == "satellite"
+            return [{"instance": "book2", "machine": "Book2", "status": {}}]
+
+    monkeypatch.setattr(federation_runner, "hosted_rendezvous", lambda: _FakeRendezvous())
+    roster = tracking._satellite_roster()
+    assert set(roster) == {"book2"}
+
+
+def test_satellite_roster_degrades_on_directory_error(monkeypatch):
+    from agent_dispatch import config, federation_runner
+
+    _reset_satellite_cache(monkeypatch)
+    monkeypatch.setattr(config, "shared_url", lambda: "https://gw.example/dispatch")
+
+    def boom():
+        raise RuntimeError("directory unreachable")
+
+    monkeypatch.setattr(federation_runner, "hosted_rendezvous", boom)
+    assert tracking._satellite_roster() == {}
+
+
+def test_satellite_roster_caches_within_ttl(monkeypatch):
+    from agent_dispatch import config, federation_runner
+
+    _reset_satellite_cache(monkeypatch)
+    monkeypatch.setattr(config, "shared_url", lambda: "https://gw.example/dispatch")
+    calls = []
+
+    class _FakeRendezvous:
+        def discover_peers(self, *, role=None):
+            calls.append(1)
+            return [{"instance": "book2", "status": {}}]
+
+    monkeypatch.setattr(federation_runner, "hosted_rendezvous", lambda: _FakeRendezvous())
+    tracking._satellite_roster()
+    tracking._satellite_roster()
+    assert len(calls) == 1  # second call hit the cache, not the directory again
+
+
+def test_resolve_live_session_satellite_uses_pushed_status(monkeypatch):
+    # A registered role=satellite owner opens no inbound listener -- resolve
+    # from its pushed directory status instead of ever touching SSH/the
+    # carrier (see the `satellite-agent-exposure` effort's Design item D).
+    monkeypatch.setattr(
+        tracking,
+        "_satellite_roster",
+        lambda: {
+            "book2": {"status": {"wt-x": {"session_id": "s-sat", "worktree_id": "wt-x"}}}
+        },
+    )
+    monkeypatch.setattr(
+        tracking.shutil,
+        "which",
+        lambda _name: pytest.fail("a satellite resolve must never touch ssh"),
+    )
+    monkeypatch.setattr(
+        tracking.bridge_remote.LocalBridgeRemoteClient,
+        "resolve_live_session",
+        lambda *_a, **_k: pytest.fail("a satellite resolve must never use the carrier"),
+    )
+
+    got = tracking.resolve_live_session("wt-x", machine="book2")
+    assert got == {"session_id": "s-sat", "worktree_id": "wt-x"}
+
+
+def test_resolve_live_session_satellite_missing_worktree_is_none(monkeypatch):
+    # Registered as a satellite, but this particular worktree isn't in its
+    # pushed status (not currently embodied there) -> no overlay, not a fall
+    # through to SSH (which would only ever time out for a no-inbound leaf).
+    monkeypatch.setattr(
+        tracking, "_satellite_roster", lambda: {"book2": {"status": {}}}
+    )
+    monkeypatch.setattr(
+        tracking.shutil,
+        "which",
+        lambda _name: pytest.fail("a satellite resolve must never touch ssh"),
+    )
+    assert tracking.resolve_live_session("wt-x", machine="book2") is None
+
+
+def test_resolve_live_session_non_satellite_falls_through_to_ssh(monkeypatch):
+    # An ordinary (non-satellite) remote owner is unaffected: an empty
+    # roster is a fast no-op and the pre-existing SSH-back path still runs.
+    monkeypatch.setattr(tracking, "_satellite_roster", lambda: {})
+    monkeypatch.setattr(tracking.shutil, "which", lambda _n: "/usr/bin/ssh")
+    monkeypatch.setattr(
+        tracking.bridge_remote.LocalBridgeRemoteClient,
+        "resolve_live_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            tracking.bridge_remote.RemoteBridgeUnavailable("not installed")
+        ),
+    )
+    monkeypatch.setattr(
+        tracking,
+        "run_ssh_capture",
+        lambda *_a, **_k: types.SimpleNamespace(
+            returncode=0, stdout=json.dumps({"session_id": "s-peer"}), stderr=""
+        ),
+    )
+    assert tracking.resolve_live_session("wt-x", machine="peer-box") == {
+        "session_id": "s-peer"
+    }
+
+
+def test_resolve_live_session_uses_carrier_without_ssh(monkeypatch):
+    calls = {}
+
+    def resolve(_self, host, target, **kwargs):
+        calls.update(host=host, target=target, **kwargs)
+        return {"session_id": "s-remote", "worktree_id": target}
+
+    monkeypatch.setattr(
+        tracking.bridge_remote.LocalBridgeRemoteClient,
+        "resolve_live_session",
+        resolve,
+    )
+    monkeypatch.setattr(
+        tracking.shutil,
+        "which",
+        lambda _name: pytest.fail("carrier-backed resolve must not use ssh"),
+    )
+
+    got = tracking.resolve_live_session(
+        "wt-x", machine="  Emancipation-Cube  "
+    )
+    assert got == {"session_id": "s-remote", "worktree_id": "wt-x"}
+    assert calls == {
+        "host": "emancipation-cube",
+        "target": "wt-x",
+        "timeout": 6.0,
+    }
+
+
+@pytest.mark.parametrize("payload", [{}, []])
+def test_resolve_live_session_rejects_invalid_carrier_payload(monkeypatch, payload):
+    monkeypatch.setattr(
+        tracking.bridge_remote.LocalBridgeRemoteClient,
+        "resolve_live_session",
+        lambda *_args, **_kwargs: payload,
+    )
+    monkeypatch.setattr(
+        tracking.shutil,
+        "which",
+        lambda _name: pytest.fail("invalid carrier response must not use ssh"),
+    )
+
+    assert (
+        tracking.resolve_live_session("wt-x", machine="emancipation-cube") is None
+    )
 
 
 def test_enrich_task_resolves_remote_owner_over_mesh(monkeypatch):
@@ -276,9 +489,31 @@ def test_enrich_task_resolves_remote_owner_over_mesh(monkeypatch):
     assert out["embodiment"]["turn_state"] == "running"
 
 
-def test_enrich_task_remote_degrades_without_ssh(monkeypatch):
+def test_enrich_task_remote_uses_carrier_without_ssh(monkeypatch):
     monkeypatch.setattr(tracking.remote_dispatch, "local_machine", lambda: "anomalous-potato")
     monkeypatch.setattr(tracking.remote_dispatch, "ssh_available", lambda: False)
+    monkeypatch.setattr(
+        tracking.bridge_remote.LocalBridgeRemoteClient,
+        "resolve_live_session",
+        lambda _self, _host, target, **_kwargs: {
+            "session_id": "s-remote",
+            "worktree_id": target,
+        },
+    )
+    task = {"id": "t1", "status": "started", "owner": "emancipation-cube/wt-x"}
+    assert tracking.enrich_task(task)["embodiment"]["session_id"] == "s-remote"
+
+
+def test_enrich_task_remote_degrades_when_carrier_and_ssh_absent(monkeypatch):
+    monkeypatch.setattr(tracking.remote_dispatch, "local_machine", lambda: "anomalous-potato")
+    monkeypatch.setattr(tracking.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        tracking.bridge_remote.LocalBridgeRemoteClient,
+        "resolve_live_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            tracking.bridge_remote.RemoteBridgeUnavailable("not installed")
+        ),
+    )
     task = {"id": "t1", "status": "started", "owner": "emancipation-cube/wt-x"}
     assert tracking.enrich_task(task) is task
 
@@ -308,7 +543,7 @@ def test_enrich_tasks_skips_bridge_probe_when_none_leased(monkeypatch):
     monkeypatch.setattr(tracking, "bridge_available", fake_available)
     tasks = [
         {"id": "a", "status": "queued", "owner": None},
-        {"id": "b", "status": "completed", "owner": "m/wt"},
+        {"id": "b", "status": "submitted", "owner": "m/wt"},
     ]
     out = tracking.enrich_tasks(tasks)
     assert out is tasks
@@ -342,16 +577,12 @@ def test_enrich_tasks_probes_once_for_a_batch(monkeypatch):
 
 
 def test_enrich_tasks_hoists_probes_and_mixes_local_and_remote(monkeypatch):
-    # A batch with a local-owner and a remote-owner task: each probe runs once,
+    # A batch with a local-owner and a remote-owner task: shared probes run once,
     # and each task resolves against the correct machine (Phase 8 Slice 8b).
-    probes = {"bridge": 0, "ssh": 0, "local": 0}
+    probes = {"bridge": 0, "local": 0}
 
     def fake_bridge():
         probes["bridge"] += 1
-        return True
-
-    def fake_ssh():
-        probes["ssh"] += 1
         return True
 
     def fake_local():
@@ -359,7 +590,6 @@ def test_enrich_tasks_hoists_probes_and_mixes_local_and_remote(monkeypatch):
         return "anomalous-potato"
 
     monkeypatch.setattr(tracking, "bridge_available", fake_bridge)
-    monkeypatch.setattr(tracking.remote_dispatch, "ssh_available", fake_ssh)
     monkeypatch.setattr(tracking.remote_dispatch, "local_machine", fake_local)
 
     resolved = []
@@ -376,7 +606,7 @@ def test_enrich_tasks_hoists_probes_and_mixes_local_and_remote(monkeypatch):
     ]
     out = tracking.enrich_tasks(tasks)
 
-    assert probes == {"bridge": 1, "ssh": 1, "local": 1}
+    assert probes == {"bridge": 1, "local": 1}
     assert ("wt-local", None) in resolved  # local owner -> local bridge
     assert ("wt-remote", "emancipation-cube") in resolved  # remote owner -> mesh
     assert out[0]["embodiment"]["session_id"] == "s-wt-local"
@@ -452,3 +682,34 @@ def test_enrich_tasks_within_budget_enriches_all(monkeypatch):
     assert all("embodiment" in t for t in out)
     passthrough = tracking.enrich_tasks([{"id": "q", "status": "queued"}])
     assert "embodiment" not in passthrough[0]
+
+
+def test_session_activity_reports_explicit_idle():
+    assert tracking.session_activity(
+        {"status": "running", "liveness": "idle", "turn_state": "idle"}
+    ) == "IDLE"
+
+
+def test_session_activity_reports_idle_status_without_liveness_fields():
+    assert tracking.session_activity({"status": "idle"}) == "IDLE"
+
+
+def test_session_activity_does_not_report_disconnected_as_active():
+    # A "disconnected" liveness means the transport is down (agent-bridge's
+    # own vocabulary: "DISCONNECTED - transport down"); a running/starting
+    # status with a dead transport must not be reported as ACTIVE.
+    assert tracking.session_activity(
+        {"status": "running", "liveness": "disconnected"}
+    ) is None
+    assert tracking.session_activity(
+        {"status": "starting", "liveness": "disconnected"}
+    ) is None
+
+
+def test_session_activity_disconnected_beats_a_lingering_running_turn_state():
+    # A dead transport can still carry a stale turn_state=="running" from
+    # before it dropped -- the earlier liveness=="active"-or-turn_state==
+    # "running" shortcut must not resurrect it as ACTIVE either.
+    assert tracking.session_activity(
+        {"status": "running", "liveness": "disconnected", "turn_state": "running"}
+    ) is None

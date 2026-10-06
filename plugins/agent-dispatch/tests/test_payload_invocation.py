@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -48,15 +49,24 @@ def test_session_catalog_hook_is_payload_root_aware_and_fail_open() -> None:
         and "COPILOT_PLUGIN_ROOT" in hook["powershell"]
         for hook in session_hooks
     )
-    catalog_hooks = [
+    # The command catalog is no longer emitted directly by a sessionStart
+    # hook; the output-free write-session-guidance writer composes
+    # emit-command-catalog internally and writes it into the exact-session
+    # guidance file instead (see write_session_guidance.py).
+    writer_hooks = [
         hook
         for hook in session_hooks
-        if "emit-command-catalog" in hook["bash"]
-        and "emit-command-catalog" in hook["powershell"]
+        if "write-session-guidance" in hook["bash"]
+        and "write-session-guidance" in hook["powershell"]
     ]
-    assert len(catalog_hooks) == 1
-    assert "else printf '{}'" in catalog_hooks[0]["bash"]
-    assert "else { [Console]::Out.Write('{}') }" in catalog_hooks[0]["powershell"]
+    assert len(writer_hooks) == 1
+    assert "else printf '{}'" in writer_hooks[0]["bash"]
+    assert "else { [Console]::Out.Write('{}') }" in writer_hooks[0]["powershell"]
+
+    writer = (PLUGIN / "scripts" / "write_session_guidance.py").read_text(
+        encoding="utf-8"
+    )
+    assert "emit-command-catalog" in writer
 
     powershell_catalog = (
         PLUGIN / "scripts" / "emit-command-catalog.ps1"
@@ -152,6 +162,53 @@ def test_windows_catalog_cmd_preserves_native_stdin(tmp_path: Path) -> None:
     comspec = os.environ.get("COMSPEC", "cmd.exe")
     env = {
         **os.environ,
+        "PATH": str(Path(comspec).parent),
+    }
+    result = subprocess.run(
+        [comspec, "/d", "/s", "/c", str(cmd), "payload", "--file", "prompt.txt"],
+        input="task body",
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "payload|--file|prompt.txt::task body"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows CMD test")
+def test_installed_cmd_template_uses_system_powershell_fallback(
+    tmp_path: Path,
+) -> None:
+    installer = (PLUGIN / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    match = re.search(
+        r"\$stubContent = @'\r?\n(?P<body>@echo off.*?exit /b %ERRORLEVEL%)\r?\n'@",
+        installer,
+        re.DOTALL,
+    )
+    assert match, "installed agent-dispatch.cmd template not found"
+    stub = match.group("body")
+    assert r"%SystemRoot%\System32\where.exe" in stub
+    assert (
+        r"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" in stub
+    )
+    assert "else (powershell " not in stub
+
+    home = tmp_path / "home"
+    bin_dir = home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    cmd = bin_dir / "agent-dispatch.cmd"
+    cmd.write_text(stub, encoding="utf-8")
+    (bin_dir / "agent-dispatch.ps1").write_text(
+        "$body = [Console]::In.ReadToEnd()\n"
+        "[Console]::Out.Write(($args -join '|') + '::' + $body)\n",
+        encoding="utf-8",
+    )
+
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    env = {
+        **os.environ,
+        "USERPROFILE": str(home),
         "PATH": str(Path(comspec).parent),
     }
     result = subprocess.run(

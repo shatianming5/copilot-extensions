@@ -47,6 +47,17 @@ MACHINE_HEADER = "x-agent-machine"
 WORKTREE_HEADER = "x-agent-worktree"
 REPO_HEADER = "x-agent-repo"
 
+#: Mirrors ``coordinator_tasks.py``'s own ``_NO_TELEMETRY_EVENT_TYPES``:
+#: event types that run periodically for every live task without ever
+#: transitioning its state -- excluded from this transport's own ``_emit``
+#: telemetry side effect so a configured spool doesn't accumulate
+#: misleading high-volume ``kind: state_transition`` records for them. The
+#: bus publish (the actual wake every ``--subscribe`` relay/poller needs)
+#: still fires unconditionally. (``mcp_http.py`` only has the heartbeat
+#: tool, not a periodic activity-update one, so this set is narrower than
+#: the HTTP transport's own.)
+_NO_TELEMETRY_EVENT_TYPES = frozenset({"task.heartbeat"})
+
 
 def _bearer_credential(authorization: str) -> str | None:
     parts = authorization.split(None, 1)
@@ -113,7 +124,10 @@ def build_coordinator_mcp(
         event_task = _event_task_dict(task)
         bus.publish({"type": event_type, "task": event_task})
         # Generic telemetry seam (no-op unless a consumer registered a sink).
-        telemetry.emit(telemetry.task_lifecycle_event(event_type, event_task))
+        # Skip it for periodic, non-state-transition event types (e.g. a
+        # heartbeat lease extension) -- see `_NO_TELEMETRY_EVENT_TYPES`.
+        if event_type not in _NO_TELEMETRY_EVENT_TYPES:
+            telemetry.emit(telemetry.task_lifecycle_event(event_type, event_task))
 
     def _emit_producer_event(event_type: str, detail: dict[str, object]) -> None:
         bus.publish({"type": event_type, "producer_fence": detail})
@@ -153,6 +167,15 @@ def build_coordinator_mcp(
             result = asdict(mutation)
         except TaskError as exc:
             return {"error": str(exc)}
+        if event_type in ("task.submitted", "task.completed", "task.abandoned"):
+            # Shared terminal-transition hook, mirroring coordinator_tasks.py's
+            # own _guard: MCP calls queue.complete_with_outcome/abandon
+            # directly (in-process), bypassing the HTTP routes entirely, so
+            # that hook alone doesn't cover this transport -- this is the
+            # matching one for MCP callers.
+            from . import handoff_claim_release
+
+            handoff_claim_release.release_if_handoff(result)
         if event_type is not None:
             _emit(event_type, result)
         return result
@@ -193,6 +216,9 @@ def build_coordinator_mcp(
         source: str | None = None,
         origin_ref: str | None = None,
         evaluator_ref: str | None = None,
+        require_verification: bool = False,
+        exclusive_key: str | None = None,
+        supersede_exclusive_key: bool = False,
         dedup_key: str | None = None,
         producer_scope: dict[str, str] | None = None,
         producer_id: str | None = None,
@@ -237,6 +263,9 @@ def build_coordinator_mcp(
                 source=source,
                 origin_ref=origin_ref,
                 evaluator_ref=evaluator_ref,
+                require_verification=require_verification,
+                exclusive_key=exclusive_key,
+                supersede_exclusive_key=supersede_exclusive_key,
                 dedup_key=dedup_key,
                 producer_scope=producer_scope,
                 producer_id=producer_id,
@@ -260,6 +289,8 @@ def build_coordinator_mcp(
                 "task.create_rejected", exc.event(operation="create")
             )
             return {"error": detail}
+        except TaskError as exc:
+            return {"error": str(exc)}
         result = asdict(outcome.task)
         if outcome.event_type is not None:
             _emit(outcome.event_type, result)
@@ -765,14 +796,16 @@ def build_coordinator_mcp(
     ) -> dict:
         """Terminally abandon a task -- requires ``permit=True`` (permission-gated)."""
         return _mutate(
-            lambda: queue.abandon(task_id, worker_id=worker_id, permitted=permit, reason=reason),
-            "task.abandoned",
+            lambda: queue.abandon_with_outcome(
+                task_id, worker_id=worker_id, permitted=permit, reason=reason
+            ),
+            None,
         )
 
     @mcp.tool(name="dispatch_heartbeat")
     def heartbeat(task_id: str, worker_id: str) -> dict:
         """Extend the lease on a held task during long work."""
-        return _mutate(lambda: queue.heartbeat(task_id, worker_id), None)
+        return _mutate(lambda: queue.heartbeat(task_id, worker_id), "task.heartbeat")
 
     @mcp.tool(name="dispatch_detach")
     def detach(task_id: str) -> dict:
@@ -783,6 +816,11 @@ def build_coordinator_mcp(
     def recover() -> dict:
         """Force a liveness GC pass (requeue tasks whose owner is confirmed gone)."""
         counts = queue.reconcile_liveness()
+        # Matches the HTTP /recover route's own event: this call bypasses
+        # _mutate entirely (no single task/CompletionOutcome to route
+        # through it), so publish directly -- a content-free wake signal
+        # for the agent-dispatch relay's `--subscribe` fast path.
+        bus.publish({"type": "task.recovered", **counts})
         return {"recovered": counts["requeued"], **counts}
 
     @mcp.tool(name="dispatch_rearm_spawn")

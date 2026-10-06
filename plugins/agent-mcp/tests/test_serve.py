@@ -8,6 +8,7 @@ import pytest
 
 from agent_mcp.client import UpstreamError
 from agent_mcp.config import parse_config
+from agent_mcp.ipc import list_tools_via_socket
 from agent_mcp.serve import (
     _HAS_AF_UNIX,
     Server,
@@ -78,6 +79,73 @@ async def test_warmpool_reuses_one_session():
     finally:
         await pool.close_all()
     assert pool.size == 0
+
+
+async def test_warmpool_cli_bridge_recovers_from_transient_auth_failure(
+    tmp_path, monkeypatch,
+):
+    """A transient CLI-bridge auth failure must not permanently poison the
+    warm-pooled session.
+
+    Regression test: ``CliTransport`` used to compute its spawn environment
+    (including the auth-injected token) once and cache it for the life of the
+    transport object. ``WarmPool`` keeps that same transport alive across
+    many calls over hours (exactly this test's ``pool.call`` reuse), so a
+    one-time hiccup in the auth command (e.g. a cold vault) permanently broke
+    every subsequent call for that bridge until the daemon restarted. The
+    auth command here fails on its first invocation and succeeds afterward;
+    the second ``pool.call`` against the same warm session must receive the
+    token, not the poisoned/ambient environment from the first failure.
+    """
+    # Hermetic: the first call's assertion depends on MY_TOKEN being absent
+    # from the base environment CliTransport merges in.
+    monkeypatch.delenv("MY_TOKEN", raising=False)
+    counter = tmp_path / "invocations"
+    auth_script = tmp_path / "mint_token.py"
+    auth_script.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"counter = Path({str(counter)!r})\n"
+        "n = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "counter.write_text(str(n))\n"
+        "if n == 1:\n"
+        "    sys.exit(1)\n"
+        "print('sekret-456')\n",
+        encoding="utf-8",
+    )
+    tool_md = tmp_path / "whoami.md"
+    mcp = {
+        "name": "whoami",
+        "description": "echo the injected token",
+        "inputSchema": {"type": "object", "properties": {}},
+        "invoke": {
+            "command": sys.executable,
+            "args": ["-c", "import os,sys; "
+                     "sys.stdout.write(os.environ.get('MY_TOKEN', '<unset>'))"],
+        },
+    }
+    tool_md.write_text("---\n" + json.dumps({"mcp": mcp}) + "\n---\n", encoding="utf-8")
+    cfg = _cfg({
+        "server": {"type": "cli", "tools_from": [str(tool_md)]},
+        "auth": {"kind": "command", "command": [sys.executable, str(auth_script)],
+                 "parse": "raw", "target_env": "MY_TOKEN"},
+    })
+
+    pool = WarmPool()
+    try:
+        r1 = await pool.call("k", cfg, "whoami", {})
+        assert pool.size == 1
+        entry = pool._entries["k"]
+        sess1 = entry.session
+        assert r1["content"][0]["text"] == "<unset>"
+
+        r2 = await pool.call("k", cfg, "whoami", {})
+        # Same warm session/transport reused, not reopened.
+        assert pool._entries["k"].session is sess1
+        assert pool.size == 1
+        assert r2["content"][0]["text"] == "sekret-456"
+    finally:
+        await pool.close_all()
 
 
 async def test_warmpool_list():
@@ -174,6 +242,40 @@ async def test_server_roundtrip_over_socket(tmp_path):
         await asyncio.wait_for(task, timeout=5)
     # handle cleaned up on shutdown (socket file on POSIX / endpoint on Windows)
     assert serve_socket_if_available(str(sock)) is None
+
+
+async def test_server_list_op_over_socket_matches_cold_materialize_filtering(tmp_path):
+    """The wire-protocol counterpart of materialize's daemon fast path: a
+    caller sends ``{"op": "list"}`` and gets exactly the same (bridge
+    ``tools:``-filtered) result the cold ``OneShotSession.list_tools()`` path
+    already returns -- consulting a warm daemon must not change *what*
+    materialize projects, only *how fast* it gets there."""
+    sock = tmp_path / "serve.sock"
+    bridge = tmp_path / "echo.mcp.yaml"
+    bridge.write_text(
+        "server:\n  type: stdio\n  command:\n"
+        f"    - {sys.executable}\n    - '-c'\n    - |\n"
+        + "".join("      " + ln + "\n" for ln in _CHILD.splitlines())
+        + "auth:\n  kind: none\ntools:\n  deny: ['echo']\n",
+        encoding="utf-8",
+    )
+    server = Server(sock)
+    task = asyncio.create_task(server.serve_forever())
+    try:
+        for _ in range(50):
+            if serve_socket_if_available(str(sock)):
+                break
+            await asyncio.sleep(0.05)
+        assert serve_socket_if_available(str(sock)) == sock
+
+        resp = await list_tools_via_socket(sock, str(bridge))
+        assert resp["ok"]
+        # The bridge's tools.deny filter is honored, same as a cold
+        # OneShotSession.list_tools() call against this same config would do.
+        assert resp["tools"] == []
+    finally:
+        await request_via_socket(sock, {"op": "shutdown"})
+        await asyncio.wait_for(task, timeout=5)
 
 
 async def test_server_reports_config_error(tmp_path):
@@ -539,3 +641,30 @@ async def test_detach_decrements_refcount_even_if_aclose_raises(tmp_path, monkey
         if not task.done():
             await request_via_socket(sock, {"op": "shutdown"})
             await asyncio.wait_for(task, timeout=5)
+
+
+@pytest.mark.skipif(not _HAS_AF_UNIX, reason="POSIX broken-symlink bind")
+async def test_serve_forever_binds_over_a_broken_symlink(tmp_path):
+    """Regression test: on POSIX the fixed cutover handle is a symlink to a
+    generation-specific socket. If the promoted daemon it pointed at later
+    exits (idle-evicted, crashed) and its generation socket is gone, the
+    fixed handle becomes a *broken* symlink. Path.exists() follows symlinks
+    and returns False for a broken one, so a naive `if path.exists():
+    unlink()` guard would leave the dangling symlink in place and
+    asyncio.start_unix_server() would then fail to bind over it -- wedging
+    respawn. serve_forever() must clear a broken symlink too."""
+    sock = tmp_path / "serve.sock"
+    # A symlink to a target that never existed -- broken by construction.
+    sock.symlink_to(tmp_path / "serve-g-does-not-exist.sock")
+    assert sock.is_symlink()
+    assert not sock.exists()  # confirms it's genuinely broken
+
+    server = Server(sock)
+    task = asyncio.create_task(server.serve_forever())
+    try:
+        await _await_socket(sock)
+        assert not sock.is_symlink(), "bind must replace the broken symlink"
+        assert (await request_via_socket(sock, {"op": "ping"}))["ok"] is True
+    finally:
+        await request_via_socket(sock, {"op": "shutdown"})
+        await asyncio.wait_for(task, timeout=5)

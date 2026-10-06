@@ -1,24 +1,112 @@
-"""Resolve a cmd.exe-free way to invoke this plugin as a module.
-
-On Windows, agent-bridge spawns provider commands via ``cmd.exe /d /s /c``
-whenever the executable is a ``.cmd`` (see
-``agent_bridge.transport._wrap_batch_for_windows``). ``cmd.exe`` expands
-``%VAR%`` tokens in the forwarded arguments -- e.g. inside the wrapped ACP
-command -- which mangles them before the Python CLI ever sees ``argv``. To
-avoid that layer entirely, callers invoke the venv interpreter directly
-with ``-m agent_containers`` rather than the
-``~/.local/bin/agent-containers.cmd`` binstub. ``CreateProcess`` runs the
-signed ``python.exe`` directly (no cmd.exe), so arguments are parsed with
-the same MSVCRT rules the caller used to quote them -- verbatim.
-"""
+"""Resolve payload-local and module launch paths for agent-containers."""
 
 from __future__ import annotations
 
+import json
+import os
 import sys
+from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 _PACKAGE = "agent_containers"
-_ROOT = Path.home() / ".agent-containers"
+_DIST_NAME = "agent-containers"
+
+
+def runtime_root() -> Path:
+    override = os.environ.get("AGENT_CONTAINERS_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    _legacy = ".agent-containers"  # marketplace-isolation: allow legacy compatibility root
+    return Path.home() / _legacy
+
+
+def _deploy_manifest_source_root() -> Path | None:
+    manifest = runtime_root() / "deploy-manifest.json"
+    if not manifest.is_file():
+        return None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+    source_path = str((data or {}).get("source", {}).get("path") or "").strip()
+    if not source_path:
+        return None
+    candidate = Path(source_path).expanduser()
+    if candidate.is_dir() and (candidate / "plugin.json").is_file():
+        return candidate.resolve()
+    return None
+
+
+def _direct_url_source_root() -> Path | None:
+    try:
+        payload_dist = distribution(_DIST_NAME)
+    except PackageNotFoundError:
+        return None
+    try:
+        payload = payload_dist.read_text("direct_url.json")
+    except FileNotFoundError:
+        return None
+    if not payload:
+        return None
+    try:
+        data = json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    url = str((data or {}).get("url") or "").strip()
+    if not url:
+        return None
+    candidate = _path_from_file_url(url)
+    if candidate is None:
+        return None
+    if candidate.is_dir() and (candidate / "plugin.json").is_file():
+        return candidate.resolve()
+    return None
+
+
+def _path_from_file_url(url: str) -> Path | None:
+    parsed = urlparse(url)
+    if parsed.scheme != "file":
+        return None
+    path = url2pathname(parsed.path)
+    if parsed.netloc and parsed.netloc.casefold() != "localhost":
+        return Path(f"//{parsed.netloc}{path}")
+    return Path(path)
+
+
+def payload_root() -> Path:
+    env_payload = os.environ.get("COPILOT_PLUGIN_ROOT", "").strip()
+    if env_payload:
+        candidate = Path(env_payload).expanduser()
+        if candidate.is_dir() and (candidate / "plugin.json").is_file():
+            return candidate.resolve()
+    candidate = Path(__file__).resolve().parents[2]
+    if candidate.is_dir() and (candidate / "plugin.json").is_file():
+        return candidate
+    direct_url_root = _direct_url_source_root()
+    if direct_url_root is not None:
+        return direct_url_root
+    manifest_root = _deploy_manifest_source_root()
+    if manifest_root is not None:
+        return manifest_root
+    return candidate
+
+
+def payload_binstub() -> Path | None:
+    name = "agent-containers.cmd" if sys.platform == "win32" else "agent-containers"
+    shim = payload_root() / "bin" / name
+    return shim if shim.is_file() else None
+
+
+def payload_command_argv() -> list[str]:
+    shim = payload_binstub()
+    if shim is not None:
+        return [str(shim)]
+    return module_argv()
+
+
+_ROOT = runtime_root()
 #: Legacy single-venv layout (pre versioned-runtime). Kept only as a last-resort
 #: fallback -- the versioned-runtime migration stopped updating it, so it goes
 #: stale and must NOT be preferred over the active runtime (dotfiles #1631).
@@ -68,10 +156,11 @@ def _venv_python() -> str:
     legacy = _LEGACY_VENV_DIR / scripts / exe
     if legacy.exists():
         return str(legacy)
+    _root_name = ".agent-containers"  # marketplace-isolation: allow deployed-runtime-diagnostics
     raise RuntimeError(
         "Cannot resolve an agent_containers interpreter: no active versioned "
-        "runtime (~/.agent-containers/current-version -> versions/<ver>), an "
-        "empty sys.executable, and no legacy ~/.agent-containers/.venv."
+        f"runtime (~/{_root_name}/current-version -> versions/<ver>), an "
+        f"empty sys.executable, and no legacy ~/{_root_name}/.venv."
     )
 
 

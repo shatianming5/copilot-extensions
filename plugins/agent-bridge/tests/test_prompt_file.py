@@ -13,6 +13,7 @@ from io import StringIO
 import pytest
 
 import agent_bridge.__main__ as m
+from agent_bridge.client import BridgeClientError
 
 
 def _parse(argv):
@@ -41,10 +42,59 @@ def test_create_accepts_prompt_file():
     assert args.prompt_file == "-"
 
 
+def test_create_accepts_worktree_targeting_flags():
+    args = _parse([
+        "create",
+        "--target-dir",
+        "/tmp/worktree",
+        "--worktree-id",
+        "wt-1",
+        "agent-x",
+        "--prompt-file",
+        "-",
+    ])
+    assert args.target == "agent-x"
+    assert args.target_dir == "/tmp/worktree"
+    assert args.worktree_id == "wt-1"
+
+
 def test_create_allows_no_prompt_at_all():
     args = _parse(["create", "agent-x"])
     assert args.prompt is None
     assert args.prompt_file is None
+
+
+def test_create_accepts_session_id_file():
+    args = _parse(
+        ["create", "agent-x", "--session-id-file", "session-id.txt"]
+    )
+    assert args.session_id_file == "session-id.txt"
+
+
+def test_create_writes_exact_session_id_before_return(
+    tmp_path, monkeypatch
+):
+    class _Client:
+        def get_session(self, _target):
+            raise BridgeClientError(404, "not found")
+
+    output = tmp_path / "session-id"
+    args = _parse(
+        [
+            "--json",
+            "create",
+            "agent-x",
+            "--session-id-file",
+            str(output),
+        ]
+    )
+    monkeypatch.setattr(m, "_get_client", lambda: _Client())
+    monkeypatch.setattr(m, "_resolve_target", lambda *_args, **_kwargs: "sid-123")
+    monkeypatch.setattr(m, "_connection_identity", lambda *_args: {})
+
+    m._cmd_create(args)
+
+    assert output.read_text(encoding="utf-8") == "sid-123\n"
 
 
 # --- _resolve_prompt behavior -----------------------------------------------

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import json
 import os
 import shutil
 import subprocess
@@ -13,6 +15,14 @@ import pytest
 
 from agent_worktrees import __main__ as m
 from agent_worktrees import config as cfg
+from agent_worktrees import copilot_launch_prefs as launch_prefs
+from agent_worktrees import registry_paths
+
+# NOTE: isolation from the real host ~/.copilot/settings.json is handled
+# plugin-wide by conftest.py's `_isolate_copilot_launch_prefs` autouse
+# fixture. Tests below that want to exercise the launch-pref injection
+# explicitly re-monkeypatch `launch_prefs.Path.home` themselves (last write
+# wins within a test).
 
 
 def _config(launch: dict[str, list[str]] | None = None) -> cfg.Config:
@@ -25,20 +35,19 @@ def _config(launch: dict[str, list[str]] | None = None) -> cfg.Config:
     )
 
 
-def _args(
-    copilot_args: list[str],
-    permission_mode: str | None = None,
-) -> argparse.Namespace:
-    return argparse.Namespace(
-        copilot_args=copilot_args,
-        recovery=False,
-        permission_mode=permission_mode,
-    )
+def _args(copilot_args: list[str]) -> argparse.Namespace:
+    return argparse.Namespace(copilot_args=copilot_args, recovery=False)
+
+
+def _inner_command(cmd: list[str]) -> list[str]:
+    """Return the command executed by the installed launch wrapper."""
+    delimiter = cmd.index("--")
+    return cmd[delimiter + 1 :]
 
 
 def test_plain_launch_appends_allow_all():
     cmd = m._build_launch_cmd(_config(), _args([]), "/w/wt")
-    assert cmd[-1] == "--allow-all"
+    assert cmd[-2:] == ["--allow-all", "--experimental"]
 
 
 def test_plain_launch_does_not_append_removed_no_sandbox_flag():
@@ -51,48 +60,128 @@ def test_plain_launch_does_not_append_removed_no_sandbox_flag():
 def test_acp_launch_skips_allow_all():
     cmd = m._build_launch_cmd(_config(), _args(["--acp", "--stdio"]), "/w/wt")
     assert "--allow-all" not in cmd
+    assert "--experimental" in cmd
     # ACP sessions get permissions managed by agent-bridge over the protocol.
     assert "--no-sandbox" not in cmd
+
+
+def test_launch_injects_persisted_model_effort_context_flags(tmp_path, monkeypatch):
+    # Copilot CLI has been observed to ignore persisted settings.json values
+    # at startup (model-policy-launcher gap) -- every launch must carry the
+    # facility's current preference as explicit CLI flags.
+    home = tmp_path / "home"
+    (home / ".copilot").mkdir(parents=True)
+    (home / ".copilot" / "settings.json").write_text(
+        json.dumps(
+            {"model": "claude-sonnet-5", "effortLevel": "medium", "contextTier": "long_context"}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(launch_prefs.Path, "home", classmethod(lambda cls: home))
+    cmd = m._build_launch_cmd(_config(), _args([]), "/w/wt")
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "claude-sonnet-5"
+    assert "--reasoning-effort" in cmd
+    assert cmd[cmd.index("--reasoning-effort") + 1] == "medium"
+    assert "--context" in cmd
+    assert cmd[cmd.index("--context") + 1] == "long_context"
+
+
+def test_launch_never_overrides_explicit_model_flag(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".copilot").mkdir(parents=True)
+    (home / ".copilot" / "settings.json").write_text(
+        json.dumps({"model": "claude-sonnet-5"}), encoding="utf-8"
+    )
+    monkeypatch.setattr(launch_prefs.Path, "home", classmethod(lambda cls: home))
+    cmd = m._build_launch_cmd(_config(), _args(["--model", "gpt-5.4"]), "/w/wt")
+    assert cmd.count("--model") == 1
+    assert cmd[cmd.index("--model") + 1] == "gpt-5.4"
+
+
+def test_launch_never_overrides_flag_embedded_in_configured_template(tmp_path, monkeypatch):
+    # A repo's configured `launch` template may already bake in a flag
+    # directly (not via copilot_args/profile args) -- that must still win
+    # over the ambient settings.json default, and must not be duplicated.
+    home = tmp_path / "home"
+    (home / ".copilot").mkdir(parents=True)
+    (home / ".copilot" / "settings.json").write_text(
+        json.dumps({"model": "claude-sonnet-5"}), encoding="utf-8"
+    )
+    monkeypatch.setattr(launch_prefs.Path, "home", classmethod(lambda cls: home))
+    config = _config(launch={"linux": ["copilot", "--model", "gpt-5.4"]})
+    cmd = m._build_launch_cmd(config, _args([]), "/w/wt")
+    assert cmd.count("--model") == 1
+    assert cmd[cmd.index("--model") + 1] == "gpt-5.4"
+
+
+def test_launch_skips_preference_flags_for_acp_sessions(tmp_path, monkeypatch):
+    # Copilot CLI ignores these flags in ACP mode; agent-bridge's ACP client
+    # carries model/effort through its own configuration path instead, so
+    # injecting them here would be dead weight at best.
+    home = tmp_path / "home"
+    (home / ".copilot").mkdir(parents=True)
+    (home / ".copilot" / "settings.json").write_text(
+        json.dumps(
+            {"model": "claude-sonnet-5", "effortLevel": "medium", "contextTier": "long_context"}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(launch_prefs.Path, "home", classmethod(lambda cls: home))
+    cmd = m._build_launch_cmd(_config(), _args(["--acp", "--stdio"]), "/w/wt")
+    assert "--model" not in cmd
+    assert "--reasoning-effort" not in cmd
+    assert "--context" not in cmd
+
+
+def test_launch_skips_preference_flags_for_template_embedded_acp(tmp_path, monkeypatch):
+    # A configured `launch` template may bake `--acp` in directly rather
+    # than via copilot_args/profile args -- ACP detection must still catch
+    # it, matching the --allow-all suppression's own detection.
+    home = tmp_path / "home"
+    (home / ".copilot").mkdir(parents=True)
+    (home / ".copilot" / "settings.json").write_text(
+        json.dumps({"model": "claude-sonnet-5"}), encoding="utf-8"
+    )
+    monkeypatch.setattr(launch_prefs.Path, "home", classmethod(lambda cls: home))
+    config = _config(launch={"linux": ["copilot", "--acp", "--stdio"]})
+    cmd = m._build_launch_cmd(config, _args([]), "/w/wt")
+    assert "--model" not in cmd
+    assert "--allow-all" not in cmd
+    assert "--experimental" in cmd
+
+
+def test_launch_skips_whitespace_only_persisted_preference(tmp_path, monkeypatch):
+    # A padded/whitespace-only persisted value must never be emitted
+    # verbatim as a CLI argument -- it would break the launch entirely.
+    home = tmp_path / "home"
+    (home / ".copilot").mkdir(parents=True)
+    (home / ".copilot" / "settings.json").write_text(
+        json.dumps({"model": "   ", "effortLevel": " medium "}), encoding="utf-8"
+    )
+    monkeypatch.setattr(launch_prefs.Path, "home", classmethod(lambda cls: home))
+    cmd = m._build_launch_cmd(_config(), _args([]), "/w/wt")
+    assert "--model" not in cmd
+    assert "--reasoning-effort" in cmd
+    assert cmd[cmd.index("--reasoning-effort") + 1] == "medium"
 
 
 def test_existing_all_perm_flag_not_duplicated():
     # --allow-all-tools, --allow-all, and --yolo are each an all-permissions
     # stance the caller already expressed, so we must not append our default
-    # --allow-all on top of any of them.
+    # --allow-all on top of any of them.  --experimental is independent and
+    # still required so SDK extensions load.
     for flag in ("--allow-all-tools", "--allow-all", "--yolo"):
         cmd = m._build_launch_cmd(_config(), _args([flag]), "/w/wt")
         assert "--allow-all" not in [c for c in cmd if c != flag]
         assert cmd.count(flag) == 1
+        assert cmd.count("--experimental") == 1
 
 
-def test_handoff_manual_permission_does_not_add_bypass_flag():
-    cmd = m._build_launch_cmd(
-        _config(),
-        _args(["--allow-all"], permission_mode="manual"),
-        "/w/wt",
-    )
-    assert "--allow-all" not in cmd
-    assert "--assisted-approval" not in cmd
-
-
-def test_handoff_assisted_permission_starts_manual_until_native_restore():
-    cmd = m._build_launch_cmd(
-        _config(),
-        _args(["--allow-all"], permission_mode="assisted"),
-        "/w/wt",
-    )
-    assert "--allow-all" not in cmd
-    assert "--assisted-approval" not in cmd
-
-
-def test_handoff_allow_all_permission_replaces_assisted_flag():
-    cmd = m._build_launch_cmd(
-        _config(),
-        _args(["--assisted-approval"], permission_mode="allow-all"),
-        "/w/wt",
-    )
-    assert cmd.count("--allow-all") == 1
-    assert "--assisted-approval" not in cmd
+def test_existing_experimental_flag_not_duplicated():
+    cmd = m._build_launch_cmd(_config(), _args(["--experimental"]), "/w/wt")
+    assert cmd.count("--experimental") == 1
+    assert "--allow-all" in cmd
 
 
 def test_resume_uses_equals_form():
@@ -103,6 +192,107 @@ def test_resume_uses_equals_form():
     cmd.append(f"--resume={session}")
     assert f"--resume={session}" in cmd
     assert "--resume" not in cmd  # bare flag must not appear separately
+
+
+def test_namespaced_launch_uses_direct_fallback_without_legacy_launcher(
+    monkeypatch, tmp_path
+):
+    cell_runtime = tmp_path / "cell" / "plugins" / "agent-worktrees"
+    cell_runtime.mkdir(parents=True)
+    cfg.set_active_project("example")
+    monkeypatch.setattr(cfg, "detect_platform", lambda: "linux")
+    monkeypatch.setattr(cfg, "install_dir", lambda: tmp_path / "legacy")
+    monkeypatch.setattr(m, "_usable_worktree_manager_launcher_dir", lambda: None)
+    monkeypatch.setattr(
+        registry_paths,
+        "installation_context",
+        lambda: {"pluginRoot": str(cell_runtime)},
+    )
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda **_kwargs: cfg.Config(
+            srcroot=str(tmp_path),
+            machine="test",
+            platform="linux",
+            repo_name="example",
+            repos={
+                "example": cfg.RepoConfig(
+                    anchor=str(tmp_path / "anchor"),
+                    worktree_root=str(tmp_path / "worktrees"),
+                )
+            },
+        ),
+    )
+    resolve_calls = []
+    child = {}
+    post_exit = []
+
+    def fake_run(argv, **kwargs):
+        if "resolve" in argv:
+            resolve_calls.append((list(argv), kwargs))
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "action": "exec",
+                        "work_dir": str(tmp_path / "worktrees" / "wt1"),
+                        "cmd": ["copilot", "chat"],
+                        "env": {"COPILOT_THEME": "dark"},
+                        "worktree_id": "wt1",
+                        "post_exit": True,
+                        "project": "example",
+                    }
+                ),
+                stderr="picker stderr",
+            )
+        if "post-exit" in argv:
+            post_exit.append((list(argv), kwargs))
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        raise AssertionError(argv)
+
+    class _Proc:
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(argv, **kwargs):
+        child["argv"] = list(argv)
+        child["cwd"] = kwargs["cwd"]
+        child["env"] = kwargs["env"]
+        return _Proc()
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    monkeypatch.setattr(m.subprocess, "Popen", fake_popen)
+
+    rc = m.cmd_launch([])
+
+    assert rc == 0
+    assert resolve_calls[0][0] == [
+        sys.executable,
+        "-m",
+        "agent_worktrees",
+        "--project",
+        "example",
+        "resolve",
+        "--no-mux",
+    ]
+    assert child["argv"] == ["copilot", "chat"]
+    assert child["cwd"] == str(tmp_path / "worktrees" / "wt1")
+    assert child["env"]["AGENT_WORKTREES_LAUNCH_RUNTIME_ROOT"] == str(cell_runtime)
+    assert child["env"]["AGENT_WORKTREES_LAUNCH_RECOVERY_ANCHOR"] == str(
+        tmp_path / "anchor"
+    )
+    assert child["env"]["COPILOT_THEME"] == "dark"
+    assert post_exit[0][0] == [
+        sys.executable,
+        "-m",
+        "agent_worktrees",
+        "--project",
+        "example",
+        "post-exit",
+        "wt1",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -137,18 +327,20 @@ def test_setup_hook_builds_normalized_launch(monkeypatch):
     monkeypatch.setattr(m.platform, "system", lambda: "Linux")
     cfg_ = _hook_config(setup_hook={"linux": "tools/setup/session-setup.sh"})
     cmd = m._build_launch_cmd(cfg_, _args([]), "/w/wt")
+    inner = _inner_command(cmd)
 
     assert cmd[0] == "bash"
-    assert "default-setup.sh" in cmd[1]
-    assert "--machine" in cmd and cmd[cmd.index("--machine") + 1] == "dev6"
-    assert "--setup-hook" in cmd
-    hook_arg = cmd[cmd.index("--setup-hook") + 1]
+    assert "launch-command.sh" in cmd[1]
+    assert "default-setup.sh" in inner[1]
+    assert "--machine" in inner and inner[inner.index("--machine") + 1] == "dev6"
+    assert "--setup-hook" in inner
+    hook_arg = inner[inner.index("--setup-hook") + 1]
     assert hook_arg.endswith("session-setup.sh")
     # relative hook path is resolved against the anchor
     assert "tools" in hook_arg and "setup" in hook_arg
     assert "--config-root" in cmd
     assert "--runtime-python" in cmd
-    assert cmd[-1] == "--allow-all"
+    assert cmd[-2:] == ["--allow-all", "--experimental"]
 
 
 def test_setup_hook_absolute_path_preserved(monkeypatch):
@@ -177,9 +369,11 @@ def test_no_hook_uses_default_setup_without_hook_arg(monkeypatch):
     """No setup_hook and no legacy setup.sh -> plain default-setup, no hook arg."""
     monkeypatch.setattr(m.platform, "system", lambda: "Linux")
     cmd = m._build_launch_cmd(_hook_config(), _args([]), "/w/wt")
+    inner = _inner_command(cmd)
     assert cmd[0] == "bash"
-    assert "default-setup.sh" in cmd[1]
-    assert "--setup-hook" not in cmd
+    assert "launch-command.sh" in cmd[1]
+    assert "default-setup.sh" in inner[1]
+    assert "--setup-hook" not in inner
 
 
 def test_setup_hook_recovery_passes_recovery_and_hook(monkeypatch):
@@ -232,7 +426,8 @@ def test_copilot_path_linux_uses_normalized_launcher(monkeypatch):
         copilot_path={"linux": "{home}/src/runtime/dist-bin/linux-arm64/copilot"},
     )
     cmd = m._build_launch_cmd(cfg_, _args(["--version"]), "/w/wt")
-    assert "default-setup.sh" in cmd[1]
+    inner = _inner_command(cmd)
+    assert "default-setup.sh" in inner[1]
     assert "--copilot-path" in cmd
     selected = cmd[cmd.index("--copilot-path") + 1]
     assert selected.endswith("/src/runtime/dist-bin/linux-arm64/copilot")
@@ -264,11 +459,121 @@ def test_explicit_launch_remains_authoritative_over_copilot_path(monkeypatch):
     monkeypatch.setattr(m.platform, "system", lambda: "Linux")
     cfg_ = _hook_config(
         legacy_launch=True,
+        setup_hook={"linux": "tools/setup/session-setup.sh"},
         copilot_path={"linux": "/opt/copilot-dev"},
     )
+    monkeypatch.setattr(
+        m.state_root_mod,
+        "resolve_config_root",
+        lambda *args, **kwargs: pytest.fail(
+            "explicit launch must not resolve normalized setup state"
+        ),
+    )
     cmd = m._build_launch_cmd(cfg_, _args([]), "/w/wt")
-    assert cmd[0] == "copilot"
-    assert "--copilot-path" not in cmd
+    inner = _inner_command(cmd)
+    assert inner[0] == "copilot"
+    assert "--copilot-path" not in inner
+
+
+def test_predecessor_copilot_path_falls_back_for_default_launch(monkeypatch):
+    monkeypatch.setattr(m.platform, "system", lambda: "Linux")
+    cmd = m._build_launch_cmd(
+        _hook_config(),
+        _args([]),
+        "/w/wt",
+        fallback_copilot_path="/opt/copilot/current/copilot",
+    )
+    assert cmd[cmd.index("--copilot-path") + 1] == (
+        "/opt/copilot/current/copilot"
+    )
+
+
+def test_configured_copilot_path_wins_over_predecessor_fallback(monkeypatch):
+    monkeypatch.setattr(m.platform, "system", lambda: "Linux")
+    cmd = m._build_launch_cmd(
+        _hook_config(copilot_path={"linux": "/opt/copilot/configured"}),
+        _args([]),
+        "/w/wt",
+        fallback_copilot_path="/opt/copilot/predecessor",
+    )
+    assert cmd[cmd.index("--copilot-path") + 1] == "/opt/copilot/configured"
+
+
+def test_explicit_launch_ignores_predecessor_copilot_path(monkeypatch):
+    monkeypatch.setattr(m.platform, "system", lambda: "Linux")
+    cmd = m._build_launch_cmd(
+        _hook_config(legacy_launch=True),
+        _args([]),
+        "/w/wt",
+        fallback_copilot_path="/opt/copilot/predecessor",
+    )
+    inner = _inner_command(cmd)
+    assert inner[0] == "copilot"
+    assert "--copilot-path" not in inner
+
+
+def test_legacy_setup_uses_path_resolved_shell(monkeypatch, tmp_path):
+    monkeypatch.setattr(m.platform, "system", lambda: "Linux")
+    setup = tmp_path / "tools" / "setup" / "setup.sh"
+    setup.parent.mkdir(parents=True)
+    setup.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    cfg_ = _hook_config()
+    repo = dataclasses.replace(cfg_.default_repo, anchor=str(tmp_path))
+    cfg_ = dataclasses.replace(cfg_, repos={"ext": repo})
+
+    cmd = m._build_launch_cmd(
+        cfg_,
+        _args([]),
+        str(tmp_path),
+    )
+
+    inner = _inner_command(cmd)
+    assert cmd[0] == "bash"
+    assert inner[:2] == ["bash", str(setup)]
+    assert "--copilot-path" not in inner
+
+
+def test_legacy_setup_ignores_predecessor_copilot_path(monkeypatch, tmp_path):
+    monkeypatch.setattr(m.platform, "system", lambda: "Linux")
+    setup = tmp_path / "tools" / "setup" / "setup.sh"
+    setup.parent.mkdir(parents=True)
+    setup.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    cfg_ = _hook_config()
+    repo = dataclasses.replace(cfg_.default_repo, anchor=str(tmp_path))
+    cfg_ = dataclasses.replace(cfg_, repos={"ext": repo})
+
+    cmd = m._build_launch_cmd(
+        cfg_,
+        _args([]),
+        str(tmp_path),
+        fallback_copilot_path="/opt/copilot/predecessor",
+    )
+
+    inner = _inner_command(cmd)
+    assert cmd[0] == "bash"
+    assert inner[:2] == ["bash", str(setup)]
+    assert "--copilot-path" not in inner
+
+
+def test_windows_normalized_launch_uses_path_resolved_shell(monkeypatch):
+    monkeypatch.setattr(m.platform, "system", lambda: "Windows")
+    cfg_ = cfg.Config(
+        srcroot="/s",
+        machine="dev6",
+        platform="windows",
+        repo_name="ext",
+        repos={
+            "ext": cfg.RepoConfig(
+                anchor=r"C:\a",
+                worktree_root=r"C:\w",
+                setup_hook={"windows": r"tools\setup\session-setup.ps1"},
+            ),
+        },
+    )
+
+    cmd = m._build_launch_cmd(cfg_, _args([]), r"C:\w\wt")
+
+    assert cmd[0] == "pwsh.exe"
 
 
 def test_session_env_config_parsing():
@@ -324,19 +629,58 @@ def test_repo_session_env_passthrough_on_bad_placeholder():
     assert out["K"] == "{unknown_placeholder}/x"  # passed through, no crash
 
 
-def test_cmd_launch_exports_active_project(monkeypatch, tmp_path):
-    """cmd_launch must bridge the resolved project to the launcher via
-    WORKTREE_PROJECT, so a bare `<project>` launched from outside the anchor
-    (e.g. $HOME) still resolves -- the dotfiles/book2 "WORKTREE_PROJECT is not
-    set" regression. We stop before the exec by pointing install_dir at a dir
-    with no launch script; the env is set first, which is what we assert."""
+def test_cmd_launch_passes_active_project_explicitly(monkeypatch, tmp_path):
+    """A bare project launch carries explicit identity into the resolved plan."""
     monkeypatch.delenv("WORKTREE_PROJECT", raising=False)
     monkeypatch.setattr(m.cfg, "_ACTIVE_PROJECT", "dotfiles")
-    monkeypatch.setattr(m.cfg, "install_dir", lambda: tmp_path)
     monkeypatch.setattr(m.cfg, "detect_platform", lambda: "linux")
+    monkeypatch.setattr(m, "_usable_worktree_manager_launcher_dir", lambda: None)
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        if "resolve" in argv:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "action": "exec",
+                        "work_dir": str(tmp_path / "wt"),
+                        "cmd": ["copilot"],
+                        "env": {},
+                        "worktree_id": "wt1",
+                        "post_exit": False,
+                    }
+                ),
+                stderr="",
+            )
+        if "post-exit" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        raise AssertionError(argv)
+
+    class _Proc:
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        m.subprocess,
+        "Popen",
+        lambda argv, **kwargs: _Proc(),
+    )
     rc = m.cmd_launch([])
-    assert rc == 1  # launch-session.sh not found under tmp_path -> early return
-    assert os.environ.get("WORKTREE_PROJECT") == "dotfiles"
+    assert rc == 0
+    assert calls[0][0] == [
+        sys.executable,
+        "-m",
+        "agent_worktrees",
+        "--project",
+        "dotfiles",
+        "resolve",
+        "--no-mux",
+    ]
+    assert "WORKTREE_PROJECT" not in os.environ
 
 
 # ---------------------------------------------------------------------------
@@ -387,8 +731,9 @@ def test_env_script_linux_builds_default_setup_with_flag(monkeypatch):
     monkeypatch.setattr(m.platform, "system", lambda: "Linux")
     cfg_ = _env_config(env_script={"linux": "tools/prime.sh"}, platform_name="linux")
     cmd = m._build_launch_cmd(cfg_, _args([]), "/a")
+    inner = _inner_command(cmd)
     assert cmd[0] == "bash"
-    assert "default-setup.sh" in cmd[1]
+    assert "default-setup.sh" in inner[1]
     assert "--env-script" in cmd
     assert cmd[cmd.index("--env-script") + 1].endswith("prime.sh")
 
@@ -450,7 +795,7 @@ def test_default_setup_sh_supports_hook_and_session_path():
     assert "Copilot was not started." in text
     # --stdio (ACP) mode keeps human output off the JSON-RPC channel
     assert "STDIO=true" in text
-    assert 'bash "$SETUP_HOOK" --machine "$MACHINE" >&2' in text
+    assert '"$BASH" "$SETUP_HOOK" --machine "$MACHINE" >&2' in text
 
 
 def test_default_setup_ps1_supports_hook_and_session_path():
@@ -471,11 +816,288 @@ def test_default_setup_ps1_supports_hook_and_session_path():
     assert "SetEnvironmentVariable" in text
     assert "-not $Recovery" in text  # hook skipped in recovery
     assert "$env:PATH" in text
+    assert "& pwsh.exe -NoProfile -NoLogo -File $SetupHook" in text
     assert "& $overrideCmd.Source @CopilotArgs" in text
-    assert "copilot @CopilotArgs" in text
+    assert "Get-Command copilot -CommandType Application -All" in text
+    assert "$source -notmatch '\\\\WindowsApps\\\\'" in text
+    assert "& $copilotCmd.Source @CopilotArgs" in text
     # --stdio (ACP) mode redirects Write-Host + hook output to stderr
     assert "StdioMode" in text
     assert "[Console]::Error.WriteLine" in text
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PATH resolution regression")
+def test_default_setup_skips_windowsapps_shadow_candidate(tmp_path):
+    shell = shutil.which("pwsh")
+    if not shell:
+        pytest.skip("pwsh is unavailable")
+
+    shadow_dir = tmp_path / "WindowsApps"
+    concrete_dir = tmp_path / "WinGet" / "Links"
+    shadow_dir.mkdir()
+    concrete_dir.mkdir(parents=True)
+    marker = tmp_path / "launched"
+    shadow_marker = tmp_path / "shadow-launched"
+
+    (shadow_dir / "copilot.cmd").write_text(
+        "@echo off\r\n"
+        "> \"%COPILOT_SHADOW_MARKER%\" echo shadow\r\n"
+        "exit /b 91\r\n",
+        encoding="utf-8",
+    )
+    (concrete_dir / "copilot.cmd").write_text(
+        "@echo off\r\n"
+        "> \"%COPILOT_LAUNCH_MARKER%\" echo launched\r\n",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["PATH"] = os.pathsep.join((str(shadow_dir), str(concrete_dir)))
+    env["HOSTNAME"] = "test-host"
+    env["HOME"] = str(tmp_path / "home")
+    env["USERPROFILE"] = str(tmp_path / "home")
+    env["COPILOT_LAUNCH_MARKER"] = str(marker)
+    env["COPILOT_SHADOW_MARKER"] = str(shadow_marker)
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+
+    proc = subprocess.run(
+        [
+            shell,
+            "-NoProfile",
+            "-NoLogo",
+            "-File",
+            str(scripts / "default-setup.ps1"),
+            "-Machine",
+            "test",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert marker.read_text(encoding="utf-8").strip() == "launched"
+    assert not shadow_marker.exists()
+
+
+def test_default_setup_ps1_stage_3_no_runtime_path_still_launches(tmp_path):
+    """Stage 3 (copilot_invoked): when no RuntimePython/resolver is available,
+    Invoke-CopilotInvokedLog's no-runtime early-return must not affect the
+    real launch -- Copilot still starts. Runs under PowerShell Core (pwsh),
+    which is cross-platform, so this exercises the actual .ps1 code path
+    without requiring native Windows."""
+    shell = shutil.which("pwsh")
+    if not shell:
+        pytest.skip("pwsh is unavailable")
+
+    marker = tmp_path / "launched"
+    home = tmp_path / "home"  # no .agent-worktrees/bin/resolve-runtime.ps1 here
+    home.mkdir()
+    env = os.environ.copy()
+    env.pop("AGENT_WORKTREES_LAUNCH_RUNTIME_ROOT", None)
+    env["HOSTNAME"] = "test-host"
+    env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)
+    env["COPILOT_LAUNCH_MARKER"] = str(marker)
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+
+    if os.name == "nt":
+        env["PATH"] = ""
+        copilot = tmp_path / "copilot-test.cmd"
+        copilot.write_text(
+            "@echo off\r\n> \"%COPILOT_LAUNCH_MARKER%\" echo launched\r\n",
+            encoding="utf-8",
+        )
+    else:
+        # PowerShell Core's snap wrapper needs `mkdir` on PATH to bootstrap
+        # (unrelated to anything under test); the real Windows path below
+        # never goes through that wrapper, so PATH stays untouched there.
+        env["PATH"] = "/usr/bin:/bin"
+        copilot = tmp_path / "copilot-test"
+        copilot.write_text(
+            "#!/bin/sh\nprintf launched > \"$COPILOT_LAUNCH_MARKER\"\n",
+            encoding="utf-8",
+        )
+        copilot.chmod(0o755)
+
+    proc = subprocess.run(
+        [
+            shell, "-NoProfile", "-NoLogo", "-File", str(scripts / "default-setup.ps1"),
+            "-Machine", "test", "-CopilotPath", str(copilot),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert marker.read_text(encoding="utf-8").strip() == "launched"
+
+
+def test_default_setup_launches_absolute_copilot_with_empty_path(
+    tmp_path,
+):
+    marker = tmp_path / "launched"
+    env = os.environ.copy()
+    env["PATH"] = ""
+    env["HOSTNAME"] = "test-host"
+    env["HOME"] = str(tmp_path / "home")
+    env["USERPROFILE"] = str(tmp_path / "home")
+    env["COPILOT_LAUNCH_MARKER"] = str(marker)
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+
+    if os.name == "nt":
+        shell = shutil.which("pwsh")
+        if not shell:
+            pytest.skip("pwsh is unavailable")
+        copilot = tmp_path / "copilot-test.cmd"
+        copilot.write_text(
+            "@echo off\r\n"
+            "> \"%COPILOT_LAUNCH_MARKER%\" echo launched\r\n",
+            encoding="utf-8",
+        )
+        command = [
+            shell,
+            "-NoProfile",
+            "-NoLogo",
+            "-File",
+            str(scripts / "default-setup.ps1"),
+            "-Machine",
+            "test",
+            "-CopilotPath",
+            str(copilot),
+        ]
+    else:
+        shell = shutil.which("bash")
+        if not shell:
+            pytest.skip("bash is unavailable")
+        copilot = tmp_path / "copilot-test"
+        copilot.write_text(
+            "#!/bin/sh\nprintf launched > \"$COPILOT_LAUNCH_MARKER\"\n",
+            encoding="utf-8",
+        )
+        copilot.chmod(0o755)
+        command = [
+            shell,
+            str(scripts / "default-setup.sh"),
+            "--machine",
+            "test",
+            "--copilot-path",
+            str(copilot),
+        ]
+
+    proc = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert marker.read_text(encoding="utf-8").strip() == "launched"
+
+
+def test_default_setup_runs_hook_with_empty_path(
+    tmp_path,
+):
+    hook_marker = tmp_path / "hook-ran"
+    launch_marker = tmp_path / "launched"
+    config_root = tmp_path / "config-root"
+    config_root.mkdir()
+    env = os.environ.copy()
+    env["PATH"] = ""
+    env["HOSTNAME"] = "test-host"
+    env["HOME"] = str(tmp_path / "home")
+    env["USERPROFILE"] = str(tmp_path / "home")
+    env["SETUP_HOOK_MARKER"] = str(hook_marker)
+    env["COPILOT_LAUNCH_MARKER"] = str(launch_marker)
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+
+    if os.name == "nt":
+        shell = shutil.which("pwsh")
+        if not shell:
+            pytest.skip("pwsh is unavailable")
+        runtime = tmp_path / "runtime.cmd"
+        runtime.write_text(
+            f"@echo off\r\necho {config_root}\r\n",
+            encoding="utf-8",
+        )
+        hook = tmp_path / "setup-hook.ps1"
+        hook.write_text(
+            "param([string]$Machine)\n"
+            "Set-Content -LiteralPath $env:SETUP_HOOK_MARKER -Value ran\n",
+            encoding="utf-8",
+        )
+        copilot = tmp_path / "copilot-test.cmd"
+        copilot.write_text(
+            "@echo off\r\n"
+            "> \"%COPILOT_LAUNCH_MARKER%\" echo launched\r\n",
+            encoding="utf-8",
+        )
+        command = [
+            shell,
+            "-NoProfile",
+            "-NoLogo",
+            "-File",
+            str(scripts / "default-setup.ps1"),
+            "-Machine",
+            "test",
+            "-SetupHook",
+            str(hook),
+            "-RuntimePython",
+            str(runtime),
+            "-CopilotPath",
+            str(copilot),
+        ]
+    else:
+        shell = shutil.which("bash")
+        if not shell:
+            pytest.skip("bash is unavailable")
+        runtime = tmp_path / "runtime"
+        runtime.write_text(
+            f"#!/bin/sh\nprintf '%s\\n' '{config_root}'\n",
+            encoding="utf-8",
+        )
+        runtime.chmod(0o755)
+        hook = tmp_path / "setup-hook.sh"
+        hook.write_text(
+            "#!/bin/sh\nprintf ran > \"$SETUP_HOOK_MARKER\"\n",
+            encoding="utf-8",
+        )
+        hook.chmod(0o755)
+        copilot = tmp_path / "copilot-test"
+        copilot.write_text(
+            "#!/bin/sh\nprintf launched > \"$COPILOT_LAUNCH_MARKER\"\n",
+            encoding="utf-8",
+        )
+        copilot.chmod(0o755)
+        command = [
+            shell,
+            str(scripts / "default-setup.sh"),
+            "--machine",
+            "test",
+            "--setup-hook",
+            str(hook),
+            "--runtime-python",
+            str(runtime),
+            "--copilot-path",
+            str(copilot),
+        ]
+
+    proc = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert hook_marker.read_text(encoding="utf-8").strip() == "ran"
+    assert launch_marker.read_text(encoding="utf-8").strip() == "launched"
 
 
 def test_supported_setup_surface_rejects_stateless_destination_before_hook(
@@ -604,7 +1226,7 @@ def _win_launch_dir(tmp_path):
 
 
 def test_windows_interactive_launch_bypasses_cmd_shim(monkeypatch, tmp_path):
-    monkeypatch.setattr(m.cfg, "install_dir", lambda: _win_launch_dir(tmp_path))
+    monkeypatch.setattr(m, "_usable_worktree_manager_launcher_dir", lambda: _win_launch_dir(tmp_path) / "bin")
     monkeypatch.setattr(m.cfg, "detect_platform", lambda: "windows")
     captured: list[list[str]] = []
     monkeypatch.setattr(m.subprocess, "Popen", _fake_popen(captured))
@@ -620,7 +1242,7 @@ def test_windows_interactive_launch_bypasses_cmd_shim(monkeypatch, tmp_path):
 
 
 def test_windows_stdio_launch_keeps_cmd_shim(monkeypatch, tmp_path):
-    monkeypatch.setattr(m.cfg, "install_dir", lambda: _win_launch_dir(tmp_path))
+    monkeypatch.setattr(m, "_usable_worktree_manager_launcher_dir", lambda: _win_launch_dir(tmp_path) / "bin")
     monkeypatch.setattr(m.cfg, "detect_platform", lambda: "windows")
     captured: list[list[str]] = []
     monkeypatch.setattr(m.subprocess, "Popen", _fake_popen(captured))
@@ -640,7 +1262,7 @@ def test_windows_interactive_falls_back_to_cmd_when_ps1_absent(monkeypatch, tmp_
     bind = tmp_path / "bin"
     bind.mkdir()
     (bind / "launch-session.cmd").write_text("@echo off\n")  # no .ps1
-    monkeypatch.setattr(m.cfg, "install_dir", lambda: tmp_path)
+    monkeypatch.setattr(m, "_usable_worktree_manager_launcher_dir", lambda: tmp_path / "bin")
     monkeypatch.setattr(m.cfg, "detect_platform", lambda: "windows")
     captured: list[list[str]] = []
     monkeypatch.setattr(m.subprocess, "Popen", _fake_popen(captured))
@@ -651,12 +1273,364 @@ def test_windows_interactive_falls_back_to_cmd_when_ps1_absent(monkeypatch, tmp_
     assert argv[0] == "cmd.exe"
 
 
+def test_cmd_launch_uses_direct_fallback_when_relocated_unavailable(
+    monkeypatch, tmp_path
+):
+    """Phase 3b Sub-slice 2a Step 2 cutover complete: agent-worktrees no
+    longer carries an in-plugin launch-session fallback tier. When the
+    relocated Worktree Manager launcher is unusable, cmd_launch must degrade
+    straight to the direct, non-mux launch path."""
+    cell_runtime = tmp_path / "cell" / "plugins" / "agent-worktrees"
+    cell_runtime.mkdir(parents=True)
+    monkeypatch.setattr(m.cfg, "_ACTIVE_PROJECT", "example")
+    monkeypatch.setattr(m.cfg, "detect_platform", lambda: "windows")
+    monkeypatch.setattr(m, "_usable_worktree_manager_launcher_dir", lambda: None)
+    monkeypatch.setattr(
+        registry_paths,
+        "installation_context",
+        lambda: {"pluginRoot": str(cell_runtime)},
+    )
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda **_kwargs: cfg.Config(
+            srcroot=str(tmp_path),
+            machine="test",
+            platform="windows",
+            repo_name="example",
+            repos={
+                "example": cfg.RepoConfig(
+                    anchor=str(tmp_path / "anchor"),
+                    worktree_root=str(tmp_path / "worktrees"),
+                )
+            },
+        ),
+    )
+    direct_calls = []
+    monkeypatch.setattr(
+        m, "_run_direct_launch_fallback",
+        lambda project, passthrough: direct_calls.append((project, passthrough)) or 0,
+    )
+
+    rc = m.cmd_launch([])
+
+    assert rc == 0
+    assert direct_calls == [("example", [])]
+
+
+def test_cmd_launch_uses_relocated_worktree_manager_launcher_when_available(
+    monkeypatch, tmp_path
+):
+    # cmd_launch mutates the real process os.environ directly (it must, to
+    # propagate to the child it hands off to) -- pre-touch each var it may
+    # set via monkeypatch.setenv so teardown restores the pre-test state
+    # regardless. Must be setenv, not delenv(raising=False) on an absent
+    # var: that combination is a documented no-op that registers no undo at
+    # all, so a later direct os.environ mutation from the SUT would leak
+    # WORKTREE_NO_UPDATE/etc. into every later test in this pytest worker
+    # (copilot-extensions#3749). An empty string reads as unset by this
+    # module's own `_env_get` (`os.environ.get(name) or None`).
+    for _leaked in (
+        "WORKTREE_NO_UPDATE", "WORKTREE_NO_MUX", "WORKTREE_VERBOSE",
+        "AGENT_WORKTREES_LAUNCH_RUNTIME_ROOT",
+        "AGENT_WORKTREES_LAUNCH_RECOVERY_ANCHOR",
+    ):
+        monkeypatch.setenv(_leaked, "")
+    cell_runtime = tmp_path / "cell" / "plugins" / "agent-worktrees"
+    cell_runtime.mkdir(parents=True)
+    wm_root = tmp_path / "wmroot"
+    slot = wm_root / "versions" / "0.1.0-dev35"
+    bind = slot / "bin"
+    bind.mkdir(parents=True)
+    (wm_root / "current-version").write_text("0.1.0-dev35", encoding="utf-8")
+    (bind / "launch-session.cmd").write_text("@echo off\r\n", encoding="utf-8")
+    (bind / "launch-session.ps1").write_text("# ps\n", encoding="utf-8")
+    monkeypatch.setenv("WORKTREE_MANAGER_ROOT", str(wm_root))
+    monkeypatch.setattr(m.cfg, "_ACTIVE_PROJECT", "example")
+    monkeypatch.setattr(m.cfg, "detect_platform", lambda: "windows")
+    monkeypatch.setattr(
+        registry_paths,
+        "installation_context",
+        lambda: {"pluginRoot": str(cell_runtime)},
+    )
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda **_kwargs: cfg.Config(
+            srcroot=str(tmp_path),
+            machine="test",
+            platform="windows",
+            repo_name="example",
+            repos={
+                "example": cfg.RepoConfig(
+                    anchor=str(tmp_path / "anchor"),
+                    worktree_root=str(tmp_path / "worktrees"),
+                )
+            },
+        ),
+    )
+
+    def fake_run(argv, **kwargs):
+        assert argv[:4] == ["uv", "run", "--quiet", "--project"]
+        assert argv[4] == str(slot)
+        assert argv[-2:] == ["worktree_manager", "--version"]
+        return subprocess.CompletedProcess(argv, 0, stdout="0.1.0-dev35\n", stderr="")
+
+    captured: list[list[str]] = []
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    monkeypatch.setattr(m.subprocess, "Popen", _fake_popen(captured))
+
+    with pytest.raises(SystemExit) as exc:
+        m.cmd_launch(["--no-update", "--no-mux", "--verbose"])
+    assert exc.value.code == 0
+    argv = captured[0]
+    assert argv[0] == "pwsh.exe"
+    assert argv[argv.index("-File") + 1] == str(bind / "launch-session.ps1")
+    assert os.environ["AGENT_WORKTREES_LAUNCH_RUNTIME_ROOT"] == str(cell_runtime)
+    assert os.environ["AGENT_WORKTREES_LAUNCH_RECOVERY_ANCHOR"] == str(
+        tmp_path / "anchor"
+    )
+    assert os.environ["WORKTREE_NO_UPDATE"] == "1"
+    assert os.environ["WORKTREE_NO_MUX"] == "1"
+    assert os.environ["WORKTREE_VERBOSE"] == "1"
+
+
+def test_cmd_launch_direct_fallback_runs_post_exit_and_preserves_env(
+    monkeypatch, tmp_path
+):
+    # See the sibling relocated-launcher test above: pre-touch every var
+    # cmd_launch may set on the real os.environ via monkeypatch.setenv (not
+    # delenv(raising=False), a no-op on an absent var that registers no
+    # undo) so teardown reverts them instead of leaking into later tests in
+    # this worker (#3749).
+    for _leaked in (
+        "WORKTREE_NO_UPDATE", "WORKTREE_NO_MUX", "WORKTREE_VERBOSE",
+        "AGENT_WORKTREES_LAUNCH_RUNTIME_ROOT",
+        "AGENT_WORKTREES_LAUNCH_RECOVERY_ANCHOR",
+    ):
+        monkeypatch.setenv(_leaked, "")
+    cell_runtime = tmp_path / "cell" / "plugins" / "agent-worktrees"
+    cell_runtime.mkdir(parents=True)
+    monkeypatch.setattr(m.cfg, "_ACTIVE_PROJECT", "example")
+    monkeypatch.setattr(m.cfg, "detect_platform", lambda: "linux")
+    monkeypatch.setattr(
+        registry_paths,
+        "installation_context",
+        lambda: {"pluginRoot": str(cell_runtime)},
+    )
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda **_kwargs: cfg.Config(
+            srcroot=str(tmp_path),
+            machine="test",
+            platform="linux",
+            repo_name="example",
+            repos={
+                "example": cfg.RepoConfig(
+                    anchor=str(tmp_path / "anchor"),
+                    worktree_root=str(tmp_path / "worktrees"),
+                )
+            },
+        ),
+    )
+    monkeypatch.setattr(m, "_usable_worktree_manager_launcher_dir", lambda: None)
+    runs = []
+    child = {}
+
+    def fake_run(argv, **kwargs):
+        runs.append((list(argv), kwargs))
+        if "resolve" in argv:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "launch": {
+                            "action": "exec",
+                            "work_dir": str(tmp_path / "worktrees" / "wt1"),
+                            "cmd": ["copilot", "--resume=abc"],
+                            "env": {"COPILOT_TEST_ENV": "1"},
+                            "worktree_id": "wt1",
+                            "post_exit": True,
+                            "project": "example",
+                        }
+                    }
+                ),
+                stderr="picker stderr",
+            )
+        if "post-exit" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        raise AssertionError(argv)
+
+    class _Proc:
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(argv, **kwargs):
+        child["argv"] = list(argv)
+        child["cwd"] = kwargs["cwd"]
+        child["env"] = kwargs["env"]
+        return _Proc()
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    monkeypatch.setattr(m.subprocess, "Popen", fake_popen)
+
+    rc = m.cmd_launch(["--no-update", "--no-mux", "--verbose"])
+
+    assert rc == 0
+    resolve_argv = runs[0][0]
+    assert resolve_argv == [
+        sys.executable,
+        "-m",
+        "agent_worktrees",
+        "--project",
+        "example",
+        "resolve",
+        "--no-mux",
+    ]
+    post_exit_argv = runs[1][0]
+    assert post_exit_argv == [
+        sys.executable,
+        "-m",
+        "agent_worktrees",
+        "--project",
+        "example",
+        "post-exit",
+        "wt1",
+    ]
+    resolve_env = runs[0][1]["env"]
+    assert resolve_env["AGENT_WORKTREES_LAUNCH_RUNTIME_ROOT"] == str(cell_runtime)
+    assert resolve_env["AGENT_WORKTREES_LAUNCH_RECOVERY_ANCHOR"] == str(
+        tmp_path / "anchor"
+    )
+    assert resolve_env["WORKTREE_NO_UPDATE"] == "1"
+    assert resolve_env["WORKTREE_NO_MUX"] == "1"
+    assert resolve_env["WORKTREE_VERBOSE"] == "1"
+    assert child["argv"] == ["copilot", "--resume=abc"]
+    assert child["cwd"] == str(tmp_path / "worktrees" / "wt1")
+    assert child["env"]["AGENT_WORKTREES_LAUNCH_RUNTIME_ROOT"] == str(cell_runtime)
+    assert child["env"]["AGENT_WORKTREES_LAUNCH_RECOVERY_ANCHOR"] == str(
+        tmp_path / "anchor"
+    )
+    assert child["env"]["WORKTREE_NO_UPDATE"] == "1"
+    assert child["env"]["WORKTREE_NO_MUX"] == "1"
+    assert child["env"]["WORKTREE_VERBOSE"] == "1"
+    assert child["env"]["COPILOT_TEST_ENV"] == "1"
+
+
+# ── Bare-launch resolution watchdog (a hung pre-handoff resolution must never
+# survive indefinitely -- see _fire_launch_resolution_watchdog's docstring) ──
+
+
+class _FakeWatchdogTimer:
+    """Records instantiation + start/cancel without ever actually firing."""
+
+    instances: list["_FakeWatchdogTimer"] = []
+
+    def __init__(self, interval, function):
+        self.interval = interval
+        self.function = function
+        self.daemon = False
+        self.started = False
+        self.cancelled = False
+        type(self).instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+
+def test_cmd_launch_cancels_watchdog_before_windows_popen_handoff(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        m, "_usable_worktree_manager_launcher_dir", lambda: _win_launch_dir(tmp_path) / "bin"
+    )
+    monkeypatch.setattr(m.cfg, "detect_platform", lambda: "windows")
+    captured: list[list[str]] = []
+    monkeypatch.setattr(m.subprocess, "Popen", _fake_popen(captured))
+    _FakeWatchdogTimer.instances = []
+    monkeypatch.setattr(m.threading, "Timer", _FakeWatchdogTimer)
+
+    with pytest.raises(SystemExit) as exc:
+        m.cmd_launch([])
+
+    assert exc.value.code == 0
+    assert len(_FakeWatchdogTimer.instances) == 1
+    timer = _FakeWatchdogTimer.instances[0]
+    assert timer.interval == m._LAUNCH_RESOLUTION_TIMEOUT_SECS
+    assert timer.function is m._fire_launch_resolution_watchdog
+    assert timer.daemon is True
+    assert timer.started is True
+    # Cancelled once the child is spawned -- the subsequent proc.wait() is the
+    # expected, legitimate long/indefinite block, not something to watchdog.
+    assert timer.cancelled is True
+
+
+def test_cmd_launch_cancels_watchdog_before_direct_fallback(monkeypatch, tmp_path):
+    cell_runtime = tmp_path / "cell" / "plugins" / "agent-worktrees"
+    cell_runtime.mkdir(parents=True)
+    monkeypatch.setattr(m.cfg, "_ACTIVE_PROJECT", "example")
+    monkeypatch.setattr(m.cfg, "detect_platform", lambda: "linux")
+    monkeypatch.setattr(
+        registry_paths, "installation_context", lambda: {"pluginRoot": str(cell_runtime)}
+    )
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda **_kwargs: cfg.Config(
+            srcroot=str(tmp_path),
+            machine="test",
+            platform="linux",
+            repo_name="example",
+            repos={
+                "example": cfg.RepoConfig(
+                    anchor=str(tmp_path / "anchor"),
+                    worktree_root=str(tmp_path / "worktrees"),
+                )
+            },
+        ),
+    )
+    monkeypatch.setattr(m, "_usable_worktree_manager_launcher_dir", lambda: None)
+    monkeypatch.setattr(m, "_run_direct_launch_fallback", lambda *a, **k: 0)
+    _FakeWatchdogTimer.instances = []
+    monkeypatch.setattr(m.threading, "Timer", _FakeWatchdogTimer)
+
+    rc = m.cmd_launch([])
+
+    assert rc == 0
+    assert len(_FakeWatchdogTimer.instances) == 1
+    assert _FakeWatchdogTimer.instances[0].cancelled is True
+
+
+def test_launch_resolution_watchdog_self_terminates(monkeypatch):
+    """The watchdog callback itself must reach for the hard exit -- nothing
+    softer, since the whole point is bypassing a stuck blocking call that
+    ordinary control flow (exceptions, signals) cannot interrupt."""
+    calls: list[int] = []
+    monkeypatch.setattr(m.os, "_exit", lambda code: calls.append(code))
+
+    m._fire_launch_resolution_watchdog()
+
+    assert calls == [1]
+
+
+def test_launch_resolution_timeout_is_generous_but_bounded():
+    """A sanity bound on the constant itself: long enough to never trip on a
+    normal cold git/config resolution, short enough that a genuine hang is
+    still caught in a human-relevant timeframe."""
+    assert 10.0 <= m._LAUNCH_RESOLUTION_TIMEOUT_SECS <= 300.0
+
+
 def test_installers_deploy_the_sourced_agent_host_helper():
     """default-setup.sh and bin/launch-session.sh source scripts/agent-host.sh
     (at runtime, ~/.agent-worktrees/scripts/agent-host.sh); a launcher whose
     helper is missing exits under ``set -e``, so both installers deploy it."""
     plugin = Path(__file__).resolve().parents[1]
-    assert '"agent-host.sh"' in (plugin / "src" / "agent_worktrees" / "installer.py").read_text()
-    assert "default-setup.sh agent-host.sh" in (plugin / "scripts" / "install.sh").read_text()
+    assert '"agent-host.sh",' in (plugin / "src" / "agent_worktrees" / "installer.py").read_text()
+    assert "        agent-host.sh \\\n" in (plugin / "scripts" / "install.sh").read_text()
     for launcher in ("scripts/default-setup.sh", "bin/launch-session.sh"):
         assert "agent-host.sh" in (plugin / launcher).read_text()

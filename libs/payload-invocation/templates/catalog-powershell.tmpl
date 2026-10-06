@@ -4,13 +4,7 @@
 $ErrorActionPreference = 'SilentlyContinue'
 
 $selfRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$contextRoot = if ($env:COPILOT_PLUGIN_ROOT) { $env:COPILOT_PLUGIN_ROOT } else { $selfRoot }
-try { $contextRoot = (Resolve-Path $contextRoot).Path } catch { Write-Output '{}'; exit 0 }
-if (-not [StringComparer]::OrdinalIgnoreCase.Equals($contextRoot, $selfRoot)) {
-    Write-Output '{}'
-    exit 0
-}
-
+@@CATALOG_GATE_POWERSHELL@@
 $commandPath = Join-Path $selfRoot '@@OUTPUT_DIR_PS@@\@@COMMAND@@@@WINDOWS_CATALOG_SUFFIX@@'
 $installerPath = Join-Path $selfRoot 'scripts\@@INSTALLER@@.ps1'
 $availability = if (
@@ -38,7 +32,7 @@ $context = @(
     '## @@COMMAND@@ session command catalog'
     ''
     'Invoke the exact `argv` below. Do not search `PATH` or substitute a same-named command from another payload.'
-    ''
+@@WINDOWS_CATALOG_NOTE_PS@@    ''
     "${fence}json"
     $catalogJson
     $fence

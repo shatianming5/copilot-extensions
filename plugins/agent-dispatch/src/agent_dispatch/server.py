@@ -6,14 +6,25 @@ import logging
 import os
 import socket
 import sys
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
 from . import __version__, telemetry
-from .config import Config, load_config, requires_token_bind, routing_dir, run_dir
+from .config import (
+    Config,
+    has_live_local_coordinator,
+    load_config,
+    requires_token_bind,
+    resolve_control_token,
+    routing_dir,
+    run_dir,
+)
 from .coordinator import create_app
 from .queue import TaskQueue
 from .rendezvous import clear_endpoint, write_endpoint
+from .single_instance import SingleInstance
 
 log = logging.getLogger("agent-dispatch.server")
 
@@ -25,10 +36,29 @@ _lifecycle_started = False
 # transient routing read failure must not strand durable wakes, and must not
 # make a passive/demoted process seize them.
 _wake_route_owned = False
+# Throttle for the missing-active self-heal probe below: this check runs on
+# every wake-drain poll (as often as every 0.25s while idle), but the probe it
+# triggers does a real socket connect, so it is rate-limited independently of
+# the wake-poll cadence.
+_MISSING_ACTIVE_HEAL_INTERVAL_S = 5.0
+_last_missing_active_heal_attempt = 0.0
 
 
 class UnsafeBindError(RuntimeError):
     """Raised when the coordinator would bind the LAN without a bearer token."""
+
+
+class CoordinatorAlreadyLiveError(RuntimeError):
+    """Raised when a non-passive, non-forced ``serve()`` would seize the active
+    route from an already-live coordinator (ThomasMichon/copilot-extensions#3066).
+
+    A caller-side pre-check (e.g. the CLI's ``_cmd_serve``) is a cheap, friendly
+    fast path, but is not atomic against a second, concurrent non-passive
+    ``serve()`` racing the same decision -- both could observe "not live" before
+    either publishes. This is raised from *inside* ``serve()``, guarded by a
+    ``SingleInstance`` lock held across the re-check and the routing-table
+    publish, so only one non-passive starter can ever win that race.
+    """
 
 
 def check_bind_safety(cfg: Config) -> None:
@@ -52,7 +82,7 @@ def check_bind_safety(cfg: Config) -> None:
 
 def build_app(cfg: Config | None = None):
     """Construct the coordinator app, ensuring the queue DB directory exists."""
-    cfg = cfg or load_config()
+    cfg = cfg or replace(load_config(), control_token=resolve_control_token())
     # Install a telemetry sink if one is configured (generic open hook; a no-op
     # unless a consumer wired a sink). Prefer a convention-located config file
     # (env-free); fall back to the environment so env-wired deploys don't
@@ -65,6 +95,8 @@ def build_app(cfg: Config | None = None):
         queue, token=cfg.token, control_token=cfg.control_token,
         sweep_interval=cfg.sweep_interval,
         orphan_grace=cfg.orphan_grace, wake_interval=0.25,
+        handoff_fallback_enabled=cfg.handoff_fallback_enabled,
+        handoff_fallback_grace=cfg.handoff_fallback_grace,
         wake_is_active=_owns_active_route,
     )
 
@@ -75,15 +107,61 @@ def _owns_active_route() -> bool:
     Preserve the last authoritative result across routing-table I/O failures.
     This lets an active coordinator keep draining during discovery degradation
     without allowing a passive or demoted process to infer ownership.
+
+    When the table has **no** ``active`` claim at all (the shape a clean
+    shutdown via ``clear_if_owner`` leaves behind when no successor ever
+    publishes itself -- see ``zdd.routing.reap_stale_active``), no process
+    would otherwise ever notice: that watchdog only runs at coordinator
+    startup and at the start of a cutover, neither of which happens on its
+    own. Any live coordinator's own wake-drain poll is a convenient, already-
+    recurring hook to self-heal that case, throttled well below the poll
+    cadence since it does a real socket probe.
     """
-    global _wake_route_owned
+    global _wake_route_owned, _last_missing_active_heal_attempt
     try:
         from zdd import routing
 
         table = routing.read_table(routing_dir())
-        raw = table.get("active") if isinstance(table, dict) else None
-        if not isinstance(raw, dict) or raw.get("pid") is None:
+        if table is None:
+            # Unreadable/absent table: ambiguous (could be a transient I/O
+            # blip), not positive evidence no one owns the route -- preserve
+            # the last known-good value rather than guessing.
             return _wake_route_owned
+        raw = table.get("active")
+        if not isinstance(raw, dict):
+            # Confirmed: this table has no active claim at all. Attempt the
+            # self-heal, but if it cannot restore one (dead/missing
+            # `previous`, throttled, or a failed probe), this is positive
+            # evidence no process currently owns the route -- unlike the
+            # unreadable-table case above, there is nothing ambiguous here,
+            # so the stale cached value must not be trusted either.
+            now = time.monotonic()
+            if now - _last_missing_active_heal_attempt >= _MISSING_ACTIVE_HEAL_INTERVAL_S:
+                _last_missing_active_heal_attempt = now
+                try:
+                    svc = "agent-dispatch"  # marketplace-isolation: allow legacy-compatibility
+                    routing.reap_stale_active(routing_dir(), service=svc)
+                except Exception:
+                    log.debug(
+                        "missing-active self-heal probe failed", exc_info=True
+                    )
+                else:
+                    table = routing.read_table(routing_dir())
+                    raw = (
+                        table.get("active")
+                        if isinstance(table, dict)
+                        else None
+                    )
+                    if isinstance(raw, dict) and raw.get("pid") is not None:
+                        _wake_route_owned = raw.get("pid") == os.getpid()
+                        return _wake_route_owned
+            _wake_route_owned = False
+            return _wake_route_owned
+        # An active dict with no recorded pid is not a "missing claim" --
+        # reap_stale_active has nothing to repair there, and it must not be
+        # treated as owned just because a previous check happened to return
+        # True: fall through to the plain pid comparison below, which
+        # correctly evaluates to False (``None != os.getpid()``).
         _wake_route_owned = raw.get("pid") == os.getpid()
         return _wake_route_owned
     except Exception:
@@ -121,13 +199,22 @@ def _publish_routing(cfg: Config, bound_port: int, *, passive: bool = False) -> 
         try:
             # Dead-port watchdog: retire any advertised-but-dead endpoint a prior
             # crashed coordinator/cutover left before we announce ourselves.
-            routing.reap_stale_active(routing_dir(), service="agent-dispatch")
+            svc = "agent-dispatch"  # marketplace-isolation: allow legacy-compatibility
+            routing.reap_stale_active(routing_dir(), service=svc)
         except Exception:
             log.debug("startup dead-port sweep skipped", exc_info=True)
 
         routing.publish_active(
             routing_dir(),
-            bind=cfg.host,
+            # Normalize a bracketed IPv6 wildcard ("[::]") to zdd routing's
+            # own canonical form ("::") before publishing: zdd.routing
+            # .Endpoint.client_host only special-cases the unbracketed form,
+            # so a bracketed bind would otherwise round-trip through the
+            # routing table unnormalized and produce an unroutable
+            # "http://[::]:<port>" client URL, misclassifying a healthy
+            # wildcard-bound coordinator as dead (review follow-up on
+            # ThomasMichon/copilot-extensions#3066).
+            bind="::" if cfg.host == "[::]" else cfg.host,
             port=bound_port,
             pid=os.getpid(),
             version=__version__,
@@ -136,8 +223,9 @@ def _publish_routing(cfg: Config, bound_port: int, *, passive: bool = False) -> 
         try:
             from zdd import lifecycle
 
+            svc = "agent-dispatch"  # marketplace-isolation: allow legacy-compatibility
             rec = lifecycle.record(
-                routing_dir(), lifecycle.START, service="agent-dispatch",
+                routing_dir(), lifecycle.START, service=svc,
                 outcome=lifecycle.OK, version=__version__, port=bound_port,
             )
             # Remember we logged START -- only if it was actually written (record
@@ -170,8 +258,9 @@ def _clear_routing() -> None:
             try:
                 from zdd import lifecycle
 
+                svc = "agent-dispatch"  # marketplace-isolation: allow legacy-compatibility
                 lifecycle.record(
-                    routing_dir(), lifecycle.STOP, service="agent-dispatch",
+                    routing_dir(), lifecycle.STOP, service=svc,
                     outcome=lifecycle.OK,
                 )
             except Exception:
@@ -183,7 +272,7 @@ def _clear_routing() -> None:
         log.debug("zdd routing clear-on-shutdown skipped", exc_info=True)
 
 
-def serve(cfg: Config | None = None, *, passive: bool = False) -> None:
+def serve(cfg: Config | None = None, *, passive: bool = False, force: bool = False) -> None:
     """Bind and serve the coordinator (blocking).
 
     Stage C: the coordinator binds an **OS-assigned** ephemeral port
@@ -198,6 +287,14 @@ def serve(cfg: Config | None = None, *, passive: bool = False) -> None:
     fresh port but does **not** publish the zdd routing table -- the cutover
     orchestrator flips the route to it only after it health-gates, so it never
     seizes the active route from the live coordinator (invariant #5).
+
+    A non-passive, non-``force`` start raises :class:`CoordinatorAlreadyLiveError`
+    rather than seize the active route when a coordinator is already live
+    (ThomasMichon/copilot-extensions#3066). The check is made *atomic* against a
+    second, concurrent non-passive ``serve()`` by holding a ``SingleInstance``
+    lock across the re-check and the routing-table publish below -- a caller-side
+    pre-check (e.g. the CLI) is a cheap, friendly fast path but cannot alone rule
+    out two starters racing the same decision.
     """
     import uvicorn
 
@@ -208,53 +305,174 @@ def serve(cfg: Config | None = None, *, passive: bool = False) -> None:
     from . import procutil
     procutil.relocate_off_payload()
 
-    cfg = cfg or load_config()
-    try:
-        check_bind_safety(cfg)
-    except UnsafeBindError as exc:
-        print(f"agent-dispatch: {exc}", file=sys.stderr)
-        raise SystemExit(2) from exc
-    if requires_token_bind(cfg.host):
-        log.warning(
-            "binding %s exposes the coordinator on all interfaces; a token is set, "
-            "but ensure the port is firewalled off the LAN (allow loopback + the "
-            "Docker bridge subnets only)",
-            cfg.host,
-        )
-    # Stage C: pre-bind the listening socket ourselves so we can capture the
-    # OS-assigned port and advertise the *actual* endpoint before serving. Passing
-    # the already-bound socket to uvicorn avoids a fixed-port reservation entirely.
-    sock = _bind_listen_socket(cfg.host, _server_bind_port())
-    bound_port = sock.getsockname()[1]
-    global _wake_route_owned
-    _wake_route_owned = not passive
-    # Advertise the bound endpoint for discovery (see the endpoint-rendezvous lib
-    # and docs/patterns/local-endpoint-discovery.md). Additive: discovery-capable
-    # clients resolve this dynamic port from the rendezvous file.
-    advertise_endpoint(replace(cfg, port=bound_port))
-    # Publish the zdd routing table (skipped while passive) so clients follow this
-    # generation across a graceful cutover (docs/patterns/graceful-daemon-cutover.md).
-    _publish_routing(cfg, bound_port, passive=passive)
-    # Record the *actually-running* version so the launch-path reconciler can tell
-    # a lagging live coordinator from an up-to-date on-disk manifest (dotfiles
-    # #533). Best-effort; a dead-pid/missing file is treated as absent by readers.
-    from .runtime_version import write_running_version
+    cfg = cfg or replace(load_config(), control_token=resolve_control_token())
+    start_lock: SingleInstance | None = None
+    if not passive:
+        # Keyed by routing_dir() -- the directory the actual raced-over
+        # resource (the zdd routing table) lives in -- not run_dir(), which
+        # has an independent AGENT_DISPATCH_* override and so would not
+        # serialize two processes sharing one routing table but different
+        # run dirs (review follow-up on ThomasMichon/copilot-extensions#3066).
+        #
+        # Acquired even when ``force`` is set: ``force`` only bypasses the
+        # *liveness rejection* below, not serialization against a concurrent
+        # transition -- a forced start still must not race a normal
+        # ``serve()`` or the `deploy`/cutover path (which holds this same
+        # lock through its own route transition), or it could publish over
+        # that other transition and recreate the exact undrained duplicate
+        # this whole guard exists to prevent.
+        lock_path = routing_dir() / "serve-start.lock"
+        start_lock = SingleInstance(lock_path)
+        if not start_lock.acquire():
+            from .single_instance import read_holder_pid
 
-    write_running_version()
-    fed_runner = _maybe_start_federation()
-    app = build_app(cfg)
-    server = uvicorn.Server(uvicorn.Config(app, log_level="info"))
-    # Expose the uvicorn server so the app's /shutdown drain-seam can request a
-    # clean exit when the cutover orchestrator retires this daemon.
-    app.state.uvicorn_server = server
+            holder_pid = read_holder_pid(lock_path)
+            holder_note = f" (held by pid {holder_pid})" if holder_pid else ""
+            raise CoordinatorAlreadyLiveError(
+                "another process is concurrently starting a coordinator on this "
+                f"host{holder_note}; refusing to race it for the active route. "
+                "If that process is genuinely wedged (not just slow), it must "
+                "be terminated externally before a new start/deploy can "
+                "proceed -- this lock cannot recover a live-but-hung holder "
+                "itself."
+            )
+        if not force:
+            try:
+                live = has_live_local_coordinator(token=cfg.token)
+            except BaseException:
+                # An exception here (e.g. a malformed AGENT_DISPATCH_ENDPOINT
+                # override raised while parsing) must not strand the lock --
+                # otherwise a caller that catches this and retries in the same
+                # process deadlocks against its own held lock (review follow-up
+                # on ThomasMichon/copilot-extensions#3066).
+                start_lock.release()
+                raise
+            if live:
+                start_lock.release()
+                raise CoordinatorAlreadyLiveError(
+                    "a coordinator is already live and answering on this host; "
+                    "refusing to seize its active route non-passively"
+                )
     try:
-        server.run(sockets=[sock])
+        sock = None
+        fed_runner = None
+        try:
+            check_bind_safety(cfg)
+        except UnsafeBindError as exc:
+            print(f"agent-dispatch: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        if requires_token_bind(cfg.host):
+            log.warning(
+                "binding %s exposes the coordinator on all interfaces; a token is set, "
+                "but ensure the port is firewalled off the LAN (allow loopback + the "
+                "Docker bridge subnets only)",
+                cfg.host,
+            )
+        # Stage C: pre-bind the listening socket ourselves so we can capture the
+        # OS-assigned port and advertise the *actual* endpoint before serving. Passing
+        # the already-bound socket to uvicorn avoids a fixed-port reservation entirely.
+        sock = _bind_listen_socket(cfg.host, _server_bind_port())
+        bound_port = sock.getsockname()[1]
+        global _wake_route_owned
+        _wake_route_owned = not passive
+        # Advertise the bound endpoint for discovery (see the endpoint-rendezvous lib
+        # and docs/patterns/local-endpoint-discovery.md). Additive: discovery-capable
+        # clients resolve this dynamic port from the rendezvous file.
+        advertise_endpoint(replace(cfg, port=bound_port))
+        # Publish the zdd routing table (skipped while passive) so clients follow this
+        # generation across a graceful cutover (docs/patterns/graceful-daemon-cutover.md).
+        _publish_routing(cfg, bound_port, passive=passive)
+        # Record the *actually-running* version so the launch-path reconciler can tell
+        # a lagging live coordinator from an up-to-date on-disk manifest (dotfiles
+        # #533). Best-effort; a dead-pid/missing file is treated as absent by readers.
+        from .runtime_version import write_running_version
+
+        write_running_version()
+        fed_runner = _maybe_start_federation()
+        app = build_app(cfg)
+        server = uvicorn.Server(uvicorn.Config(app, log_level="info"))
+        # Expose the uvicorn server so the app's /shutdown drain-seam can request a
+        # clean exit when the cutover orchestrator retires this daemon.
+        app.state.uvicorn_server = server
+        if start_lock is not None:
+            # Publishing the route above is not the same moment as actually being
+            # able to answer requests on it: uvicorn's startup (ASGI lifespan +
+            # accepting connections) still has to run, and a concurrent starter
+            # racing in during that gap would see this brand-new, not-yet-serving
+            # route as "not live" and seize it right back out from under us.
+            #
+            # ``server.run()`` itself stays on the main thread (unchanged signal
+            # handling/exception propagation -- a background *poller* thread
+            # watches for readiness instead and releases the lock either once
+            # this instance's own ``/health`` actually answers, or as soon as
+            # ``server.run()`` itself has returned/raised (``_server_exited``),
+            # so a startup failure never leaves the lock held for no reason.
+            # Deliberately *not* time-bounded beyond that: releasing on a timer
+            # while the route is published but still unready would let another
+            # starter observe it as dead and seize it -- exactly the race this
+            # gate exists to close. A startup that neither completes nor exits
+            # is the same "wedged coordinator" class this repo's watchdog/
+            # supervisor tooling already handles externally, not this lock's
+            # job (review follow-up on ThomasMichon/copilot-extensions#3066).
+            from .config import _health_responsive as _self_health_responsive
+
+            _server_exited = threading.Event()
+            self_url = _loopback_probe_url(cfg.host, bound_port)
+            _lock = start_lock  # closure-stable reference; start_lock is reset below
+
+            def _release_start_lock_when_ready() -> None:
+                while not _server_exited.is_set():
+                    try:
+                        if _self_health_responsive(self_url, timeout=0.5, token=cfg.token):
+                            break
+                    except Exception:
+                        # _health_responsive() already narrows expected
+                        # connection-level failures to False; an unexpected
+                        # exception here must not kill this daemon thread --
+                        # server.run() would keep blocking with the lock
+                        # never released, failing every later serve/deploy
+                        # attempt (review follow-up on
+                        # ThomasMichon/copilot-extensions#3066).
+                        log.warning(
+                            "readiness probe raised unexpectedly; retrying",
+                            exc_info=True,
+                        )
+                    time.sleep(0.05)
+                _lock.release()
+
+            poller = threading.Thread(
+                target=_release_start_lock_when_ready, daemon=True
+            )
+            poller.start()
+            try:
+                server.run(sockets=[sock])
+            finally:
+                _server_exited.set()
+                poller.join(timeout=2.0)
+                # The bounded join above does not *guarantee* the poller has
+                # released it -- a slow DNS/HTTP probe can still be mid-flight
+                # past the timeout. Release it here as a fallback regardless
+                # (SingleInstance.release() is a safe no-op if the poller
+                # already did it) before clearing the reference, or a stuck
+                # probe could strand serve-start.lock until process exit and
+                # block every later start/cutover (review follow-up on
+                # ThomasMichon/copilot-extensions#3066).
+                _lock.release()
+                start_lock = None
+        else:
+            server.run(sockets=[sock])
     finally:
+        # Always release even on an early raise/SystemExit above -- the
+        # readiness-gated release path above already cleared this to None on
+        # its own success, so this is a no-op there.
+        if start_lock is not None:
+            start_lock.release()
         if fed_runner is not None:
             fed_runner.stop()
         _clear_routing()
         clear_endpoint(run_dir(), owner_pid=os.getpid())
-        sock.close()
+        if sock is not None:
+            sock.close()
 
 
 #: (reserved) -- the live uvicorn server is attached to ``app.state.uvicorn_server``
@@ -291,6 +509,29 @@ def _maybe_start_federation():
     except Exception as exc:
         log.warning("federation runner not started (serving without it): %s", exc)
         return None
+
+
+def _loopback_probe_url(host: str, port: int) -> str:
+    """Build an ``http://`` URL for a locally-bound ``host:port``.
+
+    ``host`` is a bind address (e.g. from ``Config.host``), not always a valid
+    probe destination: a wildcard/unspecified bind (``0.0.0.0``/``::``,
+    explicitly permitted by ``check_bind_safety()`` when a token is
+    configured) isn't a reliable local dial target, so it's normalized to the
+    corresponding loopback address first. An IPv6 literal such as ``::1``
+    also needs bracketing (``http://[::1]:port``), or ``urlopen`` misparses
+    it as ``host=':'``/``port`` garbage -- either case would otherwise make
+    the readiness probe fail forever and reintroduce the route-seizure race
+    this probe exists to close (review follow-up on
+    ThomasMichon/copilot-extensions#3066).
+    """
+    if host in ("0.0.0.0", ""):
+        host = "127.0.0.1"
+    elif host in ("::", "[::]"):
+        host = "::1"
+    if ":" in host and not host.startswith("["):
+        return f"http://[{host}]:{port}"
+    return f"http://{host}:{port}"
 
 
 def _server_bind_port() -> int:

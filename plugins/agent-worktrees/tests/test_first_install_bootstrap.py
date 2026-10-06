@@ -15,24 +15,34 @@ import pytest
 
 PLUGIN = Path(__file__).resolve().parents[1]
 pytestmark = pytest.mark.guard
+_SH = shutil.which("sh")
 
 
-def test_session_start_prefers_payload_bootstrap_with_installed_fallback() -> None:
+def test_session_start_prefers_payload_lifecycle_client_with_installed_fallback() -> None:
     hooks = json.loads((PLUGIN / "hooks.json").read_text(encoding="utf-8"))
     entries = hooks["hooks"]["sessionStart"]
-    bootstrap = next(
+    lifecycle = next(
         entry
         for entry in entries
-        if "bootstrap-check" in entry.get("bash", "")
-        or "bootstrap-check" in entry.get("powershell", "")
+        if "hook_client.py" in entry.get("bash", "")
     )
 
-    assert '${COPILOT_PLUGIN_ROOT:-$PWD}' in bootstrap["bash"]
-    assert 's="$r/scripts/bootstrap-check.sh"' in bootstrap["bash"]
-    assert '$HOME/.agent-worktrees/bin/bootstrap-check.sh' in bootstrap["bash"]
-    assert "$env:COPILOT_PLUGIN_ROOT" in bootstrap["powershell"]
-    assert "scripts\\bootstrap-check.ps1" in bootstrap["powershell"]
-    assert ".agent-worktrees\\bin\\bootstrap-check.ps1" in bootstrap["powershell"]
+    assert 'r="${COPILOT_PLUGIN_ROOT:-}"' in lifecycle["bash"]
+    assert 'r="$PWD"' in lifecycle["bash"]
+    assert '[ -z "${COPILOT_EXTENSIONS_CONTEXT:-}" ]' in lifecycle["bash"]
+    assert 's="$r/scripts/hook_client.py"' in lifecycle["bash"]
+    assert '$HOME/.agent-worktrees/bin/hook_client.py' in lifecycle["bash"]
+    assert "$env:COPILOT_PLUGIN_ROOT" in lifecycle["powershell"]
+    assert "scripts\\hook_client.py" in lifecycle["powershell"]
+    assert ".agent-worktrees\\bin\\hook_client.py" in lifecycle["powershell"]
+    assert "scripts\\bootstrap-check.ps1" in lifecycle["powershell"]
+    assert ".agent-worktrees\\bin\\bootstrap-check.ps1" in lifecycle["powershell"]
+    assert "scripts/bootstrap-check.sh" in lifecycle["bash"]
+    assert ".agent-worktrees/bin/bootstrap-check.sh" in lifecycle["bash"]
+
+    client = (PLUGIN / "scripts" / "hook_client.py").read_text(encoding="utf-8")
+    assert '"bootstrap-check.ps1"' in client
+    assert '"bootstrap-check.sh"' in client
 
 
 def test_bootstrap_stamps_payload_when_runtime_is_unprovisioned() -> None:
@@ -47,6 +57,30 @@ def test_bootstrap_stamps_payload_when_runtime_is_unprovisioned() -> None:
     assert "deploy-manifest.json" in ps1
 
 
+def test_bootstrap_stands_down_for_explicit_installation_context() -> None:
+    sh = (PLUGIN / "scripts" / "bootstrap-check.sh").read_text(encoding="utf-8")
+    ps1 = (PLUGIN / "scripts" / "bootstrap-check.ps1").read_text(encoding="utf-8")
+
+    assert 'if [[ -n "${COPILOT_EXTENSIONS_CONTEXT:-}" ]]' in sh
+    assert "if ($env:COPILOT_EXTENSIONS_CONTEXT) { exit 0 }" in ps1
+    assert sh.index("COPILOT_EXTENSIONS_CONTEXT") < sh.index('INSTALL_DIR="$HOME/.agent-worktrees"')
+    assert ps1.index("COPILOT_EXTENSIONS_CONTEXT") < ps1.index(
+        "Join-Path $env:USERPROFILE '.agent-worktrees'"
+    )
+
+
+def test_register_nudge_stands_down_before_legacy_registry_reads() -> None:
+    sh = (PLUGIN / "scripts" / "register-nudge.sh").read_text(encoding="utf-8")
+    ps1 = (PLUGIN / "scripts" / "register-nudge.ps1").read_text(encoding="utf-8")
+
+    assert sh.index("COPILOT_EXTENSIONS_CONTEXT") < sh.index(
+        '$HOME/.agent-worktrees/projects.yaml'
+    )
+    assert ps1.index("COPILOT_EXTENSIONS_CONTEXT") < ps1.index(
+        ".agent-worktrees\\projects.yaml"
+    )
+
+
 def test_windows_binstub_resolves_complete_slots_and_serializes_provision() -> None:
     ps1 = (PLUGIN / "bin" / "agent-worktrees.ps1").read_text(encoding="utf-8")
     cmd = (PLUGIN / "bin" / "agent-worktrees.cmd").read_text(encoding="utf-8")
@@ -54,7 +88,8 @@ def test_windows_binstub_resolves_complete_slots_and_serializes_provision() -> N
     assert "resolve-runtime.ps1" in ps1
     assert "System.Threading.Mutex" in ps1
     assert 'agent-worktrees.ps1" %*' in cmd
-    assert "powershell" in cmd
+    assert "%SystemRoot%\\System32\\where.exe" in cmd
+    assert "%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" in cmd
 
 
 def test_posix_binstub_resolves_only_active_or_complete_slots() -> None:
@@ -64,12 +99,119 @@ def test_posix_binstub_resolves_only_active_or_complete_slots() -> None:
     assert '_aw_exec_resolved "$@"' in sh
 
 
+def _stub_direct_install(home: Path, dir_name: str, sentinel: str) -> Path:
+    """Write a stub install.sh under a `_direct` installed-plugins layout
+    (``<owner>--<repo>--<subpath-with-dashes>``, no nested agent-worktrees/
+    segment) that echoes a caller-chosen sentinel, so a test can prove the
+    binstub's own glob resolution located and invoked THIS specific file,
+    not merely *some* install.sh."""
+    scripts = home / ".copilot" / "installed-plugins" / "_direct" / dir_name / "scripts"
+    scripts.mkdir(parents=True)
+    install = scripts / "install.sh"
+    install.write_text(f"#!/bin/sh\necho {sentinel}\nexit 0\n", encoding="utf-8")
+    install.chmod(install.stat().st_mode | stat.S_IEXEC)
+    return install
+
+
+@pytest.mark.skipif(_SH is None, reason="POSIX sh not available")
+def test_posix_binstub_self_provisions_from_a_direct_install_layout(tmp_path: Path) -> None:
+    """Regression test for a direct (non-marketplace) `copilot plugin
+    install <repo>:<path>` install, whose `_direct/<owner>--<repo>--
+    <subpath>/` layout has no nested `agent-worktrees/` path segment --
+    the marketplace-shaped glob never matches it (copilot-extensions
+    issue: agent-worktrees self-provisioning binstub fails on a `_direct`
+    install), silently skipping self-provisioning and falling through to a
+    guaranteed-to-fail `python -m agent_worktrees` last resort."""
+    home = tmp_path / "home"
+    home.mkdir()
+    _stub_direct_install(
+        home, "SomeOwner--some-repo--plugins-agent-worktrees", "DIRECT_INSTALL_SENTINEL"
+    )
+    # An unrelated direct-installed plugin whose name merely contains the
+    # substring "agent-worktrees" (but doesn't end with it) must never be
+    # selected instead -- the glob is anchored on the trailing path segment.
+    # A DISTINCT sentinel (never asserted true) proves the real installer
+    # won, not merely that *some* install.sh ran.
+    _stub_direct_install(
+        home, "SomeOrg--agent-worktrees-extra-tool--plugins-foo", "DECOY_SENTINEL_MUST_NOT_RUN"
+    )
+
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["AGENT_WORKTREES_NO_SELFPROVISION"] = ""
+    env.pop("AGENT_RT_ROOT", None)
+
+    proc = subprocess.run(
+        ["sh", str(PLUGIN / "bin" / "agent-worktrees"), "--version"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    # install.sh's own stdout is redirected to the parent's stderr
+    # (`bash "$_awinstall" provision >&2`).
+    assert "DIRECT_INSTALL_SENTINEL" in proc.stderr, proc.stderr
+    assert "DECOY_SENTINEL_MUST_NOT_RUN" not in proc.stderr, proc.stderr
+
+
+_PWSH = shutil.which("pwsh") or shutil.which("powershell")
+
+
+@pytest.mark.skipif(_PWSH is None, reason="pwsh/powershell not available")
+def test_windows_binstub_self_provisions_from_a_direct_install_layout(tmp_path: Path) -> None:
+    """PowerShell counterpart of the POSIX regression test above: the
+    `.ps1` binstub's own `_direct` discovery must select the intended
+    installer (ending in `-agent-worktrees`) over an adjacent,
+    false-positive-shaped decoy, by actually executing both discovery
+    AND the selected install.ps1 -- not merely asserting a regex literal
+    is present in the source."""
+    home = tmp_path / "home"
+    home.mkdir()
+
+    def _stub(dir_name: str, sentinel: str) -> None:
+        scripts = home / ".copilot" / "installed-plugins" / "_direct" / dir_name / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "install.ps1").write_text(
+            f"Write-Output '{sentinel}'\n", encoding="utf-8"
+        )
+
+    _stub("SomeOwner--some-repo--plugins-agent-worktrees", "DIRECT_INSTALL_SENTINEL")
+    _stub("SomeOrg--agent-worktrees-extra-tool--plugins-foo", "DECOY_SENTINEL_MUST_NOT_RUN")
+
+    harness = tmp_path / "harness.ps1"
+    harness.write_text(
+        (PLUGIN / "bin" / "agent-worktrees.ps1")
+        .read_text(encoding="utf-8")
+        # Exercise only the _direct discovery + invocation, never the real
+        # provisioning/mutex/uv machinery below it. `& $_inst` runs the
+        # selected install.ps1 directly in the CURRENT PowerShell host --
+        # whichever one (pwsh or Windows PowerShell) actually invoked this
+        # harness -- rather than hardcoding a `pwsh` child process that
+        # would fail on a host where only `powershell.exe` is available.
+        .split("if (-not ($_inst -and (Test-Path -LiteralPath $_inst))) { [Console]::Error", 1)[0]
+        + "if ($_inst) { & $_inst } else { Write-Output 'NO_INSTALLER_FOUND' }\n",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["USERPROFILE"] = str(home)
+    env["AGENT_WORKTREES_NO_SELFPROVISION"] = ""
+
+    proc = subprocess.run(
+        [_PWSH, "-NoProfile", "-File", str(harness)],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert "DIRECT_INSTALL_SENTINEL" in proc.stdout, proc.stderr
+    assert "DECOY_SENTINEL_MUST_NOT_RUN" not in proc.stdout, proc.stderr
+
+
 def test_direct_posix_payload_entrypoints_are_tracked_executable() -> None:
     repo = PLUGIN.parents[1]
     paths = (
         "plugins/agent-worktrees/bin/agent-worktrees",
-        "plugins/agent-worktrees/bin/launch-session.sh",
-        "plugins/agent-worktrees/bin/pane-wrapper.sh",
         "plugins/agent-worktrees/bin/payload/agent-worktrees",
     )
     result = subprocess.run(
@@ -109,6 +251,96 @@ def test_lean_provision_deploys_runtime_resolvers() -> None:
     assert "Move-Item $tmp $dst -Force" in ps1_deploy
 
 
+def test_posix_context_install_bootstraps_uv_before_runtime_build() -> None:
+    sh = (PLUGIN / "scripts" / "install.sh").read_text(encoding="utf-8")
+    install = sh.split("    install)", 1)[1].split("    uninstall)", 1)[0]
+
+    assert "if $CONTEXTUAL_INSTALL; then" in install
+    assert "_ensure_uv || exit 1" in install
+    assert "_ensure_uv_index" in install
+    assert install.index("_ensure_uv || exit 1") < install.index(
+        "deploy_venv || exit 1"
+    )
+    update = sh.split("    update)", 1)[1].split("    *)", 1)[0]
+    assert "_ensure_uv || exit 1" in update
+    assert "_ensure_uv_index" in update
+
+    ps1 = (PLUGIN / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    ps1_update = ps1.split("    'update' {", 1)[1]
+    assert "if (-not (Ensure-Uv)) { exit 1 }" in ps1_update
+    assert "Ensure-UvIndex" in ps1_update
+
+
+def test_context_install_revalidates_generations_before_cutover() -> None:
+    sh = (PLUGIN / "scripts" / "install.sh").read_text(encoding="utf-8")
+    ps1 = (PLUGIN / "scripts" / "install.ps1").read_text(encoding="utf-8")
+
+    for generation in (
+        "activationGeneration",
+        "namespaceGeneration",
+        "installGeneration",
+    ):
+        assert generation in sh
+        assert generation in ps1
+    assert "context_governance_unchanged" in sh
+    assert "Test-ContextGovernanceUnchanged" in ps1
+    assert sh.index("context_governance_unchanged") < sh.index(
+        "_versioned_activate || exit 1"
+    )
+    assert ps1.index("Test-ContextGovernanceUnchanged") < ps1.index(
+        "Invoke-VersionedActivate"
+    )
+
+
+def test_windows_context_install_uses_shallow_staging_root() -> None:
+    ps1 = (PLUGIN / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    context = ps1.split("if ($ContextualInstall) {", 1)[1].split(
+        "# === install-contract:v4 self-stage", 1
+    )[0]
+
+    assert "[IO.Path]::GetTempPath()" in context
+    assert "'copilot-extensions-install'" in context
+    assert "'agent-worktrees'" in context
+    assert "Join-Path $InstallDir '.install-stage'" not in context
+
+
+def test_windows_context_stage_preserves_argument_boundaries() -> None:
+    ps1 = (PLUGIN / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    context = ps1.split("if ($ContextualInstall) {", 1)[1].split(
+        "# === install-contract:v4 self-stage", 1
+    )[0]
+
+    assert "[Diagnostics.ProcessStartInfo]::new()" in context
+    assert "ArgumentList.Add([string]$argument)" in context
+    assert "ConvertTo-NativeArgument ([string]$_)" in context
+    assert "Start-Process -FilePath $hostExe" not in context
+
+
+def test_windows_context_stage_preserves_default_for_invalid_deadline() -> None:
+    ps1 = (PLUGIN / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    context = ps1.split("if ($ContextualInstall) {", 1)[1].split(
+        "# === install-contract:v4 self-stage", 1
+    )[0]
+
+    assert "$parsedContextDeadline = 0" in context
+    assert "[ref]$parsedContextDeadline" in context
+    assert "$parsedContextDeadlineOk = [int]::TryParse" in context
+    assert "$contextDeadline = $parsedContextDeadline" in context
+    assert "[ref]$contextDeadline" not in context
+
+
+def test_posix_context_stage_reaps_child_group_before_exit() -> None:
+    sh = (PLUGIN / "scripts" / "install.sh").read_text(encoding="utf-8")
+    context = sh.split(
+        "# A structured caller supplies both the validated context", 1
+    )[1].split("# === install-contract:v4 self-stage", 1)[0]
+
+    assert "__aw_stop_context_child()" in context
+    assert 'kill -- -"$__aw_child"' in context
+    assert 'wait "$__aw_child"' in context
+    assert "trap '__aw_stop_context_child 143' TERM" in context
+
+
 def test_installers_preserve_activation_during_inventory_bootstrap() -> None:
     sh = (PLUGIN / "scripts" / "install.sh").read_text(encoding="utf-8")
     ps1 = (PLUGIN / "scripts" / "install.ps1").read_text(encoding="utf-8")
@@ -123,25 +355,71 @@ def test_installers_preserve_activation_during_inventory_bootstrap() -> None:
     assert "copilot plugin install agent-worktrees@copilot-extensions" not in ps1
 
 
-def test_generated_project_binstubs_use_shared_three_tier_resolvers() -> None:
+def test_generated_project_binstubs_use_payload_dispatchers() -> None:
     sh = (PLUGIN / "scripts" / "install.sh").read_text(encoding="utf-8")
     ps1 = (PLUGIN / "scripts" / "install.ps1").read_text(encoding="utf-8")
-
-    assert 'source "\\$_root/bin/resolve-runtime.sh"' in sh
-    assert "resolve-runtime.ps1" in ps1
-    assert "last-known-good" not in sh.split("deploy_binstub() {", 1)[1].split(
+    sh_binstub = sh.split("deploy_binstub() {", 1)[1].split(
         "deploy_global_config()", 1
     )[0]
+    ps1_binstub = ps1.split("function Deploy-Binstub {", 1)[1].split(
+        "function Deploy-GlobalBinstub {", 1
+    )[0]
+
+    assert "bin/payload/agent-worktrees" in sh_binstub
+    assert "resolve-runtime.sh" not in sh_binstub
+    assert "bin\\payload\\agent-worktrees" in ps1_binstub
+    assert "resolve-runtime.ps1" not in ps1_binstub
+    assert "last-known-good" not in sh_binstub
 
 
-def test_launch_session_cmd_preserves_windows_powershell_fallback() -> None:
-    cmd = (PLUGIN / "bin" / "launch-session.cmd").read_text(encoding="utf-8")
+@pytest.mark.skipif(os.name != "nt", reason="Windows cmd regression")
+def test_windows_binstub_survives_overlong_path(tmp_path: Path) -> None:
+    cmd = tmp_path / "agent-worktrees.cmd"
+    shutil.copyfile(PLUGIN / "bin" / "agent-worktrees.cmd", cmd)
+    (tmp_path / "agent-worktrees.ps1").write_text(
+        "Write-Output ($args -join '|')\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PATH"] = ";".join([r"C:\missing"] * 1000)
 
-    assert "where pwsh" in cmd
-    assert 'set "_PSHOST=powershell"' in cmd
-    assert '"%_PSHOST%"' in cmd
+    proc = subprocess.run(
+        [os.environ["ComSpec"], "/d", "/c", str(cmd), "path-overflow"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "path-overflow"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows cmd regression")
+def test_windows_binstub_discovers_pwsh_by_absolute_path(tmp_path: Path) -> None:
+    pwsh = shutil.which("pwsh")
+    if not pwsh:
+        pytest.skip("pwsh is unavailable")
+    cmd = tmp_path / "agent-worktrees.cmd"
+    shutil.copyfile(PLUGIN / "bin" / "agent-worktrees.cmd", cmd)
+    (tmp_path / "agent-worktrees.ps1").write_text(
+        "Write-Output ($args -join '|')\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PATH"] = str(Path(pwsh).parent)
+
+    proc = subprocess.run(
+        [os.environ["ComSpec"], "/d", "/c", str(cmd), "pwsh-discovery"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "pwsh-discovery"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows cmd regression")
 def test_windows_stamp_reuses_immutable_version_snapshot() -> None:
     installer = (PLUGIN / "scripts" / "install.ps1").read_text(encoding="utf-8")
     stamp = installer.split("function Invoke-Stamp", 1)[1].split(
@@ -154,6 +432,20 @@ def test_windows_stamp_reuses_immutable_version_snapshot() -> None:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer integration")
+# Genuinely heavier than most tests in this file: a real payload copytree,
+# then `install.sh provision` (self-stage re-exec + venv create + package
+# install + versioned-activate + the post-activation monitor seam),
+# followed by two more subprocess invocations of the generated launchers.
+# That's 5+ real subprocess spawns chained together -- reliably ~15s in
+# 20/20 isolated local reproductions, but observed to intermittently exceed
+# the suite-wide 30s pytest-timeout default under real CI concurrency (a
+# `full - agent-worktrees` run hit `Failed: Timeout (>30.0s)` here on an
+# otherwise-unrelated PR, blocking dev->main promotion). No logic bug found
+# -- this is legitimate multi-subprocess work that needs more headroom than
+# the blanket default under load, not a hang to fix. Give it real margin
+# rather than reaching for a global timeout bump that would mask a genuine
+# hang in a lighter test.
+@pytest.mark.timeout(90)
 def test_posix_lean_provision_installs_resolver_and_launchers_reenter_runtime(
     tmp_path: Path,
 ) -> None:
@@ -165,7 +457,16 @@ def test_posix_lean_provision_installs_resolver_and_launchers_reenter_runtime(
         / "copilot-extensions"
         / "agent-worktrees"
     )
-    shutil.copytree(PLUGIN, payload)
+    shutil.copytree(
+        PLUGIN,
+        payload,
+        ignore=shutil.ignore_patterns(
+            "__pycache__",
+            "*.pyc",
+            ".pytest_cache",
+            ".test-venvs",
+        ),
+    )
 
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -181,6 +482,8 @@ case "${1:-}" in
 #!/bin/sh
 set -eu
 slot_dir="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
+_arg1="${1:-}"
+[ "$_arg1" = "-I" ] && shift
 if [ "${1:-}" = "-c" ]; then
   case "${2:-}" in
     *"import agent_worktrees, os"*)
@@ -245,3 +548,102 @@ esac
         )
         assert launched.returncode == 0, launched.stderr
         assert launched.stdout.strip() == "fake-agent-worktrees --version"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer integration")
+def test_posix_health_gate_rejects_namespace_package_slot(tmp_path: Path) -> None:
+    """A partial ``uv pip install`` can leave ``agent_worktrees`` on disk as an
+    empty directory -- no ``__init__.py``, no ``__main__.py``, no dist-info.
+    Python still imports that as a PEP 420 *namespace* package with no error,
+    so a health gate that only runs ``import agent_worktrees`` falsely passes
+    and the broken slot gets marked complete and activated (the exact bug
+    this regression guards). The fixed gate imports ``agent_worktrees.__main__``
+    instead, which requires a real ``__main__.py`` and its full transitive
+    import chain to resolve, so it must fail loudly here and the slot must
+    never be activated.
+    """
+    home = tmp_path / "home"
+    payload = (
+        home
+        / ".copilot"
+        / "installed-plugins"
+        / "copilot-extensions"
+        / "agent-worktrees"
+    )
+    shutil.copytree(
+        PLUGIN,
+        payload,
+        ignore=shutil.ignore_patterns(
+            "__pycache__",
+            "*.pyc",
+            ".pytest_cache",
+            ".test-venvs",
+        ),
+    )
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        """#!/usr/bin/env bash
+set -eu
+case "${1:-}" in
+  venv)
+    target="$2"
+    # Simulate the partial install: the package directory exists (so it is
+    # importable as a namespace package) but is otherwise empty -- no
+    # __init__.py, no __main__.py, no dist-info -- exactly what an
+    # interrupted `uv pip install` of the multi-package project left behind.
+    mkdir -p "$target/bin" "$target/fake-site/agent_worktrees"
+    cat > "$target/bin/python" <<'PY'
+#!/bin/sh
+set -eu
+_arg1="${1:-}"
+[ "$_arg1" = "-I" ] && shift
+if [ "${1:-}" = "-c" ]; then
+  case "${2:-}" in
+    *"import agent_worktrees.__main__"*) exit 1 ;;
+    *"import agent_worktrees"*) exit 0 ;;
+  esac
+fi
+if [ "${1:-}" = "-m" ] && [ "${2:-}" = "agent_worktrees" ]; then
+  echo "should never run: broken slot was activated" >&2
+  exit 1
+fi
+exec "$REAL_PYTHON" "$@"
+PY
+    chmod +x "$target/bin/python"
+    ;;
+  pip) ;;
+  *) exit 2 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+            "REAL_PYTHON": sys.executable,
+            "COPILOT_PLUGIN_INSTALL_DEADLINE_SEC": "0",
+        }
+    )
+    provision = subprocess.run(
+        ["bash", str(payload / "scripts" / "install.sh"), "provision"],
+        cwd=home,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert provision.returncode != 0
+    assert "failed its health gate" in provision.stderr
+
+    # The broken slot must never be marked complete or activated: no
+    # current-version marker, and no last-known-good pointing at it.
+    install_dir = home / ".agent-worktrees"
+    assert not (install_dir / "current-version").exists()
+    assert not (install_dir / "last-known-good").exists()

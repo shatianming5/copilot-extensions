@@ -1,3 +1,24 @@
+# --- bootstrap-killswitch guard (vendored; see libs/bootstrap-killswitch/README.md) ---
+# One shared, repo-wide switch (not per-plugin) that pauses EVERY adopting
+# plugin's reconcile-on-session-start at once, for when an operator/agent is
+# hand-diagnosing a venv/install and a background reconcile must not race it.
+# Legacy/default installation ONLY: a namespaced marketplace cell
+# (COPILOT_EXTENSIONS_CONTEXT set) reconciles through its own cell-scoped
+# mechanism, never this global state file -- crossing that installation-cell
+# boundary would let one marketplace's switch pause an unrelated,
+# independently-owned cell's reconcile (visions/plugin-services/
+# installation-cells). This guard is therefore a deliberate no-op under a
+# cell context, same as this hook's own existing cell-context exit below.
+if (-not $env:COPILOT_EXTENSIONS_CONTEXT) {
+  $_bksGuardDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+  $_bksGuard = Join-Path $_bksGuardDir "bootstrap-killswitch-guard.ps1"
+  if (Test-Path -LiteralPath $_bksGuard) {
+    & $_bksGuard check
+    if ($LASTEXITCODE -eq 0) { [Console]::Out.Write('{}'); exit 0 }
+  }
+}
+# --- end bootstrap-killswitch guard ---
+
 # Bootstrap hook -- runs on session start via hooks.json. hooks.json runs the
 # PLUGIN PAYLOAD copy first, falling back to the deployed ~/.agent-worktrees\bin
 # copy. Two jobs, both grace-window-cheap:
@@ -12,6 +33,11 @@
 # Compatible with PowerShell 5.1+ and pwsh 7+.
 
 $ErrorActionPreference = 'SilentlyContinue'
+
+# A selected installation context owns runtime resolution. The payload-local
+# command validates it and provisions its cell on first use; this best-effort
+# hook must never touch the legacy root while any explicit context is present.
+if ($env:COPILOT_EXTENSIONS_CONTEXT) { exit 0 }
 
 $InstallDir = Join-Path $env:USERPROFILE '.agent-worktrees'
 $LibDir     = Join-Path $InstallDir 'lib'
@@ -43,29 +69,31 @@ if ((-not $VenvPython) -and (-not (Test-AwProvisioned))) {
         $pw = Get-Command pwsh -ErrorAction SilentlyContinue
         $exe = if ($pw) { $pw.Source } else { 'powershell.exe' }
         & $exe -NoProfile -ExecutionPolicy Bypass -File $installer stamp *> $null
+        [Console]::Out.Write('{}')
         exit 0
     }
-    # Deployed-copy fallback on a still-unprovisioned box -> setup hint.
-    Write-Host ''
-    Write-Host '[agent-worktrees] Runtime not installed.' -ForegroundColor Yellow
-    Write-Host '  Ask Copilot to ''set up agent-worktrees'' to bootstrap the runtime.' -ForegroundColor DarkGray
-    Write-Host ''
+    # Deployed-copy fallback on a still-unprovisioned box -> setup hint. Every
+    # sessionStart invocation of this fallback (including hooks.json's direct,
+    # no-python last resort) must emit exactly `{}`; the hint is diagnostic,
+    # not model-facing, so it goes to stderr only.
+    [Console]::Error.WriteLine("[agent-worktrees] Runtime not installed. Ask Copilot to 'set up agent-worktrees' to bootstrap the runtime.")
+    [Console]::Out.Write('{}')
     exit 0
 }
 
 # Provisioned via the tools-half (versioned slot) but the full-launcher resolver
 # isn't deployed -> nothing to reconcile via the legacy lib-copy path; no-op.
-if (-not $VenvPython) { exit 0 }
+if (-not $VenvPython) { [Console]::Out.Write('{}'); exit 0 }
 
 # --- Installed: check if package is stale ---
-if (-not (Test-Path $Manifest)) { exit 0 }
+if (-not (Test-Path $Manifest)) { [Console]::Out.Write('{}'); exit 0 }
 try {
     $m = Get-Content $Manifest -Raw | ConvertFrom-Json
     $pluginDir = $m.plugin_source
-    if (-not $pluginDir -or -not (Test-Path $pluginDir)) { exit 0 }
+    if (-not $pluginDir -or -not (Test-Path $pluginDir)) { [Console]::Out.Write('{}'); exit 0 }
 
     $PkgSrc = Join-Path $pluginDir 'src\agent_worktrees'
-    if (-not (Test-Path $PkgSrc)) { exit 0 }
+    if (-not (Test-Path $PkgSrc)) { [Console]::Out.Write('{}'); exit 0 }
 
     $deployedCommit = $m.commit
     $currentCommit = $null
@@ -74,11 +102,13 @@ try {
     } catch { }
 
     if (-not $deployedCommit -or -not $currentCommit -or $deployedCommit -eq $currentCommit) {
+        [Console]::Out.Write('{}')
         exit 0
     }
 
-    # Stale -- re-deploy package
-    Write-Host '[agent-worktrees] Updating runtime payload...' -ForegroundColor DarkGray
+    # Stale -- re-deploy package. Progress notices are diagnostics, not model
+    # context: route them to stderr and keep stdout a single JSON object.
+    [Console]::Error.WriteLine('[agent-worktrees] Updating runtime payload...')
     if (Test-Path $PkgDst) {
         Remove-Item $PkgDst -Recurse -Force
     }
@@ -125,7 +155,8 @@ BUILD_INFO: dict[str, str] = {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($Manifest, $manifestJson, $utf8NoBom)
 
-    Write-Host '[agent-worktrees] Runtime updated.' -ForegroundColor DarkGray
+    [Console]::Error.WriteLine('[agent-worktrees] Runtime updated.')
 } catch { }
 
+[Console]::Out.Write('{}')
 exit 0

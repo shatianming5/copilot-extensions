@@ -36,6 +36,22 @@ Configure the target with the `session-sync-setup` skill, or edit
 `sync.repo_denylist`, and `sync.repo_allowlist_fail_closed` when a machine
 should archive only particular repos (or everything except particular repos).
 
+Session `files/` may accumulate generated artifacts that should never be
+archived or synced: tool-generated Chromium user-data directories (which can
+carry live cookies/auth state), Python venvs, git clones/worktrees, and
+`node_modules` trees. Session-sync identifies each of these from its on-disk
+signature (a Chromium profile structure, a `pyvenv.cfg`, a `.git` entry, or a
+`node_modules` directory name), omits the whole subtree across all
+transports, and removes any stale copy already present on filesystem-backed
+destinations. It never deletes the original local session artifact; the
+latest omission footprint is visible in `session-sync status`.
+
+This is detection, not prevention -- it keeps such artifacts out of the
+synced archive, but does not stop an agent from writing them into `files/` in
+the first place. Session guidance should still steer agents toward ephemeral
+workdirs / existing tool caches for installs and clones rather than the
+session `files/` directory.
+
 ## 3. Fleet hub (many machines, one shared folder)
 
 Every machine runs **session-sync** pointed at a **shared folder** or service
@@ -79,3 +95,15 @@ OneDrive/(Copilot)/sessions/<machine>/
 A hub machine that has the folder synced locally then reads
 `(Copilot)/sessions/<machine>/...` for every machine, persists validated render
 bundles, and lands the resulting logs.
+
+The same hub can report bounded fleet health without reading task logs:
+
+```
+session-sync health --fleet --max-age-hours 12 --partial-threshold 3 --json
+```
+
+Fresh complete machines are healthy. A fresh partial result remains degraded
+until it reaches the repeated-partial threshold; stale, missing, unreadable, or
+repeatedly partial machines are unhealthy and make the command exit nonzero.
+Repeat `--machine NAME` to restrict alerting to the active fleet while retaining
+historical or ephemeral machine data in the shared corpus.

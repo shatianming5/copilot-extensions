@@ -15,6 +15,7 @@ Three surfaces are covered:
 
 from __future__ import annotations
 
+import math
 import threading
 
 import pytest
@@ -27,6 +28,8 @@ from agent_dispatch.registrations import (
     RegistrationKind,
     RegistrationStatus,
     derive_registration_id,
+    validate_companion_config_result,
+    validate_companion_health_result,
     validate_registration,
 )
 from tests._helpers import OTHER_REPO, TEST_REPO
@@ -47,7 +50,15 @@ def q(tmp_path):
 
 
 def test_validate_accepts_each_kind():
-    validate_registration(RegistrationKind.SUPERVISED_LANE, {"repo": TEST_REPO})
+    validate_registration(
+        RegistrationKind.SUPERVISED_LANE,
+        {
+            "repo": TEST_REPO,
+            "labels": ["review"],
+            "embody_backend": "cli",
+            "disposable_cli_labels": ["review"],
+        },
+    )
     validate_registration(RegistrationKind.SUPERVISED_LANE, {"all_repos": True})
     validate_registration(RegistrationKind.SCHEDULE, {"id": "nightly", "repo": TEST_REPO})
     validate_registration(RegistrationKind.EMITTER, {"url": "http://x"})
@@ -57,11 +68,102 @@ def test_validate_accepts_each_kind():
          "interval_seconds": 3600},
     )
     validate_registration(
-        RegistrationKind.EVALUATOR, {"evaluator_spec": {}, "all_repos": True}
+        RegistrationKind.EMITTER,
+        {
+            "id": "effort-driver",
+            "effort_driver_loop": {
+                "name": "effort-driver",
+                "kind": "effort-driver-loop",
+                "repo": TEST_REPO,
+                "source": "effort-driver",
+                "cadence_seconds": 3600,
+                "effort_slugs": ["recipe-library"],
+                "state_root": "C:\\repo",
+                "task_label": "effort-work",
+                "pool": {"body": {"type": "headless", "agent": "effort-worker"}},
+            },
+            "interval_seconds": 60,
+            "cwd": "C:\\repo",
+        },
     )
     validate_registration(
-        RegistrationKind.EVALUATOR, {"evaluator": "eval.json", "repo": TEST_REPO}
+        RegistrationKind.EVALUATOR,
+        {"evaluator_spec": {}, "all_repos": True, "evaluator_ref": "review-loop"},
     )
+    validate_registration(
+        RegistrationKind.EVALUATOR,
+        {"evaluator": "eval.json", "repo": TEST_REPO, "evaluator_ref": "review-loop"},
+    )
+    validate_registration(
+        RegistrationKind.PLUGIN_COMPANION,
+        {
+            "command": ["bin/serve", "--foreground"],
+            "stop_command": ["bin/stop"],
+            "health_probe": ["bin/health", "--json"],
+            "config_provider": ["bin/config"],
+            "health_timeout_seconds": 5,
+            "managed_runtime": {
+                "schema_version": 1,
+                "runtimes": [
+                    {
+                        "name": "service",
+                        "version": "1.2.3",
+                        "profile": "host",
+                        "python_env": "EXAMPLE_MANAGED_PYTHON",
+                        "projects": [
+                            {"path": "libs/helper"},
+                            {"path": ".", "extras": ["service"]},
+                        ],
+                        "imports": ["example_service", "example_service.api"],
+                    }
+                ],
+            },
+        },
+    )
+
+
+def test_validate_registration_accepts_effort_driver_emitter_builtin():
+    validate_registration(
+        RegistrationKind.EMITTER,
+        {
+            "id": "effort-driver",
+            "effort_driver_loop": {
+                "name": "effort-driver",
+                "kind": "effort-driver-loop",
+                "repo": TEST_REPO,
+                "source": "effort-driver",
+                "cadence_seconds": 3600,
+                "effort_slugs": ["recipe-library"],
+                "state_root": "C:\\repo",
+                "task_label": "effort-work",
+                "pool": {"body": {"type": "headless", "agent": "effort-worker"}},
+            },
+            "interval_seconds": 60,
+            "cwd": "C:\\repo",
+        },
+    )
+
+
+def test_register_evaluator_requires_explicit_ref(tmp_path):
+    queue = TaskQueue(tmp_path / "tasks.db")
+    with pytest.raises(TaskError, match="non-empty 'evaluator_ref'"):
+        queue.register_registration(
+            RegistrationKind.EVALUATOR,
+            {"evaluator_spec": {}, "repo": TEST_REPO},
+        )
+
+
+def test_validate_registration_rejects_non_finite_reviewer_loop_stale_after_days():
+    with pytest.raises(RegistrationError, match="stale_after_days must be a number > 0"):
+        validate_registration(
+            RegistrationKind.EVALUATOR,
+            {
+                "repo": TEST_REPO,
+                "evaluator_ref": "review-loop",
+                "evaluator_spec": {},
+                "reviewer_loop": {"stale_after_days": math.nan},
+            },
+        )
 
 
 @pytest.mark.parametrize(
@@ -84,10 +186,512 @@ def test_validate_accepts_each_kind():
         (RegistrationKind.EVALUATOR, {"evaluator": "e.json"}, "needs a 'repo'"),
         (RegistrationKind.EVALUATOR, {"evaluator_spec": "not-a-dict", "all_repos": True},
          "must be a JSON object"),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {"stop_command": ["bin/stop"], "health_probe": ["bin/health"]},
+            "command",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["/bin/serve"],
+                "stop_command": ["bin/stop"],
+                "health_probe": ["bin/health"],
+            },
+            "plugin-relative",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["../serve"],
+                "stop_command": ["bin/stop"],
+                "health_probe": ["bin/health"],
+            },
+            "contained relative",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["C:../serve.exe"],
+                "stop_command": ["bin/stop"],
+                "health_probe": ["bin/health"],
+            },
+            "plugin-relative",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "health_timeout_seconds": math.nan,
+            },
+            "> 0 and <= 3600",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "stop_command": ["bin/stop"],
+                "health_probe": ["bin/health"],
+                "surprise": True,
+            },
+            "unknown fields",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {"command": ["bin/serve"], "managed_runtime": []},
+            "JSON object",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {"schema_version": 2, "runtimes": []},
+            },
+            "schema_version 1",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "../service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": "."}],
+                            "imports": ["example"],
+                        }
+                    ],
+                },
+            },
+            "portable filesystem component",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "CON.txt",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": "."}],
+                            "imports": ["example"],
+                        }
+                    ],
+                },
+            },
+            "portable filesystem component",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service.",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": "."}],
+                            "imports": ["example"],
+                        }
+                    ],
+                },
+            },
+            "portable filesystem component",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": "../outside"}],
+                            "imports": ["example"],
+                        }
+                    ],
+                },
+            },
+            "contained plugin-relative path",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": "COM¹"}],
+                            "imports": ["example"],
+                        }
+                    ],
+                },
+            },
+            "contained plugin-relative path",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": "LPT².txt"}],
+                            "imports": ["example"],
+                        }
+                    ],
+                },
+            },
+            "contained plugin-relative path",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": "libs\\helper"}],
+                            "imports": ["example"],
+                        }
+                    ],
+                },
+            },
+            "plugin-relative path",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": "bad:stream"}],
+                            "imports": ["example"],
+                        }
+                    ],
+                },
+            },
+            "contained plugin-relative path",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": "project "}],
+                            "imports": ["example"],
+                        }
+                    ],
+                },
+            },
+            "contained plugin-relative path",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "not-an-env",
+                            "projects": [{"path": "."}],
+                            "imports": ["example"],
+                        }
+                    ],
+                },
+            },
+            "environment variable name",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": ".", "extras": ["bad extra"]}],
+                            "imports": ["example"],
+                        }
+                    ],
+                },
+            },
+            "unique portable names",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [
+                                {"path": ".", "extras": ["service", "SERVICE"]}
+                            ],
+                            "imports": ["example"],
+                        }
+                    ],
+                },
+            },
+            "unique portable names",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": "."}],
+                            "imports": ["not-valid!"],
+                        }
+                    ],
+                },
+            },
+            "Python import names",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": "."}],
+                            "imports": ["example.api", "EXAMPLE.API"],
+                        }
+                    ],
+                },
+            },
+            "Python import names",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": ".", "installer": "pip"}],
+                            "imports": ["example"],
+                        }
+                    ],
+                },
+            },
+            "unknown fields",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": "C:\\outside"}],
+                            "imports": ["example"],
+                        }
+                    ],
+                },
+            },
+            "plugin-relative path",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": "."}],
+                            "imports": ["example"],
+                        },
+                        {
+                            "name": "service",
+                            "version": "2",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON_2",
+                            "projects": [{"path": "."}],
+                            "imports": ["example"],
+                        },
+                    ],
+                },
+            },
+            "duplicate runtime name",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service-a",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "RUNTIME_PYTHON",
+                            "projects": [{"path": "."}],
+                            "imports": ["example"],
+                        },
+                        {
+                            "name": "service-b",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "runtime_python",
+                            "projects": [{"path": "."}],
+                            "imports": ["example"],
+                        },
+                    ],
+                },
+            },
+            "duplicate python environment",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": "a" * 1025}],
+                            "imports": ["example"],
+                        }
+                    ],
+                },
+            },
+            "contained plugin-relative path",
+        ),
+        (
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "1",
+                            "profile": "host",
+                            "python_env": "EXAMPLE_PYTHON",
+                            "projects": [{"path": "."}],
+                            "imports": ["a" * 513],
+                        }
+                    ],
+                },
+            },
+            "Python import names",
+        ),
         (RegistrationKind.SCHEDULE, {"schedules": "nope", "id": "x", "repo": "r"},
          "non-empty list of objects"),
         (RegistrationKind.SCHEDULE, {"schedules": [], "id": "x", "repo": "r"},
          "non-empty list of objects"),
+        (
+            RegistrationKind.SUPERVISED_LANE,
+            {
+                "repo": TEST_REPO,
+                "labels": ["review"],
+                "embody_backend": "cli",
+                "disposable_cli_labels": ["other"],
+            },
+            "not watched",
+        ),
+        (
+            RegistrationKind.SUPERVISED_LANE,
+            {
+                "repo": TEST_REPO,
+                "labels": ["review"],
+                "embody_backend": "cli",
+                "fleet": {"pool": ["host-a"]},
+                "disposable_cli_labels": ["review"],
+            },
+            "only for local bodies",
+        ),
     ],
 )
 def test_validate_rejects_malformed(kind, spec, needle):
@@ -107,6 +711,30 @@ def test_derive_id_is_deterministic_and_scope_sensitive():
     assert a != derive_registration_id(
         "supervised-lane", _lane(labels=["x"]), "anomalous-potato", "default"
     )
+
+
+def test_companion_provider_result_contracts_are_versioned_and_strict():
+    validate_companion_config_result(
+        {
+            "schema_version": 1,
+            "active": True,
+            "arguments": ["--config", "config.json"],
+            "environment": {"MODE": "service"},
+        }
+    )
+    validate_companion_health_result(
+        {"schema_version": 1, "healthy": True, "detail": "ready"}
+    )
+    with pytest.raises(RegistrationError, match="schema_version 1"):
+        validate_companion_config_result({"schema_version": 2, "active": True})
+    with pytest.raises(RegistrationError, match="schema_version 1"):
+        validate_companion_config_result({"schema_version": True, "active": True})
+    with pytest.raises(RegistrationError, match="schema_version 1"):
+        validate_companion_health_result({"schema_version": 1.0, "healthy": True})
+    with pytest.raises(RegistrationError, match="unknown fields"):
+        validate_companion_health_result(
+            {"schema_version": 1, "healthy": True, "extra": "nope"}
+        )
 
 
 # -- store: queue-level semantics --------------------------------------------
@@ -147,6 +775,18 @@ def test_register_validates_eagerly(q):
     with pytest.raises(TaskError) as exc:
         q.register_registration("supervised-lane", {}, reg_id="x")
     assert "repo" in str(exc.value)
+
+
+def test_direct_registration_rejects_plugin_companion(q):
+    with pytest.raises(TaskError, match="not available through direct registration"):
+        q.register_registration(
+            RegistrationKind.PLUGIN_COMPANION,
+            {
+                "command": ["bin/serve"],
+                "stop_command": ["bin/stop"],
+                "health_probe": ["bin/health"],
+            },
+        )
 
 
 def test_register_rejects_non_serializable_spec(q):
@@ -271,11 +911,13 @@ def _parse(argv):
 def test_cli_register_parses_lane_flags():
     args = _parse(
         ["supervise", "register", "--repo", TEST_REPO, "--label", "x",
+         "--embody-backend", "cli", "--disposable-cli-label", "x",
          "--max-concurrent", "2"]
     )
     assert args.supervise_command == "register"
     assert args.repo == TEST_REPO
     assert args.label == ["x"]
+    assert args.disposable_cli_label == ["x"]
     assert args.max_concurrent == 2
 
 
@@ -289,12 +931,62 @@ def test_cli_build_spec_from_lane_flags():
 
     args = _parse(
         ["supervise", "register", "--all-repos", "--label", "code-review",
+         "--embody-backend", "script", "--script-label", "maintenance",
+         "--disposable-cli-label", "code-review",
          "--max-attempts", "5"]
     )
     spec = _build_registration_spec(args)
     assert spec["all_repos"] is True
     assert spec["labels"] == ["code-review"]
+    assert spec["embody_backend"] == "script"
+    assert spec["script_labels"] == ["maintenance"]
+    assert spec["disposable_cli_labels"] == ["code-review"]
     assert spec["max_attempts"] == 5
+
+
+def test_cli_build_spec_from_lane_flags_includes_idle_nudge_exempt_labels():
+    from agent_dispatch.__main__ import _build_registration_spec
+
+    args = _parse(
+        ["supervise", "register", "--all-repos", "--label", "code-review",
+         "--idle-nudge-exempt-label", "code-review"]
+    )
+    spec = _build_registration_spec(args)
+    assert spec["idle_nudge_exempt_labels"] == ["code-review"]
+
+
+def test_cli_build_spec_from_lane_flags_includes_steering_disallowed_labels():
+    from agent_dispatch.__main__ import _build_registration_spec
+
+    args = _parse(
+        ["supervise", "register", "--all-repos", "--label", "code-review",
+         "--steering-disallowed-label", "code-review"]
+    )
+    spec = _build_registration_spec(args)
+    assert spec["steering_disallowed_labels"] == ["code-review"]
+
+
+def test_validate_registration_accepts_steering_disallowed_labels_subset_of_labels():
+    validate_registration(
+        RegistrationKind.SUPERVISED_LANE,
+        {
+            "all_repos": True,
+            "labels": ["intelligence-dampener-review"],
+            "steering_disallowed_labels": ["intelligence-dampener-review"],
+        },
+    )
+
+
+def test_validate_registration_rejects_steering_disallowed_label_not_watched():
+    with pytest.raises(RegistrationError, match="not watched"):
+        validate_registration(
+            RegistrationKind.SUPERVISED_LANE,
+            {
+                "all_repos": True,
+                "labels": ["general"],
+                "steering_disallowed_labels": ["intelligence-dampener-review"],
+            },
+        )
 
 
 def test_cli_build_spec_inline_json():
@@ -308,6 +1000,21 @@ def test_cli_build_spec_inline_json():
     assert spec == {"id": "nightly", "interval_seconds": 3600}
 
 
+def test_cli_build_spec_inline_json_rejects_charter_with_cli_embody_backend():
+    """A raw --spec bypasses the flag-based charter/mode check entirely --
+    it needs the same guard so a persisted registration can't retry a lane
+    the daemon will always refuse to start."""
+    from agent_dispatch.__main__ import _build_registration_spec
+
+    args = _parse(
+        ["supervise", "register", "--spec",
+         '{"charter": "cab-charter", "embody_backend": "cli"}']
+    )
+    with pytest.raises(SystemExit) as exc:
+        _build_registration_spec(args)
+    assert "--spec charter is only supported for a fully headless lane" in str(exc.value)
+
+
 def test_cli_build_spec_missing_file_errors():
     from agent_dispatch.__main__ import _build_registration_spec
 
@@ -318,6 +1025,32 @@ def test_cli_build_spec_missing_file_errors():
     with pytest.raises(SystemExit) as exc:
         _build_registration_spec(args)
     assert "could not read --spec file" in str(exc.value)
+
+
+def test_cli_build_spec_rejects_charter_with_cli_embody_backend():
+    """agent-worktrees embody has no charter-binding flag -- refuse persisting
+    a registration the daemon can never actually start."""
+    from agent_dispatch.__main__ import _build_registration_spec
+
+    args = _parse(
+        ["supervise", "register", "--all-repos", "--label", "code-review",
+         "--embody-backend", "cli", "--charter", "cab-charter"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        _build_registration_spec(args)
+    assert "--charter is only supported for a fully headless lane" in str(exc.value)
+
+
+def test_cli_build_spec_rejects_charter_with_cli_label():
+    from agent_dispatch.__main__ import _build_registration_spec
+
+    args = _parse(
+        ["supervise", "register", "--all-repos", "--label", "code-review",
+         "--cli-label", "code-review", "--charter", "cab-charter"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        _build_registration_spec(args)
+    assert "--charter is only supported for a fully headless lane" in str(exc.value)
 
 
 def test_cli_status_and_remove_take_id():
@@ -349,6 +1082,144 @@ def test_cli_register_ensure_flag():
     assert a.ensure is True
     b = _parse(["supervise", "register", "--repo", TEST_REPO])
     assert b.ensure is False
+
+
+def test_supervisor_daemon_root_hosts_recurring_children_windowlessly(
+    monkeypatch, tmp_path,
+):
+    from agent_dispatch import __main__ as cli
+    from agent_dispatch import procutil
+
+    observed = {}
+    # No installed runtime under this fake home -> resolve_own_runtime_python
+    # degrades to sys.executable (its documented fallback), keeping this test
+    # isolated from whatever runtime happens to be installed on the machine
+    # actually running the suite.
+    monkeypatch.setattr(cli.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(cli.sys, "executable", "python.exe")
+    monkeypatch.setattr(
+        procutil,
+        "windowless_daemon_kwargs",
+        lambda: {"creationflags": 0x08000000},
+    )
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda argv, **kwargs: observed.update(argv=argv, kwargs=kwargs),
+    )
+
+    assert cli._spawn_supervisor_daemon_detached("host-a", "default")
+    assert observed["argv"][0] == "python.exe"
+    assert observed["kwargs"]["creationflags"] == 0x08000000
+
+
+def test_supervisor_daemon_root_resolves_installed_slot_not_sys_executable(
+    monkeypatch, tmp_path,
+):
+    """Regression test (sibling to the coordinator's own): the supervisor's
+    detached self-relaunch must resolve the canonical current-version slot, not
+    sys.executable, so it can never diverge from what the daemon it is meant to
+    replace/join is actually running."""
+    from agent_dispatch import __main__ as cli
+    from agent_dispatch import procutil
+
+    monkeypatch.setattr(cli.Path, "home", lambda: tmp_path)
+    install_dir = tmp_path / ".agent-dispatch"
+    slot_py = install_dir / "versions" / "0.1.2-dev49" / "Scripts" / "python.exe"
+    slot_py.parent.mkdir(parents=True)
+    slot_py.write_text("")
+    (install_dir / "current-version").write_text("0.1.2-dev49")
+    monkeypatch.setattr(cli.sys, "executable", "WRONG-INTERPRETER")
+    monkeypatch.setattr(procutil, "windowless_daemon_kwargs", lambda: {})
+    observed = {}
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda argv, **kwargs: observed.update(argv=argv),
+    )
+
+    assert cli._spawn_supervisor_daemon_detached("host-a", "default")
+    assert observed["argv"][0] == str(slot_py)
+
+
+def test_ensure_supervisor_daemon_no_ops_for_a_foreign_machine(monkeypatch):
+    """Regression test for #2791: ``--ensure`` must never spawn a local
+    supervisor for a ``--machine`` scope that isn't this host's own resolved
+    identity -- that previously left a persistent, wrongly-scoped daemon
+    running on the wrong box with no local visibility into why."""
+    from agent_dispatch import remote_dispatch
+    from agent_dispatch import supervise_cli
+
+    monkeypatch.setattr(remote_dispatch, "local_machine", lambda: "host-a")
+    spawned = {}
+
+    def _fake_spawn(machine, env):
+        spawned["called"] = (machine, env)
+        return True
+
+    monkeypatch.setattr(supervise_cli, "_spawn_supervisor_daemon_detached", _fake_spawn)
+
+    result = supervise_cli._ensure_supervisor_daemon(
+        _parse(["supervise", "register"]), "host-b", "default"
+    )
+
+    assert result["ensured"] is False
+    assert result["reason"] == "not-local-machine"
+    assert result["local_machine"] == "host-a"
+    assert "called" not in spawned
+
+
+def test_ensure_supervisor_daemon_still_spawns_for_the_local_machine(monkeypatch, tmp_path):
+    """Sibling to the above: a scope that DOES match the local host's resolved
+    identity is unaffected by the new guard."""
+    from agent_dispatch import __main__ as cli
+    from agent_dispatch import remote_dispatch
+    from agent_dispatch import supervise_cli
+
+    monkeypatch.setattr(remote_dispatch, "local_machine", lambda: "host-a")
+    monkeypatch.setattr(cli.Path, "home", lambda: tmp_path)
+    spawned = {}
+
+    def _fake_spawn(machine, env):
+        spawned["called"] = (machine, env)
+        return True
+
+    monkeypatch.setattr(supervise_cli, "_spawn_supervisor_daemon_detached", _fake_spawn)
+
+    result = supervise_cli._ensure_supervisor_daemon(
+        _parse(["supervise", "register"]), "host-a", "default"
+    )
+
+    assert result["ensured"] is True
+    assert spawned["called"] == ("host-a", "default")
+
+
+def test_ensure_supervisor_daemon_still_spawns_for_a_case_insensitive_local_match(
+    monkeypatch, tmp_path,
+):
+    """Regression test for the reviewed-in follow-up: a differently-cased but
+    otherwise identical machine name is still THIS host, not a foreign one
+    (mirrors :func:`remote_dispatch.is_peer_machine`'s own case-insensitivity)."""
+    from agent_dispatch import __main__ as cli
+    from agent_dispatch import remote_dispatch
+    from agent_dispatch import supervise_cli
+
+    monkeypatch.setattr(remote_dispatch, "local_machine", lambda: "host-a")
+    monkeypatch.setattr(cli.Path, "home", lambda: tmp_path)
+    spawned = {}
+
+    def _fake_spawn(machine, env):
+        spawned["called"] = (machine, env)
+        return True
+
+    monkeypatch.setattr(supervise_cli, "_spawn_supervisor_daemon_detached", _fake_spawn)
+
+    result = supervise_cli._ensure_supervisor_daemon(
+        _parse(["supervise", "register"]), "HOST-A", "default"
+    )
+
+    assert result["ensured"] is True
+    assert spawned["called"] == ("HOST-A", "default")
 
 
 def test_cli_build_spec_evaluator_convenience():

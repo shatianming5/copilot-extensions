@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -279,6 +280,40 @@ def test_resolve_plugin_bridge_no_infix(tmp_path, monkeypatch):
     assert resolve_config_path("vei") == p
 
 
+def test_selected_marketplace_root_scopes_duplicate_plugin_bridges(
+    tmp_path, monkeypatch
+):
+    market_a = tmp_path / "market-a"
+    market_b = tmp_path / "market-b"
+    expected = _make_plugin_bridge(market_a, ".", "plug-a", "demo.mcp.yaml")
+    _make_plugin_bridge(market_b, ".", "plug-b", "demo.mcp.yaml")
+    monkeypatch.setenv("AGENT_MCP_MARKETPLACE_ROOT", str(market_a))
+    monkeypatch.setenv("AGENT_MCP_PLUGIN_ROOTS", str(tmp_path))
+    assert resolve_config_path("demo") == expected
+
+
+def test_selected_marketplace_root_trims_surrounding_whitespace(
+    tmp_path, monkeypatch
+):
+    market = tmp_path / "market-a"
+    expected = _make_plugin_bridge(market, ".", "plug-a", "demo.mcp.yaml")
+    monkeypatch.setenv("AGENT_MCP_MARKETPLACE_ROOT", f"  {market}  ")
+    monkeypatch.delenv("AGENT_MCP_PLUGIN_ROOTS", raising=False)
+    assert resolve_config_path("demo") == expected
+
+
+def test_selected_marketplace_root_does_not_fall_back_to_global_scan(
+    tmp_path, monkeypatch
+):
+    market_a = tmp_path / "market-a"
+    market_b = tmp_path / "market-b"
+    _make_plugin_bridge(market_b, ".", "plug-b", "demo.mcp.yaml")
+    monkeypatch.setenv("AGENT_MCP_MARKETPLACE_ROOT", str(market_a))
+    monkeypatch.setenv("AGENT_MCP_PLUGIN_ROOTS", str(tmp_path))
+    with pytest.raises(ConfigError, match="no bridge named 'demo'"):
+        resolve_config_path("demo")
+
+
 def test_user_bridge_wins_over_plugin(tmp_path, monkeypatch):
     # User-space bridges/ takes precedence over a plugin-shipped one.
     bridges = tmp_path / "bridges"
@@ -295,6 +330,58 @@ def test_ambiguous_plugin_bridge_raises(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_MCP_PLUGIN_ROOTS", str(tmp_path))
     _make_plugin_bridge(tmp_path, "mkt-a", "plug-a", "dup.mcp.yaml")
     _make_plugin_bridge(tmp_path, "mkt-b", "plug-b", "dup.mcp.yaml")
+    with pytest.raises(ConfigError) as exc:
+        resolve_config_path("dup")
+    assert "ambiguous" in str(exc.value).lower()
+
+
+def test_live_directory_marketplace_wins_over_stale_installed_copy(
+        tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    live = workspace / ".ai"
+    current = _make_plugin_bridge(
+        live.parent, ".ai", "ado-data", "ado-review.mcp.yaml"
+    )
+    settings = workspace / ".github" / "copilot" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({
+        "extraKnownMarketplaces": {
+            "local": {"source": {"source": "directory", "path": "./.ai"}}
+        }
+    }), encoding="utf-8")
+
+    copilot_home = tmp_path / "copilot-home"
+    stale = copilot_home / "installed-plugins"
+    _make_plugin_bridge(
+        stale, "local", "ado-data", "ado-review.mcp.yaml",
+        {"server": {"type": "http", "url": "https://stale.example"}},
+    )
+    monkeypatch.delenv("AGENT_MCP_PLUGIN_ROOTS", raising=False)
+    monkeypatch.setenv("COPILOT_HOME", str(copilot_home))
+    nested = workspace / "src" / "package"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir(nested)
+
+    assert resolve_config_path("ado-review") == current
+
+
+def test_ambiguous_live_directory_marketplaces_raise(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    for marketplace in (".ai-a", ".ai-b"):
+        _make_plugin_bridge(
+            workspace, marketplace, "ado-data", "dup.mcp.yaml"
+        )
+    settings = workspace / ".github" / "copilot" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({
+        "extraKnownMarketplaces": {
+            "a": {"source": {"source": "directory", "path": "./.ai-a"}},
+            "b": {"source": {"source": "directory", "path": "./.ai-b"}},
+        }
+    }), encoding="utf-8")
+    monkeypatch.delenv("AGENT_MCP_PLUGIN_ROOTS", raising=False)
+    monkeypatch.chdir(workspace)
+
     with pytest.raises(ConfigError) as exc:
         resolve_config_path("dup")
     assert "ambiguous" in str(exc.value).lower()
@@ -471,39 +558,68 @@ def test_python_token_expands_without_source_path(monkeypatch):
     assert cfg.server.command == ["/opt/py/python3", "${config_dir}/server.py"]
 
 
-def test_resolve_python_prefers_platform_names(monkeypatch):
+def test_python_token_ignores_hostile_path(tmp_path, monkeypatch):
     import agent_mcp.config as cfgmod
 
-    monkeypatch.setattr(cfgmod.os, "name", "posix")
-    seen: list[str] = []
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    fake_python = hostile / ("python.exe" if os.name == "nt" else "python3")
+    fake_python.write_text("not the runtime")
+    fake_python.chmod(0o755)
+    runtime_python = tmp_path / ("runtime.exe" if os.name == "nt" else "runtime-python")
+    runtime_python.write_text("runtime")
+    runtime_python.chmod(0o755)
+    monkeypatch.setenv("PATH", str(hostile))
+    monkeypatch.setattr(cfgmod.sys, "executable", str(runtime_python))
 
-    def fake_which(name):
-        seen.append(name)
-        return "/usr/bin/python3" if name == "python3" else None
+    cfg = parse_config(
+        {
+            "server": {"type": "stdio", "command": ["${python}", "server.py"]},
+            "auth": {"kind": "none"},
+        }
+    )
 
-    monkeypatch.setattr(cfgmod.shutil, "which", fake_which)
-    assert cfgmod._resolve_python() == "/usr/bin/python3"
-    assert seen[0] == "python3"  # POSIX probes python3 first
+    assert cfg.server.command == [str(runtime_python.absolute()), "server.py"]
 
 
-def test_resolve_python_windows_probes_python_first(monkeypatch):
+def test_resolve_python_uses_runtime_executable(tmp_path, monkeypatch):
     import agent_mcp.config as cfgmod
 
-    monkeypatch.setattr(cfgmod.os, "name", "nt")
-    seen: list[str] = []
+    executable = tmp_path / "runtime-python"
+    executable.write_text("runtime")
+    monkeypatch.setattr(cfgmod.sys, "executable", str(executable))
 
-    def fake_which(name):
-        seen.append(name)
-        return r"C:\Python\python.exe" if name == "python" else None
-
-    monkeypatch.setattr(cfgmod.shutil, "which", fake_which)
-    assert cfgmod._resolve_python() == r"C:\Python\python.exe"
-    assert seen[0] == "python"  # Windows probes python first
+    assert cfgmod._resolve_python() == str(executable.absolute())
 
 
-def test_resolve_python_falls_back_to_sys_executable(monkeypatch):
+def test_resolve_python_rejects_empty_runtime_executable(monkeypatch):
     import agent_mcp.config as cfgmod
 
-    monkeypatch.setattr(cfgmod.shutil, "which", lambda name: None)
-    monkeypatch.setattr(cfgmod.sys, "executable", "/venv/bin/python")
-    assert cfgmod._resolve_python() == "/venv/bin/python"
+    monkeypatch.setattr(cfgmod.sys, "executable", "")
+
+    with pytest.raises(ConfigError, match="interpreter is unavailable"):
+        cfgmod._resolve_python()
+
+
+def test_resolve_python_rejects_missing_runtime_executable(tmp_path, monkeypatch):
+    import agent_mcp.config as cfgmod
+
+    missing = tmp_path / "missing-python"
+    monkeypatch.setattr(cfgmod.sys, "executable", str(missing))
+
+    with pytest.raises(ConfigError, match="interpreter is not a file"):
+        cfgmod._resolve_python()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation is privilege-gated on Windows")
+def test_resolve_python_preserves_virtualenv_symlink(tmp_path, monkeypatch):
+    import agent_mcp.config as cfgmod
+
+    base = tmp_path / "base-python"
+    base.write_text("base")
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base)
+    monkeypatch.setattr(cfgmod.sys, "executable", str(venv_python))
+
+    assert cfgmod._resolve_python() == str(venv_python.absolute())

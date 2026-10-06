@@ -3,16 +3,17 @@
 Guidance for GitHub Copilot working in this repository. **These instructions are
 read by every Copilot surface** — chat, the coding agent, and the automatic code
 review agent — as well as by anyone browsing the repo, so they are written as
-neutral engineering guidance.
+neutral engineering guidance, applying to *anyone* (human or agent) making
+changes here.
 
-- The **General standards** sections below are how we build in this repo; they
-  apply to *anyone* (human or agent) making changes here.
-- The final **Code Review** section adds directives aimed specifically at the
-  automatic code-review agent when it reviews a pull request. Other agents may
-  read it, but it describes *how to review*, not how to build.
+For guidance specific to reviewing a pull request, see the dedicated
+[`REVIEW.md`](../REVIEW.md) (read by Copilot code review specifically) rather
+than this file -- keeping review-only directives out of the file that also
+shapes Chat and coding-agent behavior.
 
 The full guides are [`AGENTS.md`](../AGENTS.md) (development guide),
-[`CONTRIBUTING.md`](../CONTRIBUTING.md) (versioning & release), and
+[`CONTRIBUTING.md`](../CONTRIBUTING.md) (contributor process), [`docs/pipelines.md`](../docs/pipelines.md)
+(CI/CD gating & versioning), and
 [`docs/install-contract.md`](../docs/install-contract.md).
 
 ## What this repo is
@@ -81,9 +82,13 @@ These repo-specific rules must be followed by any change:
 - **Public repo — stay identifier-neutral.** This repository is public. Do not
   introduce internal organization/account/project names, private hostnames, or
   personal aliases in code, docs, comments, examples, or PR metadata. Hidden
-  HTML comments are still public. This repo must keep
-  `pr.source_attribution: false`; closed-circuit repos may opt in through their
-  own config. Use neutral placeholders.
+  HTML comments are still public. This repo's `pr.source_attribution` must
+  stay in `codename` mode (the default; only the worktree's assigned
+  codename, decodes to nothing on its own — safe for a public repo, and not
+  a violation) or `false` (fully anonymous); the full raw
+  `pr.source_attribution: true` marker must stay off here. Closed-circuit
+  repos may opt into `true` through their own config. Use neutral
+  placeholders.
 
 - **Terminal status bars must not compute on the render path.** Nothing in a
   tmux/psmux `status-left` / `status-right` may spawn a process per render (no
@@ -91,45 +96,15 @@ These repo-specific rules must be followed by any change:
   watcher computes segments off the render path. Regressions here cause severe
   input latency and are covered by guard tests.
 
-## Code Review
-
-Directives for the **automatic code-review agent** when reviewing a pull request
-(other agents may read this, but it describes how to review, not how to build):
-
-- **Scope to the diff.** Review the code the PR actually changes. The repo
-  carries pre-existing style debt — do **not** demand repo-wide cleanup or flag
-  untouched code.
-- **Concrete over cosmetic.** Prefer flagging concrete violations of the General
-  standards above over stylistic nitpicks.
-- **Lead with the highest-signal miss: the version-bump triplet.** For any
-  changed plugin *payload*, verify all three version locations moved together; a
-  partial/missing bump silently breaks machine updates. This is the single most
-  valuable thing to catch.
-- **Tests for runtime logic.** Flag PRs that change a runtime plugin's logic
-  without adding or updating that plugin's `tests/`.
-- **Test portfolio growth.** Flag new exhaustive matrices, repeated process
-  startup, or specialized suites added unconditionally to required PR CI.
-  Require path gating, a focused smoke contract, and a scheduled/manual
-  exhaustive lane. Do not recommend pooling where real process boundaries are
-  the behavior under test.
-- **Cross-platform parity.** When a PR edits an installer/launcher `.sh` (or
-  `.ps1`), flag a missing matching change to its `.ps1` (or `.sh`) counterpart.
-- **Identifier neutrality.** Flag any newly introduced internal
-  organization/account/project names, private hostnames, or personal aliases —
-  this repository is public. PR titles, bodies, labels, commit messages, and
-  hidden comments count; flag any attempt to enable `pr.source_attribution`
-  here.
-- **ruff signal, not noise.** Hold changed Python to at least the `F`/`E9`
-  groups; do not block on pre-existing style debt in code the PR did not touch.
-- **Make every comment count.** Copilot review comments (it does not approve or
-  block merges), so each comment should be actionable and worth the author's
-  attention.
-
 ## Full details
 
+- [`REVIEW.md`](../REVIEW.md) — directives for the automatic code-review
+  agent specifically.
 - [`AGENTS.md`](../AGENTS.md) — repository structure, per-plugin lifecycles, and
   the complete "what NOT to do" list.
-- [`CONTRIBUTING.md`](../CONTRIBUTING.md) — the full versioning scheme, git
-  hooks, and per-plugin deploy pipelines.
+- [`CONTRIBUTING.md`](../CONTRIBUTING.md) — git hooks, the full
+  contributor PR flow, and per-plugin deploy pipelines.
+- [`docs/pipelines.md`](../docs/pipelines.md) — CI/CD gating, the full
+  versioning scheme, and the `dev` → `main` promotion pipeline.
 - [`docs/install-contract.md`](../docs/install-contract.md) — the install
   contract every runtime plugin must satisfy.

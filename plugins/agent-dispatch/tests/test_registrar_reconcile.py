@@ -34,7 +34,68 @@ def test_spec_general_pool_headless():
     assert "embody_backend" not in spec
     assert spec["headless_agent"] == "general-loop-worker"
     assert spec["heartbeat"] is True
-    assert spec["reactive"] is True
+    assert spec["reactive"] is False
+
+
+def test_spec_and_command_carry_disposable_cli_labels():
+    decl = load_declaration(
+        {
+            "name": "reviewers",
+            "labels": ["review"],
+            "body": {
+                "type": "embody",
+                "disposable_cli_labels": ["review"],
+            },
+        }
+    )
+    spec = declaration_to_spec(decl)
+    assert spec["disposable_cli_labels"] == ["review"]
+    command = build_command(
+        declaration_to_registration(decl, machine="host-a"),
+        python="PY",
+    )
+    assert command[command.index("--disposable-cli-label") + 1] == "review"
+
+
+def test_spec_and_command_carry_idle_nudge_exempt_labels():
+    decl = load_declaration(
+        {
+            "name": "reviewers",
+            "labels": ["review"],
+            "body": {
+                "type": "embody",
+                "idle_nudge_exempt_labels": ["review"],
+            },
+        }
+    )
+    spec = declaration_to_spec(decl)
+    assert spec["idle_nudge_exempt_labels"] == ["review"]
+    command = build_command(
+        declaration_to_registration(decl, machine="host-a"),
+        python="PY",
+    )
+    assert command[command.index("--idle-nudge-exempt-label") + 1] == "review"
+
+
+def test_spec_carries_steering_disallowed_labels():
+    """Coordinator-only field (see ``TaskQueue.set_card``): unlike
+    ``idle_nudge_exempt_labels``, the running supervisor subprocess never
+    consumes this itself -- the coordinator reads the live registrations
+    table directly at ``card set`` request time -- so it round-trips
+    through the spec but deliberately does not appear in the relaunched
+    subprocess's own argv (``build_command``)."""
+    decl = load_declaration(
+        {
+            "name": "reviewers",
+            "labels": ["review"],
+            "body": {
+                "type": "embody",
+                "steering_disallowed_labels": ["review"],
+            },
+        }
+    )
+    spec = declaration_to_spec(decl)
+    assert spec["steering_disallowed_labels"] == ["review"]
 
 
 def test_spec_fleet_pool_origin_headless():
@@ -135,6 +196,68 @@ def test_periodic_emitter_declaration_maps_to_emitter_registration():
     assert cmd[cmd.index("--holder") + 1] == "host-a"
 
 
+def test_plugin_companion_registration_preserves_runtime_revision():
+    decl = load_declaration(
+        {
+            "name": "index-service",
+            "kind": "plugin-companion",
+            "spec": {
+                "command": ["bin/serve"],
+                "stop_command": ["bin/stop"],
+                "health_probe": ["bin/health"],
+                "managed_runtime": {
+                    "schema_version": 1,
+                    "runtimes": [
+                        {
+                            "name": "service",
+                            "version": "2.0.0",
+                            "profile": "host",
+                            "python_env": "INDEX_MANAGED_PYTHON",
+                            "projects": [{"path": ".", "extras": ["service"]}],
+                            "imports": ["index_service"],
+                        }
+                    ],
+                },
+            },
+        },
+        allow_plugin_companion=True,
+    ).with_owner("plugin@example").with_plugin_provenance(
+        plugin_root="/plugins/index",
+        source_path="/plugins/index/registrar/index.json",
+        plugin_version="2.0.0",
+        activation_scopes=("global", "project:demo"),
+    )
+
+    reg = declaration_to_registration(decl, machine="host-a")
+
+    assert reg["plugin"] == {
+        "root": "/plugins/index",
+        "source_path": "/plugins/index/registrar/index.json",
+        "version": "2.0.0",
+        "activation_scopes": ["global", "project:demo"],
+    }
+    assert reg["runtime_revision"] == {
+        "plugin_root": "/plugins/index",
+        "plugin_owner": "plugin@example",
+        "plugin_source_path": "/plugins/index/registrar/index.json",
+        "plugin_version": "2.0.0",
+        "activation_scopes": ["global", "project:demo"],
+        "managed_runtime": {
+            "schema_version": 1,
+            "runtimes": [
+                {
+                    "name": "service",
+                    "version": "2.0.0",
+                    "profile": "host",
+                    "python_env": "INDEX_MANAGED_PYTHON",
+                    "projects": [{"path": ".", "extras": ["service"]}],
+                    "imports": ["index_service"],
+                }
+            ],
+        },
+    }
+
+
 def test_runs_on_machine_respects_permit_filter():
     pinned = load_declaration(
         {"name": "g", "filters": {"permit": {"machine": ["host-a"]}}}
@@ -142,7 +265,7 @@ def test_runs_on_machine_respects_permit_filter():
     assert runs_on_machine(pinned, "host-a") is True
     assert runs_on_machine(pinned, "host-b") is False
     # Fail closed: an unidentified host (machine=None) must NOT run a machine-pinned
-    # declaration it cannot confirm membership of (aperture-labs #5001).
+    # declaration it cannot confirm membership of (the downstream tracker).
     assert runs_on_machine(pinned, None) is False
     unpinned = load_declaration({"name": "g"})
     assert runs_on_machine(unpinned, "host-b") is True

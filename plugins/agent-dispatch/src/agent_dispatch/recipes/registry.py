@@ -71,6 +71,7 @@ class Recipe:
     resolution: str
     requires: tuple[str, ...] = ()
     labels: tuple[str, ...] = ()
+    require_verification: bool | None = None
 
     def required_params(self) -> tuple[str, ...]:
         return tuple(p.name for p in self.params if p.required)
@@ -93,6 +94,7 @@ class RenderedRecipe:
     resolution: str
     requires: tuple[str, ...]
     labels: tuple[str, ...]
+    require_verification: bool | None = None
     params: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -106,6 +108,7 @@ class RenderedRecipe:
             "resolution": self.resolution,
             "requires": list(self.requires),
             "labels": list(self.labels),
+            "require_verification": self.require_verification,
             "params": dict(self.params),
         }
 
@@ -129,12 +132,57 @@ _RESOLUTION_CLAUSE = (
 _SUSPEND_CLAUSE = (
     "You may reach a natural checkpoint where you are waiting on something outside "
     "your control (an update to the change, a review, a build). At such a point, "
-    "record your progress and suspend rather than busy-waiting: hand the wait to "
-    "the layer with `agent-dispatch run --detach --resume <your-worktree> -- "
-    "<blocking-wait-command>`, which tears your session down while a cheap waiter "
-    "owns the wait and resumes you -- with your context intact -- when the world "
-    "moves."
+    "hand the wait to the layer with `agent-dispatch run --detach --resume "
+    "<your-worktree> --task <this-task-id> -- <blocking-wait-command>`. Always "
+    "pass `--task` here: it atomically suspends this task the moment the detached "
+    "waiter is confirmed live, so status stops implying you're still actively "
+    "working it (do not also call `agent-dispatch suspend` separately -- that step "
+    "is now folded into `run --detach`). A cheap waiter then owns the wait and "
+    "resumes you -- with your context intact -- when the world moves."
 )
+
+_EXTERNAL_AUTHOR_CLAUSE = (
+    "Owning landing never means replacing the author's own contribution with a "
+    "competing pull request under your own identity -- not even a 'repair patch' "
+    "explicitly marked not to merge independently -- even when their fork or "
+    "branch is temporarily unreachable. If you cannot push directly to the "
+    "author's branch, leave specific, actionable review feedback and record the "
+    "blocking condition (the exact URL and head SHA) as a comment on the pull "
+    "request itself; do not open a second PR that repairs, patches, or "
+    "supersedes it. Prefer cooperative handling when the other contributor also "
+    "runs an agentic workflow: address feedback to that contributor's own "
+    "process so it can land the change on its own schedule, rather than acting "
+    "unilaterally. Escalate with a steering card if landing genuinely requires "
+    "access this identity does not have."
+)
+
+_STAGNATION_CLAUSE = (
+    "If you find yourself resuming repeatedly with no real forward movement -- "
+    "the same unresolved external state each time, nothing new to reply to, no "
+    "operator answer -- do not keep silently re-suspending indefinitely. After a "
+    "small number of such non-productive cycles (roughly 3-5), stop and set a "
+    "durable steering card summarizing exactly what's blocking you and what "
+    "decision you need, with `--request-input` so the task is correctly marked "
+    "`awaiting_steer` (a card without a `--request-input` form never blocks the "
+    "task, so it silently drops out of Blocked-queue tracking -- this is "
+    "REQUIRED, not optional). If you already carded this exact blocker and a "
+    "later wake finds nothing has changed, re-affirm it (re-run "
+    "`agent-dispatch card set` with the same content) rather than assuming the "
+    "operator still sees your original ask -- restate the situation and how "
+    "long it has now persisted so a delayed operator glance gets the current "
+    "picture, not a stale one."
+)
+
+#: Public aliases for the shared charter clauses above, for a caller outside
+#: this module that wants the same standing-conduct prose without
+#: duplicating it (e.g. a registrar global recipe's static `pool.body.charter`
+#: -- see ``registrar_recipes.py``'s ``GLOBAL_RECIPES``). The underscore-
+#: prefixed names stay the internal spelling this module's own recipe
+#: definitions below use; these aliases are the intentional public surface.
+RESOLUTION_CLAUSE = _RESOLUTION_CLAUSE
+SUSPEND_CLAUSE = _SUSPEND_CLAUSE
+EXTERNAL_AUTHOR_CLAUSE = _EXTERNAL_AUTHOR_CLAUSE
+STAGNATION_CLAUSE = _STAGNATION_CLAUSE
 
 
 REGISTRY: dict[str, Recipe] = {}
@@ -182,6 +230,8 @@ _register(
             "resume only when the change updates or the non-response policy expires. "
             "Never merge on the author's behalf in that model. " + _SUSPEND_CLAUSE
             + " When the change updates, resume and re-review only what moved.\n\n"
+            + _EXTERNAL_AUTHOR_CLAUSE + "\n\n"
+            + _STAGNATION_CLAUSE + "\n\n"
             + _RESOLUTION_CLAUSE
         ),
         suspend_on=("change-updated", "review-posted"),
@@ -222,7 +272,7 @@ _register(
             "build state.\n\n" + _SUSPEND_CLAUSE + " Resume on the next "
             "review/build/update and iterate until it lands.\n\n"
             "Stay within the intent of the existing change -- you are unblocking it, not "
-            "redesigning it.\n\n" + _RESOLUTION_CLAUSE
+            "redesigning it.\n\n" + _STAGNATION_CLAUSE + "\n\n" + _RESOLUTION_CLAUSE
         ),
         suspend_on=("change-updated", "build-updated", "review-posted"),
         resolution="pull-request-merged-or-abandoned",
@@ -254,6 +304,7 @@ _register(
             "requests, handling conflicts and review feedback as they arise. Stay "
             "within the bounds of the goal -- do not expand scope.\n\n"
             + _SUSPEND_CLAUSE + " Resume when a change you opened moves.\n\n"
+            + _STAGNATION_CLAUSE + "\n\n"
             + _RESOLUTION_CLAUSE
         ),
         suspend_on=("change-updated", "review-posted"),
@@ -341,6 +392,7 @@ def render_recipe(name: str, params: dict[str, str]) -> RenderedRecipe:
         resolution=resolution,
         requires=recipe.requires,
         labels=labels,
+        require_verification=recipe.require_verification,
         params={k: values[k] for k in values},
     )
 

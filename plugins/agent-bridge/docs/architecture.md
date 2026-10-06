@@ -35,7 +35,9 @@ Copilot CLI sessions (multiple)
 |--------|------|---------|
 | FastAPI app | `app.py` | HTTP server, routing, auth middleware |
 | Session manager | `session_manager.py` | Session lifecycle, turn tracking |
+| Recovery dormancy | `session_recovery_dormancy.py` | Explicit-stop dormancy, reconnect backoff, idle auto-dormancy (mixin) |
 | Transport | `transport.py` | Local + SSH subprocess spawning |
+| SSH carrier | `carrier.py` + vendored `ssh-manager` | One bounded, reconnecting framed stdio carrier per normalized SSH connection identity |
 | ACP agent | `acp_agent.py` | Upstream ACP agent interface (stdio mode) |
 | ACP client | `acp_client.py` | Downstream ACP client (subprocess comms) |
 | Events | `events.py` | SSE event log with durable IDs; content-free session, conversation, and tool-call telemetry reduction. Owned and represented sources are labeled; represented turn completion supplies its terminal idle boundary. |
@@ -88,6 +90,13 @@ For SSH-spawned agents, the transport layer reads per-machine
 forwards plus environment variable exports. This makes the local relay
 available inside remote agent sessions without separate relay setup.
 
+Stopped trusted-container sessions have a stricter resume boundary. The bridge
+re-resolves the provider target, replaces any surviving reverse-forward against
+the current live relay port, and verifies the container-side loopback listener
+before ACP readiness or prompt delivery. A relay-enabled resume fails explicitly
+when that readiness cannot be proven; fleets with relay disabled skip the gate.
+This resume contract is separate from broader relay port-stability policy.
+
 The relay speaks the git credential protocol over TCP and supports the standard
 `get`/`fill`, `store`/`approve`, and `erase`/`reject` shapes plus token actions
 such as `get-github-token`, `get-azure-token`, and `get-access-token`; provider
@@ -99,6 +108,56 @@ config (`elevated.py` -> `_seed_config`), so it never re-binds -- and thus never
 evicts -- the primary's relay; local elevated agents reuse the primary's relay on
 the same host. The `enable_credential_relay` config flag (default `true`) gates
 relay startup in the `app.py` lifespan.
+
+## Persistent SSH Carrier Foundation
+
+Agent Bridge owns a persistent SSH carrier pool through the same
+`ssh-manager.ConnectionManager` that owns ordinary SSH connections. A carrier
+is keyed by the complete normalized SSH connection identity, not a display
+alias, and opens exactly one long-lived `agent-bridge carrier --stdio` process
+through `open_stdio_channel`. This gives native Windows and POSIX hosts the same
+application-level multiplexing contract without depending on ControlMaster.
+
+The versioned protocol uses bounded, length-prefixed frames for hello, request,
+response, event, heartbeat, cancellation, and error envelopes. It supports
+concurrent request IDs and replayable subscriptions, detects heartbeat and
+subscription staleness, reconnects with bounded backoff, bounds output queues,
+retires after an idle interval with no logical clients, and closes stdin before
+reaping the SSH process tree.
+
+The operation contract proxies exact session status, session-or-worktree live
+resolution, cursor-based events, session create/stop/end, and represented live
+message delivery. The remote carrier endpoint authenticates to its host-local
+Bridge through the existing discovered HTTP endpoint and bearer-token flow,
+then calls the same session, live-message, event, and cursor authorities used by
+direct clients. Mutating requests are version-gated separately from the original
+read/event contract and return structured results instead of CLI preambles. It
+does not import Agent Dispatch, copy session state, or maintain a second event
+log.
+
+The caller supplies a required stable `caller_id`; no anonymous/default cursor
+is used for remote subscriptions. Actual event IDs, names, payloads, and
+timestamps are forwarded unchanged. The local proxy acknowledges the hosting
+Bridge only after its own authenticated API/CLI consumer accepts delivery, so a
+carrier reconnect reopens from the durable hosting cursor. A replacement local
+daemon can do the same after zero-downtime cutover. Event-log rebuilds persist a
+per-caller invalidation marker, while continuity changes and non-contiguous
+event IDs terminate the stream with an explicit `bridge_control` /
+`full_reconcile` signal rather than an empty result. Unsupported operation
+versions are rejected before a remote HTTP request or subscription is opened.
+An aggregate `POST /api/v1/remote/events` surface accepts a bounded set of exact
+host/session/caller identities and returns one SSE connection. Each logical
+subscription retains its own hosting cursor and carrier lease, while events and
+control signals carry their subscription identity in the envelope. Replacing
+the set means replacing this one local stream; it never creates one local HTTP
+connection per observed session. Carrier heartbeats and tool-progress envelopes
+become SSE comments so ongoing remote activity keeps the aggregate connection
+and its local consumer healthy without creating reconciliation wakes.
+Agent Dispatch uses the authenticated local remote-operation API for fleet
+create, status/activity, end, worktree resolution, and queued prompt delivery.
+A raw SSH Bridge command remains only when the local daemon or required HTTP
+generation is absent; a carrier operation failure never starts parallel direct
+outreach.
 
 ## HTTP API
 
@@ -119,7 +178,40 @@ POST   /api/v1/sessions/{id}/cursor      # Ack delivery (advance cursor)
 POST   /api/v1/sessions/{id}/stop        # Stop (preserve state)
 POST   /api/v1/sessions/{id}/resume      # Resume stopped session
 DELETE /api/v1/sessions/{id}             # End (full cleanup)
+
+GET    /api/v1/live-sessions             # Registered live interactive CLI sessions
+GET    /api/v1/live-sessions/resolve     # Resolve a session id OR worktree handle -> its live session
+GET    /api/v1/live-sessions/{id}        # Fetch one registered live session
+POST   /api/v1/live-sessions/{id}/mode   # Switch its agent mode (interactive/plan/autopilot); waits for the outcome
+GET    /api/v1/live-sessions/{id}/controls # Extension: claim pending session controls (each returned once)
+POST   /api/v1/live-sessions/{id}/controls/ack # Extension: report claimed controls applied or rejected
+GET    /api/v1/dispatch-tasks/{id}/session # Resolve an agent-dispatch task -> the session that worked it (live-then-cold-store, durable attachment history)
+
+GET    /api/v1/remote/{host}/sessions/{id}/status
+GET    /api/v1/remote/{host}/live-sessions/{id}
+GET    /api/v1/remote/{host}/sessions/{id}/events
+POST   /api/v1/remote/events             # Multiplex several remote subscriptions
+POST   /api/v1/remote/{host}/sessions/{id}/cursor
 ```
+
+**Session controls.** A mode change (`POST .../mode`, protocol version 19,
+`LIVE_SESSION_MODE_PROTOCOL_VERSION`) is queued as a `control:*` row in the
+live-message table, but it is never delivered as a prompt: the session's
+extension claims it from `/controls` and reports its outcome through
+`/controls/ack`, and message and control acks never settle each other's rows.
+The claim orders the requester's timeout against the application: at
+`wait_timeout` an unclaimed control is withdrawn (`state: withdrawn`, it never
+applies later); a claimed one is waited on briefly for its outcome, otherwise
+reported `state: in_flight` with `applied: null` (it may still apply). A
+control whose requester is gone (older than the longest wait plus that grace)
+expires unapplied at the next poll.
+
+**Session identity: `session_id` vs `durable_session_id`.** Every session
+response also carries `acp_session_id` (the durable Copilot session id) and
+`durable_session_id` (`acp_session_id` when known, else the non-durable
+`session_id`). Persist or deep-link with `durable_session_id`, never
+`session_id` directly -- see the `agent-bridge` skill's *Session identity*
+section for the full contract and the incident that motivated it.
 
 The SSE stream (`/events`) resumes from the caller's last-acked **delivery
 cursor** when `after` is omitted and `caller_id` is supplied; pass an explicit
@@ -130,10 +222,25 @@ re-read already-consumed content and never moves the cursor. See
 [Streaming & the delivery cursor](../README.md#streaming--the-delivery-cursor)
 in the README for the consumer model.
 
+The `/remote` endpoints are authenticated local proxy surfaces. Clients name a
+topology host and exact hosting-Bridge session, never SSH arguments. Each remote
+event caller must provide a distinct stable `caller_id`; response headers expose
+the accepted cursor and event-log continuity, and cursor acknowledgements carry
+that continuity back. `bridge_control` SSE events have no durable event ID and
+request full reconciliation after cursor invalidation or a replay gap.
+The aggregate endpoint emits `bridge_event` envelopes containing the exact
+`host`, `session_id`, `caller_id`, durable `event_id`, event name, continuity,
+timestamp, and payload. Any subscription-level gap or carrier failure emits one
+identified `bridge_control` envelope so the consumer can run a full
+reconciliation pass, acknowledge the identified subscription's authoritative
+head and continuity when supplied, and reconnect the whole set from durable
+cursors. Initialization-time subscription failures use the same identified SSE
+control envelope instead of changing the aggregate response shape.
+
 ### Health
 
 ```
-GET    /health                           # Service health (no auth); reports {status, service, draining}, plus a drain{} detail block while draining
+GET    /health                           # Service health (no auth); includes aggregate ssh_carriers health/counts, never payloads or SSH details
 ```
 
 ### Admin / Deployment
@@ -141,8 +248,9 @@ GET    /health                           # Service health (no auth); reports {st
 ```
 POST   /api/v1/drain                     # Open the drain gate; wait for busy sessions to settle
 POST   /api/v1/undrain                   # Release the drain gate (cutover rollback)
-POST   /api/v1/shutdown                  # Clean daemon shutdown (retires its own routing-table entry)
+POST   /api/v1/shutdown                  # Clean daemon shutdown (releases this generation's session-host claims, then retires its own routing-table entry)
 POST   /api/v1/relay/adopt               # Bind/adopt the provider-configured credential relay on this daemon
+POST   /api/v1/session-hosts/reattach    # Retry the session-host claim + reattach scan on demand (post-cutover, once the old generation is confirmed exited)
 POST   /api/v1/gc                        # Prune aged terminal/disconnected sessions
 ```
 
@@ -183,6 +291,26 @@ downstream agent.
 
 ## Deployment
 
+### Declared lifecycle tier (per `service-lifecycle-supervision`)
+
+- **Default tier: 2 — scheduled activation**, layered around the tier-1
+  user-mode ensure path. `do_start` (POSIX) and `Invoke-Start`-equivalent
+  (Windows) both prefer the registered scheduled mechanism but **fall back
+  to a direct daemon launch** when it is unavailable or unregistered — the
+  scheduled trigger is a convenience, never a prerequisite for `start`/
+  `stop`/`update`/session-start readiness.
+- **Availability promise:** starts with the user's session; restarts at
+  logon; does not survive full logout or start before login (no concrete
+  requirement for either has been identified).
+- **Windows:** Scheduled Task, `AtLogOn`, 15-second delay, non-elevated.
+- **POSIX:** systemd **user** unit (`~/.config/systemd/user/`); no
+  requirement for lingering has been identified (the daemon is expected to
+  restart at the next logon, not persist across a full logout).
+- **macOS:** planned, not yet implemented.
+- **No escalation:** no tier-3 (system service) or tier-4
+  (container-managed) requirement has been identified for the standalone
+  deployment shape.
+
 ### Platform-Specific Service Management
 
 | Platform | Service manager | Install location | Config |
@@ -202,7 +330,7 @@ downstream agent.
 | `start` | Start the service (`--passive` for a cutover spare -- see below) |
 | `stop` | Stop the service |
 | `status` | Show service status |
-| `uninstall` | Remove service (`--remove-config` for config too) |
+| `uninstall` | Remove service (`--remove-config` for config too; `-DryRun`/`--dry-run` previews without changing anything) |
 
 ### Scheduled task: write-once bootstrap (decoupled from the runtime version)
 
@@ -241,7 +369,14 @@ updates rarely — in practice never — touch it:
 
 ### Deploy Manifest
 
-The installer writes `~/.agent-bridge/deploy-manifest.json` tracking:
+Legacy/default installs write `~/.agent-bridge/deploy-manifest.json`. When an
+explicit valid installation context is active, agent-bridge instead keeps its
+deploy manifest, `sessions.db`, routing table, host index, provider registry,
+relay-port record, logs, and service identities under the selected installation
+root. Cross-cell discovery rejects foreign standard `providers.d` roots, while
+legacy execution with no installation context remains machine-global.
+
+The installer writes `deploy-manifest.json` tracking:
 - Schema version, installer type (plugin vs legacy)
 - Source commit, branch, timestamp
 - Plugin directory path
@@ -258,7 +393,20 @@ restart does not inherently close the child's pipes.
 - **Idle / stopped sessions survive transparently.** Session metadata, turns,
   events, and host connection data are persisted to SQLite/host state. On startup
   the daemon reattaches to compatible surviving Session Hosts; otherwise it can
-  lazily resume from persisted Copilot state.
+  lazily resume from persisted Copilot state. An explicit `stop` marks the
+  session dormant so startup/heartbeat recovery leaves it alone until an
+  explicit `resume`/`send` re-arms it.
+- **Background CodeSpace recovery does not wake unavailable venues.** Before
+  reattaching a disconnected CodeSpace session, the heartbeat reads the exact
+  target's state through the GitHub API, once per CodeSpace per pass. It honors
+  explicitly pinned credentials; otherwise an inaccessible target is retried
+  under the other authenticated GitHub accounts. All lookup commands share a
+  30-second budget. Unavailable or unverifiable venues remain untouched; a later
+  Available result permits recovery. Healthy attached sessions need no check.
+- **Background reconnect is bounded.** Heartbeat-driven reconnect retries back
+  off exponentially up to five minutes. An idle, unwatched session that keeps
+  failing background recovery is parked dormant instead of hammering an
+  unreachable target forever; an explicit `resume` or later `send` wakes it.
 - **Active turns are preserved across frontend restarts when the Session Host
   survives.** A streaming `send`/`read`/`wait` reconnects through the routing
   table and resumes from the caller's acked delivery cursor. If a host is
@@ -381,9 +529,14 @@ runs a reversible cutover (`zdd.cutover.CutoverOrchestrator`):
 2. wait until it is healthy;
 3. **flip the routing table** -> new `active`, old demoted to `previous`;
 4. **drain** the old daemon (busy-oracle wait, optional `--force`);
-5. **-- commit point --** shut the old daemon down (a clean exit; it
-   `clear_if_owner`s only its own route entry);
-6. best-effort: adopt the credential relay (ephemeral) on the new daemon.
+5. **-- commit point --** shut the old daemon down (`POST /api/v1/shutdown`:
+   releases every session-host claim this generation holds, then a clean
+   exit; it `clear_if_owner`s only its own route entry -- see
+   [Session-host generation handoff](#4-session-host-generation-handoff-claimreleaserecover)
+   below);
+6. best-effort: adopt the credential relay (ephemeral) on the new daemon, and
+   retry the session-host claim scan (`POST /api/v1/session-hosts/reattach`)
+   now that the old generation is confirmed gone.
 
 Any failure **before** the commit point rolls back: re-publish the old endpoint
 as active, undrain the old daemon, and terminate the freshly spawned passive. If
@@ -391,7 +544,11 @@ the route was already flipped and the old daemon is gone, the orchestrator
 **commits forward** to the healthy new daemon rather than strand clients. The
 [single-instance guard](#single-instance-guard) is **port-keyed** so an active
 and a passive daemon can coexist on one config dir during the overlap (two starts
-on the *same* port still collide).
+on the *same* port still collide). A process-wide `zdd.cutover_lock.CutoverLock`
+additionally serializes the whole sequence against a second concurrent
+invocation (two operators, or a `restart` racing an installer-driven `deploy`);
+contention waits (bounded) rather than refusing outright, so a legitimate
+back-to-back trigger still succeeds once the first cutover completes.
 
 **Durable breadcrumb + stale-cutover recovery.** The orchestrator runs in the
 short-lived `agent-bridge deploy` process, separate from the daemons it drives.
@@ -404,6 +561,52 @@ to the cutover that drained it. `agent-bridge deploy` heals such a stale
 breadcrumb on its next run (undraining the stranded survivor); `agent-bridge
 deploy --recover` runs *only* that heal and exits. Combined with the drain
 watchdog (#1757), a stranded survivor self-heals even if no deploy is re-run.
+
+### 4. Session-host generation handoff (claim/release/recover)
+
+The routing table's `active.json` cutover above swaps the *daemon*; each
+session's own **Session Host** child (`HostIndex`, `<config_dir>/hosts/
+index.json`) survives that swap independently and needs its own handoff so
+the new daemon adopts it rather than respawning it or racing the old daemon
+over it:
+
+- Each process computes a **generation id** once at startup
+  (`zdd.claims.generation_id(version, pid)`), never persisted or reused
+  across a restart. A newly-spawned host is registered with this
+  generation's ownership already stamped -- it never looks "unclaimed" to
+  another generation while this one is actively driving it.
+- **A passive cutover instance never reattaches at all.** Reattaching means
+  ATTACHing to the Session Host's socket, and the host's own connection
+  handler unconditionally displaces whatever front already holds it -- so a
+  still-passive daemon reattaching would disconnect the truly active old
+  generation before any cutover gate ever ran. The startup reattach scan
+  (`reattach_session_hosts()`) therefore only runs for a normally-starting
+  (non-passive) daemon; a passive instance's own claim/reattach work is
+  deferred entirely to the post-cutover retry below.
+- **Claim** -- `reattach_session_hosts()` calls `HostIndex.claim(session_id,
+  generation=...)` for every live record before adopting it: a record still
+  claimed by a *live* other generation is left alone (not stolen); one whose
+  owning generation is provably dead is claimed silently (no live handshake
+  needed).
+- **Release** -- `POST /api/v1/shutdown` releases every claim the exiting
+  generation holds (`HostIndex.release_all`), only once a server handle to
+  actually shut down exists, before triggering the clean exit -- the
+  outgoing generation's own initiative, never blocking on the new
+  generation.
+- **Retry** -- `agent-bridge deploy` calls the newly-active daemon's
+  `POST /api/v1/session-hosts/reattach` once the old generation is
+  *confirmed* exited, running the claim+reattach scan for the first time on
+  this (now-active) generation.
+- `HostIndex`'s own mutating methods (`register`/`claim`/`release_all`/...)
+  hold a short-lived cross-process file lock and **reload the latest
+  on-disk state before applying a change** -- the old and new generations
+  each hold their own long-lived in-process `HostIndex` snapshot over the
+  same file during the overlap, so a write from a stale in-memory snapshot
+  must never silently clobber a concurrent write from the other generation.
+  `register()` specifically preserves whatever ownership the durable index
+  already has recorded -- it is a location/metadata update, never an
+  ownership change; only `claim`/`release`/`release_all` mutate ownership.
+
 
 **Windows listener recovery.** A Proactor accept-socket failure can leave the
 uvicorn process alive while its loopback listener no longer serves. The
@@ -502,13 +705,16 @@ an agent name, the prefix is looked up in the namespace registry and
 resolution is delegated to the matching resolver.
 
 The core bridge does not require or vendor provider packages. External provider
-plugins self-register by writing JSON manifests under
-`~/.agent-bridge/providers.d/`; the daemon scans that directory at startup and
-again on demand (throttled) and drives each provider's CLI over a process
-boundary (`namespace-list`, `namespace-resolve`, `namespace-ensure-ready`,
-`namespace-target-repo`). Missing or malformed provider manifests are skipped
-with a warning, so a bad sibling never breaks daemon startup. The built-in
-`admin:` resolver is registered in-process.
+plugins self-register by writing JSON manifests under the active install root's
+`providers.d/` directory (`~/.agent-bridge/providers.d/` in legacy mode, or the
+selected cell root in namespaced mode); the daemon scans that directory at
+startup and again on demand (throttled) and drives each provider's CLI over a
+process boundary (`namespace-list`, `namespace-resolve`,
+`namespace-ensure-ready`, `namespace-target-repo`). Missing or malformed
+provider manifests are skipped with a warning, and a foreign standard
+`providers.d` root is rejected as an install mismatch, so a bad sibling or
+cross-cell mix-up never breaks daemon startup. The built-in `admin:` resolver
+is registered in-process.
 
 `namespace-resolve` may return a versioned, provider-owned `venue` object.
 Agent-bridge preserves that object unchanged in the `SpawnTarget` and durable
@@ -575,3 +781,61 @@ and `AgentResolver.refresh_provider_resolvers()` in `agent_registry.py`. Provide
 manifests are additive and idempotent; a provider dropped after daemon start is
 picked up on the next scan without a restart. The installer deliberately leaves
 sibling plugin packages and binstubs to their own installers.
+
+### Listing reliability: per-resolver timeout
+
+`AgentResolver.list_agents_async()` (the `agents` CLI/API listing) queries every
+registered namespace resolver concurrently via `asyncio.gather`, since each
+`list()` can be a slow, network-bound subprocess call (`agent-codespaces`
+enumerating CodeSpaces across accounts is documented at 4-10s). Without an
+individual bound, one straggling resolver made the whole listing wait for the
+slowest provider -- observed pushing `agent_dispatch`'s `registered_agents()`
+(a 20s caller-side timeout) past its limit, which surfaced as "could not read
+the local agent registry" and dead-lettered unrelated spawn reservations.
+
+Each resolver's `list()` call is now bounded by
+`AGENT_BRIDGE_NAMESPACE_LIST_RESOLVER_TIMEOUT` (default **8 seconds**; set to
+`0`/`off`/`false` to disable and restore the prior unbounded-wait behavior). A
+resolver that exceeds the bound is dropped from that call's result with a
+warning, exactly like an already-erroring resolver -- not raised, and its own
+short-TTL cache (`AGENT_BRIDGE_NAMESPACE_LIST_TTL`) is left untouched, so the
+next call retries fresh. For `CliNamespaceResolver`, the bound is threaded
+into the underlying `subprocess.run(..., timeout=...)` call so a wedged
+provider's **child process is actually killed** on expiry -- an outer
+`asyncio.wait_for` alone only cancels the awaiting task and cannot stop a
+blocking `subprocess.run` already running in a worker thread, which would
+otherwise keep the process (and thread) alive for its own much longer
+default subprocess timeout.
+
+### Fast single-agent lookup: skipping enumeration entirely
+
+The per-resolver timeout above bounds the worst case, but most callers never
+needed the full listing (and its namespace enumeration) in the first place:
+`agent_dispatch`'s spawn preflight and headless-lane resolution only ever
+check whether *one specific, known* agent name is registered. `agent-show
+<name>` (client: `BridgeClient.get_agent`, route: `GET /api/v1/agents/{name}`)
+answers that from static/topology config alone (`AgentResolver.
+get_agent_config`) and **never touches a namespace resolver at all** -- no
+CodeSpaces/container enumeration, no per-resolver timeout to wait out. By
+default it surfaces only **addressable first-class targets**; worktree-bound
+charter profiles stay hidden from ordinary `agents` / `agent-show` listings even
+though they remain in the registry for `bound_agent` resolution. The internal
+`include_unaddressable`/`--include-unaddressable` escape hatch exists for
+callers such as `agent_dispatch` that must validate a hidden charter profile
+without making it look like a direct target. It still cannot resolve a
+namespace-prefixed name (`codespace:foo`, `container:bar`); `agent_dispatch`'s
+callers most commonly name a plain local/SSH-topology agent (the common case
+this fast path covers), but `--headless-agent` is user-configurable and can
+legitimately be namespace-prefixed. `agent_dispatch`'s
+`bridge._resolve_agent_record()` handles this transparently: it detects a
+namespace-prefixed name (or an older agent-bridge CLI that predates
+`agent-show`, or the newer hidden-profile flag, version-skew concerns since
+these are independently-updated plugins) and falls back to the full `agents`
+listing for that one name, rather than misreporting it as unregistered.
+`agent_is_registered()` / `registered_agent_project()` build on this wrapper,
+with a much shorter default timeout (8s, was 20s) for the common plain-name
+case since there is no namespace enumeration latency to size for there. The
+full `agents` listing
+(and its per-resolver timeout) remains the right tool when the actual set of *all*
+registered agents is needed (the interactive `agents` command, `--all-projects`
+fleet catalogs, etc.).

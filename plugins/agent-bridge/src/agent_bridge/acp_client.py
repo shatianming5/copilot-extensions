@@ -14,8 +14,10 @@ import json
 import logging
 import os
 import re
+import time
 import signal
 import sys
+import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -61,7 +63,7 @@ from acp.schema import (
 )
 
 from . import __version__
-from .procgroup import safe_killpg
+from .procgroup import safe_killpg, terminate_windows_tree
 
 log = logging.getLogger("agent-bridge")
 
@@ -179,15 +181,7 @@ async def _terminate_process_tree(proc: asyncio.subprocess.Process) -> None:
     """
     pid = proc.pid
     if sys.platform == "win32":
-        try:
-            killer = await asyncio.create_subprocess_exec(
-                "taskkill", "/PID", str(pid), "/T", "/F",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(killer.wait(), timeout=5.0)
-        except (TimeoutError, asyncio.TimeoutError, OSError, ProcessLookupError):
-            pass
+        await terminate_windows_tree(proc)
     else:
         # POSIX: agent spawns use start_new_session, so the child leads its
         # own process group -- signal the whole group, then escalate. Guard
@@ -488,6 +482,8 @@ class AcpClient:
         self._prompt_error: str | None = None
         self._stop_reason: str | None = None
         self._pending_permission_future: asyncio.Future[RequestPermissionResponse] | None = None
+        self._pending_permission_id: str | None = None
+        self._pending_permission_options: set[str] = set()
 
         # Parked ``ask_user`` elicitations, keyed by tool_call_id. Each future
         # resolves to a CreateElicitationResponse once a human answers (via
@@ -720,7 +716,10 @@ class AcpClient:
         )
 
     async def new_session(
-        self, cwd: str, mcp_servers: list[dict[str, Any]] | None = None,
+        self,
+        cwd: str,
+        mcp_servers: list[dict[str, Any]] | None = None,
+        timing_callback: Callable[[str, float], None] | None = None,
     ) -> str:
         """Create a new ACP session. Returns the ACP session ID.
 
@@ -729,14 +728,24 @@ class AcpClient:
         """
         if not self._connection:
             raise RuntimeError("ACP connection not initialized")
+        started = time.monotonic()
+        servers = build_mcp_servers(mcp_servers)
+        if timing_callback is not None:
+            timing_callback("session_new_mcp_build", time.monotonic() - started)
+        started = time.monotonic()
         result = await self._connection.new_session(
-            cwd=cwd, mcp_servers=build_mcp_servers(mcp_servers),
+            cwd=cwd, mcp_servers=servers,
         )
+        if timing_callback is not None:
+            timing_callback("session_new_rpc", time.monotonic() - started)
         self._acp_session_id = result.session_id
         # Set the session's model/effort now that it exists (dotfiles#790):
         # copilot ignores the ``--model`` launch flag in ``--acp`` mode, so the
         # model is chosen here against the advertised select options.
+        started = time.monotonic()
         await self._apply_model_config(getattr(result, "config_options", None))
+        if timing_callback is not None:
+            timing_callback("session_new_model_config", time.monotonic() - started)
         return result.session_id
 
     def adopt_session(self, acp_session_id: str) -> None:
@@ -762,6 +771,7 @@ class AcpClient:
         session_id: str,
         suppress_replay: bool = True,
         mcp_servers: list[dict[str, Any]] | None = None,
+        timing_callback: Callable[[str, float], None] | None = None,
     ) -> None:
         """Reload a previously persisted ACP session (for resume).
 
@@ -786,17 +796,27 @@ class AcpClient:
         self._suppress_replay = suppress_replay
         result = None
         try:
+            started = time.monotonic()
+            servers = build_mcp_servers(mcp_servers)
+            if timing_callback is not None:
+                timing_callback("session_load_mcp_build", time.monotonic() - started)
+            started = time.monotonic()
             result = await self._connection.load_session(
                 cwd=cwd, session_id=session_id,
-                mcp_servers=build_mcp_servers(mcp_servers),
+                mcp_servers=servers,
             )
+            if timing_callback is not None:
+                timing_callback("session_load_rpc", time.monotonic() - started)
         finally:
             self._loading_session = False
             self._suppress_replay = True
         self._acp_session_id = session_id
         # Re-assert the model/effort on resume: a reloaded session may report
         # the agent's default in its config options (dotfiles#790).
+        started = time.monotonic()
         await self._apply_model_config(getattr(result, "config_options", None))
+        if timing_callback is not None:
+            timing_callback("session_load_model_config", time.monotonic() - started)
 
     async def _apply_model_config(self, config_options: Any) -> None:
         """Set the session's ``model`` / ``reasoning_effort`` via ACP.
@@ -1317,15 +1337,69 @@ class AcpClient:
                 outcome={"outcome": "selected", "optionId": option_id}
             )
 
-        # Manual mode -- emit event and block
-        self._emit("permission_request", {
-            "title": title,
-            "options": option_dicts,
-        })
+        # Manual mode -- emit a correlated event and block. The correlation is
+        # process-live for resolution and durable in the event log for replay.
+        request_id = uuid.uuid4().hex
         loop = asyncio.get_running_loop()
-        self._pending_permission_future = loop.create_future()
+        future: asyncio.Future[RequestPermissionResponse] = loop.create_future()
+        self._pending_permission_future = future
+        self._pending_permission_id = request_id
+        self._pending_permission_options = {
+            str(option["optionId"])
+            for option in option_dicts
+            if option.get("optionId")
+        }
+        try:
+            self._emit("permission_request", {
+                "request_id": request_id,
+                "title": title,
+                "options": option_dicts,
+            })
+        except Exception:
+            self._pending_permission_future = None
+            self._pending_permission_id = None
+            self._pending_permission_options = set()
+            raise
         self._completion_event.set()
-        return await self._pending_permission_future
+        try:
+            result = await future
+            outcome = getattr(result, "outcome", None)
+            if hasattr(outcome, "model_dump"):
+                outcome = outcome.model_dump(by_alias=True, mode="json")
+            self._emit("permission_resolved", {
+                "request_id": request_id,
+                "outcome": outcome,
+                "auto": False,
+            })
+            return result
+        finally:
+            if self._pending_permission_future is future:
+                self._pending_permission_future = None
+                self._pending_permission_id = None
+                self._pending_permission_options = set()
+
+    def has_pending_permission(self, request_id: str) -> bool:
+        """Whether ``request_id`` is the currently answerable permission."""
+        return bool(
+            request_id
+            and request_id == self._pending_permission_id
+            and self._pending_permission_future
+            and not self._pending_permission_future.done()
+        )
+
+    def resolve_permission(self, request_id: str, option_id: str) -> bool:
+        """Resolve the current manual permission request with one offered option."""
+        if not self.has_pending_permission(request_id):
+            return False
+        if option_id not in self._pending_permission_options:
+            raise ValueError(f"Unknown permission option {option_id}")
+        assert self._pending_permission_future is not None
+        self._pending_permission_future.set_result(
+            RequestPermissionResponse(
+                outcome={"outcome": "selected", "optionId": option_id}
+            )
+        )
+        return True
 
     async def _handle_elicitation(
         self, message: str, mode: Any
@@ -1466,6 +1540,8 @@ class AcpClient:
         self._prompt_error = None
         self._stop_reason = None
         self._pending_permission_future = None
+        self._pending_permission_id = None
+        self._pending_permission_options = set()
         self._completion_event = asyncio.Event()
 
     def _build_turn_result(self) -> dict[str, Any]:

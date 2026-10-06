@@ -13,10 +13,16 @@ interactive git/GCM prompts. This is the **public seam** agent-bridge calls
 from __future__ import annotations
 
 import os
+import json
+import re
 import shlex
+import shutil
 import socket
+import subprocess
 import sys
 from pathlib import Path
+
+from agent_procutil import no_window_flags
 
 # Static PATs a CodeSpace injects that must be neutralized so a dispatched agent
 # never relies on a stale/expired token instead of the credential relay.
@@ -35,7 +41,99 @@ SCRUB_ENV_VARS: tuple[str, ...] = (
 # ``LC_GIT_CREDENTIAL_RELAY`` (or inherited a since-torn-down port) can still
 # find an active channel back to the caller (dotfiles #489/#187/#19). Kept under
 # the same ``~/.agent-bridge`` dir the connect breadcrumb uses.
-RELAY_PORTMAP_DIR = "$HOME/.agent-bridge/relay-ports"
+RELAY_PORTMAP_DIR = "$HOME/.agent-bridge/relay-ports"  # marketplace-isolation: allow registry
+
+# Directory the launch prelude symlinks the RushStack-facing bare
+# ``azure-auth-helper`` name into. It sits outside the default PATH and is
+# only reachable when THIS launch's prelude exports it inline (see
+# ``build_azure_auth_helper_compat_shim``) -- never persisted to a dotfile, so
+# it never survives past this one launch's shell.
+AZURE_AUTH_HELPER_COMPAT_DIR = "$HOME/.cache/agent-codespaces/compat-path"
+_SUBPROCESS_FLAGS = no_window_flags()
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _az_argv(rest: list[str]) -> list[str] | None:
+    """Build an argv that can launch the Azure CLI cross-platform."""
+    az = shutil.which("az")
+    if not az:
+        return None
+    if sys.platform == "win32" and az.lower().endswith((".cmd", ".bat")):
+        return ["cmd", "/c", az, *rest]
+    return [az, *rest]
+
+
+def current_identity(*, timeout: float = 10.0) -> str | None:
+    """Return the current host Azure-login identity string, or ``None``."""
+    args = _az_argv(["account", "show", "--output", "json"])
+    if args is None:
+        return None
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=_SUBPROCESS_FLAGS,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    user = data.get("user") if isinstance(data, dict) else None
+    if not isinstance(user, dict):
+        return None
+    raw = str(user.get("name") or "").strip()
+    if not raw or any(ch in raw for ch in "\r\n\0"):
+        return None
+    if str(user.get("type") or "").strip().casefold() == "user" and "@" in raw:
+        alias = raw.split("@", 1)[0].strip()
+        if alias:
+            return alias
+    return raw
+
+
+def _valid_env_names(var_names) -> list[str]:
+    """Return only safe shell env-var names."""
+    return [
+        name for name in (var_names or ())
+        if isinstance(name, str) and _ENV_VAR_NAME_RE.fullmatch(name)
+    ]
+
+
+def build_azure_auth_helper_compat_shim() -> str:
+    """POSIX snippet exposing bare ``azure-auth-helper`` on PATH for one launch.
+
+    RushStack's ``@rushstack/rush-azure-storage-build-cache-plugin``
+    ``AdoCodespacesAuthCredential`` hard-codes
+    ``Executable.spawnSync("azure-auth-helper", ...)`` with no override, so it
+    resolves the bare name through the current process's ``PATH``. #404
+    correctly stopped *persistently* installing a same-named shadow at
+    ``~/azure-auth-helper`` / ``~/.local/bin/azure-auth-helper`` -- that shadow
+    broke Azure CLI's own native ``azure-auth-helper``, whose verbs the ADO
+    relay does not implement. A clean headless CodeSpace (no VS Code server)
+    then has no executable of that name at all, so ``AdoCodespacesAuth`` fails
+    before attempt 1 (#415).
+
+    This maps the bare name to the relay-first ``ado-auth-helper`` wrapper
+    (installed by ``codespace_assets.build_provision_command``) ONLY for the
+    duration of this one launch's shell: ``PATH`` is exported inline in the
+    returned snippet, never written to ``~/.bashrc``, ``~/.profile``, or any
+    persisted dotfile, so a fresh interactive VS Code session or a plain
+    ``az login`` never inherits it. ``AZURE_AUTH_HELPER_COMPAT_DIR`` itself
+    sits outside the default PATH, so it stays unreachable outside a launch
+    that includes this prelude.
+    """
+    d = AZURE_AUTH_HELPER_COMPAT_DIR
+    return (
+        f'mkdir -p "{d}"; '
+        f'ln -sf "{ADO_AUTH_HELPER}" "{d}/azure-auth-helper"; '
+        f'export PATH="{d}:$PATH"; '
+    )
 
 
 def relay_listening(port: int, timeout: float = 0.5) -> bool:
@@ -72,10 +170,11 @@ def build_relay_portmap_write(relay_port: int) -> str:
     """POSIX snippet that publishes a relay port-mapping file (best-effort).
 
     Writes ``<RELAY_PORTMAP_DIR>/<port>.json`` =
-    ``{"port","token","ado_host","ts"}`` with a restrictive umask, reading the
+    ``{"port","token","ado_host","github_account","ts"}`` with a restrictive umask, reading the
     secret from the just-exported ``LC_GIT_CREDENTIAL_RELAY_TOKEN`` (never
-    re-interpolated) and the non-secret ADO host from
-    ``LC_GIT_CREDENTIAL_RELAY_ADO_HOST``. Never aborts the prelude (``|| true``).
+    re-interpolated) and non-secret host/account metadata from
+    ``LC_GIT_CREDENTIAL_RELAY_ADO_HOST`` / ``LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT``.
+    Never aborts the prelude (``|| true``).
     Keyed by port so repeat launches to the same relay are idempotent; a stale
     file whose channel later dies is pruned by the auth helpers' liveness probe
     (the discovery reader), not here.
@@ -83,9 +182,10 @@ def build_relay_portmap_write(relay_port: int) -> str:
     d = RELAY_PORTMAP_DIR
     return (
         f'mkdir -p "{d}" 2>/dev/null; '
-        '( umask 177; printf \'{"port":%s,"token":"%s","ado_host":"%s","ts":%s}\\n\' '
+        '( umask 177; printf \'{"port":%s,"token":"%s","ado_host":"%s","github_account":"%s","ts":%s}\\n\' '
         f'{relay_port} "$LC_GIT_CREDENTIAL_RELAY_TOKEN" '
         '"${LC_GIT_CREDENTIAL_RELAY_ADO_HOST:-}" '
+        '"${LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT:-}" '
         '"$(date +%s 2>/dev/null || echo 0)" '
         f'> "{d}/{relay_port}.json" ) 2>/dev/null || true; '
     )
@@ -118,14 +218,57 @@ def build_feed_token_exports(var_names) -> str:
     outlives it re-borrows on the next launch, matching the relay's own model).
     """
     out = ""
-    for name in var_names or ():
-        if not name:
-            continue
+    for name in _valid_env_names(var_names):
         out += (
             f'export {name}="$({ADO_AUTH_HELPER} get-access-token '
             '2>/dev/null || true)"; '
         )
     return out
+
+
+def build_identity_env_exports(var_names) -> str:
+    """POSIX snippet exporting each identity env var from the host Azure login.
+
+    Unlike feed-token exports, these values are resolved on the HOST while the
+    launch prelude is being built, so they do not depend on
+    ``LC_GIT_CREDENTIAL_RELAY`` and can be emitted for any launch shape. The
+    resolved value comes from the same host Azure CLI session the relay mints
+    Azure bearers from; ordinary user principals export a short login-like
+    alias, while other principal types keep the reported identity string.
+    """
+    names = _valid_env_names(var_names)
+    if not names:
+        return ""
+    identity = current_identity()
+    if not identity:
+        return ""
+    out = ""
+    quoted = shlex.quote(identity)
+    for name in names:
+        out += f"export {name}={quoted}; "
+    return out
+
+
+def build_relay_portmap_publish(
+    relay_port: int,
+    relay_token: str | None,
+    *,
+    ado_host: str | None = None,
+    github_account: str | None = None,
+) -> str:
+    """Standalone command that publishes only the relay port-mapping file.
+
+    For a connection whose remote shell never runs the launch prelude (an
+    interactive ``gh codespace ssh`` after skipped warm-up/provisioning): ssh
+    does not carry the local ``LC_*`` relay env across, so the auth helpers
+    must discover the token and GitHub account from this file instead.
+    """
+    env = f"export LC_GIT_CREDENTIAL_RELAY_TOKEN={shlex.quote(relay_token or '')}; "
+    if ado_host:
+        env += f"export LC_GIT_CREDENTIAL_RELAY_ADO_HOST={shlex.quote(ado_host)}; "
+    if github_account:
+        env += f"export LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT={shlex.quote(github_account)}; "
+    return env + build_relay_portmap_write(relay_port)
 
 
 def build_relay_env(
@@ -134,7 +277,9 @@ def build_relay_env(
     *,
     use_relay: bool,
     ado_host: str | None = None,
+    github_account: str | None = None,
     feed_token_env: list[str] | None = None,
+    identity_env: list[str] | None = None,
 ) -> str:
     """Build the CodeSpace launch-prelude env string.
 
@@ -143,19 +288,26 @@ def build_relay_env(
     and appends the relay exports when ``use_relay``. ``GIT_TERMINAL_PROMPT=0``
     keeps git from blocking on an interactive prompt when a credential can't be
     resolved; ``GCM_INTERACTIVE=never`` makes Git Credential Manager fail fast
-    rather than starting an interactive broker in a headless ACP session. When
-    ``use_relay``, also publishes a port-mapping file so the auth helpers can
-    rediscover this relay channel by liveness probe even if the env is not
-    inherited by a later tool shell (see :func:`build_relay_portmap_write`), and
-    -- for any ``feed_token_env`` var names -- exports a feed-auth token minted
-    from the ADO auth helper so env-token feed auth (npm/nuget/rush) works over
-    the relay (dotfiles#1221). The feed-token exports come LAST so they can use
-    the just-exported ``LC_GIT_CREDENTIAL_RELAY``.
+    rather than starting an interactive broker in a headless ACP session. Any
+    ``identity_env`` vars are resolved on the host at prelude-build time and
+    exported regardless of ``use_relay`` because they do not depend on
+    ``LC_GIT_CREDENTIAL_RELAY``. When ``use_relay``, also publishes a
+    port-mapping file so the auth helpers can rediscover this relay channel by
+    liveness probe even if the env is not inherited by a later tool shell (see
+    :func:`build_relay_portmap_write`), exposes the bare
+    ``azure-auth-helper`` name RushStack's ``AdoCodespacesAuthCredential``
+    requires -- session/process-scoped only, never a persisted shadow (see
+    :func:`build_azure_auth_helper_compat_shim`, #415) -- and -- for any
+    ``feed_token_env`` var names -- exports a feed-auth token minted from the
+    ADO auth helper so env-token feed auth (npm/nuget/rush) works over the
+    relay (dotfiles#1221). The feed-token exports come LAST so they can use the
+    just-exported ``LC_GIT_CREDENTIAL_RELAY``.
     """
     from .codespace_assets import build_auth_error_policy_command
 
     env = "".join(f"unset {v}; " for v in SCRUB_ENV_VARS)
     env += build_auth_error_policy_command()
+    env += build_identity_env_exports(identity_env)
     if use_relay:
         env += (
             f"export LC_GIT_CREDENTIAL_RELAY={relay_port}; "
@@ -168,9 +320,45 @@ def build_relay_env(
                 "export LC_GIT_CREDENTIAL_RELAY_ADO_HOST="
                 f"{shlex.quote(ado_host)}; "
             )
+        if github_account:
+            env += (
+                "export LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT="
+                f"{shlex.quote(github_account)}; "
+            )
         env += build_relay_portmap_write(relay_port)
+        env += build_azure_auth_helper_compat_shim()
         env += build_feed_token_exports(feed_token_env)
     return env
+
+
+def relay_azure_resources(cfg) -> list[str]:
+    """The Azure resources a codespace's relay token may mint tokens for.
+
+    The default ADO REST + Storage resources, plus any the adopting repo's
+    ``az-login`` source config adds. No product-specific values here -- they
+    come from the merged config a harness plugin supplies by convention.
+    """
+    from .relay_provider import DEFAULT_AZURE_RESOURCES
+
+    resources = list(DEFAULT_AZURE_RESOURCES)
+    az_cfg = getattr(getattr(cfg, "credentials", None), "sources", {}).get("az-login")
+    if az_cfg and az_cfg.enabled:
+        resources.extend(az_cfg.allowed_resources)
+    return resources
+
+
+def scoped_relay_token(codespace_name: str, cfg) -> str:
+    """Mint/reuse the codespace's relay token with its configured Azure scope.
+
+    Every connect path must mint through this: a token minted without a scope
+    records ``allowed_resources: []``, which the relay authorizer reads as
+    "no Azure resources" -- the CodeSpace's ``azure-auth-helper`` then fails,
+    and RushStack's cloud-cache login falls through to an interactive browser
+    flow that waits forever in an unattended session.
+    """
+    from .relay_token import token_for
+
+    return token_for(codespace_name, allowed_resources=relay_azure_resources(cfg))
 
 
 def build_relay_launch_env(
@@ -195,10 +383,14 @@ def build_relay_launch_env(
     ``credentials.relay_port``.
     """
     from .config import load_merged_config
-    from .relay_provider import DEFAULT_AZURE_RESOURCES
-    from .relay_token import token_for
 
     cfg = load_merged_config(include_cwd=False)
+    try:
+        from .gh_account import fast_credential_account_for_codespace
+
+        github_account = fast_credential_account_for_codespace(codespace_name)
+    except Exception:
+        github_account = None
     if relay_port is not None:
         port = int(relay_port)
     else:
@@ -207,15 +399,9 @@ def build_relay_launch_env(
             port = published
         else:
             port = int(cfg.credentials.relay_port)
-    # Record the per-token Azure scope the relay authorizer enforces: the default
-    # ADO REST + Storage resources, plus any the adopting repo's ``az-login``
-    # source config adds. No product-specific values here -- they come from the
-    # merged config a harness plugin supplies by convention.
-    resources = list(DEFAULT_AZURE_RESOURCES)
-    az_cfg = getattr(cfg.credentials, "sources", {}).get("az-login")
-    if az_cfg and az_cfg.enabled:
-        resources.extend(az_cfg.allowed_resources)
-    token = token_for(codespace_name, allowed_resources=resources)
+    # Record the per-token Azure scope the relay authorizer enforces (see
+    # :func:`relay_azure_resources`).
+    token = scoped_relay_token(codespace_name, cfg)
     warn_if_relay_unavailable(
         port, codespace_name, context="Session Host dispatch",
     )
@@ -225,7 +411,9 @@ def build_relay_launch_env(
             token,
             use_relay=True,
             ado_host=getattr(cfg.credentials, "ado_host", None),
+            github_account=github_account,
             feed_token_env=getattr(cfg.credentials, "feed_token_env", None),
+            identity_env=getattr(cfg.credentials, "identity_env", None),
         ),
         port,
     )
@@ -242,8 +430,9 @@ def _published_live_relay_port() -> int | None:
     relay port is discovered even on the standalone path (#540 pt3). Returns
     ``None`` when the file is absent/unparseable.
     """
+    _default_dir = "~/.agent-bridge"  # marketplace-isolation: allow registry
     base = Path(
-        os.environ.get("AGENT_BRIDGE_CONFIG_DIR", "~/.agent-bridge")
+        os.environ.get("AGENT_BRIDGE_CONFIG_DIR", _default_dir)
     ).expanduser()
     if base.name == "elevated":
         base = base.parent

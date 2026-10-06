@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from agent_procutil import detached_kwargs, windowless_python
+from agent_procutil import detached_kwargs, windowless_python, windowless_python_env
 
 from . import config, rendezvous
 from .config import IS_WINDOWS, SOCKET_PATH, ResolvedVault
@@ -122,7 +122,7 @@ def _windows_run_dirs() -> list[Path]:
         for profile in users.iterdir():
             if profile.name.lower() in skip:
                 continue
-            ep = profile / ".agent-vault" / "run" / "endpoint.json"
+            ep = profile / ".agent-vault" / "run" / "endpoint.json"  # marketplace-isolation: allow legacy compatibility root
             try:
                 mtime = ep.stat().st_mtime
             except OSError:
@@ -171,28 +171,45 @@ def _discover_endpoint(
     exactly today's legacy dial (UDS->TCP / fixed port).
     """
     override = os.environ.get(config.ENDPOINT_ENV)
+    expected_installation = config.installation_id()
     if strict:
         if override is not None:
             endpoint = rendezvous.Endpoint.parse(override, source="env")
             rendezvous.validate_endpoint(endpoint)
             return endpoint
         endpoint = rendezvous.read_endpoint_strict(config.run_dir())
-        if endpoint is not None and not rendezvous.is_stale(
-            endpoint,
-            probe=rendezvous.connect_probe,
+        if (
+            endpoint is not None
+            and expected_installation
+            and endpoint.installation_id not in (None, expected_installation)
         ):
+            endpoint = None
+        if endpoint is not None and not rendezvous.is_stale(endpoint, probe=rendezvous.connect_probe):
             return endpoint
     else:
         try:
-            return rendezvous.resolve(
+            endpoint = rendezvous.resolve(
                 config.run_dir(),
                 override=override,
                 probe=rendezvous.connect_probe,
             )
+            if (
+                expected_installation
+                and endpoint.installation_id not in (None, expected_installation)
+            ):
+                return None
+            return endpoint
         except rendezvous.EndpointUnavailable:
             pass
     if IS_WSL:
-        return _read_windows_endpoint(strict=strict)
+        endpoint = _read_windows_endpoint(strict=strict)
+        if (
+            endpoint is not None
+            and expected_installation
+            and endpoint.installation_id not in (None, expected_installation)
+        ):
+            return None
+        return endpoint
     return None
 
 
@@ -310,15 +327,16 @@ def send_command(
 
 def _start_service_systemd() -> bool:
     """Start the vault service via systemd user unit if available."""
+    unit = os.environ.get(config.SYSTEMD_UNIT_ENV) or "agent-vault.service"  # marketplace-isolation: allow legacy-compatibility
     try:
         result = subprocess.run(
-            ["systemctl", "--user", "is-enabled", "agent-vault.service"],
+            ["systemctl", "--user", "is-enabled", unit],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
             return False
         subprocess.run(
-            ["systemctl", "--user", "start", "agent-vault.service"],
+            ["systemctl", "--user", "start", unit],
             capture_output=True, timeout=10,
         )
         for _ in range(20):
@@ -339,14 +357,18 @@ def start_service(tcp_port: int | None = None) -> bool:
             return True
         tcp_port = context.port
 
-    cmd = [windowless_python(sys.executable), "-m", "agent_vault.service"]
+    python = sys.executable
+    cmd = [windowless_python(python), "-m", "agent_vault.service"]
     if tcp_port:
         cmd.extend(["--tcp-port", str(tcp_port)])
 
     if IS_WINDOWS:
         cmd.append("--foreground")
+        env = os.environ.copy()
+        env.update(windowless_python_env(python))
         subprocess.Popen(
             cmd,
+            env=env,
             **detached_kwargs(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -1633,7 +1655,27 @@ def cmd_vault_remove(args):
 def main(argv: list[str] | None = None):
     import argparse
 
-    from . import __version__
+    class _LazyVersionAction(argparse.Action):
+        """Defer ``__version__`` resolution until ``--version`` is actually
+        passed, instead of eagerly formatting it into every parser build
+        (argparse's own ``action="version"`` requires the finished string up
+        front, forcing the ``importlib.metadata`` lookup on every invocation
+        regardless of subcommand)."""
+
+        def __init__(self, option_strings, dest=argparse.SUPPRESS,
+                     default=argparse.SUPPRESS, help=None):
+            super().__init__(
+                option_strings=option_strings, dest=dest, default=default,
+                nargs=0, help=help,
+            )
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            import sys as _sys
+
+            from . import __version__
+
+            parser._print_message(f"agent-vault {__version__}\n", _sys.stdout)
+            parser.exit()
 
     parser = argparse.ArgumentParser(
         prog="agent-vault",
@@ -1641,8 +1683,8 @@ def main(argv: list[str] | None = None):
     )
     parser.add_argument(
         "--version",
-        action="version",
-        version=f"agent-vault {__version__}",
+        action=_LazyVersionAction,
+        help="show program's version number and exit",
     )
     sub = parser.add_subparsers(dest="command")
 

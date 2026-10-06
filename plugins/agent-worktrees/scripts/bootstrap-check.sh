@@ -1,4 +1,27 @@
 #!/usr/bin/env bash
+
+# --- bootstrap-killswitch guard (vendored; see libs/bootstrap-killswitch/README.md) ---
+# One shared, repo-wide switch (not per-plugin) that pauses EVERY adopting
+# plugin's reconcile-on-session-start at once, for when an operator/agent is
+# hand-diagnosing a venv/install and a background reconcile must not race it.
+# Legacy/default installation ONLY: a namespaced marketplace cell
+# (COPILOT_EXTENSIONS_CONTEXT set) reconciles through its own cell-scoped
+# mechanism, never this global state file -- crossing that installation-cell
+# boundary would let one marketplace's switch pause an unrelated,
+# independently-owned cell's reconcile (visions/plugin-services/
+# installation-cells). This guard is therefore a deliberate no-op under a
+# cell context, same as this hook's own existing cell-context exit below.
+if [ -z "${COPILOT_EXTENSIONS_CONTEXT:-}" ]; then
+  _bks_guard_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  _bks_guard="$_bks_guard_dir/bootstrap-killswitch-guard.sh"
+  if [ -f "$_bks_guard" ] && bash "$_bks_guard" check >&2; then
+    printf '{}'
+    exit 0
+  fi
+  unset _bks_guard_dir _bks_guard
+fi
+# --- end bootstrap-killswitch guard ---
+
 # Bootstrap hook -- runs on session start via hooks.json. hooks.json runs the
 # PLUGIN PAYLOAD copy first, falling back to the deployed ~/.agent-worktrees/bin
 # copy. Two jobs, both grace-window-cheap:
@@ -12,6 +35,13 @@
 #      deployed lib-copy package when the source commit drifts.
 
 set -euo pipefail
+
+# A selected installation context owns runtime resolution. The payload-local
+# command validates it and provisions its cell on first use; this best-effort
+# hook must never touch the legacy root while any explicit context is present.
+if [[ -n "${COPILOT_EXTENSIONS_CONTEXT:-}" ]]; then
+    exit 0
+fi
 
 ScriptDir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo '')"
 INSTALL_DIR="$HOME/.agent-worktrees"
@@ -44,39 +74,44 @@ if [[ ! -x "$VENV_PYTHON" ]] && ! _aw_provisioned; then
     _installer="${ScriptDir:+$ScriptDir/install.sh}"
     if [[ -n "$_installer" && -f "$_installer" ]] && grep -qE '^[[:space:]]*stamp\)' "$_installer" 2>/dev/null; then
         bash "$_installer" stamp >/dev/null 2>&1 || true
+        printf '{}'
         exit 0
     fi
-    # Deployed-copy fallback on a still-unprovisioned box -> setup hint.
-    echo ''
-    echo -e '\033[33m[agent-worktrees] Runtime not installed.\033[0m'
-    echo -e "\033[90m  Ask Copilot to 'set up agent-worktrees' to bootstrap the runtime.\033[0m"
-    echo ''
+    # Deployed-copy fallback on a still-unprovisioned box -> setup hint. Every
+    # sessionStart invocation of this fallback (including hooks.json's direct,
+    # no-python last resort) must emit exactly `{}`; the hint is diagnostic,
+    # not model-facing, so it goes to stderr only.
+    echo "[agent-worktrees] Runtime not installed. Ask Copilot to 'set up agent-worktrees' to bootstrap the runtime." >&2
+    printf '{}'
     exit 0
 fi
 
 # Provisioned via the tools-half (versioned slot) but the full-launcher resolver
 # isn't deployed -> nothing to reconcile via the legacy lib-copy path; no-op.
 if [[ ! -x "$VENV_PYTHON" ]]; then
+    printf '{}'
     exit 0
 fi
 
 # --- Installed: check if package is stale ---
-if [[ ! -f "$MANIFEST" ]]; then exit 0; fi
+if [[ ! -f "$MANIFEST" ]]; then printf '{}'; exit 0; fi
 plugin_dir="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('plugin_source',''))" "$MANIFEST" 2>/dev/null || true)"
-if [[ -z "$plugin_dir" || ! -d "$plugin_dir" ]]; then exit 0; fi
+if [[ -z "$plugin_dir" || ! -d "$plugin_dir" ]]; then printf '{}'; exit 0; fi
 
 PKG_SRC="$plugin_dir/src/agent_worktrees"
-if [[ ! -d "$PKG_SRC" ]]; then exit 0; fi
+if [[ ! -d "$PKG_SRC" ]]; then printf '{}'; exit 0; fi
 
 deployed_commit="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('commit',''))" "$MANIFEST" 2>/dev/null || true)"
 current_commit="$(git -C "$plugin_dir" rev-parse HEAD 2>/dev/null || true)"
 
 if [[ -z "$deployed_commit" || -z "$current_commit" || "$deployed_commit" == "$current_commit" ]]; then
+    printf '{}'
     exit 0
 fi
 
-# Stale -- re-deploy package
-echo -e '\033[90m[agent-worktrees] Updating runtime payload...\033[0m'
+# Stale -- re-deploy package. Progress notices are diagnostics, not model
+# context: route them to stderr and keep stdout a single JSON object.
+echo -e '\033[90m[agent-worktrees] Updating runtime payload...\033[0m' >&2
 rm -rf "$PKG_DST"
 mkdir -p "$LIB_DIR"
 cp -r "$PKG_SRC" "$PKG_DST"
@@ -110,5 +145,6 @@ m['dirty'] = False
 json.dump(m, open(sys.argv[1], 'w'), indent=2)
 " "$MANIFEST" "$current_commit" 2>/dev/null || true
 
-echo -e '\033[90m[agent-worktrees] Runtime updated.\033[0m'
+echo -e '\033[90m[agent-worktrees] Runtime updated.\033[0m' >&2
+printf '{}'
 exit 0

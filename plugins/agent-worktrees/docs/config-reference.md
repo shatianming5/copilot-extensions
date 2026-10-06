@@ -7,11 +7,22 @@ Every configuration option for a repo adopted by agent-worktrees.
 agent-worktrees merges configuration from the layers below at load time.
 **Highest precedence wins**, per key (deep merge):
 
+The three machine-local global files (`config.yaml`, `projects.yaml`, and
+`repos.yaml`) always share one validated registry root. With no explicit
+installation context that root is `~/.agent-worktrees`. An explicit context
+selects the validated agent-worktrees cell plugin root; invalid or foreign
+context fails without reading the legacy files. Per-project
+Per-project config also follows the selected installation boundary:
+legacy/default mode keeps `~/.{project}/config.yaml`; namespaced mode validates
+the repository's normalized-remote identity receipt and uses
+`<cell>/repos/<repository-id>/agent-worktrees/config.yaml`. The host-owned
+Copilot session database remains outside this path.
+
 | Precedence | Source | Path | Scope | Committed? |
 |------------|--------|------|-------|-----------|
-| **Highest** | **Machine-local** | `~/.{project}/config.yaml` | Per-machine overrides + machine paths (anchor, custom worktree_root). The **adapter** that makes a *foreign* repo compatible. | No |
-| *(conditional)* | **Knowledge overlay** | bound knowledge repo's config | For a **stateless harness** bound to a knowledge repo, portable operator-preference keys only (`copilot_profiles`, `profile_assignment`, `headless`, `auto_fast_forward`, `new_picker`). Machine-specifics and the binding never graft. | Yes |
-| **Middle** | **In-repo** | `<anchor>/.agent-worktrees/config.yaml` | The repo's **own** committed settings — the base, shared by every machine. | Yes |
+| **Highest** | **Machine-local** | legacy `~/.{project}/config.yaml`; namespaced `<cell>/repos/<repository-id>/agent-worktrees/config.yaml` | Per-machine overrides + machine paths (anchor, custom worktree_root). The **adapter** that makes a *foreign* repo compatible. | No |
+| *(conditional)* | **Knowledge overlay** | bound knowledge repo's config | For a **stateless harness** bound to a knowledge repo, portable operator-preference keys only (`copilot_profiles`, `profile_assignment`, `headless`, `auto_fast_forward`). Machine-specifics and the binding never graft. | Yes |
+| **Middle** | **In-repo** | `<anchor>/.copilot-extensions/agent-worktrees/config.yaml` | The repo's **own** committed settings — the base, shared by every machine. Legacy `<anchor>/.agent-worktrees/config.yaml` and `<anchor>/.agent-worktrees.yaml` remain readable. | Yes |
 | **Lowest** | **Global** | `~/.agent-worktrees/config.yaml` | Machine-wide defaults: `srcroot`, `machine`, `platform`, `copilot_profiles`. | No |
 
 **A repo designed for this system needs no machine-local file.** Its anchor
@@ -21,9 +32,10 @@ config. Machine-local config is only needed to **override** a setting on a
 specific machine, or to adopt a *foreign* repo (work product, external GitHub)
 that carries no in-repo config.
 
-- **Top-level fields** (`srcroot`/`machine`/`platform`/`copilot_profiles`/
-  `profile_assignment`/`headless`/`auto_fast_forward`/`new_picker`) resolve **machine-local >
-  knowledge overlay (portable prefs only) > global > detected/default**.
+- **Portable top-level fields** (`srcroot`/`machine`/`platform`/
+  `copilot_profiles`/`profile_assignment`/`headless`/`auto_fast_forward`)
+  resolve **machine-local > knowledge overlay (portable prefs
+  only) > global > detected/default**.
 - **Per-repo settings** merge **in-repo flat settings < machine-local
   `repos.<name>` block**. The global tier carries *only* machine-wide top-level
   settings — never per-repo settings.
@@ -33,12 +45,12 @@ that carries no in-repo config.
 - A missing or malformed file at any tier is skipped safely — config loading
   never breaks the CLI on a bad file.
 
-> **Version note:** the in-repo **directory form**
-> (`<anchor>/.agent-worktrees/config.yaml`) and the global tier are read by
+> **Version note:** the in-repo canonical path
+> (`<anchor>/.copilot-extensions/agent-worktrees/config.yaml`) and the global tier are read by
 > **agent-worktrees ≥ v1.5.3-dev34**. Older plugins read only the machine-local
-> file plus a legacy single-file `<anchor>/.agent-worktrees.yaml` (which carried
-> just a `pr:` block) — still honored as a back-compat fallback when the
-> directory form is absent.
+> file plus legacy `<anchor>/.agent-worktrees/config.yaml` and
+> `<anchor>/.agent-worktrees.yaml` compatibility paths — still honored as
+> back-compat fallbacks when the canonical file is absent.
 
 ---
 
@@ -71,6 +83,16 @@ repos:
 > repos doctor` flags redundant/conflicting overlay keys and `--fix` strips the
 > redundant ones (comments preserved). A base-repo enlistment overlay typically
 > shrinks to just `repo_name` + the `env_script` it alone provides.
+>
+> **`default_branch` itself is likewise redundant in `repos.yaml` for a repo
+> that declares its own** (its in-repo `.agent-worktrees/config.yaml`, e.g.
+> a repo whose real contribution branch differs from its GitHub-advertised
+> HEAD). `repos add`/`repos clone` auto-derive the registry value from that
+> declaration when `--default-branch` isn't given, and `repos sync` treats
+> the in-repo declaration as authoritative over a stale registry value,
+> self-healing an anchor left checked out on the wrong branch (clean trees
+> only) rather than skipping it forever.
+
 
 It may *also* carry the machine-wide fields below (they then override the global
 config), but the slim form above is preferred:
@@ -112,10 +134,37 @@ repos:
 | `repo_name` | string | `""` | Which `repos.<name>` is the default repo. Optional when exactly one repo is defined. |
 | `headless` | bool | `false` | CLI-only project: the bare binstub lists worktrees instead of launching an interactive Copilot session. |
 | `auto_fast_forward` | bool | `true` | On resume, fast-forward a clean worktree that is strictly behind upstream. Only ever a FF — never touches dirty / ahead / diverged worktrees. |
-| `new_picker` | bool | `true` | Use the Textual picker. `picker disable` writes `false` to opt the machine out to the legacy picker. |
+| `default_copilot_account` | string | `""` | This machine's default **Copilot CLI** login for a repo with no explicit `copilot_account` override (see `repos.<name>.copilot_account`). Machine-local policy, not a portable knowledge-repo preference. Resolves machine-local `config.yaml` > global `~/.agent-worktrees/config.yaml` only. Empty means no machine-wide preference (ambient Copilot login). |
+| `copilot_identity_switch_enabled` | bool | `false` | Master switch for the Copilot CLI identity-enforcement feature (`copilot-identity ensure`, run automatically at the start of every session launch, and available manually). **Off by default** — when false, `ensure` is a pure no-op regardless of `default_copilot_account`/a repo's `copilot_account`: it never mints a `gh` token, shells out to `copilot login`, or reads `~/.copilot/config.json`. Deliberately config-file based (not an environment-variable opt-out) so the choice is durable and visible in `config.yaml`. Same tiering as `default_copilot_account`. |
 | `copilot_profiles` | list | `[]` | Selectable Copilot backend profiles (Tab-cycle in the picker). |
 | `profile_assignment` | map | absent/off | Optional balanced assignment policy over existing `copilot_profiles`. Only a user-owned global, knowledge-overlay, or machine-local/per-project block can set `armed: true`. |
 | `repos` | map | `{}` | Per-repo configuration, keyed by repo name. |
+
+### Same-machine AHP sessions
+
+Agent-worktrees no longer owns AHP configuration or the create/verify/dispose
+protocol flow. Configure same-machine AHP in Worktree Manager's
+`~/.worktree-manager/config.toml` `[ahp]` block; Worktree Manager owns the
+loopback endpoint, account/token resolution, protocol negotiation, and the
+provider-side lifecycle operations.
+
+Agent-worktrees keeps only the provider-neutral `execution_leg` record plus the
+generic `execution-leg get/reserve/set/release/clear` verbs and the
+finalize/cleanup barriers that treat `active` or `unknown` external legs as
+live. The legacy on-disk `session_backend:` record still loads through the
+reader-side compatibility shim, but it is no longer part of the supported
+configuration surface.
+
+The bare/direct `agent-worktrees` launcher consults `execution-leg get` only to
+resume an already-established AHP session for the worktree. If no active AHP
+execution leg exists, it launches normally and warns that establishing a **new**
+AHP session now requires the Worktree Manager Picker.
+
+Provider-owned lifecycle operations reserve the leg under the same
+record/finalize fence before contacting the host. Concurrent lifecycle
+operations fail closed while the reservation is `unknown`; publication requires
+the reservation token. A newly created session is disposed before a failed
+publication is rolled back, so stale or dead bindings are never advertised.
 
 ### Config drop-ins — `~/.{project}/config.d/`
 
@@ -183,9 +232,14 @@ agent-worktrees ≥ 1.5.3-dev113.)
 | `validate_paths` | list[str] | `[]` | Repo-relative paths the `validate` command checks for. |
 | `validate_hook` | map(platform→list) | `{}` | Custom validation command per platform. |
 | `service_paths` | list[str] (globs) | `[]` | Globs for service discovery (`services` subcommands). |
+| `bootstrap_services` | list[str] | `[]` | Opt-in additional service names (discovered via `service_paths`) that the normalized launcher must confirm are current **before** starting Copilot, alongside agent-worktrees itself. The launcher declares no facility- or repo-specific service names by default -- a repo names its own here rather than the launcher assuming one exists. |
 | `post_install_hook` | map(platform→list) | `{}` | Command run after install, per platform. |
 | `pr` | map | *(disabled)* | PR-workflow policy — see below. **Can also live in-repo.** |
 | `base_repo` | bool | `false` | Drive the anchor directly with **no worktrees** (for repos that can't use worktrees, e.g. enlistment-based monorepos). Pair with `env_script` (Windows enlistment env) or a custom `launch`. |
+| `stateless` | bool | `false` | This repo is a stateless harness routing personal state to a bound knowledge repo (see `Config.knowledge_repo`). Implies `requires_external_state_root`. |
+| `requires_external_state_root` | bool | `false` | Personal state (efforts/visions/logs) must be written to a separately-bound knowledge repo; the resolver refuses rather than falling back to this repo. |
+| `compose_knowledge_plugins` | bool | `true` | When false, never graft the paired knowledge repo's marketplaces/plugins into the harness session overlay. |
+| `knowledge_only` | bool | `false` | This repo is a **knowledge-only companion**: it exists solely to be carved as another project's paired `-k` knowledge worktree, never driven directly. `create` (and the interactive new-worktree flow) refuses a standalone worktree for it; binstub reconcile skips/reclaims its `<repo>` binstub; the Worktree Manager excludes it from implicit-default/ambiguous-selection project listings. The internal pairing carve is unaffected. Set the matching registry `repos add/update --class knowledge` too so `repos list`/the Manager's repo view reflect it. See the `knowledge-only-repos` effort. |
 
 **Platform-keyed maps** (`launch`, `launch_recovery`, `validate_hook`,
 `post_install_hook`) use the keys `windows`, `wsl`, `linux`, each mapping to a
@@ -247,6 +301,33 @@ repos:
       windows: "otools\\bin\\OpenEnlistment.bat"
 ```
 
+### Persisted model/effort/context preference at launch
+
+Every launch built by `_build_launch_cmd` (interactive worktree create,
+resume, and recovery) appends `--model`, `--reasoning-effort`, and `--context`
+flags derived from the persisted `~/.copilot/settings.json` keys `model`,
+`effortLevel`, and `contextTier` — whichever of the three are present and
+non-empty. This exists because Copilot CLI has been observed to ignore its
+own persisted settings values at startup, honoring only an explicit CLI flag
+or a mid-session `/model` change; without this, a machine's intended default
+model/effort/context tier is only a preference, never a guarantee (see the
+facility's `agent-machines` plugin, which is typically the sole writer of
+that settings file). The settings file may contain `//` line comments
+(JSON-with-comments); the reader tolerates them rather than silently
+dropping every preference on a strict-JSON parse failure.
+
+An explicit `--model`, `--reasoning-effort`, or `--context` already present
+*anywhere* in the assembled launch command — a configured `launch` template,
+`copilot_args`, or a backend profile's `copilot_args` — always wins; this
+never duplicates or overrides it, bare or `=`-form. No
+`~/.copilot/settings.json`, or none of the three keys set, means no flags are
+injected; the launch falls back to Copilot's own default resolution.
+
+**Not applied to ACP sessions** (`--acp`): Copilot CLI ignores these CLI
+flags in ACP mode. `agent-bridge`'s ACP client carries model/effort through
+its own configuration path there instead; context tier is not yet carried
+through ACP — a separate, tracked gap outside this mechanism's scope.
+
 ### Backend profiles — `copilot_profiles[]`
 
 | Key | Type | Default | Meaning |
@@ -255,6 +336,21 @@ repos:
 | `label` | string | = `name` | Human-readable label shown in the picker. |
 | `env` | map(str→str) | `{}` | Environment variables exported for the session. Keys must be valid env-var identifiers. |
 | `copilot_args` | list[str] | `[]` | Extra arguments passed to `copilot`. |
+
+**Scope (known gap, tracked):** `profiles[0]` is used as a default only inside
+the **interactive Tab-cycle picker** flow (a bare binstub invocation with a
+TTY and no explicit worktree). `resolve --base`, `resolve --json
+--worktree-id <id>` (the path `embody`, `agent-bridge`, `agent-dispatch`, and
+any background/headless launcher goes through), and a plain resume/new call
+all resolve `profile=None` unless the caller passes an explicit `--profile
+<name>`. A declared `copilot_profiles` entry does **not** yet act as a
+universal default the way the persisted-settings mechanism above does — see
+[ThomasMichon/copilot-extensions#4849](https://github.com/ThomasMichon/copilot-extensions/issues/4849).
+Until that lands, prefer the persisted `~/.copilot/settings.json`
+`model`/`effortLevel`/`contextTier` mechanism above for a default that must
+survive every launch path; reach for a named `copilot_profiles` entry plus an
+explicit `--profile` when a specific call site needs it (e.g. a different
+backend/provider per profile, not just a model string).
 
 ### Balanced profile assignment — `profile_assignment`
 
@@ -324,19 +420,123 @@ in-repo overlay (below); the in-repo version wins when both are present.
 | `enabled` | bool | `false` | Turn on PR mode — makes `create-pr` available. With `enabled` alone the PR path is *optional* per worktree: it is taken once a `create-pr` has run; a worktree with no PR record still finalizes direct to the default branch. |
 | `required` | bool | `false` | **Enforce** PRs: `push-changes` and the unmerged-work guard in `finalize` refuse the direct-to-default-branch path. The only way to land work is `create-pr` → open PR → merge. **Implies `enabled`.** |
 | `provider` | string | `gitea` | `gitea` \| `github` \| `azure-devops`. Selects which sub-agent / CLI opens the PR. |
-| `strategy` | string | `detach` | Default disposition after `create-pr`: `keep-alive` (keep the worktree open to iterate on review feedback, pushing updates to the feature branch) or `detach` (finalize the worktree immediately; resume later via a fresh `create`). Does **not** affect squash timing — squashing always happens at `create-pr`. |
+| `strategy` | string | `keep-alive` | Default disposition after `create-pr`: `keep-alive` (keep the worktree open to iterate on review feedback, pushing updates to the feature branch) or `detach` (finalize the worktree immediately; resume later via a fresh `create`). **`keep-alive` is the safe default** — driving every opened PR through to merge is the default conduct, so an unset `strategy` fails safe here, never to `detach`. Does **not** affect squash timing — squashing always happens at `create-pr`. |
 | `branch_prefix` | string | `feature` | Prefix for generated feature-branch names (e.g. `feature/<slug>-<suffix>`). Used by the `snapshot` head scheme and as the `{prefix}` token in `head_pattern`. |
-| `head_scheme` | string | `refspec` | How `create-pr` publishes the PR head — **naming + push mechanism only**. Both schemes leave the local worktree on `worktree/<id>` at the squashed commit (never reset off it, #1804). `refspec` (default, #1815/#1899): push `worktree/<id>` directly to the PR head ref (`worktree/<id>:refs/heads/pr/<slug>`) — no local feature branch. Requires the repo's pre-push hook to permit the mediated `worktree/<id> → pr/<slug>` push (honor `AGENT_WORKTREES_PR_PUSH=1`). `snapshot` (legacy/compatible): copy the squashed commit onto a separate local `feature/<slug>` branch and push that — no reset, no checkout dance; needs no pre-push-hook cooperation, so it's the safe opt-out for a repo whose hook still blocks the refspec push. A parallel `--new` PR auto-falls-back to a snapshot ref even under `refspec`. A present-but-invalid value falls back to `snapshot` (the compatible scheme), not the refspec default. |
-| `head_pattern` | string | *(scheme default)* | Template for the PR head branch name. Tokens: `{prefix}` `{slug}` `{suffix}` `{username}` `{machine}`. Empty ⇒ scheme default: `pr/{slug}-{suffix}` under `refspec` and `{prefix}/{slug}-{suffix}` under `snapshot` (`feature/<slug>`). Repos that want e.g. `user/{username}/{slug}-{suffix}` set it explicitly. `{username}` resolves from the repo's git identity (`user.email` local-part, then `user.name`). |
-| `source_attribution` | bool | `false` | Embed a hidden PR-body marker containing the source worktree, machine, session, and head SHA. Opt in only for closed-circuit systems where those identifiers are safe to publish; public repos should leave this disabled. `--no-attribution` can suppress it for one invocation. |
+| `head_scheme` | string | `refspec` | How `create-pr` publishes the PR head — **naming + push mechanism only**. Both schemes leave the local worktree on `worktree/<id>` at the squashed commit (never reset off it, #1804). `refspec` (default, #1815/#1899): push `worktree/<id>` directly to the provider-resolved PR head ref — for example `worktree/<id>:refs/heads/pr/<slug>-<suffix>` on non-Azure-DevOps repos, or `worktree/<id>:refs/heads/user/<username>/<slug>-<suffix>` on Azure DevOps when no explicit `head_pattern` overrides it — with no local feature branch. Requires the repo's pre-push hook to permit the mediated push (honor `AGENT_WORKTREES_PR_PUSH=1`). `snapshot` (legacy/compatible): copy the squashed commit onto a separate local publish branch (`feature/<slug>-<suffix>` by default; Azure DevOps still defaults to `user/<username>/<slug>-<suffix>` when no explicit `head_pattern` is set) and push that — no reset, no checkout dance; needs no pre-push-hook cooperation, so it's the safe opt-out for a repo whose hook still blocks the refspec push. A parallel `--new` PR auto-falls-back to a snapshot ref even under `refspec`. A present-but-invalid value falls back to `snapshot` (the compatible scheme), not the refspec default. |
+| `head_pattern` | string | *(provider/scheme default)* | Template for the PR head branch name. Tokens: `{prefix}` `{slug}` `{suffix}` `{username}` `{machine}` `{topic}`. Empty ⇒ provider-aware default: `azure-devops` uses `user/{username}/{slug}-{suffix}` regardless of `head_scheme`; other providers keep the scheme defaults (`pr/{slug}-{suffix}` under `refspec` and `{prefix}/{slug}-{suffix}` under `snapshot` / `feature/<slug>`). `{username}` resolves from the repo's git identity (`user.email` local-part, then `user.name`). `create-pr --topic <token>` slugifies the token and folds it into those generated defaults as `...-{topic}-{suffix}`; an explicit `head_pattern` uses it only when the pattern itself references `{topic}` (otherwise `--topic` is a no-op with an informational note). **When `source_attribution` isn't `true`, a `head_pattern` (or an explicit `--branch`, or an existing-PR-reuse) whose effective resolved head embeds `{machine}`, the raw worktree id, or an unresolved `{worktree_id}` marker is a hard `create-pr` error, not a warning** — see `attribution-audit` below.
+| `source_attribution` | bool, or `"codename"` | `"codename"` | Embed a hidden marker in the initial PR body and publish later pushed heads as dedicated managed PR comments. Consumers use the newest marker. `"codename"` (default, codename-attribution-by-default) — a public-safe marker carrying **only** the worktree's assigned codename (see `agent_worktrees.codename`), for a public repo that still wants an author to trace a stalled PR back to its worktree without publishing anything that decodes on its own; resolve it via `resolve --codename`/`embody --codename`, which resolves locally first and then via an automated cross-machine SSH scan (Phase 3) — a match on a different machine reports it (fails closed) rather than launching remotely. A PR-active repo (`pr.enabled: true`) with a custom `codename.wordlist_path` configured must set this key explicitly before a new codename may be allocated (see `CodenameAttributionPolicyError`) -- a PR-disabled repo may still allocate from a custom wordlist without this setting, since it can never publish a marker. `false` — no marker at all; the fully anonymous opt-out. `true` — the full raw marker (worktree id, machine, session, head SHA); closed-circuit systems only, never a public repo. An unrecognized string value falls back to `false`, not `true` — a typo can't silently enable the raw-marker mode. `--no-attribution` can suppress any mode for one invocation. **Applies beyond the hidden marker too:** whenever this isn't exactly `true`, `create-pr` also hard-blocks publishing a *branch name* that itself carries the raw worktree id or machine name (the branch-name leak class, effort `pr-attribution-codenames` Phase 5) — run `attribution-audit` to check whether this repo's `head_pattern` is at risk under its current setting. |
+| `required_body_sections` | list[string] | `[]` | Markdown heading names that must exist with non-empty visible content before `create-pr` may publish, for example `[Intent, Changes, Validation]`. Use `--body` or `--body-file`; hidden comments do not satisfy a section. |
 | `automerge_label` | string | *(empty)* | **Review-vocabulary binding** for the `pr-*` command family. The label whose presence signals **merge consent** — the author's post-approval "auto-complete this" (applied by `pr-merge`). Empty ⇒ no auto-merge mechanism configured (the family declines rather than guessing a label). Example value: `auto-merge`. |
 | `hold_labels` | list | `[]` | **Review-vocabulary binding.** Labels that **block** consent/merge — an explicit hold or a state needing author action (e.g. a rebase). Empty ⇒ nothing is treated as a hold. Example value: `[do-not-merge, needs-rebase, wip]`. |
 | `wip_title_prefixes` | list | `[]` | **Review-vocabulary binding.** Case-insensitive PR-title prefixes treated as work-in-progress (never eligible for consent). Empty ⇒ no title is WIP. Example value: `["wip:", "[wip]", "draft:", "[draft]"]`. |
 | `approval_required` | bool | `true` | Must a PR be **approved** before `pr-merge` requests auto-complete? `true` preserves the review-gated shape (a `CHANGES_REQUESTED` still always blocks). `false` suits a **self-complete** repo (we own the merge): eligible when simply *not* changes-requested — no approval vote needed. |
+| `allow_stale_approval` | bool | `false` | Allow the latest approval to authorize `pr-merge` after the PR head changes only when the same provider endpoint observed the exact tracked current head before that approval was submitted, using the provider's server clock for both events. Every `create-pr`, `push-changes`, and manual `set-pr` association clears and reacquires this evidence; a post-approval mediated push therefore remains unapproved. Same-second, missing, malformed, endpoint-mismatched, or head-mismatched evidence fails closed. Providers do not expose a portable head-generation watermark, so repositories enabling this policy must require branch updates to use the mediated PR flow; an arbitrary out-of-band replay of a previously observed SHA cannot be distinguished generically. The `pr-status` / `pr-watch` payloads report `approval_stale` and `approval_stale_authorized`. |
+| `dismiss_stale_reviews` | bool or `null` | `null` | Does **this repo's own** branch protection actually invalidate an approval when the PR head moves (GitHub `required_pull_request_reviews.dismiss_stale_reviews` / Gitea `dismiss_stale_approvals`)? `null` (default, unknown/unread) keeps the classifier's conservative behavior: a raw commit-SHA mismatch alone still denies an otherwise-live `APPROVED` verdict. `adopt` writes an explicit `true`/`false` here once a provider's live branch-protection read confirms the real setting. A confirmed `false` lets an approval survive a non-substantive head movement (e.g. a clean rebase with no content/patch-id change) instead of requiring a fresh review solely because the raw SHA changed (copilot-extensions#2060) — the provider's own `review.dismissed` signal (already read correctly for GitHub/Gitea) remains authoritative either way. Independent of, and layered under, `allow_stale_approval` above. |
 | `squash` | bool | `true` | Auto-complete completion option (Azure DevOps): squash-merge. |
 | `delete_source_branch` | bool | `true` | Auto-complete completion option (Azure DevOps): delete the source branch on merge. |
 | `bypass_policy` | bool | `false` | Complete the PR **past** branch policies when requesting auto-complete (Azure DevOps). Needed for a default branch whose policy never auto-satisfies for our own PRs (e.g. a central governance **status** policy). Only set true where we are authorized to self-complete. |
 | `bypass_reason` | string | *(empty)* | Reason recorded on the policy bypass. |
+| `fork` | object | *(disabled)* | Role-aware fork-PR flow (see `efforts/2026/09/26 role-aware-fork-pr-flow/README.md`, GitHub-only). `{enabled, remote, owner}` — repo-wide default for whether `create-pr` publishes through a personal fork instead of a direct push. `enabled` (bool, default `false`); `remote` (string, default `"fork"`) — the local git remote name pointed at the fork; `owner` (string, default `""`) — override the fork-owner login used to build the `<owner>:<branch>` PR head (default: whoever the resolved token belongs to). Disabled by default — an unconfigured repo's push/PR flow is unchanged. |
+| `roles` | map | `{}` | Per-**live-permission-level** overrides layered onto this `PRConfig`, keyed by one of `read` / `triage` / `write` / `maintain` / `admin` (GitHub's permission vocabulary). Each entry may set any of `reviewer`, `review_blocking`, `self_approve`, `merge_actor`, `fork` — omitted fields inherit the base `PRConfig` unchanged. Networked actor-specific surfaces (`create-pr`, `pr-status`, `pr-watch wait`, and `pr-merge`) resolve the caller's live GitHub permission and layer the matching role before classifying or acting. Empty (the default) keeps the single configured flow. Example: a conservative base can omit `merge_actor`, while `maintain` adds `merge_actor: submitter-direct`; conversely, a `write` override can explicitly clear an inherited self-merge actor. |
+| `notes` | string | *(empty)* | Free-text, repo-specific guidance surfaced as an extra `Note:` line on every `pr_reminder()` (the "Reminder [...]" text every `pr-*` verb and `push-changes` already print). Exists because an agent interacts with PR config through `agent-worktrees repos get`/the `pr-*` verbs, not by reading this file's own comments — a comment explaining a non-obvious repo choice (e.g. why a bypass mode is `pull_request` and not `always`/`exempt`) never reaches a calling agent unless it rides along through a command's own output. Keep it short — one or two sentences. |
+
+> **`pr.fork`/`pr.roles` confirmation gate.** When the resolved flow for a
+> `create-pr` call needs a fork, it does **not** silently fork anything or
+> push to an unexpected remote on the caller's first try for that repo+login.
+> It returns `needs_confirmation: "fork_setup"` with a human-readable
+> `message` — the calling agent relays this to the user, then re-runs
+> `create-pr --confirm-fork` (or `confirm_fork=True`) once they agree. That
+> confirmed call creates/verifies the fork (idempotent — a caller who already
+> has one is untouched) and points the local `fork` remote at it.
+>
+> **This confirmation is durable, not per-call — but it is scoped to the
+> login that actually authenticates, not merely the repo.** A successful
+> confirmed call records the approval in the machine-local `forks.yaml`
+> registry (see `fork_pr.py`), keyed by repo **and** the effective login
+> (`fork_pr._resolve_fork_credential`, resolved **once** and reused for both
+> the confirmation scope and the actual fork operation: an explicit
+> `pr.token_command`/`token_env` binding first, else the repo's resolved
+> account mapping only when a token can actually be minted for it, else the
+> active `gh` account; an identity that cannot be resolved at all fails
+> closed — never persisted or trusted). Every later `create-pr` call for
+> that same repo **under the same resolved login** — any worktree, any
+> session, on this machine — skips the gate automatically, since the
+> underlying GitHub fork is a durable, account-scoped resource, not a
+> per-worktree one. If the account mapping changes, ambient `gh` auth
+> switches users, or a configured token rotates, the next call re-prompts
+> instead of silently authorizing a different identity's fork/push.
+>
+> **`pr.fork` only supports the default GitHub authority (github.com)
+> today.** The durable registry is keyed by repo+account, not by GitHub
+> authority/host — so the same `owner/repo` slug could otherwise identify
+> two unrelated repositories on github.com vs. a GitHub Enterprise host
+> (whether pinned via an explicit `pr.api_base` or ambient `GH_HOST`), and
+> reusing a confirmation across that boundary would silently authorize a
+> fork/push against a different real repository. `create-pr` refuses
+> `pr.fork` entirely whenever the EFFECTIVE authority (the same
+> `pr.api_base`-then-`GH_HOST`-then-`github.com` precedence every other
+> provider call uses) isn't the default host — before any registry lookup,
+> so a confirmation recorded under github.com can never be silently reused
+> once the effective authority later points elsewhere.
+>
+> **A repo can carry more than one confirmed account at once.** The registry
+> key is `(repo, account)`, not repo alone — confirming under a second
+> account (an operator switching which identity publishes a repo's PRs) adds
+> a separate durable entry rather than overwriting the first, so switching
+> back to the original account later does not re-trigger the gate either.
+> Separately, when `pr.fork.owner` is explicitly configured, it
+> deterministically overrides the owner login used to build the PR head
+> (`<owner>:<branch>`) regardless of identity — `_ensure_fork_and_remote`
+> still obtains the actual fork/remote (`clone_url`) from the authenticated
+> provider first; the override only changes which login names the PR head,
+> not which repository is actually forked/pushed to. If a stored
+> confirmation's owner doesn't match that configured override, the gate
+> treats it as a *different* approval and re-prompts rather than silently
+> publishing under the newly-configured owner; a successful re-confirmation
+> then updates the stored entry to the new owner. The same re-validation
+> also applies with **no** `pr.fork.owner` override configured at all: if a
+> stored confirmation's owner diverges from the fork owner the provider
+> actually resolves live (a typo at `forks set` time, or a genuine upstream
+> change), a silent skip re-prompts rather than trusting the stale stored
+> value — only an explicit `--confirm-fork` this call proceeds regardless,
+> and self-heals the stored entry to the real owner it resolved. A FAILED or
+> inconclusive live owner lookup (e.g. a transient API error) ALSO fails
+> closed, exactly like a genuine mismatch. The approved local **remote
+> name** (`pr.fork.remote`) is likewise part of what was approved: if it
+> later changes (including to an existing remote such as `origin`), the old
+> approval is not reused either.
+>
+> A repo can also be pre-approved once, ahead of any `create-pr` call — e.g.
+> during machine/harness setup — with `agent-worktrees forks set
+> <owner>/<repo> --owner <login>` (its `--account` defaults to the same
+> resolver for the common account-mapping/ambient-auth case; a repo whose
+> real config binds `pr.token_command`/`token_env` instead needs
+> **`--token-stdin`** — piping that same token's value on stdin (never as a
+> bare argv value, to keep it out of shell history and process listings) —
+> so the pre-seeded entry's scope is derived from the token's own value,
+> matching exactly what `create-pr`'s gate will compute for it; `--account`
+> alone cannot reproduce that scope for an opaque token). Manage the catalog
+> with `forks list` / `forks show <repo> [--account A]` / `forks remove
+> <repo> [--account A]` (omitting `--account` on `remove` forgets every
+> account confirmed for that repo; the gate asks again on that repo's/
+> account's next call).
+
+> **Configured profile vs. effective actor profile.** The base `PRConfig`
+> always has a pure, network-free **configured profile**. `get pr-profile`
+> reports that configured profile and never contacts a provider. Networked
+> commands that make actor-specific decisions resolve an **effective actor
+> profile** from the base config + live permission + matching `pr.roles`
+> override. `pr-status` reports both (`flow.configured_profile` and the
+> effective `flow.profile`) plus its resolution source; `pr-status --no-live`
+> remains offline and reports the configured profile only.
+>
+> Permission lookup is fail-open to the configured base, not to a synthesized
+> role. This makes fallback follow the repository's chosen safety posture: a
+> conservative base remains non-self-merge when permission is unknown, while a
+> legacy repo whose base itself is `pr-self-merge` preserves the historical
+> fail-open behavior. A confident read-only permission demotes an otherwise
+> unscoped self-merge profile for operational commands. Non-GitHub providers
+> ignore `pr.roles` and retain their existing configured behavior.
 
 > **"Request auto-complete" is the first-class concept; the label is an
 > implementation detail.** `pr-merge` asks the provider to *auto-complete* the
@@ -359,12 +559,13 @@ in-repo overlay (below); the in-repo version wins when both are present.
 > nor a hold label, the classifier ignores it. See the `pr-command-family` effort in
 > test-chamber.
 
-Query the effective (post-merge) values at runtime:
+Query configured (post-overlay, network-free) values at runtime:
 
 ```bash
 agent-worktrees get pr-enabled    # true | false
 agent-worktrees get pr-required   # true | false
 agent-worktrees get pr-provider   # gitea | github | azure-devops (empty when off)
+agent-worktrees get pr-profile    # configured/base profile; no provider read
 ```
 
 See the `worktree` skill § PR Workflow for the end-to-end flow
@@ -372,7 +573,7 @@ See the `worktree` skill § PR Workflow for the end-to-end flow
 
 ---
 
-## In-repo config — `<anchor>/.agent-worktrees/config.yaml`
+## In-repo config — `<anchor>/.copilot-extensions/agent-worktrees/config.yaml`
 
 A committed file carrying the repo's **own repo-level settings** — the base
 layer, identical on every machine that checks out the repo. The schema is
@@ -381,7 +582,7 @@ layer, identical on every machine that checks out the repo. The schema is
 map. Any of these may appear:
 
 ```yaml
-# <repo-root>/.agent-worktrees/config.yaml
+# <repo-root>/.copilot-extensions/agent-worktrees/config.yaml
 default_branch: main
 remote: origin
 validate_paths: [src, tests]
@@ -411,21 +612,26 @@ profile_assignment:
   launch side effects.
 - Omitting `pr:` leaves PR mode **off** (direct-push finalization) — appropriate
   for a repo with no automated reviewer.
-- **Location:** the directory form `<anchor>/.agent-worktrees/config.yaml`
-  (constant `INREPO_CONFIG_DIRNAME` + `config.yaml`) is canonical. The legacy
-  single-file `<anchor>/.agent-worktrees.yaml` (`INREPO_CONFIG_FILENAME`, `pr:`
-  only) is still read as a fallback when the directory form is absent; the
-  directory form wins when both exist.
+- **Location:** the canonical path is
+  `<anchor>/.copilot-extensions/agent-worktrees/config.yaml`. Legacy
+  `<anchor>/.agent-worktrees/config.yaml` and the older single-file
+  `<anchor>/.agent-worktrees.yaml` (`INREPO_CONFIG_FILENAME`, `pr:` only) are
+  still read as fallbacks when the canonical file is absent. An explicit
+  marketplace-specific overlay may further merge
+  `<anchor>/.copilot-extensions/agent-worktrees/marketplaces/<marketplace-id>/config.yaml`
+  on top.
 - A missing or malformed file safely degrades to "no in-repo settings" — the
   machine-local + global tiers still resolve the repo.
 
 ---
 
-## Global config — `~/.agent-worktrees/config.yaml`
+## Global config — `<validated-registry-root>/config.yaml`
 
 The **user-owned base tier**: machine-wide settings shared across **every**
-project on the machine. The installer **scaffolds it once when missing**, then
-**never overwrites it** — not even with `--force` (which targets installer-owned
+project adopted by that registry root. Legacy/default operation uses
+`~/.agent-worktrees/config.yaml`; namespaced operation uses the validated
+cell plugin root. The installer **scaffolds it once when missing**, then **never
+overwrites it** — not even with `--force` (which targets installer-owned
 artifacts). Only a deliberate schema migration should rewrite it. Profiles are
 user-authored.
 
@@ -460,6 +666,8 @@ profile_assignment:
 | `copilot_profiles` | list | Machine-wide backend profiles. |
 | `profile_assignment` | map | Optional user-owned balanced assignment policy. |
 | `auto_fast_forward` / `headless` | bool | Machine-wide top-level defaults. |
+| `default_copilot_account` | string | Machine-wide default Copilot CLI login for repos with no explicit override (see the top-level keys table). |
+| `copilot_identity_switch_enabled` | bool | Machine-wide master switch for the Copilot identity-enforcement feature. **Off by default.** |
 
 A convention-adopted repo with its anchor in `~/.agent-worktrees/repos.yaml`,
 its settings in the in-repo config, and machine defaults here needs **no**
@@ -467,26 +675,27 @@ its settings in the in-repo config, and machine defaults here needs **no**
 
 ---
 
-## Related repos -- `<anchor>/.agent-worktrees/related.yaml`
+## Related repos -- `<anchor>/.copilot-extensions/agent-worktrees/related.yaml`
 
 A separate **committed, in-repo** file (a sibling of the in-repo `config.yaml`)
 that records, **from this repo's point of view**, the OTHER repos relevant to
 it. It is *directional* and *per-project* -- distinct from the global,
 machine-wide `repos.yaml` registry. Keys reference **global-registry names**;
-the file adds only relationship + locus + delegate, never checkout paths (those
+the file adds relationship + locus + delegate, plus the `ownership`/
+`audience`/`ai_attribution` metadata below -- never checkout paths (those
 still resolve from `repos.yaml`).
 
 Managed by `agent-worktrees related ...`; see the **`agent-worktrees-related`**
 skill (authoring the index) and **`working-cross-repo`** skill (using it).
 
 ```yaml
-# <anchor>/.agent-worktrees/related.yaml
+# <anchor>/.copilot-extensions/agent-worktrees/related.yaml
 primary: example-web                  # the default/primary related repo
 related:
   example-web:
     role: product                  # product|dependency|consumer|tooling|docs|sibling
     summary: "Primary product monorepo we ship changes to."
-    doc: related/example-web.md       # narrative, relative to .agent-worktrees/
+    doc: related/example-web.md       # narrative, relative to the selected related-config root
     locus:
       preferred: codespace         # local | machine:<key> | codespace | container
       machines: [dev6]             # boxes a *local* checkout is available on (optional)
@@ -504,16 +713,24 @@ related:
 | `related.<name>` | map | One related repo, keyed by its **global-registry** name. |
 | `related.<name>.role` | string | `product` \| `dependency` \| `consumer` \| `tooling` \| `docs` \| `sibling` (free-form; stored verbatim). |
 | `related.<name>.summary` | string | One line: why the repo matters to this one. |
-| `related.<name>.doc` | string | Narrative-doc path, relative to `.agent-worktrees/` (default `related/<name>.md`). |
+| `related.<name>.doc` | string | Narrative-doc path, relative to the selected related-config root (default `related/<name>.md`). |
 | `related.<name>.locus.preferred` | string | Where work happens: `local` \| `machine:<key>` \| `codespace` \| `container`. |
 | `related.<name>.locus.machines` | list | Machine keys a *local* checkout is available on (per-machine availability the per-platform registry can't express). |
 | `related.<name>.locus.codespace` | map | GitHub CodeSpace hints: `repo` / `machine` / `location` / `workspace_folder`. Cloud venue -- usable from any machine. |
 | `related.<name>.locus.container` | map | Local Docker dev-container fleet: `repo` / `workspace_folder` + a `machines` list scoping it to the fleet hosts. Local venue -- `machines` restricts where it runs. |
 | `related.<name>.delegate.via` | string | How to hand off work: `agent-bridge` \| `agent-codespaces` \| `agent-containers` \| `none`. |
+| `related.<name>.ownership` | string | Contribution/authority posture: `owned` \| `internal` \| `external`. Derived once at registration from the operator's own gh accounts + the remote; an explicit value always wins. |
+| `related.<name>.owner` | string | Resolving operator account login (optional, set alongside `ownership`). |
+| `related.<name>.audience` | string | Who can read what gets published here: `public` \| `internal` \| `private`. Orthogonal to `ownership`; drives the AI-attribution decision (see the `ai-attribution-audience-policy` effort). Never derived automatically; empty means unclassified. |
+| `related.<name>.ai_attribution` | map | Optional per-repo disclosure override: `disclose_on_open` / `disclose_on_reply` (bool), each defaulting to the `audience`-derived policy when omitted. |
 
 Reads degrade safely (a missing/malformed file yields an empty index); a bare
-`name:` is a valid minimal link. Writes emit only non-empty fields, keeping the
-committed file minimal.
+`name:` is a valid minimal link. The canonical base file is
+`<anchor>/.copilot-extensions/agent-worktrees/related.yaml`, with legacy
+`<anchor>/.agent-worktrees/related.yaml` fallback and an explicit marketplace
+overlay at
+`<anchor>/.copilot-extensions/agent-worktrees/marketplaces/<marketplace-id>/related.yaml`.
+Writes emit only non-empty fields, keeping the committed file minimal.
 
 An active plugin may contribute a lowest-precedence related-repo fragment by
 shipping `.agent-worktrees/related.yaml` in its payload. The active corpus is

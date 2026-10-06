@@ -37,7 +37,8 @@ def test_resolver_helpers_are_marker_only():
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="PowerShell is unavailable")
 def test_powershell_resolver_exports_payload_invocation_contract(tmp_path):
-    runtime = tmp_path / ".agent-worktrees"
+    home = tmp_path / "home"
+    runtime = tmp_path / "cell-runtime"
     slot_python = runtime / "versions" / "1.2.3" / "Scripts" / "python.exe"
     slot_python.parent.mkdir(parents=True)
     slot_python.touch()
@@ -51,10 +52,12 @@ def test_powershell_resolver_exports_payload_invocation_contract(tmp_path):
     )
     (runtime / "current-version").write_text("1.2.3\n", encoding="utf-8")
     resolver = _SCRIPTS / "resolve-runtime.ps1"
-    home_literal = str(tmp_path).replace("'", "''")
+    home_literal = str(home).replace("'", "''")
+    runtime_literal = str(runtime).replace("'", "''")
     resolver_literal = str(resolver).replace("'", "''")
     script = (
         f"$env:USERPROFILE = '{home_literal}'; "
+        f"$env:AGENT_RT_ROOT = '{runtime_literal}'; "
         f". '{resolver_literal}'; "
         "[pscustomobject]@{ AwPy = $AwPy; AgentRtPy = $AgentRtPy } "
         "| ConvertTo-Json -Compress"
@@ -87,7 +90,7 @@ def _hook_scripts() -> list[Path]:
     names = [
         "session-machine", "session-conduct", "register-session",
         "deregister-session", "project-hooks", "provision-check",
-        "anchor-hygiene-check", "marketplace-overrides", "bootstrap-check",
+        "anchor-hygiene-check", "bootstrap-check",
     ]
     out: list[Path] = []
     for n in names:
@@ -240,6 +243,42 @@ def test_posix_resolver_exports_payload_invocation_contract(tmp_path):
 
 
 @pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX sh resolver")
+def test_posix_resolver_honors_explicit_runtime_root(tmp_path):
+    cell = tmp_path / "cell-runtime"
+    slot = cell / "versions" / "1.2.3"
+    (slot / "bin").mkdir(parents=True)
+    (slot / ".install-complete.json").write_text(
+        json.dumps(
+            {
+                "version": "1.2.3",
+                "completed_at": "2026-08-27T00:00:00Z",
+                "pid": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    python = slot / "bin" / "python"
+    python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    python.chmod(0o755)
+    (cell / "current-version").write_text("1.2.3\n", encoding="utf-8")
+    resolver = _SCRIPTS / "resolve-runtime.sh"
+    script = f'. "{resolver}"; printf "%s" "$AW_PY"'
+    result = subprocess.run(
+        ["sh", "-c", script],
+        capture_output=True,
+        text=True,
+        env={
+            "HOME": str(tmp_path / "home"),
+            "AGENT_RT_ROOT": str(cell),
+            "PATH": "/usr/bin:/bin",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(python)
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX sh resolver")
 def test_resolver_tier1_prefers_current_version_marker(tmp_path):
     aw = tmp_path / ".agent-worktrees"
     _make_slot(tmp_path, "0.1.0")
@@ -345,6 +384,106 @@ def test_global_binstub_tier3_prefers_dev10_over_dev9(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "1.5.3"
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX sh binstub")
+def test_posix_binstub_sanitizes_inherited_python_env(tmp_path):
+    """#2411: a stray, mismatched-architecture PYTHONHOME (or any of the same
+    class of inherited Python runtime variable) in the CALLER's ambient
+    environment must not survive into the dispatched interpreter -- it can
+    crash a resolved runtime-slot python that honors it."""
+    import os
+    import subprocess
+
+    runtime = tmp_path / ".agent-worktrees"
+    runtime_bin = runtime / "bin"
+    runtime_bin.mkdir(parents=True)
+    shutil.copy2(_SCRIPTS / "resolve-runtime.sh", runtime_bin / "resolve-runtime.sh")
+    slot = runtime / "versions" / "1.5.3"
+    command = slot / "bin" / "python"
+    command.parent.mkdir(parents=True)
+    command.write_text(
+        "#!/bin/sh\n"
+        "printf 'PYTHONHOME=%s\\n' \"${PYTHONHOME:-<unset>}\"\n"
+        "printf 'PYTHONPATH=%s\\n' \"${PYTHONPATH:-<unset>}\"\n"
+        "printf 'UV_INTERNAL__PYTHONHOME=%s\\n' \"${UV_INTERNAL__PYTHONHOME:-<unset>}\"\n",
+        encoding="utf-8",
+    )
+    command.chmod(0o755)
+    (slot / ".install-complete.json").write_text(
+        json.dumps({
+            "version": "1.5.3",
+            "completed_at": "2026-08-27T00:00:00Z",
+            "pid": 1,
+        }),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path)
+    env["PYTHONHOME"] = "/some/mismatched-architecture/python"
+    env["PYTHONPATH"] = "/some/stray/site-packages"
+    env["UV_INTERNAL__PYTHONHOME"] = "/some/uv-managed/python"
+
+    result = subprocess.run(
+        ["sh", str(_BIN / "agent-worktrees"), "status"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "PYTHONHOME=<unset>" in result.stdout
+    assert "PYTHONPATH=<unset>" in result.stdout
+    assert "UV_INTERNAL__PYTHONHOME=<unset>" in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="PowerShell is unavailable")
+def test_windows_binstub_sanitizes_inherited_python_env():
+    """#2411, Windows binstub parity: extracts and runs ONLY the sanitization
+    prologue from agent-worktrees.ps1 (the binstub's real dispatch paths all
+    end in `exit`, making a full end-to-end invocation unsuitable for
+    asserting on post-run environment state) and proves it clears every
+    inherited Python runtime variable this class of bug can involve."""
+    import subprocess
+
+    text = (_BIN / "agent-worktrees.ps1").read_text(encoding="utf-8")
+    marker = "# Resolve the runtime slot python SOLELY"
+    prologue_end = text.index(marker)
+    prologue = text[:prologue_end]
+    assert "Remove-Item" in prologue and "PYTHONHOME" in prologue, (
+        "sanitization prologue not found before the resolver comment -- "
+        "update this test's extraction marker if agent-worktrees.ps1 moved it"
+    )
+    script = (
+        "$env:PYTHONHOME = 'C:\\mismatched\\architecture\\python'; "
+        "$env:PYTHONPATH = 'C:\\stray\\site-packages'; "
+        "$env:PYTHONEXECUTABLE = 'C:\\stray\\python.exe'; "
+        "$env:VIRTUAL_ENV = 'C:\\stray\\venv'; "
+        "$env:UV_INTERNAL__PYTHONHOME = 'C:\\uv\\managed\\python'; "
+        "$env:__PYVENV_LAUNCHER__ = 'C:\\stray\\python.exe'; "
+        f"{prologue}\n"
+        "[pscustomobject]@{ "
+        "PYTHONHOME = $env:PYTHONHOME; "
+        "PYTHONPATH = $env:PYTHONPATH; "
+        "PYTHONEXECUTABLE = $env:PYTHONEXECUTABLE; "
+        "VIRTUAL_ENV = $env:VIRTUAL_ENV; "
+        "UV_INTERNAL__PYTHONHOME = $env:UV_INTERNAL__PYTHONHOME; "
+        "__PYVENV_LAUNCHER__ = $env:__PYVENV_LAUNCHER__ "
+        "} | ConvertTo-Json -Compress"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", script],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    resolved = json.loads(result.stdout.strip().splitlines()[-1])
+    for name in (
+        "PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE",
+        "VIRTUAL_ENV", "UV_INTERNAL__PYTHONHOME", "__PYVENV_LAUNCHER__",
+    ):
+        assert resolved[name] is None, f"{name} was not sanitized"
 
 
 @pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX sh resolver")

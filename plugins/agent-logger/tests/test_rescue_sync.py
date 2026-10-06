@@ -15,11 +15,54 @@ from agent_logger import sessions
 from agent_logger.chronicle.source import ReservationStore, SyncedSessionSource
 from agent_logger.config import Config, load_config
 from agent_logger.sync import engine, rescue
-from agent_logger.sync.provenance import MAX_PROVENANCE_BYTES, rescue_snapshot_path
+from agent_logger.sync.provenance import (
+    MAX_PROVENANCE_BYTES,
+    open_regular_no_follow,
+    rescue_snapshot_path,
+)
 from agent_logger.sync.rescue_validation import RescueSourceError
 from agent_logger.sync.targets import PushResult
+from agent_logger.sync.targets import filesystem
 
 SESSION_ID = "11111111-2222-4333-8444-555555555555"
+
+
+def _agent_worktrees_projection(session_id: str = SESSION_ID) -> bytes:
+    return (
+        json.dumps(
+            {
+                "version": 1,
+                "session_id": session_id,
+                "relations": [
+                    {
+                        "project": "example/repo",
+                        "worktree_id": "worktree-a",
+                        "role": "bound",
+                        "relation_revision": 1,
+                    }
+                ],
+                "overflow": False,
+                "omitted_relations": 0,
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+
+
+def _deep_agent_worktrees_projection() -> bytes:
+    nested: object = 0
+    for _ in range(70):
+        nested = [nested]
+    return json.dumps(
+        {
+            "version": 1,
+            "session_id": SESSION_ID,
+            "relations": [{"nested": nested}],
+            "overflow": False,
+            "omitted_relations": 0,
+        }
+    ).encode()
 
 
 def _cfg(
@@ -29,6 +72,7 @@ def _cfg(
     denylist: list[str] | None = None,
     fail_closed: bool = False,
     target: str = "local",
+    require_repo_opt_in: bool = False,
 ) -> Config:
     home = tmp_path / "logger-home"
     data = load_config(home=home).as_dict()
@@ -36,6 +80,7 @@ def _cfg(
     data["sync"]["repo_allowlist"] = allowlist or []
     data["sync"]["repo_denylist"] = denylist or []
     data["sync"]["repo_allowlist_fail_closed"] = fail_closed
+    data["sync"]["require_repo_opt_in"] = require_repo_opt_in
     data["sync"]["target"] = target
     return Config(data, home)
 
@@ -115,7 +160,12 @@ def _destination(tmp_path: Path) -> Path:
 
 def test_complete_capture_is_projected_with_generic_provenance(tmp_path: Path) -> None:
     root = tmp_path / "rescues"
-    capture = _write_capture(root, "100-a")
+    projection = _agent_worktrees_projection()
+    capture = _write_capture(
+        root,
+        "100-a",
+        extra_members={"agent-worktrees.json": projection},
+    )
     (root / ".capture-sandbox-1.lock").write_text("ignored", encoding="utf-8")
     (capture.parent / "status.json").write_text("{}", encoding="utf-8")
     (capture / ".pin-active.json").write_text("{}", encoding="utf-8")
@@ -133,6 +183,9 @@ def test_complete_capture_is_projected_with_generic_provenance(tmp_path: Path) -
     assert (
         destination / "session-state" / SESSION_ID / "rescued-origin.json"
     ).is_file()
+    assert (
+        destination / "session-state" / SESSION_ID / "agent-worktrees.json"
+    ).read_bytes() == projection
     provenance = json.loads(
         (destination / "provenance" / f"{SESSION_ID}.json").read_text(
             encoding="utf-8"
@@ -155,6 +208,7 @@ def test_complete_capture_is_projected_with_generic_provenance(tmp_path: Path) -
     assert provenance["model"] == "example-model"
     assert provenance["billing_scope"] == "unknown"
     assert "rescued-origin.json" in provenance["members"]
+    assert "agent-worktrees.json" in provenance["members"]
     assert "origin.json" not in provenance["members"]
     assert "tokens" not in provenance
     assert "cost" not in provenance
@@ -341,6 +395,141 @@ def test_member_size_or_hash_mismatch_is_rejected(tmp_path: Path, field: str) ->
         assert summary.rejected_sessions == 1
 
 
+@pytest.mark.parametrize(
+    ("projection", "message"),
+    [
+        (b"{", "not valid UTF-8 JSON"),
+        (
+            _agent_worktrees_projection(
+                "22222222-3333-4444-8555-666666666666"
+            ),
+            "session_id does not match",
+        ),
+        (
+            _deep_agent_worktrees_projection(),
+            "nesting limit",
+        ),
+    ],
+    ids=["malformed", "session-mismatch", "nested-schema"],
+)
+def test_invalid_agent_worktrees_projection_is_ignored(
+    tmp_path: Path,
+    projection: bytes,
+    message: str,
+) -> None:
+    root = tmp_path / "rescues"
+    _write_capture(
+        root,
+        "100-a",
+        extra_members={"agent-worktrees.json": projection},
+    )
+
+    summary = rescue.push_rescues(_cfg(tmp_path), rescue_roots=[root])
+
+    assert summary.accepted == 1
+    assert summary.rejected_sessions == 0
+    assert any(message in detail for detail in summary.details)
+    destination = _destination(tmp_path) / "session-state" / SESSION_ID
+    assert (destination / "events.jsonl").is_file()
+    assert not (destination / "agent-worktrees.json").exists()
+    assert (destination / "rescued-origin.json").is_file()
+
+
+def test_future_agent_worktrees_projection_is_preserved(tmp_path: Path) -> None:
+    root = tmp_path / "rescues"
+    projection = json.dumps(
+        {
+            "version": 2,
+            "session_id": SESSION_ID,
+            "future": {"shape": "opaque"},
+        }
+    ).encode()
+    _write_capture(
+        root,
+        "100-a",
+        extra_members={"agent-worktrees.json": projection},
+    )
+
+    summary = rescue.push_rescues(_cfg(tmp_path), rescue_roots=[root])
+
+    assert summary.accepted == 1
+    destination = _destination(tmp_path) / "session-state" / SESSION_ID
+    assert (destination / "agent-worktrees.json").read_bytes() == projection
+    assert (destination / "rescued-origin.json").is_file()
+
+
+def test_canonical_tolerant_v1_projection_is_preserved(tmp_path: Path) -> None:
+    root = tmp_path / "rescues"
+    projection = json.dumps(
+        {
+            "version": 1,
+            "session_id": SESSION_ID,
+            "relations": [{"worktree_id": str(index)} for index in range(129)],
+        }
+    ).encode()
+    _write_capture(
+        root,
+        "100-a",
+        extra_members={"agent-worktrees.json": projection},
+    )
+
+    summary = rescue.push_rescues(_cfg(tmp_path), rescue_roots=[root])
+
+    assert summary.accepted == 1
+    destination = _destination(tmp_path) / "session-state" / SESSION_ID
+    assert (destination / "agent-worktrees.json").read_bytes() == projection
+
+
+def test_oversized_agent_worktrees_projection_is_ignored(tmp_path: Path) -> None:
+    root = tmp_path / "rescues"
+    projection = b" " * (128 * 1024 + 1)
+    _write_capture(
+        root,
+        "100-a",
+        extra_members={"agent-worktrees.json": projection},
+    )
+
+    summary = rescue.push_rescues(_cfg(tmp_path), rescue_roots=[root])
+
+    assert summary.accepted == 1
+    assert summary.rejected_sessions == 0
+    assert any("exceeds 131072 bytes" in detail for detail in summary.details)
+    destination = _destination(tmp_path) / "session-state" / SESSION_ID
+    assert (destination / "events.jsonl").is_file()
+    assert not (destination / "agent-worktrees.json").exists()
+
+
+def test_excluded_agent_worktrees_projection_does_not_reject_session(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "rescues"
+    capture = _write_capture(root, "100-a")
+    metadata_path = capture / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["completeness"] = "partial"
+    metadata["excluded"] = {
+        "allowlisted": [
+            {
+                "session_id": SESSION_ID,
+                "member": "agent-worktrees.json",
+                "reason": "invalid_projection_json",
+                "bytes": 1,
+            }
+        ],
+        "missing_events": [],
+    }
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    summary = rescue.push_rescues(_cfg(tmp_path), rescue_roots=[root])
+
+    assert summary.accepted == 1
+    assert summary.rejected_sessions == 0
+    assert any("ignored optional" in detail for detail in summary.details)
+    assert (
+        _destination(tmp_path) / "session-state" / SESSION_ID / "events.jsonl"
+    ).is_file()
+
+
 def test_capture_total_size_mismatch_is_rejected(tmp_path: Path) -> None:
     root = tmp_path / "rescues"
     capture = _write_capture(root, "100-a")
@@ -433,8 +622,10 @@ def test_chronicler_capture_path_remains_immutable_after_newer_rescue(
     second = by_capture["200-b"]
 
     assert first.session_path != second.session_path
-    assert (first.session_path / "events.jsonl").read_bytes() == b'{"value":"old"}\n'
-    assert (second.session_path / "events.jsonl").read_bytes() == b'{"value":"new"}\n'
+    with open_regular_no_follow(first.session_path / "events.jsonl") as stream:
+        assert stream.read() == b'{"value":"old"}\n'
+    with open_regular_no_follow(second.session_path / "events.jsonl") as stream:
+        assert stream.read() == b'{"value":"new"}\n'
 
 
 def test_all_unjournaled_rescue_snapshots_are_discovered(tmp_path: Path) -> None:
@@ -588,6 +779,7 @@ def test_newer_projection_removes_stale_optional_members(tmp_path: Path) -> None
         "200-b",
         events=b'{"value":"new"}\n',
         origin=None,
+        extra_members={"agent-worktrees.json": _agent_worktrees_projection()},
     )
     assert rescue.push_rescues(
         cfg, rescue_roots=[older_root, newer_root]
@@ -595,7 +787,8 @@ def test_newer_projection_removes_stale_optional_members(tmp_path: Path) -> None
 
     assert (destination / "events.jsonl").read_bytes() == b'{"value":"new"}\n'
     assert not (destination / "context.json").exists()
-    assert not (destination / "rescued-origin.json").exists()
+    assert (destination / "rescued-origin.json").exists()
+    assert (destination / "agent-worktrees.json").exists()
     assert not (destination / "checkpoints").exists()
 
 
@@ -610,17 +803,17 @@ def test_replacement_backup_is_outside_session_state_and_cleanup_failure_is_nonf
     assert rescue.push_rescues(cfg, rescue_roots=[older_root]).accepted == 1
     _write_capture(newer_root, "200-b", events=b'{"value":"new"}\n')
 
-    original_force_rmtree = sessions.force_rmtree
+    original_remove_tree = filesystem._remove_tree_checked
 
-    def fail_backup(path: Path) -> bool:
+    def fail_backup(path: Path, *, allow_nonempty: bool = False) -> None:
         if (
             path.name.endswith(".cleanup")
             and (path / "old").exists()
         ):
-            return False
-        return original_force_rmtree(path)
+            raise OSError("simulated cleanup failure")
+        original_remove_tree(path, allow_nonempty=allow_nonempty)
 
-    monkeypatch.setattr(sessions, "force_rmtree", fail_backup)
+    monkeypatch.setattr(filesystem, "_remove_tree_checked", fail_backup)
     summary = rescue.push_rescues(
         cfg,
         rescue_roots=[older_root, newer_root],
@@ -647,7 +840,7 @@ def test_replacement_backup_is_outside_session_state_and_cleanup_failure_is_nonf
         for item in discovered
     } == {"100-a", "200-b"}
 
-    monkeypatch.setattr(sessions, "force_rmtree", original_force_rmtree)
+    monkeypatch.setattr(filesystem, "_remove_tree_checked", original_remove_tree)
     _write_capture(newer_root, "300-c", events=b'{"value":"newer"}\n')
     assert rescue.push_rescues(
         cfg,
@@ -684,7 +877,7 @@ def test_filesystem_venue_failure_rolls_back_sessions_and_provenance(
     )
     from agent_logger.sync.targets import filesystem
 
-    original_replace = filesystem.os.replace
+    original_replace = filesystem._durable_replace
 
     def fail_second_provenance(src: Path, dst: Path) -> None:
         if (
@@ -695,7 +888,7 @@ def test_filesystem_venue_failure_rolls_back_sessions_and_provenance(
             raise OSError("synthetic provenance failure")
         original_replace(src, dst)
 
-    monkeypatch.setattr(filesystem.os, "replace", fail_second_provenance)
+    monkeypatch.setattr(filesystem, "_durable_replace", fail_second_provenance)
     summary = rescue.push_rescues(
         cfg,
         rescue_roots=[first_root, second_root],
@@ -736,7 +929,7 @@ def test_failed_rollback_retains_recovery_backup(
     _write_capture(newer_root, "200-b", events=b'{"value":"new"}\n')
     from agent_logger.sync.targets import filesystem
 
-    original_replace = filesystem.os.replace
+    original_replace = filesystem._durable_replace
     destination = _destination(tmp_path) / "session-state" / SESSION_ID
 
     def fail_publish_and_restore(src: Path, dst: Path) -> None:
@@ -746,7 +939,7 @@ def test_failed_rollback_retains_recovery_backup(
             raise OSError("synthetic session replacement failure")
         original_replace(src, dst)
 
-    monkeypatch.setattr(filesystem.os, "replace", fail_publish_and_restore)
+    monkeypatch.setattr(filesystem, "_durable_replace", fail_publish_and_restore)
     summary = rescue.push_rescues(
         cfg,
         rescue_roots=[older_root, newer_root],
@@ -763,7 +956,7 @@ def test_failed_rollback_retains_recovery_backup(
     assert len(recovery) == 1
     assert (recovery[0] / "events.jsonl").read_bytes() == b'{"value":"old"}\n'
 
-    monkeypatch.setattr(filesystem.os, "replace", original_replace)
+    monkeypatch.setattr(filesystem, "_durable_replace", original_replace)
     retry = rescue.push_rescues(
         cfg,
         rescue_roots=[older_root, newer_root],
@@ -783,14 +976,14 @@ def test_failure_to_mark_completed_transaction_is_target_failure(
     _write_capture(root, "100-a")
     from agent_logger.sync.targets import filesystem
 
-    original_replace = filesystem.os.replace
+    original_replace = filesystem._durable_replace
 
     def fail_completion_mark(src: Path, dst: Path) -> None:
         if src.name.endswith(".active") and dst.name.endswith(".cleanup"):
             raise OSError("synthetic completion-mark failure")
         original_replace(src, dst)
 
-    monkeypatch.setattr(filesystem.os, "replace", fail_completion_mark)
+    monkeypatch.setattr(filesystem, "_durable_replace", fail_completion_mark)
     cfg = _cfg(tmp_path)
     summary = rescue.push_rescues(cfg, rescue_roots=[root])
 
@@ -805,7 +998,7 @@ def test_failure_to_mark_completed_transaction_is_target_failure(
     )
     assert not (cfg.home / "rescue-sync" / "checkpoint.json").exists()
 
-    monkeypatch.setattr(filesystem.os, "replace", original_replace)
+    monkeypatch.setattr(filesystem, "_durable_replace", original_replace)
     retry = rescue.push_rescues(cfg, rescue_roots=[root])
     assert retry.accepted == 1
     assert not list(
@@ -999,6 +1192,67 @@ def test_symlink_and_special_member_are_rejected(tmp_path: Path) -> None:
     assert summary.rejected_sessions == len(roots)
 
 
+def test_symlinked_agent_worktrees_projection_is_ignored(tmp_path: Path) -> None:
+    root = tmp_path / "rescues"
+    projection = _agent_worktrees_projection()
+    capture = _write_capture(
+        root,
+        "100-a",
+        extra_members={"agent-worktrees.json": projection},
+    )
+    sidecar = capture / "sessions" / SESSION_ID / "agent-worktrees.json"
+    outside = tmp_path / "outside-agent-worktrees.json"
+    outside.write_bytes(projection)
+    sidecar.unlink()
+    try:
+        sidecar.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    summary = rescue.push_rescues(_cfg(tmp_path), rescue_roots=[root])
+
+    assert summary.accepted == 1
+    assert summary.rejected_sessions == 0
+    assert any("not a regular file" in detail for detail in summary.details)
+    destination = _destination(tmp_path) / "session-state" / SESSION_ID
+    assert (destination / "events.jsonl").is_file()
+    assert not (destination / "agent-worktrees.json").exists()
+
+
+def test_oversized_symlinked_agent_worktrees_projection_is_ignored(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "rescues"
+    projection = _agent_worktrees_projection()
+    capture = _write_capture(
+        root,
+        "100-a",
+        extra_members={"agent-worktrees.json": projection},
+    )
+    sidecar = capture / "sessions" / SESSION_ID / "agent-worktrees.json"
+    outside = tmp_path / "outside-oversized-agent-worktrees.json"
+    outside.write_bytes(projection)
+    sidecar.unlink()
+    try:
+        sidecar.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    metadata_path = capture / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    member = metadata["sessions"][SESSION_ID]["members"]["agent-worktrees.json"]
+    metadata["total_bytes"] += 128 * 1024 + 1 - member["bytes"]
+    member["bytes"] = 128 * 1024 + 1
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    summary = rescue.push_rescues(_cfg(tmp_path), rescue_roots=[root])
+
+    assert summary.accepted == 1
+    assert summary.rejected_sessions == 0
+    destination = _destination(tmp_path) / "session-state" / SESSION_ID
+    assert (destination / "events.jsonl").is_file()
+    assert not (destination / "agent-worktrees.json").exists()
+
+
 def test_rescue_repo_allowlist_is_always_fail_closed(tmp_path: Path) -> None:
     root = tmp_path / "rescues"
     _write_capture(
@@ -1010,6 +1264,31 @@ def test_rescue_repo_allowlist_is_always_fail_closed(tmp_path: Path) -> None:
     )
     summary = rescue.push_rescues(
         _cfg(tmp_path, allowlist=["allowed-repo"]),
+        rescue_roots=[root],
+    )
+    assert summary.accepted == 0
+    assert summary.rejected_sessions == 1
+    assert not (tmp_path / "target").exists()
+
+
+def test_rescue_require_repo_opt_in_fails_closed_even_when_allowlisted(
+    tmp_path: Path,
+) -> None:
+    # Rescued sessions carry only a provider-reported repo name, never a
+    # resolvable local path -- resolve_repo_opt_in cannot be honestly
+    # evaluated for them, so require_repo_opt_in must reject every rescued
+    # session (not silently ignore the setting), even one that would
+    # otherwise pass the allowlist.
+    root = tmp_path / "rescues"
+    _write_capture(
+        root,
+        "100-a",
+        workspace=b"repository: allowed-repo\n",
+        origin=b'{"source_repo":"allowed-repo"}\n',
+        metadata_overrides={"source_repo": "allowed-repo"},
+    )
+    summary = rescue.push_rescues(
+        _cfg(tmp_path, allowlist=["allowed-repo"], require_repo_opt_in=True),
         rescue_roots=[root],
     )
     assert summary.accepted == 0

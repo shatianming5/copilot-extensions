@@ -1,12 +1,14 @@
 {
   "hooks": {
-    "PostToolUse": [
+    "SessionStart": [
       {
+        "matcher": "startup|resume|clear|compact",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-adapter.py\" PostToolUse",
-            "timeout": 30
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-adapter.py\" SessionStart",
+            "timeout": 15,
+            "statusMessage": "Loading agent-worktrees..."
           }
         ]
       }
@@ -17,7 +19,18 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-adapter.py\" PreToolUse",
-            "timeout": 55
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-adapter.py\" PostToolUse",
+            "timeout": 10
           }
         ]
       }
@@ -28,19 +41,7 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-adapter.py\" SessionEnd",
-            "timeout": 20
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "matcher": "startup|resume|clear|compact",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-adapter.py\" SessionStart",
-            "timeout": 150
+            "timeout": 10
           }
         ]
       }

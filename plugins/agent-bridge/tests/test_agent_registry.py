@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,8 @@ from agent_bridge.agent_registry import (
     AgentConfig,
     AgentRegistryLoadError,
     AgentResolver,
+    CliNamespaceResolver,
+    NamespaceAgentInfo,
     build_resolver,
     discover_local_agents,
     load_agent_registry,
@@ -20,13 +23,16 @@ from agent_bridge.agent_registry import (
 from agent_bridge.topology import MachineConfig, SshEnvironment, parse_machines_yaml
 from agent_bridge.transport import PluginRef, SpawnTarget
 
-
 # -- Sample data ---------------------------------------------------------------
 
 SAMPLE_AGENTS = {
     "local-agent": {
         "description": "Local test agent",
         "project": "my-project",
+        "mcp_servers": [
+            {"name": "gitea-mcp", "type": "stdio", "command": "agent-mcp",
+             "args": ["bridge", "--config", "agents/gitea.mcp.yaml"]},
+        ],
     },
     "remote-agent": {
         "host": "server-a",
@@ -119,6 +125,7 @@ class TestParseAgentRegistry:
         assert registry["pool-body-agent"].worktree_discovery is False
         # a spawn body keeps its project (load-bearing for spawn-time worktree resolve)
         assert registry["pool-body-agent"].project == "my-project"
+        assert registry["pool-body-agent"].spawnable_as_target is False
 
     def test_local_agent_fields(self):
         registry = parse_agent_registry(SAMPLE_AGENTS)
@@ -126,7 +133,22 @@ class TestParseAgentRegistry:
         assert agent.host is None
         assert agent.cwd is None
         assert agent.managed is False
+        assert agent.spawnable_as_target is True
         assert agent.project == "my-project"
+        assert agent.mcp_servers == [
+            {"name": "gitea-mcp", "type": "stdio", "command": "agent-mcp",
+             "args": ["bridge", "--config", "agents/gitea.mcp.yaml"]},
+        ]
+
+    def test_mcp_servers_defaults_empty(self):
+        registry = parse_agent_registry(SAMPLE_AGENTS)
+        assert registry["remote-agent"].mcp_servers == []
+
+    def test_mcp_servers_must_be_list_of_objects(self):
+        with pytest.raises(ValueError, match="mcp_servers must be a list of objects"):
+            parse_agent_registry(
+                {"bad-agent": {"mcp_servers": ["not-an-object"]}}
+            )
 
     def test_ssh_agent_fields(self):
         registry = parse_agent_registry(SAMPLE_AGENTS)
@@ -158,6 +180,10 @@ class TestAgentResolver:
         assert target.cwd is None
         assert target.host is None
         assert target.project == "my-project"
+        assert target.mcp_servers == [
+            {"name": "gitea-mcp", "type": "stdio", "command": "agent-mcp",
+             "args": ["bridge", "--config", "agents/gitea.mcp.yaml"]},
+        ]
 
     def test_resolve_ssh_agent(self):
         target = self.resolver.resolve("remote-agent")
@@ -167,6 +193,7 @@ class TestAgentResolver:
         assert target.cwd is None
         assert target.env == {"MY_VAR": "hello"}
         assert target.project == "my-project"
+        assert target.mcp_servers == []
 
     def test_resolve_ssh_agent_explicit_environment(self):
         target = self.resolver.resolve("lambda-agent")
@@ -343,10 +370,11 @@ class TestAgentResolver:
 
     def test_list_agents(self):
         agents = self.resolver.list_agents()
-        assert len(agents) == 6
+        assert len(agents) == 5
         names = {a["name"] for a in agents}
         assert "local-agent" in names
         assert "managed-agent" in names
+        assert "pool-body-agent" not in names
         # Managed agents should be marked non-spawnable
         managed = next(a for a in agents if a["name"] == "managed-agent")
         assert managed["spawnable"] is False
@@ -772,6 +800,206 @@ class TestNamespaceResolvers:
         agents = resolver.list_agents()
         ns_agents = [a for a in agents if a["name"].startswith("mock:")]
         assert len(ns_agents) == 0
+
+    @pytest.mark.asyncio
+    async def test_list_agents_async_queries_namespaces_concurrently(self):
+        # Perf hardening: two slow namespace resolvers (e.g. codespace +
+        # container) must be awaited concurrently, not sequentially -- their
+        # ``list()`` calls can each be a multi-second, network-bound subprocess
+        # in production, and sequential awaiting made every provider's latency
+        # additive instead of bounded by the slowest one.
+        import asyncio
+
+        class _SlowResolver:
+            def __init__(self, prefix_val: str, delay: float) -> None:
+                self._prefix = prefix_val
+                self._delay = delay
+
+            @property
+            def prefix(self) -> str:
+                return self._prefix
+
+            async def list(self):
+                await asyncio.sleep(self._delay)
+                return [NamespaceAgentInfo(name=f"{self._prefix}-agent")]
+
+            async def resolve(self, name):  # pragma: no cover - unused here
+                raise NotImplementedError
+
+            async def ensure_ready(self, name):  # pragma: no cover - unused
+                raise NotImplementedError
+
+        resolver = AgentResolver({}, {})
+        resolver.register_namespace_resolver(_SlowResolver("slow-a", 0.2))
+        resolver.register_namespace_resolver(_SlowResolver("slow-b", 0.2))
+
+        start = asyncio.get_event_loop().time()
+        agents = await resolver.list_agents_async()
+        elapsed = asyncio.get_event_loop().time() - start
+
+        names = {a["name"] for a in agents}
+        assert "slow-a:slow-a-agent" in names
+        assert "slow-b:slow-b-agent" in names
+        # Sequential would take >= 0.4s; concurrent stays well under it.
+        assert elapsed < 0.35
+
+    @pytest.mark.asyncio
+    async def test_list_agents_async_bounds_one_straggling_resolver(self, monkeypatch):
+        # Reliability: a single resolver that hangs far longer than the
+        # others (a slow CodeSpaces API call, an unreachable SSH host, etc.)
+        # must not make the whole listing wait for it -- observed in
+        # production causing agent_dispatch's registered_agents() (20s
+        # timeout) to intermittently fail with "could not read the local
+        # agent registry" for agents having nothing to do with the slow
+        # resolver, which then dead-lettered unrelated spawn reservations.
+        import asyncio
+
+        monkeypatch.setenv("AGENT_BRIDGE_NAMESPACE_LIST_RESOLVER_TIMEOUT", "0.05")
+
+        class _SlowResolver:
+            @property
+            def prefix(self) -> str:
+                return "hangs"
+
+            async def list(self):
+                await asyncio.sleep(5.0)
+                return [NamespaceAgentInfo(name="hangs-agent")]  # pragma: no cover
+
+            async def resolve(self, name):  # pragma: no cover - unused here
+                raise NotImplementedError
+
+            async def ensure_ready(self, name):  # pragma: no cover - unused
+                raise NotImplementedError
+
+        resolver = AgentResolver({}, {})
+        resolver.register_namespace_resolver(_SlowResolver())
+        resolver.register_namespace_resolver(_MockResolver("fast"))
+
+        start = asyncio.get_event_loop().time()
+        agents = await resolver.list_agents_async()
+        elapsed = asyncio.get_event_loop().time() - start
+
+        names = {a["name"] for a in agents}
+        assert "fast:test-agent" in names
+        assert not any(n.startswith("hangs:") for n in names)
+        # Bounded by the 0.05s per-resolver timeout, not the 5s sleep.
+        assert elapsed < 1.0
+
+    @pytest.mark.asyncio
+    async def test_list_agents_async_forwards_timeout_into_cli_resolver_subprocess(
+        self, monkeypatch
+    ):
+        # Integration coverage: AgentResolver.list_agents_async() must not
+        # just bound a wedged CliNamespaceResolver by cancellation (which
+        # cannot stop a subprocess.run already running in a worker thread --
+        # see test_list_threads_timeout_into_subprocess_run in
+        # test_cli_namespace_resolver.py for the unit-level proof). It must
+        # actually detect that this resolver's list() accepts a ``timeout``
+        # keyword and pass the configured bound through, so the underlying
+        # subprocess.run(..., timeout=...) is what kills the child process.
+        import shutil
+        from unittest.mock import patch
+
+        monkeypatch.setenv("AGENT_BRIDGE_NAMESPACE_LIST_RESOLVER_TIMEOUT", "3.5")
+
+        resolver = AgentResolver({}, {})
+        resolver.register_namespace_resolver(
+            CliNamespaceResolver("codespace", "agent-codespaces")
+        )
+
+        with patch.object(shutil, "which", return_value="/usr/bin/agent-codespaces"), \
+             patch(
+                 "subprocess.run",
+                 return_value=subprocess.CompletedProcess([], 0, "[]", ""),
+             ) as mock_run:
+            await resolver.list_agents_async()
+
+        assert mock_run.call_args.kwargs["timeout"] == 3.5
+
+    @pytest.mark.asyncio
+    async def test_list_agents_async_one_namespace_failure_does_not_block_others(self):
+        class _FailingResolver:
+            @property
+            def prefix(self) -> str:
+                return "broken"
+
+            async def list(self):
+                raise RuntimeError("boom")
+
+            async def resolve(self, name):  # pragma: no cover - unused here
+                raise NotImplementedError
+
+            async def ensure_ready(self, name):  # pragma: no cover - unused
+                raise NotImplementedError
+
+        resolver = AgentResolver({}, {})
+        resolver.register_namespace_resolver(_FailingResolver())
+        resolver.register_namespace_resolver(_MockResolver("ok"))
+        agents = await resolver.list_agents_async()
+        names = {a["name"] for a in agents}
+        assert "ok:test-agent" in names
+        assert not any(n.startswith("broken:") for n in names)
+
+    @pytest.mark.asyncio
+    async def test_list_agents_async_reports_incomplete_namespaces(self):
+        """A namespace resolver that fails/times out must be surfaced via
+        `incomplete_namespaces` -- not just silently dropped -- so a
+        `--stream`/`--subscribe` consumer (`agent-bridge agents --stream`)
+        can tell "transiently unavailable" apart from "genuinely gone" and
+        never report a false removal for it."""
+        class _FailingResolver:
+            @property
+            def prefix(self) -> str:
+                return "broken"
+
+            async def list(self):
+                raise RuntimeError("boom")
+
+            async def resolve(self, name):  # pragma: no cover - unused here
+                raise NotImplementedError
+
+            async def ensure_ready(self, name):  # pragma: no cover - unused
+                raise NotImplementedError
+
+        resolver = AgentResolver({}, {})
+        resolver.register_namespace_resolver(_FailingResolver())
+        resolver.register_namespace_resolver(_MockResolver("ok"))
+        assert resolver.incomplete_namespaces == []
+        await resolver.list_agents_async()
+        assert resolver.incomplete_namespaces == ["broken"]
+        # A SUBSEQUENT fully-successful call resets it -- it reflects only
+        # the most recent scan, never a sticky/latched failure.
+        resolver._namespace_resolvers.pop("broken")
+        await resolver.list_agents_async()
+        assert resolver.incomplete_namespaces == []
+
+    @pytest.mark.asyncio
+    async def test_list_agents_async_reports_incomplete_for_real_cli_resolver_failure(
+        self,
+    ):
+        """The real production shape (`CliNamespaceResolver` with no
+        in-process fallback) must also surface `incomplete_namespaces` on a
+        genuine provider failure -- not just a bespoke test double's raised
+        exception. A manifest-backed provider (e.g. ``codespace:``) has no
+        fallback, and its namespace-list CLI can fail (non-zero exit,
+        timeout, malformed output) without the binstub itself being
+        missing; that must not be swallowed into a clean empty listing."""
+        from unittest.mock import patch
+
+        cli_resolver = CliNamespaceResolver(
+            "codespace", "agent-codespaces", fallback=None,
+        )
+        resolver = AgentResolver({}, {})
+        resolver.register_namespace_resolver(cli_resolver)
+        resolver.register_namespace_resolver(_MockResolver("ok"))
+        with patch("shutil.which", return_value="/usr/bin/agent-codespaces"), patch(
+            "subprocess.run",
+            return_value=subprocess.CompletedProcess([], 1, "", "boom"),
+        ):
+            agents = await resolver.list_agents_async()
+        assert resolver.incomplete_namespaces == ["codespace"]
+        assert any(a["name"] == "ok:test-agent" for a in agents)
+        assert not any(a["name"].startswith("codespace:") for a in agents)
 
 
 # -- AdminResolver tests ------------------------------------------------------
@@ -1251,17 +1479,16 @@ class TestPluginInjectionContract:
 import textwrap
 
 from agent_bridge.agent_registry import (
+    _effective_spawn_defaults,
+    _load_related_entries,
+    _match_machine_shortname,
+    _short_machine_agent_name,
     derive_topology_agents,
     infer_control_plane_project,
     load_local_repos,
-    _effective_spawn_defaults,
-    _short_machine_agent_name,
-    _match_machine_shortname,
-    _load_related_entries,
 )
 from agent_bridge.models import RepoBridgeConfig, TopologyProfile
 from agent_bridge.topology import load_control_plane_project
-
 
 TOPO_MACHINES_DATA = {
     "control_plane": {"project": "dotfiles"},
@@ -1880,6 +2107,225 @@ class TestVenueBoundResolve:
         assert target.project == "SPO.Core"
 
     @pytest.mark.asyncio
+    async def test_repo_at_machine_rebinds_plugin_args_not_default_projects(self):
+        # Regression: _resolve_static(venue) resolves plugin args for the
+        # venue's own DEFAULT project ("dotfiles") before _bind_repo swaps
+        # in the requested repo ("SPO.Core") -- the final copilot_args must
+        # carry SPO.Core's plugin args, never dotfiles' stale ones.
+        from unittest.mock import patch
+        local = self.machines["host-dev6"]
+
+        def _own(project, cwd=None):
+            return ["--plugin-dir", f"/own/{project}"]
+
+        def _related(project):
+            return ["--plugin-dir", f"/related/{project}"]
+
+        with patch(
+            "agent_bridge.agent_registry._detect_local_machine",
+            return_value=(local, "windows"),
+        ):
+            resolver = AgentResolver(self.agents, self.machines)
+            with (
+                patch.object(resolver, "_own_plugin_args", side_effect=_own),
+                patch.object(resolver, "_related_plugin_args", side_effect=_related),
+            ):
+                target = await resolver.resolve_async("SPO.Core@dev6")
+
+        assert target.project == "SPO.Core"
+        assert "/own/dotfiles" not in target.copilot_args
+        assert "/related/dotfiles" not in target.copilot_args
+        assert "/own/SPO.Core" in target.copilot_args
+        assert "/related/SPO.Core" in target.copilot_args
+
+    @pytest.mark.asyncio
+    async def test_repo_at_machine_rebind_never_re_resolves_old_project(self):
+        # Rebinding must build copilot_args from the configured base
+        # (old_config.copilot_args) plus a single fresh resolution for the
+        # final bound repo -- it must never re-resolve the venue's default
+        # project's own/related plugin args a second time to compute a
+        # suffix to strip, since that result isn't guaranteed to match the
+        # one baked in during the initial venue resolution (a changed
+        # setting or a transient failure would silently leave the default
+        # project's plugins attached alongside the requested repo's).
+        # _own_plugin_args/_related_plugin_args must therefore be called
+        # with the OLD ("dotfiles") project exactly once (during the
+        # initial venue resolution), never again during the rebind -- only
+        # with the final bound ("SPO.Core") one.
+        from unittest.mock import patch
+        local = self.machines["host-dev6"]
+        own_calls: list[str] = []
+        related_calls: list[str] = []
+
+        def _own(project, cwd=None):
+            own_calls.append(project)
+            # Deliberately returns something DIFFERENT each time it's
+            # called for "dotfiles" -- proves this project is never
+            # re-resolved a second time (the old bug's exact failure mode).
+            if project == "dotfiles":
+                return ["--plugin-dir", f"/own/dotfiles-call-{len(own_calls)}"]
+            return ["--plugin-dir", f"/own/{project}"]
+
+        def _related(project):
+            related_calls.append(project)
+            return ["--plugin-dir", f"/related/{project}"]
+
+        with patch(
+            "agent_bridge.agent_registry._detect_local_machine",
+            return_value=(local, "windows"),
+        ):
+            resolver = AgentResolver(self.agents, self.machines)
+            with (
+                patch.object(resolver, "_own_plugin_args", side_effect=_own),
+                patch.object(resolver, "_related_plugin_args", side_effect=_related),
+            ):
+                target = await resolver.resolve_async("SPO.Core@dev6")
+
+        assert own_calls.count("dotfiles") == 1
+        assert related_calls.count("dotfiles") == 1
+        assert "/own/dotfiles-call-1" not in target.copilot_args
+        assert "/own/SPO.Core" in target.copilot_args
+        assert "/related/SPO.Core" in target.copilot_args
+
+    @pytest.mark.asyncio
+    async def test_repo_at_machine_rebind_preserves_cwd_fallback(self):
+        # Regression: a venue whose own project has no
+        # registry anchor resolves its own-plugin args via the cwd fallback
+        # (_own_plugin_args(project, cwd)). Rebinding to the SAME project
+        # via `<repo>@<venue>` must still receive that fallback -- losing
+        # `cwd` on the rebind call would silently drop those plugins even
+        # though nothing about the actual target changed.
+        from unittest.mock import patch
+        local = self.machines["host-dev6"]
+        agents = {
+            "box": AgentConfig(
+                name="box", project="demo", cwd="/checkout/demo", derived=True,
+            ),
+        }
+
+        def _own(project, cwd=None):
+            if project == "demo" and cwd == "/checkout/demo":
+                return ["--plugin-dir", "/from-cwd/demo"]
+            return []
+
+        with patch(
+            "agent_bridge.agent_registry._detect_local_machine",
+            return_value=(local, "windows"),
+        ):
+            resolver = AgentResolver(agents, self.machines)
+            with patch.object(resolver, "_own_plugin_args", side_effect=_own):
+                target = await resolver.resolve_async("demo@box")
+
+        assert target.project == "demo"
+        assert "/from-cwd/demo" in target.copilot_args
+
+    @pytest.mark.asyncio
+    async def test_repo_at_machine_rebind_different_project_ignores_venue_cwd(self):
+        # Regression: the cwd fallback above is ONLY valid
+        # when `repo` is the venue's own default project (genuinely the
+        # same checkout) -- for any OTHER repo, `target.cwd` belongs to the
+        # venue's default project, not the requested one, and must not be
+        # passed at all, or the requested (different, unrelated) project
+        # would silently resolve the venue's own checkout's plugins.
+        from unittest.mock import patch
+        local = self.machines["host-dev6"]
+        agents = {
+            "box": AgentConfig(
+                name="box", project="demo", cwd="/checkout/demo", derived=True,
+            ),
+        }
+
+        def _own(project, cwd=None):
+            if project == "demo" and cwd == "/checkout/demo":
+                return ["--plugin-dir", "/from-cwd/demo"]
+            if project == "other-repo" and cwd is None:
+                return ["--plugin-dir", "/own/other-repo"]
+            # Anything else (e.g. other-repo incorrectly given demo's cwd)
+            # is the bug this test guards against.
+            return ["--plugin-dir", "/WRONG"]
+
+        with patch(
+            "agent_bridge.agent_registry._detect_local_machine",
+            return_value=(local, "windows"),
+        ):
+            resolver = AgentResolver(agents, self.machines)
+            with patch.object(resolver, "_own_plugin_args", side_effect=_own):
+                target = await resolver.resolve_async("other-repo@box")
+
+        assert target.project == "other-repo"
+        assert "/WRONG" not in target.copilot_args
+        assert "/from-cwd/demo" not in target.copilot_args
+        assert "/own/other-repo" in target.copilot_args
+
+    @pytest.mark.asyncio
+    async def test_repo_at_remote_machine_leaves_ssh_copilot_args_untouched(self):
+        # Regression: a genuine-remote (non-loopback) venue
+        # never had plugin args appended by _resolve_static in the first
+        # place -- _bind_repo must not recompute a "stale suffix" for it and
+        # risk stripping real, explicitly configured SSH args that happen to
+        # coincide with what plugin resolution would have produced.
+        from unittest.mock import patch
+
+        agents = {
+            "cloud1": AgentConfig(
+                name="cloud1", host="host-cloud1", ssh_environment="windows",
+                project="dotfiles", copilot_args=["--plugin-dir", "/own/dotfiles"],
+                derived=True,
+            ),
+        }
+        local = self.machines["host-dev6"]  # dispatcher is dev6, not cloud1
+
+        def _own(project, cwd=None):
+            return ["--plugin-dir", f"/own/{project}"]
+
+        with patch(
+            "agent_bridge.agent_registry._detect_local_machine",
+            return_value=(local, "windows"),
+        ):
+            resolver = AgentResolver(agents, self.machines)
+            with patch.object(resolver, "_own_plugin_args", side_effect=_own):
+                target = await resolver.resolve_async("SPO.Core@cloud1")
+
+        assert target.type == "ssh"
+        assert target.project == "SPO.Core"
+        # The explicitly configured arg (coincidentally equal to what
+        # _own_plugin_args("dotfiles") would produce) must survive untouched.
+        assert target.copilot_args == ["--plugin-dir", "/own/dotfiles"]
+
+    @pytest.mark.asyncio
+    async def test_bare_venue_rebind_through_sender_repo_uses_final_project(self):
+        # The other rebinding path: a bare machine resolved
+        # via a namespace/bare candidate, then rebound through _bind_repo.
+        # Exercise it the same way the venue-bound path is exercised above --
+        # a bare local agent with no `host`, rebound onto a different repo.
+        from unittest.mock import patch
+
+        agents = {
+            "box": AgentConfig(name="box", project="dotfiles", derived=True),
+        }
+
+        def _own(project, cwd=None):
+            return ["--plugin-dir", f"/own/{project}"]
+
+        def _related(project):
+            return ["--plugin-dir", f"/related/{project}"]
+
+        resolver = AgentResolver(agents, self.machines)
+        with (
+            patch.object(resolver, "_own_plugin_args", side_effect=_own),
+            patch.object(resolver, "_related_plugin_args", side_effect=_related),
+        ):
+            target = resolver._bind_repo(
+                resolver._resolve_static("box"), "SPO.Core", "box",
+            )
+
+        assert target.project == "SPO.Core"
+        assert "/own/dotfiles" not in target.copilot_args
+        assert "/related/dotfiles" not in target.copilot_args
+        assert "/own/SPO.Core" in target.copilot_args
+        assert "/related/SPO.Core" in target.copilot_args
+
+    @pytest.mark.asyncio
     async def test_explicit_repo_at_machine_agent_resolves_static(self):
         # A derived <repo>@<machine> entry that IS an exact registry key resolves
         # directly (loopback) -- it needs no bare venue agent to rebind onto.
@@ -2097,8 +2543,8 @@ def test_detect_local_machine_via_hostname_field(monkeypatch):
     from agent_bridge.agent_registry import _detect_local_machine
     machines = parse_machines_yaml({
         "machines": {
-            "host-augloop1": {
-                "display_name": "augloop1",
+            "host-box1": {
+                "display_name": "box1",
                 "hostname": "cpc-tmich-oixui",
                 "environment": "Windows 11",
             },
@@ -2107,7 +2553,7 @@ def test_detect_local_machine_via_hostname_field(monkeypatch):
     monkeypatch.setattr("socket.gethostname", lambda: "CPC-tmich-OIXUI")
     machine, _platform = _detect_local_machine(machines)
     assert machine is not None
-    assert machine.key == "host-augloop1"
+    assert machine.key == "host-box1"
 
 
 class TestWorktreeDiscoveryEligibility:
@@ -2125,7 +2571,7 @@ class TestWorktreeDiscoveryEligibility:
         cache = WorktreeDiscoveryCache()
         crawled: list[str] = []
 
-        async def fake_crawl_agent(agent_name, config, resolver):
+        async def fake_crawl_agent(agent_name, config, resolver, *, classify=True):
             crawled.append(agent_name)
             return []
 
@@ -2185,7 +2631,8 @@ class TestAgentWorktreesBinResolution:
         assert got.endswith("agent-worktrees.cmd")
 
     def test_which_hit_is_used_directly(self, monkeypatch):
-        import agent_bridge.agent_registry as ar
         import shutil as _sh
+
+        import agent_bridge.agent_registry as ar
         monkeypatch.setattr(_sh, "which", lambda _n: "/usr/bin/agent-worktrees")
         assert ar._agent_worktrees_bin() == "/usr/bin/agent-worktrees"

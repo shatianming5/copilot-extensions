@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 
 import pytest
 
@@ -40,6 +41,34 @@ def _install_fake(monkeypatch, handler):
     )
     monkeypatch.setattr(ec.subprocess, "run",
                         lambda cmd, **kw: handler(cmd, kw))
+
+
+def test_engine_environment_removes_parent_python_runtime(monkeypatch):
+    inherited = {
+        "PYTHONHOME": "/parent/python",
+        "PYTHONPATH": "/parent/modules",
+        "PYTHONEXECUTABLE": "/parent/python/bin/python",
+        "VIRTUAL_ENV": "/parent/venv",
+        "UV_INTERNAL__PYTHONHOME": "/uv/python",
+        "__PYVENV_LAUNCHER__": "/parent/python",
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("UV_DEFAULT_INDEX", "https://example.invalid/simple")
+
+    env = ec._engine_environment()
+
+    assert not inherited.keys() & env.keys()
+    assert env["PYTHONUTF8"] == "1"
+    assert env["PYTHONSAFEPATH"] == "1"
+    assert env["UV_DEFAULT_INDEX"] == "https://example.invalid/simple"
+
+
+def test_engine_environment_preserves_differently_cased_posix_names(monkeypatch):
+    assert not ec._is_parent_python_variable("virtual_env", windows=False)
+    assert not ec._is_parent_python_variable("PythonPath", windows=False)
+    assert ec._is_parent_python_variable("VIRTUAL_ENV", windows=False)
+    assert ec._is_parent_python_variable("virtual_env", windows=True)
 
 
 _ONE_WT = {
@@ -218,6 +247,203 @@ def test_list_worktree_rows_uses_supplied_cancellable_runner(monkeypatch):
     assert seen["timeout"] == ec._DEFAULT_TIMEOUT
 
 
+def test_current_worktree_status_uses_status_segment_json(monkeypatch):
+    payload = {"version": 1, "id": "wt-ab12", "state": "wip", "closure": None}
+
+    def handler(cmd, kw):
+        assert "status-segment" in cmd
+        assert "--json" in cmd
+        assert "--path" in cmd and "/w" in cmd
+        assert "--fetch" not in cmd
+        return _fake_completed(cmd, stdout=json.dumps(payload))
+
+    _install_fake(monkeypatch, handler)
+
+    result = ec.current_worktree_status(path="/w")
+
+    assert result == payload
+
+
+def test_current_worktree_status_passes_fetch_flag(monkeypatch):
+    def handler(cmd, kw):
+        assert "--fetch" in cmd
+        return _fake_completed(cmd, stdout=json.dumps({"version": 1, "id": None}))
+
+    _install_fake(monkeypatch, handler)
+
+    ec.current_worktree_status(path="/w", fetch=True)
+
+
+def test_find_worktree_for_path_matches_exact_path(monkeypatch, tmp_path):
+    wt_dir = tmp_path / "wt-ab12"
+    wt_dir.mkdir()
+    payload = {
+        "version": 1,
+        "worktrees": [{"id": "wt-ab12", "path": str(wt_dir)}],
+    }
+
+    def handler(cmd, kw):
+        assert "--cache-only" in cmd
+        assert "--classify" not in cmd
+        return _fake_completed(cmd, stdout=json.dumps(payload))
+
+    _install_fake(monkeypatch, handler)
+
+    row = ec.find_worktree_for_path(str(wt_dir))
+
+    assert row == payload["worktrees"][0]
+
+
+def test_find_worktree_for_path_matches_ancestor_directory(monkeypatch, tmp_path):
+    wt_dir = tmp_path / "wt-ab12"
+    nested = wt_dir / "sub" / "dir"
+    nested.mkdir(parents=True)
+    payload = {
+        "version": 1,
+        "worktrees": [{"id": "wt-ab12", "path": str(wt_dir)}],
+    }
+    _install_fake(monkeypatch, lambda cmd, kw: _fake_completed(
+        cmd, stdout=json.dumps(payload)))
+
+    row = ec.find_worktree_for_path(str(nested))
+
+    assert row == payload["worktrees"][0]
+
+
+def test_find_worktree_for_path_returns_none_when_untracked(monkeypatch, tmp_path):
+    payload = {"version": 1, "worktrees": [{"id": "wt-ab12", "path": str(tmp_path / "other")}]}
+    _install_fake(monkeypatch, lambda cmd, kw: _fake_completed(
+        cmd, stdout=json.dumps(payload)))
+
+    assert ec.find_worktree_for_path(str(tmp_path / "unrelated")) is None
+
+
+def test_repository_identity_uses_scoped_engine_commands(monkeypatch):
+    calls = []
+
+    def handler(cmd, kw):
+        calls.append(cmd)
+        if "account-for" in cmd:
+            return _fake_completed(
+                cmd,
+                stdout=json.dumps({
+                    "target": "example/example",
+                    "account": "example-user",
+                }),
+            )
+        return _fake_completed(cmd, stdout="secret-token\n")
+
+    _install_fake(monkeypatch, handler)
+
+    assert ec.repository_account("example") == "example-user"
+    assert ec.repository_token("example", "example-user") == "secret-token"
+    assert calls[1][-7:] == [
+        "repos",
+        "gh",
+        "--",
+        "auth",
+        "token",
+        "--user",
+        "example-user",
+    ]
+
+
+def test_execution_leg_set_uses_json_blob_file_and_fencing(monkeypatch):
+    seen = {}
+
+    def handler(cmd, kw):
+        blob_path = ec.Path(cmd[cmd.index("--blob-file") + 1])
+        seen["blob_path"] = blob_path
+        seen["blob"] = json.loads(blob_path.read_text(encoding="utf-8"))
+        seen["cmd"] = cmd
+        return _fake_completed(
+            cmd,
+            stdout=json.dumps({
+                "worktree_id": "wt-1",
+                "execution_leg": {"binding_revision": 2},
+            }),
+        )
+
+    _install_fake(monkeypatch, handler)
+
+    result = ec.execution_leg_set(
+        "example",
+        "wt-1",
+        provider="ahp",
+        state="active",
+        binding_revision=2,
+        blob={"session_id": "session-1"},
+        if_match_revision=1,
+    )
+
+    assert result["execution_leg"]["binding_revision"] == 2
+    assert seen["blob"] == {"session_id": "session-1"}
+    assert "--if-match-revision" in seen["cmd"]
+    assert not seen["blob_path"].exists()
+
+
+def test_execution_leg_lifecycle_reservation_uses_engine_owned_tokens(monkeypatch):
+    calls = []
+
+    def handler(cmd, kw):
+        calls.append(cmd)
+        return _fake_completed(
+            cmd,
+            stdout=json.dumps({"reservation_token": "token-1"}),
+        )
+
+    _install_fake(monkeypatch, handler)
+
+    assert ec.execution_leg_reserve(
+        "example",
+        "wt-1",
+        provider="ahp",
+        operation="ensure",
+        owner="manager:test",
+        owner_pid=123,
+        owner_start_time="456",
+        lease_seconds=45,
+    )["reservation_token"] == "token-1"
+    ec.execution_leg_release(
+        "example",
+        "wt-1",
+        reservation_token="token-1",
+    )
+
+    assert "--operation" in calls[0]
+    assert calls[0][calls[0].index("--operation") + 1] == "ensure"
+    assert calls[0][calls[0].index("--reservation-owner") + 1] == "manager:test"
+    assert calls[0][calls[0].index("--reservation-owner-pid") + 1] == "123"
+    assert calls[0][calls[0].index("--reservation-owner-start-time") + 1] == "456"
+    assert calls[0][calls[0].index("--lease-seconds") + 1] == "45"
+    assert calls[1][calls[1].index("--reservation-token") + 1] == "token-1"
+
+
+def test_execution_leg_get_classifies_only_conclusive_unsupported_engine(
+    monkeypatch,
+):
+    _install_fake(
+        monkeypatch,
+        lambda cmd, kw: _fake_completed(
+            cmd,
+            returncode=2,
+            stderr="invalid choice: 'execution-leg' (choose from 'list', 'resolve')",
+        ),
+    )
+    with pytest.raises(ec.EngineFeatureUnavailable):
+        ec.execution_leg_get("example", "wt-1")
+
+
+def test_execution_leg_get_parse_failure_remains_fail_closed(monkeypatch):
+    _install_fake(
+        monkeypatch,
+        lambda cmd, kw: _fake_completed(cmd, stdout="not json"),
+    )
+    with pytest.raises(ec.EngineError) as error:
+        ec.execution_leg_get("example", "wt-1")
+    assert not isinstance(error.value, ec.EngineFeatureUnavailable)
+
+
 def test_refresh_worktree_uses_exact_provider_contract(monkeypatch):
     seen = {}
 
@@ -286,6 +512,40 @@ def test_list_worktree_sessions_parses_rows(monkeypatch):
         cmd, stdout=json.dumps(payload)))
 
     assert ec.list_worktree_sessions("dotfiles", "wt-ab12") == payload["sessions"]
+
+
+def test_orphaned_obligations_parses_rows(monkeypatch):
+    payload = {
+        "orphaned": [
+            {"kind": "codespace", "ref": "cs-1", "source_worktree": "wt-old",
+             "abandoned_at": "2026-10-01T00:00:00"},
+        ],
+        "count": 1,
+    }
+    calls = []
+
+    def handler(cmd, kw):
+        calls.append(cmd)
+        return _fake_completed(cmd, stdout=json.dumps(payload))
+
+    _install_fake(monkeypatch, handler)
+    assert ec.orphaned_obligations("dotfiles") == payload["orphaned"]
+    assert any("orphans" in part for cmd in calls for part in cmd)
+
+
+def test_orphaned_obligations_degrades_to_empty_on_engine_error(monkeypatch):
+    """An older engine predating ``claims orphans`` (or any other engine
+    failure) must never surface as a Picker crash -- this is a visibility
+    nicety, not a required capability (see the function's own docstring)."""
+    _install_fake(monkeypatch, lambda cmd, kw: _fake_completed(
+        cmd, returncode=2, stderr="unrecognized arguments: orphans"))
+    assert ec.orphaned_obligations("dotfiles") == []
+
+
+def test_orphaned_obligations_tolerates_a_non_list_or_missing_field(monkeypatch):
+    _install_fake(monkeypatch, lambda cmd, kw: _fake_completed(
+        cmd, stdout=json.dumps({"count": 0})))
+    assert ec.orphaned_obligations("dotfiles") == []
 
 
 def test_recent_worktree_messages_returns_envelope(monkeypatch):
@@ -612,6 +872,28 @@ def test_resolve_new_sends_new_flag(monkeypatch):
     assert plan.is_exec
 
 
+def test_resolve_new_with_seed_forwards_seed_flag(monkeypatch):
+    def handler(cmd, kw):
+        assert "--new" in cmd
+        assert "--seed" in cmd
+        assert cmd[cmd.index("--seed") + 1] == "fix the thing"
+        return _fake_completed(cmd, stdout=json.dumps(_RESUME_PLAN))
+
+    _install_fake(monkeypatch, handler)
+    plan = ec.resolve_launch_plan("dotfiles", new=True, seed="fix the thing")
+    assert plan.is_exec
+
+
+def test_resolve_without_seed_omits_seed_flag(monkeypatch):
+    def handler(cmd, kw):
+        assert "--seed" not in cmd
+        return _fake_completed(cmd, stdout=json.dumps(_RESUME_PLAN))
+
+    _install_fake(monkeypatch, handler)
+    ec.resolve_launch_plan("dotfiles", new=True, seed=None)
+    ec.resolve_launch_plan("dotfiles", new=True, seed="")
+
+
 def test_resolve_base_sends_base_flag(monkeypatch):
     def handler(cmd, kw):
         assert "--base" in cmd
@@ -784,6 +1066,53 @@ def test_resolve_bare_resume_skew_retries_without_flag(monkeypatch):
     assert plan.is_exec
     assert any("--bare-resume" in c for c in calls)
     assert any("--bare-resume" not in c for c in calls)
+
+
+def test_resolve_bare_resume_retry_preserves_seed(monkeypatch):
+    calls = []
+
+    def handler(cmd, kw):
+        calls.append(list(cmd))
+        if "--bare-resume" in cmd:
+            return _fake_completed(cmd, returncode=2,
+                                   stderr="unrecognized arguments: --bare-resume")
+        return _fake_completed(cmd, stdout=json.dumps(_RESUME_PLAN))
+
+    _install_fake(monkeypatch, handler)
+    plan = ec.resolve_launch_plan(
+        "dotfiles", worktree_id="x", bare_resume=True, seed="fix the thing")
+    assert plan.is_exec
+    # Both the original (rejected) attempt AND the degraded retry must carry
+    # --seed -- the retry rebuilds its own argv from the original kwargs, so
+    # a seed dropped from that rebuild would silently vanish on exactly the
+    # path meant to gracefully degrade one unsupported flag, not all of them.
+    assert all("--seed" in c and "fix the thing" in c for c in calls)
+
+
+def test_importing_engine_execution_leg_directly_before_engine_client_works():
+    """A genuine cold-import-order regression test for the lazy
+    `__getattr__` re-export: every OTHER test in this suite (including this
+    file's own `from worktree_manager import engine_client` at module
+    scope) already imports `engine_client` first, so none of them would
+    catch a regression back to a top-level `from .engine_execution_leg
+    import ...` in `engine_client.py` -- that shape only deadlocks when
+    `engine_execution_leg` is the FIRST of the two modules actually
+    imported. A fresh subprocess is the only way to force that cold order;
+    an in-process import (even via `importlib.reload`) would still see
+    `engine_client` already fully initialized from this file's own import
+    at the top."""
+    script = (
+        "import worktree_manager.engine_execution_leg as eel\n"
+        "from worktree_manager import engine_client\n"
+        "assert engine_client.execution_leg_get is eel.execution_leg_get\n"
+        "print('OK')\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout
 
 
 def test_resolve_error_envelope_surfaced(monkeypatch):

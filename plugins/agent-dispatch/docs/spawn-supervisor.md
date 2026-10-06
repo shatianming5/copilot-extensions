@@ -8,8 +8,14 @@ the exact `argv[0]` from the agent-dispatch session command catalog.
 Status: **in progress** — the spawn-reservation primitive, the supervisor loop
 (spawn-at-most-once), the liveness-gated lease heartbeat, **confirmed-gone
 auto-recovery** (local CLI worktree bodies, local headless bodies, and headless
-fleet bodies), **nudge-before-recover**, reactive turn-end polling, and **fleet
-dispatch (a health-gated remote embody pool, Model C)** are built. The
+fleet bodies), **nudge-before-recover**, push-accelerated fixed-interval
+reconciliation, and **fleet dispatch (a health-gated remote embody pool, Model
+C)** are built. Label-scoped
+**disposable local-worker conclusion** is also built (the configuration field
+retains its legacy `disposable_cli_labels` name): a registration may opt
+selected CLI or local headless ACP worker classes into safe terminal session
+conclusion and managed-worktree GC priming without deleting the worktree
+directly. The
 backlog-catch-up policy, authenticated container transport, per-host fleet
 concurrency caps, and load-aware pool selection land in follow-up slices.
 Public trackers: [#44](https://github.com/ThomasMichon/copilot-extensions/issues/44)
@@ -45,33 +51,80 @@ time.
 ## The primitive: an atomic spawn reservation
 
 A **spawn reservation** is an atomic record, distinct from the execution claim,
-that guarantees **exactly one embody spawn per (task, attempt)**.
+that guarantees **exactly one embody spawn per (task, attempt)**. A task may
+also carry an `exclusive_key`, which extends the same guarantee across task ids
+that represent successive episodes for one logical resource.
 
 - **Distinct from the claim.** The execution *claim* is taken later, by the
   embodied worker, under its own worktree identity (`claim`/`start`/`complete`).
   The *reservation* is taken first, by the **spawner** (a `create --spawn` CLI,
   or — later — the supervisor loop), **before** launching embody.
 - **Keyed** `dispatch-task:<task_id>:<attempt>`.
-- **Lifecycle:** `reserving → spawned → settled`, plus `failed` for a bounded
-  retry that mints a fresh attempt and `rearmed` when an operator atomically
-  retires failed history after repairing the transport.
+- **Lifecycle:** `reserving → spawned → settled`, with `cold` for a suspended
+  reusable headless body, `releasing` while a failed/yielded/terminal attempt
+  concludes its exact created allocation, `failed` for a bounded retry that
+  mints a fresh attempt, and `rearmed` when an operator atomically retires
+  failed history after repairing the transport.
 
   | state       | meaning                                                        |
   |-------------|----------------------------------------------------------------|
-  | `reserving` | this spawner owns the (task, attempt) spawn; embody not yet confirmed launched. A restart reconciles a reservation stuck here. |
+  | `reserving` | this spawner owns the (task, attempt) spawn; embody not yet confirmed launched. A restart reconciles a pre-recorded worktree to `spawned`, `failed`, or held-unknown. |
   | `spawned`   | embody launched; the session/worktree handle is recorded.      |
-  | `settled`   | the reserved attempt reached a terminal outcome; no more spawning. |
-  | `failed`    | spawn failed or was lost; a fresh attempt may now be reserved.  |
+  | `cold`      | the headless process is stopped while its resumable session, worktree, and task ownership remain bound. |
+  | `releasing` | release is requested and exact body teardown or absence is not yet proven; replacement remains fenced. |
+  | `settled`   | the reserved attempt reached a terminal outcome or its body was released without a failed attempt. Optional `conclusion_state` / structured `conclusion_detail` keep worktree cleanup retryable and visible without retaining the active/exclusive-key fence. |
+  | `failed`    | spawn failed or was lost and exact body absence is proven; a fresh attempt may now be reserved. Cleanup may remain `pending` or `held` as explicit conclusion metadata. |
   | `rearmed`   | a failed attempt was retired by an audited operator rearm; preserved for history but excluded from the dead-letter count. |
+
+Operator rearm applies only to concluded failed history. If any failed
+reservation still has `conclusion_state=pending`, the entire rearm transaction
+is rejected: pending session/worktree cleanup remains durable and continues to
+fence that worktree until a claimed cleanup result reaches `complete` or
+`held`.
 
 - **Exactly-one invariant.** `reserve_spawn(task_id)` is a single
   `BEGIN IMMEDIATE` transaction: if any reservation for the task is **active**
-  (`reserving`/`spawned`), it returns `(existing, reserved=False)` — the caller
-  must **not** spawn. Otherwise the task must still be `queued` and unowned; a
-  different task state is refused. It then mints attempt `max(prior)+1` (or
-  `1`), `reserving`, and returns `(new, reserved=True)`. A prior
-  `failed`/`settled`/`rearmed` reservation therefore never blocks a legitimate
-  retry, but no two callers ever spawn the same attempt.
+  (`reserving`/`spawned`/`cold`/`releasing`), it returns
+  `(existing, reserved=False)` — the caller must **not** spawn. For an
+  `exclusive_key`, the active lookup and a partial unique index use that key
+  across all task ids, so two episodes cannot reserve the same resource. A new
+  exclusive reservation carries the most recent recorded worktree and bridge
+  session as reuse candidates. Otherwise the task must still be `queued` and
+  unowned; a different task state is refused. It then mints attempt
+  `max(prior)+1` (or `1`), `reserving`, and returns `(new, reserved=True)`. A
+  prior `failed`/`settled`/`rearmed` reservation therefore never blocks a
+  legitimate retry, but no two callers ever spawn the same attempt or exclusive
+  resource.
+
+**Dropping a carried session: `release_requested`.** The carried-session reuse
+above is a *candidate*, not an unconditional carry-forward — a confirmed-gone
+body must never keep getting resumed forever. `reserve_spawn` only drops a
+carried `session_handle` once it finds the reservation that recorded it marked
+`release_requested = 1` **and** in a terminal state (`settled`/`failed`/
+`rearmed`). `fail_spawn`/`settle_spawn` take an explicit `release_requested`
+flag the caller sets **only** once it has independently confirmed the body is
+gone (never for an ordinary business-logic failure, where the body might still
+be alive and worth resuming); `rearm_spawn` always sets it, since an operator
+rearm explicitly starts the task over. Before this flag existed (fixed in
+copilot-extensions#4990, filed as #4978), every genuine confirmed-gone
+recovery path left it unset, so a dead body's session kept getting carried
+forward into every later reservation — for this task *and* any other task
+sharing the `exclusive_key` — perpetually failing a resume against a
+confirmed-gone body instead of ever reaching a fresh spawn. See
+`troubleshooting-agent-dispatch`'s "stuck on the same dead session" entry.
+
+Retired reservations keep session and allocation cleanup as separate
+`conclusion_state`/`conclusion_detail` metadata. Positive body absence first
+retires the active reservation atomically; only then may the supervisor run the
+idempotent session end or worktree conclusion. A worktree cleanup retry takes an
+expiring tokenized claim before touching the recorded worktree. If any newer
+reservation has already inherited that worktree, the old cleanup becomes a
+visible held obligation and does not run, even after that successor settles. If
+the retry claims first, a concurrently reserved successor does not inherit that
+worktree. A supervisor crash leaves the claim pending; after its bounded lease
+expires another supervisor may safely reclaim it. Thus failed session-record
+retirement remains retryable without reasserting ownership of the body or its
+exclusive key.
 
 ### Where it lives
 
@@ -81,17 +134,59 @@ atomic-under-concurrency guarantee with no new locking. HTTP surface:
 
 ```
 POST /spawn-reservations               {task_id, reserved_by} -> {reserved, reservation}
+POST /spawn-reservations/{key}/routing-assignment {purpose, selected_model, eligibility_state, selection_reason, execution_surface, decision_ref, ...}
+POST /routing-assignments/{assignment_id}/transition {event_type, actor_role, ...}
+POST /spawn-reservations/{key}/worktree {worktree, ownership, creating_host, driver}
 POST /spawn-reservations/{key}/spawned  {session_handle, worktree}
+POST /spawn-reservations/{key}/release  {detail, disposition}
+POST /spawn-reservations/{key}/retire   {exact_absence, detail, conclusion_state?, conclusion_detail?}
 POST /spawn-reservations/{key}/fail     {detail}
-POST /spawn-reservations/{key}/settle   {detail}
+POST /spawn-reservations/{key}/defer    {detail}
+POST /spawn-reservations/{key}/cold
+POST /spawn-reservations/{key}/settle   {detail, conclusion_state?, conclusion_detail?}
+POST /spawn-reservations/{key}/conclusion {conclusion_state, conclusion_detail, claim_token?}
+POST /spawn-reservations/{key}/conclusion/claim
+POST /spawn-reservations/{key}/conclusion/validate {claim_token}
 POST /spawn-reservations/tasks/{task_id}/rearm {permitted, reason, min_failures}
 GET  /spawn-reservations                ?task_id&state&limit
 GET  /spawn-reservations/{key}
 ```
 
+`fail`, `settle`, and `defer` cannot move a `releasing` reservation. Only
+`retire` exits that state, and it requires an explicit exact-absence proof from
+the liveness/teardown owner. Public manual commands therefore cannot bypass an
+unresolved body or orphan pending cleanup.
+
 `DispatchClient` exposes each as a method. Events (`spawn.reserved`,
 `spawn.spawned`, `spawn.failed`, `spawn.settled`, `spawn.rearmed`) are published
 on the SSE bus.
+
+### Routing assignment provenance
+
+A caller may attach one immutable routing assignment to the reservation key
+after reserving and before launch:
+
+```text
+POST /spawn-reservations/{key}/routing-assignment
+POST /routing-assignments/{id}/transition
+POST /routing-assignments/{id}/billing-ref
+GET  /routing-assignments/{id}
+GET  /routing-assignments/{id}/events
+GET  /routing-assignments?task_id=<id>&limit=<n>
+```
+
+The assignment ID is the reservation key
+`dispatch-task:<task_id>:<attempt>`. Repeating an identical assignment is
+idempotent; changing its immutable routing facts is rejected. Lifecycle events
+are append-only and terminal transition is compare-and-set. Retry or repair
+work receives a new assignment linked through `parent_assignment_id` rather
+than rewriting the original attempt.
+
+The optional provider billing-event reference is opaque and unique per provider.
+Agent-dispatch stores no monetary value and no raw prompt/source content.
+Existing reservations with no routing assignment remain valid and readable;
+candidate admission and container enforcement are a separate follow-up
+boundary.
 
 ### How `create --spawn` uses it (the bug fix)
 
@@ -99,10 +194,33 @@ on the SSE bus.
 
 1. `reserve_spawn(task_id)`. If `reserved=False`, print a skip note and return
    (an active spawn already exists — the double-spawn is prevented).
-2. If `reserved=True`, run the spawn (`embody` or `bridge` backend).
-3. On success, `record_spawn(key, session_handle, worktree)`; on non-zero exit
-   or no mechanism, `fail_spawn(key, detail=…)` so a later run can retry a fresh
-   attempt.
+2. Resolve a targeted/carried worktree or create one, then record that id plus
+   `created|targeted|reused` ownership while the reservation is still
+   `reserving`. A newly created worktree is stamped before launch with its
+   task, reservation, attempt, driver, supervisor, and creating-machine
+   provenance. It is deliberately top-level: the dispatch reservation owns its
+   cleanup, so an interactive caller's worktree does not acquire a competing
+   outbound-resource claim. A positively missing carried id may be replaced; an
+   indeterminate lookup fails closed.
+3. Run the spawn (`embody` or `bridge` backend) in that recorded checkout. The
+   bridge backend first resumes a valid carried ACP session and creates a
+   replacement only after the prior session is confirmed gone.
+4. On success, `record_spawn(key, session_handle, worktree)`. A non-zero exit
+   or missing mechanism moves a reservation-created allocation to `releasing`;
+   `create --spawn` immediately attempts the same exact-ID managed teardown as
+   the supervisor. A later run cannot retry until the ground layer safely
+   removes the worktree or explicitly holds it for attention. `make_embody_spawn`
+   treats a zero exit with no recognizable session id (`embody.parse_handle`
+   found nothing usable) as a **failure**, not a success: a `SPAWNED`
+   reservation with `session_handle=None` would otherwise be indistinguishable
+   from one that never reached spawning anything at all, letting
+   `release_requested_bodies`' absent-worktree shortcut (see below) wrongly
+   treat a genuinely-launched but unidentifiable body as confirmed absent.
+   The supervisor's own single spawn call site enforces the same rule
+   generically for **every** `spawn_fn`, not only the built-in factories: a
+   sessionless `ok=True` is downgraded to a failure before ever reaching
+   `record_spawn`, so a custom caller-supplied `spawn_fn` can't reintroduce
+   the ambiguity either.
 
 Fail-safe: if the reservation call itself errors, `create --spawn` **does not
 spawn** (better to leave the task queued than risk a second autonomous worker).
@@ -116,18 +234,42 @@ invariant:
 > **A task is spawned only when a *fresh* spawn reservation is acquired for it.**
 
 Because `reserve_spawn` returns `reserved=False` whenever an *active*
-(`reserving`/`spawned`) reservation already exists, a task that is already being
+(`reserving`/`spawned`/`cold`/`releasing`) reservation already exists, a task that is already being
 spawned — or is still held by a slow-but-alive embody — is skipped. **Elapsed
 time is not treated as death**, so a slow-but-alive embody is never
 double-spawned. Each cycle:
 
-1. **reconcile** — settle `spawned` reservations whose task reached a **terminal**
-   state (`completed`/`abandoned`). This is the *only* automatic release, and only
-   for a provably-finished task, so it can never free a still-running spawn.
-2. **poll** — for each eligible queued task (in the lane, due, matching the
+1. **reconcile** — settle reservations whose task reached a **concluded**
+   state (`submitted`/`completed`/`abandoned`). An exclusive reservation is not released merely
+   because its task became terminal: live/unknown bodies remain bound, and only
+   a confirmed-gone body or an explicit end/conclusion permits release. A
+   completed idle **local** headless session may remain carried for the next task
+   episode; a fleet body is ended because no remote carry/resume path exists.
+   A provenance-bearing reservation-created worktree moves to `releasing`
+   before settlement and remains fenced while exact-ID managed teardown is
+   transiently pending. Legacy CLI worktrees explicitly opted in with
+   `--disposable-cli-label` retain their existing post-settlement conclusion
+   path: the dispatcher durably checkpoints the ACP session identity and marks
+   conclusion pending, ends the idle or stopped local body, then asks
+   agent-worktrees to conclude and remove the exact recorded session/worktree.
+   A running worker or operational failure remains pending for a later
+   reconcile; a preservation decision is held visibly.
+2. **recover interrupted reservations** — a `reserving` row with a pre-recorded
+   worktree is promoted when that worker is confirmed live. A confirmed-gone
+   reservation-created worktree enters `releasing`; targeted/reused legacy
+   rows may fail directly. Unknown liveness remains reserved. An unbound
+   reservation is never guessed away.
+3. **fulfill yield/release requests** — yielding marks the active reservation
+   for release but does not settle it transactionally. The supervisor ends a
+   confirmed-live headless body (or observes it gone), concludes only a
+   provenance-verified reservation-created worktree, and persists pending or
+   held cleanup across restarts. Targeted, reused, foreign-host, origin-unknown,
+   dirty, committed, live, and obligated worktrees are preserved.
+4. **poll** — for each eligible queued task (in the lane, due, matching the
    optional **label opt-in**), up to `--max-concurrent` in-flight: `reserve_spawn`
-   → if reserved, spawn embody → `record_spawn` (or `fail_spawn` on error, which
-   releases a fresh attempt). A task that accumulates `--max-attempts` **failed**
+   → if reserved, pre-create and record its worktree → spawn embody →
+   `record_spawn` (or fenced release on error). A task that accumulates
+   `--max-attempts` **failed**
    spawn attempts is treated as **spawn-dead-lettered** by the supervisor — held
    out of auto-retry, with its failed history queryable via `reservations list
    --state failed` for a human — so a persistently-unspawnable task can't drive a
@@ -141,12 +283,43 @@ agent-dispatch supervise [--repo R | --all-repos] [--label L ...] \
     [--max-concurrent N] [--max-attempts N] [--no-heartbeat] \
     [--no-reactive] [--reactive-interval S] \
     [--embody-backend headless|cli] [--cli-label L ...] \
-    [--headless-label L ...] [--headless-agent AGENT] [--interval S] [--once]
+    [--headless-label L ...] [--disposable-cli-label L ...] \
+    [--idle-nudge-exempt-label L ...] \
+    [--headless-agent AGENT] [--interval S] [--once]
 agent-dispatch reservations list [--task ID] [--state S]
 agent-dispatch reservations fail|settle <key> [--detail ...]
 agent-dispatch reservations rearm <task> --permit --reason "transport repaired" \
     [--min-failures 3]
 ```
+
+By default each long-lived lane supervisor owns one authenticated local Agent
+Bridge event client. It sends the complete set of active fleet reservation
+host/session identities over one aggregate SSE connection; Agent Bridge then
+multiplexes their logical subscriptions over its per-host persistent carriers.
+Durable turn, session-state, and handoff boundaries coalesce into one ordinary
+reconciliation wake. Cursors are acknowledged only after that pass completes.
+Reservation settlement or rebinding replaces the aggregate subscription set.
+
+Stream exit, heartbeat/progress failure, cursor invalidation, and local Bridge
+cutover mark acceleration degraded and wake one immediate full pass. Reconnect
+uses bounded backoff and rediscovers the active local Bridge endpoint. The
+outage guard resets only after heartbeat or event progress, so an immediately
+failing reconnect cannot turn backoff into short reconciliation polling. After
+a cursor invalidation or replay gap, the completed full pass acknowledges the
+identified authoritative head and continuity before reconnecting.
+The ordinary `--interval` remains the sole correctness floor and continues unchanged
+when Bridge or a remote carrier is missing or version-skewed. `--no-reactive`
+disables push acceleration. `--reactive-interval` remains accepted only for
+configuration compatibility and never enables polling.
+
+Remote fleet Bridge commands use the same local Bridge owner and per-host
+carrier as event subscriptions. Create, exact status/activity, end,
+session-or-worktree resolution, and queued steering/redrive delivery therefore
+do not create additional SSH processes while the command capability is present.
+Dispatch retains its former bounded raw SSH commands only when the optional
+local Bridge daemon or required command protocol is absent. Once that local
+capability is accepted, a timeout, remote rejection, or carrier failure degrades
+the operation without falling through to direct SSH beside the event stream.
 
 The rearm is one coordinator write transaction. It succeeds only while the
 task is still queued and unowned, no `reserving`/`spawned` reservation exists,
@@ -160,6 +333,19 @@ later claim or reservation observes the rearmed state normally.
 Dead-letter visibility is set-oriented: a supervisor logs one bounded,
 actionable summary when its blocked task set changes, rather than repeating one
 warning per task on every cycle.
+
+**Where that log (and every other `agent-dispatch.*` log call) actually goes.**
+Both the coordinator and the supervisor normally run headless (`pythonw.exe`,
+no console), and neither configured a logging handler until
+copilot-extensions#4990 — every `log.info`/`log.warning`/`log.exception` call
+across the whole package, including this dead-letter summary and every
+recovery-path message above, was silently dropped. `configure_file_logging`
+(`logging_setup.py`) now wires a rotating file handler into both daemon
+entrypoints at startup: `<install_dir>/logs/coordinator.log` and
+`<install_dir>/logs/supervisor.log` (`<install_dir>` is normally
+`~/.agent-dispatch`; see `install_paths.install_dir()`). Read these first when
+diagnosing a stalled lane instead of guessing from `list`/`show`/`doctor`
+output alone — see `troubleshooting-agent-dispatch`.
 
 ## Registered supervision (built) — register-and-return
 
@@ -179,7 +365,9 @@ agent-dispatch supervise register [--kind KIND] [--id ID] [--spec JSON|@FILE] \
     # supervised-lane convenience flags (when --spec is omitted):
     [--repo R | --all-repos] [--label L ...] [--max-concurrent N] \
     [--max-attempts N] [--label-max-attempts LABEL=N ...] \
-    [--headless-label L ...] [--headless-agent AGENT] [--evaluator SPEC] \
+    [--headless-label L ...] [--disposable-cli-label L ...] \
+    [--idle-nudge-exempt-label L ...] [--steering-disallowed-label L ...] \
+    [--headless-agent AGENT] [--evaluator SPEC] \
     [--interval S]
 agent-dispatch supervise status <id>
 agent-dispatch supervise list [--kind KIND] [--machine M] [--env E] [--active]
@@ -221,7 +409,7 @@ set against the registry on every tick.
   supervisor per machine-and-environment* guarantee. A double launch (e.g. two
   `--ensure` registers racing) is self-correcting: the loser stands down.
 - **Reconcile each tick.** Start a newly-registered unit; **restart** one whose
-  spec changed (fingerprint of `kind`+`spec`); **wind down** one that was removed
+  spec or attributed runtime revision changed; **wind down** one that was removed
   or paused (`terminate` its subprocess); **revive** one whose subprocess crashed,
   gated by a restart backoff and bounded by `max_restarts` (a crash-looping unit
   is left stopped and surfaced, never retried forever).
@@ -247,11 +435,29 @@ set against the registry on every tick.
   **materialized** to a per-registration file under the run dir so its subprocess
   can read it. A kind the daemon can't build a command for is logged and skipped,
   never fatal.
+- **Attributed plugin companions.** Active plugin discovery may contribute the
+  non-direct `plugin-companion` kind. Its optional provider decides whether the
+  unit is active and may add arguments/environment; provider uncertainty retains
+  a previous answer only under the exact same declaration authority. The daemon
+  validates plugin-root containment, strips inherited dispatch authority,
+  launches through a pre-execution containment gate, and records PID plus process
+  creation identity before plugin code runs. Windows uses a kill-on-close Job;
+  POSIX uses a process group and can recover a matching receipt after supervisor
+  restart. Confirmed unhealthy probes restart the unit; indeterminate probes do
+  not.
+- **Managed companion runtime declarations.** A plugin companion may carry a
+  versioned `managed_runtime` data contract containing bounded logical runtime
+  identities, plugin-relative Python project inputs, validation imports, and
+  interpreter environment bindings. The contract is attributed and
+  restart-significant, but this increment is non-operative: the daemon does not
+  create a runtime, invoke a package manager, or alter launch behavior from this
+  metadata.
 
 > **Increment status.** The **registration store + verbs**, the **singleton
 > daemon** (reconcile, per-unit subprocesses, crash-safe OS-lock single-instance,
-> crash-revive, wind-down), and **all four kinds** (supervised-lane, evaluator,
-> schedule, emitter) are built — the daemon runs each as its own subprocess,
+> crash-revive, wind-down), the **four direct kinds** (supervised-lane, evaluator,
+> schedule, emitter), and attributed-plugin-only **plugin companions** are built.
+> The daemon runs each active unit as its own contained subprocess,
 > subsuming the foreground `supervise --evaluator` flag into an evaluator
 > registration. The bare `supervise` foreground loop remains available.
 
@@ -425,19 +631,28 @@ session **by default** (`--embody-backend headless`) — the right body for a
 dispatched/supervised task, which is a self-contained, autonomous unit that needs
 no human attach. Headless also sidesteps the **CLI-start-prompt** path entirely (a
 seeded CLI/mux session can *race the input-prompt caret and never deliver its
-seed*, deadlocking at 0%). `--headless-agent AGENT` names the agent-bridge agent
-used (default `task-worker`).
+seed*, deadlocking at 0%). `--headless-agent AGENT` names the **venue** the
+spawn targets (default `task-worker`): a real, addressable agent-bridge
+machine/repo identity that controls access and resources. `--charter CHARTER`
+names an *optional* `.github/agents/<charter>.agent.md` **behavior overlay** —
+rendered as Copilot's own `--agent <charter>` flag — layered on top of the venue
+without changing what venue is spawned. Venue and charter are independent axes:
+the venue is what gets addressed/spawned, the charter (when set) is only what
+shapes the spawned agent's behavior. `--charter` is supported for a fully
+headless lane only today — `agent-worktrees embody` has no charter-binding flag
+yet, so pairing `--charter` with `--embody-backend cli`/`script` (or any
+`--cli-label`/`--script-label`) is refused up front.
 
 > **Preflight (fail-loud, best-effort).** At loop startup a headless lane checks
 > that its `--headless-agent` is actually registered with agent-bridge on the host
 > where the body will spawn — the local registry, or each `--pool` host over SSH
 > for a fleet lane — and prints a one-line **WARNING** for any host where the agent
 > is provably absent (the classic trap being the bogus `task-worker` default naming
-> an agent nobody registered, which otherwise fails as `'task-worker' is not a
-> known agent name`, retries, and dead-letters *silently*). The check never blocks
-> the lane and stays silent when the registry can't be read (bridge absent,
-> unreachable, timeout) — it only warns on a confirmed miss. It is skipped for
-> `--once` so hot one-shot/cron polls stay cheap.
+> a charter nobody registered), or where it resolves only to a `managed: true`
+> entry that cannot be borrowed as a charter profile. The check never blocks the
+> lane and stays silent when the registry can't be read (bridge absent,
+> unreachable, timeout) — it only warns on a confirmed miss / managed guard. It
+> is skipped for `--once` so hot one-shot/cron polls stay cheap.
 
 When a task *does* want an attachable **mux-wrapped CLI autopilot**
 (`agent-worktrees embody`) — standalone/durable work a human may take over — opt
@@ -450,18 +665,37 @@ out:
   stays headless-by-default (the common opt-out).
 
 The routing is **per label within one supervisor**, so a single service can
-embody self-contained sweeps headless (the default) while opting a "kick a
-session" interactive label out to CLI. The headless body reuses the **same
-autopilot seed** as the CLI backend (claim-under-identity, contract-net
-evaluation, deferred completion), so a headless-embodied task is *driven*
-identically; only its body differs. A headless body is not a worktree, so the
-worktree-keyed lease heartbeat does not apply to it (bounded sweeps drive their
-own lifecycle to completion); reconciliation still settles its reservation on the
-task's terminal state. `--embody-backend`/`--cli-label`/`--headless-label` apply
-to **local** (non-pool) spawn. In fleet (`--pool`) mode the body choice is
-**fleet-wide** instead: fleet bodies are headless by default too (only
-`--embody-backend cli` makes them CLI on the pool host; the legacy `--headless`
-flag remains an explicit force), and the per-label flags are ignored.
+embody self-contained sweeps headless (the default), opt a "kick a session"
+interactive label out to CLI, or opt a deterministic maintenance label out to a
+plain script subprocess. The headless body reuses the **same autopilot seed**
+as the CLI backend (claim-under-identity, contract-net evaluation, deferred
+completion), so a headless-embodied task is *driven* identically; only its body
+differs. The script body is deliberately non-agentic: a plain subprocess that
+claims, starts, heartbeats, reports progress, requests steering, and explicitly
+completes/abandons through the ordinary lifecycle client surface. A headless or
+script body is not a worktree, so the worktree-keyed lease heartbeat does not
+apply to it; reconciliation still settles its reservation on the task's
+terminal state. `--embody-backend`/`--cli-label`/`--headless-label`/
+`--script-label` apply to **local** (non-pool) spawn. In fleet (`--pool`) mode
+the body choice is **fleet-wide** instead: fleet bodies are headless by default
+too (only `--embody-backend cli` makes them CLI on the pool host; the legacy
+`--headless` flag remains an explicit force), and the per-label flags are
+ignored.
+
+**Script payload contract.** A script-embodied task carries a JSON
+`payload_inline` describing what to launch:
+
+- `{"path":"C:\\absolute\\worker.py","args":["..."],"env":{"K":"V"}}`
+  runs the file with agent-dispatch's own runtime Python.
+- `{"argv":["some-exe","arg1","arg2"],"cwd":"C:\\absolute\\dir","env":{"K":"V"}}`
+  runs the exact argv directly.
+
+`agent_dispatch.script_worker.ScriptTaskRuntime` is the small helper contract
+for those bodies. It reads the supervisor-injected task/coordinator context from
+environment variables, wraps claim/start/heartbeat/progress/complete/abandon,
+and treats a return without an explicit terminal call as a protocol violation:
+an orderly exit auto-abandons in the helper, and a confirmed-gone process is
+abandoned by supervisor recovery.
 
 The local supervisor and every worker use the ordinary `agent-dispatch` client
 discovery path. The supervisor resolves a fresh client for every coordinator
@@ -475,6 +709,115 @@ cannot be handed to a locally-spawned worker (it would bake a raw,
 possibly-dynamic endpoint into the body); route by the default local
 coordinator, `--shared`, or fleet mode (`--pool`/`--origin`, which routes by
 machine alias).
+
+### Disposable local-worker conclusion (built) — provenance-first priming
+
+Every locally created dispatch worktree carries immutable task, reservation,
+attempt, driver, supervisor, and creating-machine provenance. That proof
+authorizes automatic conclusion for both CLI and local headless ACP bodies; no
+label opt-in or branch-name inference is needed. Pre-existing targeted/reused
+worktrees and legacy records without exact ownership are never treated as
+dispatch-owned.
+
+The older `--disposable-cli-label LABEL` path remains for explicitly declared
+CLI worker classes whose worktrees predate allocation provenance. A registrar
+may supply the equivalent `body.disposable_cli_labels`.
+
+### Idle-confirm nudge exemption
+
+A `STARTED` headless body that goes idle with no new activity is only
+ambiguous when nothing else is watching it. A recipe/emitter-driven task type
+already has its own resume mechanism -- an in-process evaluator, or an
+external one driven entirely through this CLI -- and going idle there is that
+task's correct resting state, not an unfinished turn; nudging it anyway can
+push the worker toward a resolution its own charter never sanctioned.
+
+`--idle-nudge-exempt-label LABEL` (repeatable; a registrar may supply the
+equivalent `body.idle_nudge_exempt_labels`) exempts a task carrying that label
+from the generic idle-confirm nudge entirely. The default (no exemptions)
+preserves today's behavior for genuinely self-tracked work with no evaluator
+watching it -- the case the nudge exists for.
+
+### Steering-card permission gate
+
+`agent-dispatch card set --request-input` suspends a task in
+`awaiting_steer` until a human answers it -- a capability every task type
+gets by default, whether or not a human is actually watching. Confirmed
+live (the downstream tracker): Intelligence Dampener's reviewer reached
+for this on its own initiative, blocking its normal automatic resume path
+for over 2 hours because nothing was going to answer a card it should
+never have posted in the first place.
+
+`--steering-disallowed-label LABEL` (repeatable, `supervise register` only;
+a registrar may supply the equivalent `body.steering_disallowed_labels`)
+forbids a task carrying that label from posting a `request_input` card at
+all -- enforced **coordinator-side** in `TaskQueue.set_card`, since the
+call goes straight from the embodied worker to the coordinator and the
+supervisor process never intermediates it (unlike the idle-confirm nudge
+above). The **default is permissive**: an undeclared label may still post
+a card, matching this facility's own policy of allowing steering by
+default and naming only the task types with no human on the other end of
+an answer (an evaluator-owned auto-reviewer, a batch log writer, an
+Adjudication Board sweep/verdict worker). A card with no `request_input`
+(a plain status note) is never gated.
+
+On terminal task settlement the supervisor uses only the spawn reservation's
+recorded `session_handle` and `worktree`. It never infers an allocation by
+branch name or age. When the initial session handle is the known
+`wt-<worktree>` mux placeholder, the supervisor upgrades it from the task's
+durably captured `owner_session_id` (or a matching live-session observation)
+before settlement; an already-exact handle is never replaced by a successor.
+For a provenance-bearing allocation, the reservation stays active in
+`releasing` while cleanup is transiently pending, preventing a retry from
+allocating another worktree. The supervisor invokes:
+
+```bash
+agent-worktrees conclude-disposable \
+    --worktree <exact-id> \
+    --session <exact-session-id> \
+    --policy dispatch-attempt \
+    --reservation <exact-reservation-key> \
+    --owner agent-dispatch \
+    --remove \
+    --json
+```
+
+The legacy label-scoped CLI path instead invokes:
+
+```bash
+agent-worktrees conclude-disposable \
+    --worktree <exact-id> \
+    --session <exact-session-id> \
+    --policy disposable-cli \
+    --owner agent-dispatch \
+    --remove \
+    --json
+```
+
+The ground layer preserves any live mux/bound session, follow-up or resource
+obligation, open pull request, branch drift, arbitrary dirty path, or local
+commit. It also preserves a different or unresolved asserted lifecycle head
+rather than making a clean checkout GC-eligible around a resumable session.
+Dirty generated overlays are preserved under the same rule as other dirty work;
+a clean branch with zero commits ahead of the configured upstream may remain
+behind without being rewritten. A safe result concludes the exact recorded
+session, marks the checkout as a managed final worker, and immediately asks the
+managed sweep to remove only that exact id with zero idle grace. The sweep
+remains the deletion authority:
+it freshly re-checks liveness, lifecycle state, Git state, and record invariants
+under the same lifecycle fence used by CLI embodiment. Final Git removal is
+non-forced, runs after the short record recheck lock is released, and retains
+the tracking record whenever Git refuses removal.
+
+A safe preservation decision (`dirty-work`, `local-commits`,
+`session-mismatch`, and related reasons) is a structured held outcome, not an
+error. `live-session` / `live-mux` and operational failures remain durably pending and
+retry with exponential backoff. On the first live-session result, the supervisor
+sends one bounded conclusion prompt to the exact same local ACP session and
+worktree; it never creates a replacement merely to clean the first. Each cycle processes a bounded batch; after
+twelve failed conclusion attempts (a teardown window of roughly 40 minutes at
+the bounded cadence) the reservation becomes visibly held instead of hot-looping
+forever. A removed or held outcome is idempotent and does not run again.
 
 ### Lease heartbeat (built) — the live-worker safety net
 
@@ -506,8 +849,9 @@ The supervisor now has the positive-death signal the earlier design deferred to:
   SSH for a remote owner). A different/absent session is `gone`.
 - **local headless body** — parse the local `agent-bridge` session id from the
   reservation handle and probe that session on this host.
-- **headless fleet body** — parse `fleet-body:<host>:<session-id>` and probe the
-  pool host over SSH (`agent-bridge --json status <session-id>`).
+- **headless fleet body** — parse `fleet-body:<host>:<session-id>` and ask the
+  local Bridge for exact remote status over its shared carrier. A direct SSH
+  status probe is compatibility-only.
 
 For a confirmed-gone body, the supervisor yields the task on the dead owner's
 behalf when it is still leased (preserving `goal` and `progress_log`), marks the
@@ -518,6 +862,62 @@ of being recovered. The remaining unsupported recovery path is **CLI/mux fleet**
 auto-recovery: without a headless bridge session handle, a synthetic-owner fleet
 body is still not auto-joined to the origin's live-session registry; use
 headless fleet for recoverable remote sweeps.
+
+**Retiring an unleased worktree-only reservation.** A `release_requested`
+reservation whose task never reached a captured `owner_session_id` (the normal
+shape of a RESERVING-stage spawn failure — the attempt failed before any
+session/claim ever existed) has no owner identity for `verdict_fn`/
+`tracking.liveness_verdict` to key a `gone` verdict on, so that shared,
+identity-keyed resolver stays `unknown` here exactly as it does for every
+other claimed/started task's liveness GC — it must not be loosened generally,
+since a generically claimed task's worktree may have no agent-worktrees
+record at all, and an uncaptured `owner_session_id` can legitimately mean
+"claim not yet registered" for a still-live worker.
+
+`release_requested_bodies`'s own worktree-only retirement branch layers one
+additional, narrowly-scoped check on top: when `verdict_fn` answers `unknown`
+for exactly this shape (`task.get("owner")` and `owner_session_id` both
+literally `None` -- not merely an owner string `_machine_from_owner` fails to
+parse, e.g. a claimer's arbitrary non-`<machine>/<worktree>` worker id --
+*and* the reservation's own `session_handle` is also empty, since a
+spawned-but-never-claimed body (or one that yielded after claiming) can have
+the same unset owner/owner_session_id while `session_handle` still names a
+real recorded body whose liveness must resolve through its own path, not this
+shortcut -- and the reservation's *own* recorded `worktree`,
+`worktree_ownership == "created"`, and a `creating_host` matching this
+supervisor's own `machine`, compared case-insensitively like every other
+machine/SSH-alias comparison in this plugin — created by agent-dispatch
+itself via `embody.prepare_reusable_worktree`, so the local agent-worktrees
+registry is authoritative for whether it still exists), it cross-checks that
+registry directly (`worktree_directory_present_fn`, default
+`tracking.worktree_directory_present`, scoped to the **same allocation
+project** `_prepare_spawn_task` would have used to actually create this
+worktree -- `self._spawn_attribute(task, "allocation_project",
+embody.project_for_task(task) or "")`, not a plain re-derivation, since a
+routed/headless `spawn_fn` can select a different project via an
+`allocation_project_for` selector; this daemon is CWD-neutral either way).
+That resolution call sits inside the same `try`/`except` as the probe itself
+-- `_spawn_attribute` can invoke an I/O-backed selector (the default headless
+one calls a strict registry lookup) that may raise when a backing registry is
+unavailable, and that must degrade only this one reservation to `unknown`
+for this cycle, never abort the whole `release_requested_bodies` polling
+pass over every other reservation. The probe also passes
+`--include-other-platforms`: the registry's default `list` filters to the
+host's *current* detected local platform, so a reservation created on this
+same host under a different local platform (e.g. Windows vs. WSL) would
+otherwise be silently omitted and its still-existing worktree misread as
+absent -- presence, not per-platform enumeration, is what this probe answers.
+It checks across every tracking status, not merely the ACTIVE-only set
+`live_worktrees()` uses for orphan reaping — a `finalized` worktree may still
+be fully present on disk. Only a confirmed absence retires the reservation;
+an unresolved probe, a claimed task under any owner string (well-formed or
+not), or a reservation whose `creating_host` differs from this host (a shared
+cross-machine queue's reservation created elsewhere) all leave it `unknown`.
+`worktree_directory_present`'s own docstring notes one residual, pre-existing
+platform limitation it shares with `live_worktrees()`: agent-worktrees'
+registry reader silently skips an unreadable tracking record rather than
+reporting it, so an empty result cannot be perfectly distinguished from a
+transient read failure for that exact record.
 
 ## Transport for a containerized producer
 
@@ -582,12 +982,12 @@ Three properties define it:
 ### Headless-fleet body (`--headless`) — the reliable remote embodiment
 
 By default a fleet body is a **CLI/mux embody** on the pool host
-(`agent-worktrees embody`). But a seeded CLI session can *race the input caret and
-never deliver its startup seed* (the documented "Loading…" hang,
-github/copilot-agent-runtime#13492) — so a kicked fleet body may never claim its
-task, exactly the failure headless sweeps hit on anomalous-potato-wsl. `--headless`
-(fleet-wide) instead embodies each fleet body as a **headless agent-bridge ACP
-session** on the pool host — `ssh <host> agent-bridge create <agent> "<fleet
+(`agent-worktrees embody`). A seeded CLI session historically could *race the
+input caret and never deliver its startup seed* on a since-fixed CLI startup
+bug -- a kicked fleet body no longer risks that specific race on an up-to-date
+CLI. Independent of that history, `--headless` (fleet-wide) still has its own
+standing benefits: it embodies each fleet body as a **headless agent-bridge
+ACP session** on the pool host — `ssh <host> agent-bridge create <agent> "<fleet
 seed>" --no-wait` (`fleet.py` → `embody.spawn_fleet_headless_worker`) — spawning
 the body in that host's own persistent agent-bridge daemon, which owns it
 independently of the launching SSH invocation. It sidesteps the
@@ -601,16 +1001,26 @@ completes identically; only the *body* differs. A headless-fleet body is **not a
 worktree**, so the *worktree-keyed* liveness probe doesn't apply — instead its
 recovery handle is the **pool host's agent-bridge session id** (captured from
 `create --no-wait --json` and stamped on the reservation as
-`fleet-body:<host>:<session-id>`). The supervisor probes *that* over SSH
-(`ssh <host> agent-bridge --json status <session-id>`, `embody.fleet_body_verdict`)
+`fleet-body:<host>:<session-id>`). The supervisor probes *that* through the
+local Bridge carrier (`embody.fleet_body_verdict`, with bounded direct SSH only
+when the command capability is absent)
 for the same tri-state verdict: a **confirmed-live** body is heartbeated
 (`hold_live_leases`) so a quiet-but-alive sweep isn't wrongly recovered, and a
 **confirmed-gone** body (its ACP session terminal or absent) has its reservation
 released (`recover_gone`) so the next cycle re-embodies it — resuming from the
 task's `progress_log`. As always, an `unknown` probe (ssh/bridge unreachable,
 lagging reconcile) is never treated as death, so recovery cannot double-spawn a
-live body. `--headless-agent AGENT` names the agent-bridge agent
+live body. `--headless-agent AGENT` names the headless spawn profile
 (default `task-worker`).
+
+For local headless bodies, a settled ACP turn is an implicit suspension
+boundary. The supervisor publishes `IDLE`, suspends the task, and uses
+`agent-bridge stop --reap-host` so both the Copilot process and its owned
+Session Host release capacity while the ACP session record, task owner,
+worktree, and reservation remain durable. A later steer or Resume sends the
+next turn to that same session id, starts a fresh child, and returns the cold
+reservation to `spawned`; it does not release the task for a new embodiment.
+Confirmed session loss still follows the ordinary liveness recovery path.
 
 CLI:
 
@@ -622,7 +1032,11 @@ agent-dispatch supervise --pool host-a,host-b [--origin <alias>] \
 `--origin` is the supervisor machine's own SSH alias that bodies report back to
 (defaults to the resolved local machine). Omit `--pool` for local spawn. Add
 `--headless` for a headless agent-bridge ACP body on the pool host instead of a
-CLI/mux one.
+CLI/mux one. `--charter CHARTER` layers a `.github/agents/<charter>.agent.md`
+behavior overlay on the headless fleet venue (`--headless-agent`) — supported
+for a headless fleet lane only; combining it with a CLI-embodied fleet lane
+(`--embody-backend cli`) is refused up front, since `agent-worktrees embody`
+has no charter-binding flag yet.
 
 **Recovery-on-kill (headless fleet):** because the recovery handle is the pool
 host's bridge session, a killed headless-fleet body is auto-recovered

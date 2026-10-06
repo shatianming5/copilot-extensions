@@ -131,7 +131,11 @@ def _configured_paths() -> tuple[list[Path], list[str]]:
         if not root.is_dir():
             errors.append(f"{root}: adopted project {name!r} is unavailable")
             continue
-        paths.append(config.repo_config_path(root))
+        layers = config._repo_config_layers(root)
+        if layers:
+            paths.extend(layers)
+        else:
+            paths.append(config.repo_config_path(root))
     return paths, errors
 
 
@@ -193,7 +197,9 @@ def evaluate(
         return _result(
             "failed",
             "The agent-index service is unavailable: "
-            f"{detail}. Re-run the installer and inspect `agent-index status`.",
+            f"{detail}. Inspect `agent-index status` and the installer/runtime "
+            "lifecycle (`install`, `start`, `update`, or `deploy --recover`); "
+            "routine service updates do not rebuild the durable engine.",
         )
     index = status.get("index")
     if not isinstance(index, Mapping) or index.get("chunks") is None:

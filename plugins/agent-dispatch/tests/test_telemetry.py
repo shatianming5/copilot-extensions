@@ -61,6 +61,7 @@ def test_task_lifecycle_event_carries_state_only() -> None:
         "source": "context-handoff",
         "target_machine": "host-a",
         "target_worktree": "wt-1",
+        "exclusive_key": "resource:42",
         "owner": "wt-1",
         "attempts": 1,
         # Sensitive fields that must NOT appear in the telemetry record:
@@ -75,6 +76,7 @@ def test_task_lifecycle_event_carries_state_only() -> None:
     assert ev["id"] == "abc123"
     assert ev["repo"] == "example.com/acme/widget"
     assert ev["target_machine"] == "host-a"
+    assert ev["exclusive_key"] == "resource:42"
     # Redact-by-construction: prompt/payload never surface.
     assert "prompt" not in ev
     assert "payload_inline" not in ev
@@ -208,7 +210,7 @@ def test_make_spool_sink_appends_jsonl_with_ts(tmp_path) -> None:
     sink = telemetry.make_spool_sink(spool)
     assert callable(sink)
     sink({"kind": "state_transition", "name": "task", "event": "task.claimed", "to": "claimed"})
-    sink({"kind": "state_transition", "name": "task", "event": "task.completed", "to": "completed"})
+    sink({"kind": "state_transition", "name": "task", "event": "task.submitted", "to": "submitted"})
     rows = _read_spool(spool)
     assert len(rows) == 2
     assert rows[0]["event"] == "task.claimed"
@@ -219,11 +221,11 @@ def test_make_spool_sink_appends_jsonl_with_ts(tmp_path) -> None:
 def test_result_recorded_telemetry_is_distinct_from_completion() -> None:
     record = telemetry.task_lifecycle_event(
         "task.result_recorded",
-        {"id": "t1", "status": "completed", "result": {"secret": "excluded"}},
+        {"id": "t1", "status": "submitted", "result": {"secret": "excluded"}},
     )
 
     assert record["event"] == "task.result_recorded"
-    assert record["to"] == "completed"
+    assert record["to"] == "submitted"
     assert "result" not in record
 
 

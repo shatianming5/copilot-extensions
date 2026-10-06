@@ -38,8 +38,9 @@ import threading
 
 from agent_procutil import no_window_flags
 
-from .. import config as cfg
+from .. import project_config as cfg
 from . import data_local, derive, provider_sources, roster, source_identity
+from .loader_lazy import LazyLoadMixin, _lazy_loading_enabled, _ping_argv, _PING_TIMEOUT_SECS  # noqa: F401
 
 # Shared display surface so the engine treats this exactly like ``data_local``.
 # ``LOCAL`` is resolved from the actual local source below (so it carries the
@@ -54,8 +55,8 @@ host_cols = roster.host_cols
 target_envs = roster.target_envs
 # Repo name + default branch for the top bar -- project config, not hardcoded
 # (shared with data_local; both resolve the same active-project config).
-REPO = data_local.REPO
-BRANCH = data_local.BRANCH
+# Bound lazily so importing this module cannot pull config/roster I/O before
+# the first picker frame paints.
 
 # machines.yaml environment name -> the picker's short env label (and C_ENV key).
 _ENV_LABEL = {"windows": "Win", "wsl": "WSL", "linux": "Linux"}
@@ -769,9 +770,9 @@ def list_sessions_argv(
 def profiles_argv(machine, env, *, action, set_json=None, no_mirror=False):
     """SSH argv to run ``profiles get|apply`` on a remote host/env.
 
-    Returns the ssh argv, or ``None`` for the local host or an unknown /
-    not-ready target (the caller runs the local op in-process). ``set_json`` is
-    the column payload for ``apply``.
+    Phase 3e Step 6 (#3390): shells ``worktree-manager profiles <project>``
+    (the retired agent-worktrees verb); mirrors only via ``--mirror --live``,
+    passed when ``no_mirror`` is false. ``set_json`` is the ``apply`` payload.
     """
     project = _project()
     for s in _build_sources():
@@ -781,12 +782,12 @@ def profiles_argv(machine, env, *, action, set_json=None, no_mirror=False):
             if s.local or not s.ready or not s.alias:
                 return None
             if action == "get":
-                inner = f"{project} profiles get --json"
+                inner = "worktree-manager profiles " + project + " get --json"
             else:  # apply
-                flags = " --no-mirror" if no_mirror else ""
+                flags = "" if no_mirror else " --mirror --live"
                 payload = (set_json or "[]").replace("'", "'\\''")
-                inner = (f"{project} profiles apply --json{flags} "
-                         f"--set '{payload}'")
+                inner = (f"worktree-manager profiles {project} apply "
+                         f"--json{flags} --set '{payload}'")
             return _wrap_remote(s.shell, s.alias, inner)
     return None
 
@@ -794,6 +795,11 @@ def profiles_argv(machine, env, *, action, set_json=None, no_mirror=False):
 def source_snapshot():
     """Capture one source-registry/roster view for a Picker setup pass."""
     return tuple(_build_sources())
+
+
+def bootstrap_rows():
+    """Return cache-only rows for this host without loading config or roster."""
+    return data_local.load(classify=False)
 
 
 def machines(sources=None):
@@ -824,6 +830,7 @@ def source_tabs(sources=None):
             "machine": source.machine,
             "env": source.env,
             "ready": source.ready,
+            "local": source.local,
             "source_kind": source.source_kind,
             "source_id": source.source_id,
             "source_label": source.source_label,
@@ -882,25 +889,9 @@ def apply_profile_column(machine, env, sels, *, mirror=True):
     return profiles_io.apply_column(machine, env, sels, mirror=mirror)
 
 
-def reconcile_prs() -> int:
-    """Reconcile the LOCAL machine's stale PR states against the provider (#1423).
-
-    Delegates to :func:`data_local.reconcile_prs`. Each *remote* machine's PRs are
-    reconciled on their own owning machine by :meth:`LiveLoader.reconcile_remote_prs`
-    (a bounded, after-first-paint ``list --reconcile-prs`` over SSH, #2102).
-    """
-    return data_local.reconcile_prs()
-
-
-def reconcile_bound_live() -> int:
-    """Reconcile the LOCAL machine's cached bound-Copilot liveness (#4057/#1416).
-
-    Delegates to :func:`data_local.reconcile_bound_live`. The bound-Copilot scan
-    is inherently machine-local (it reads this host's session-state), so -- like
-    :func:`reconcile_prs` -- each remote machine reconciles its own worktrees when
-    its picker runs; this only ever touches the local machine's records.
-    """
-    return data_local.reconcile_bound_live()
+def reconcile_local_batch():
+    """Run the local Group C reconcile batch; remotes reconcile on their host."""
+    return data_local.reconcile_local_batch()
 
 
 def _reconcile_argv(source: "Source"):
@@ -936,8 +927,18 @@ def _resolve_local() -> tuple[str, str]:
         pass
     return data_local.LOCAL
 
+_LOCAL: tuple[str, str] | None = None
 
-LOCAL = _resolve_local()
+
+def __getattr__(name: str):
+    global _LOCAL
+    if name in ("REPO", "BRANCH", "orphans"):
+        return getattr(data_local, name)
+    if name == "LOCAL":
+        if _LOCAL is None:
+            _LOCAL = _resolve_local()
+        return _LOCAL
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def load(machine: str | None = None, env: str | None = None):
@@ -946,7 +947,8 @@ def load(machine: str | None = None, env: str | None = None):
     Provided so this source stays swap-compatible with ``data_local`` for the
     non-live code path; returns just this host's worktrees.
     """
-    return data_local.load(LOCAL[0], LOCAL[1])
+    local = __getattr__("LOCAL")
+    return data_local.load(local[0], local[1])
 
 
 def make_loader(sources=None):
@@ -987,12 +989,25 @@ _CREATE_NO_WINDOW = no_window_flags()
 
 
 def _run(argv, timeout):
+    # Sanitize the child's environment the same way LiveLoader._spawn /
+    # _spawn_stream do (#2359): the *local* source's fast/classify passes fall
+    # back to this module-level runner (see ``_fetch``'s ``runner = runner or
+    # _run``, taken before the ``source.local`` branch), so without this it
+    # inherits the Picker process's own PYTHONHOME/PYTHONPATH/VIRTUAL_ENV --
+    # e.g. a foreign-architecture PYTHONHOME from an outer ``uv run`` -- which
+    # crashes the local agent-worktrees venv's own interpreter on `import
+    # socket` (DLL load failed: arch mismatch) instead of resolving its own
+    # pyvenv.cfg. Remote (SSH) invocations need this too: a remote alias can
+    # legitimately share a Python-tooling PATH/profile with the picker host.
+    from ...engine_client import _engine_environment
+
     kwargs = dict(
         capture_output=True, text=True,
         encoding="utf-8", errors="replace", timeout=timeout,
         # DEVNULL gives ssh an empty stdin (instant EOF) so a background ssh
         # child can't read the operator's keystrokes out from under the TUI.
         stdin=subprocess.DEVNULL,
+        env=_engine_environment(),
     )
     if os.name == "nt" and _CREATE_NO_WINDOW:
         kwargs["creationflags"] = _CREATE_NO_WINDOW
@@ -1250,7 +1265,7 @@ def _fetch(source: Source, runner=None, *, classify: bool = True, argv=None,
             for w in data.get("worktrees", [])]
 
 
-class LiveLoader:
+class LiveLoader(LazyLoadMixin):
     """Background, per-machine loader feeding the picker's spinner -> resolve.
 
     On :meth:`start`, spawns one daemon thread per *ready* source. Each thread
@@ -1291,12 +1306,48 @@ class LiveLoader:
         # repoll that started earlier never commits stale rows over a newer
         # intentional reload (#1421, ordering fix).
         self._gen: dict = {}
+        # A streaming source becomes usable after its first row, before its
+        # roster is authoritative. Track that distinction so the picker can
+        # merge the prefix over bootstrap rows instead of treating omitted
+        # identities as removals during the first paint.
+        self._stream_incomplete: dict = {}
+        # Sources whose full worktree listing has been DEFERRED behind a cheap
+        # connectivity ping (see `start`'s `focus_keys`) -- machine tabs the
+        # operator hasn't actually looked at yet. `ensure_loaded`/
+        # `ensure_all_loaded` promote one out of this set (and start its real
+        # load) the moment its tab becomes current (picker-lazy-per-machine-
+        # loading). Never populated for a source `start()` fully loads up front.
+        self._pinged_only: set = set()
+        # cache_key -> list of live ssh Popen this source's current load
+        # spawned, so `cancel_source` can kill only ITS children (unlike the
+        # blanket `cancel()`/`self._procs`, used for whole-picker teardown).
+        # Populated by `_spawn`/`_spawn_stream` via `_active_source` (a
+        # thread-local the load entry points set before calling `_fetch`).
+        self._procs_by_source: dict = {}
+        self._active_source = threading.local()
         for s in all_sources:
             self._state[s.cache_key] = "loading" if s.ready else "failed"
             self._records[s.cache_key] = []
             self._gen[s.cache_key] = 0
 
-    def start(self):
+    def start(self, focus_keys=None):
+        """Start every ready source loading -- or, with ``focus_keys``, load
+        only the sources the operator can actually see right now and cheaply
+        *ping* every other ready remote instead (picker-lazy-per-machine-
+        loading). A pinged tab shows the same spinner -> checkmark/X the
+        operator already reads as "reachable" -- ``ensure_loaded`` upgrades it
+        to a real listing the moment its tab becomes current, so a machine
+        never pays the full ``list --classify`` SSH round-trip (and the
+        continuous git-classification load it drives remotely) until the
+        operator is actually looking at it.
+
+        ``focus_keys`` is a set of ``(machine, env)`` tuples and/or
+        ``source_id`` strings identifying the source(s) that should load in
+        full immediately (typically just the local/initial tab); ``None``
+        (the default) loads every ready source in full, unchanged from
+        before this feature -- a caller that doesn't pass it sees identical
+        behavior to plain ``start()``.
+        """
         derive.NOW = _dt.datetime.now()
         self._log_load_header()
         # Every source -- local included -- loads on its own daemon thread so
@@ -1309,10 +1360,29 @@ class LiveLoader:
         # interaction immediate and the local tab simply shows the connect
         # spinner until its records arrive, exactly like the remotes.
         for s in self._sources:
+            if (
+                focus_keys is not None
+                and _lazy_loading_enabled()
+                and s.source_kind == SOURCE_KIND_MACHINE_SSH
+                and not (s.local or self._matches_focus(s, focus_keys))
+            ):
+                # Not local, not in view yet: a cheap reachability probe
+                # stands in for the real listing until `ensure_loaded`
+                # promotes it (picker-lazy-per-machine-loading).
+                self._pinged_only.add(s.cache_key)
+                threading.Thread(
+                    target=self._ping_one,
+                    args=(s, self._gen.get(s.cache_key, 0)),
+                    name=f"ping-{s.machine}-{s.env}", daemon=True,
+                ).start()
+                continue
             threading.Thread(
                 target=self._load_one, args=(s, self._gen.get(s.cache_key, 0)),
                 name=f"load-{s.machine}-{s.env}", daemon=True,
             ).start()
+
+    # _matches_focus, _ping_one, ensure_loaded, ensure_all_loaded, and
+    # cancel_source live in loader_lazy.LazyLoadMixin (module-size guard).
 
     def reload(self, machine, env):
         """Re-fetch one source now (e.g. after a Maintenance op changed it).
@@ -1331,6 +1401,7 @@ class LiveLoader:
             if s.cache_key == source_id:
                 with self._lock:
                     self._state[s.cache_key] = "loading"
+                    self._pinged_only.discard(s.cache_key)
                     # Invalidate any in-flight silent repoll of this source so
                     # its (older) rows can't land after this reload (#1421).
                     self._gen[s.cache_key] = self._gen.get(s.cache_key, 0) + 1
@@ -1388,7 +1459,11 @@ class LiveLoader:
         the fetched rows are committed only if the generation is unchanged --
         i.e. no :meth:`reload` superseded this refresh while it ran (#1421)."""
         with self._source_locks[source.cache_key]:
-            self._refresh_one_serial(source, gen)
+            self._active_source.key = source.cache_key
+            try:
+                self._refresh_one_serial(source, gen)
+            finally:
+                self._active_source.key = None
 
     def _refresh_one_serial(self, source: Source, gen: int):
         """Serialized implementation of :meth:`_refresh_one`."""
@@ -1440,6 +1515,8 @@ class LiveLoader:
                 ):
                     self._records[source.cache_key] = recs
                     self._state[source.cache_key] = "ready"
+                    if self._stream_incomplete.get(source.cache_key) == gen:
+                        self._stream_incomplete.pop(source.cache_key, None)
         finally:
             with self._lock:
                 self._refreshing.discard(source.cache_key)
@@ -1497,6 +1574,7 @@ class LiveLoader:
         A failed reconcile leaves ``_pr_reconciled_keys`` set (best-effort, one
         attempt) so a persistently-unreachable remote isn't re-hit every poll.
         """
+        self._active_source.key = source.cache_key
         try:
             if self._cancelled.is_set():
                 return
@@ -1509,7 +1587,10 @@ class LiveLoader:
                         and self._state.get(source.cache_key) == "ready"
                         and self._gen.get(source.cache_key, 0) == gen):
                     self._records[source.cache_key] = recs
+                    if self._stream_incomplete.get(source.cache_key) == gen:
+                        self._stream_incomplete.pop(source.cache_key, None)
         finally:
+            self._active_source.key = None
             with self._lock:
                 self._refreshing.discard(source.cache_key)
 
@@ -1526,6 +1607,29 @@ class LiveLoader:
         for p in procs:
             _kill_proc_tree(p)
 
+    def _register_proc(self, proc):
+        """Track a freshly spawned child for both whole-picker `cancel()` and
+        per-source `cancel_source()` -- keyed by whichever source the calling
+        thread tagged via `_active_source` (unset for a caller outside the
+        load/ping/reconcile entry points, e.g. a raw test double)."""
+        key = getattr(self._active_source, "key", None)
+        with self._procs_lock:
+            self._procs.append(proc)
+            if key is not None:
+                self._procs_by_source.setdefault(key, []).append(proc)
+
+    def _unregister_proc(self, proc):
+        key = getattr(self._active_source, "key", None)
+        with self._procs_lock:
+            if proc in self._procs:
+                self._procs.remove(proc)
+            if key is not None:
+                bucket = self._procs_by_source.get(key)
+                if bucket and proc in bucket:
+                    bucket.remove(proc)
+                    if not bucket:
+                        self._procs_by_source.pop(key, None)
+
     def _spawn(self, argv, timeout):
         """Tracked, killable runner for prefetch subprocesses.
 
@@ -1536,6 +1640,8 @@ class LiveLoader:
         """
         if self._cancelled.is_set():
             raise RuntimeError("cancelled")
+        from ...engine_client import _engine_environment
+
         kwargs = dict(
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             # Never inherit the console stdin: an ``ssh`` child would otherwise
@@ -1543,11 +1649,7 @@ class LiveLoader:
             # reader, freezing the picker's keys until the load fan-out exits.
             stdin=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace",
-            env={
-                **os.environ,
-                "PYTHONUTF8": "1",
-                "PYTHONSAFEPATH": "1",
-            },
+            env=_engine_environment(),
         )
         if os.name == "posix":
             kwargs["start_new_session"] = True   # own group -> killpg on cancel
@@ -1560,8 +1662,7 @@ class LiveLoader:
                 | _CREATE_NO_WINDOW
             )
         proc = subprocess.Popen(argv, **kwargs)
-        with self._procs_lock:
-            self._procs.append(proc)
+        self._register_proc(proc)
         # Close the cancel/spawn race: if cancel() ran between the top-of-method
         # check and the Popen above, it never saw this child. Re-check now that
         # it's registered and kill it so a late spawn can't orphan an ssh child.
@@ -1573,9 +1674,7 @@ class LiveLoader:
             _kill_proc_tree(proc)
             out, err = proc.communicate()
         finally:
-            with self._procs_lock:
-                if proc in self._procs:
-                    self._procs.remove(proc)
+            self._unregister_proc(proc)
         return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
     def _spawn_stream(self, argv):
@@ -1586,11 +1685,14 @@ class LiveLoader:
         teardown) tears it down and no ``ssh ... list --stream`` is orphaned."""
         if self._cancelled.is_set():
             raise RuntimeError("cancelled")
+        from ...engine_client import _engine_environment
+
         kwargs = dict(
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace",
             bufsize=1,   # line-buffered: surface rows as they arrive
+            env=_engine_environment(),
         )
         if os.name == "posix":
             kwargs["start_new_session"] = True
@@ -1600,33 +1702,41 @@ class LiveLoader:
                 | _CREATE_NO_WINDOW
             )
         proc = subprocess.Popen(argv, **kwargs)
-        with self._procs_lock:
-            self._procs.append(proc)
+        self._register_proc(proc)
         # Close the cancel/spawn race (see _spawn).
         if self._cancelled.is_set():
             _kill_proc_tree(proc)
         return proc
 
     def _untrack(self, proc):
-        with self._procs_lock:
-            if proc in self._procs:
-                self._procs.remove(proc)
+        self._unregister_proc(proc)
 
     def _load_one(self, source: Source, gen: int | None = None):
         if gen is None:
             gen = self._gen.get(source.cache_key, 0)
         with self._source_locks[source.cache_key]:
-            self._load_one_serial(source, gen)
+            self._active_source.key = source.cache_key
+            try:
+                self._load_one_serial(source, gen)
+            finally:
+                self._active_source.key = None
 
     def _load_one_serial(self, source: Source, gen: int):
         if source.local:
             # Local tab: fast-then-fill so rows paint immediately (see below).
-            self._load_local_two_phase(source)
+            self._load_local_two_phase(source, gen)
             return
         try:
             changed = _resolve_provider_source(source, self._spawn)
         except Exception as exc:
             with self._lock:
+                # Same generation guard as the fetch paths below: a
+                # cancel_source()-bumped generation must discard this
+                # (now-superseded) attempt's failure instead of clobbering
+                # whatever a newer, re-armed attempt goes on to commit
+                # (#round-7 finding).
+                if self._gen.get(source.cache_key, 0) != gen:
+                    return
                 self._records[source.cache_key] = []
                 self._state[source.cache_key] = "failed"
                 self._error[source.cache_key] = (
@@ -1635,6 +1745,8 @@ class LiveLoader:
             return
         if changed:
             with self._lock:
+                if self._gen.get(source.cache_key, 0) != gen:
+                    return
                 self._records[source.cache_key] = []
         if source.source_kind == SOURCE_KIND_PROVIDER_EXEC:
             try:
@@ -1670,7 +1782,7 @@ class LiveLoader:
         # too old to know --stream.
         if _stream_enabled() and self._load_remote_stream(source, gen):
             return
-        self._load_remote_two_phase(source)
+        self._load_remote_two_phase(source, gen)
 
     def _load_remote_stream(self, source: Source, gen: int) -> bool:
         """Single-connection NDJSON streaming load.
@@ -1699,8 +1811,15 @@ class LiveLoader:
         except Exception as exc:
             self._log_fetch_failure(source, exc, t0, phase="stream")
             with self._lock:
-                self._state[source.cache_key] = "failed"
-                self._error[source.cache_key] = str(exc).strip() or type(exc).__name__
+                # A superseded load (a newer reload()/reload_source() already
+                # bumped the generation) must never clobber state a fresher
+                # attempt already committed -- mirrors the success branch's
+                # generation guard below (#nit: stale-failure red-X, #2347).
+                if self._gen.get(source.cache_key, 0) == gen:
+                    self._state[source.cache_key] = "failed"
+                    self._error[source.cache_key] = (
+                        str(exc).strip() or type(exc).__name__
+                    )
             return True
         timer = threading.Timer(deadline, lambda: _kill_proc_tree(proc))
         timer.daemon = True
@@ -1738,6 +1857,7 @@ class LiveLoader:
                             break
                         if self._gen.get(source.cache_key, 0) != gen:
                             break   # superseded by a reload()
+                        self._stream_incomplete[source.cache_key] = gen
                         if rid not in by_id:
                             order.append(rid)
                         by_id[rid] = rec
@@ -1747,6 +1867,9 @@ class LiveLoader:
                             ready = True
                 elif typ == "done":
                     done = True
+                    with self._lock:
+                        if self._stream_incomplete.get(source.cache_key) == gen:
+                            self._stream_incomplete.pop(source.cache_key, None)
         finally:
             timer.cancel()
             try:
@@ -1782,11 +1905,14 @@ class LiveLoader:
             returncode=rc, stderr=err, argv=argv)
         self._log_fetch_failure(source, exc, t0, phase="stream", timeout=deadline)
         with self._lock:
-            self._state[source.cache_key] = "failed"
-            self._error[source.cache_key] = str(exc).strip() or type(exc).__name__
+            # Same generation guard as above: a stale attempt's failure must
+            # not overwrite a newer reload's already-committed ready state/rows.
+            if self._gen.get(source.cache_key, 0) == gen:
+                self._state[source.cache_key] = "failed"
+                self._error[source.cache_key] = str(exc).strip() or type(exc).__name__
         return True
 
-    def _load_remote_two_phase(self, source: Source):
+    def _load_remote_two_phase(self, source: Source, gen: int | None = None):
         """Fast-then-classify for a remote tab (mirrors the local two-phase).
 
         Phase 1 runs the remote ``list`` **without** ``--classify`` -- a cheap
@@ -1801,8 +1927,19 @@ class LiveLoader:
 
         A remote already known not to support ``--classify`` (an older
         agent-worktrees, ``use_classify`` cleared by a prior fetch) has nothing
-        to classify, so it loads in a single pass -- there is no second phase."""
-        gen = self._gen.get(source.cache_key, 0)
+        to classify, so it loads in a single pass -- there is no second phase.
+
+        ``gen`` is the generation captured by the caller (``_load_one``) when
+        THIS load started; every commit below (phase-1's success AND failure,
+        not just phase-2) checks it against the source's CURRENT generation
+        before writing state/records, so a `cancel_source`/`reload_source`
+        that bumps the generation while phase 1 is still in flight can never
+        have its bump raced by a phase-1 commit that would otherwise ignore
+        it entirely. Defaults to the source's current generation when omitted
+        (a direct/test call with no cancellation in play -- unchanged from
+        before this guard existed)."""
+        if gen is None:
+            gen = self._gen.get(source.cache_key, 0)
         fast_argv = _drop_classify_arg(source.argv)
         two_phase = source.use_classify and fast_argv != source.argv
         # picker-cache-first-paint (dotfiles#948): when enabled, the fast phase
@@ -1820,6 +1957,8 @@ class LiveLoader:
             self._log_fetch_failure(source, exc, t0,
                                     phase="fast" if two_phase else "load")
             with self._lock:
+                if self._gen.get(source.cache_key, 0) != gen:
+                    return
                 self._state[source.cache_key] = "failed"
                 self._error[source.cache_key] = str(exc).strip() or type(exc).__name__
             return
@@ -1828,7 +1967,7 @@ class LiveLoader:
         _ssh_log(f"  OK      {source.machine}/{source.env} resolved "
                  f"{len(first)} worktree(s) ({label}) in {elapsed:.1f}s")
         with self._lock:
-            if self._cancelled.is_set():
+            if self._cancelled.is_set() or self._gen.get(source.cache_key, 0) != gen:
                 return
             self._records[source.cache_key] = first
             self._state[source.cache_key] = "ready"
@@ -1853,7 +1992,7 @@ class LiveLoader:
                     and self._gen.get(source.cache_key, 0) == gen):
                 self._records[source.cache_key] = full
 
-    def _load_local_two_phase(self, source: Source):
+    def _load_local_two_phase(self, source: Source, gen: int | None = None):
         """Fast-then-fill for the local tab.
 
         Phase 1 (``classify=False``) is cheap -- tracking + sessions + mux, no
@@ -1862,19 +2001,35 @@ class LiveLoader:
         on git classification of every worktree, which can take seconds or stall.
         Phase 2 (``classify=True``) runs the full git classification and swaps
         the authoritative ``state`` in. A generation guard keeps a concurrent
-        :meth:`reload` from being clobbered by this pass's phase 2 (#1421)."""
-        gen = self._gen.get(source.cache_key, 0)
+        :meth:`reload` from being clobbered by this pass's phase 2 (#1421), and
+        -- mirroring the sibling ``_load_remote_stream`` fix (#2347) -- Phase 1's
+        own failure write too: a superseded Phase 1 attempt (a newer
+        ``reload()``/``reload_source()`` already bumped the generation and
+        committed a fresher, genuinely successful ready state) must never
+        clobber that with a stale failure marker.
+
+        ``gen`` is the generation captured by the caller (``_load_one``) when
+        THIS load started -- mirrors ``_load_remote_two_phase``'s guard so a
+        ``cancel_source()``/``reload_source()`` bump raced against an
+        in-flight local load can't have its bump ignored. Defaults to the
+        source's current generation when omitted (unchanged direct/test call
+        behavior)."""
+        if gen is None:
+            gen = self._gen.get(source.cache_key, 0)
         t0 = _dt.datetime.now()
         try:
             fast = _fetch(source, classify=False)
         except Exception as exc:
             self._log_fetch_failure(source, exc, t0, phase="local")
             with self._lock:
-                self._state[source.cache_key] = "failed"
-                self._error[source.cache_key] = str(exc).strip() or type(exc).__name__
+                if self._gen.get(source.cache_key, 0) == gen:
+                    self._state[source.cache_key] = "failed"
+                    self._error[source.cache_key] = (
+                        str(exc).strip() or type(exc).__name__
+                    )
             return
         with self._lock:
-            if self._cancelled.is_set():
+            if self._cancelled.is_set() or self._gen.get(source.cache_key, 0) != gen:
                 return
             self._records[source.cache_key] = fast
             self._state[source.cache_key] = "ready"
@@ -1981,6 +2136,30 @@ class LiveLoader:
         """Return a copy of one canonical source's current rows."""
         with self._lock:
             return list(self._records.get(source_id, []))
+
+    def authoritative_source_ids(self):
+        """Sources whose current rows describe a complete roster.
+
+        Streaming sources intentionally flip to ``ready`` on their first row so
+        the picker can render and interact with that prefix. ``ready`` alone
+        therefore does not mean identities absent from the prefix are gone.
+
+        A successful connectivity ping (picker-lazy-per-machine-loading) ALSO
+        flips a source to ``ready`` -- with deliberately empty records -- but
+        it has never run the real listing at all: connectivity, not roster
+        completeness. Excluding ``_pinged_only`` here keeps that distinct from
+        a genuine (possibly legitimately empty) full listing, so the picker's
+        merge path never treats a not-yet-loaded machine's absence of rows as
+        an authoritative "this machine has none" and drops cached/partial rows
+        over it (#round-7 finding)."""
+        with self._lock:
+            return {
+                key
+                for key, state in self._state.items()
+                if state == "ready"
+                and key not in self._pinged_only
+                and self._stream_incomplete.get(key) != self._gen.get(key, 0)
+            }
 
     def counts(self):
         """(ready, loading, failed) machine counts for the status note."""

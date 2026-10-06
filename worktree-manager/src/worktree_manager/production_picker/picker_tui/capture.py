@@ -30,6 +30,7 @@ Three capture forms, one seam:
 """
 from __future__ import annotations
 
+import asyncio
 import io
 from typing import Any, Awaitable, Callable, Optional
 
@@ -39,6 +40,27 @@ from rich.segment import Segment, Segments
 # The picker's canonical headless render size (matches the test suite). A wide
 # grid so columns don't get dropped by the responsive fitter.
 DEFAULT_SIZE = (118, 40)
+
+
+async def _wait_for_initial_setup(scr: Any, pilot: Any, *, timeout: float = 5.0) -> None:
+    """Wait until a non-live picker's initial async setup epoch has applied."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        current = getattr(scr, "_setup_epoch", 0)
+        failed = getattr(scr, "_setup_failed_epoch", 0)
+        if current != 0 and getattr(scr, "_setup_applied_epoch", 0) == current:
+            return
+        if current != 0 and failed == current:
+            return
+        await pilot.pause()
+        await asyncio.sleep(0.01)
+    current = getattr(scr, "_setup_epoch", 0)
+    applied = getattr(scr, "_setup_applied_epoch", 0)
+    failed = getattr(scr, "_setup_failed_epoch", 0)
+    raise AssertionError(
+        "timed out waiting for setup epoch "
+        f"{current} to finish (applied={applied}, failed={failed})"
+    )
 
 
 def _screen_segments(scr: Any) -> list:
@@ -121,6 +143,7 @@ async def capture_async(
     settle: float = 0.0,
     keys: Optional[list[str]] = None,
     update_state: Optional[str] = None,
+    manager_update_state: Optional[str] = None,
     prepare: Optional[Callable[[Any, Any], Awaitable[None]]] = None,
     pivot: str | None = None,
     wait_pivot: float = 0.0,
@@ -146,8 +169,12 @@ async def capture_async(
     - ``wait_pivot`` -- when on a registered pivot, poll (up to this many seconds)
       for its background ``list`` load to finish before capturing, so the snapshot
       shows real rows instead of a "loading…" spinner. ``0`` disables the wait.
-    - ``update_state`` -- force the topbar update indicator (e.g. ``"current"``
-      for a clean ✓ instead of a transient "update available").
+    - ``update_state`` -- force the engine/marketplace topbar update indicator
+      (e.g. ``"current"`` for a clean ✓ instead of a transient "update available").
+    - ``manager_update_state`` -- force the Manager's OWN update indicator
+      (distinct from ``update_state`` -- see ``manager_update_check``'s module
+      docstring for why they must not be conflated), e.g. ``"current"``/
+      ``"available"``/``"idle"``.
     - ``prepare`` -- an escape-hatch coroutine awaited with ``(screen, pilot)``
       for anything ``keys`` can't express.
     """
@@ -156,6 +183,8 @@ async def capture_async(
     app = PickerApp(source, live=live)
     async with app.run_test(size=size) as pilot:
         scr = app.query_one(PickerScreen)
+        if not live:
+            await _wait_for_initial_setup(scr, pilot)
         if view == "all":
             scr.machine_idx = 0
         else:
@@ -163,6 +192,14 @@ async def capture_async(
                 scr.machine_idx = scr.local_index()
             except Exception:
                 pass
+        # Route this programmatic tab selection through the same activation
+        # hook navigation uses (picker-lazy-per-machine-loading): otherwise a
+        # live "all" capture leaves every deferred remote ping-only, and its
+        # documented All view is captured missing rows.
+        try:
+            scr._activate_current_machine_tab()
+        except Exception:
+            pass
         await pilot.pause()
         if pivot:
             await _select_pivot(scr, pilot, pivot, wait_pivot)
@@ -177,10 +214,32 @@ async def capture_async(
         if prepare is not None:
             await prepare(scr, pilot)
             await pilot.pause()
-        if update_state is not None:
-            # Set last, just before render: a background update-poll can flip it
-            # back during settle, so an early assignment would not stick.
-            scr.update_state = update_state
+        if update_state is not None or manager_update_state is not None:
+            # Pin FIRST, before assigning: this makes ``_poll_update_state``/
+            # ``_poll_manager_update_state`` permanently no-op regardless of
+            # WHEN their ``call_after_refresh``-scheduled callback actually
+            # fires (not guaranteed to have already fired by any particular
+            # pilot.pause() count -- Textual's mount lifecycle can defer it
+            # later, a real observed race that clobbered the override back
+            # to its polled value moments after this code set it, even with
+            # a trailing pause to force the repaint below).
+            if update_state is not None:
+                scr._update_state_pinned = True
+                scr.update_state = update_state
+            if manager_update_state is not None:
+                scr._manager_update_state_pinned = True
+                scr.manager_update_state = manager_update_state
+            # Force a real repaint before capturing: ``capture_screen`` reads
+            # the compositor's LAST-PAINTED frame (``screen._compositor``),
+            # not a fresh render, so plainly assigning these attributes is
+            # not enough by itself -- whichever frame happened to already be
+            # painted (or not) before this point is what would otherwise be
+            # captured. ``refresh()`` + one more pause lets the compositor
+            # actually paint these values before the snapshot is taken; the
+            # pin above keeps that pause from letting a still-pending poll
+            # win the race back.
+            scr.refresh()
+            await pilot.pause()
         return capture_screen(scr, title=title)
 
 
@@ -255,6 +314,8 @@ async def capture_frames_async(
     app = PickerApp(source, live=live)
     async with app.run_test(size=size) as pilot:
         scr = app.query_one(PickerScreen)
+        if not live:
+            await _wait_for_initial_setup(scr, pilot)
         if view == "all":
             scr.machine_idx = 0
         else:
@@ -262,6 +323,14 @@ async def capture_frames_async(
                 scr.machine_idx = scr.local_index()
             except Exception:
                 pass
+        # Route this programmatic tab selection through the same activation
+        # hook navigation uses (picker-lazy-per-machine-loading): otherwise a
+        # live "all" capture leaves every deferred remote ping-only, and its
+        # documented All view is captured missing rows.
+        try:
+            scr._activate_current_machine_tab()
+        except Exception:
+            pass
         if update_state is not None:
             scr.update_state = update_state
         await pilot.pause()
@@ -314,6 +383,8 @@ async def capture_modal_async(
     app = PickerApp(source, live=live)
     async with app.run_test(size=size) as pilot:
         scr = app.query_one(PickerScreen)
+        if not live:
+            await _wait_for_initial_setup(scr, pilot)
         if view == "all":
             scr.machine_idx = 0
         else:
@@ -321,6 +392,14 @@ async def capture_modal_async(
                 scr.machine_idx = scr.local_index()
             except Exception:
                 pass
+        # Route this programmatic tab selection through the same activation
+        # hook navigation uses (picker-lazy-per-machine-loading): otherwise a
+        # live "all" capture leaves every deferred remote ping-only, and its
+        # documented All view is captured missing rows.
+        try:
+            scr._activate_current_machine_tab()
+        except Exception:
+            pass
         await pilot.pause()
         await opener(scr, pilot)
         await pilot.pause()

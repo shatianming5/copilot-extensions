@@ -93,45 +93,6 @@ def test_worktrees_list_grid_matches_golden(monkeypatch, tmp_path):
     assert grid == _golden("worktrees_list.txt", grid)
 
 
-def test_native_list_grid_parity(monkeypatch, tmp_path):
-    """NF5-5 (#88): the swappable native ``OptionList`` data body renders the
-    *same* character grid as the text-line body -- the whole point of a drop-in
-    swap. Capture the home screen with ``AGENT_WORKTREES_PICKER_NATIVE_LIST`` OFF
-    (text-line body) and ON (native OptionList) and assert the normalized grids
-    are identical (styles differ -- the native cursor is amber vs the text
-    body's reverse -- but the character grid is byte-for-byte the same). Also
-    pins the native grid to the same golden."""
-    _isolate_pivots(monkeypatch, tmp_path)
-    monkeypatch.delenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", raising=False)
-    off = _normalize(pcap.capture(_fixture_source(), live=False)["text"])
-    monkeypatch.setenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", "1")
-    on = _normalize(pcap.capture(_fixture_source(), live=False)["text"])
-    assert on == off
-    assert on == _golden("worktrees_list.txt", on)
-
-
-def test_native_list_multiselect_grid_parity(monkeypatch, tmp_path):
-    """NF5-5 (#88): the native list renders the multi-select gutter identically to
-    the text-line body. Mark both worktrees (so multi-select is active and the
-    checkbox gutter renders) and assert native-OFF and native-ON grids match --
-    the gutter is built from the same ``_build_data_vrows`` source, so the swap
-    stays byte-identical even in multi-select mode."""
-    _isolate_pivots(monkeypatch, tmp_path)
-
-    async def _mark(scr, pilot):
-        scr.wt_sel.replace({
-            row["selection_id"] for row in scr.list_records()[:2]
-        })
-        scr.refresh()
-        await pilot.pause()
-
-    monkeypatch.delenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", raising=False)
-    off = _normalize(pcap.capture(_fixture_source(), live=False, prepare=_mark)["text"])
-    monkeypatch.setenv("AGENT_WORKTREES_PICKER_NATIVE_LIST", "1")
-    on = _normalize(pcap.capture(_fixture_source(), live=False, prepare=_mark)["text"])
-    assert on == off
-
-
 def test_grid_renders_state_vocabulary(monkeypatch, tmp_path):
     _isolate_pivots(monkeypatch, tmp_path)
     text = pcap.capture(_fixture_source(), live=False)["text"]
@@ -140,6 +101,32 @@ def test_grid_renders_state_vocabulary(monkeypatch, tmp_path):
     assert "WORKTREES" in text
     assert "WIP" in text
     assert "UNUSED" in text
+
+
+def test_command_bar_renders_the_filter_and_narrows_the_grid(monkeypatch, tmp_path):
+    """#2228 Phase 4: the "/" command bar's chrome row is legible in the
+    deterministic character grid while composing, and the list itself narrows
+    to the matching title -- an end-to-end capture proof alongside the
+    behavioral tests in ``test_picker_tui.py``."""
+    _isolate_pivots(monkeypatch, tmp_path)
+
+    async def type_filter(scr, pilot):
+        nl = scr.query_one("#nf-body-data")
+        for _ in range(len(scr.region_heads()) + 1):
+            await pilot.press("tab")
+            await pilot.pause()
+            if scr.app.focused is nl:
+                break
+        for key in ("/", "f", "i", "x"):
+            await pilot.press(key)
+            await pilot.pause()
+
+    caps = pcap.capture(_fixture_source(), live=False, prepare=type_filter)
+    text = caps["text"]
+    assert "/ fix" in text
+    assert "Fix the thing" in text
+    assert "Old idle wt" not in text
+    assert "Done work" not in text
 
 
 def test_ansi_capture_encodes_semantic_state_colour(monkeypatch, tmp_path):
@@ -206,11 +193,292 @@ def test_awaiting_operator_renders_marker_and_pulse(monkeypatch, tmp_path):
         "the ⏳ pulse glyph is not painted with the awaiting amber accent")
 
 
+def test_pulse_level_never_drops_an_existing_intent():
+    """context-handoff bug #2 (ephemeral "current task" line): an unparseable
+    or missing ``live_intent_at``, with no graded ``live_rest``, used to make
+    ``_pulse_level`` return ``None`` -- silently dropping the live-intent TEXT
+    from the tile even though it was present, contradicting the documented
+    #228 "never expires, only greys" contract. Grading now degrades to
+    ``'stale'`` (unknown freshness reads as aged/grey), never to absent."""
+    # No live_intent_at at all.
+    assert derive._pulse_level({"live_intent": "still working"}) == "stale"
+    # An unparseable timestamp.
+    assert derive._pulse_level(
+        {"live_intent": "still working", "live_intent_at": "not-a-date"}
+    ) == "stale"
+    # No intent text at all -- the ONLY case the line is legitimately absent.
+    assert derive._pulse_level({"live_intent": ""}) is None
+    assert derive._pulse_level({}) is None
+
+
+def _untimed_intent_source():
+    """A worktree with a live intent but no parseable timestamp/rest -- the
+    #2 repro: the intent text exists but its freshness can't be graded."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-20260627-eeee", "title": "In progress",
+         "status": "active", "started_at": "2026-06-27T17:00:00",
+         "turn_count": 1, "state": "active",
+         "live_intent": "reconciling the untimed pulse"},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+    return src
+
+
+def test_untimed_intent_still_renders_the_pulse_line(monkeypatch, tmp_path):
+    """End-to-end capture proof for the fix above: the tile's second line
+    still shows the intent text even when its timestamp/rest can't grade
+    freshness (previously the whole pulse sub-line vanished)."""
+    _isolate_pivots(monkeypatch, tmp_path)
+    text = pcap.capture(_untimed_intent_source(), live=False)["text"]
+    assert "reconciling the untimed pulse" in text
+
+
+def _assets_source():
+    """A fleet with one worktree carrying held claims of several kinds (#6443/
+    upstream #1979 Phase 6) -- exercises the tile's bounded asset-hint line
+    across a wide and a narrow capture width."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-20260627-dddd", "title": "Ships things",
+         "status": "active", "started_at": "2026-06-27T17:00:00",
+         "turn_count": 2, "state": "wip",
+         "resources": [
+             {"kind": "pr", "ref": "https://example/pulls/42",
+              "state": "active"},
+             {"kind": "worktree", "ref": "host/repo/wt-child",
+              "state": "at-rest"},
+         ]},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+    return src
+
+
+def test_asset_hints_render_at_wide_and_narrow_widths(monkeypatch, tmp_path):
+    """#6443/upstream #1979 Phase 6, superseded by the "Title: Activity"
+    simplification (picker-list-interaction-layer follow-up): the per-kind
+    asset-hint breakdown (``PR``/``WT``/...) no longer renders on the tile's
+    detail line at all -- it collapsed into a single, neutrally-styled ``*``
+    (the full breakdown now lives behind the Actions menu's "View details"
+    card). This proves that collapse is legible and bounded at both a wide
+    and a narrow capture width -- neither width crashes the renderer nor
+    drops the marker."""
+    _isolate_pivots(monkeypatch, tmp_path)
+    wide = pcap.capture(_assets_source(), live=False, size=(118, 24))["text"]
+    narrow = pcap.capture(_assets_source(), live=False, size=(60, 24))["text"]
+    for text in (wide, narrow):
+        assert "Ships things" in text   # the full title, now on its own line
+        detail_lines = [ln for ln in text.splitlines() if "Ships things" in ln]
+        assert len(detail_lines) == 1
+        assert detail_lines[0].rstrip().endswith("*")
+        # The raw per-kind codes never leak onto the detail line itself (the
+        # PR/WT column headers elsewhere in the grid would otherwise produce
+        # a false pass for a bare substring check).
+        assert "PR" not in detail_lines[0]
+        assert "WT" not in detail_lines[0]
+
+
+def _bare_markers_source():
+    """A fleet with a ``status_markers`` closure descriptor and NO asset hints
+    or live pulse -- the case the operator flagged as an "indecipherable bare
+    marker" second line (bug-fix phase, picker-list-interaction-layer effort):
+    a raw ``C1 U* OC*`` token string with nothing else to give it context."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-20260627-eeee", "title": "Bare marker row",
+         "status": "active", "started_at": "2026-06-27T17:00:00",
+         "turn_count": 3, "state": "completed",
+         "closure": {
+             "version": 2, "label": "MERGED", "style": "merged-blocked",
+             "compact": "MERGED C1 U* OC*",
+             "claims": {"held": 1}, "follow_ups": {"open": 0},
+             "closure": {"final": False}, "action": {"disposition": "blocked"},
+         }},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+    return src
+
+
+def test_bare_status_markers_render_as_readable_text(monkeypatch, tmp_path):
+    """The raw closure-descriptor tokens (``C1``/``U*``/``OC*``) are a wire
+    shorthand, never operator-facing copy. Superseded by the "Title: Activity"
+    simplification: rather than expanding into a (still fairly cryptic) short
+    phrase, the whole marker breakdown now collapses into a single, neutral
+    ``*`` on the title's own detail line -- the full breakdown lives behind
+    the Actions menu's "View details" card instead."""
+    _isolate_pivots(monkeypatch, tmp_path)
+    text = pcap.capture(_bare_markers_source(), live=False)["text"]
+    detail_lines = [ln for ln in text.splitlines() if "Bare marker row" in ln]
+    assert len(detail_lines) == 1
+    assert detail_lines[0].rstrip().endswith("*")
+    # The raw wire tokens themselves never leak into the rendered grid.
+    assert "C1" not in text
+    assert "OC*" not in text
+    assert "U*" not in text
+
+
+def _markers_and_assets_source():
+    """A fleet with BOTH a ``status_markers`` closure descriptor AND asset
+    hints on the same row -- the mixed case a PR #2897 review flagged: the
+    human-readable marker expansion is longer than the compact wire tokens it
+    replaces, and at a narrow capture width the combined line could overflow
+    the row and crowd out (or wrap past) the asset hints that follow it."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-20260627-ffff", "title": "Mixed row",
+         "status": "active", "started_at": "2026-06-27T17:00:00",
+         "turn_count": 5, "state": "completed",
+         "closure": {
+             "version": 2, "label": "MERGED", "style": "merged-blocked",
+             "compact": "MERGED C1 U* OC*",
+             "claims": {"held": 1}, "follow_ups": {"open": 0},
+             "closure": {"final": False}, "action": {"disposition": "blocked"},
+         },
+         "resources": [
+             {"kind": "pr", "ref": "https://example/pulls/43",
+              "state": "active"},
+             {"kind": "worktree", "ref": "host/repo/wt-child2",
+              "state": "at-rest"},
+         ]},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+    return src
+
+
+def test_marker_and_asset_line_never_overflows_narrow_width(monkeypatch, tmp_path):
+    """The "Title: Activity [*]" detail line must never exceed the capture
+    width, even at a narrow 60-column width with both a closure-descriptor
+    marker AND asset hints on the same row (PR #2897's original overflow
+    scenario, now exercised against the simplified single-``*`` collapse).
+    Bounded by construction -- every grid row is exactly `width` cells, so
+    this asserts the capture doesn't crash and stays a clean rectangular grid
+    at the narrow width, AND that the claims marker specifically survives on
+    the title's own detail line."""
+    _isolate_pivots(monkeypatch, tmp_path)
+    grid = pcap.capture(_markers_and_assets_source(), live=False, size=(60, 24))["text"]
+    lines = grid.splitlines()
+    widths = {len(line) for line in lines}
+    assert len(widths) == 1, f"ragged grid at narrow width: {sorted(widths)}"
+    detail_lines = [ln for ln in lines if "Mixed row" in ln]
+    assert len(detail_lines) == 1
+    assert detail_lines[0].rstrip().endswith("*")
+
+
+def _markers_and_pulse_source():
+    """A fleet with BOTH a ``status_markers`` closure descriptor AND a live
+    pulse/intent on the same row, no asset hints -- the second mixed case a
+    PR #2897 review flagged: the pulse segment's own width floor can still
+    push a marker-carrying row past the capture width even after the
+    markers/assets segment is itself bounded."""
+    derive.NOW = datetime.datetime(2026, 6, 27, 18, 0, 0)
+    local = ("anomalous-potato", "Win")
+    raws = [
+        {"id": "anomalous-potato-win-20260627-9999", "title": "Marker + pulse row",
+         "status": "active", "started_at": "2026-06-27T17:59:00",
+         "turn_count": 5, "state": "completed",
+         "live_intent": "a fairly long live-intent line to press the width budget",
+         "live_intent_at": "2026-06-27T17:59:00", "live_rest": "busy",
+         "closure": {
+             "version": 2, "label": "MERGED", "style": "merged-blocked",
+             "compact": "MERGED C1 U* OC*",
+             "claims": {"held": 1}, "follow_ups": {"open": 0},
+             "closure": {"final": False}, "action": {"disposition": "blocked"},
+         }},
+    ]
+    src = types.SimpleNamespace()
+    src.LOCAL = local
+    src.LOCAL_LABEL = "anomalous-potato · win"
+    src.machines = lambda: [("anomalous-potato Win", "anomalous-potato", "Win", True)]
+    src.bucket = derive.bucket
+    src.for_machine = derive.for_machine
+    src.load = lambda: [derive.norm(w, *local) for w in raws]
+    return src
+
+
+def test_marker_and_pulse_line_never_overflows_narrow_width(monkeypatch, tmp_path):
+    """The combined status_markers + live-pulse detail line must never exceed
+    the capture width: the pulse segment's own ``avail = max(1, ...)`` floor
+    otherwise unconditionally appends a padded intent clip even when the
+    markers segment already used the whole row (PR #2897 review)."""
+    _isolate_pivots(monkeypatch, tmp_path)
+    grid = pcap.capture(_markers_and_pulse_source(), live=False, size=(60, 24))["text"]
+    lines = grid.splitlines()
+    widths = {len(line) for line in lines}
+    assert len(widths) == 1, f"ragged grid at narrow width: {sorted(widths)}"
+
+
 def test_capture_is_deterministic(monkeypatch, tmp_path):
     _isolate_pivots(monkeypatch, tmp_path)
-    first = pcap.capture(_fixture_source(), live=False)["text"]
-    second = pcap.capture(_fixture_source(), live=False)["text"]
+    # Pin BOTH async, background-polled update-indicator states:
+    # ``_poll_update_state``/``_poll_manager_update_state``'s
+    # ``call_after_refresh`` callbacks race the capture snapshot -- whether
+    # either has run by the time the grid is captured is a genuine
+    # asyncio-scheduling coin flip, so two otherwise-identical captures
+    # could nondeterministically differ by an update segment. ``capture``
+    # takes both explicitly so a determinism test never depends on that
+    # race -- but the override value must MATCH what the real async poll
+    # would settle on in this test environment, or the override itself
+    # just becomes the other side of the same race (this test's
+    # ``_disable_manager_update_check`` fixture sets ``WORKTREE_NO_UPDATE=1``,
+    # under which ``update_stage.indicator_state()`` always resolves to
+    # "paused", never "idle" -- an "idle" override raced against that real
+    # value and still flaked).
+    first = pcap.capture(
+        _fixture_source(), live=False,
+        update_state="paused", manager_update_state="idle")["text"]
+    second = pcap.capture(
+        _fixture_source(), live=False,
+        update_state="paused", manager_update_state="idle")["text"]
     assert first == second
+
+
+def test_capture_update_state_override_reliably_paints(monkeypatch, tmp_path):
+    """Regression for the deeper bug behind the flake above:
+    ``capture_screen`` reads Textual's COMPOSITOR (the last-painted frame),
+    not a fresh render -- so plainly assigning ``scr.update_state``/
+    ``scr.manager_update_state`` was not enough by itself to make an
+    override actually show up in the captured grid; it depended on whether
+    the on-mount async poll had already painted a frame by that point, a
+    real timing coin flip. A single capture with an override value the
+    async poll would NEVER naturally produce (``manager_update_state=
+    "available"`` needs a real/staged update file this env never has) must
+    reliably show that override every time, not race it."""
+    _isolate_pivots(monkeypatch, tmp_path)
+    for _ in range(15):
+        grid = pcap.capture(
+            _fixture_source(), live=False,
+            update_state="current", manager_update_state="available",
+        )["text"]
+        assert "✓" in grid.splitlines()[0]
+        assert "Update available" in grid.splitlines()[0]
 
 
 def test_capture_modal_screenshots_a_native_modal(monkeypatch, tmp_path):

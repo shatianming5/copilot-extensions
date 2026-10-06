@@ -2,7 +2,20 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
-import { assertNativeProfile, bindNativeSuccessor } from "../extensions/context-handoff/native-runtime.mjs";
+import { assertNativeProfile, bindNativeSuccessor, describeNativeStartupError } from "../extensions/context-handoff/native-runtime.mjs";
+
+test("ordinary registration errors do not claim a failed restoration or a predecessor", () => {
+  const error = Object.assign(new Error("command failed"), { stderr: "missing native binding\n" });
+  const message = describeNativeStartupError(error);
+  assert.match(message, /^Worker lifecycle registration failed: missing native binding/);
+  assert.match(message, /no handoff restoration was attempted/);
+  assert.doesNotMatch(message, /Native restoration failed|Predecessor preserved/);
+});
+
+test("checkpoint startup errors preserve native restoration diagnostics", () => {
+  assert.equal(describeNativeStartupError(new Error("profile mismatch"), "/checkpoint.json"),
+    "Native restoration failed: profile mismatch. Predecessor preserved.");
+});
 
 test("mux admission requires token binding and verified head, not a candidate", () => {
   const record = {
@@ -12,13 +25,13 @@ test("mux admission requires token binding and verified head, not a candidate", 
   const calls = [];
   bindNativeSuccessor(record, "target", (command, args) => {
     calls.push([command, args]);
-    return JSON.stringify({ bound: true, head_session: "target", session: "target" });
+    return JSON.stringify({ bound: true, head_session: "target", handoff_token: "token" });
   });
   assert.deepEqual(calls, [["agent-worktrees", [
     "bind-session", "--session-id", "target", "--worktree-id", "owned", "--handoff-token", "token",
   ]]]);
   assert.throws(() => bindNativeSuccessor(record, "target", () =>
-    JSON.stringify({ bound: true, head_session: "source", session: "target" })),
+    JSON.stringify({ bound: true, head_session: "source", handoff_token: "token" })),
   /acknowledged worktree head/);
   bindNativeSuccessor({ ...record, nativeGoal: { launchTransport: "herdr" } }, "target", () =>
     assert.fail("Herdr must not create a parallel ownership registry"));
@@ -123,7 +136,7 @@ test("the actual extension initializer returns before native UI selection", { ti
     "../extensions/context-handoff/extension.mjs", import.meta.url,
   ), "utf8");
   const start = source.indexOf("nativeStartup = bootstrapNativeHandoff(session)");
-  const end = source.indexOf("if (handoffConfig.warning)", start);
+  const end = source.indexOf("handoffConfigPromise.then(", start);
   assert.ok(start >= 0 && end > start);
   let select;
   const selection = new Promise(resolve => { select = resolve; });
@@ -131,7 +144,6 @@ test("the actual extension initializer returns before native UI selection", { ti
     session: { sessionId: "target" }, state: {},
     bootstrapNativeHandoff: () => selection,
     recoverPendingHandoff: () => null,
-    readSessionStateHandoff: () => null,
   });
   vm.runInContext(`globalThis.initialize = async () => {
     let nativeStartup, nativeReceiptPath, nativeStartupError;

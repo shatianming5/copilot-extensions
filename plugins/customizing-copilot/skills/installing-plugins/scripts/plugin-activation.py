@@ -11,9 +11,17 @@ from pathlib import Path
 from types import ModuleType
 
 
-def _load_state_module() -> ModuleType:
-    plugin_root = Path(__file__).resolve().parents[3]
-    state_path = (
+def _resolve_state_py(plugin_root: Path) -> Path:
+    """Return this plugin's vendored ``plugin_activation/state.py`` path.
+
+    Deliberately does NOT import ``plugin_activation`` itself: that package's
+    ``__init__.py`` pulls in ``resolver.py``, which needs PyYAML -- a
+    dependency this standalone skill script has no reason to require, since
+    ``state.py`` itself is stdlib-only. Loading it directly by file path keeps
+    that isolation intact in both the dev checkout and a materialized payload,
+    where this library is now always a real local copy.
+    """
+    return (
         plugin_root
         / "libs"
         / "plugin-activation"
@@ -21,6 +29,11 @@ def _load_state_module() -> ModuleType:
         / "plugin_activation"
         / "state.py"
     )
+
+
+def _load_state_module() -> ModuleType:
+    plugin_root = Path(__file__).resolve().parents[3]
+    state_path = _resolve_state_py(plugin_root)
     spec = importlib.util.spec_from_file_location(
         "_customizing_copilot_plugin_activation_state",
         state_path,

@@ -21,11 +21,14 @@
 // throws into the CLI.
 
 import { existsSync, readFileSync } from "node:fs";
-import { join, basename } from "node:path";
-import { homedir, release } from "node:os";
-import { execFileSync, execSync } from "node:child_process";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { approveAll } from "@github/copilot-sdk";
 import { joinSession } from "@github/copilot-sdk/extension";
+import { InFlightMessages, adoptSessionId, drainControls, drainInbox, serializedRegister } from "./delivery.mjs";
+import { firstLoadThisSession } from "./announce.mjs";
+import { makeBridgeEndpoint } from "./bridge-endpoint.mjs";
+import { processIdentity, resolveMetadataAsync } from "./metadata.mjs";
 
 // --- Constants ---
 const HEARTBEAT_MS = 30_000; // refresh liveness (updated_at) every 30s
@@ -57,10 +60,12 @@ const REPRESENT_TYPES = new Set([
   "session.usage_info",
   "assistant.turn_end",
   "permission.requested",
+  "session.compaction_start",
+  "session.compaction_complete",
 ]);
 const CONFIG_DIR = process.env.AGENT_BRIDGE_CONFIG_DIR
   ? process.env.AGENT_BRIDGE_CONFIG_DIR
-  : join(homedir(), ".agent-bridge");
+  : join(homedir(), ".agent-bridge"); // marketplace-isolation: allow legacy-compatibility
 
 // --- State ---
 const state = {
@@ -78,6 +83,7 @@ const state = {
   inboxPoll: null, // delivery inbox poll interval handle
   deliveryEnabled: DELIVERY_DEFAULT_ON, // /peer MUTE toggle (delivery on by default)
   delivering: false, // guard against overlapping inbox drains
+  inFlight: new InFlightMessages(), // delivered but not yet recorded by the CLI
   lastEventAt: 0, // advanced by the observe-only event handler
 };
 
@@ -87,19 +93,6 @@ function extLog(msg) {
     process.stderr.write(`[agent-bridge-ext] ${msg}\n`);
   } catch {
     /* ignore */
-  }
-}
-
-// --- Portable CLI runner (Windows binstubs are .cmd -> need a shell) ---
-function runCli(bin, args, cwd) {
-  try {
-    if (process.platform === "win32") {
-      const line = [bin, ...args.map((a) => `"${String(a).replace(/"/g, '""')}"`)].join(" ");
-      return execSync(line, { cwd, timeout: 8000, encoding: "utf-8" }).trim();
-    }
-    return execFileSync(bin, args, { cwd, timeout: 8000, encoding: "utf-8" }).trim();
-  } catch {
-    return null;
   }
 }
 
@@ -127,13 +120,9 @@ function resolveBaseUrl() {
   } catch {
     /* fall through */
   }
-  // 3) platform default: a host is 9280; only a WSL guest (which shares the
-  //    Windows host's TCP port namespace) uses 9281. The discriminator is
-  //    "am I a WSL guest?", not "am I non-Windows?" -- bare-metal Linux is 9280.
-  const isWsl =
-    process.platform === "linux" &&
-    (!!process.env.WSL_DISTRO_NAME || /microsoft|wsl/i.test(release()));
-  return `http://${host}:${isWsl ? 9281 : 9280}`;
+  // 3) platform default: the Python client retired the former WSL +1 fallback,
+  //    so every platform uses the canonical last-resort port.
+  return `http://${host}:9280`;
 }
 
 function resolveToken() {
@@ -149,52 +138,22 @@ function resolveToken() {
   return null;
 }
 
-// --- One-time session metadata (safe to run sync at load: not a hot path) ---
-function resolveMetadata() {
-  const cwd = process.cwd();
-  const get = (key) => runCli("agent-worktrees", ["get", key], cwd); // marketplace-isolation: allow agent-worktrees-management
-  let branch = null;
-  try {
-    branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
-      cwd,
-      timeout: 5000,
-      encoding: "utf-8",
-    }).trim();
-  } catch {
-    branch = null;
-  }
-  const wtDir = get("worktree-dir");
-  return {
-    machine: get("machine"),
-    cwd,
-    worktree_id: wtDir ? basename(wtDir) : null,
-    repo: get("project"),
-    branch: branch || null,
-    // process.pid is the extension host process -- a liveness hint, not the
-    // copilot PID. The durable key is session_id; liveness is heartbeat-based.
-    pid: process.pid,
-    role: null,
-    // D4: who is steering this session, if an agent embodied it (set by
-    // `agent-worktrees embody --driver`). Surfaces the "driven by <agent>"
-    // banner so a human dropping in via Neuron Forge sees who's at the wheel.
-    // Absent/null for an operator-launched session.
-    driven_by: process.env.AGENT_BRIDGE_DRIVEN_BY || null,
-  };
+// --- Bridge I/O (off the event loop; always best-effort) ---
+// The endpoint re-resolves the address/token after a failed call (see
+// bridge-endpoint.mjs); state.base/state.token mirror it for the guards below.
+let endpoint = null;
+
+async function fetchBridge(method, path, body) {
+  const res = await endpoint.call(method, path, body);
+  state.base = endpoint.ep.base;
+  state.token = endpoint.ep.token;
+  return res;
 }
 
-// --- Bridge I/O (off the event loop; always best-effort) ---
 async function bridgeFetch(method, path, body) {
   if (!state.base || !state.token) return false;
   try {
-    const res = await fetch(`${state.base}${path}`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${state.token}`,
-        "Content-Type": "application/json",
-      },
-      body: body ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-    });
+    const res = await fetchBridge(method, path, body);
     return res.ok;
   } catch {
     return false; // bridge down/unreachable -> degrade silently
@@ -205,11 +164,7 @@ async function bridgeFetch(method, path, body) {
 async function bridgeGetJson(path) {
   if (!state.base || !state.token) return null;
   try {
-    const res = await fetch(`${state.base}${path}`, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${state.token}` },
-      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-    });
+    const res = await fetchBridge("GET", path);
     if (!res.ok) return null;
     return await res.json();
   } catch {
@@ -217,22 +172,47 @@ async function bridgeGetJson(path) {
   }
 }
 
-async function register() {
-  if (!state.sessionId) return;
-  const payload = { session_id: state.sessionId, ...(state.meta || {}) };
-  const ok = await bridgeFetch("POST", "/api/v1/live-sessions", payload);
-  if (ok && !state.registered) {
-    state.registered = true;
-    extLog(`registered live session ${state.sessionId} with local bridge`);
-  }
-}
+// Session metadata (machine, worktree, ...), resolved off the event loop from
+// load. Registration waits for it -- never readiness: see serializedRegister.
+const metadataReady = resolveMetadataAsync()
+  .then((meta) => { state.meta = meta; })
+  .catch((e) => extLog(`metadata resolution failed (degrading, session unaffected): ${e.message}`));
+
+const register = serializedRegister(
+  state,
+  async (id) => {
+    if (!state.base || !state.token) return false;
+    try {
+      const body = { session_id: id, ...processIdentity(), ...(state.meta || {}) };
+      const res = await fetchBridge("POST", "/api/v1/live-sessions", body);
+      if (res.ok) return true;
+      if (res.status === 409) {
+        const body = await res.json().catch(() => null);
+        if (body?.detail?.reason === "incarnation_mismatch") {
+          extLog(`bridge refused ${id} for this process (another incarnation's row); keeping the registered id`);
+          return "rejected";
+        }
+      }
+      return false;
+    } catch {
+      return false; // bridge down/unreachable -> the next heartbeat retries
+    }
+  },
+  (id) => extLog(`registered live session ${id} with local bridge`),
+  { ready: metadataReady },
+);
 
 async function deregister() {
-  if (!state.sessionId) return;
-  await bridgeFetch(
-    "DELETE",
-    `/api/v1/live-sessions/${encodeURIComponent(state.sessionId)}`,
-  );
+  // Every id this process registered, once no registration is left in flight
+  // (a rename can leave the placeholder's row and the resumed one). An id
+  // folded into its successor is already gone; its DELETE is a no-op. Each
+  // carries this process's identity, so a row another process registered under
+  // the id meanwhile (between these DELETEs) is left alone by the bridge.
+  const { pid, process_started_at: started } = processIdentity();
+  const who = `pid=${encodeURIComponent(pid)}&process_started_at=${encodeURIComponent(started)}`;
+  for (const id of await register.close()) {
+    await bridgeFetch("DELETE", `/api/v1/live-sessions/${encodeURIComponent(id)}?${who}`);
+  }
 }
 
 // Drain the represented-event queue to the bridge's ingest endpoint. Runs off
@@ -258,44 +238,6 @@ async function flushEvents() {
   }
 }
 
-// Render an incoming envelope as an ATTRIBUTED, ANSWERABLE agent-message. The
-// wrapper mirrors the runtime's own system markers (<system_reminder> /
-// <system_notification>) so a cooperating agent parses it as authoritative
-// structure: it can tell peer traffic from operator input, see who sent it, and
-// reply with the agent-bridge session catalog's exact argv[0] plus
-// `send <reply-to> "..."`.
-// Attribute values are escaped; the body is left literal (trusted single-
-// operator mesh) for readability.
-function escAttr(v) {
-  return String(v == null ? "" : v)
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-// A non-`prompt` kind (D2) asks only for a terse out-of-band acknowledgement --
-// it must NOT be treated as new work. The guidance line makes that explicit to
-// the receiving agent so a status ping doesn't spawn a task.
-const KIND_GUIDANCE = {
-  notify: "This is a NOTIFY (informational). No reply or new work is expected; " +
-    "acknowledge only if useful.",
-  "status-check": "This is a STATUS-CHECK. Answer tersely using the exact " +
-    "argv[0] from the agent-bridge session command catalog with " +
-    "`send <reply-to> \"...\"`; do NOT treat it as new work or start a task.",
-};
-
-function renderDeliveredPrompt(msg) {
-  const kind = msg.kind && msg.kind !== "prompt" ? String(msg.kind) : null;
-  const attrs = [`from="${escAttr(msg.sender || "unknown")}"`];
-  if (msg.reply_to) attrs.push(`reply-to="${escAttr(msg.reply_to)}"`);
-  if (typeof msg.id === "number") attrs.push(`msg-id="${msg.id}"`);
-  if (kind) attrs.push(`kind="${escAttr(kind)}"`);
-  const body = String(msg.body ?? "");
-  const guidance = kind && KIND_GUIDANCE[kind] ? `\n\n(${KIND_GUIDANCE[kind]})` : "";
-  return `<agent-message ${attrs.join(" ")}>\n${body}${guidance}\n</agent-message>`;
-}
-
 // Poll the bridge inbox and deliver pending messages into THIS session via
 // session.send (off the CLI event loop, on the poll timer). Delivery is on by
 // default; this does nothing only while the session is MUTED (/peer).
@@ -303,41 +245,47 @@ function renderDeliveredPrompt(msg) {
 // undelivered message is redelivered next tick rather than lost, and the ack
 // makes redelivery a no-op on the bridge (idempotent) rather than a double
 // injection.
+//
+// buildDeliveredSendOptions (delivery.mjs) always sets an explicit
+// `source: "agent-bridge"`, not cosmetic: SendRequest.source is the runtime's
+// own provenance tag (must be `user`, `system`, `command-<id>`,
+// `schedule-<id>`, or `agent-<agent-id>` -- see the generated API docs for
+// SendRequest). Omitting it lets the runtime's admission logic default an
+// immediate/visible send to `source: "user"` (apply_public_send_admission),
+// which makes a bridge-delivered message indistinguishable from the real
+// operator's own live keystrokes at the contention/steering layer -- exactly
+// the collision "prompt control is experimental until single-stream admission
+// is proven" warns about in docs/delegation-contract.md. Tagging every
+// delivery as an explicit `agent-` source keeps it on its own,
+// correctly-arbitrated lane.
 async function pollInbox() {
   if (state.delivering) return;
   if (!state.deliveryEnabled) return;
   if (!state.sessionId || !state.registered) return;
   state.delivering = true;
   try {
-    const data = await bridgeGetJson(
-      `/api/v1/live-sessions/${encodeURIComponent(state.sessionId)}/messages`,
-    );
-    const messages = data?.messages;
-    if (!Array.isArray(messages) || messages.length === 0) return;
-    const delivered = [];
-    for (const msg of messages) {
-      if (!msg || typeof msg.id !== "number") continue;
-      try {
-        await session.send({
-          prompt: renderDeliveredPrompt(msg),
-          displayPrompt: `Message from ${msg.sender || "peer"} (via agent-bridge)`,
-        });
-        delivered.push(msg.id);
-      } catch (e) {
-        // Stop the batch on the first send failure; unacked messages redeliver.
-        extLog(`deliver failed for message ${msg.id}: ${e.message}`);
-        break;
-      }
-    }
-    if (delivered.length > 0) {
-      await bridgeFetch(
-        "POST",
-        `/api/v1/live-sessions/${encodeURIComponent(state.sessionId)}/messages/ack`,
-        { ids: delivered },
-      );
-    }
+    await drainInbox(state.sessionId, {
+      getJson: bridgeGetJson, post: bridgeFetch, session, inFlight: state.inFlight, log: extLog,
+    });
   } finally {
     state.delivering = false;
+  }
+}
+
+// Poll the bridge for session controls (a mode change: what `/autopilot on`
+// does from this terminal) and apply them through the CLI's own RPC
+// (``drainControls`` in delivery.mjs). Controls are polled apart from
+// messages, so they're never delivered as a prompt.
+async function pollControls() {
+  if (state.controlling) return;
+  if (!state.sessionId || !state.registered) return;
+  state.controlling = true;
+  try {
+    await drainControls(state.sessionId, {
+      getJson: bridgeGetJson, post: bridgeFetch, session, log: extLog,
+    });
+  } finally {
+    state.controlling = false;
   }
 }
 
@@ -380,16 +328,17 @@ const session = await joinSession({
 });
 
 // Observe-only, non-blocking: the ONLY work done on the CLI event loop. Just
-// note that the session is alive and capture the session id if the env var was
-// missing. No I/O, no await -- returns immediately (hot-potato). Bridge writes
+// note that the session is alive and follow its session id (a missing env var,
+// or a resume that renamed the conversation). No I/O, no await -- returns immediately (hot-potato). Bridge writes
 // happen on the heartbeat timer below. Phase 5 will extend this to buffer
 // events into a bounded queue that a decoupled flusher drains to the bridge.
 session.on((event) => {
   try {
     state.lastEventAt = Date.now();
-    if (!state.sessionId && event?.sessionId) {
-      state.sessionId = event.sessionId;
-      // Late session id -> kick a one-off registration off the event loop.
+    state.inFlight.observe(event);
+    if (adoptSessionId(state, event?.sessionId)) {
+      // A late id, or a resume that renamed this conversation: register it
+      // off the event loop (the bridge folds a renamed placeholder into it).
       setTimeout(() => register().catch(() => {}), 0);
     }
     // Represent (Phase 5): enqueue whitelisted events for the flusher. This is
@@ -429,9 +378,19 @@ session.on((event) => {
 
 // --- Load-time initialization (runs once; async work off the event loop) ---
 try {
-  state.base = resolveBaseUrl();
-  state.token = resolveToken();
-  state.meta = resolveMetadata();
+  endpoint = makeBridgeEndpoint({
+    resolveBase: resolveBaseUrl, resolveToken, fetchImpl: fetch, log: extLog,
+    timeoutMs: HTTP_TIMEOUT_MS,
+  });
+  state.base = endpoint.ep.base;
+  state.token = endpoint.ep.token;
+  // state.meta starts unset -- metadataReady (above) fills it in the
+  // background. Deliberately NOT awaited here: this whole init block must
+  // finish (and the extension report ready) without waiting on any child
+  // process. Registration alone waits for it (it carries this process's
+  // identity, processIdentity(), and spreads `...(state.meta || {})`), so a
+  // placeholder is registered with its machine and worktree and a resume
+  // that renames it can fold it in. A failed lookup registers without them.
 
   if (!state.token) {
     extLog("no local agent-bridge auth token found; not registering (ok)");
@@ -458,6 +417,7 @@ try {
     // best-effort.
     state.inboxPoll = setInterval(() => {
       pollInbox().catch(() => {});
+      pollControls().catch(() => {});
     }, INBOX_POLL_MS);
     if (state.inboxPoll.unref) state.inboxPoll.unref();
   }
@@ -492,4 +452,7 @@ process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
 process.once("beforeExit", shutdown);
 
-await session.log("agent-bridge live-session extension loaded");
+// Announce once per session, not once per extension-host start (announce.mjs).
+if (firstLoadThisSession(state.sessionId)) {
+  await session.log("agent-bridge live-session extension loaded");
+}

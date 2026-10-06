@@ -1,4 +1,4 @@
-﻿"""Tests for the live-cutover handoff mux primitives + ``handoff-cutover`` cmd.
+"""Tests for the live-cutover handoff mux primitives + ``handoff-cutover`` cmd.
 
 These cover the *pure* argv construction and the command's control flow
 (mode selection, arg validation, plan reconstruction) with the mux
@@ -15,12 +15,15 @@ import platform
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from agent_worktrees import __main__ as m
 from agent_worktrees import activity, locks, procs, reclaim, sessions
+from agent_worktrees import sessions_pane_retire
+from agent_worktrees import worktree_identity
 
 
 # â”€â”€ build_mux_new_window_argv (pure) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -29,7 +32,7 @@ class TestBuildMuxNewWindowArgv:
         argv = sessions.build_mux_new_window_argv(
             "wt1-abc",
             "/w/wt1",
-            ["bash", "setup.sh", "--allow-all-tools", "-i", "seed text"],
+            ["bash", "setup.sh", "--allow-all", "--experimental", "-i", "seed text"],
             {"COPILOT_FEATURE_FLAGS": "x"},
             mux="tmux",
             pane_wrapper="/does/not/exist",
@@ -52,7 +55,9 @@ class TestBuildMuxNewWindowArgv:
             "env", "-u", "WORKTREE_PROJECT", "-u", "WORKTREE_ID",
         ]
         # command tail is verbatim (no -- separator, no wrapper)
-        assert argv[-5:] == ["bash", "setup.sh", "--allow-all-tools", "-i", "seed text"]
+        assert argv[-6:] == [
+            "bash", "setup.sh", "--allow-all", "--experimental", "-i", "seed text",
+        ]
         assert "--" not in argv
 
     def test_tmux_with_wrapper_wraps_command(self, tmp_path):
@@ -89,10 +94,10 @@ class TestBuildMuxNewWindowArgv:
         # the command verbatim -- no quoting layer that could break the spawn.
         argv = sessions.build_mux_new_window_argv(
             "id2", "C:/w",
-            ["pwsh.exe", "--allow-all-tools"], None, mux="psmux",
+            ["pwsh.exe", "--allow-all", "--experimental"], None, mux="psmux",
             pane_wrapper="/does/not/exist",
         )
-        assert argv[-2:] == ["pwsh.exe", "--allow-all-tools"]
+        assert argv[-3:] == ["pwsh.exe", "--allow-all", "--experimental"]
 
     def test_psmux_prompt_transport_requires_and_uses_wrapper(self, tmp_path):
         wrapper = tmp_path / "wrapper with spaces" / "pane-wrapper.ps1"
@@ -125,6 +130,27 @@ class TestBuildMuxNewWindowArgv:
             wrapper_args[receipt_flag + 1]
         ).decode("utf-8")
         assert decoded_receipt == str(receipt)
+
+    @pytest.mark.parametrize("with_wrapper", [False, True])
+    def test_native_runner_without_prompt_preserves_spaced_argv(self, tmp_path, with_wrapper):
+        wrapper = tmp_path / "profile with spaces" / "pane-wrapper.ps1"
+        if with_wrapper:
+            wrapper.parent.mkdir()
+            wrapper.write_text("# wrapper fixture\n")
+        command = [
+            "node", "C:/plugin payload/native-launch.mjs", "--checkpoint",
+            "C:/profile path/handoff-request.json", "--cli", "C:/CLI path/copilot.exe",
+            "--", "--model", "source-model",
+        ]
+        argv = sessions.build_mux_new_window_argv(
+            "owned", "C:/worktree path", command, None, mux="psmux",
+            pane_wrapper=str(wrapper), initial_prompt=None,
+        )
+        assert argv[-2] == "-EncodedCommand"
+        script = base64.b64decode(argv[-1]).decode("utf-16-le")
+        encoded = script.split("FromBase64String('")[2 if with_wrapper else 1].split("'")[0]
+        decoded = json.loads(base64.b64decode(encoded).decode("utf-8"))
+        assert decoded == (["-AwWt", "owned", *command] if with_wrapper else command)
 
     def test_explicit_mux_session_targets_adopted_anchor_session(self):
         argv = sessions.build_mux_new_window_argv(
@@ -169,6 +195,27 @@ class TestMuxNewWindow:
         assert out["ok"] is True
         assert out["new_pane"] == "%7"
 
+    def test_success_emits_stage_2_mux_session_assigned(self, monkeypatch, tmp_path):
+        """Stage 2 (mux_session_assigned): the programmatic cutover path's own
+        emitter, fired right after the mux subprocess call succeeds."""
+        monkeypatch.setattr(
+            "agent_worktrees.config.install_dir", lambda: tmp_path / ".agent-worktrees"
+        )
+
+        class R:
+            returncode = 0
+            stdout = "%7\n"
+            stderr = ""
+
+        import subprocess
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: R())
+        sessions.mux_new_window("id", "/w", ["copilot"], None, mux="tmux")
+        events = activity.read_events(worktree_id="id", event="mux_session_assigned")
+        assert len(events) == 1
+        assert events[0]["stage"] == 2
+        assert events[0]["stage_name"] == "mux_session_assigned"
+        assert events[0]["new_pane"] == "%7"
+
     def test_failure_returns_error(self, monkeypatch):
         class R:
             returncode = 1
@@ -180,6 +227,21 @@ class TestMuxNewWindow:
         out = sessions.mux_new_window("id", "/w", ["copilot"], None, mux="tmux")
         assert out["ok"] is False
         assert "no such session" in out["error"]
+
+    def test_failure_does_not_emit_stage_2(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "agent_worktrees.config.install_dir", lambda: tmp_path / ".agent-worktrees"
+        )
+
+        class R:
+            returncode = 1
+            stdout = ""
+            stderr = "no such session"
+
+        import subprocess
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: R())
+        sessions.mux_new_window("id", "/w", ["copilot"], None, mux="tmux")
+        assert activity.read_events(worktree_id="id", event="mux_session_assigned") == []
 
     def test_required_prompt_wrapper_failure_is_structured(self, monkeypatch):
         monkeypatch.setattr(
@@ -209,11 +271,14 @@ class TestMuxNewWindow:
             lambda token: tmp_path / token,
         )
         retired = {}
+        # _retire_failed_successor (sessions_pane_retire.py) calls
+        # mux_retire_pane unqualified from its OWN module namespace, not
+        # sessions.py's re-export -- patch the real call site.
         monkeypatch.setattr(
-            sessions,
+            sessions_pane_retire,
             "mux_retire_pane",
             lambda pane, **k: retired.update(pane=pane)
-            or {"ok": True, "method": "test-retire"},
+            or {"ok": True, "gone": True, "method": "test-retire"},
         )
         monkeypatch.setattr(
             sessions,
@@ -273,6 +338,53 @@ class TestMuxNewWindow:
         assert out["prompt_status"] == "failed:2"
         assert cleaned == {"pane": "%9", "tree": {100, 101}}
 
+    def test_child_exit_during_startup_grace_preserves_receipt_failure(
+        self, monkeypatch, tmp_path,
+    ):
+        receipt = tmp_path / "receipt"
+
+        class R:
+            returncode = 0
+            stdout = "%9\n"
+            stderr = ""
+
+        def _spawn(*args, **kwargs):
+            receipt.write_text("launching", encoding="utf-8")
+            return R()
+
+        monkeypatch.setattr(subprocess, "run", _spawn)
+        monkeypatch.setattr(
+            sessions, "_initial_prompt_receipt_path", lambda token: receipt,
+        )
+        monkeypatch.setattr(sessions, "_mux_pane_alive", lambda *a, **k: False)
+        monkeypatch.setattr(
+            sessions, "_mux_pane_process_tree", lambda *a, **k: {100},
+        )
+        monkeypatch.setattr(
+            sessions,
+            "_retire_failed_successor",
+            lambda *a, **k: {"ok": True},
+        )
+        monkeypatch.setattr(
+            sessions,
+            "build_mux_new_window_argv",
+            lambda *a, **k: ["psmux", "new-window"],
+        )
+
+        out = sessions.mux_new_window(
+            "id",
+            "/w",
+            ["copilot"],
+            None,
+            mux="psmux",
+            initial_prompt="continue",
+        )
+
+        assert out["ok"] is False
+        assert out["prompt_received"] is False
+        assert out["prompt_status"] == "failed:pane-exited"
+        assert out["error"].endswith("(status: failed:pane-exited)")
+
     def test_parent_transports_exact_watched_receipt_path(
         self, monkeypatch, tmp_path,
     ):
@@ -297,7 +409,7 @@ class TestMuxNewWindow:
             sessions, "build_mux_new_window_argv", _build,
         )
         monkeypatch.setattr(subprocess, "run", lambda *a, **k: R())
-        monkeypatch.setattr(sessions, "_mux_pane_alive", lambda *a: True)
+        monkeypatch.setattr(sessions, "_mux_pane_alive", lambda *a, **k: True)
 
         out = sessions.mux_new_window(
             "id", "/w", ["copilot"], None,
@@ -335,7 +447,13 @@ class TestMuxNewWindow:
 
 class TestPaneWrapperInitialPrompt:
     def test_wrapper_appends_native_interactive_prompt(self, tmp_path):
-        root = Path(__file__).resolve().parents[1]
+        # The interactive mux launch scripts (including the pane wrappers)
+        # relocated to Worktree Manager in Phase 3b Sub-slice 2a Step 2
+        # (efforts/active/worktree-manager-control-plane/
+        # phase-3b-mux-relocation.md); agent-worktrees no longer ships its
+        # own copy, but this test still exercises the real
+        # `sessions._mux_pane_cmd` construction here.
+        root = Path(__file__).resolve().parents[3] / "worktree-manager"
         wrapper_dir = tmp_path / "wrapper with spaces"
         wrapper_dir.mkdir()
         capture = tmp_path / "capture.py"
@@ -397,7 +515,17 @@ class TestPaneWrapperInitialPrompt:
 
 class TestMuxRetirePane:
     def test_already_gone(self, monkeypatch):
-        monkeypatch.setattr(sessions, "_mux_pane_alive", lambda p, b: False)
+        # mux_retire_pane lives in sessions_pane_retire.py (the module-size
+        # split moved it there); its `_mux_pane_alive` reference resolves in
+        # THAT module's namespace, not `sessions`'s re-export -- patching
+        # `sessions._mux_pane_alive` alone silently no-ops here (#2660-class
+        # regression: discovered while working Phase 3 of
+        # context-handoff-overhaul, unrelated to this fix).
+        monkeypatch.setattr(
+            sessions_pane_retire,
+            "_mux_pane_alive",
+            lambda p, b, session_name=None: False,
+        )
         out = sessions.mux_retire_pane("%3", mux="tmux")
         assert out == {"ok": True, "pane": "%3", "gone": True,
                        "method": "already-gone"}
@@ -405,11 +533,14 @@ class TestMuxRetirePane:
     def test_graceful_quit(self, monkeypatch):
         # alive once (initial check), then gone after the double Ctrl-C
         states = iter([True, False])
-        monkeypatch.setattr(sessions, "_mux_pane_alive",
-                            lambda p, b: next(states))
+        monkeypatch.setattr(
+            sessions_pane_retire,
+            "_mux_pane_alive",
+            lambda p, b, session_name=None: next(states),
+        )
         import subprocess
         monkeypatch.setattr(subprocess, "run",
-                            lambda *a, **k: type("R", (), {"returncode": 0})())
+                            lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
         out = sessions.mux_retire_pane("%3", mux="tmux", ctrl_c_gap=0,
                                        poll_interval=0, settle_timeout=1)
         assert out["gone"] is True
@@ -417,26 +548,60 @@ class TestMuxRetirePane:
 
     def test_hard_kill_fallback(self, monkeypatch):
         # never gone via graceful; kill-pane also fails to remove it
-        monkeypatch.setattr(sessions, "_mux_pane_alive", lambda p, b: True)
+        monkeypatch.setattr(
+            sessions_pane_retire,
+            "_mux_pane_alive",
+            lambda p, b, session_name=None: True,
+        )
         import subprocess
         monkeypatch.setattr(subprocess, "run",
-                            lambda *a, **k: type("R", (), {"returncode": 0})())
+                            lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
         out = sessions.mux_retire_pane("%3", mux="tmux", ctrl_c_gap=0,
-                                       poll_interval=0, settle_timeout=0)
+                                       poll_interval=0, settle_timeout=0,
+                                       hard_kill_settle=0)
         assert out["gone"] is False
         assert out["method"] == "failed"
 
+    def test_hard_kill_waits_for_mux_to_drop_pane(self, monkeypatch):
+        states = iter([True, True, True, True, False])
+        monkeypatch.setattr(
+            sessions_pane_retire,
+            "_mux_pane_alive",
+            lambda p, b, session_name=None: next(states),
+        )
+        import subprocess
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})(),
+        )
+        out = sessions.mux_retire_pane(
+            "%3", mux="tmux", ctrl_c_gap=0, poll_interval=0,
+            settle_timeout=0, hard_kill_settle=1,
+        )
+        assert out["gone"] is True
+        assert out["method"] == "hard"
+
     def test_last_window_guard_skips_retire(self, monkeypatch):
         calls: list[list[str]] = []
-        monkeypatch.setattr(sessions, "_mux_pane_alive", lambda p, b: True)
-        monkeypatch.setattr(sessions, "_mux_last_window_guard",
-                            lambda p, b: {"session": "wt-demo", "window_count": 1})
+        monkeypatch.setattr(
+            sessions_pane_retire,
+            "_mux_pane_alive",
+            lambda p, b, session_name=None: True,
+        )
+        monkeypatch.setattr(
+            sessions_pane_retire,
+            "_mux_last_window_guard",
+            lambda p, b, session_name=None: {
+                "session": "wt-demo",
+                "window_count": 1,
+            },
+        )
         monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
         import subprocess
 
         def _fake_run(*a, **k):
             calls.append(list(a[0]))
-            return type("R", (), {"returncode": 0})()
+            return type("R", (), {"returncode": 0, "stdout": ""})()
 
         monkeypatch.setattr(subprocess, "run", _fake_run)
         out = sessions.mux_retire_pane("%3", mux="tmux")
@@ -451,13 +616,16 @@ class TestMuxRetirePane:
 
         # alive for: initial check + escalate poll (still up), then gone.
         states = iter([True, True, False])
-        monkeypatch.setattr(sessions, "_mux_pane_alive",
-                            lambda p, b: next(states))
+        monkeypatch.setattr(
+            sessions_pane_retire,
+            "_mux_pane_alive",
+            lambda p, b, session_name=None: next(states),
+        )
         import subprocess
 
         def _fake_run(*a, **k):
             calls.append(list(a[0]))
-            return type("R", (), {"returncode": 0})()
+            return type("R", (), {"returncode": 0, "stdout": ""})()
 
         monkeypatch.setattr(subprocess, "run", _fake_run)
         out = sessions.mux_retire_pane(
@@ -475,13 +643,332 @@ class TestMuxRetirePane:
 def _ns(**kw):
     base = dict(seed=None, worktree_id=None, session_id=None, old_pane=None,
                 retire_pane=None, mux_session=None, require_mux_identity=False,
-                dry_run=False, permission_mode=None,
-                copilot_args=[], recovery=False)
+                expected_copilot_pid=None, expected_copilot_start_time=None,
+                dry_run=False, retry=False, handoff_token=None,
+                copilot_args=[], recovery=False, headless=False)
     base.update(kw)
     return argparse.Namespace(**base)
 
 
+class TestHeadlessNewSession:
+    """sessions.headless_new_session / mux_available -- the non-mux launch
+    primitive (context-handoff-overhaul Phase 3 §4.3)."""
+
+    def test_mux_available_true_when_binary_on_path(self, monkeypatch):
+        monkeypatch.setattr(shutil, "which", lambda b: "/usr/bin/tmux" if b == "tmux" else None)
+        assert sessions.mux_available(mux="tmux") is True
+
+    def test_mux_available_false_when_no_mux_at_all(self, monkeypatch):
+        monkeypatch.setattr(shutil, "which", lambda b: None)
+        assert sessions.mux_available(mux="tmux") is False
+        assert sessions.mux_available(mux="psmux") is False
+
+    def test_headless_new_session_spawns_detached_with_native_seed_arg(
+        self, monkeypatch,
+    ):
+        # Force non-contained detachment kwargs so this assertion is
+        # deterministic regardless of the ambient test-runner env: CI (and
+        # any COPILOT_EXTENSIONS_TEST_CONTAINED=1 runner) suppresses
+        # start_new_session/creationflags by design (agent_procutil's own
+        # contained_test_mode()), which this test must not itself trip over.
+        monkeypatch.delenv("COPILOT_EXTENSIONS_TEST_CONTAINED", raising=False)
+        captured = {}
+
+        class _Proc:
+            pid = 4242
+
+        def _fake_popen(argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            return _Proc()
+
+        monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+        out = sessions.headless_new_session(
+            "wtH", "/work/dir", ["copilot"], {"FOO": "bar"}, seed="continue please",
+        )
+        assert out == {"ok": True, "pid": 4242, "error": None}
+        # The seed is a native -i arg -- headless has no pane-wrapper argv
+        # mangling to route around, unlike the mux path.
+        assert captured["argv"] == ["copilot", "-i", "continue please"]
+        assert captured["kwargs"]["cwd"] == "/work/dir"
+        assert captured["kwargs"]["env"]["FOO"] == "bar"
+        assert captured["kwargs"]["stdin"] == subprocess.DEVNULL
+        assert captured["kwargs"]["stdout"] == subprocess.DEVNULL
+        assert captured["kwargs"]["stderr"] == subprocess.DEVNULL
+        if platform.system() == "Windows":
+            assert captured["kwargs"]["creationflags"] & subprocess.DETACHED_PROCESS
+        else:
+            assert captured["kwargs"]["start_new_session"] is True
+
+    def test_headless_new_session_without_seed_omits_interactive_arg(
+        self, monkeypatch,
+    ):
+        captured = {}
+
+        class _Proc:
+            pid = 7
+
+        def _fake_popen(argv, **k):
+            captured["argv"] = argv
+            return _Proc()
+
+        monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+        sessions.headless_new_session("wtH", "/work", ["copilot"], None)
+        assert captured["argv"] == ["copilot"]
+
+    def test_headless_new_session_reports_spawn_failure(self, monkeypatch):
+        monkeypatch.setattr(
+            subprocess, "Popen",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("no such file")),
+        )
+        out = sessions.headless_new_session("wtH", "/work", ["copilot"])
+        assert out == {"ok": False, "pid": None, "error": "no such file"}
+
+
 class TestCmdHandoffCutover:
+    @pytest.mark.parametrize("permission_mode", ["manual", "assisted"])
+    def test_native_permission_rejected_before_launch(
+        self, monkeypatch, capfd, tmp_path, permission_mode,
+    ):
+        checkpoint = tmp_path / "native-checkpoint.json"
+        checkpoint.write_text(json.dumps({
+            "sessionId": "source",
+            "seed": "owned seed",
+            "nativeGoal": {
+                "successorSessionId": "target", "phase": "frozen",
+                "permissionMode": permission_mode,
+            },
+        }))
+        monkeypatch.setattr(
+            m, "_resolve_handoff_cutover_target",
+            lambda *a, **k: pytest.fail("Native permission rejection must precede target resolution"),
+        )
+        monkeypatch.setattr(
+            m.pane_lifecycle, "pane_create",
+            lambda *a, **k: pytest.fail("Unsupported native mode must never create a pane"),
+        )
+        before = checkpoint.read_text()
+        rc = m.cmd_handoff_cutover(_ns(
+            seed="owned seed", worktree_id="wt-owned", session_id="source",
+            native_handoff=str(checkpoint), native_launcher="native-launch.mjs",
+        ))
+        assert rc == 1
+        result = json.loads(capfd.readouterr().out)
+        assert result["ok"] is False
+        assert "cannot preserve" in result["error"]
+        assert checkpoint.read_text() == before
+
+    def test_wait_for_handoff_candidate_observes_session_start(
+        self, monkeypatch, tmp_path,
+    ):
+        handoff = type("_Handoff", (), {
+            "token": "task-123",
+            "candidate": "successor-session",
+        })()
+        record = type("_Record", (), {"handoffs": [handoff]})()
+        monkeypatch.setattr(m.tracking, "load_record", lambda path: record)
+
+        assert m._wait_for_handoff_candidate(
+            tmp_path / "wt.yaml", "task-123", "%5", timeout=0.1,
+        ) == ("successor-session", "session-associated")
+
+    def test_wait_for_handoff_candidate_rejects_exited_pane(
+        self, monkeypatch, tmp_path,
+    ):
+        record = type("_Record", (), {"handoffs": []})()
+        monkeypatch.setattr(m.tracking, "load_record", lambda path: record)
+        monkeypatch.setattr(sessions_pane_retire, "_mux_bin", lambda: "psmux")
+        monkeypatch.setattr(sessions_pane_retire, "_mux_pane_alive", lambda *a: False)
+
+        assert m._wait_for_handoff_candidate(
+            tmp_path / "wt.yaml", "task-123", "%5", timeout=0.1,
+        ) == (None, "pane-exited-before-session")
+
+    def test_wait_for_handoff_candidate_confirms_via_pane_process_match(
+        self, monkeypatch, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """No env-var self-report required (#5252 follow-up): a session
+        already registered on this worktree (ordinary sessionStart
+        registration, unconditional on any handoff token) is confirmed as the
+        candidate purely because agent-worktrees itself sees -- via
+        ``mux_binding_for_session``'s process-ancestry match, never an env var
+        -- that it is running under the exact pane this cutover just opened.
+        This is the psmux/Windows-safe path: ``-e``-propagated env values are
+        never trusted for candidacy."""
+        from agent_worktrees import tracking as _tracking
+
+        worktree_id = "wt-pane-match"
+        rec = _tracking.WorktreeRecord(
+            worktree_id=worktree_id, branch=f"worktree/{worktree_id}",
+            worktree_path=f"/tmp/src/{worktree_id}", repo="test-repo",
+            machine="test", platform="windows", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        path = tmp_tracking_dir / f"{worktree_id}.yaml"
+        _tracking.save_record(rec, path)
+        _tracking.register_session(worktree_id, "predecessor-1")
+        _tracking.register_session(worktree_id, "successor-1")
+        loaded = _tracking.load_record(path)
+        _tracking.open_handoff(loaded, "predecessor-1", "task-pane-match")
+
+        def _fake_binding(session_id, *, expected_session_name=None, **_k):
+            if session_id == "successor-1":
+                return {"pane_id": "%9", "session_name": expected_session_name}
+            return None
+
+        monkeypatch.setattr(sessions, "mux_binding_for_session", _fake_binding)
+
+        result = m._wait_for_handoff_candidate(
+            path, "task-pane-match", "%9",
+            timeout=0.5, mux_session="wt-pane-match",
+            predecessor_session_id="predecessor-1",
+        )
+        assert result == ("successor-1", "pane-process-associated")
+        assert (
+            _tracking.load_record(path)
+            .handoffs[0].candidate == "successor-1"
+        )
+
+    def test_wait_for_handoff_candidate_skips_predecessor_and_wrong_pane(
+        self, monkeypatch, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """A live predecessor session and a live session under a different
+        pane must never be mistaken for the successor."""
+        from agent_worktrees import tracking as _tracking
+
+        worktree_id = "wt-pane-mismatch"
+        rec = _tracking.WorktreeRecord(
+            worktree_id=worktree_id, branch=f"worktree/{worktree_id}",
+            worktree_path=f"/tmp/src/{worktree_id}", repo="test-repo",
+            machine="test", platform="windows", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        path = tmp_tracking_dir / f"{worktree_id}.yaml"
+        _tracking.save_record(rec, path)
+        _tracking.register_session(worktree_id, "predecessor-2")
+        _tracking.register_session(worktree_id, "unrelated-2")
+        loaded = _tracking.load_record(path)
+        _tracking.open_handoff(loaded, "predecessor-2", "task-pane-mismatch")
+
+        def _fake_binding(session_id, *, expected_session_name=None, **_k):
+            # predecessor is (still) alive under the OLD pane; the unrelated
+            # session is alive under some other, irrelevant pane -- neither
+            # is the successor under the pane this cutover just opened.
+            if session_id == "predecessor-2":
+                return {"pane_id": "%1", "session_name": expected_session_name}
+            if session_id == "unrelated-2":
+                return {"pane_id": "%2", "session_name": expected_session_name}
+            return None
+
+        monkeypatch.setattr(sessions, "mux_binding_for_session", _fake_binding)
+        monkeypatch.setattr(sessions_pane_retire, "_mux_bin", lambda: "psmux")
+        monkeypatch.setattr(sessions_pane_retire, "_mux_pane_alive", lambda *a: False)
+
+        result = m._wait_for_handoff_candidate(
+            path, "task-pane-mismatch", "%9",
+            timeout=0.2, mux_session="wt-pane-mismatch",
+            predecessor_session_id="predecessor-2",
+        )
+        assert result == (None, "pane-exited-before-session")
+        assert _tracking.load_record(path).handoffs[0].candidate is None
+
+    def test_wait_for_handoff_candidate_rejects_stale_candidate_in_another_pane(
+        self, monkeypatch, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """A ``handoff.candidate`` already recorded for a *different* live pane
+        (e.g. set by a racing/earlier spawn attempt's self-report) must never
+        be trusted just because the field is non-empty -- this wait is scoped
+        to one specific pane."""
+        from agent_worktrees import tracking as _tracking
+
+        worktree_id = "wt-pane-stale-candidate"
+        rec = _tracking.WorktreeRecord(
+            worktree_id=worktree_id, branch=f"worktree/{worktree_id}",
+            worktree_path=f"/tmp/src/{worktree_id}", repo="test-repo",
+            machine="test", platform="windows", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        path = tmp_tracking_dir / f"{worktree_id}.yaml"
+        _tracking.save_record(rec, path)
+        _tracking.register_session(worktree_id, "predecessor-3")
+        _tracking.register_session(worktree_id, "other-pane-successor")
+        loaded = _tracking.load_record(path)
+        _tracking.open_handoff(loaded, "predecessor-3", "task-stale-candidate")
+        _tracking.associate_handoff_candidate(
+            loaded, "task-stale-candidate", "other-pane-successor",
+        )
+
+        def _fake_binding(session_id, *, expected_session_name=None, **_k):
+            if session_id == "other-pane-successor":
+                # Alive, but under a DIFFERENT pane than the one being waited on.
+                return {"pane_id": "%OTHER", "session_name": expected_session_name}
+            return None
+
+        monkeypatch.setattr(sessions, "mux_binding_for_session", _fake_binding)
+        monkeypatch.setattr(sessions_pane_retire, "_mux_bin", lambda: "psmux")
+        monkeypatch.setattr(sessions_pane_retire, "_mux_pane_alive", lambda *a: True)
+
+        result = m._wait_for_handoff_candidate(
+            path, "task-stale-candidate", "%9",
+            timeout=0.15, mux_session="wt-pane-stale-candidate",
+            predecessor_session_id="predecessor-3",
+        )
+        assert result == (None, "session-association-timeout")
+
+    def test_associate_pane_matched_candidate_does_not_report_a_race_loser(
+        self, monkeypatch, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """When another session already won the token (associated between
+        this call's unlocked pane check and its own locked association
+        attempt), the loser must never be returned as the confirmed
+        candidate, and the winner's association must be left intact."""
+        from agent_worktrees import tracking as _tracking
+
+        worktree_id = "wt-pane-race-loser"
+        rec = _tracking.WorktreeRecord(
+            worktree_id=worktree_id, branch=f"worktree/{worktree_id}",
+            worktree_path=f"/tmp/src/{worktree_id}", repo="test-repo",
+            machine="test", platform="windows", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        path = tmp_tracking_dir / f"{worktree_id}.yaml"
+        _tracking.save_record(rec, path)
+        _tracking.register_session(worktree_id, "predecessor-4")
+        _tracking.register_session(worktree_id, "winner-session")
+        _tracking.register_session(worktree_id, "loser-session")
+        loaded = _tracking.load_record(path)
+        _tracking.open_handoff(loaded, "predecessor-4", "task-race")
+        # The winner already claimed the token before this call runs -- e.g.
+        # the successor's own token self-report landed first.
+        _tracking.associate_handoff_candidate(loaded, "task-race", "winner-session")
+
+        def _fake_binding(session_id, *, expected_session_name=None, **_k):
+            if session_id == "loser-session":
+                return {"pane_id": "%9", "session_name": expected_session_name}
+            return None
+
+        monkeypatch.setattr(sessions, "mux_binding_for_session", _fake_binding)
+
+        result = sessions_pane_retire.associate_pane_matched_candidate(
+            path, "task-race", "wt-pane-race-loser", "%9", "predecessor-4",
+        )
+        assert result is None
+        assert (
+            _tracking.load_record(path).handoffs[0].candidate == "winner-session"
+        )
+
+    @pytest.fixture(autouse=True)
+    def _use_local_session_backend(self, monkeypatch):
+        monkeypatch.setattr(
+            m,
+            "_unsupported_hosted_launch",
+            lambda record, operation: "",
+        )
+
     def test_parser_accepts_retire_mux_identity(self):
         args = m.build_parser().parse_args([
             "handoff-cutover",
@@ -492,28 +979,532 @@ class TestCmdHandoffCutover:
         assert args.mux_session == "caller-session"
         assert args.require_mux_identity is True
 
-    def test_parser_accepts_permission_mode(self):
+    def test_parser_accepts_retry(self):
         args = m.build_parser().parse_args([
             "handoff-cutover",
-            "--seed", "continue",
-            "--permission-mode", "manual",
+            "--retry",
+            "--session-id", "predecessor-1",
         ])
-        assert args.permission_mode == "manual"
+        assert args.retry is True
+        assert args.session_id == "predecessor-1"
+
+    def test_retire_rejects_reused_predecessor_pid(self, monkeypatch, capfd):
+        monkeypatch.setattr(
+            sessions,
+            "mux_binding_for_session",
+            lambda sid: {
+                "pane_id": "%9",
+                "copilot_pid": 77,
+                "copilot_start_time": "new-process",
+            },
+        )
+        monkeypatch.setattr(
+            sessions, "mux_retire_pane",
+            lambda *a, **k: pytest.fail("must not retire an unverified process"),
+        )
+        monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
+
+        rc = m.cmd_handoff_cutover(_ns(
+            retire_pane="%9",
+            session_id="old-sess",
+            expected_copilot_pid=77,
+            expected_copilot_start_time="old-process",
+        ))
+
+        assert rc == 1
+        out = json.loads(capfd.readouterr().out)
+        assert out["method"] == "process-identity-mismatch"
+
+    def test_retire_retry_accepts_already_gone_predecessor(
+        self, monkeypatch, capfd,
+    ):
+        monkeypatch.setattr(
+            m, "_resolve_retire_pane_mux_session", lambda pane, expected: None,
+        )
+        monkeypatch.setattr(
+            sessions, "mux_binding_for_session",
+            lambda sid: pytest.fail("gone pane needs no live mux binding"),
+        )
+        monkeypatch.setattr(
+            m.pane_lifecycle, "pane_terminate",
+            lambda *a, **k: pytest.fail("gone pane must not be signaled"),
+        )
+        monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
+        seen = {}
+
+        def _ensure(sid, **kwargs):
+            seen.update(session=sid, **kwargs)
+            return {
+                "checked": True,
+                "identity_verified": True,
+                "found": 0,
+                "reaped": 0,
+                "survivors": 0,
+                "pids": [],
+            }
+
+        monkeypatch.setattr(reclaim, "ensure_session_copilot_reaped", _ensure)
+        rc = m.cmd_handoff_cutover(_ns(
+            retire_pane="%9",
+            session_id="old-sess",
+            mux_session="original-session",
+            require_mux_identity=True,
+            expected_copilot_pid=77,
+            expected_copilot_start_time="old-process",
+        ))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["method"] == "identity-unresolved-skip"
+        assert out["ok"] is True
+        assert seen == {
+            "session": "old-sess",
+            "expected_pid": 77,
+            "expected_start_time": "old-process",
+        }
+
+    def test_retire_retry_skips_reused_pane_without_live_binding(
+        self, monkeypatch, capfd,
+    ):
+        monkeypatch.setattr(
+            m, "_resolve_retire_pane_mux_session",
+            lambda pane, expected: "different-session",
+        )
+        monkeypatch.setattr(
+            sessions, "mux_binding_for_session",
+            lambda sid: pytest.fail("reused pane needs no predecessor binding"),
+        )
+        monkeypatch.setattr(
+            m.pane_lifecycle, "pane_terminate",
+            lambda *a, **k: pytest.fail("reused pane must not be signaled"),
+        )
+        monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
+        monkeypatch.setattr(
+            reclaim, "ensure_session_copilot_reaped",
+            lambda sid, **kwargs: {
+                "checked": True,
+                "identity_verified": True,
+                "found": 0,
+                "reaped": 0,
+                "survivors": 0,
+                "pids": [],
+            },
+        )
+        rc = m.cmd_handoff_cutover(_ns(
+            retire_pane="%9",
+            session_id="old-sess",
+            mux_session="original-session",
+            require_mux_identity=True,
+            expected_copilot_pid=77,
+            expected_copilot_start_time="old-process",
+        ))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["method"] == "identity-mismatch-skip"
+        assert out["current_mux_session"] == "different-session"
+        assert out["ok"] is True
 
     def test_retire_mode(self, monkeypatch, capfd):
-        monkeypatch.setattr(sessions, "mux_retire_pane",
-                            lambda p, **k: {"ok": True, "pane": p, "gone": True,
-                                            "method": "graceful"})
-        monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
+        monkeypatch.setattr(
+            m.pane_lifecycle,
+            "pane_terminate",
+            lambda p, **k: {
+                "ok": True, "pane": p, "gone": True,
+                "method": "graceful-signature-confirmed",
+            },
+        )
+        logged = []
+        monkeypatch.setattr(
+            activity,
+            "log_event",
+            lambda event, **kwargs: logged.append((event, kwargs)),
+        )
         rc = m.cmd_handoff_cutover(_ns(retire_pane="%9"))
         assert rc == 0
         out = json.loads(capfd.readouterr().out)
         assert out["pane"] == "%9" and out["gone"] is True
+        assert out["method"] == "graceful-signature-confirmed"
+        assert logged[-1][0] == "handoff_predecessor_retire"
+        assert logged[-1][1]["outcome"] == "gone"
+
+    def test_retire_mode_emits_stage_13_when_head_is_already_linked(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """#2457 Stage 13: a successful retire (outcome="gone") for a token
+        whose handoff is ALREADY linked (the successor claimed head before
+        this retire ran) must emit `handoff_complete` -- exercising the real
+        `_handoff_cutover_retire_result` wiring, not just the standalone
+        `_maybe_emit_stage_13` unit."""
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id="wt-retire-13", branch="worktree/wt-retire-13",
+            worktree_path="/tmp/src/wt-retire-13", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        _tracking.save_record(rec, tmp_tracking_dir / "wt-retire-13.yaml")
+        _tracking.register_session("wt-retire-13", "old-sess")
+        _tracking.register_session("wt-retire-13", "new-sess")
+        loaded = _tracking.load_record(tmp_tracking_dir / "wt-retire-13.yaml")
+        _tracking.open_handoff(loaded, "old-sess", "task-retire-13")
+        _tracking.link_handoff(loaded, "task-retire-13", "new-sess")
+
+        monkeypatch.setattr(
+            m.pane_lifecycle, "pane_terminate",
+            lambda p, **k: {"ok": True, "pane": p, "gone": True, "method": "graceful"},
+        )
+        monkeypatch.setattr(
+            reclaim, "ensure_session_copilot_reaped",
+            lambda sid, **kwargs: {
+                "checked": True, "identity_verified": True, "found": 0,
+                "reaped": 0, "survivors": 0, "pids": [],
+            },
+        )
+
+        rc = m.cmd_handoff_cutover(_ns(
+            worktree_id="wt-retire-13",
+            retire_pane="%9",
+            session_id="old-sess",
+            handoff_token="task-retire-13",
+        ))
+
+        assert rc == 0
+        complete = activity.read_events(
+            worktree_id="wt-retire-13", event="handoff_complete",
+        )
+        assert len(complete) == 1
+        assert complete[0]["session_id"] == "old-sess"
+        assert complete[0]["successor_session_id"] == "new-sess"
+        assert complete[0]["handoff_token"] == "task-retire-13"
+
+    def test_retire_confirmed_dead_predecessor_clears_zombie_head(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """A bare self-retire (no handoff-token successor -- e.g. a
+        double-Ctrl-C idle-quit with nobody waiting to take over) must not
+        leave the retired session's ``SessionEntry.state`` stuck at
+        ``"active"`` once its Copilot process is positively confirmed dead.
+        A stuck-active predecessor otherwise permanently blocks
+        ``register_session``'s creation-guard from ever promoting a later
+        successor to head (the zombie head-pointer regression)."""
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id="wt-retire-4702", branch="worktree/wt-retire-4702",
+            worktree_path="/tmp/src/wt-retire-4702", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        _tracking.save_record(rec, tmp_tracking_dir / "wt-retire-4702.yaml")
+        _tracking.register_session("wt-retire-4702", "old-sess")
+        before = _tracking.load_record(tmp_tracking_dir / "wt-retire-4702.yaml")
+        assert before.resolved_head_session == "old-sess"
+
+        monkeypatch.setattr(
+            m.pane_lifecycle, "pane_terminate",
+            lambda p, **k: {"ok": True, "pane": p, "gone": True, "method": "graceful"},
+        )
+        monkeypatch.setattr(
+            reclaim, "ensure_session_copilot_reaped",
+            lambda sid, **kwargs: {
+                "checked": True, "identity_verified": True, "found": 1,
+                "reaped": 1, "survivors": 0, "pids": [7],
+            },
+        )
+        monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
+
+        rc = m.cmd_handoff_cutover(_ns(
+            worktree_id="wt-retire-4702",
+            retire_pane="%9",
+            session_id="old-sess",
+        ))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["ok"] is True
+
+        after = _tracking.load_record(tmp_tracking_dir / "wt-retire-4702.yaml")
+        entry = after.session_entry("old-sess")
+        assert entry.state == "concluded"
+        # The head pointer must clear -- not stay stuck on the dead session --
+        # so a later successor registration is not blocked by the creation-guard.
+        assert after.resolved_head_session is None
+        _tracking.register_session("wt-retire-4702", "new-sess")
+        final = _tracking.load_record(tmp_tracking_dir / "wt-retire-4702.yaml")
+        assert final.resolved_head_session == "new-sess"
+
+    def test_retire_settles_predecessor_session_claim_to_at_rest(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """A confirmed-retired bare predecessor's Phase 8 ``session`` claim
+        (opened by ``register_session``) must be settled to ``at-rest`` --
+        not left ``active`` forever, which would otherwise show up as a
+        permanently "still live" session claim in ``finalize``'s advisory
+        ``_advise_other_live_sessions`` pass and the never-wedge sweep."""
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id="wt-retire-claim", branch="worktree/wt-retire-claim",
+            worktree_path="/tmp/src/wt-retire-claim", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        _tracking.save_record(rec, tmp_tracking_dir / "wt-retire-claim.yaml")
+        _tracking.register_session("wt-retire-claim", "old-sess")
+        before = _tracking.load_record(tmp_tracking_dir / "wt-retire-claim.yaml")
+        claim_ref = _tracking.format_claim_ref(
+            before.machine, before.repo, before.worktree_id, session="old-sess",
+        )
+        before_claim = next(c for c in before.resources if c.ref == claim_ref)
+        assert before_claim.state == "active"
+
+        monkeypatch.setattr(
+            m.pane_lifecycle, "pane_terminate",
+            lambda p, **k: {"ok": True, "pane": p, "gone": True, "method": "graceful"},
+        )
+        monkeypatch.setattr(
+            reclaim, "ensure_session_copilot_reaped",
+            lambda sid, **kwargs: {
+                "checked": True, "identity_verified": True, "found": 1,
+                "reaped": 1, "survivors": 0, "pids": [7],
+            },
+        )
+        monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
+
+        rc = m.cmd_handoff_cutover(_ns(
+            worktree_id="wt-retire-claim", retire_pane="%9", session_id="old-sess",
+        ))
+
+        assert rc == 0
+        after = _tracking.load_record(tmp_tracking_dir / "wt-retire-claim.yaml")
+        after_claim = next(c for c in after.resources if c.ref == claim_ref)
+        assert after_claim.state == "at-rest"
+
+    def test_retire_settles_predecessor_session_claim_for_token_bearing_handoff(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """A token-bearing retire (the ordinary handoff flow, not the
+        bare-retire repair) must ALSO settle the predecessor's own ``session``
+        claim once its pane/process are confirmed gone -- ``link_handoff``
+        only transitions ``SessionEntry.state``; nothing else settles the
+        Phase 8 resource claim for that path."""
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id="wt-retire-claim-tok", branch="worktree/wt-retire-claim-tok",
+            worktree_path="/tmp/src/wt-retire-claim-tok", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        _tracking.save_record(rec, tmp_tracking_dir / "wt-retire-claim-tok.yaml")
+        _tracking.register_session("wt-retire-claim-tok", "old-sess")
+        loaded = _tracking.load_record(tmp_tracking_dir / "wt-retire-claim-tok.yaml")
+        _tracking.open_handoff(loaded, "old-sess", "task-claim-tok")
+        _tracking.register_session(
+            "wt-retire-claim-tok", "new-sess", handoff_token="task-claim-tok",
+        )
+        claim_ref = _tracking.format_claim_ref(
+            loaded.machine, loaded.repo, loaded.worktree_id, session="old-sess",
+        )
+
+        monkeypatch.setattr(
+            m.pane_lifecycle, "pane_terminate",
+            lambda p, **k: {"ok": True, "pane": p, "gone": True, "method": "graceful"},
+        )
+        monkeypatch.setattr(
+            reclaim, "ensure_session_copilot_reaped",
+            lambda sid, **kwargs: {
+                "checked": True, "identity_verified": True, "found": 1,
+                "reaped": 1, "survivors": 0, "pids": [7],
+            },
+        )
+        monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
+
+        rc = m.cmd_handoff_cutover(_ns(
+            worktree_id="wt-retire-claim-tok", retire_pane="%9",
+            session_id="old-sess", handoff_token="task-claim-tok",
+        ))
+
+        assert rc == 0
+        after = _tracking.load_record(tmp_tracking_dir / "wt-retire-claim-tok.yaml")
+        after_claim = next(c for c in after.resources if c.ref == claim_ref)
+        assert after_claim.state == "at-rest"
+        # link_handoff's own SessionEntry transition is untouched.
+        assert after.session_entry("old-sess").state == "handed-off"
+
+    def test_retire_does_not_resurrect_a_released_session_claim(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """A ``deregister_session`` (``sessionEnd``) that raced ahead and
+        released the predecessor's claim before this retire ran must not be
+        overwritten back to ``at-rest`` -- a genuinely torn-down claim
+        must not come back to life (mirrors ``finalize.py``'s
+        ``_settle_current_session_claim`` released-claim guard)."""
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id="wt-retire-claim-rel", branch="worktree/wt-retire-claim-rel",
+            worktree_path="/tmp/src/wt-retire-claim-rel", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        _tracking.save_record(rec, tmp_tracking_dir / "wt-retire-claim-rel.yaml")
+        _tracking.register_session("wt-retire-claim-rel", "old-sess")
+        _tracking.deregister_session("wt-retire-claim-rel", "old-sess")
+        before = _tracking.load_record(tmp_tracking_dir / "wt-retire-claim-rel.yaml")
+        claim_ref = _tracking.format_claim_ref(
+            before.machine, before.repo, before.worktree_id, session="old-sess",
+        )
+        before_claim = next(c for c in before.resources if c.ref == claim_ref)
+        assert before_claim.state == "released"
+
+        monkeypatch.setattr(
+            m.pane_lifecycle, "pane_terminate",
+            lambda p, **k: {"ok": True, "pane": p, "gone": True, "method": "graceful"},
+        )
+        monkeypatch.setattr(
+            reclaim, "ensure_session_copilot_reaped",
+            lambda sid, **kwargs: {
+                "checked": True, "identity_verified": True, "found": 0,
+                "reaped": 0, "survivors": 0, "pids": [],
+            },
+        )
+        monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
+
+        rc = m.cmd_handoff_cutover(_ns(
+            worktree_id="wt-retire-claim-rel", retire_pane="%9", session_id="old-sess",
+        ))
+
+        assert rc == 0
+        after = _tracking.load_record(tmp_tracking_dir / "wt-retire-claim-rel.yaml")
+        after_claim = next(c for c in after.resources if c.ref == claim_ref)
+        assert after_claim.state == "released"
+
+    def test_retire_does_not_infer_succession_for_an_unrelated_active_session(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """A session that registered while the predecessor was still head is
+        not necessarily its successor -- it could be an unrelated parallel
+        session. The retire repair must conclude ONLY the confirmed-dead
+        predecessor and clear the head; it must never guess a replacement
+        from list membership, matching ``conclude_session``'s own explicit
+        contract ("another active session is never promoted by list or
+        timestamp order")."""
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id="wt-retire-race", branch="worktree/wt-retire-race",
+            worktree_path="/tmp/src/wt-retire-race", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        _tracking.save_record(rec, tmp_tracking_dir / "wt-retire-race.yaml")
+        _tracking.register_session("wt-retire-race", "old-sess")
+        # A second session registers (e.g. an unrelated parallel session)
+        # while old-sess is still head -- the creation-guard correctly
+        # declines to promote it.
+        _tracking.register_session("wt-retire-race", "other-sess")
+        pre = _tracking.load_record(tmp_tracking_dir / "wt-retire-race.yaml")
+        assert pre.resolved_head_session == "old-sess"
+        assert pre.session_entry("other-sess").state == "active"
+
+        monkeypatch.setattr(
+            m.pane_lifecycle, "pane_terminate",
+            lambda p, **k: {"ok": True, "pane": p, "gone": True, "method": "graceful"},
+        )
+        monkeypatch.setattr(
+            reclaim, "ensure_session_copilot_reaped",
+            lambda sid, **kwargs: {
+                "checked": True, "identity_verified": True, "found": 1,
+                "reaped": 1, "survivors": 0, "pids": [7],
+            },
+        )
+        monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
+
+        rc = m.cmd_handoff_cutover(_ns(
+            worktree_id="wt-retire-race", retire_pane="%9", session_id="old-sess",
+        ))
+
+        assert rc == 0
+        after = _tracking.load_record(tmp_tracking_dir / "wt-retire-race.yaml")
+        assert after.session_entry("old-sess").state == "concluded"
+        # The head clears -- it is NOT silently handed to other-sess.
+        assert after.resolved_head_session is None
+        assert after.session_entry("other-sess").state == "active"
+
+    def test_retire_with_pending_handoff_token_does_not_preempt_late_acknowledgement(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """A confirmed-dead retire that STILL carries a ``handoff_token``
+        belongs to the ordinary token-mediated handoff, not the bare-retire
+        repair. A resident monitor is allowed to retire the predecessor's
+        pane once a successor has been associated as a *candidate*
+        (``associate_handoff_candidate``) but before that candidate has
+        actually claimed the token via ``register_session(...,
+        handoff_token=...)``/``link_handoff`` -- the predecessor is still
+        legitimately ``"active"`` at that point. Concluding it here would
+        make the later, real acknowledgement fail, since ``link_handoff``
+        refuses an already-concluded predecessor."""
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id="wt-retire-late-ack", branch="worktree/wt-retire-late-ack",
+            worktree_path="/tmp/src/wt-retire-late-ack", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        _tracking.save_record(rec, tmp_tracking_dir / "wt-retire-late-ack.yaml")
+        _tracking.register_session("wt-retire-late-ack", "old-sess")
+        _tracking.register_session("wt-retire-late-ack", "new-sess")
+        loaded = _tracking.load_record(tmp_tracking_dir / "wt-retire-late-ack.yaml")
+        _tracking.open_handoff(loaded, "old-sess", "task-late-ack")
+        _tracking.associate_handoff_candidate(loaded, "task-late-ack", "new-sess")
+
+        monkeypatch.setattr(
+            m.pane_lifecycle, "pane_terminate",
+            lambda p, **k: {"ok": True, "pane": p, "gone": True, "method": "graceful"},
+        )
+        monkeypatch.setattr(
+            reclaim, "ensure_session_copilot_reaped",
+            lambda sid, **kwargs: {
+                "checked": True, "identity_verified": True, "found": 1,
+                "reaped": 1, "survivors": 0, "pids": [7],
+            },
+        )
+        monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
+
+        rc = m.cmd_handoff_cutover(_ns(
+            worktree_id="wt-retire-late-ack",
+            retire_pane="%9",
+            session_id="old-sess",
+            handoff_token="task-late-ack",
+        ))
+
+        assert rc == 0
+        after = _tracking.load_record(tmp_tracking_dir / "wt-retire-late-ack.yaml")
+        # NOT concluded -- opening the handoff yielded "old-sess", but the
+        # token is still pending, so the real
+        # handoff must remain linkable.
+        assert after.session_entry("old-sess").state == "yielded"
+
+        # The late acknowledgement must still succeed.
+        linked = _tracking.link_handoff(after, "task-late-ack", "new-sess")
+        assert linked.state == "linked"
+        assert after.session_entry("old-sess").state == "handed-off"
 
     def test_retire_reaps_old_copilot_before_success(self, monkeypatch, capfd):
         # A hard pane-kill left the pane gone; the OLD Copilot process is then
         # reaped, and only then is success declared.
-        monkeypatch.setattr(sessions, "mux_retire_pane",
+        monkeypatch.setattr(m.pane_lifecycle, "pane_terminate",
                             lambda p, **k: {"ok": True, "pane": p, "gone": True,
                                             "method": "hard"})
         monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
@@ -534,7 +1525,7 @@ class TestCmdHandoffCutover:
     def test_retire_fails_when_old_copilot_survives(self, monkeypatch, capfd):
         # Pane retired but the old Copilot process survived the reap -> the retire
         # must NOT declare success (a lingering parallel session remains).
-        monkeypatch.setattr(sessions, "mux_retire_pane",
+        monkeypatch.setattr(m.pane_lifecycle, "pane_terminate",
                             lambda p, **k: {"ok": True, "pane": p, "gone": True,
                                             "method": "hard"})
         monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
@@ -550,7 +1541,7 @@ class TestCmdHandoffCutover:
     def test_retire_last_window_skip_does_not_reap(self, monkeypatch, capfd):
         # The last-window guard deliberately keeps the pane + session alive, so
         # the process reap must be skipped (never kill the session we're keeping).
-        monkeypatch.setattr(sessions, "mux_retire_pane",
+        monkeypatch.setattr(m.pane_lifecycle, "pane_terminate",
                             lambda p, **k: {"ok": True, "pane": p, "gone": False,
                                             "method": "last-window-skip"})
         monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
@@ -567,15 +1558,93 @@ class TestCmdHandoffCutover:
         out = json.loads(capfd.readouterr().out)
         assert "copilot" not in out
 
+    def test_retire_last_window_skip_does_not_conclude_the_still_running_session(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """``ok: true, gone: false`` (the last-window guard) reports overall
+        success but never actually retired the pane -- the predecessor is
+        still running and must stay ``"active"``, not be marked concluded."""
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id="wt-retire-lw", branch="worktree/wt-retire-lw",
+            worktree_path="/tmp/src/wt-retire-lw", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        _tracking.save_record(rec, tmp_tracking_dir / "wt-retire-lw.yaml")
+        _tracking.register_session("wt-retire-lw", "old-sess")
+
+        monkeypatch.setattr(m.pane_lifecycle, "pane_terminate",
+                            lambda p, **k: {"ok": True, "pane": p, "gone": False,
+                                            "method": "last-window-skip"})
+        monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
+
+        rc = m.cmd_handoff_cutover(_ns(
+            worktree_id="wt-retire-lw", retire_pane="%9", session_id="old-sess",
+        ))
+
+        assert rc == 0
+        after = _tracking.load_record(tmp_tracking_dir / "wt-retire-lw.yaml")
+        assert after.session_entry("old-sess").state == "active"
+        assert after.resolved_head_session == "old-sess"
+
+    def test_retire_identity_mismatch_skip_does_not_conclude_unrelated_session(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """A reused-pane identity-mismatch skip reports ``gone: true`` for
+        bookkeeping purposes, but the pane was never actually signaled --
+        the named session must not be concluded."""
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id="wt-retire-mismatch", branch="worktree/wt-retire-mismatch",
+            worktree_path="/tmp/src/wt-retire-mismatch", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        _tracking.save_record(rec, tmp_tracking_dir / "wt-retire-mismatch.yaml")
+        _tracking.register_session("wt-retire-mismatch", "old-sess")
+
+        monkeypatch.setattr(
+            m, "_resolve_retire_pane_mux_session",
+            lambda pane, expected: "new-server-session",
+        )
+        monkeypatch.setattr(
+            m.pane_lifecycle, "pane_terminate",
+            lambda *a, **k: pytest.fail("must not retire a reused pane"),
+        )
+        monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
+        monkeypatch.setattr(
+            reclaim, "ensure_session_copilot_reaped",
+            lambda sid: {
+                "checked": True, "found": 1, "reaped": 1,
+                "survivors": 0, "pids": [7],
+            },
+        )
+
+        rc = m.cmd_handoff_cutover(_ns(
+            worktree_id="wt-retire-mismatch",
+            retire_pane="%9",
+            mux_session="original-session",
+            session_id="old-sess",
+        ))
+
+        assert rc == 0
+        after = _tracking.load_record(tmp_tracking_dir / "wt-retire-mismatch.yaml")
+        assert after.session_entry("old-sess").state == "active"
+
     def test_retire_mux_identity_mismatch_skips_unrelated_pane(
         self, monkeypatch, capfd,
     ):
         monkeypatch.setattr(
-            sessions, "mux_session_for_pane",
-            lambda pane: "new-server-session",
+            m, "_resolve_retire_pane_mux_session",
+            lambda pane, expected: "new-server-session",
         )
         monkeypatch.setattr(
-            sessions, "mux_retire_pane",
+            m.pane_lifecycle, "pane_terminate",
             lambda *a, **k: pytest.fail("must not retire a reused pane"),
         )
         monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
@@ -603,9 +1672,9 @@ class TestCmdHandoffCutover:
     def test_retire_unresolved_mux_identity_requires_session_reap(
         self, monkeypatch, capfd,
     ):
-        monkeypatch.setattr(sessions, "mux_session_for_pane", lambda pane: None)
+        monkeypatch.setattr(m, "_resolve_retire_pane_mux_session", lambda pane, expected: None)
         monkeypatch.setattr(
-            sessions, "mux_retire_pane",
+            m.pane_lifecycle, "pane_terminate",
             lambda *a, **k: pytest.fail("must not retire an unverified pane"),
         )
         monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
@@ -632,7 +1701,7 @@ class TestCmdHandoffCutover:
         self, monkeypatch, capfd,
     ):
         monkeypatch.setattr(
-            sessions, "mux_retire_pane",
+            m.pane_lifecycle, "pane_terminate",
             lambda *a, **k: pytest.fail("must not retire without mux identity"),
         )
         monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
@@ -746,13 +1815,29 @@ class TestCmdHandoffCutover:
         monkeypatch.setattr(m.cfg, "load_config", lambda: config)
         monkeypatch.setattr(
             m, "_preflight_launch", lambda c, a, w: m.LaunchPreflight())
+        launch = {}
+
+        def _build_launch(config, args, work_dir, **kwargs):
+            launch.update(kwargs)
+            return ["copilot"]
+
         monkeypatch.setattr(
-            m, "_build_launch_cmd", lambda c, a, wd, **k: ["copilot"])
+            m, "_build_launch_cmd", _build_launch)
         monkeypatch.setattr(m, "_build_env", lambda p, s, work_dir=None: {})
         monkeypatch.setattr(m, "_repo_session_env", lambda c, w: {})
+        monkeypatch.setattr(
+            sessions,
+            "mux_binding_for_session",
+            lambda sid, expected_session_name=None: {
+                "session_name": expected_session_name,
+                "pane_id": "%4",
+                "copilot_pid": 4242,
+                "copilot_start_time": "created-1",
+            },
+        )
         captured = {}
 
-        def _new_window(wt, wd, cmd, env, **kwargs):
+        def _pane_create(wt, wd, cmd, env, **kwargs):
             captured.update(
                 worktree=wt,
                 work_dir=wd,
@@ -763,14 +1848,25 @@ class TestCmdHandoffCutover:
             return {
                 "ok": True,
                 "new_pane": "%5",
+                "pane_id": "%5",
                 "prompt_received": True,
+                "prompt_status": "launching",
+                "receipt_received": True,
+                "receipt_status": "launching",
+                "foregrounded": True,
+                "mux_session": "caller-session",
+                "method": "new-window",
             }
 
-        monkeypatch.setattr(sessions, "mux_new_window", _new_window)
+        monkeypatch.setattr(m.pane_lifecycle, "pane_create", _pane_create)
         monkeypatch.setattr(m.activity, "log_event", lambda *a, **k: None)
 
         rc = m.cmd_handoff_cutover(
-            _ns(seed="continue", old_pane="%4")
+            _ns(
+                seed="continue",
+                old_pane="%4",
+                session_id="anchor-session",
+            )
         )
 
         assert rc == 0
@@ -778,6 +1874,13 @@ class TestCmdHandoffCutover:
         assert out["session"] == "caller-session"
         assert out["old_pane"] == "%4"
         assert out["new_pane"] == "%5"
+        assert out["pane_id"] == "%5"
+        assert out["prompt_status"] == "launching"
+        assert out["receipt_received"] is True
+        assert out["receipt_status"] == "launching"
+        assert out["foregrounded"] is True
+        assert out["mux_session"] == "caller-session"
+        assert out["method"] == "new-window"
         assert captured == {
             "worktree": "@anchor",
             "work_dir": str(anchor),
@@ -785,6 +1888,7 @@ class TestCmdHandoffCutover:
             "session_name": "caller-session",
             "initial_prompt": "continue",
         }
+        assert launch["fallback_copilot_path"] is None
 
     def test_spawn_dry_run_reports_plan_and_old_pane(
         self, monkeypatch, capfd, tmp_path,
@@ -811,13 +1915,13 @@ class TestCmdHandoffCutover:
             m, "_preflight_launch", lambda c, a, w: m.LaunchPreflight())
         monkeypatch.setattr(
             m, "_build_launch_cmd",
-            lambda cfg_, args, wd, **k: ["bash", "setup.sh", "--allow-all-tools"],
+            lambda cfg_, args, wd, **k: ["bash", "setup.sh", "--allow-all", "--experimental"],
         )
         monkeypatch.setattr(m, "_build_env", lambda p, s, work_dir=None: {})
         monkeypatch.setattr(m, "_repo_session_env", lambda c, w: {})
 
         # Guard: a real window must NOT be created in dry-run.
-        monkeypatch.setattr(sessions, "mux_new_window",
+        monkeypatch.setattr(m.pane_lifecycle, "pane_create",
                             lambda *a, **k: pytest.fail("should not spawn"))
 
         rc = m.cmd_handoff_cutover(_ns(seed="continue the work", dry_run=True))
@@ -827,8 +1931,132 @@ class TestCmdHandoffCutover:
         assert out["old_pane"] == "%1"
         assert out["session"] == "wt-wtY"
         # The seed is NOT a launch arg -- the plain launch cmd is reported as-is.
-        assert out["cmd"] == ["bash", "setup.sh", "--allow-all-tools"]
+        assert out["cmd"] == ["bash", "setup.sh", "--allow-all", "--experimental"]
         assert out["seed_len"] == len("continue the work")
+
+    def test_retry_refocuses_live_successor_without_spawning(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id="wt-retry-refocus",
+            branch="worktree/wt-retry-refocus",
+            worktree_path="/tmp/src/wt-retry-refocus",
+            repo="test-repo",
+            machine="test",
+            platform="wsl",
+            started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00",
+            resume_count=0,
+            title=None,
+            status="active",
+            completed_at=None,
+            sessions=[],
+        )
+        _tracking.save_record(rec, tmp_tracking_dir / "wt-retry-refocus.yaml")
+        _tracking.register_session("wt-retry-refocus", "predecessor-1")
+        _tracking.register_session("wt-retry-refocus", "successor-1")
+        loaded = _tracking.load_record(tmp_tracking_dir / "wt-retry-refocus.yaml")
+        _tracking.open_handoff(loaded, "predecessor-1", "task-retry-refocus")
+        _tracking.link_handoff(loaded, "task-retry-refocus", "successor-1")
+
+        monkeypatch.setattr(
+            m,
+            "_handoff_cutover_spawn_result",
+            lambda args: pytest.fail("live successor retry must not spawn"),
+        )
+        monkeypatch.setattr(
+            sessions,
+            "mux_binding_for_session",
+            lambda sid, **kwargs: {
+                "session_name": "wt-wt-retry-refocus",
+                "pane_id": "%22",
+            } if sid == "successor-1" else None,
+        )
+        monkeypatch.setattr(sessions, "_mux_bin", lambda mux=None: "tmux")
+        monkeypatch.setattr(
+            sessions,
+            "_mux_pane_alive",
+            lambda pane, mux_bin, session_name=None: pane == "%22",
+        )
+        focused = {}
+        monkeypatch.setattr(
+            sessions,
+            "mux_focus_pane",
+            lambda session_name, pane_id, **kwargs: focused.update(
+                session=session_name, pane=pane_id,
+            ) or True,
+        )
+
+        rc = m.cmd_handoff_cutover(
+            _ns(retry=True, worktree_id="wt-retry-refocus", session_id="predecessor-1")
+        )
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["outcome"] == "refocused"
+        assert out["successor_session"] == "successor-1"
+        assert out["successor_pane"] == "%22"
+        assert focused == {"session": "wt-wt-retry-refocus", "pane": "%22"}
+
+    def test_retry_falls_back_to_spawn_when_no_live_successor(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id="wt-retry-spawn",
+            branch="worktree/wt-retry-spawn",
+            worktree_path="/tmp/src/wt-retry-spawn",
+            repo="test-repo",
+            machine="test",
+            platform="wsl",
+            started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00",
+            resume_count=0,
+            title=None,
+            status="active",
+            completed_at=None,
+            sessions=[],
+        )
+        _tracking.save_record(rec, tmp_tracking_dir / "wt-retry-spawn.yaml")
+        _tracking.register_session("wt-retry-spawn", "predecessor-1")
+        loaded = _tracking.load_record(tmp_tracking_dir / "wt-retry-spawn.yaml")
+        _tracking.open_handoff(loaded, "predecessor-1", "task-retry-spawn")
+
+        monkeypatch.setattr(
+            m,
+            "_monitor_read_session_state_handoff",
+            lambda path: {
+                "handoffId": "task-retry-spawn",
+                "seed": "HANDOFF_SEED",
+                "promptText": "stored markdown",
+            },
+        )
+        monkeypatch.setattr(
+            sessions,
+            "mux_binding_for_session",
+            lambda sid, **kwargs: None,
+        )
+        captured = {}
+
+        def _spawn(args):
+            captured["args"] = args
+            return 0, {"ok": True, "session": "wt-wt-retry-spawn", "new_pane": "%33"}
+
+        monkeypatch.setattr(m, "_handoff_cutover_spawn_result", _spawn)
+
+        rc = m.cmd_handoff_cutover(
+            _ns(retry=True, worktree_id="wt-retry-spawn", session_id="predecessor-1")
+        )
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["outcome"] == "spawned"
+        assert captured["args"].seed == "HANDOFF_SEED"
+        assert captured["args"].handoff_token == "task-retry-spawn"
+        assert captured["args"].session_id == "predecessor-1"
 
     def test_spawn_dry_run_prefers_recorded_copilot_pane(
         self, monkeypatch, capfd, tmp_path
@@ -868,8 +2096,8 @@ class TestCmdHandoffCutover:
         out = json.loads(capfd.readouterr().out)
         assert out["old_pane"] == "%bound"
 
-    @pytest.mark.parametrize("native_outcome", [None, "success", "retained"])
-    def test_spawn_success_opens_window(self, monkeypatch, capfd, tmp_path, native_outcome):
+    @pytest.mark.parametrize("native", [False, True])
+    def test_spawn_success_opens_window(self, monkeypatch, capfd, tmp_path, native):
         monkeypatch.setattr(m, "_infer_worktree_id_from_cwd", lambda: "wtZ")
         monkeypatch.setattr(sessions, "has_mux_session", lambda w: True)
         monkeypatch.setattr(sessions, "mux_active_pane", lambda w: "%2")
@@ -890,69 +2118,1726 @@ class TestCmdHandoffCutover:
 
         captured = {}
 
-        def _fake_new_window(wt, wd, cmd, env, **k):
+        def _fake_pane_create(wt, wd, cmd, env, **k):
             captured["cmd"] = cmd
             captured["env"] = env
             captured["kwargs"] = k
             return {
-                "ok": native_outcome != "retained",
+                "ok": True,
+                "new_pane": "%5",
+                "pane_id": "%5",
+                "prompt_received": True,
+                "prompt_status": "launching",
+                "receipt_received": True,
+                "receipt_status": "launching",
+                "foregrounded": True,
+                "mux_session": "wt-wtZ",
+                "method": "new-window",
+                "error": None,
+            }
+
+        monkeypatch.setattr(m.pane_lifecycle, "pane_create", _fake_pane_create)
+        monkeypatch.setattr(
+            m,
+            "_wait_for_handoff_candidate",
+            lambda *a, **k: ("successor-session", "session-associated"),
+        )
+        native_args = {}
+        if native:
+            checkpoint = tmp_path / "native-checkpoint.json"
+            checkpoint.write_text(json.dumps({
+                "sessionId": "source",
+                "nativeGoal": {
+                    "successorSessionId": "target", "phase": "frozen",
+                    "permissionMode": "allow-all",
+                },
+            }))
+            native_args = {
+                "session_id": "source", "native_handoff": str(checkpoint),
+                "native_launcher": "native-launch.mjs",
+            }
+        rc = m.cmd_handoff_cutover(_ns(
+            seed="resume the multi word work",
+            old_pane="%2",
+            handoff_token="task-123",
+            **native_args,
+        ))
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["ok"] is True
+        assert out["old_pane"] == "%2"
+        assert out["new_pane"] == "%5"
+        assert out["pane_id"] == "%5"
+        assert out["prompt_status"] == "launching"
+        assert out["receipt_received"] is True
+        assert out["foregrounded"] is True
+        assert out["seed_len"] == len("resume the multi word work")
+        assert out["seeded"] is True
+        # The launch cmd carries NO seed arg; the wrapper receives base64 through
+        # the mux window environment and appends native --interactive afterward.
+        assert captured["cmd"] == ([
+            "node", "native-launch.mjs", "--checkpoint", str(checkpoint),
+            "--cli", "copilot", "--", "--session-id", "target",
+        ] if native else ["copilot"])
+        assert captured["kwargs"]["initial_prompt"] == (
+            None if native else "resume the multi word work"
+        )
+        if native:
+            assert out["native_handoff"] == str(checkpoint)
+            assert out["startup_pending"] is True
+        assert captured["env"]["AGENT_WORKTREES_HANDOFF_TOKEN"] == "task-123"
+        assert out["seed_method"] == "interactive-argv"
+
+    def test_spawn_success_emits_started_then_success_event(
+        self, monkeypatch, capfd, tmp_path,
+    ):
+        """#2457 Phase 1: the spawn-started event must fire before the mux
+        subprocess call, and the terminal success event follows it -- so a
+        killed spawn still leaves a started-but-no-terminal trace."""
+        monkeypatch.setattr(m, "_infer_worktree_id_from_cwd", lambda: "wtZ")
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: True)
+        monkeypatch.setattr(sessions, "mux_active_pane", lambda w: "%2")
+        (tmp_path / "wtZ.yaml").write_text("x")
+        monkeypatch.setattr(m.cfg, "load_config", lambda: object())
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+
+        class _Rec:
+            worktree_path = str(tmp_path / "w")
+
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: _Rec())
+        monkeypatch.setattr(
+            m, "_preflight_launch", lambda c, a, w: m.LaunchPreflight())
+        monkeypatch.setattr(m, "_build_launch_cmd",
+                            lambda c, a, wd, **k: ["copilot"])
+        monkeypatch.setattr(m, "_build_env", lambda p, s, work_dir=None: {})
+        monkeypatch.setattr(m, "_repo_session_env", lambda c, w: {})
+
+        recorded: list[str] = []
+
+        def _fake_pane_create(wt, wd, cmd, env, **k):
+            # The started event must already be visible by the time the mux
+            # subprocess call itself runs.
+            assert recorded == ["handoff_successor_spawn_started"]
+            return {
+                "ok": True,
                 "new_pane": "%5",
                 "prompt_received": True,
                 "error": None,
             }
 
-        monkeypatch.setattr(sessions, "mux_new_window", _fake_new_window)
-        native_args = {}
-        if native_outcome:
-            checkpoint = tmp_path / "native checkpoint.json"
-            checkpoint.write_text(json.dumps({
-                "sessionId": "owned-source",
-                "nativeGoal": {
-                    "successorSessionId": "owned-target", "phase": "frozen",
-                    "permissionMode": "allow-all",
-                },
-            }))
-            native_args = dict(native_handoff=str(checkpoint), native_launcher="/owned/native-launch.mjs",
-                               session_id="owned-source")
-        rc = m.cmd_handoff_cutover(_ns(seed="resume the multi word work", old_pane="%2", **native_args))
-        assert rc == (4 if native_outcome == "retained" else 0)
+        def _record_log_event(event, **kwargs):
+            recorded.append(event)
+
+        monkeypatch.setattr(m.pane_lifecycle, "pane_create", _fake_pane_create)
+        monkeypatch.setattr(activity, "log_event", _record_log_event)
+        monkeypatch.setattr(
+            m,
+            "_wait_for_handoff_candidate",
+            lambda *a, **k: ("successor-session", "session-associated"),
+        )
+        rc = m.cmd_handoff_cutover(_ns(
+            seed="resume the multi word work",
+            old_pane="%2",
+            handoff_token="task-123",
+        ))
+        assert rc == 0
+        capfd.readouterr()
+        assert recorded == [
+            "handoff_successor_spawn_started",
+            "handoff_cutover_spawn",
+        ]
+
+    def test_spawn_threads_verified_predecessor_executable(
+        self, monkeypatch, capfd, tmp_path,
+    ):
+        monkeypatch.setattr(m, "_infer_worktree_id_from_cwd", lambda: "wtZ")
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: True)
+        (tmp_path / "wtZ.yaml").write_text("x", encoding="utf-8")
+        monkeypatch.setattr(m.cfg, "load_config", lambda: object())
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+
+        class _Rec:
+            worktree_path = str(tmp_path / "w")
+
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: _Rec())
+        monkeypatch.setattr(
+            m, "_preflight_launch", lambda c, a, w: m.LaunchPreflight()
+        )
+        monkeypatch.setattr(
+            sessions,
+            "mux_binding_for_session",
+            lambda sid: {
+                "session_name": "wt-wtZ",
+                "pane_id": "%2",
+                "copilot_pid": 4242,
+                "copilot_start_time": "created-1",
+            },
+        )
+        monkeypatch.setattr(
+            procs,
+            "process_executable_path",
+            lambda pid: r"C:\Programs\Copilot\copilot.exe.old-123",
+        )
+        monkeypatch.setattr(
+            procs,
+            "copilot_relaunch_path",
+            lambda path: r"C:\Programs\Copilot\copilot.exe",
+        )
+        monkeypatch.setattr(
+            locks, "process_start_time", lambda pid: "created-1"
+        )
+        captured = {}
+
+        def _build(config, args, work_dir, **kwargs):
+            captured.update(kwargs)
+            return ["copilot"]
+
+        monkeypatch.setattr(m, "_build_launch_cmd", _build)
+        monkeypatch.setattr(m, "_build_env", lambda p, s, work_dir=None: {})
+        monkeypatch.setattr(m, "_repo_session_env", lambda c, w: {})
+        monkeypatch.setattr(
+            sessions,
+            "mux_binding_for_session",
+            lambda sid: {
+                "session_name": "wt-wtZ",
+                "pane_id": "%2",
+                "copilot_pid": 4242,
+                "copilot_start_time": "created-1",
+            },
+        )
+        monkeypatch.setattr(
+            m.pane_lifecycle,
+            "pane_create",
+            lambda *a, **k: {
+                "ok": True,
+                "new_pane": "%5",
+                "prompt_received": True,
+            },
+        )
+
+        rc = m.cmd_handoff_cutover(
+            _ns(seed="continue", session_id="session-1")
+        )
+
+        assert rc == 0
+        assert captured["fallback_copilot_path"] == (
+            r"C:\Programs\Copilot\copilot.exe"
+        )
+        assert json.loads(capfd.readouterr().out)["old_pane"] == "%2"
+
+    def test_spawn_drops_executable_when_process_identity_changes(
+        self, monkeypatch, capfd, tmp_path,
+    ):
+        monkeypatch.setattr(m, "_infer_worktree_id_from_cwd", lambda: "wtZ")
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: True)
+        monkeypatch.setattr(sessions, "mux_active_pane", lambda w: "%2")
+        (tmp_path / "wtZ.yaml").write_text("x", encoding="utf-8")
+        monkeypatch.setattr(m.cfg, "load_config", lambda: object())
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+
+        class _Rec:
+            worktree_path = str(tmp_path / "w")
+
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: _Rec())
+        monkeypatch.setattr(
+            m, "_preflight_launch", lambda c, a, w: m.LaunchPreflight()
+        )
+        monkeypatch.setattr(
+            sessions,
+            "mux_binding_for_session",
+            lambda sid: {
+                "session_name": "wt-wtZ",
+                "pane_id": "%2",
+                "copilot_pid": 4242,
+                "copilot_start_time": "created-1",
+            },
+        )
+        monkeypatch.setattr(
+            procs, "process_executable_path", lambda pid: "/opt/copilot"
+        )
+        monkeypatch.setattr(
+            procs, "copilot_relaunch_path", lambda path: path
+        )
+        monkeypatch.setattr(
+            locks, "process_start_time", lambda pid: "created-2"
+        )
+        captured = {}
+
+        def _build(config, args, work_dir, **kwargs):
+            captured.update(kwargs)
+            return ["copilot"]
+
+        monkeypatch.setattr(m, "_build_launch_cmd", _build)
+        monkeypatch.setattr(m, "_build_env", lambda p, s, work_dir=None: {})
+        monkeypatch.setattr(m, "_repo_session_env", lambda c, w: {})
+        monkeypatch.setattr(
+            m.pane_lifecycle,
+            "pane_create",
+            lambda *a, **k: {
+                "ok": True,
+                "new_pane": "%5",
+                "prompt_received": True,
+            },
+        )
+
+        rc = m.cmd_handoff_cutover(
+            _ns(seed="continue", session_id="session-1")
+        )
+
+        assert rc == 0
+        assert captured["fallback_copilot_path"] is None
+        capfd.readouterr()
+
+    def test_token_launch_requires_associated_successor_session(
+        self, monkeypatch, capfd, tmp_path,
+    ):
+        monkeypatch.setattr(m, "_infer_worktree_id_from_cwd", lambda: "wtZ")
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: True)
+        record_path = tmp_path / "wtZ.yaml"
+        record_path.write_text("x", encoding="utf-8")
+        monkeypatch.setattr(m.cfg, "load_config", lambda: object())
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+
+        class _Rec:
+            worktree_path = str(tmp_path / "w")
+
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: _Rec())
+        monkeypatch.setattr(
+            m, "_preflight_launch", lambda c, a, w: m.LaunchPreflight()
+        )
+        monkeypatch.setattr(m, "_build_launch_cmd", lambda *a, **k: ["copilot"])
+        monkeypatch.setattr(m, "_build_env", lambda p, s, work_dir=None: {})
+        monkeypatch.setattr(m, "_repo_session_env", lambda c, w: {})
+        monkeypatch.setattr(
+            m.pane_lifecycle,
+            "pane_create",
+            lambda *a, **k: {
+                "ok": True,
+                "new_pane": "%5",
+                "prompt_received": True,
+            },
+        )
+        monkeypatch.setattr(
+            m,
+            "_wait_for_handoff_candidate",
+            lambda *a, **k: (None, "pane-exited-before-session"),
+        )
+        monkeypatch.setattr(
+            sessions, "_mux_pane_process_tree", lambda pane: {100, 101}
+        )
+        monkeypatch.setattr(
+            sessions,
+            "_retire_failed_successor",
+            lambda pane, tree: pytest.fail("verification timeout must not retire the pane"),
+        )
+
+        rc = m.cmd_handoff_cutover(
+            _ns(
+                seed="continue",
+                session_id="session-1",
+                handoff_token="task-123",
+            )
+        )
+
+        assert rc == 4
         out = json.loads(capfd.readouterr().out)
-        assert out["ok"] is (native_outcome != "retained")
-        assert out["old_pane"] == "%2"
-        assert out["new_pane"] == "%5"
-        if native_outcome:
-            assert out["native_handoff"] == str(checkpoint)
-            assert captured["cmd"] == [
-                "node", "/owned/native-launch.mjs", "--checkpoint", str(checkpoint),
-                "--cli", "copilot", "--", "--session-id", "owned-target",
-            ]
-            assert captured["kwargs"]["initial_prompt"] is None
-            return
+        assert out["ok"] is False
+        assert out["candidate_status"] == "pane-exited-before-session"
+        assert "cleanup" not in out
+
+    def test_token_launch_returns_associated_successor_session(
+        self, monkeypatch, capfd, tmp_path,
+    ):
+        monkeypatch.setattr(m, "_infer_worktree_id_from_cwd", lambda: "wtZ")
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: True)
+        record_path = tmp_path / "wtZ.yaml"
+        record_path.write_text("x", encoding="utf-8")
+        monkeypatch.setattr(m.cfg, "load_config", lambda: object())
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+
+        class _Rec:
+            worktree_path = str(tmp_path / "w")
+
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: _Rec())
+        monkeypatch.setattr(
+            m, "_preflight_launch", lambda c, a, w: m.LaunchPreflight()
+        )
+        monkeypatch.setattr(m, "_build_launch_cmd", lambda *a, **k: ["copilot"])
+        monkeypatch.setattr(m, "_build_env", lambda p, s, work_dir=None: {})
+        monkeypatch.setattr(m, "_repo_session_env", lambda c, w: {})
+        monkeypatch.setattr(
+            m.pane_lifecycle,
+            "pane_create",
+            lambda *a, **k: {
+                "ok": True,
+                "new_pane": "%5",
+                "prompt_received": True,
+            },
+        )
+        monkeypatch.setattr(
+            m,
+            "_wait_for_handoff_candidate",
+            lambda *a, **k: ("successor-session", "session-associated"),
+        )
+
+        rc = m.cmd_handoff_cutover(
+            _ns(
+                seed="continue",
+                session_id="session-1",
+                handoff_token="task-123",
+            )
+        )
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["candidate_session"] == "successor-session"
+
+    def test_spawn_failure_preserves_prompt_receipt_details(
+        self, monkeypatch, capfd, tmp_path,
+    ):
+        monkeypatch.setattr(m, "_infer_worktree_id_from_cwd", lambda: "wtZ")
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: True)
+        monkeypatch.setattr(sessions, "mux_active_pane", lambda w: "%2")
+        (tmp_path / "wtZ.yaml").write_text("x", encoding="utf-8")
+        monkeypatch.setattr(m.cfg, "load_config", lambda: object())
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+
+        class _Rec:
+            worktree_path = str(tmp_path / "w")
+
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: _Rec())
+        monkeypatch.setattr(
+            m, "_preflight_launch", lambda c, a, w: m.LaunchPreflight(),
+        )
+        monkeypatch.setattr(
+            m, "_build_launch_cmd", lambda *a, **k: ["copilot"],
+        )
+        monkeypatch.setattr(m, "_build_env", lambda p, s, work_dir=None: {})
+        monkeypatch.setattr(m, "_repo_session_env", lambda c, w: {})
+        monkeypatch.setattr(
+            m.pane_lifecycle,
+            "pane_create",
+            lambda *a, **k: {
+                "ok": False,
+                "new_pane": "%5",
+                "pane_id": "%5",
+                "prompt_received": False,
+                "prompt_status": "failed:pane-exited",
+                "receipt_received": False,
+                "receipt_status": "failed:pane-exited",
+                "foregrounded": False,
+                "mux_session": "wt-wtZ",
+                "method": "new-window",
+                "error": "successor exited during startup",
+            },
+        )
+
+        rc = m.cmd_handoff_cutover(_ns(seed="continue"))
+
+        assert rc == 4
+        out = json.loads(capfd.readouterr().out)
+        assert out["ok"] is False
+        assert out["prompt_received"] is False
+        assert out["prompt_status"] == "failed:pane-exited"
+        assert out["receipt_status"] == "failed:pane-exited"
+        assert out["error"] == (
+            "failed to open successor window: "
+            "successor exited during startup"
+        )
+
+    def test_spawn_failure_emits_started_then_failed_event(
+        self, monkeypatch, capfd, tmp_path,
+    ):
+        """#2457 Phase 1: a spawn that fails to open the mux window still
+        emits the started event, followed by the terminal failure event --
+        never the success event `handoff_cutover_spawn`."""
+        monkeypatch.setattr(m, "_infer_worktree_id_from_cwd", lambda: "wtZ")
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: True)
+        monkeypatch.setattr(sessions, "mux_active_pane", lambda w: "%2")
+        (tmp_path / "wtZ.yaml").write_text("x", encoding="utf-8")
+        monkeypatch.setattr(m.cfg, "load_config", lambda: object())
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+
+        class _Rec:
+            worktree_path = str(tmp_path / "w")
+
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: _Rec())
+        monkeypatch.setattr(
+            m, "_preflight_launch", lambda c, a, w: m.LaunchPreflight(),
+        )
+        monkeypatch.setattr(
+            m, "_build_launch_cmd", lambda *a, **k: ["copilot"],
+        )
+        monkeypatch.setattr(m, "_build_env", lambda p, s, work_dir=None: {})
+        monkeypatch.setattr(m, "_repo_session_env", lambda c, w: {})
+        monkeypatch.setattr(
+            m.pane_lifecycle,
+            "pane_create",
+            lambda *a, **k: {
+                "ok": False,
+                "new_pane": "%5",
+                "prompt_received": False,
+                "prompt_status": "failed:pane-exited",
+                "error": "successor exited during startup",
+            },
+        )
+
+        recorded: list[str] = []
+        monkeypatch.setattr(
+            activity,
+            "log_event",
+            lambda event, **kwargs: recorded.append(event),
+        )
+
+        rc = m.cmd_handoff_cutover(_ns(seed="continue"))
+
+        assert rc == 4
+        capfd.readouterr()
+        assert recorded == [
+            "handoff_successor_spawn_started",
+            "handoff_successor_spawn_failed",
+        ]
+
+    def test_spawn_exception_from_mux_still_emits_failed_event(
+        self, monkeypatch, tmp_path,
+    ):
+        """An exception `mux_new_window` doesn't itself guard against (it only
+        catches OSError/RuntimeError/TimeoutExpired) must not leave the trace
+        stuck at 'started' -- the failure event still fires, and the
+        exception still propagates to the caller unchanged."""
+        monkeypatch.setattr(m, "_infer_worktree_id_from_cwd", lambda: "wtZ")
+        monkeypatch.setattr(sessions, "has_mux_session", lambda w: True)
+        monkeypatch.setattr(sessions, "mux_active_pane", lambda w: "%2")
+        (tmp_path / "wtZ.yaml").write_text("x", encoding="utf-8")
+        monkeypatch.setattr(m.cfg, "load_config", lambda: object())
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+
+        class _Rec:
+            worktree_path = str(tmp_path / "w")
+
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: _Rec())
+        monkeypatch.setattr(
+            m, "_preflight_launch", lambda c, a, w: m.LaunchPreflight(),
+        )
+        monkeypatch.setattr(
+            m, "_build_launch_cmd", lambda *a, **k: ["copilot"],
+        )
+        monkeypatch.setattr(m, "_build_env", lambda p, s, work_dir=None: {})
+        monkeypatch.setattr(m, "_repo_session_env", lambda c, w: {})
+
+        def _raise(*a, **k):
+            raise ValueError("unexpected mux blowup")
+
+        monkeypatch.setattr(m.pane_lifecycle, "pane_create", _raise)
+
+        recorded: list[tuple[str, object]] = []
+        monkeypatch.setattr(
+            activity,
+            "log_event",
+            lambda event, **kwargs: recorded.append((event, kwargs.get("error"))),
+        )
+
+        with pytest.raises(ValueError, match="unexpected mux blowup"):
+            m.cmd_handoff_cutover(_ns(seed="continue"))
+
+        assert [event for event, _ in recorded] == [
+            "handoff_successor_spawn_started",
+            "handoff_successor_spawn_failed",
+        ]
+        assert recorded[1][1] == "unexpected mux blowup"
+
+    # -- --headless (Phase 3 §4.3 non-mux launch primitive) --------------
+
+    def test_headless_bypasses_mux_session_requirement(self, monkeypatch, capfd):
+        """Unlike the ordinary spawn path, --headless must NOT fail just
+        because there is no live mux session for this worktree."""
+        monkeypatch.setattr(m, "_infer_worktree_id_from_cwd", lambda: "wtH")
+        monkeypatch.setattr(
+            sessions, "has_mux_session",
+            lambda w: pytest.fail("headless must not check for a mux session"),
+        )
+        rc = m.cmd_handoff_cutover(_ns(seed="go", headless=True))
+        # Fails later (no config/record fixtures here), but never on the
+        # mux-session check -- confirmed by has_mux_session never being called.
+        assert rc != 3 or "not under mux" not in capfd.readouterr().out
+
+    def test_headless_rejects_anchor_mode(self, monkeypatch, capfd):
+        monkeypatch.setattr(
+            m, "_resolve_handoff_cutover_target",
+            lambda raw_id, session_id: (
+                0, {"worktree_id": "wtX", "config": None, "anchor_mode": True},
+            ),
+        )
+        rc = m.cmd_handoff_cutover(_ns(seed="go", headless=True))
+        assert rc == 2
+        assert "anchor-mode" in capfd.readouterr().out
+
+    def test_headless_spawn_success(self, monkeypatch, capfd, tmp_path):
+        monkeypatch.setattr(m, "_infer_worktree_id_from_cwd", lambda: "wtH")
+        (tmp_path / "wtH.yaml").write_text("x")
+        monkeypatch.setattr(m.cfg, "load_config", lambda: object())
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+
+        class _Rec:
+            worktree_path = str(tmp_path / "w")
+
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: _Rec())
+        monkeypatch.setattr(
+            m, "_preflight_launch", lambda c, a, w: m.LaunchPreflight())
+        monkeypatch.setattr(m, "_build_launch_cmd",
+                            lambda c, a, wd, **k: ["copilot"])
+        monkeypatch.setattr(m, "_build_env", lambda p, s, work_dir=None: {})
+        monkeypatch.setattr(m, "_repo_session_env", lambda c, w: {})
+
+        captured = {}
+
+        def _fake_headless(wt, wd, cmd, env, *, seed=None):
+            captured["cmd"] = cmd
+            captured["env"] = env
+            captured["seed"] = seed
+            return {"ok": True, "pid": 4242, "error": None}
+
+        monkeypatch.setattr(sessions, "headless_new_session", _fake_headless)
+        monkeypatch.setattr(
+            m,
+            "_wait_for_handoff_candidate",
+            lambda *a, **k: ("successor-session", "session-associated"),
+        )
+        rc = m.cmd_handoff_cutover(_ns(
+            seed="resume the multi word work",
+            headless=True,
+            handoff_token="task-123",
+        ))
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["ok"] is True
+        assert out["headless"] is True
+        assert out["pid"] == 4242
         assert out["seed_len"] == len("resume the multi word work")
         assert out["seeded"] is True
-        # The launch cmd carries NO seed arg; the wrapper receives base64 through
-        # the mux window environment and appends native --interactive afterward.
+        assert out["candidate_session"] == "successor-session"
+        # The seed is threaded through as a real kwarg -- headless_new_session
+        # (not this call site) is responsible for appending native -i <seed>.
         assert captured["cmd"] == ["copilot"]
-        assert captured["kwargs"]["initial_prompt"] == (
-            "resume the multi word work"
-        )
-        assert out["seed_method"] == "interactive-argv"
+        assert captured["seed"] == "resume the multi word work"
+        assert captured["env"]["AGENT_WORKTREES_HANDOFF_TOKEN"] == "task-123"
 
-    @pytest.mark.parametrize("permission_mode", ["manual", "assisted"])
-    def test_native_permissions_rejected_before_launch_planning(self, monkeypatch, capfd, tmp_path, permission_mode):
-        checkpoint = tmp_path / "native.json"
-        checkpoint.write_text(json.dumps({
-            "sessionId": "owned-source",
-            "nativeGoal": {
-                "successorSessionId": "owned-target", "phase": "frozen",
-                "permissionMode": permission_mode,
-            },
-        }))
-        monkeypatch.setattr(m.cfg, "load_config", lambda: pytest.fail("must reject before planning"))
-        monkeypatch.setattr(sessions, "mux_new_window", lambda *a, **k: pytest.fail("must not spawn"))
-        rc = m.cmd_handoff_cutover(_ns(
-            seed="owned seed", session_id="owned-source",
-            native_handoff=str(checkpoint), native_launcher="/owned/native-launch.mjs",
-        ))
+    def test_headless_spawn_failure_reports_error(self, monkeypatch, capfd, tmp_path):
+        monkeypatch.setattr(m, "_infer_worktree_id_from_cwd", lambda: "wtH")
+        (tmp_path / "wtH.yaml").write_text("x")
+        monkeypatch.setattr(m.cfg, "load_config", lambda: object())
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+
+        class _Rec:
+            worktree_path = str(tmp_path / "w")
+
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: _Rec())
+        monkeypatch.setattr(
+            m, "_preflight_launch", lambda c, a, w: m.LaunchPreflight())
+        monkeypatch.setattr(m, "_build_launch_cmd",
+                            lambda c, a, wd, **k: ["copilot"])
+        monkeypatch.setattr(m, "_build_env", lambda p, s, work_dir=None: {})
+        monkeypatch.setattr(m, "_repo_session_env", lambda c, w: {})
+        monkeypatch.setattr(
+            sessions, "headless_new_session",
+            lambda *a, **k: {"ok": False, "pid": None, "error": "no such file"},
+        )
+        rc = m.cmd_handoff_cutover(_ns(seed="go", headless=True))
+        assert rc == 4
+        out = json.loads(capfd.readouterr().out)
+        assert out["ok"] is False
+        assert "no such file" in out["error"]
+
+    def test_headless_dry_run_reports_plan_without_spawning(
+        self, monkeypatch, capfd, tmp_path,
+    ):
+        monkeypatch.setattr(m, "_infer_worktree_id_from_cwd", lambda: "wtH")
+        (tmp_path / "wtH.yaml").write_text("x")
+        monkeypatch.setattr(m.cfg, "load_config", lambda: object())
+        monkeypatch.setattr(m.cfg, "tracking_dir", lambda: tmp_path)
+
+        class _Rec:
+            worktree_path = str(tmp_path / "w")
+
+        monkeypatch.setattr(m.tracking, "load_record", lambda p: _Rec())
+        monkeypatch.setattr(
+            m, "_preflight_launch", lambda c, a, w: m.LaunchPreflight())
+        monkeypatch.setattr(
+            m, "_build_launch_cmd", lambda c, a, wd, **k: ["copilot"])
+        monkeypatch.setattr(m, "_build_env", lambda p, s, work_dir=None: {})
+        monkeypatch.setattr(m, "_repo_session_env", lambda c, w: {})
+        monkeypatch.setattr(
+            sessions, "headless_new_session",
+            lambda *a, **k: pytest.fail("dry-run must not spawn"),
+        )
+        rc = m.cmd_handoff_cutover(_ns(seed="continue", headless=True, dry_run=True))
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["dry_run"] is True
+        assert out["headless"] is True
+        assert out["cmd"] == ["copilot", "-i", "<seed>"]
+
+
+class TestHandoffRepairDispatchArgs:
+    """Direct unit tests pinning the exact ``tracking_write`` verb/args each
+    confirmed-retire repair dispatches (2026-09-27 PR #3911 review findings)
+    -- distinct from the end-to-end ``cmd_handoff_cutover`` tests above,
+    which prove the resulting record state but not the wire-level args."""
+
+    def test_settle_predecessor_session_claim_requests_skip_if_released(
+        self, monkeypatch, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """Must pass ``skip_if_released=True`` so the shared ``claim_settle``
+        verb reproduces this repair's own long-standing guard against
+        resurrecting an already-``released`` claim. Does NOT request a
+        softer lock policy (2026-09-27 PR #3911 review findings): the
+        pre-migration inline transaction's own OUTER ``_RecordLock``
+        degraded on contention, but its final ``save_record`` call already
+        hard-required the sidecar internally, so the verb's own hard
+        requirement matches that net effect exactly."""
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id="wt-repair-args", branch="worktree/wt-repair-args",
+            worktree_path="/tmp/src/wt-repair-args", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        _tracking.save_record(rec, tmp_tracking_dir / "wt-repair-args.yaml")
+        _tracking.register_session("wt-repair-args", "old-sess")
+
+        from agent_worktrees import handoff_cutover as _hc
+
+        captured = {}
+        monkeypatch.setattr(
+            _hc, "_dispatch_handoff_repair",
+            lambda verb, verb_args: captured.update(verb=verb, args=verb_args),
+        )
+        m._settle_predecessor_session_claim("wt-repair-args", "old-sess")
+
+        assert captured["verb"] == "claim_settle"
+        assert captured["args"]["skip_if_released"] is True
+        assert "require_sidecar" not in captured["args"]
+
+    def test_conclude_retired_predecessor_requests_only_if_active(
+        self, monkeypatch, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """Must pass ``only_if_active=True`` so the shared ``session_conclude``
+        verb reproduces this repair's own long-standing no-op guard against
+        re-processing an already-concluded/handed-off entry."""
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id="wt-repair-args-2", branch="worktree/wt-repair-args-2",
+            worktree_path="/tmp/src/wt-repair-args-2", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        _tracking.save_record(rec, tmp_tracking_dir / "wt-repair-args-2.yaml")
+        _tracking.register_session("wt-repair-args-2", "old-sess")
+
+        from agent_worktrees import handoff_cutover as _hc
+
+        captured = {}
+        monkeypatch.setattr(
+            _hc, "_dispatch_handoff_repair",
+            lambda verb, verb_args: captured.update(verb=verb, args=verb_args),
+        )
+        m._conclude_retired_predecessor("wt-repair-args-2", "old-sess")
+
+        assert captured["verb"] == "session_conclude"
+        assert captured["args"]["only_if_active"] is True
+
+
+class TestCmdHandoffsCheck:
+    """``handoffs-check`` -- the on-demand diagnostic + repair counterpart to
+    the resident status-monitor's own automatic predecessor-retire sweep."""
+
+    def _record(self, tmp_tracking_dir, worktree_id, *, predecessor, successor):
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id=worktree_id, branch=f"worktree/{worktree_id}",
+            worktree_path=f"/tmp/src/{worktree_id}", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        path = tmp_tracking_dir / f"{worktree_id}.yaml"
+        _tracking.save_record(rec, path)
+        _tracking.register_session(worktree_id, predecessor)
+        _tracking.register_session(worktree_id, successor)
+        loaded = _tracking.load_record(path)
+        _tracking.open_handoff(loaded, predecessor, f"task-{worktree_id}")
+        _tracking.associate_handoff_candidate(loaded, f"task-{worktree_id}", successor)
+        return path
+
+    def _record_with_chain(self, tmp_tracking_dir, worktree_id, session_ids):
+        """A worktree with several independent stale handoffs -- the exact
+        real-world shape this tool exists for (a serial chain of predecessors
+        each still alive, waiting on retirement)."""
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id=worktree_id, branch=f"worktree/{worktree_id}",
+            worktree_path=f"/tmp/src/{worktree_id}", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        path = tmp_tracking_dir / f"{worktree_id}.yaml"
+        _tracking.save_record(rec, path)
+        for sid in session_ids:
+            _tracking.register_session(worktree_id, sid)
+        loaded = _tracking.load_record(path)
+        for i in range(len(session_ids) - 1):
+            predecessor, successor = session_ids[i], session_ids[i + 1]
+            token = f"task-{worktree_id}-{i}"
+            _tracking.open_handoff(loaded, predecessor, token)
+            _tracking.associate_handoff_candidate(loaded, token, successor)
+        return path
+
+    def test_requires_worktree_id_or_all(self, capfd):
+        rc = m.cmd_handoffs_check(_ns())
         assert rc == 1
-        assert f"cannot preserve {permission_mode}" in json.loads(capfd.readouterr().out)["error"]
+        out = json.loads(capfd.readouterr().out)
+        assert "error" in out
+
+    def test_reports_stale_predecessor_without_executing(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        self._record(
+            tmp_tracking_dir, "wt-check-1",
+            predecessor="old-sess", successor="new-sess",
+        )
+        monkeypatch.setattr(activity, "read_events", lambda **kw: (
+            [{
+                "handoff_token": "task-wt-check-1", "session_id": "old-sess",
+                "old_pane": "%9", "expected_mux_session": "wt-wt-check-1",
+                "predecessor_copilot_pid": 77, "predecessor_copilot_start_time": "old",
+            }] if kw.get("event") == "handoff_cutover_spawn" else []
+        ))
+        retired = []
+
+        def _must_not_execute(req):
+            retired.append(req)
+            pytest.fail("must not execute without --execute")
+
+        monkeypatch.setattr(m, "_monitor_retire_handoff_predecessor", _must_not_execute)
+
+        rc = m.cmd_handoffs_check(_ns(worktree_id="wt-check-1", json=True))
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["checked"] == 1
+        assert out["found"] == 1
+        assert out["executed"] is False
+        finding = out["findings"][0]
+        assert finding["predecessor_session_id"] == "old-sess"
+        assert finding["retire_pane"] == "%9"
+        assert finding["executed"] is False
+        assert not retired
+
+    def test_execute_retires_and_reports_success(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """Regression: the real ``_handoff_cutover_retire_result`` response
+        has no "outcome" key at all (that string is only computed for the
+        activity-log event, never merged back) -- its actual success signal
+        is ``ok``/``gone``. This mock intentionally omits "outcome" to match
+        that real shape; a prior version of cmd_handoffs_check checked
+        ``response.get("outcome") == "gone"``, which is always False against
+        the real function and reported every successful retire as failed."""
+        self._record(
+            tmp_tracking_dir, "wt-check-2",
+            predecessor="old-sess", successor="new-sess",
+        )
+        monkeypatch.setattr(activity, "read_events", lambda **kw: (
+            [{
+                "handoff_token": "task-wt-check-2", "session_id": "old-sess",
+                "old_pane": "%9", "expected_mux_session": "wt-wt-check-2",
+                "predecessor_copilot_pid": 77, "predecessor_copilot_start_time": "old",
+            }] if kw.get("event") == "handoff_cutover_spawn" else []
+        ))
+        monkeypatch.setattr(
+            m, "_monitor_retire_handoff_predecessor",
+            lambda req: (0, {"ok": True, "pane": req["retire_pane"], "gone": True}),
+        )
+
+        rc = m.cmd_handoffs_check(_ns(worktree_id="wt-check-2", execute=True, json=True))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        finding = out["findings"][0]
+        assert finding["executed"] is True
+        assert finding["retired"] is True
+
+    def test_trusts_live_binding_over_historically_wrong_recorded_pid(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """Regression: a handoff's spawn event can have a permanently wrong
+        recorded predecessor_copilot_pid (context-handoff previously logged
+        its own Node extension-host pid, never fixed retroactively for
+        already-written events -- see PR #2518). A fresh, session-scoped
+        mux_binding_for_session() lookup must override that bad recorded
+        value, or the identity check keeps failing forever even after the
+        root-cause bug is fixed going forward."""
+        self._record(
+            tmp_tracking_dir, "wt-check-8",
+            predecessor="old-sess", successor="new-sess",
+        )
+        monkeypatch.setattr(activity, "read_events", lambda **kw: (
+            [{
+                "handoff_token": "task-wt-check-8", "session_id": "old-sess",
+                "old_pane": "%9", "expected_mux_session": "wt-wt-check-8",
+                # The permanently wrong recorded values (e.g. a Node
+                # extension-host pid, not the real copilot process).
+                "predecessor_copilot_pid": 999999,
+                "predecessor_copilot_start_time": "wrong-start",
+            }] if kw.get("event") == "handoff_cutover_spawn" else []
+        ))
+        monkeypatch.setattr(
+            m.sessions, "mux_session_name", lambda wt_id: f"wt-{wt_id}",
+        )
+        monkeypatch.setattr(
+            m.sessions, "mux_binding_for_session",
+            lambda sid, **kw: (
+                {
+                    "pane_id": "%99", "copilot_pid": 12345,
+                    "copilot_start_time": "real-start",
+                    "session_name": "wt-wt-check-8",
+                }
+                if sid == "old-sess" else None
+            ),
+        )
+        captured = {}
+        monkeypatch.setattr(
+            m, "_monitor_retire_handoff_predecessor",
+            lambda req: (captured.__setitem__("req", req), (0, {"ok": True, "gone": True}))[1],
+        )
+
+        rc = m.cmd_handoffs_check(_ns(worktree_id="wt-check-8", execute=True, json=True))
+
+        assert rc == 0
+        assert captured["req"]["predecessor_pid"] == 12345
+        assert captured["req"]["predecessor_start_time"] == "real-start"
+        assert captured["req"]["retire_pane"] == "%99"
+
+    def test_finds_already_linked_handoff_not_just_pending(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """Regression: a handoff reaches "linked" (successor confirmed) well
+        before its predecessor is actually retired -- that is a separate,
+        later step. A predecessor whose retire failed (or was never
+        attempted) hours ago is long past "pending" by the time anyone
+        checks, so this must still be found via the FULL handoffs list, not
+        just the "still pending" subset -- exactly the real shape this tool
+        was built to catch (this session's own worktree had three)."""
+        from agent_worktrees import tracking as _tracking
+
+        path = self._record(
+            tmp_tracking_dir, "wt-check-6",
+            predecessor="old-sess", successor="new-sess",
+        )
+        loaded = _tracking.load_record(path)
+        _tracking.link_handoff(loaded, "task-wt-check-6", "new-sess")
+        # Confirm the setup actually reproduces the real bug precondition:
+        # once linked, it is no longer in pending_handoffs at all.
+        reloaded = _tracking.load_record(path)
+        assert reloaded.pending_handoffs == []
+
+        monkeypatch.setattr(activity, "read_events", lambda **kw: (
+            [{
+                "handoff_token": "task-wt-check-6", "session_id": "old-sess",
+                "old_pane": "%9", "expected_mux_session": "wt-wt-check-6",
+                "predecessor_copilot_pid": 77, "predecessor_copilot_start_time": "old",
+            }] if kw.get("event") == "handoff_cutover_spawn" else []
+        ))
+        monkeypatch.setattr(
+            m, "_monitor_retire_handoff_predecessor",
+            lambda req: (0, {"ok": True, "pane": req["retire_pane"], "gone": True}),
+        )
+
+        rc = m.cmd_handoffs_check(_ns(worktree_id="wt-check-6", execute=True, json=True))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["found"] == 1
+        assert out["findings"][0]["retired"] is True
+
+    def test_finds_handoff_beyond_bounded_activity_log_via_durable_trace(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """Regression: activity.jsonl is bounded (age + a 64-event read cap),
+        so a worktree with more than 64 later cutovers -- or one revisited
+        past the log's retention window -- can drop an older handoff's
+        spawn/retire evidence out of the bounded activity.read_events()
+        window entirely. Both handoff_cutover_spawn and
+        handoff_predecessor_retire are stage-mapped, so they also land in
+        the durable, unrotated per-project trace store (Phase 3) -- this
+        must be consulted as a completeness backstop."""
+        self._record(
+            tmp_tracking_dir, "wt-check-7",
+            predecessor="old-sess", successor="new-sess",
+        )
+        # The bounded activity log has already aged this handoff's spawn
+        # event out -- simulate that by returning nothing from it.
+        monkeypatch.setattr(activity, "read_events", lambda **kw: [])
+        monkeypatch.setattr(m.cfg, "active_project", lambda: "private-downstream-repo")
+        monkeypatch.setattr(
+            m.handoff_trace, "read_trace",
+            lambda project, worktree_id: (
+                [{
+                    "event": "handoff_cutover_spawn",
+                    "handoff_token": "task-wt-check-7", "session_id": "old-sess",
+                    "old_pane": "%9", "expected_mux_session": "wt-wt-check-7",
+                    "predecessor_copilot_pid": 77, "predecessor_copilot_start_time": "old",
+                }]
+                if worktree_id == "wt-check-7" else []
+            ),
+        )
+        monkeypatch.setattr(
+            m, "_monitor_retire_handoff_predecessor",
+            lambda req: (0, {"ok": True, "pane": req["retire_pane"], "gone": True}),
+        )
+
+        rc = m.cmd_handoffs_check(_ns(worktree_id="wt-check-7", execute=True, json=True))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["found"] == 1
+        assert out["findings"][0]["retired"] is True
+
+    def test_execute_reports_failure_without_masking_it(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        self._record(
+            tmp_tracking_dir, "wt-check-3",
+            predecessor="old-sess", successor="new-sess",
+        )
+        monkeypatch.setattr(activity, "read_events", lambda **kw: (
+            [{
+                "handoff_token": "task-wt-check-3", "session_id": "old-sess",
+                "old_pane": "%9", "expected_mux_session": "wt-wt-check-3",
+                "predecessor_copilot_pid": 77, "predecessor_copilot_start_time": "old",
+            }] if kw.get("event") == "handoff_cutover_spawn" else []
+        ))
+        monkeypatch.setattr(
+            m, "_monitor_retire_handoff_predecessor",
+            lambda req: (
+                1,
+                {
+                    "ok": False, "outcome": "left-running",
+                    "method": "process-identity-mismatch",
+                },
+            ),
+        )
+
+        rc = m.cmd_handoffs_check(_ns(worktree_id="wt-check-3", execute=True, json=True))
+
+        assert rc == 1
+        out = json.loads(capfd.readouterr().out)
+        finding = out["findings"][0]
+        assert finding["executed"] is True
+        assert finding["retired"] is False
+
+    def test_no_findings_is_clean_exit(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id="wt-check-4", branch="worktree/wt-check-4",
+            worktree_path="/tmp/src/wt-check-4", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        _tracking.save_record(rec, tmp_tracking_dir / "wt-check-4.yaml")
+        monkeypatch.setattr(activity, "read_events", lambda **kw: [])
+
+        rc = m.cmd_handoffs_check(_ns(worktree_id="wt-check-4", json=True))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["found"] == 0
+        assert out["findings"] == []
+
+    def test_execute_retires_every_stale_predecessor_in_one_pass(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """Regression: a worktree that accumulated several stale predecessors
+        in a row (the real failure mode this tool exists for) must have ALL
+        of them found and retired in one --execute pass, not just the first
+        -- forcing an operator to re-invoke once per stranded pane."""
+        sessions_chain = ["p0", "p1", "p2", "head"]
+        self._record_with_chain(tmp_tracking_dir, "wt-check-5", sessions_chain)
+
+        spawn_events = [
+            {
+                "handoff_token": f"task-wt-check-5-{i}", "session_id": sessions_chain[i],
+                "old_pane": f"%{i}", "expected_mux_session": "wt-wt-check-5",
+                "predecessor_copilot_pid": 100 + i,
+                "predecessor_copilot_start_time": f"start-{i}",
+            }
+            for i in range(len(sessions_chain) - 1)
+        ]
+        monkeypatch.setattr(activity, "read_events", lambda **kw: (
+            spawn_events if kw.get("event") == "handoff_cutover_spawn" else []
+        ))
+        retired_panes: list[str] = []
+        monkeypatch.setattr(
+            m, "_monitor_retire_handoff_predecessor",
+            lambda req: (
+                retired_panes.append(req["retire_pane"]),
+                (0, {"ok": True, "pane": req["retire_pane"], "gone": True}),
+            )[1],
+        )
+
+        rc = m.cmd_handoffs_check(_ns(worktree_id="wt-check-5", execute=True, json=True))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["found"] == len(sessions_chain) - 1
+        assert sorted(retired_panes) == ["%0", "%1", "%2"]
+        assert all(f["retired"] for f in out["findings"])
+
+
+class TestCmdHandoffCutoverTrigger:
+    """``handoff-cutover-trigger`` -- the on-demand, explicit counterpart to
+    the resident status-monitor's own per-worktree claim+spawn+retire
+    choreography (mux-companion-manual-cutover-diagnostics, #4369). Unlike
+    ``handoffs-check``, there is no read-only preview: invoking the verb IS
+    the explicit human action, so these tests exercise the real
+    ``_monitor_maybe_process_handoff_record`` call via a stub rather than
+    asserting it is withheld."""
+
+    def _record(self, tmp_tracking_dir, worktree_id):
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id=worktree_id, branch=f"worktree/{worktree_id}",
+            worktree_path=f"/tmp/src/{worktree_id}", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        path = tmp_tracking_dir / f"{worktree_id}.yaml"
+        _tracking.save_record(rec, path)
+        return path
+
+    def test_errors_on_unknown_worktree(self, capfd, monkeypatch_config):
+        rc = m.cmd_handoff_cutover_trigger(
+            argparse.Namespace(worktree_id="wt-does-not-exist", json=True))
+        assert rc != 0
+        out = json.loads(capfd.readouterr().out)
+        assert "error" in out
+
+    def test_no_actionable_handoff_is_a_silent_successful_no_op(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        self._record(tmp_tracking_dir, "wt-trigger-1")
+        # Real _monitor_maybe_process_handoff_record with nothing pending is
+        # itself a no-op; stub it so this test doesn't depend on the daemon's
+        # full internal check chain (mux/activity/etc.) -- only this verb's
+        # own before/after reporting is under test here.
+        monkeypatch.setattr(m, "_monitor_maybe_process_handoff_record", lambda rec: None)
+
+        rc = m.cmd_handoff_cutover_trigger(
+            argparse.Namespace(worktree_id="wt-trigger-1", json=True))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["changed"] is False
+        assert out["head_before"] == out["head_after"]
+
+    def test_reports_head_change_after_a_successful_spawn(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        from agent_worktrees import tracking as _tracking
+
+        path = self._record(tmp_tracking_dir, "wt-trigger-2")
+        _tracking.register_session("wt-trigger-2", "predecessor-1")
+
+        def _fake_process(record):
+            # Simulate the daemon's own choreography landing a successor:
+            # register + set head on the SAME record file the CLI will reload.
+            _tracking.register_session("wt-trigger-2", "successor-1")
+            reloaded = _tracking.load_record(path)
+            _tracking.set_head_session(reloaded, "successor-1")
+            _tracking.save_record(reloaded, path)
+
+        monkeypatch.setattr(m, "_monitor_maybe_process_handoff_record", _fake_process)
+
+        rc = m.cmd_handoff_cutover_trigger(
+            argparse.Namespace(worktree_id="wt-trigger-2", json=True))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["changed"] is True
+        assert out["head_after"] == "successor-1"
+        assert out["session_count_after"] == out["session_count_before"] + 1
+
+    def test_arms_ledger_from_unconsumed_session_state_marker_before_processing(
+        self, monkeypatch, tmp_path, tmp_tracking_dir, monkeypatch_config,
+    ):
+        # #mux-companion-manual-cutover-diagnostics: the ledger entry
+        # (record.handoffs) is what triggerHandoff() withholds under
+        # manual-only mode (PR #3041) -- but the session-state marker
+        # (writeSessionStateHandoff) is written UNCONDITIONALLY. This verb
+        # must arm the ledger from that marker itself, so it works even when
+        # the operator never separately ran `trigger --force`.
+        from agent_worktrees import tracking as _tracking
+
+        path = self._record(tmp_tracking_dir, "wt-trigger-4")
+        _tracking.register_session("wt-trigger-4", "predecessor-2")
+        marker_path = tmp_path / "handoff-request.json"
+        marker_path.write_text(json.dumps({
+            "handoffId": "handoff-predecessor-2", "sessionId": "predecessor-2",
+            "consumed": False,
+        }), encoding="utf-8")
+        monkeypatch.setattr(
+            m, "_monitor_session_state_handoff_path",
+            lambda sid: marker_path if sid == "predecessor-2" else None,
+        )
+        seen_records = []
+        monkeypatch.setattr(
+            m, "_monitor_maybe_process_handoff_record",
+            lambda record: seen_records.append(record),
+        )
+
+        rc = m.cmd_handoff_cutover_trigger(
+            argparse.Namespace(worktree_id="wt-trigger-4", json=True))
+
+        assert rc == 0
+        assert len(seen_records) == 1
+        tokens = {h.token for h in seen_records[0].handoffs}
+        assert "handoff-predecessor-2" in tokens
+        # `live_cutover` must be set: `_monitor_pending_handoff_request`'s
+        # own `not handoff.live_cutover` filter would otherwise silently
+        # skip this entry forever, making the whole on-demand trigger a
+        # permanent no-op for exactly the manual-only-mode scenario it
+        # exists to serve.
+        armed = next(h for h in seen_records[0].handoffs if h.token == "handoff-predecessor-2")
+        assert armed.live_cutover is True
+        # The ledger entry is durable -- reloading the record from disk
+        # (not just the in-memory object passed to the stub) shows it too.
+        reloaded = _tracking.load_record(path)
+        assert any(h.token == "handoff-predecessor-2" for h in reloaded.handoffs)
+        reloaded_armed = next(h for h in reloaded.handoffs if h.token == "handoff-predecessor-2")
+        assert reloaded_armed.live_cutover is True
+
+    def test_does_not_duplicate_an_already_open_token_but_upgrades_live_cutover(
+        self, monkeypatch, tmp_path, tmp_tracking_dir, monkeypatch_config,
+    ):
+        from agent_worktrees import tracking as _tracking
+
+        path = self._record(tmp_tracking_dir, "wt-trigger-5")
+        _tracking.register_session("wt-trigger-5", "predecessor-3")
+        loaded = _tracking.load_record(path)
+        # Opened WITHOUT live_cutover -- exactly what an ordinary (non-force)
+        # `trigger_handoff` call leaves behind: a real ledger entry that is
+        # nonetheless invisible to `_monitor_pending_handoff_request`'s own
+        # filter. A human pressing "Cut over" (or calling this verb) must
+        # still be able to arm and recover it.
+        _tracking.open_handoff(loaded, "predecessor-3", "handoff-predecessor-3")
+        _tracking.save_record(loaded, path)
+        marker_path = tmp_path / "handoff-request.json"
+        marker_path.write_text(json.dumps({
+            "handoffId": "handoff-predecessor-3", "sessionId": "predecessor-3",
+            "consumed": False,
+        }), encoding="utf-8")
+        monkeypatch.setattr(
+            m, "_monitor_session_state_handoff_path",
+            lambda sid: marker_path if sid == "predecessor-3" else None,
+        )
+        seen_records = []
+        monkeypatch.setattr(
+            m, "_monitor_maybe_process_handoff_record",
+            lambda record: seen_records.append(record),
+        )
+
+        rc = m.cmd_handoff_cutover_trigger(
+            argparse.Namespace(worktree_id="wt-trigger-5", json=True))
+
+        assert rc == 0
+        assert len(seen_records[0].handoffs) == 1  # still exactly one entry -- not duplicated
+        armed = next(h for h in seen_records[0].handoffs if h.token == "handoff-predecessor-3")
+        assert armed.live_cutover is True
+        reloaded = _tracking.load_record(path)
+        reloaded_armed = next(h for h in reloaded.handoffs if h.token == "handoff-predecessor-3")
+        assert reloaded_armed.live_cutover is True
+
+    def test_human_readable_output_when_nothing_changed(
+        self, monkeypatch, capsys, tmp_tracking_dir, monkeypatch_config,
+    ):
+        self._record(tmp_tracking_dir, "wt-trigger-3")
+        monkeypatch.setattr(m, "_monitor_maybe_process_handoff_record", lambda rec: None)
+
+        rc = m.cmd_handoff_cutover_trigger(
+            argparse.Namespace(worktree_id="wt-trigger-3", json=False))
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "no actionable pending handoff" in out
+
+    @pytest.mark.parametrize("seed_ledger_entry", [False, True])
+    def test_automatic_sweep_path_never_arms_an_ordinary_trigger_handoff_call(
+        self, monkeypatch, tmp_tracking_dir, monkeypatch_config,
+        seed_ledger_entry,
+    ):
+        """Safety boundary: an ordinary (non-``force``) ``trigger_handoff``
+        MCP tool call in ``mode: manual-only`` must never result in a live
+        cutover on its own -- only the Mux Companion's "Cut over" button (or
+        a direct ``handoff-cutover-trigger`` call) may arm one.
+
+        On the JS side (``handoff-core.mjs``'s ``triggerHandoff``), ``note-
+        handoff`` is called UNCONDITIONALLY regardless of mode/force -- an
+        ordinary manual-only call DOES create a real ``record.handoffs``
+        entry, just with ``live_cutover=False`` (``seed_ledger_entry=True``
+        models this, the realistic shape). ``seed_ledger_entry=False`` also
+        covers the degenerate case of no ledger entry at all (e.g. a
+        ``note-handoff`` failure).
+
+        This proves the Python-side half of the boundary:
+        ``_monitor_maybe_process_handoff_record`` -- the EXACT function the
+        resident status-monitor's automatic per-tick sweep calls for every
+        tracked worktree, with no human action involved -- must not itself
+        read the session-state marker and arm (or act on) an unarmed entry.
+        Only ``_arm_pending_handoff_from_session_state`` (reached exclusively
+        via ``cmd_handoff_cutover_trigger``, i.e. an explicit human action)
+        may do that. Exercises the real function directly, bypassing the CLI
+        verb entirely, so a future change that made the automatic sweep
+        path ALSO consult session-state markers -- or act on an unarmed
+        ledger entry -- would be caught here."""
+        from pathlib import Path as _Path
+        from agent_worktrees import tracking as _tracking
+
+        monkeypatch.setenv("AGENT_WORKTREES_STATUS_MONITOR", "1")
+        path = self._record(tmp_tracking_dir, "wt-trigger-6")
+        _tracking.register_session("wt-trigger-6", "predecessor-6")
+        record = _tracking.load_record(path)
+        token = "handoff-predecessor-6"
+        if seed_ledger_entry:
+            # The realistic shape: noteHandoff() already ran unconditionally
+            # with liveCutover=False, so a real entry exists but is unarmed.
+            _tracking.open_handoff(record, "predecessor-6", token, save=False)
+            _tracking.save_record(record, path)
+            record = _tracking.load_record(path)
+        # Exactly what an ordinary trigger_handoff call also leaves behind
+        # regardless of mode: the unconditional session-state marker, with a
+        # nonempty seed (as a real handoff would carry). Written to the REAL
+        # resolved path (``_monitor_session_state_handoff_path`` is a plain,
+        # non-overridable function along this call path -- unlike
+        # ``_arm_pending_handoff_from_session_state``'s own call site, it
+        # cannot be monkeypatched here), relying on the suite's own global
+        # ``Path.home()`` sandbox redirection for isolation.
+        marker_path = _Path.home() / ".copilot" / "session-state" / "predecessor-6" / "handoff-request.json"
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps({
+            "handoffId": token, "sessionId": "predecessor-6",
+            "seed": "Task: example | Resume: /consume-handoff to take over",
+            "consumed": False,
+        }), encoding="utf-8")
+        # Spying on the claim step directly (rather than only inferring from
+        # head/session-count side effects) proves the live_cutover filter
+        # itself rejects an unarmed entry BEFORE any claim is even
+        # attempted -- not merely that a claim happened to fail for an
+        # unrelated reason (e.g. a nonexistent worktree path in this
+        # fixture).
+        claim_calls = []
+        monkeypatch.setattr(
+            m, "_monitor_claim_handoff_cutover",
+            lambda request_data: (claim_calls.append(request_data), {"ok": False})[1],
+        )
+        before_handoffs = list(record.handoffs)
+
+        m._monitor_maybe_process_handoff_record(record)
+
+        assert claim_calls == []
+        reloaded = _tracking.load_record(path)
+        assert len(reloaded.handoffs) == len(before_handoffs)
+        for handoff in reloaded.handoffs:
+            assert handoff.live_cutover is False
+            assert handoff.successor is None
+            assert handoff.candidate is None
+        assert reloaded.resolved_head_session == record.resolved_head_session
+
+
+def test_retire_stamps_predecessor_session_state_with_successor_id(monkeypatch):
+    predecessor_state = sessions._session_state_dir() / "old-sess"
+    predecessor_state.mkdir(parents=True, exist_ok=True)
+    (predecessor_state / "handoff-request.json").write_text(
+        json.dumps({"handoffId": "task-123", "sessionId": "old-sess"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda raw: raw)
+    monkeypatch.setattr(
+        m.pane_lifecycle,
+        "pane_terminate",
+        lambda *a, **k: {"ok": True, "gone": True, "method": "test-retire"},
+    )
+    monkeypatch.setattr(
+        reclaim,
+        "ensure_session_copilot_reaped",
+        lambda *a, **k: {"checked": False, "identity_verified": True},
+    )
+
+    rc, result = m._handoff_cutover_retire_result(
+        _ns(
+            worktree_id="wt-retire",
+            session_id="old-sess",
+            retire_pane="%9",
+            handoff_token="task-123",
+            successor_session_id="new-sess",
+            successor_verified=True,
+        )
+    )
+
+    assert rc == 0
+    assert result["ok"] is True
+    stamped = json.loads(
+        (predecessor_state / "handoff-request.json").read_text(encoding="utf-8")
+    )
+    assert stamped["successor_session_id"] == "new-sess"
+    event = activity.read_events(
+        worktree_id="wt-retire", event="handoff_predecessor_retire"
+    )[0]
+    assert event["predecessor_session_id"] == "old-sess"
+    assert event["successor_session_id"] == "new-sess"
+
+def test_retire_result_passes_expected_mux_session_to_pane_terminate(monkeypatch):
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda raw: raw)
+    monkeypatch.setattr(m, "_conclude_retired_predecessor", lambda *args, **kwargs: None)
+    monkeypatch.setattr(m, "_maybe_emit_stage_13", lambda *args, **kwargs: None)
+    monkeypatch.setattr(m, "_resolve_retire_pane_mux_session", lambda pane, expected: "wt-retire")
+    monkeypatch.setattr(
+        m.pane_lifecycle,
+        "pane_terminate",
+        lambda pane, **kwargs: observed.update(pane=pane, **kwargs)
+        or {"ok": True, "gone": True, "method": "graceful"},
+    )
+    monkeypatch.setattr(
+        reclaim,
+        "ensure_session_copilot_reaped",
+        lambda *args, **kwargs: {"checked": False, "identity_verified": True},
+    )
+
+    rc, result = m._handoff_cutover_retire_result(
+        _ns(
+            worktree_id="wt-retire",
+            retire_pane="%9",
+            session_id="old-sess",
+            mux_session="wt-retire",
+        )
+    )
+
+    assert rc == 0
+    assert result["ok"] is True
+    assert observed == {"pane": "%9", "mux_session": "wt-retire"}
+
+
+def test_resolve_retire_pane_mux_session_prefers_scoped_membership_check(
+    monkeypatch,
+):
+    """Regression (live-discovered, 2026-09-18): a bare ``display-message -t
+    <pane_id>`` (what ``sessions.current_mux_session``/``mux_session_for_pane``
+    runs) can resolve to the *caller's own current/default* mux session
+    rather than the session that genuinely contains the pane -- reproduced
+    live even with no real pane-id collision, when the CLI invoking
+    ``handoff-cutover --retire-pane`` is not itself inside the target pane
+    (e.g. an orchestrator, not a self-retiring predecessor). That produced a
+    false ``identity-mismatch-skip`` that silently no-op'd a legitimate
+    retire. ``_resolve_retire_pane_mux_session`` must check membership in the
+    *expected* session first (scoped ``list-panes -a`` filter), and must
+    never call the unscoped/bare lookup for that check."""
+    calls: list[tuple[str, str | None]] = []
+
+    def _fake_list_matching(pane_id, mux_bin, *, session_name=None):
+        calls.append((pane_id, session_name))
+        # The pane genuinely lives in "wt-expected" -- simulate the scoped
+        # filter finding it there.
+        return [("wt-expected", "1.0")] if session_name == "wt-expected" else []
+
+    monkeypatch.setattr(
+        m.sessions_pane_retire, "_list_matching_pane_targets", _fake_list_matching,
+    )
+    monkeypatch.setattr(
+        m.sessions_pane_retire, "_resolve_unambiguous_pane_session",
+        lambda pane, mux_bin: pytest.fail(
+            "must not need the unscoped fallback when the scoped check finds the pane"
+        ),
+    )
+    monkeypatch.setattr(
+        m.sessions, "current_mux_session",
+        lambda pane=None, mux=None: pytest.fail(
+            "must never fall back to the unsafe bare display-message lookup"
+        ),
+    )
+    monkeypatch.setattr(
+        m.sessions, "mux_session_for_pane",
+        lambda pane, mux=None: pytest.fail(
+            "must never fall back to the unsafe bare display-message lookup"
+        ),
+    )
+
+    result = m._resolve_retire_pane_mux_session("%1", "wt-expected")
+
+    assert result == "wt-expected"
+    # Confirms the scoped check ran (and, per the monkeypatched fallbacks
+    # above, that nothing unscoped/bare was ever consulted).
+    assert calls == [("%1", "wt-expected")]
+
+
+def test_resolve_retire_pane_mux_session_falls_back_when_not_in_expected(
+    monkeypatch,
+):
+    """When the pane genuinely isn't in the expected session, fall back to
+    the safe (still ``list-panes -a``-based) unscoped resolver -- never the
+    unsafe bare lookup -- to report where it actually is."""
+    monkeypatch.setattr(
+        m.sessions_pane_retire, "_list_matching_pane_targets",
+        lambda pane, mux_bin, *, session_name=None: [],
+    )
+    monkeypatch.setattr(
+        m.sessions_pane_retire, "_resolve_unambiguous_pane_session",
+        lambda pane, mux_bin: "wt-actual",
+    )
+
+    result = m._resolve_retire_pane_mux_session("%1", "wt-expected")
+
+    assert result == "wt-actual"
+
+
+def test_resolve_retire_pane_mux_session_none_on_ambiguity(monkeypatch):
+    monkeypatch.setattr(
+        m.sessions_pane_retire, "_list_matching_pane_targets",
+        lambda pane, mux_bin, *, session_name=None: [],
+    )
+
+    def _raise(pane, mux_bin):
+        raise m.sessions_pane_retire.MuxPaneTargetAmbiguityError(pane, ["a", "b"])
+
+    monkeypatch.setattr(
+        m.sessions_pane_retire, "_resolve_unambiguous_pane_session", _raise,
+    )
+
+    assert m._resolve_retire_pane_mux_session("%1", "wt-expected") is None
+
+
+class TestPendingHandoffRetireAbandonment:
+    """A predecessor whose retire attempts have ALL failed the same
+    unrecoverable way for a sustained period is concluded ("abandoned")
+    rather than retried forever -- regression coverage for a real production
+    incident: a predecessor whose own Copilot process had already exited (so
+    identity could never be proven again) was retried every daemon sweep
+    (~25-40s) for 3+ days straight (3,000+ no-op attempts across several
+    worktrees, only ever contesting a pane a much later, unrelated session
+    had since legitimately reused)."""
+
+    def _record(self, tmp_tracking_dir, worktree_id, *, predecessor, successor):
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id=worktree_id, branch=f"worktree/{worktree_id}",
+            worktree_path=f"/tmp/src/{worktree_id}", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        path = tmp_tracking_dir / f"{worktree_id}.yaml"
+        _tracking.save_record(rec, path)
+        _tracking.register_session(worktree_id, predecessor)
+        _tracking.register_session(worktree_id, successor)
+        loaded = _tracking.load_record(path)
+        _tracking.open_handoff(loaded, predecessor, f"task-{worktree_id}")
+        _tracking.associate_handoff_candidate(loaded, f"task-{worktree_id}", successor)
+        return _tracking.load_record(path)
+
+    def _events(self, *, worktree_id, token, spawn=True, retire_events=()):
+        def _read_events(**kw):
+            if kw.get("event") == "handoff_cutover_spawn":
+                return [{
+                    "handoff_token": token, "session_id": "old-sess",
+                    "old_pane": "%9", "expected_mux_session": f"wt-{worktree_id}",
+                    "predecessor_copilot_pid": 77,
+                    "predecessor_copilot_start_time": "old",
+                }] if spawn else []
+            if kw.get("event") == "handoff_predecessor_retire":
+                return list(retire_events)
+            return []
+        return _read_events
+
+    def test_stale_terminal_failures_past_grace_are_abandoned(
+        self, monkeypatch, tmp_tracking_dir, monkeypatch_config,
+    ):
+        record = self._record(
+            tmp_tracking_dir, "wt-abandon-1",
+            predecessor="old-sess", successor="new-sess",
+        )
+        old_ts = "2026-01-01T00:00:00+00:00"  # far past the abandon grace
+        monkeypatch.setattr(activity, "read_events", self._events(
+            worktree_id="wt-abandon-1", token="task-wt-abandon-1",
+            retire_events=[
+                {
+                    "handoff_token": "task-wt-abandon-1", "session_id": "old-sess",
+                    "old_pane": "%9", "method": "process-identity-unavailable",
+                    "outcome": "left-running", "ts": old_ts,
+                },
+                {
+                    "handoff_token": "task-wt-abandon-1", "session_id": "old-sess",
+                    "old_pane": "%9", "method": "process-identity-unavailable",
+                    "outcome": "left-running", "ts": old_ts,
+                },
+            ],
+        ))
+        logged = []
+        monkeypatch.setattr(
+            activity, "log_event",
+            lambda event, **fields: logged.append({"event": event, **fields}),
+        )
+
+        requests = m._pending_handoff_retire_requests(record)
+
+        assert requests == []
+        assert len(logged) == 1
+        assert logged[0]["event"] == "handoff_predecessor_retire"
+        assert logged[0]["outcome"] == "abandoned"
+        assert logged[0]["handoff_token"] == "task-wt-abandon-1"
+        assert logged[0]["reason"] == "monitor-abandoned"
+
+    def test_recent_terminal_failures_within_grace_still_retried(
+        self, monkeypatch, tmp_tracking_dir, monkeypatch_config,
+    ):
+        record = self._record(
+            tmp_tracking_dir, "wt-abandon-2",
+            predecessor="old-sess", successor="new-sess",
+        )
+        recent_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        monkeypatch.setattr(activity, "read_events", self._events(
+            worktree_id="wt-abandon-2", token="task-wt-abandon-2",
+            retire_events=[{
+                "handoff_token": "task-wt-abandon-2", "session_id": "old-sess",
+                "old_pane": "%9", "method": "process-identity-unavailable",
+                "outcome": "left-running", "ts": recent_ts,
+            }],
+        ))
+        logged = []
+        monkeypatch.setattr(
+            activity, "log_event",
+            lambda event, **fields: logged.append({"event": event, **fields}),
+        )
+
+        requests = m._pending_handoff_retire_requests(record)
+
+        assert len(requests) == 1
+        assert requests[0]["handoff_token"] == "task-wt-abandon-2"
+        assert logged == []  # not yet abandoned -- no premature conclusion
+
+    def test_mixed_failure_methods_are_never_abandoned(
+        self, monkeypatch, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """A token that has ever failed with a NON-terminal-class method
+        (e.g. "left-running" from a transient cause other than the
+        unrecoverable-identity set) must stay retryable forever -- only a
+        uniformly unrecoverable failure history is ever concluded."""
+        record = self._record(
+            tmp_tracking_dir, "wt-abandon-3",
+            predecessor="old-sess", successor="new-sess",
+        )
+        old_ts = "2026-01-01T00:00:00+00:00"
+        monkeypatch.setattr(activity, "read_events", self._events(
+            worktree_id="wt-abandon-3", token="task-wt-abandon-3",
+            retire_events=[
+                {
+                    "handoff_token": "task-wt-abandon-3", "session_id": "old-sess",
+                    "old_pane": "%9", "method": "process-identity-unavailable",
+                    "outcome": "left-running", "ts": old_ts,
+                },
+                {
+                    "handoff_token": "task-wt-abandon-3", "session_id": "old-sess",
+                    "old_pane": "%9", "method": "some-other-transient-method",
+                    "outcome": "left-running", "ts": old_ts,
+                },
+            ],
+        ))
+        logged = []
+        monkeypatch.setattr(
+            activity, "log_event",
+            lambda event, **fields: logged.append({"event": event, **fields}),
+        )
+
+        requests = m._pending_handoff_retire_requests(record)
+
+        assert len(requests) == 1
+        assert logged == []
+
+    def test_already_abandoned_token_is_not_re_logged(
+        self, monkeypatch, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """Idempotency: once an "abandoned" outcome has been logged, later
+        sweeps must neither re-surface the request nor re-log the
+        conclusion -- the abandonment log event is itself what the
+        ``retired`` set picks up, self-limiting without extra state."""
+        record = self._record(
+            tmp_tracking_dir, "wt-abandon-4",
+            predecessor="old-sess", successor="new-sess",
+        )
+        old_ts = "2026-01-01T00:00:00+00:00"
+        monkeypatch.setattr(activity, "read_events", self._events(
+            worktree_id="wt-abandon-4", token="task-wt-abandon-4",
+            retire_events=[
+                {
+                    "handoff_token": "task-wt-abandon-4", "session_id": "old-sess",
+                    "old_pane": "%9", "method": "process-identity-unavailable",
+                    "outcome": "left-running", "ts": old_ts,
+                },
+                {
+                    "handoff_token": "task-wt-abandon-4", "session_id": "old-sess",
+                    "old_pane": "%9", "method": "process-identity-unavailable",
+                    "outcome": "abandoned", "ts": old_ts,
+                },
+            ],
+        ))
+        logged = []
+        monkeypatch.setattr(
+            activity, "log_event",
+            lambda event, **fields: logged.append({"event": event, **fields}),
+        )
+
+        requests = m._pending_handoff_retire_requests(record)
+
+        assert requests == []
+        assert logged == []  # already concluded -- no duplicate log
+
+    def test_successful_retirement_is_never_abandoned(
+        self, monkeypatch, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """A token that has already succeeded ("gone") stays excluded via
+        the pre-existing `retired` path, not the new abandonment path."""
+        record = self._record(
+            tmp_tracking_dir, "wt-abandon-5",
+            predecessor="old-sess", successor="new-sess",
+        )
+        old_ts = "2026-01-01T00:00:00+00:00"
+        monkeypatch.setattr(activity, "read_events", self._events(
+            worktree_id="wt-abandon-5", token="task-wt-abandon-5",
+            retire_events=[{
+                "handoff_token": "task-wt-abandon-5", "session_id": "old-sess",
+                "old_pane": "%9", "method": "graceful",
+                "outcome": "gone", "ts": old_ts,
+            }],
+        ))
+        logged = []
+        monkeypatch.setattr(
+            activity, "log_event",
+            lambda event, **fields: logged.append({"event": event, **fields}),
+        )
+
+        requests = m._pending_handoff_retire_requests(record)
+
+        assert requests == []
+        assert logged == []

@@ -12,9 +12,10 @@
 `cell-scoped-project-adoption`, `cell-local-invocation`,
 `attributable-agent-capabilities`, `provenance-safe-transition`; and all
 corresponding Behaviors.
-**Exemplars:** none yet. Phase 3 of the
+**Exemplars:** Agent Machines is the command-only operative exemplar. Phase 3
+of the
 [marketplace-scoped-installations effort](../../efforts/active/marketplace-scoped-installations/README.md)
-will establish one on-demand runtime and one service-bearing runtime.
+still requires a service-bearing exemplar.
 
 ## Problem
 
@@ -166,13 +167,18 @@ Cross-cell composition is a separate opt-in contract and always names the target
 cell. A missing same-cell peer degrades gracefully; a same-named cross-cell peer
 is never a fallback.
 
-Session-context aggregation is one explicit cross-cell contract. Repository
-adoption names the exact source-qualified `context-injection` authority, and
-each contributor declaration identifies its owning plugin and payload-relative
-commands. The authority reconstructs a fresh child environment with the
-contributor's validated payload roots instead of inheriting its own. Before
-authority proof, each producer invokes its own payload-relative contributor;
-it never scans for a same-named coordinator or contributor in another cell.
+Dispatch and CodeSpaces share the vendorable
+[`peer-launch` boundary](../../libs/peer-launch/README.md). Explicit context
+refusals propagate instead of authorizing ambient authentication, legacy state,
+or L1-only claims. Only a validated optional-peer absence or compatible
+unsupported capability can degrade. No-context paths retain their legacy
+selection and error semantics.
+
+Session guidance does not introduce a cross-cell coordinator. Each plugin cell
+owns its checked-in pointer, exact-session writer, and payload-relative
+emitters. A host that natively composes independent `additionalContext` outputs
+may do so only with each plugin's attributable payload identity intact; one
+cell never scans for or adopts a same-named aggregation authority from another.
 
 ## Lifecycle and migration
 
@@ -185,6 +191,15 @@ it never scans for a same-named coordinator or contributor in another cell.
   parallel empty runtime beside an existing legacy footprint.
 - Provision, update, rollback, repair, supervision, reconciliation, and
   uninstall operate on one validated installation identity.
+- One cell-root provisioning lock serializes each complete operative build and
+  cutover transaction, not only the short receipt publications within it.
+  Snapshot copy is staged in an owned temporary sibling and atomically published;
+  recovery removes only a marker-proven, still-unproven directory created by
+  that publisher. Successful cutover republishes the active-runtime deploy
+  manifest before the adapter reports completion. The manifest keeps the latest
+  reconciled payload provenance separate from the selected runtime slot, so an
+  explicit historical rollback survives bootstrap while a later payload update
+  still reconciles. Failed compare-and-swap leaves the manifest unchanged.
 - Legacy unqualified state has no trustworthy owner. Migration requires the
   operator to name the destination cell and writes an ownership receipt.
 - New and legacy state found together are reported; registries are never merged
@@ -197,6 +212,28 @@ it never scans for a same-named coordinator or contributor in another cell.
 - A user-local maintenance marker can quiesce hooks, reconciliation,
   provisioning, service ensure/start, scheduled work, and dispatch while
   preserving read-only doctor and explicitly authorized repair surfaces.
+- Marker cutover and deploy-manifest publication are one durable transaction,
+  not independent writes. The installation records the exact prior selection,
+  validated completed target, and receipt generations before marker CAS;
+  retry/bootstrap either finishes the target or restores the prior
+  marker+manifest. Governance is rechecked immediately before marker mutation,
+  before service reconciliation, and -- for a service cutover -- after passive
+  health but immediately before target promotion and route publication. A
+  blocked final check retires the passive target and restores the prior
+  selection without draining, rerouting, or stopping the old service.
+- A namespaced passive service may publish an instance-specific ownership
+  receipt so recovery can address it, but it does not start/dequeue shared work
+  or publish shared active endpoint/version evidence. A transaction-authorized,
+  exact-instance promotion first starts adoption and proves read readiness;
+  only then may routing atomically select that PID/version. A crash before route
+  publication leaves the prior route active and the passive receipt available
+  for exact recovery. Random deploy/promotion/recovery authorization lives only
+  for that installation transaction; context alone is not management authority.
+- Control and cleanup are exact-instance operations. Clients validate route PID,
+  runtime version, installation identity, and the freshly attested instance
+  token before drain, undrain, shutdown, or promotion. Reconciliation shuts down
+  only matching instance receipts and converges a completed cutover to one owned
+  installation PID; it never sweeps by process name.
 
 Policy and maintenance resolve from the canonical OS user profile, not an
 ordinary `HOME`, durable-home override, or repository directory. Windows, native

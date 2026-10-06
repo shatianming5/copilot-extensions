@@ -19,11 +19,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import sys
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING
 from ._invoke import dispatch_argv
 from .config import (
+    RUNTIME_DIR,
     _norm_repo as _config_norm_repo,
     _repo_matches_codespace as _config_repo_matches_codespace,
     load_merged_config,
@@ -109,7 +110,7 @@ def _repo_matches_codespace(repo: str, cs_repository: str | None) -> bool:
     return _config_repo_matches_codespace(repo, cs_repository)
 
 
-_DISPATCH_DIR = Path.home() / ".agent-codespaces" / "dispatch"
+_DISPATCH_DIR = RUNTIME_DIR / "dispatch"
 # A dispatch payload file is kept alive by use: its mtime is refreshed on every
 # launch that reads it (see the CLI's --remote-cmd-file handler), so mtime is the
 # LAST-LAUNCH time. One untouched past this window belongs to a session that is
@@ -174,7 +175,8 @@ def _build_spawn_command(
 ) -> list[str]:
     """Build the spawn command for a codespace agent.
 
-    The ``acp_command`` (from ``.agent-codespaces/config.yaml`` defaults) is
+    The ``acp_command`` (from
+    ``.copilot-extensions/agent-codespaces/config.yaml`` defaults) is
     written to a durable file and passed by PATH as ``--remote-cmd-file`` to
     ``agent-codespaces ssh --stdio`` -- never as a ``--remote-cmd`` string.
     Routing the payload through a file keeps argv free of shell-mangling-prone
@@ -419,7 +421,57 @@ class CodespaceResolver:
                 ) from None
             raise RuntimeError(f"Codespace '{name}' not found") from None
         if cs.state in ("Available", "Shutdown"):
+            if getattr(cs, "account", ""):
+                from . import account_binding
+
+                # The binding is how a later relay-launch-env process learns
+                # which account to ask GCM for; losing it silently would fall
+                # back to the ambient account.
+                try:
+                    account_binding.bind(cs.name, cs.account, cs.repository)
+                except Exception as exc:
+                    if account_binding.bound_account(cs.name) != cs.account:
+                        raise RuntimeError(
+                            f"Codespace '{cs.name}' is reachable, but its gh account "
+                            f"'{cs.account}' couldn't be recorded for the credential "
+                            f"relay: {exc}"
+                        ) from exc
             return
         raise RuntimeError(
             f"Codespace '{cs.name}' is '{cs.state}' (not in a connectable state)."
         )
+
+
+async def list_specs_tolerant() -> list[dict]:
+    """``CodespaceResolver().list_specs()``, but never raises.
+
+    A codespace-listing failure (missing `codespace` OAuth scope, no `gh`
+    auth at all, network unreachable, etc.) must never be a hard requirement
+    for a host to resolve *any* agent -- CodeSpaces are optional, and a host
+    that doesn't use them (confirmed live, Lambda-Core, 2026-10-04) has no
+    reason to carry the `codespace` scope at all. Before this fix,
+    ``agent-codespaces namespace-list`` propagated any such failure as an
+    uncaught exception, crashing with a non-zero exit; agent-bridge's own
+    namespace-resolver consumer (``NamespaceListIncomplete`` on a non-zero
+    exit) then dropped the `codespace:` namespace for that one listing call
+    as designed -- but a confirmed, separate production incident that same
+    day showed bare-name agent resolution (``POST /api/v1/sessions``)
+    returning 404 for completely unrelated, purely-static agents while this
+    failure was live, starving the Intelligence Dampener reviewer-dispatch
+    pool for hours. Reporting zero codespaces here (the host's
+    genuinely-accurate state when it can't query them) instead of crashing
+    removes any chance of that class of failure recurring from this
+    specific subprocess boundary.
+    """
+    try:
+        return await CodespaceResolver().list_specs()
+    except Exception as exc:
+        print(
+            f"agent-codespaces: namespace-list could not query CodeSpaces "
+            f"({exc}); reporting zero CodeSpaces rather than failing closed "
+            f"-- CodeSpaces are optional and must never block other agent "
+            f"resolution",
+            file=sys.stderr,
+        )
+        return []
+

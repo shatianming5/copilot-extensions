@@ -19,6 +19,9 @@ _step() { printf '  ...    %s\n' "$1"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/installer-engine.sh"
+
 # === install-contract:v4 self-stage -- keep byte-identical across plugins ===
 # dotfiles #935: a plugin installer reads its own payload (src/, libs/,
 # pyproject.toml) to build the venv, so while it runs -- especially if it wedges
@@ -160,6 +163,7 @@ shift || true
 
 NO_SERVICE=0
 PURGE=0
+DRY_RUN=0
 INSTALL_DIR=""
 FORCE="${AGENT_VAULT_ALLOW_DOWNGRADE:-0}"
 [[ "$FORCE" == "1" ]] && FORCE=1 || FORCE=0
@@ -168,18 +172,47 @@ while [[ $# -gt 0 ]]; do
         --no-service) NO_SERVICE=1; shift ;;
         --purge) PURGE=1; shift ;;
         --force) FORCE=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
         --install-dir) INSTALL_DIR="${2:?--install-dir requires a directory}"; shift 2 ;;
         *) _fail "Unknown option: $1"; exit 2 ;;
     esac
 done
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.agent-vault}"
+if [[ "$INSTALL_DIR" != /* ]]; then
+    INSTALL_DIR="$PWD/$INSTALL_DIR"
+fi
+LEGACY_INSTALL_DIR="$HOME/.agent-vault"
+legacy_cmp="$(printf '%s' "$LEGACY_INSTALL_DIR" | tr '\\' '/' | tr '[:upper:]' '[:lower:]')"
+install_cmp="$(printf '%s' "$INSTALL_DIR" | tr '\\' '/' | tr '[:upper:]' '[:lower:]')"
+if [[ "$install_cmp" == "$legacy_cmp" ]]; then
+    SERVICE_SUFFIX=""
+    SYSTEMD_UNIT="agent-vault.service"
+else
+    if command -v sha256sum >/dev/null 2>&1; then
+        SERVICE_SUFFIX="$(printf '%s' "$install_cmp" | sha256sum | awk '{print substr($1,1,12)}')"
+    elif command -v shasum >/dev/null 2>&1; then
+        SERVICE_SUFFIX="$(printf '%s' "$install_cmp" | shasum -a 256 | awk '{print substr($1,1,12)}')"
+    else
+        SERVICE_SUFFIX="$(printf '%s' "$install_cmp" | cksum | awk '{print $1}')"
+    fi
+    SYSTEMD_UNIT="agent-vault-${SERVICE_SUFFIX}.service"
+fi
+INSTALLATION_ID="${AGENT_VAULT_INSTALLATION_ID:-}"
+RUN_DIR="$INSTALL_DIR/run"
+SOCKET_PATH="$RUN_DIR/agent-vault.sock"
+PIPE_PATH="\\\\.\\pipe\\agent-vault${SERVICE_SUFFIX:+-$SERVICE_SUFFIX}"
+PID_FILE="$RUN_DIR/agent-vault-service.pid"
+LOG_FILE="$INSTALL_DIR/logs/agent-vault-service.log"
+PORT_ENV_LINE=""
+if [[ -n "$INSTALLATION_ID" ]]; then
+    PORT_ENV_LINE="Environment=AGENT_VAULT_PORT=0"
+fi
 VENV_DIR="$INSTALL_DIR/.venv"
 LOCAL_BIN="$HOME/.local/bin"
 VENV_PYTHON="$VENV_DIR/bin/python"
 STUB="$LOCAL_BIN/agent-vault"
 ASKPASS="$LOCAL_BIN/vault-askpass"
-SYSTEMD_UNIT="agent-vault.service"
 UNIT_DIR="$HOME/.config/systemd/user"
 
 # === install-contract:v3 versioned-venv (agent-vault: .venv-as-symlink) ===
@@ -329,6 +362,18 @@ _source_kind() {
 }
 # === end install-contract:v4 source-kind ===
 
+_git_info() {
+    local path="$1"
+    local commit branch dirty
+    commit=$(git -C "$path" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    branch=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    dirty="false"
+    if [[ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]]; then
+        dirty="true"
+    fi
+    echo "$commit $branch $dirty"
+}
+
 _installed_version() {
     # The version currently ACTIVE (via the `.venv` link), for the downgrade guard.
     [[ -x "$LINK_PYTHON" ]] || return 1
@@ -398,96 +443,17 @@ _check_keepassxc() {
     fi
 }
 
-_write_binstub() {
-    mkdir -p "$LOCAL_BIN" "$INSTALL_DIR/bin"
-    # Co-deploy the canonical marker-only resolver so the binstub (and any
-    # launcher) resolves the interpreter the ONE uniform way
-    # (uniform-runtime-resolution, #765).
-    for r in resolve-runtime.sh resolve-runtime.ps1; do
-        [ -f "$SCRIPT_DIR/$r" ] && cp -f "$SCRIPT_DIR/$r" "$INSTALL_DIR/bin/$r"
-    done
-    cat > "$STUB" << 'STUBEOF'
-#!/usr/bin/env bash
-# agent-vault binstub -- self-provisioning (install-on-first-use).
-# Resolves the interpreter SOLELY via the junction-free versioned-runtime marker
-# (the deployed resolve-runtime.sh; uniform-runtime-resolution, #765): current-
-# version -> last-known-good -> newest complete slot. NEVER a `.venv` link, NEVER
-# a PATH python -- when no slot is installed AGENT_RT_PY is empty and we self-
-# provision on first use rather than silently binding the system interpreter.
-export PYTHONUTF8=1
-_name="agent-vault"
-_root="$HOME/.$_name"
-_resolver="$_root/bin/resolve-runtime.sh"
-_resolve() {
-    AGENT_RT_PY=""
-    if [ -f "$_resolver" ]; then
-        AGENT_RT_ROOT="$_root"
-        . "$_resolver"
-    fi
-}
-_resolve
-[ -n "$AGENT_RT_PY" ] && exec "$AGENT_RT_PY" -m agent_vault "$@"
-mkdir -p "$_root"
-_status="$_root/.provision-status"
-printf '%s\n' "[$_name] runtime not provisioned -- provisioning on first use (may take ~30-120s: acquires uv + builds a venv). Do not kill; extend your timeout." >&2
-printf '::agent-provisioning:: plugin=%s eta_seconds=120 reason=first-use status=%s\n' "$_name" "$_status" >&2
-_install="$(cat "$_root/payload-dir" 2>/dev/null)/scripts/install.sh"
-[ -f "$_install" ] || _install="$(ls "$HOME"/.copilot/installed-plugins/*/"$_name"/scripts/install.sh 2>/dev/null | head -n1)"
-if [ ! -f "$_install" ]; then
-    printf '%s\n' "[$_name] cannot self-provision: installer not found in plugin payload. Ensure the plugin is enabled, then retry." >&2
-    exit 127
-fi
-_lock="$_root/.provision.lock"
-exec 9>"$_lock"
-command -v flock >/dev/null 2>&1 && flock 9 2>/dev/null
-_resolve
-[ -n "$AGENT_RT_PY" ] && exec "$AGENT_RT_PY" -m agent_vault "$@"
-printf 'provisioning %s\n' "$(date -u +%FT%TZ 2>/dev/null)" > "$_status" 2>/dev/null || true
-bash "$_install" provision >&2
-_rc=$?
-_resolve
-if [ "$_rc" -eq 0 ] && [ -n "$AGENT_RT_PY" ]; then
-    printf 'ready %s\n' "$(date -u +%FT%TZ 2>/dev/null)" > "$_status" 2>/dev/null || true
-    exec "$AGENT_RT_PY" -m agent_vault "$@"
-fi
-printf 'failed rc=%s %s\n' "$_rc" "$(date -u +%FT%TZ 2>/dev/null)" > "$_status" 2>/dev/null || true
-if [ "$_rc" -eq 0 ]; then
-    printf '%s\n' "[$_name] provisioning reported success but no runtime slot resolved." >&2
-    _rc=1
-else
-    printf '%s\n' "[$_name] provisioning FAILED (rc=$_rc). See the log above; retry, or run: bash \"$_install\" provision" >&2
-fi
-exit "$_rc"
-STUBEOF
-    chmod +x "$STUB"
-    _ok "Binstub: $STUB (self-provisioning)"
-}
-
-# --- self-provisioning helpers (runtime-self-provisioning pattern) -----------
-# Vendor a standalone uv into the runtime tool dir when uv is absent (pristine or
-# governed box) instead of dead-ending; add it to PATH for this run.
-_ensure_uv() {
-    command -v uv >/dev/null 2>&1 && return 0
-    local tooldir="$INSTALL_DIR/tool"
-    if [[ -x "$tooldir/uv" ]]; then export PATH="$tooldir:$PATH"; return 0; fi
-    _step "uv not found -- vendoring a standalone uv into $tooldir"
-    mkdir -p "$tooldir"
-    local url="https://astral.sh/uv/install.sh" script="$tooldir/uv-install.sh" got=""
-    if command -v curl >/dev/null 2>&1; then curl -LsSf "$url" -o "$script" 2>/dev/null && got=1; fi
-    if [[ -z "$got" ]] && command -v wget >/dev/null 2>&1; then wget -qO "$script" "$url" 2>/dev/null && got=1; fi
-    if [[ -z "$got" ]] && command -v python3 >/dev/null 2>&1; then
-        python3 - "$url" "$script" <<'PY' 2>/dev/null && got=1
-import sys, urllib.request
-urllib.request.urlretrieve(sys.argv[1], sys.argv[2])
-PY
-    fi
-    if [[ -n "$got" && -s "$script" ]]; then
-        env UV_INSTALL_DIR="$tooldir" UV_UNMANAGED_INSTALL="$tooldir" INSTALLER_NO_MODIFY_PATH=1 sh "$script" >/dev/null 2>&1 || true
-    fi
-    [[ -x "$tooldir/bin/uv" && ! -x "$tooldir/uv" ]] && ln -sf "$tooldir/bin/uv" "$tooldir/uv" 2>/dev/null || true
-    if [[ -x "$tooldir/uv" ]]; then export PATH="$tooldir:$PATH"; _ok "Vendored uv into $tooldir"; return 0; fi
-    _fail "uv is required but not found, and vendoring failed (no reachable uv installer). Install uv, then retry."
-    return 1
+_deploy_binstub() {
+    write_simple_binstub \
+        "agent-vault" \
+        "agent_vault" \
+        "$INSTALL_DIR" \
+        "$LOCAL_BIN" \
+        "$INSTALL_DIR/bin" \
+        "scripts/install.sh" \
+        "AGENT_VAULT_NO_SELFPROVISION" \
+        "$SCRIPT_DIR/resolve-runtime.ps1" \
+        "$SCRIPT_DIR/resolve-runtime.sh"
 }
 
 # Mirror pip's configured index to uv on a governed box (public PyPI TLS-blocked):
@@ -497,8 +463,8 @@ PY
 _ensure_uv_index() {
     [[ -n "${UV_INDEX_URL:-}${UV_DEFAULT_INDEX:-}" ]] && return 0
     local idx=""
-    if command -v pip >/dev/null 2>&1; then idx="$(pip config get global.index-url 2>/dev/null | tr -d '[:space:]')"; fi
-    if [[ -z "$idx" ]] && command -v pip3 >/dev/null 2>&1; then idx="$(pip3 config get global.index-url 2>/dev/null | tr -d '[:space:]')"; fi
+    if command -v pip >/dev/null 2>&1; then idx="$(pip config get global.index-url 2>/dev/null | tr -d '[:space:]' || true)"; fi
+    if [[ -z "$idx" ]] && command -v pip3 >/dev/null 2>&1; then idx="$(pip3 config get global.index-url 2>/dev/null | tr -d '[:space:]' || true)"; fi
     if [[ -z "$idx" ]]; then
         local f
         for f in "${PIP_CONFIG_FILE:-}" "$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf" /etc/pip.conf /etc/xdg/pip/pip.conf; do
@@ -516,7 +482,7 @@ do_stamp() {
     echo ''; echo '=== agent-vault stamp (defer runtime to first use) ==='; echo ''
     mkdir -p "$INSTALL_DIR" "$LOCAL_BIN"
     printf '%s\n' "${COPILOT_PLUGIN_STAGED_FROM:-$PLUGIN_DIR}" > "$INSTALL_DIR/payload-dir"
-    _write_binstub
+    _deploy_binstub
     _ok "Stamped: binstub on PATH; runtime provisions on first use."
 }
 
@@ -542,22 +508,23 @@ _ensure_runtime() {
     _ok "Python: $py"
     # Self-acquire uv (vendored if absent) + mirror the governed pip index to uv
     # so a solo/standalone install works on a pristine or governed box.
-    _ensure_uv || exit 1
+    local uv_cmd=""
     _ensure_uv_index
-    command -v uv >/dev/null 2>&1 && have_uv=1
+    uv_cmd="$(ensure_uv "$INSTALL_DIR" tool 1 || true)"
+    if [[ -z "$uv_cmd" ]]; then
+        _fail 'uv is required but could not be resolved or acquired'
+        exit 1
+    fi
+    have_uv=1
 
     mkdir -p "$INSTALL_DIR" "$LOCAL_BIN"
     _ok "Directories: $INSTALL_DIR"
 
     if [[ ! -x "$VENV_PYTHON" ]]; then
-        if [[ "$have_uv" -eq 1 ]]; then
-            _step 'Creating venv via uv...'
-            _versioned_slot_clean
-            uv venv "$VENV_DIR" --allow-existing >/dev/null 2>&1 \
-                || "$py" -m venv "$VENV_DIR" >/dev/null 2>&1
-        else
-            _step 'Creating venv via python -m venv...'
-            "$py" -m venv "$VENV_DIR" >/dev/null 2>&1
+        _versioned_slot_clean
+        if ! new_signed_venv "$uv_cmd" "$VENV_DIR" "3.10"; then
+            _fail "Failed to create venv at $VENV_DIR"
+            exit 1
         fi
         [[ -x "$VENV_PYTHON" ]] || { _fail "Venv creation failed -- $VENV_PYTHON not found"; exit 1; }
         _ok 'Venv created'
@@ -565,11 +532,44 @@ _ensure_runtime() {
         _skip 'Venv already exists'
     fi
 
+    # Every `[tool.uv.sources]` workspace path dep -- both the zdd
+    # canonical-on-dev / materialized-on-release reference and the other
+    # `uv`-editable canonical references (``agent-procutil``,
+    # ``agent-single-instance-lease``: vendor-pointer-generalization
+    # effort, Phase 1) -- needs an explicit pre-install here: `uv`
+    # resolves `[tool.uv.sources]` fine when installing the main package
+    # directly, but the non-uv (bare `pip install`) fallback below ignores
+    # that table entirely and would otherwise try (and fail) to resolve
+    # each as an ordinary index package.
+    for _lib in zdd agent-procutil single-instance-lease; do
+        _lib_dir="$PLUGIN_DIR/libs/$_lib"
+        if [[ ! -f "$_lib_dir/pyproject.toml" ]]; then
+            _lib_dir="$(cd "$PLUGIN_DIR/../.." && pwd)/libs/$_lib"
+        fi
+        if [[ -f "$_lib_dir/pyproject.toml" ]]; then
+            if [[ "$have_uv" -eq 1 ]]; then
+                _lib_out=""
+                if ! _lib_out=$(invoke_uv_pip_install_resilient "${uv_cmd:-uv}" --python "$VENV_PYTHON" "$_lib_dir" --quiet); then
+                    [[ -n "$_lib_out" ]] && printf '%s\n' "$_lib_out" >&2
+                    _fail "$_lib library install failed"
+                    exit 1
+                fi
+            else
+                "$VENV_PYTHON" -m pip install --quiet "$_lib_dir" \
+                    || { _fail "$_lib library install failed"; exit 1; }
+            fi
+        fi
+    done
+
     if [[ "$have_uv" -eq 1 ]]; then
-        uv pip install --python "$VENV_PYTHON" "$PLUGIN_DIR" --quiet 2>/dev/null \
-            || { _fail 'Failed to install agent-vault package into venv'; exit 1; }
+        pkg_out=""
+        if ! pkg_out=$(INSTALLER_ENGINE_PAYLOAD_DIR_TO_SCRUB="$PLUGIN_DIR" invoke_uv_pip_install_resilient "${uv_cmd:-uv}" --python "$VENV_PYTHON" --no-deps "$PLUGIN_DIR" --quiet); then
+            [[ -n "$pkg_out" ]] && printf '%s\n' "$pkg_out" >&2
+            _fail 'Failed to install agent-vault package into venv'
+            exit 1
+        fi
     else
-        "$VENV_PYTHON" -m pip install --quiet "$PLUGIN_DIR" 2>/dev/null \
+        "$VENV_PYTHON" -m pip install --quiet --no-deps "$PLUGIN_DIR" 2>/dev/null \
             || { _fail 'Failed to install agent-vault package into venv'; exit 1; }
     fi
     _ok 'Package installed: agent-vault'
@@ -589,9 +589,9 @@ _ensure_runtime() {
         _versioned_activate || exit 1
     fi
 
-    _write_binstub
+    _deploy_binstub
     _write_askpass
-    _write_manifest
+    write_deploy_manifest "agent-vault" "agent-vault" "$INSTALL_DIR" "$PLUGIN_DIR" "$VENV_DIR"
     _check_keepassxc
 
     if "$LINK_PYTHON" -c 'import agent_vault' 2>/dev/null; then
@@ -612,52 +612,6 @@ _ensure_runtime() {
     esac
 }
 
-_write_manifest() {
-    _git_info() {
-        local path="$1" commit branch dirty
-        commit=$(git -C "$path" rev-parse --short HEAD 2>/dev/null || echo "unknown")
-        branch=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
-        dirty="false"
-        [[ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]] && dirty="true"
-        echo "$commit $branch $dirty"
-    }
-    local manifest="$INSTALL_DIR/deploy-manifest.json"
-    local kind ver commit branch dirty
-    kind="$(_source_kind "$PLUGIN_DIR")"
-    ver="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' "$PLUGIN_DIR/pyproject.toml" 2>/dev/null | head -n1)"
-    [[ -n "$ver" ]] || ver="$(_source_version 2>/dev/null || echo 0.0.0)"
-    commit="null"; branch="null"; dirty="false"
-    if [[ "$kind" == "local" ]]; then
-        local repo_root _c _b _d
-        repo_root="$(cd "$PLUGIN_DIR/../.." && pwd)"
-        read -r _c _b _d <<< "$(_git_info "$repo_root")"
-        commit="\"$_c\""; branch="\"$_b\""; dirty="$_d"
-    fi
-    local tmp="$manifest.tmp"
-    cat > "$tmp" << EOF
-{
-  "schema_version": 3,
-  "service": "agent-vault",
-  "deployed_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
-  "deployed_by": "$(hostname)-$(uname -s | tr '[:upper:]' '[:lower:]')",
-  "source": {
-    "kind": "$kind",
-    "path": "$PLUGIN_DIR",
-    "repo": "copilot-extensions",
-    "plugin": "agent-vault",
-    "version": "$ver",
-    "commit": $commit,
-    "branch": $branch,
-    "dirty": $dirty
-  },
-  "venv": "$VENV_DIR",
-  "runtime": "python"
-}
-EOF
-    mv -f "$tmp" "$manifest"
-    _ok "Deploy manifest written (source: $kind)"
-}
-
 _install_service() {
     if [[ "$NO_SERVICE" -eq 1 ]]; then
         _skip "agent-vault service skipped (--no-service): this host is a client only"
@@ -667,7 +621,35 @@ _install_service() {
         _skip "systemd not available -- the CLI can cold-start the daemon on demand"
         return 0
     fi
-    mkdir -p "$UNIT_DIR"
+    # $RUN_DIR/logs must exist before the daemon's first bind (the unix socket
+    # bind fails outright with a bare FileNotFoundError if $RUN_DIR is
+    # missing, and the log file open warns-and-continues without $INSTALL_DIR/
+    # logs) -- neither was created here before.
+    mkdir -p "$UNIT_DIR" "$RUN_DIR" "$INSTALL_DIR/logs"
+
+    # Drain-safe cutover (#743): if a generation is already active, capture its
+    # unlocked state BEFORE we touch the unit -- `--export-handoff` dials the
+    # OUTGOING daemon over its owner-gated AF_UNIX control socket and prints
+    # one line of JSON (or nothing, if there is nothing unlocked, or the
+    # transport isn't owner-gated). Held only in this shell variable, never
+    # written to a file.
+    local handoff_json=""
+    if systemctl --user is-active "$SYSTEMD_UNIT" >/dev/null 2>&1; then
+        # config.SOCKET_PATH/run_dir() etc. resolve from these env vars at
+        # import time, so they must be set for THIS invocation explicitly --
+        # unlike the systemd-managed daemon (which gets them from the unit's
+        # own `Environment=` lines), a plain subprocess call here inherits
+        # only this script's shell variables, not an environment the child
+        # process can see.
+        handoff_json="$(
+            AGENT_VAULT_HOME="$INSTALL_DIR" \
+            AGENT_VAULT_RUN_DIR="$RUN_DIR" \
+            AGENT_VAULT_SOCKET="$SOCKET_PATH" \
+            AGENT_VAULT_INSTALLATION_ID="$INSTALLATION_ID" \
+            "$LINK_PYTHON" -m agent_vault.service --export-handoff 2>/dev/null
+        )" || handoff_json=""
+    fi
+
     cat > "$UNIT_DIR/$SYSTEMD_UNIT" << EOF
 [Unit]
 Description=agent-vault -- local KeePassXC-backed secret store
@@ -676,7 +658,19 @@ After=default.target
 [Service]
 Type=simple
 Environment=PYTHONUTF8=1
-ExecStart=$LINK_PYTHON -m agent_vault.service --foreground --persistent
+Environment=AGENT_VAULT_HOME=$INSTALL_DIR
+Environment=AGENT_VAULT_RUN_DIR=$RUN_DIR
+Environment=AGENT_VAULT_CORE_RUN_DIR=$INSTALL_DIR/core
+Environment=AGENT_VAULT_CACHE_DIR=$INSTALL_DIR/cache
+Environment=AGENT_VAULT_SOCKET=$SOCKET_PATH
+Environment=AGENT_VAULT_PIPE=$PIPE_PATH
+Environment=AGENT_VAULT_PID=$PID_FILE
+Environment=AGENT_VAULT_LOG=$LOG_FILE
+Environment=AGENT_VAULT_SYSTEMD_UNIT=$SYSTEMD_UNIT
+Environment=AGENT_VAULT_TASK_NAME=AgentVault${SERVICE_SUFFIX:+-$SERVICE_SUFFIX}
+Environment=AGENT_VAULT_INSTALLATION_ID=$INSTALLATION_ID
+$PORT_ENV_LINE
+ExecStart=$LINK_PYTHON -m agent_vault.service --foreground --persistent --handoff-stdin
 Restart=on-failure
 RestartSec=5
 WorkingDirectory=$INSTALL_DIR
@@ -686,9 +680,26 @@ WantedBy=default.target
 EOF
     systemctl --user daemon-reload 2>/dev/null || true
     systemctl --user enable "$SYSTEMD_UNIT" 2>/dev/null || true
+    # Drain-safe cutover (#743), continued: hand the captured payload to the
+    # NEW generation via systemd's own per-manager environment -- set right
+    # before the restart spawns it, unset right after (`restart` blocks until
+    # the start job completes, and `--handoff-stdin` consumes/pops the var at
+    # the very start of `main()`, before serving) -- so the plaintext secret
+    # sits in the systemd --user manager's environment for the shortest
+    # practical window, never in the unit file, never on disk.
+    if [[ -n "$handoff_json" ]]; then
+        systemctl --user set-environment "AGENT_VAULT_HANDOFF_JSON=$handoff_json" 2>/dev/null || true
+    fi
     systemctl --user restart "$SYSTEMD_UNIT" 2>/dev/null || true
+    if [[ -n "$handoff_json" ]]; then
+        systemctl --user unset-environment AGENT_VAULT_HANDOFF_JSON 2>/dev/null || true
+    fi
     if systemctl --user is-active "$SYSTEMD_UNIT" >/dev/null 2>&1; then
-        _ok "agent-vault service installed + started ($SYSTEMD_UNIT)"
+        if [[ -n "$handoff_json" ]]; then
+            _ok "agent-vault service installed + started ($SYSTEMD_UNIT, drain-safe cutover: no re-unlock)"
+        else
+            _ok "agent-vault service installed + started ($SYSTEMD_UNIT)"
+        fi
     else
         _warn "agent-vault service installed but not active -- check: systemctl --user status $SYSTEMD_UNIT"
     fi
@@ -754,29 +765,55 @@ do_status() {
 }
 
 do_uninstall() {
-    echo ''; echo '=== agent-vault uninstall ==='; echo ''
+    echo ''; echo '=== agent-vault uninstall ==='
+    [[ "$DRY_RUN" -eq 1 ]] && echo '(dry run -- nothing will be changed)'
+    echo ''
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl --user stop "$SYSTEMD_UNIT" 2>/dev/null || true
-        systemctl --user disable "$SYSTEMD_UNIT" 2>/dev/null || true
-        rm -f "$UNIT_DIR/$SYSTEMD_UNIT"
-        systemctl --user daemon-reload 2>/dev/null || true
-        _ok "Service removed"
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            [[ -f "$UNIT_DIR/$SYSTEMD_UNIT" ]] && echo "[dry-run] would stop + disable + remove: $SYSTEMD_UNIT"
+        else
+            systemctl --user stop "$SYSTEMD_UNIT" 2>/dev/null || true
+            systemctl --user disable "$SYSTEMD_UNIT" 2>/dev/null || true
+            rm -f "$UNIT_DIR/$SYSTEMD_UNIT"
+            systemctl --user daemon-reload 2>/dev/null || true
+            _ok "Service removed"
+        fi
     fi
-    rm -f "$STUB"; _ok "Binstub removed"
-    rm -f "$ASKPASS"; _ok "SUDO_ASKPASS helper removed"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        [[ -e "$STUB" ]] && echo "[dry-run] would remove binstub: $STUB"
+        [[ -e "$ASKPASS" ]] && echo "[dry-run] would remove SUDO_ASKPASS helper: $ASKPASS"
+    else
+        rm -f "$STUB"; _ok "Binstub removed"
+        rm -f "$ASKPASS"; _ok "SUDO_ASKPASS helper removed"
+    fi
     if [[ "$PURGE" -eq 1 ]]; then
-        rm -rf "$INSTALL_DIR"; _ok "Runtime purged: $INSTALL_DIR"
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            echo "[dry-run] would PURGE: $INSTALL_DIR"
+        else
+            rm -rf "$INSTALL_DIR"; _ok "Runtime purged: $INSTALL_DIR"
+        fi
     else
         # Remove the runtime venv. Versioned: the `.venv` link + the versions/
         # tree; otherwise the single real venv dir.
-        if [[ "$VERSIONED_RUNTIME" == 1 ]]; then
-            [[ -L "$LINK_DIR" ]] && rm -f "$LINK_DIR"
-            [[ -d "$LINK_DIR" && ! -L "$LINK_DIR" ]] && rm -rf "$LINK_DIR"
-            [[ -d "$INSTALL_DIR/versions" ]] && rm -rf "$INSTALL_DIR/versions"
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            if [[ "$VERSIONED_RUNTIME" == 1 ]]; then
+                [[ -e "$LINK_DIR" ]] && echo "[dry-run] would remove: $LINK_DIR"
+                [[ -d "$INSTALL_DIR/versions" ]] && echo "[dry-run] would remove: $INSTALL_DIR/versions"
+            else
+                [[ -d "$VENV_DIR" ]] && echo "[dry-run] would remove venv: $VENV_DIR"
+            fi
+            echo "[dry-run] state at $INSTALL_DIR would be kept (--purge to delete)"
+            echo "agent-vault uninstall dry run complete -- nothing was changed"
         else
-            rm -rf "$VENV_DIR"
+            if [[ "$VERSIONED_RUNTIME" == 1 ]]; then
+                [[ -L "$LINK_DIR" ]] && rm -f "$LINK_DIR"
+                [[ -d "$LINK_DIR" && ! -L "$LINK_DIR" ]] && rm -rf "$LINK_DIR"
+                [[ -d "$INSTALL_DIR/versions" ]] && rm -rf "$INSTALL_DIR/versions"
+            else
+                rm -rf "$VENV_DIR"
+            fi
+            _ok "Venv removed (state kept; --purge to delete)"
         fi
-        _ok "Venv removed (state kept; --purge to delete)"
     fi
 }
 

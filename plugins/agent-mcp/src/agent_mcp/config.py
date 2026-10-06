@@ -19,13 +19,14 @@ import json
 import math
 import os
 import re
-import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from ._predicate import validate_predicate
 
 # Transport kinds (mirror MCP server-launch ``type`` values, plus ``cli`` --
 # the local CLI->MCP responder that has no upstream MCP at all).
@@ -67,15 +68,25 @@ PARSE_MODES = ("keyvalue", "raw")
 
 # Decorator types in the ``decorators:`` stack. Kept in sync with the registry in
 # ``agent_mcp.decorators`` (a test asserts they match) to avoid a circular import.
-DECORATOR_TYPES = ("filter", "rename", "defer", "code-mode", "storage", "transform", "gate")
+DECORATOR_TYPES = ("filter", "rename", "defer", "code-mode", "storage", "transform",
+                    "gate", "input_gate")
 
 BRIDGES_DIR = Path(os.environ.get("AGENT_MCP_HOME", Path.home() / ".agent-mcp")) / "bridges"
 
+
+def _marketplace_roots() -> list[Path]:
+    """Return explicit same-marketplace payload roots, when provided."""
+    raw = os.environ.get("AGENT_MCP_MARKETPLACE_ROOT")
+    if not raw:
+        return []
+    return [Path(p.strip()).expanduser() for p in raw.split(os.pathsep) if p.strip()]
+
 # Plugin-shipped bridge configs. A Copilot CLI plugin may ship its bridge config
 # *inside the plugin* (``<plugin>/agents/<name>.mcp.yaml``) instead of requiring a
-# copy under ``~/.agent-mcp/bridges/``. Plugins install to the deterministic tree
-# ``<copilot-home>/installed-plugins/<marketplace>/<plugin>/``, so a bare bridge
-# name resolves against ``.../installed-plugins/*/*/{agents,mcp}/<name>.{yaml,yml,json}``.
+# copy under ``~/.agent-mcp/bridges/``. Copied plugins resolve from
+# ``<copilot-home>/installed-plugins/<marketplace>/<plugin>/``. Directory
+# marketplaces declared by the nearest workspace are searched first because
+# Copilot loads those plugins live and never copies them into installed-plugins.
 # This lets a plugin-shipped sub-agent run ``agent-mcp bridge <name>`` with **no**
 # user-space install step (the spawned MCP's cwd is the session repo, not the
 # plugin, so a plugin-relative ``--config`` path can't work). The user-space
@@ -91,6 +102,33 @@ def _plugin_roots() -> list[Path]:
         return [Path(p).expanduser() for p in raw.split(os.pathsep) if p.strip()]
     home = Path(os.environ.get("COPILOT_HOME", Path.home() / ".copilot"))
     return [home / "installed-plugins"]
+
+
+def _live_marketplace_roots() -> list[Path]:
+    """Return directory marketplace roots declared by the nearest workspace."""
+    for root in (Path.cwd(), *Path.cwd().parents):
+        settings = root / ".github" / "copilot" / "settings.json"
+        if not settings.is_file():
+            continue
+        try:
+            data = json.loads(settings.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        marketplaces = data.get("extraKnownMarketplaces")
+        if not isinstance(marketplaces, dict):
+            return []
+        found: list[Path] = []
+        for entry in marketplaces.values():
+            source = entry.get("source") if isinstance(entry, dict) else None
+            if not isinstance(source, dict) or source.get("source") != "directory":
+                continue
+            raw_path = source.get("path")
+            if not isinstance(raw_path, str) or not raw_path:
+                continue
+            path = Path(raw_path).expanduser()
+            found.append((root / path).resolve() if not path.is_absolute() else path)
+        return found
+    return []
 
 # Machine-local config overlays. A bridge config keyed ``id`` (or, absent that,
 # its filename stem with a trailing ``.mcp`` stripped) may be overridden per-host
@@ -283,6 +321,7 @@ class BridgeConfig:
     tools: ToolFilter = field(default_factory=ToolFilter)
     timeout: float = 30.0
     retries: int = 1
+    idle_timeout: float = 300.0  # idle self-reap seconds (#3876); <=0 disables
     name: str | None = None
     source_path: Path | None = None
     # Decorator stack (client->upstream order). See ``agent_mcp.decorators``.
@@ -321,12 +360,39 @@ def _read_file(path: Path) -> dict[str, Any]:
 def _find_plugin_bridge(name: str) -> Path | None:
     """Find a plugin-shipped bridge config named ``name``.
 
-    Searches every plugin root (see ``_plugin_roots``) for
-    ``<marketplace>/<plugin>/{agents,mcp}/<name>.{yaml,yml,json}``. Returns the
-    single match, or ``None`` if there is none. Raises ``ConfigError`` if two or
-    more **distinct** files match (ambiguous bridge name across plugins) so the
-    collision surfaces instead of silently picking one.
+    Searches live directory marketplaces from the nearest workspace first, then
+    every copied plugin root (see ``_plugin_roots``). Returns the single match,
+    or ``None`` if there is none. Raises ``ConfigError`` if two or more
+    **distinct** files match within the selected source tier.
     """
+    live_matches: list[Path] = []
+    for root in _live_marketplace_roots():
+        if not root.is_dir():
+            continue
+        for sub in ("agents", "mcp"):
+            for ext in (".yaml", ".yml", ".json"):
+                live_matches.extend(sorted(root.glob(f"*/{sub}/{name}{ext}")))
+                live_matches.extend(sorted(root.glob(f"*/{sub}/{name}.mcp{ext}")))
+
+    live_unique = _unique_paths(live_matches)
+    if live_unique:
+        return _single_plugin_bridge(name, live_unique)
+
+    marketplace_matches: list[Path] = []
+    marketplace_roots = _marketplace_roots()
+    for root in marketplace_roots:
+        if not root.is_dir():
+            continue
+        for sub in ("agents", "mcp"):
+            for ext in (".yaml", ".yml", ".json"):
+                marketplace_matches.extend(sorted(root.glob(f"*/{sub}/{name}{ext}")))
+                marketplace_matches.extend(
+                    sorted(root.glob(f"*/{sub}/{name}.mcp{ext}"))
+                )
+    marketplace_unique = _unique_paths(marketplace_matches)
+    if marketplace_roots:
+        return _single_plugin_bridge(name, marketplace_unique)
+
     matches: list[Path] = []
     for root in _plugin_roots():
         if not root.is_dir():
@@ -338,11 +404,20 @@ def _find_plugin_bridge(name: str) -> Path | None:
                 # bridge name ``ado``).
                 matches.extend(sorted(root.glob(f"*/*/{sub}/{name}{ext}")))
                 matches.extend(sorted(root.glob(f"*/*/{sub}/{name}.mcp{ext}")))
-    # De-duplicate by resolved path (a root may be listed twice, symlinks, etc.).
+    return _single_plugin_bridge(name, _unique_paths(matches))
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    """De-duplicate paths while preserving discovery order."""
     seen: dict[Path, Path] = {}
-    for p in matches:
+    for p in paths:
         seen.setdefault(p.resolve(), p)
-    uniq = list(seen.values())
+    return list(seen.values())
+
+
+def _single_plugin_bridge(name: str, matches: list[Path]) -> Path | None:
+    """Return one bridge match or surface an ambiguous live/plugin catalog."""
+    uniq = _unique_paths(matches)
     if not uniq:
         return None
     if len(uniq) > 1:
@@ -381,6 +456,20 @@ def discover_plugin_bridge_candidates() -> list[tuple[str, Path]]:
     """
     candidates: list[tuple[str, Path]] = []
     seen: set[Path] = set()
+    marketplace_roots = _marketplace_roots()
+    if marketplace_roots:
+        for root in marketplace_roots:
+            if not root.is_dir():
+                continue
+            for sub in ("agents", "mcp"):
+                for ext in (".yaml", ".yml", ".json"):
+                    for path in sorted(root.glob(f"*/{sub}/*{ext}")):
+                        resolved = path.resolve()
+                        if resolved in seen:
+                            continue
+                        seen.add(resolved)
+                        candidates.append((normalize_bridge_name(path.name), path))
+        return candidates
     for root in _plugin_roots():
         if not root.is_dir():
             continue
@@ -450,22 +539,41 @@ def _as_command(value: Any) -> list[str]:
 
 
 def _resolve_python() -> str:
-    """Resolve the ``${python}`` command token to a working Python 3 interpreter.
+    """Resolve ``${python}`` to agent-mcp's own absolute interpreter.
 
-    A stateless, plugin-shipped command (run in-place via ``${config_dir}``) needs
-    an interpreter on ``PATH``, but the bare name differs by platform: many POSIX
-    installs ship only ``python3`` (no ``python`` at all), while Windows ships
-    ``python``. Probe the platform-appropriate names in order; if none is on
-    ``PATH``, fall back to the interpreter running agent-mcp itself
-    (``sys.executable``), which always exists and can run any stdlib-only sibling
-    script. This keeps a plugin's bridge YAML portable without a per-OS launcher.
+    Config-local helpers are part of the trusted bridge declaration. They must
+    not select an unrelated interpreter from a long-lived daemon's inherited
+    ``PATH``; the provisioned runtime already owns a working cross-platform
+    Python executable.
+
+    **Never resolves to a windowless (``pythonw``) launcher.** The resident
+    ``serve`` daemon deliberately runs under ``pythonw.exe`` on Windows (see
+    :func:`agent_procutil.windowless_python`) so it never flashes a console --
+    but that makes ``sys.executable`` inside the daemon ``pythonw.exe`` too. A
+    ``pythonw.exe`` parent's stdout is not a usable pipe: a *grandchild*
+    process this interpreter spawns (e.g. a credential-mint helper invoked via
+    ``${python} <script> ...`` in a bridge's ``auth.command``) that inherits
+    stdout rather than having it explicitly captured writes into a dangling
+    handle -- the process still exits 0, but every byte it wrote is silently
+    lost. That surfaced as a real, reproducible bug: a bridge's vault-backed
+    auth command returned an empty (but "successful") token under the serve
+    daemon, so the bridge sent no ``Authorization`` header and every request
+    got HTTP 401 -- while the identical command run directly under
+    ``python.exe`` (any non-daemon invocation) worked every time. Substituting
+    the sibling console interpreter here fixes it at the one place every
+    ``${python}``-templated command shares, rather than requiring each
+    config-local helper script to re-implement explicit-pipe subprocess I/O.
     """
-    names = ("python", "python3") if os.name == "nt" else ("python3", "python")
-    for name in names:
-        found = shutil.which(name)
-        if found:
-            return found
-    return sys.executable
+    if not sys.executable:
+        raise ConfigError("agent-mcp runtime interpreter is unavailable")
+    executable = Path(os.path.abspath(sys.executable))
+    if executable.name.lower() == "pythonw.exe":
+        console_sibling = executable.with_name("python.exe")
+        if console_sibling.is_file():
+            executable = console_sibling
+    if not executable.is_file():
+        raise ConfigError(f"agent-mcp runtime interpreter is not a file: {executable}")
+    return str(executable)
 
 
 def _expand_command_vars(argv: list[str], base_dir: str | None) -> list[str]:
@@ -478,9 +586,9 @@ def _expand_command_vars(argv: list[str], base_dir: str | None) -> list[str]:
       or a stdio launcher) with no PATH deploy and no install. Only expanded when
       the config was loaded from a file (``base_dir`` known); a bare-dict parse
       leaves it intact.
-    * ``${python}`` -> a working Python 3 interpreter for **this** platform (see
-      :func:`_resolve_python`), so the same YAML runs on Windows (``python``) and
-      POSIX (``python3``) without a per-OS launcher. Path-independent, so it is
+    * ``${python}`` -> the absolute interpreter running agent-mcp (see
+      :func:`_resolve_python`), so the same YAML uses the provisioned runtime on
+      every platform without consulting the daemon's inherited ``PATH``. It is
       expanded regardless of ``base_dir``.
 
     Invoke a sibling via such an interpreter (``${python}``/``node``/``pwsh``)
@@ -685,6 +793,8 @@ def parse_config(data: dict[str, Any], *, name: str | None = None,
         tools=tools,
         timeout=float(data.get("timeout", 30.0)),
         retries=int(data.get("retries", 1)),
+        idle_timeout=float(
+            data.get("idle_timeout", os.environ.get("AGENT_MCP_BRIDGE_IDLE_TIMEOUT", 300.0))),
         name=name,
         source_path=source_path,
         decorators=decorators,
@@ -923,6 +1033,50 @@ def _validate_decorators(decorators: list[DecoratorSpec]) -> list[str]:
             errors.extend(_validate_transform_rules(opts, label))
         if d.type == "gate":
             errors.extend(_validate_gate(opts, label))
+        if d.type == "input_gate":
+            errors.extend(_validate_input_gate(opts, label))
+    errors.extend(_validate_input_gate_position(decorators))
+    return errors
+
+
+# Decorator types whose synthesized/rewritten/rehydrated sub-requests can
+# bypass an `input_gate` positioned before (client-side / outer of) them --
+# see input_gate.py's module docstring for the full rationale.
+_UNSAFE_BEFORE_INPUT_GATE = ("code-mode", "defer", "storage", "rename")
+
+
+def _validate_input_gate_position(decorators: list[DecoratorSpec]) -> list[str]:
+    """Reject a decorator stack where an ``input_gate`` sits BEFORE
+    ``code-mode``/``defer`` (whose synthesized sub-requests only reach
+    decorators below their own position, never back through ``input_gate``
+    above them), ``storage`` (which may rehydrate a ``$stream`` argument
+    handle into its real value on the way to upstream -- an ``input_gate``
+    above it would evaluate ``deny_when`` against the handle, not the real
+    value), or ``rename`` (which rewrites the client-visible tool name back to
+    the real upstream name on the way down -- an ``input_gate`` above it would
+    see the RENAMED name in ``match_tools``, e.g. a caller-facing
+    `partner__update_incident` instead of the real `update_incident`, so a
+    `match_tools: [update_incident]` gate would silently never trigger). This
+    is a documented ordering requirement (README, module docstrings); this
+    function makes it a HARD, enforced requirement instead of a config author
+    simply having to remember it correctly."""
+    errors: list[str] = []
+    input_gate_indices = [i for i, d in enumerate(decorators) if d.type == "input_gate"]
+    if not input_gate_indices:
+        return errors
+    last_unsafe_index = max(
+        (i for i, d in enumerate(decorators) if d.type in _UNSAFE_BEFORE_INPUT_GATE),
+        default=-1,
+    )
+    for i in input_gate_indices:
+        if i < last_unsafe_index:
+            errors.append(
+                f"decorators[{i}] (input_gate) must be positioned AFTER every "
+                f"{'/'.join(_UNSAFE_BEFORE_INPUT_GATE)} decorator (found one at "
+                f"decorators[{last_unsafe_index}]) -- a synthesized sub-request "
+                "or a rehydrated $stream value would otherwise bypass its "
+                "deny_when check. Move input_gate to be the LAST decorator in "
+                "the stack.")
     return errors
 
 
@@ -944,12 +1098,30 @@ def _validate_gate(opts: dict, label: str) -> list[str]:
             errors.append(f"{label}.preflight.cache '{cache}' must be per-key|none")
     if not isinstance(opts.get("allow_when"), dict):
         errors.append(f"{label}: gate requires an 'allow_when' predicate mapping")
+    else:
+        errors.extend(validate_predicate(opts["allow_when"], f"{label}.allow_when"))
     on_deny = opts.get("on_deny", "stub")
     if on_deny not in ("stub", "drop", "error"):
         errors.append(f"{label}.on_deny '{on_deny}' must be stub|drop|error")
     on_error = opts.get("on_error", "deny")
     if on_error not in ("deny", "allow"):
         errors.append(f"{label}.on_error '{on_error}' must be deny|allow")
+    return errors
+
+
+def _validate_input_gate(opts: dict, label: str) -> list[str]:
+    """Validate an input_gate decorator (match_tools + deny_when + on_deny)."""
+    errors: list[str] = []
+    match_tools = opts.get("match_tools")
+    if not match_tools or not isinstance(match_tools, list):
+        errors.append(f"{label}: input_gate requires a non-empty 'match_tools' list")
+    if not isinstance(opts.get("deny_when"), dict):
+        errors.append(f"{label}: input_gate requires a 'deny_when' predicate mapping")
+    else:
+        errors.extend(validate_predicate(opts["deny_when"], f"{label}.deny_when"))
+    on_deny = opts.get("on_deny", "error")
+    if on_deny not in ("stub", "drop", "error"):
+        errors.append(f"{label}.on_deny '{on_deny}' must be stub|drop|error")
     return errors
 
 

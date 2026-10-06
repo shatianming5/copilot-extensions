@@ -67,11 +67,11 @@ A bridge config can be referenced two ways:
 | Form | Reference | Lives in | Use for |
 |------|-----------|----------|---------|
 | **In-repo `--config`** (preferred) | `bridge --config <path>` | the repo (e.g. `.github/agents/<name>.mcp.yaml`) | **repo-scoped agents** -- config is version-controlled, travels with the repo, needs no deploy |
-| **Named bridge** | `bridge <name>` | `~/.agent-mcp/bridges/<name>.{yaml,yml,json}` | **personal / cross-repo** MCPs not tied to one repo |
+| **Named bridge** | `bridge <name>` | `~/.agent-mcp/bridges/<name>.{yaml,yml,json}` | **personal / cross-repo** MCPs not tied to one repo <!-- marketplace-isolation: allow deployed-runtime-diagnostics --> |
 | **Plugin-shipped bridge** | `bridge <name>` | installed plugin `agents/` or `mcp/` directory | a plugin ships its own sub-agent + bridge config; user-space bridge file is not required |
 
 > **Prefer the in-repo `--config` form for any agent that ships inside a repo.**
-> Reserve named bridges (user-global `~/.agent-mcp/bridges/`) for MCPs you use
+> Reserve named bridges (user-global `~/.agent-mcp/bridges/`) for MCPs you use <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 > across many repos or that do not belong to a checkout. Both forms read the
 > same config schema; only the lookup differs.
 
@@ -79,7 +79,7 @@ A bridge config can be referenced two ways:
 > plugin-shipped bridge (which tools it exposes, its decorators, headers, auth)
 > for *this host only*, without editing the shared file, use the
 > **`customizing-bridges`** skill: it writes a deep-merged overlay at
-> `~/.agent-mcp/overrides/<id>.yaml`.
+> `~/.agent-mcp/overrides/<id>.yaml`. <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 
 ## Wire an existing repo-scoped agent (the common case)
 
@@ -177,7 +177,7 @@ drift contract live in
 
 | kind | acquires via | injects |
 |------|--------------|---------|
-| `entra` / `az` | `az account get-access-token` | `Authorization: Bearer` (http) / env (stdio) |
+| `entra` / `az` | on-PATH `ado-auth-helper` (Codespace-guest relay client) if present, else `az account get-access-token`; always the latter when `tenant` is configured, since the relay has no tenant parameter | `Authorization: Bearer` (http) / env (stdio) |
 | `gh` | `gh auth token` | `Authorization: Bearer` / env |
 | `git-credential` | Git Credential Manager | `Authorization: Basic` / env |
 | `command` | any `git credential fill`-shaped command | templated header / env |
@@ -303,12 +303,14 @@ decorators:
 | `storage` | Externalize large outputs to `mcpstream://…` handles; rehydrate handle inputs; `read_stream` fetches them. **Field-level `rules:`** target specific tool input/output JSON paths, attach a summary (count + schema + head, or a command), and rewrite a stream-mode input param's schema to a URL. |
 | `transform` | Reshape tool results per tool: `extract`/`pick`/`drop` dotted paths (literal-dotted keys like ADO `fields.System.Title` supported) or a `command` (jq-style) filter. |
 | `gate` | Allow/deny a tool **per-call** by a **preflight** upstream lookup + boolean predicate (`all`/`any`/`not`; `in`/`matches`/`equals`/`contains`/`exists` over `[*]`/dotted paths). Deny → `stub`/`drop`/`error`; fail-closed on preflight error. For rules whose signal is out-of-band for the gated tool. |
+| `input_gate` | Deny a tool call whose **own arguments** match a `deny_when` predicate (same predicate language as `gate`'s `allow_when`, evaluated directly against the call — no preflight). For "never let this write introduce marker X" invariants a preflight can't see. Must be positioned **last** (innermost) — after `code-mode`/`defer`/`storage`/`rename` — or config validation rejects it; see the README's `input_gate` section for why. |
 
 Decorators compose because each calls *through* the ones below it. Recommended
-order: `defer`/`code-mode` outermost, then `rename`, then `filter`, with
-`storage` innermost. The legacy `tools:` filter still works (applied as an
-implicit `filter`). Full reference + per-decorator options:
-[README → Decorator stack](../../README.md#decorator-stack).
+order: `defer`/`code-mode` outermost, then `rename`, then `filter`, then `gate`,
+with `storage` innermost — **except `input_gate`, which must go even after
+`storage` and `rename`** (truly last of all; config validation enforces this). The legacy
+`tools:` filter still works (applied as an implicit `filter`). Full reference +
+per-decorator options: [README → Decorator stack](../../README.md#decorator-stack).
 
 ### Is an MCP a good `code-mode` candidate? (prerequisites)
 
@@ -402,7 +404,7 @@ of speaking JSON-RPC.
   provide it on stdin or with `--request-file` at a simple temporary path.
 
 - **`materialize`** projects the whole `tools/list` catalog into a discoverable,
-  pipeable command fleet under `~/.agent-mcp/materialized/<server>/`:
+  pipeable command fleet under `~/.agent-mcp/materialized/<server>/`: <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 
   ```
   bin/    one short-named stub per tool (POSIX: symlinks to one dispatcher;

@@ -43,6 +43,8 @@ def _powershell() -> str:
     for name in ("pwsh", "powershell.exe", "powershell"):
         executable = shutil.which(name)
         if executable is not None:
+            if os.name != "nt" and Path(executable).suffix.lower() == ".exe":
+                continue
             return executable
     pytest.skip("PowerShell is not available")
 
@@ -50,6 +52,90 @@ def _powershell() -> str:
 def _hooks(event: str) -> list[dict[str, object]]:
     hooks = json.loads((_PLUGIN / "hooks.json").read_text(encoding="utf-8"))
     return hooks["hooks"][event]
+
+
+def test_session_guidance_projection_points_to_hook_written_file():
+    projections = json.loads(
+        (_PLUGIN / "instruction-projections.json").read_text(encoding="utf-8")
+    )
+    assert projections == {
+        "schema": "copilot-extensions.instruction-projections",
+        "version": 1,
+        "projections": [
+            {
+                "id": "session-guidance",
+                "template": "instructions/session-guidance.instructions.md",
+                "destination": (
+                    ".github/instructions/agent-worktrees/"
+                    "session-guidance.instructions.md"
+                ),
+                "customizationKind": "instructions",
+                "applyTo": "**",
+                "legacyMarkers": [],
+            },
+            {
+                "id": "worktree-context-guide",
+                "template": "instructions/worktree-context-guide.instructions.md",
+                "destination": (
+                    ".github/instructions/agent-worktrees/"
+                    "worktree-context-guide.instructions.md"
+                ),
+                "customizationKind": "instructions",
+                "applyTo": "**",
+                "legacyMarkers": [],
+            },
+            {
+                "id": "head-claim-fallback",
+                "template": "instructions/head-claim-fallback.instructions.md",
+                "destination": (
+                    ".github/instructions/agent-worktrees/"
+                    "head-claim-fallback.instructions.md"
+                ),
+                "customizationKind": "instructions",
+                "applyTo": "**",
+                "legacyMarkers": [],
+            },
+            {
+                "id": "cli-fallback",
+                "template": "instructions/cli-fallback.instructions.md",
+                "destination": (
+                    ".github/instructions/agent-worktrees/"
+                    "cli-fallback.instructions.md"
+                ),
+                "customizationKind": "instructions",
+                "applyTo": "**",
+                "legacyMarkers": [],
+            },
+            {
+                "id": "ownership-boundary-fallback",
+                "template": "instructions/ownership-boundary-fallback.instructions.md",
+                "destination": (
+                    ".github/instructions/agent-worktrees/"
+                    "ownership-boundary-fallback.instructions.md"
+                ),
+                "customizationKind": "instructions",
+                "applyTo": "**",
+                "legacyMarkers": [],
+            },
+        ],
+    }
+    template = (
+        _PLUGIN / "instructions" / "session-guidance.instructions.md"
+    ).read_text(encoding="utf-8")
+    assert "applyTo: \"**\"" in template
+    assert "already-disclosed session folder" in template
+    assert "~/.copilot/session-state" not in template
+    assert (
+        "instructions/agent-worktrees/session-guidance.instructions.md"
+        in template
+    )
+    assert "Its absence is not an error." in template
+    guide = (
+        _PLUGIN / "instructions" / "worktree-context-guide.instructions.md"
+    ).read_text(encoding="utf-8")
+    assert "applyTo: \"**\"" in guide
+    assert "Related:" in guide
+    assert "agent-worktrees related list" in guide
 
 
 def _run(command: str, shell: str, home: Path, cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -121,7 +207,7 @@ def test_bash_hooks_do_not_mask_runtime_script_failures(tmp_path: Path):
         home.mkdir(parents=True)
         cwd.mkdir()
         command = str(hook["bash"])
-        if "invoke-context-contributor.sh" in command:
+        if "hook_client.py" in command:
             continue
         _stage_stub(command, home, cwd, "exit 23")
 
@@ -129,22 +215,14 @@ def test_bash_hooks_do_not_mask_runtime_script_failures(tmp_path: Path):
         assert result.returncode == 23
 
 
-def test_bash_hook_forwards_runtime_script_output(tmp_path: Path):
-    home = tmp_path / "home"
-    cwd = tmp_path / "cwd"
-    home.mkdir()
-    cwd.mkdir()
-    command = next(
+def test_bash_lifecycle_hook_is_one_bounded_client():
+    commands = [
         str(hook["bash"])
         for hook in _hooks("sessionStart")
-        if "invoke-context-contributor.sh" not in str(hook["bash"])
-    )
-    expected = '{"additionalContext":"runtime guidance"}'
-    _stage_stub(command, home, cwd, f"printf '%s' '{expected}'")
-
-    result = _run(command, _bash(), home, cwd)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == expected
+        if "hook_client.py" in str(hook["bash"])
+    ]
+    assert len(commands) == 1
+    assert "sessionStart" in commands[0]
 
 
 def test_register_session_bash_coalesces_command_catalog(tmp_path: Path):
@@ -450,7 +528,7 @@ def test_powershell_hooks_do_not_mask_runtime_script_failures(tmp_path: Path):
         script = tmp_path / str(index) / "stub.ps1"
         script.write_text("exit 23\n", encoding="utf-8")
         raw_command = str(hook["powershell"])
-        if "invoke-context-contributor.ps1" in raw_command:
+        if "hook_client.py" in raw_command:
             continue
         command = _powershell_wrapper(raw_command, script)
 
@@ -458,28 +536,65 @@ def test_powershell_hooks_do_not_mask_runtime_script_failures(tmp_path: Path):
         assert result.returncode != 0
 
 
-def test_powershell_hook_forwards_runtime_script_output(tmp_path: Path):
+def test_powershell_lifecycle_hook_is_one_bounded_client():
+    commands = [
+        str(hook["powershell"])
+        for hook in _hooks("sessionStart")
+        if "hook_client.py" in str(hook["powershell"])
+    ]
+    assert len(commands) == 1
+    assert "sessionStart" in commands[0]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows command resolution regression")
+@pytest.mark.parametrize("alias_first", [False, True])
+def test_powershell_lifecycle_hook_ignores_windowsapps_alias(
+    tmp_path: Path,
+    alias_first: bool,
+):
     powershell = _powershell()
     home = tmp_path / "home"
     cwd = tmp_path / "cwd"
-    home.mkdir()
-    cwd.mkdir()
-    script = tmp_path / "stub.ps1"
-    expected = '{"additionalContext":"runtime guidance"}'
-    script.write_text(f"[Console]::Out.Write('{expected}')\n", encoding="utf-8")
-    command = _powershell_wrapper(
-        next(
-            str(hook["powershell"])
-            for hook in _hooks("sessionStart")
-            if "invoke-context-contributor.ps1"
-            not in str(hook["powershell"])
-        ),
-        script,
+    plugin_root = tmp_path / "plugin"
+    scripts = plugin_root / "scripts"
+    alias_bin = tmp_path / "WindowsApps"
+    marker = tmp_path / "python-args.txt"
+    for directory in (home, cwd, scripts, alias_bin):
+        directory.mkdir(parents=True)
+    (scripts / "hook_client.py").write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        f"Path({str(marker)!r}).write_text(' '.join(sys.argv[1:]), encoding='utf-8')\n"
+        "print('{}', end='')\n",
+        encoding="utf-8",
+    )
+    (alias_bin / "python.exe").write_bytes(b"")
+    command = next(
+        str(hook["powershell"])
+        for hook in _hooks("sessionStart")
+        if "hook_client.py" in str(hook["powershell"])
+    )
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)
+    env["COPILOT_PROJECT_DIR"] = str(cwd)
+    env["COPILOT_PLUGIN_ROOT"] = str(plugin_root)
+    candidates = (str(alias_bin), str(Path(sys.executable).parent))
+    if not alias_first:
+        candidates = tuple(reversed(candidates))
+    env["PATH"] = os.pathsep.join(candidates)
+
+    result = subprocess.run(
+        [powershell, "-NoLogo", "-NoProfile", "-Command", command],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
-    result = _run(command, powershell, home, cwd)
     assert result.returncode == 0, result.stderr
-    assert result.stdout == expected
+    assert marker.read_text(encoding="utf-8") == "sessionStart"
 
 
 def test_register_session_powershell_coalesces_context_and_fails_open(

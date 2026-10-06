@@ -7,6 +7,8 @@ integration (an asleep pool defers a task without burning a spawn attempt).
 
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
 from agent_dispatch import embody, fleet
@@ -76,6 +78,7 @@ def _fake_headless_spawn(record: list | None = None, *, ok: bool = True, rc: int
         owner,
         worker_id,
         agent,
+        charter=None,
         repo=None,
         all_repos=False,
     ):
@@ -153,6 +156,18 @@ def test_empty_pool_rejected():
         fleet.FleetSpawner([], origin="orig")
     with pytest.raises(ValueError):
         fleet.FleetSpawner(["a"], origin="  ")
+
+
+def test_charter_rejected_for_cli_embodied_fleet():
+    """A non-headless (CLI-embodied) fleet has no charter-binding path -- fail
+    fast at construction rather than silently dropping the requested charter
+    when spawn_fleet_embodied_worker is invoked without it."""
+    with pytest.raises(embody.EmbodyUnavailable):
+        fleet.FleetSpawner(
+            ["a"], origin="orig", headless=False, charter="cab-charter"
+        )
+    # A headless fleet accepts the same charter without complaint.
+    fleet.FleetSpawner(["a"], origin="orig", headless=True, charter="cab-charter")
 
 
 # -- FleetSpawner.__call__ (SpawnFn contract) --------------------------------
@@ -234,6 +249,8 @@ def test_fleet_seed_drives_origin_over_ssh_with_explicit_owner():
         "t42", origin="brain", owner="fleet-t42-abc123", worker_id="fleet-t42-abc123"
     )
     # every lifecycle verb reaches the origin over ssh, with the explicit owner
+    assert "ssh brain agent-dispatch charter show operating-procedures" in seed
+    assert "ssh brain agent-dispatch charter show autopilot" in seed
     assert "ssh brain agent-dispatch claim --task t42 --worker fleet-t42-abc123" in seed
     assert "ssh brain agent-dispatch start t42 fleet-t42-abc123" in seed
     assert (
@@ -270,6 +287,29 @@ def test_fleet_seed_carries_explicit_all_repos_claim_mode():
     ) in seed
 
 
+def test_fleet_seed_duplicate_check_sweep_shares_the_claim_lane_scope():
+    # dev-cycle regression: the duplicate-check `list` sweep must respect the
+    # same repo scoping as the claim step, not silently sweep every lane on
+    # the origin (or default to whatever lane the origin happens to be in).
+    seed = embody.fleet_autopilot_worker_prompt(
+        "t42",
+        origin="brain",
+        owner="fleet-t42-abc123",
+        worker_id="fleet-t42-abc123",
+        repo="github.com/o/n",
+    )
+    assert "ssh brain agent-dispatch list --repo github.com/o/n" in seed
+
+    all_repos_seed = embody.fleet_autopilot_worker_prompt(
+        "t42",
+        origin="brain",
+        owner="fleet-t42-abc123",
+        worker_id="fleet-t42-abc123",
+        all_repos=True,
+    )
+    assert "ssh brain agent-dispatch list --all-repos" in all_repos_seed
+
+
 def test_spawn_fleet_embodied_worker_builds_ssh_embody_argv(monkeypatch):
     captured = {}
 
@@ -281,7 +321,12 @@ def test_spawn_fleet_embodied_worker_builds_ssh_embody_argv(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
 
     monkeypatch.setattr(embody.shutil, "which", lambda _n: "/usr/bin/ssh")
-    monkeypatch.setattr(embody.subprocess, "run", fake_run)
+    monkeypatch.setattr(embody, "run_ssh_command", fake_run)
+    monkeypatch.setattr(
+        embody.bridge_remote.LocalBridgeRemoteClient,
+        "create_session",
+        _remote_unavailable,
+    )
 
     embody.spawn_fleet_embodied_worker(
         "Host-B", "t7", origin="brain", owner="fleet-t7-xyz", worker_id="fleet-t7-xyz"
@@ -322,13 +367,12 @@ def test_host_can_bridge_probes_agent_bridge(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, stdout="/usr/bin/agent-bridge", stderr="")
 
     monkeypatch.setattr(fleet.shutil, "which", lambda _n: "/usr/bin/ssh")
-    monkeypatch.setattr(fleet.subprocess, "run", fake_run)
-    monkeypatch.setattr(fleet, "no_window_kwargs", lambda: {"creationflags": 123})
+    monkeypatch.setattr(fleet, "run_ssh_command", fake_run)
     assert fleet.host_can_bridge("Host-B") is True
     cmd = captured["cmd"]
     assert cmd[-1] == "command -v agent-bridge"
     assert cmd[-2] == "host-b"  # alias lowercased
-    assert captured["kwargs"]["creationflags"] == 123
+    assert captured["kwargs"]["timeout"] == 8.0
 
 
 def test_spawn_fleet_headless_worker_builds_ssh_agent_bridge_argv(monkeypatch):
@@ -340,11 +384,19 @@ def test_spawn_fleet_headless_worker_builds_ssh_agent_bridge_argv(monkeypatch):
         captured["cmd"] = cmd
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
+    def unavailable_client():
+        raise embody.bridge_remote.RemoteBridgeUnavailable()
+
     monkeypatch.setattr(embody.shutil, "which", lambda _n: "/usr/bin/ssh")
-    monkeypatch.setattr(embody.subprocess, "run", fake_run)
+    monkeypatch.setattr(embody, "run_ssh_command", fake_run)
+    monkeypatch.setattr(embody.bridge_remote, "LocalBridgeRemoteClient", unavailable_client)
 
     embody.spawn_fleet_headless_worker(
-        "Host-B", "t7", origin="brain", owner="fleet-t7-xyz", worker_id="fleet-t7-xyz",
+        "  Host-B  ",
+        "t7",
+        origin="brain",
+        owner="fleet-t7-xyz",
+        worker_id="fleet-t7-xyz",
         agent="review-worker",
     )
     cmd = captured["cmd"]
@@ -363,6 +415,11 @@ def test_spawn_fleet_headless_worker_builds_ssh_agent_bridge_argv(monkeypatch):
 
 def test_spawn_fleet_headless_worker_requires_ssh(monkeypatch):
     monkeypatch.setattr(embody.shutil, "which", lambda _n: None)
+    monkeypatch.setattr(
+        embody.bridge_remote.LocalBridgeRemoteClient,
+        "create_session",
+        _remote_unavailable,
+    )
     with pytest.raises(embody.EmbodyUnavailable):
         embody.spawn_fleet_headless_worker(
             "a", "t1", origin="brain", owner="o", worker_id="o"
@@ -403,6 +460,10 @@ def _fake_status_run(rc, stdout, stderr=""):
     return run
 
 
+def _remote_unavailable(*_args, **_kwargs):
+    raise embody.bridge_remote.RemoteBridgeUnavailable("not installed")
+
+
 @pytest.mark.parametrize(
     "rc,stdout,stderr,expected",
     [
@@ -419,12 +480,22 @@ def _fake_status_run(rc, stdout, stderr=""):
 )
 def test_fleet_body_verdict_classifies(monkeypatch, rc, stdout, stderr, expected):
     monkeypatch.setattr(embody.shutil, "which", lambda _n: "/usr/bin/ssh")
-    monkeypatch.setattr(embody.subprocess, "run", _fake_status_run(rc, stdout, stderr))
+    monkeypatch.setattr(embody, "run_ssh_command", _fake_status_run(rc, stdout, stderr))
+    monkeypatch.setattr(
+        embody.bridge_remote.LocalBridgeRemoteClient,
+        "session_status",
+        _remote_unavailable,
+    )
     assert embody.fleet_body_verdict("Host-B", "sid-1") == expected
 
 
 def test_fleet_body_verdict_unknown_without_ssh(monkeypatch):
     monkeypatch.setattr(embody.shutil, "which", lambda _n: None)
+    monkeypatch.setattr(
+        embody.bridge_remote.LocalBridgeRemoteClient,
+        "session_status",
+        _remote_unavailable,
+    )
     assert embody.fleet_body_verdict("h", "sid") == "unknown"
 
 
@@ -433,13 +504,141 @@ def test_fleet_body_verdict_unknown_without_ssh(monkeypatch):
     [
         ('{"status":"running","liveness":"active"}', "ACTIVE"),
         ('{"status":"running","liveness":"stalled"}', "STALLED"),
-        ('{"status":"idle","liveness":"idle"}', None),
+        ('{"status":"idle","liveness":"idle"}', "IDLE"),
     ],
 )
 def test_fleet_body_activity_classifies(monkeypatch, payload, expected):
     monkeypatch.setattr(embody.shutil, "which", lambda _n: "/usr/bin/ssh")
-    monkeypatch.setattr(embody.subprocess, "run", _fake_status_run(0, payload))
+    monkeypatch.setattr(embody, "run_ssh_command", _fake_status_run(0, payload))
+    monkeypatch.setattr(
+        embody.bridge_remote.LocalBridgeRemoteClient,
+        "session_status",
+        _remote_unavailable,
+    )
     assert embody.fleet_body_activity("Host-B", "sid-1") == expected
+
+
+def test_headless_create_uses_carrier_without_ssh(monkeypatch):
+    calls = {}
+
+    def create(_self, host, **kwargs):
+        calls.update(host=host, **kwargs)
+        return {"session_id": "bridge-1"}
+
+    monkeypatch.setattr(
+        embody.bridge_remote.LocalBridgeRemoteClient, "create_session", create
+    )
+    monkeypatch.setattr(
+        embody.shutil,
+        "which",
+        lambda _name: pytest.fail("carrier-backed create must not resolve ssh"),
+    )
+
+    result = embody.spawn_fleet_headless_worker(
+        "  Host-B  ",
+        "t7",
+        origin="brain",
+        owner="fleet-t7-xyz",
+        worker_id="fleet-t7-xyz",
+        agent="review-worker",
+    )
+
+    assert result.returncode == 0
+    assert embody.parse_fleet_body_session(result) == "bridge-1"
+    assert calls["host"] == "host-b"
+    assert calls["agent"] == "review-worker"
+    assert calls["caller_id"] == "fleet-t7-xyz"
+
+
+def test_carrier_status_preserves_tri_state_without_ssh(monkeypatch):
+    calls = {}
+
+    def status(_self, host, session_id, **kwargs):
+        calls.update(host=host, session_id=session_id, **kwargs)
+        return {"status": "idle"}
+
+    monkeypatch.setattr(
+        embody.bridge_remote.LocalBridgeRemoteClient,
+        "session_status",
+        status,
+    )
+    monkeypatch.setattr(
+        embody.shutil,
+        "which",
+        lambda _name: pytest.fail("carrier-backed status must not resolve ssh"),
+    )
+    assert embody.fleet_body_verdict("  Host-B  ", "sid-1") == "live"
+    assert calls["host"] == "host-b"
+
+
+def test_carrier_end_and_activity_normalize_host_without_ssh(monkeypatch):
+    calls = []
+
+    def end(_self, host, session_id, **kwargs):
+        calls.append(("end", host, session_id, kwargs))
+
+    def status(_self, host, session_id, **kwargs):
+        calls.append(("status", host, session_id, kwargs))
+        return {"status": "running", "liveness": "active"}
+
+    monkeypatch.setattr(
+        embody.bridge_remote.LocalBridgeRemoteClient, "end_session", end
+    )
+    monkeypatch.setattr(
+        embody.bridge_remote.LocalBridgeRemoteClient, "session_status", status
+    )
+    monkeypatch.setattr(
+        embody.shutil,
+        "which",
+        lambda _name: pytest.fail("carrier operations must not resolve ssh"),
+    )
+
+    assert embody.stop_fleet_body("  Host-B  ", "sid-1")
+    assert embody.fleet_body_activity("  Host-B  ", "sid-1") == "ACTIVE"
+    assert [call[1] for call in calls] == ["host-b", "host-b"]
+
+
+def test_carrier_not_found_is_gone_without_ssh_fallback(monkeypatch):
+    def missing(*_args, **_kwargs):
+        raise embody.bridge_remote.RemoteBridgeOperationError(
+            "missing", status=404, code="session_not_found"
+        )
+
+    monkeypatch.setattr(
+        embody.bridge_remote.LocalBridgeRemoteClient,
+        "session_status",
+        missing,
+    )
+    monkeypatch.setattr(
+        embody.shutil,
+        "which",
+        lambda _name: pytest.fail("carrier operation errors must not fall back"),
+    )
+    assert embody.fleet_body_verdict("Host-B", "sid-1") == "gone"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        subprocess.TimeoutExpired(["ssh"], 20),
+        subprocess.SubprocessError("ssh failed"),
+        OSError("ssh unavailable"),
+    ],
+)
+def test_stop_fleet_body_normalizes_ssh_fallback_errors(monkeypatch, error):
+    monkeypatch.setattr(embody.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(
+        embody.bridge_remote.LocalBridgeRemoteClient,
+        "end_session",
+        _remote_unavailable,
+    )
+
+    def fail(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(embody, "run_ssh_command", fail)
+
+    assert embody.stop_fleet_body("Host-B", "sid-1") is False
 
 
 def test_headless_call_encodes_fleet_body_recovery_handle():
@@ -455,6 +654,7 @@ def test_headless_call_encodes_fleet_body_recovery_handle():
         owner,
         worker_id,
         agent,
+        charter=None,
         repo=None,
         all_repos=False,
     ):
@@ -486,6 +686,7 @@ def test_headless_call_without_session_id_falls_back_to_owner():
         owner,
         worker_id,
         agent,
+        charter=None,
         repo=None,
         all_repos=False,
     ):

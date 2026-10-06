@@ -24,7 +24,8 @@ description: >
 # Contributing to copilot-extensions
 
 The authoritative, versioned rules live in the repo's own **`CONTRIBUTING.md`**,
-**`AGENTS.md`**, **`TESTING.md`**, **`docs/install-contract.md`**, and
+**`docs/pipelines.md`**, **`AGENTS.md`**, **`TESTING.md`**,
+**`docs/install-contract.md`**, and
 **`docs/architecture.md`** — read and respect them for the current detail (they
 are the repo's own root docs, not carried by this plugin). This skill is the
 operator's map: what to touch, in what order, and the gotchas that bite.
@@ -71,7 +72,7 @@ copilot-extensions/
 
 **Payload vs runtime.** A *payload-only* plugin ships skills/hooks/extensions
 (no venv) — enabling it is the whole install. A *runtime* plugin also ships a
-venv + `~/.local/bin` binstub (and sometimes a service), deployed by its own
+venv + `~/.local/bin` binstub (and sometimes a service), deployed by its own <!-- marketplace-isolation: allow doc-example -->
 installer. Know which kind you are changing.
 
 ## The flow
@@ -83,16 +84,66 @@ installer. Know which kind you are changing.
    skips this with a word; a design change owes the reconcile. This is a guide,
    not a gate.
 1. **Isolate.** This is a worktree-class, **PR-required** repo — never edit the
-   anchor checkout and never push directly to `main`. Create a worktree with
-   `copilot-extensions create`, edit and commit there, then land through the
-   repo's `pr-self-merge` flow.
+   anchor checkout and never push directly to `dev` **or** `main`. Create a
+   worktree with `copilot-extensions create`, edit and commit there, then land
+   through the repo's `pr-self-merge` flow. **`dev` is the contribution
+   branch** — every worktree forks from it and every PR targets it (the
+   in-repo `default_branch` config). `main` remains the repo's formal GitHub
+   default and release branch: `dev` is periodically promoted to `main`
+   through the release pipeline, never by an individual contributor's PR. The
+   **only** sanctioned exception to landing on `dev` is a direct `main` change
+   to unstick a broken release pipeline itself — a deliberate, explicitly
+   named operator action, never a routine contribution. The pre-commit hook
+   guard blocks direct in-worktree commits to **both** `main` and `dev`
+   (`protected_branches` in the in-repo config), so this is enforced the same
+   way for every agent regardless of which branch it assumes is "the" default.
 2. **Edit in the repo, never the deployed copy.** The repo is the source of
    truth. Do **not** edit `~/.copilot/installed-plugins/...` (overwritten on
    update) or a runtime dir (`~/.agent-*/lib`, service venvs).
 3. **Test.** Run `pytest` from the changed runtime plugin's dir
-   (`plugins/<plugin>/`). agent-worktrees has no suite yet — verify worktree ops
-   end-to-end. Lint touched Python with `ruff check --select F,E9`. Respect the
-   repo's `TESTING.md` for how to run the suites and the opt-in e2e smoke tests.
+   (`plugins/<plugin>/`). Lint touched Python with `ruff check --select F,E9`.
+   Respect the repo's `TESTING.md` for how to run the suites and the opt-in
+   e2e smoke tests. **Prefer `tools/run_tests_in_devcontainer.py <plugin>`
+   over the bare `tools/run-plugin-tests.py` whenever Docker + the
+   devcontainers CLI are available (Linux only)** — any validation, not
+   just a bug fix — it runs the identical suite inside a hardened,
+   network-disconnected, ephemeral container, adding a real OS-level
+   boundary the bare runner's process-level containment alone can't
+   guarantee against. Fall back to the bare runner when that tooling isn't
+   present. **`git add` any newly created source/test files first** — the
+   wrapper snapshots only git-tracked paths by default, so an untracked
+   regression test is silently omitted and the run can pass without ever
+   exercising it; staging is enough, a commit isn't required. **A container
+   marker alone isn't sufficient reason to skip the wrapper** — a generic
+   dispatched-development or CI container may not be hardened or
+   network-disconnected the way the wrapper's own boundary is; only fall
+   back to the bare runner when nested Docker-in-Docker genuinely isn't
+   available, or that outer container's isolation is independently
+   verified equivalent. See `AGENTS.md` for the full criteria.
+   See `AGENTS.md` § *Test Before PR Publication* and `TESTING.md`
+   § *Optional devcontainer-based isolation*.
+
+   **Fix every failing test you encounter — never label it "pre-existing" and
+   move on.** `dev` feeds a fully automated release pipeline
+   (`.github/workflows/validate-and-promote.yml`, the
+   dev-branch-release-pipeline effort, ThomasMichon/copilot-extensions#3336):
+   promotion only proceeds when the FULL per-plugin suite is genuinely green
+   against `dev`'s current tip, and a red build blocks **every** pending
+   contributor's already-merged work from ever reaching `main`, not just
+   yours. There is no separate human gatekeeper who re-triages "was this
+   pre-existing" before it jams the pipeline — you are the only checkpoint
+   that can prevent that. If a test fails while you're working — even one you
+   didn't write, in a plugin you didn't intend to touch, that only surfaces
+   in the full/slow suite rather than the fast smoke lane — you own fixing it
+   before you merge, exactly as if your own change had caused it. Do not
+   defer it, comment past it, or note it as "pre-existing, not my concern" in
+   a PR description and move on regardless — diagnose it and land a real fix
+   (or an honest revert of whatever actually regressed it) in the same PR or
+   an immediate follow-up before finalizing. The only exception is a failure
+   already tracked as a known, accepted flake/gap with its own open issue —
+   link that issue in your PR description rather than silently skipping past
+   an undocumented one.
+
    **Clean-room validation (install/bootstrap/provision/behavior changes).** When a
    change affects how a plugin installs, bootstraps, self-provisions, or behaves on
    a fresh machine, **run or extend the relevant clean-room scenario when
@@ -106,31 +157,121 @@ installer. Know which kind you are changing.
 4. **Install-contract gate (runtime plugins).** Run
    `python tools/check-install-contract.py` — it must report **zero
    violations**.
-5. **BUMP THE VERSION — mandatory, same commit.** This is the mistake that
-   silently swallows changes: the marketplace detects updates by comparing
-   versions, so an unbumped plugin change makes every machine report "already at
-   latest" and skip your change after merge. For the plugin you touched, bump
-   **together**:
-   - `plugins/<plugin>/plugin.json` → `version`
-   - `plugins/<plugin>/pyproject.toml` → `[project].version` (runtime plugins)
-   - `.github/plugin/marketplace.json` → that plugin's `plugins[N].version`
-   - the agent-worktrees plugin only: also `marketplace.json` `metadata.version` **and**
-     `plugins[0].version`. Adding a **new** plugin is a catalog change — bump
-     `metadata.version` too.
+5. **Add a changefile — mandatory, same commit. Never hand-edit a version
+   number.** This is the mistake that silently swallows changes: nothing
+   ships until a real version bump lands, and versions are no longer
+   hand-picked here — `main` is a wholesale-regenerated release snapshot the
+   CI promotion pipeline (dev-branch-release-pipeline effort,
+   ThomasMichon/copilot-extensions#3336) bumps and stamps automatically from
+   pending changefiles. For every plugin you touched, once per PR:
 
-   Default bump is **patch with a `-devN` suffix** (e.g. `1.3.1` → `1.3.2-dev1`);
-   never bump minor/major unless the maintainer asks. The exact per-plugin file
-   table is in `CONTRIBUTING.md` — follow it; entries drift, so trust the repo.
+   ```bash
+   python tools/changefile.py add --plugin <name> --type patch --comment "<summary>"
+   python tools/changefile.py list   # see what's pending
+   ```
+
+   Default to **`patch`** (or `dev` for an iterative fixup within the same
+   change); never request `minor`/`major` unless the maintainer asks. Do
+   **not** touch `plugin.json`'s `version`, `pyproject.toml`'s
+   `[project].version`, or `.github/plugin/marketplace.json` by hand — the
+   next promotion consumes your changefile and writes all three in lockstep.
+   The exact changefile schema and edge cases (renamed/split plugins, shared
+   libs) are in `docs/pipelines.md` § Release & Versioning — follow it; entries
+   drift, so trust the repo over this summary.
 6. **Open/update the PR.** Use `copilot-extensions create-pr` to squash the
    worktree, push `pr/<slug>`, and open the GitHub PR (the repo config has
    `auto_open: true`). If review feedback requires more commits in the same
    worktree, use `copilot-extensions push-changes` to update the PR head — never
-   push a worktree branch or `main` by hand.
-7. **Self-merge and finalize.** This repo's effective profile is
+   push a worktree branch or `dev`/`main` by hand. Opening the PR is a progress
+   milestone, not a handoff or completion condition.
+7. **Steward the PR through self-merge and finalization.** This repo's effective profile is
    **`pr-self-merge`**: the GitHub ruleset blocks direct pushes and requests a
-   non-blocking Copilot review, but the submitter is authorized to merge. After
-   the PR is ready, run `copilot-extensions pr-merge <PR> --now` (or the same
-   verb through `agent-worktrees`) and then `copilot-extensions finalize`.
+   Copilot review, but the submitter is authorized to merge once that review
+   yields a real verdict.
+   The submitting agent remains responsible until the PR is merged and its
+   worktree is finalized:
+   - **Wait for `Approve` on a contributor's PR; a clean `Comment` is the
+     passing verdict on this repo's own owner-authored PRs.** Copilot code
+     review can only ever render `Approve` or `Comment` (no "Request
+     changes" capability exists in the product -- see CONTRIBUTING.md §
+     "Waiting for a verdict" for the current GitHub-docs citation);
+     Approvals are enabled in
+     this repo, so a genuinely ready **contributor** PR should come back
+     `Approve`. **This repo's own owner-authored PRs are a documented,
+     empirically confirmed exception**
+     (`plugins/agent-worktrees/src/agent_worktrees/pr_contract.py`'s
+     `NONBLOCKING_VERDICT_STATES`; every merged owner-authored PR in this
+     repo's history has been `Comment`-only, never `Approve`) -- there, a
+     `Comment` review with zero Medium/High findings open *is* the passing
+     verdict; do not keep chasing an `Approve` that cannot land. On a
+     **contributor** PR, actively strive for a genuine `Approve` across up
+     to 3 rounds (each open/push/re-request + wait counts as one round)
+     before a maintainer may short-circuit on a stubborn/overly-cautious
+     reviewer -- that bound exists to cap the loop, not as a target to race
+     toward. Use
+     `pr-watch wait <owner>/<repo> <PR> --since <cursor> --until
+     approved,commented,changes_requested --timeout 600` (a bounded
+     ~10-minute window per attempt scoped to actual review transitions only
+     -- triggering a review, whether the initial open or an explicit
+     re-request, is not instant, so give it real room to land -- `--until
+     any` also wakes on unrelated transitions like checks or
+     conflicts, which is not itself a review result) to wait for the initial
+     review, **capturing a fresh `<cursor>` immediately before each wait**
+     (`pr-watch cursor <owner>/<repo> <PR>`, or the cursor a prior wait
+     returned) rather than always reusing `r0`, which can report an old
+     review instead of waiting for a new one. **Check `events[].review.user`
+     before treating a wake as Copilot's verdict** -- this same `--until`
+     set also wakes on an `approved` or `changes_requested` review from any
+     human maintainer or other collaborator, and that is not Copilot's
+     verdict; a human review follows the ordinary contributor-review path
+     (address feedback, re-request the maintainer if needed), not this
+     loop. **No review landed after that window (a timeout, not a review
+     event):** skip straight to explicitly re-requesting a review (`POST
+     .../pulls/<PR>/requested_reviewers` with
+     `reviewers[]=copilot-pull-request-reviewer[bot]` -- see
+     `CONTRIBUTING.md` § "Requesting a fresh review" for the exact call,
+     including direct evidence that this call genuinely triggers a fresh
+     re-review rather than being a no-op)
+     and wait up to 10 minutes again -- there's nothing to address or push yet,
+     so don't invent a commit just to have something to push. On a
+     contributor PR's `Approve`, or an owner-authored PR's `Comment` with
+     zero Medium/High findings open, merge. Otherwise: address genuinely
+     valuable findings; if that requires a real change, push it and wait
+     up to another 10 minutes for the automatic post-push review. **If every
+     finding is dismissed/explained with no actual change needed,** skip
+     the push (there's nothing new for a re-review to see) and go straight
+     to re-requesting. **After the post-push wait, treat a timeout the same
+     as a `Comment`** -- neither is a pass by itself, so either way,
+     re-request and wait again; do not just push another commit hoping the
+     next automatic pass flips on its own. **Narrow bypass, contributor
+     PRs only:** after up to 3 rounds genuinely striving for `Approve`
+     (not at round 1 just because a first pass came back `Comment`), if
+     the maintainer is
+     merging and the *current* `Comment` review's remaining findings are
+     all Low severity, self-merge is permitted (state what was dismissed
+     and why); any Medium/High finding blocks self-merge regardless of who
+     authored the PR.
+   - **This is agent discipline, not yet tool-enforced.** `pr-merge --now`
+     itself does not check Copilot's verdict before merging --
+     `.agent-worktrees/config.yaml`'s `review_blocking: false` makes every
+     `pr-merge` call pass `--admin` (bypassing GitHub's own review-gate
+     check unconditionally), so nothing currently stops a driving agent
+     from merging before this loop is actually satisfied. Follow the loop
+     above deliberately; do not rely on the tooling to refuse a premature
+     merge on your behalf.
+   - Keep the branch current and mergeable. If `dev` moves or conflicts appear,
+     reconcile with the supported worktree PR verbs, re-run the required gates,
+     and update the PR with `push-changes`.
+   - When provider checks are slow, use `pr-watch` or the agent-dispatch
+     hibernation waiter. Sleeping the worker is allowed; dropping ownership is
+     not.
+   - Run `copilot-extensions pr-merge <PR> --now`, verify the provider reports
+     the PR merged, then run `copilot-extensions finalize`.
+
+   **Hard completion gate:** an open PR, a posted review, green checks, or a
+   conflict-free branch is not completion. Stop only after merged + finalized,
+   or after recording a concrete terminal blocker/abandonment in the owning
+   task. This repository has no human-review handoff step.
 8. **Deploy with `<repo> update` — one unified command.** Merging only *primes*
    the change; deploy it on each target machine (over SSH for remotes) with the
    repo's update binstub: **`<repo> update`** (e.g. `agent-worktrees update`, <!-- marketplace-isolation: allow deployment-management -->
@@ -150,40 +291,27 @@ installer. Know which kind you are changing.
 
 ## The fix-path bridge (a review flagged an external plugin)
 
-When `reviewing-customizations` (the `customizing-copilot` plugin) reviews a
-consumer harness with `--from-settings`, a **trigger collision** — or any
-finding — that lands on a plugin from **this** suite is *outside that repo's
-control*: it can't be fixed in the consumer repo, only here. This skill is the
-**fix path** that review points at (via the `<repo>-harness → contributing-to-<repo>`
-bridge). When you arrive here from such a finding:
-
-1. **Confirm it's a copilot-extensions plugin.** The review tags each collision
-   owner `skill [marketplace/plugin]`; a `[copilot-extensions/<plugin>]` origin
-   (or a `source:` of `github.com/ThomasMichon/copilot-extensions`) is ours.
-2. **Reproduce against the repo source, never the installed payload.** Resolve
-   the anchor and read the offending skill/agent in `plugins/<plugin>/…` — do
-   **not** inspect or edit `~/.copilot/installed-plugins/…` (overwritten on
-   update).
-3. **Fix it through the normal flow above** — worktree, edit, **bump the
-   version**, gates, PR/self-merge, deploy. A trigger collision is usually
-   resolved by sharpening or de-duplicating the phrase in the owning skill's
-   `description` / `Trigger phrases include:` list.
-4. **Can't/shouldn't fix it now?** File a GitHub issue on
-   `ThomasMichon/copilot-extensions` describing the collision (both skills, the
-   shared phrase) in generic, world-readable terms (see *Coordinating concurrent
-   drivers* below) so it's tracked for a maintainer.
-
-The consumer repo's own options (an in-repo authority-override skill that
-reclaims the phrase, or disabling the plugin there) live on the *consumer* side
-and are documented by `customizing-copilot:reviewing-customizations`; **this** skill covers the
-upstream half — landing the real fix in the plugin.
+If `reviewing-customizations` (the `customizing-copilot` plugin) flags a
+trigger collision or other finding on a plugin from **this** suite, it's
+outside that consumer repo's control — this skill is the fix path review
+points at. Confirm the `[copilot-extensions/<plugin>]` origin, reproduce
+against the repo source (never the installed payload), and fix it through the
+normal flow above (worktree, edit, bump, gates, PR). Full steps, including the
+file-an-issue fallback:
+[`references/fix-path-bridge.md`](../../references/fix-path-bridge.md).
 
 ## What NOT to do
 
-- **Don't open/update a PR without the required version bump.** (See step 5.
-  This is the one.)
+- **Don't open/update a PR without a changefile for every touched plugin.**
+  (See step 5. This is the one.)
+- **Don't leave a test failure you encountered as "pre-existing."** (See
+  step 3.) That reasoning is exactly what jams the release pipeline for
+  everyone else.
+- **Don't hand-edit a plugin's version anywhere** (`plugin.json`,
+  `pyproject.toml`, `marketplace.json`) — add a changefile; the promotion
+  pipeline stamps every version surface for you.
 - **Don't edit installed/deployed copies** to "fix fast" — fix the repo source,
-  bump, PR/self-merge, deploy.
+  add a changefile, PR/self-merge, deploy.
 - **Don't hand-run `copilot plugin update` or a per-plugin `scripts/install.*` /
   `scripts/init.*`** — always deploy with the unified **`<repo> update`**
   (`agent-worktrees update`). <!-- marketplace-isolation: allow deployment-management -->
@@ -198,7 +326,7 @@ upstream half — landing the real fix in the plugin.
 
 `copilot-extensions` is **public** and may be driven from **more than one
 private control repo at once** (for example a personal control repo and a work
-control repo). Everyone lands through the same PR-required `main`. Two
+control repo). Everyone lands through the same PR-required `dev`. Two
 disciplines keep them from colliding — and keep private context off the public
 face.
 
@@ -267,16 +395,18 @@ pre-publication search closes the cross-control-repo gap.
 
 ### Serial, single-writer merges
 
-Treat `main` as a single-writer lane:
+Treat `dev` as a single-writer lane:
 
 - Land one coherent change, then the next — avoid parallel in-flight PR merges from
   different worktrees or drivers.
-- **Rebase/update before PR publication or merge and re-check the version bump.**
-  A concurrent merge may have already consumed your `-devN`; if the marketplace
-  version moved under you, bump again on top of theirs (never reuse a version
-  another merge took).
-- If you pull and find another driver touched the same plugin, reconcile before
-  updating/merging your PR rather than force-landing.
+- **Changefiles make concurrent merges safe by design** — unlike a hand-picked
+  version, a changefile just accumulates; the promotion pipeline computes the
+  real version once, at promotion time, from whatever's pending. You do not
+  need to detect or react to another merge having "consumed" a version.
+- If you pull and find another driver touched the same plugin's *content*,
+  reconcile the actual conflict before updating/merging your PR rather than
+  force-landing — that's a real collision the changefile mechanism doesn't
+  paper over.
 
 ### Sanitization — keep private context off the public face
 
@@ -289,24 +419,12 @@ comments, docs, `AGENTS.md`. Never put downstream-private material in them.
 - **Do** describe changes in self-contained, general-purpose terms — as if for a
   stranger who has only this repo ("add a `--json` flag to `list`", *not* "so the
   internal dashboard can parse it").
-- **Abstract every attached artifact — examples, traces, repros, and
-  references are the easy leaks.** Anything you paste to illustrate a change
-  tends to smuggle consumer-side detail:
-  - **Error output / stack traces / logs** carry internal paths, hostnames,
-    usernames, and IPs — replace them with neutral placeholders
-    (`/path/to/repo`, `HOST`, `user`, `192.0.2.10`) and drop lines that don't
-    bear on the issue. *E.g.* `at C:\Users\jdoe\src\internal-app\...` →
-    `at <repo>/...`.
-  - **Reproductions** must reduce to the **minimal, generic steps** that repro
-    on a bare checkout — not "run it inside <private system> with <private
-    config>". Strip the private setup; keep only what a stranger needs.
-  - **Example / sample data** must be synthetic, never real internal values
-    (record IDs, tokens, topic roots, private URLs). Use `example.com` and
-    obviously-fake values.
-  - **References** must point only at **public** anchors (a repo issue/PR/commit
-    in this repo) — never an internal tracker, private doc, or session/task ID.
-    Attach the concrete internal artifact to the driver's **private** plan and
-    link the public issue to that; never the reverse.
+- **Abstract every attached artifact** — examples, traces, repros, and
+  references are the easy leaks; anything pasted to illustrate a change tends
+  to smuggle consumer-side detail (internal paths/hostnames in error output,
+  private setup in repros, real internal values in sample data, non-public
+  anchors in references). Worked examples per category:
+  [`references/sanitization-examples.md`](../../references/sanitization-examples.md).
 - The proprietary "why" lives in the **driver's private effort/plan**, which
   *links to* the public issue. The public artifact stays generic; the private
   artifact stays private.
@@ -316,7 +434,8 @@ contributor — because to a reader, you are.
 
 ## Reference
 
-`CONTRIBUTING.md` (versioning + release), `AGENTS.md` (dev guide),
+`CONTRIBUTING.md` (contributor process), `docs/pipelines.md` (CI/CD gating,
+versioning + release), `AGENTS.md` (dev guide),
 `TESTING.md` (running the suites), `docs/install-contract.md` (the runtime-plugin
 contract), `docs/architecture.md` (payload/runtime split, ports), `docs/patterns/`
 (how we build — shapes, principles, invariants, focused patterns), `visions/` (the

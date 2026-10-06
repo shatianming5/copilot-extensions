@@ -1,21 +1,51 @@
 # copilot-extensions-harness
 
 A **payload-only** Copilot CLI plugin that ships the **operator harness** for the
-copilot-extensions repo — the skills to work *on* the plugin suite. Enable it in
-any control repo and your agent knows how to **contribute** changes to the
-plugins, **diagnose** the deployed runtimes, and **validate** them on a fresh box,
-without you hand-writing a per-repo guide or installing a runtime.
+copilot-extensions repo — the skills to work *on* the plugin suite. Its
+**primary purpose** is to make sure any agent using an enabling plugin can
+quickly identify which local scripts/processes/paths belong to this system and
+never monkey-patches a deployed copy — file a bug upstream or auto-update
+instead. Its **secondary purpose**, for repos that also choose to be
+contributors, is to describe the correct flow for landing a real fix. Enable it
+in any control repo and your agent knows how to **diagnose** the deployed
+runtimes, **contribute** changes to the plugins, and **validate** them on a
+fresh box, without you hand-writing a per-repo guide or installing a runtime.
 
-At session start, the plugin injects one concise pointer to its contribution
-boundary. The full guide remains versioned at
-[`references/contribution-ground-rules.md`](references/contribution-ground-rules.md):
-generic, organization-neutral capabilities are welcome; personal or
-organization-specific needs are routed elsewhere.
+The plugin declares four checked-in static projections. Adopting
+repositories synchronize them with the
+`customizing-copilot:reviewing-customizations` manager; each remains available
+without a competing `sessionStart` output.
+- **`contribution-boundary`** — the full guide remains versioned at
+  [`references/contribution-ground-rules.md`](references/contribution-ground-rules.md):
+  generic, organization-neutral capabilities are welcome; personal or
+  organization-specific needs are routed elsewhere.
+- **`cross-repo-debug-tracking`** — before concluding an `agent-*` or
+  `context-handoff` plugin's source is undocumented, or filing an upstream
+  bug against one, resolve its actual checked-out location first (for example
+  `<agent-worktrees catalog argv[0]> related resolve <repo>` -- the exact
+  `argv[0]` from the session command catalog, never a bare PATH lookup), and
+  cross-link a local symptom's tracking issue with its upstream
+  `ThomasMichon/copilot-extensions` issue/PR in both directions.
+- **`commented-review-verdict`** — a PR review verdict that comes back as a
+  plain comment (not an approval/change-request) is Copilot's normal
+  non-blocking review shape absent a repo-specific override; read it as
+  advisory and land the change rather than chasing a further verdict that
+  may never arrive.
+- **`validate-and-promote-triage`** — a red `validate-and-promote` release
+  gate blocks every pending contributor's work, not just whoever broke it;
+  identify every job that actually failed (a per-plugin fan-out job, or
+  `worktree-manager`/`guards-full-sweep`), and for a fan-out failure
+  classify a known accepted flake apart from a CI-environment-specific test
+  bug apart from a genuine regression, then fix
+  forward. Full runbook in the
+  [diagnosing-validate-and-promote-failures](skills/diagnosing-validate-and-promote-failures/SKILL.md)
+  skill.
 
-| Skill | Covers |
-|-------|--------|
-| [contributing-to-copilot-extensions](skills/contributing-to-copilot-extensions/SKILL.md) | Repo layout, the PR-required worktree flow (`create` → `create-pr`/`push-changes` → `pr-merge --now` → `finalize`), the **mandatory version bump**, test + install-contract gates, deploy-after-merge, and source-of-truth rules |
-| [diagnosing-copilot-extensions](skills/diagnosing-copilot-extensions/SKILL.md) | Symptom → cause → action for deployed plugins, key paths, diagnostic commands, and the baseline-reset escape hatch |
+| Skill | Priority | Covers |
+|-------|----------|--------|
+| [diagnosing-copilot-extensions](skills/diagnosing-copilot-extensions/SKILL.md) | **Primary (hard guidance)** | Identify what belongs to this system before touching it; never monkey-patch a deployed copy (file a bug upstream, sanitized, or auto-update instead); symptom → cause → action for deployed plugins; key paths, diagnostic commands, and the baseline-reset escape hatch |
+| [diagnosing-validate-and-promote-failures](skills/diagnosing-validate-and-promote-failures/SKILL.md) | Secondary (opt-in) | Diagnose a red `validate-and-promote` release-pipeline run: isolate the failing per-plugin fan-out job via `gh run view --log`, classify a CI-environment-specific test bug apart from a genuine regression, and land the fix forward |
+| [contributing-to-copilot-extensions](skills/contributing-to-copilot-extensions/SKILL.md) | Secondary (opt-in) | Repo layout, the PR-required worktree flow (`create` → `create-pr`/`push-changes` → `pr-merge --now` → `finalize`), the submitter's hard **merged + finalized** completion gate, the **mandatory version bump**, test + install-contract gates, deploy-after-merge, and source-of-truth rules |
 | [validating-in-clean-room](skills/validating-in-clean-room/SKILL.md) | **Run · evaluate · author** clean-room validation (`tools/clean-room/`): fresh-box scenarios, `cr-report.json` + `cr-logs/`, jam taxonomy, Tier-E literal-mode judging, and the scenario contract |
 
 The plugin also ships `.agent-worktrees/related.yaml`, so an active
@@ -27,6 +57,22 @@ Repository operations require a public GitHub account; enterprise-managed
 GitHub accounts are appropriate for internal organizations, while Entra
 credentials apply to Azure DevOps rather than this GitHub repository.
 
+The plugin also registers one **preToolUse** guard (`hooks.json` +
+`scripts/copilot-mention-guard.py`): it denies a `gh` invocation that would
+publish an `@copilot` mention in a PR/issue comment or review, scoped to this
+plugin's own repo (`ThomasMichon/copilot-extensions`, read live from
+`plugin.json`'s `repository` field rather than a second hardcoded string --
+a maintainer rename of that field is the only place to update; a GitHub
+*fork* does NOT retarget the guard, since a fork's checked-in `plugin.json`
+still names the upstream repo). On GitHub, that mention doesn't nudge the
+review bot; it delegates to the separate Copilot **cloud coding agent**,
+which starts pushing its own commits directly to the PR branch. See
+`CONTRIBUTING.md`'s own "Do not comment `@copilot review`" rule for the
+written policy this hook mechanically enforces. A control repo enabling this
+plugin purely for its instruction projections is never touched by the guard
+-- it only fires for a `gh`
+invocation whose current directory resolves to this plugin's own target repo.
+
 | Sub-agent | Covers |
 |-----------|--------|
 | [clean-room-judge](agents/clean-room-judge.agent.md) | Read-only Tier-E evaluator: scores a clean-room eval run against a scenario's stated outcome under **literal-mode** rules (credits only the literal task; a self-heal "pass" is a false pass), emitting PASS/FAIL + classified jams |
@@ -34,8 +80,10 @@ credentials apply to Azure DevOps rather than this GitHub repository.
 ## Enable
 
 No runtime, binstub, service, or setup script is involved. Enabling the plugin is
-the whole install; restart the session so the skills, agent, and contribution
-boundary hook are scanned.
+the whole install; restart the session so the skills and agent are scanned.
+Synchronize the declared instruction projection in each adopting repository so
+the contribution boundary is available on launch paths that load checked-in
+instructions.
 
 In a control repo, declare the marketplace (if it is not already declared) and
 enable the plugin in `.github/copilot/settings.json`:
@@ -55,6 +103,15 @@ enable the plugin in `.github/copilot/settings.json`:
 
 Then use the skills directly by asking to contribute to copilot-extensions,
 diagnose an installed plugin/runtime, or validate a plugin in the clean room.
+
+The retained cross-platform boundary emitter is not registered as a
+**sessionStart** hook. It is the policy producer seam for a future direct
+plugin-owned `additionalContext` path, which may be activated only after
+native host composition is proven at the supported Copilot CLI version floor
+-- multiple plugins' own `additionalContext` currently has no composition
+story. The `preToolUse` guard above has no such composition hazard (each
+plugin's `preToolUse` hooks run independently, with nothing to compose), so
+it is registered normally.
 
 ## The `<repo>-harness` standard
 

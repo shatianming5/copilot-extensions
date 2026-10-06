@@ -8,10 +8,19 @@ double-spawned.
 
 from __future__ import annotations
 
+import json
+import sqlite3
+import time
 from dataclasses import asdict
+from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 
+from agent_dispatch import bridge, tracking
+from agent_dispatch import supervisor as supervisor_module
+from agent_dispatch.client import DispatchError
 from agent_dispatch.queue import SpawnState, Status
 from agent_dispatch.supervisor import Supervisor
 from tests._helpers import TEST_REPO
@@ -59,6 +68,7 @@ class QueueBackedClient:
         state=None,
         repo=None,
         label=None,
+        conclusion_state=None,
         resume_requested=None,
         limit=200,
     ):
@@ -68,26 +78,150 @@ class QueueBackedClient:
             state=states,
             repo=repo,
             label=label,
+            conclusion_state=conclusion_state,
             resume_requested=resume_requested,
             limit=limit,
         )
         return [asdict(r) for r in rows]
 
-    def reserve_spawn(self, task_id, *, reserved_by=None):
-        res, ok = self._q.reserve_spawn(task_id, reserved_by=reserved_by)
+    def reserve_spawn(self, task_id, *, reserved_by=None, allow_suspended_reembodiment=False):
+        res, ok = self._q.reserve_spawn(
+            task_id, reserved_by=reserved_by,
+            allow_suspended_reembodiment=allow_suspended_reembodiment,
+        )
         return {"reserved": ok, "reservation": asdict(res)}
 
     def record_spawn(self, key, *, session_handle=None, worktree=None):
         return asdict(self._q.record_spawn(key, session_handle=session_handle, worktree=worktree))
 
-    def fail_spawn(self, key, *, detail=None):
-        return asdict(self._q.fail_spawn(key, detail=detail))
+    def record_spawn_worktree(self, key, worktree, **kwargs):
+        return asdict(
+            self._q.record_spawn_worktree(key, worktree, **kwargs)
+        )
 
-    def record_cold(self, key):
-        return asdict(self._q.record_cold(key))
+    def fail_spawn(
+        self,
+        key,
+        *,
+        detail=None,
+        conclusion_state=None,
+        conclusion_detail=None,
+        claim_token=None,
+        force=False,
+        confirmed_absent=False,
+        release_requested=False,
+    ):
+        return asdict(
+            self._q.fail_spawn(
+                key,
+                detail=detail,
+                conclusion_state=conclusion_state,
+                conclusion_detail=conclusion_detail,
+                claim_token=claim_token,
+                force=force,
+                confirmed_absent=confirmed_absent,
+                release_requested=release_requested,
+            )
+        )
 
-    def settle_spawn(self, key, *, detail=None):
-        return asdict(self._q.settle_spawn(key, detail=detail))
+    def defer_spawn(self, key, *, detail=None):
+        return asdict(self._q.defer_spawn(key, detail=detail))
+
+    def request_spawn_release(
+        self,
+        key,
+        *,
+        detail=None,
+        disposition="failed",
+        session_handle=None,
+        worktree=None,
+    ):
+        return asdict(
+            self._q.request_spawn_release(
+                key,
+                detail=detail,
+                disposition=disposition,
+                session_handle=session_handle,
+                worktree=worktree,
+            )
+        )
+
+    def retire_spawn(
+        self,
+        key,
+        *,
+        exact_absence,
+        detail=None,
+        conclusion_state=None,
+        conclusion_detail=None,
+    ):
+        return asdict(
+            self._q.retire_spawn(
+                key,
+                exact_absence=exact_absence,
+                detail=detail,
+                conclusion_state=conclusion_state,
+                conclusion_detail=conclusion_detail,
+            )
+        )
+
+    def record_cold(self, key, *, release_exclusive=False):
+        return asdict(self._q.record_cold(key, release_exclusive=release_exclusive))
+
+    def settle_spawn(
+        self,
+        key,
+        *,
+        detail=None,
+        conclusion_state=None,
+        conclusion_detail=None,
+        claim_token=None,
+        release_requested=False,
+    ):
+        return asdict(
+            self._q.settle_spawn(
+                key,
+                detail=detail,
+                conclusion_state=conclusion_state,
+                conclusion_detail=conclusion_detail,
+                claim_token=claim_token,
+                release_requested=release_requested,
+            )
+        )
+
+    def record_spawn_conclusion(
+        self,
+        key,
+        *,
+        conclusion_state,
+        conclusion_detail,
+        detail=None,
+        claim_token=None,
+    ):
+        return asdict(
+            self._q.record_spawn_conclusion(
+                key,
+                conclusion_state=conclusion_state,
+                conclusion_detail=conclusion_detail,
+                detail=detail,
+                claim_token=claim_token,
+            )
+        )
+
+    def claim_spawn_conclusion_retry(self, key):
+        reservation, claimed, claim_token = (
+            self._q.claim_spawn_conclusion_retry(key)
+        )
+        return {
+            "claimed": claimed,
+            "claim_token": claim_token,
+            "reservation": asdict(reservation),
+        }
+
+    def validate_spawn_conclusion_claim(self, key, claim_token):
+        return asdict(
+            self._q.validate_spawn_conclusion_claim(key, claim_token)
+        )
 
     def heartbeat(self, task_id, worker_id):
         return asdict(self._q.heartbeat(task_id, worker_id))
@@ -99,8 +233,95 @@ class QueueBackedClient:
             )
         )
 
-    def yield_task(self, task_id, worker_id, *, note=None, exclude=None):
-        return asdict(self._q.yield_task(task_id, worker_id, note=note, exclude=exclude))
+    def bind_owner_session(
+        self,
+        task_id,
+        worker_id,
+        owner_session_id,
+        *,
+        expected_generation=None,
+    ):
+        return asdict(
+            self._q.bind_owner_session(
+                task_id,
+                worker_id,
+                owner_session_id,
+                expected_generation=expected_generation,
+            )
+        )
+
+    def yield_task(
+        self,
+        task_id,
+        worker_id,
+        *,
+        note=None,
+        exclude=None,
+        release_spawn=True,
+    ):
+        return asdict(
+            self._q.yield_task(
+                task_id,
+                worker_id,
+                note=note,
+                exclude=exclude,
+                release_spawn=release_spawn,
+            )
+        )
+
+    def abandon(
+        self,
+        task_id,
+        *,
+        worker_id=None,
+        permitted=False,
+        reason=None,
+        expected_status=None,
+        expected_generation=None,
+        expected_owner_session_id=None,
+    ):
+        return asdict(
+            self._q.abandon(
+                task_id,
+                worker_id=worker_id,
+                permitted=permitted,
+                reason=reason,
+                expected_status=expected_status,
+                expected_generation=expected_generation,
+                expected_owner_session_id=expected_owner_session_id,
+            )
+        )
+
+    def confirm(self, task_id, *, actor=None, expected_status=None, expected_generation=None):
+        return asdict(
+            self._q.confirm(
+                task_id,
+                actor=actor,
+                expected_status=expected_status,
+                expected_generation=expected_generation,
+            )
+        )
+
+    def reopen_completed(
+        self,
+        task_id,
+        *,
+        reason=None,
+        steer_fields=None,
+        sender=None,
+        expected_status=None,
+        expected_generation=None,
+    ):
+        return asdict(
+            self._q.reopen_completed(
+                task_id,
+                reason=reason,
+                steer_fields=steer_fields,
+                sender=sender,
+                expected_status=expected_status,
+                expected_generation=expected_generation,
+            )
+        )
 
     def release(self, task_id, worker_id, *, reason=None):
         return asdict(
@@ -109,8 +330,70 @@ class QueueBackedClient:
             )
         )
 
+    def suspend(self, task_id, worker_id, *, reason):
+        return asdict(self._q.suspend(task_id, worker_id, reason=reason))
+
+    def resume(
+        self,
+        task_id,
+        worker_id,
+        *,
+        wake=True,
+        message=None,
+        adopt_session=False,
+        reuse_session=False,
+        expected_owner_session_id=None,
+        expected_generation=None,
+    ):
+        return asdict(
+            self._q.resume(
+                task_id,
+                worker_id,
+                wake_requested=wake,
+                wake_message=message,
+                adopt_owner_session_id=(
+                    expected_owner_session_id if adopt_session else None
+                ),
+                reuse_session=reuse_session,
+                expected_owner_session_id=expected_owner_session_id,
+                expected_generation=expected_generation,
+            )
+        )
+
     def progress_log(self, task_id):
         return self._q.progress_log(task_id)
+
+
+def test_default_liveness_uses_local_bridge_for_local_machine(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        tracking.remote_dispatch, "is_peer_machine", lambda machine: False
+    )
+    monkeypatch.setattr(
+        tracking,
+        "resolve_live_session",
+        lambda worktree, *, machine=None: calls.append((worktree, machine)) or {},
+    )
+
+    supervisor_module._default_liveness("wt-local", "LOCAL-HOST")
+
+    assert calls == [("wt-local", None)]
+
+
+def test_default_liveness_uses_ssh_for_peer_machine(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        tracking.remote_dispatch, "is_peer_machine", lambda machine: True
+    )
+    monkeypatch.setattr(
+        tracking,
+        "resolve_live_session",
+        lambda worktree, *, machine=None: calls.append((worktree, machine)) or {},
+    )
+
+    supervisor_module._default_liveness("wt-peer", "peer-host")
+
+    assert calls == [("wt-peer", "peer-host")]
 
 
 @pytest.fixture
@@ -154,6 +437,149 @@ def test_poll_spawns_eligible_task_once(q, client):
     assert spawn.calls == [t.id]
 
 
+def test_eligible_scopes_the_200_limit_per_own_label_not_globally(q, client):
+    """A per-label eligibility regression: `client.list()` truncates at
+    `limit` (200) newest-first ACROSS THE WHOLE COORDINATOR -- every
+    label/pool sharing it, not just this one. Flood the queue with 250
+    newer, differently-labeled tasks (simulating heavy unrelated activity
+    from other pools) ahead of one older task in THIS supervisor's own
+    label -- it must still be found eligible, not silently truncated off a
+    shared newest-first page before this supervisor's own label filter ever
+    gets a chance to apply."""
+    old_task = q.create("old durable review", labels=["intelligence-dampener-review"])
+    for i in range(250):
+        q.create(f"unrelated newer task {i}", labels=["some-other-pool"])
+
+    spawn = _ok_spawn()
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        labels={"intelligence-dampener-review"},
+    )
+
+    spawned = sup.poll_once()
+    assert spawned == [old_task.id]
+
+
+def test_poll_skips_a_held_queued_task(q, client):
+    """PR #2913 review finding: `Supervisor._eligible()` must exclude a
+    queued task with a durable operator hold (Phase 1's Pause primitive) --
+    otherwise a spawn reservation is minted for it, its follow-up
+    `claim_one` fails on the hold, and the stray reservation is left
+    behind."""
+    t = q.create("work")
+    q.set_hold(t.id, reason="operator paused before spawn", actor="operator")
+    spawn = _ok_spawn()
+    sup = Supervisor(client, spawn_fn=spawn, repo=TEST_REPO, max_concurrent=5)
+
+    assert sup.poll_once() == []
+    assert spawn.calls == []
+    assert q.latest_reservation(t.id) is None
+
+    q.clear_hold(t.id, actor="operator")
+    assert sup.poll_once() == [t.id]
+
+
+def test_poll_treats_a_sessionless_success_as_a_failure(q, client):
+    # A spawn_fn (built-in or custom) reporting success with no session id
+    # must not be recorded as SPAWNED with session_handle=None --
+    # indistinguishable from a reservation that never launched anything at
+    # all, which release_requested_bodies' absent-worktree shortcut relies on
+    # to avoid bypassing a real (if unidentifiable) body's own liveness
+    # resolution.
+    t = q.create("work")
+    calls = []
+
+    def sessionless_spawn(task):
+        calls.append(task["id"])
+        return True, {"worktree": "wt-1"}  # no "session" key at all
+
+    sup = Supervisor(client, spawn_fn=sessionless_spawn, repo=TEST_REPO, max_concurrent=5)
+
+    assert sup.poll_once() == []
+    assert calls == [t.id]
+    res = q.latest_reservation(t.id)
+    assert res.state != SpawnState.SPAWNED
+    assert res.session_handle is None
+
+
+def test_poll_records_failed_headless_session_before_releasing_worktree(
+    monkeypatch, q, client
+):
+    from agent_dispatch import embody
+
+    task = q.create("work")
+
+    def failed_spawn(_task):
+        return False, {
+            "error": "ACP launch failed",
+            "session": "local-body:failed-session",
+        }
+
+    failed_spawn.requires_reusable_worktree = True
+    failed_spawn.allocation_interface = "acp"
+    failed_spawn.allocation_project = "worker-harness"
+    monkeypatch.setattr(
+        embody,
+        "prepare_reusable_worktree",
+        lambda *_args, **_kwargs: {
+            "worktree": "wt-created",
+            "path": "/tmp/wt-created",
+            "created": True,
+            "replaced": False,
+            "ownership": "created",
+        },
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=failed_spawn,
+        repo=TEST_REPO,
+        machine="host-a",
+    )
+
+    assert sup.poll_once() == []
+    reservation = q.latest_reservation(task.id)
+    assert reservation.state == SpawnState.RELEASING
+    assert reservation.session_handle == "local-body:failed-session"
+    assert reservation.worktree == "wt-created"
+
+
+def test_poll_threads_allocation_no_pair_into_worktree_preparation(
+    monkeypatch, q, client
+):
+    """Regression: a registrar/pool declaration's `body.no_pair` (rendered
+    as `--no-pair` and surfaced on the spawn_fn as `allocation_no_pair`)
+    must reach `embody.prepare_reusable_worktree`'s own `no_pair` kwarg --
+    the mechanism that skips the paired-knowledge carve for a worker pool
+    with no bound knowledge repo."""
+    from agent_dispatch import embody
+
+    task = q.create("work")
+    captured_kwargs: dict = {}
+
+    def fake_prepare(*_args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return {
+            "worktree": "wt-created",
+            "path": "/tmp/wt-created",
+            "created": True,
+            "replaced": False,
+            "ownership": "created",
+        }
+
+    monkeypatch.setattr(embody, "prepare_reusable_worktree", fake_prepare)
+
+    spawn = _ok_spawn()
+    spawn.requires_reusable_worktree = True
+    spawn.allocation_no_pair = True
+    sup = Supervisor(client, spawn_fn=spawn, repo=TEST_REPO, machine="host-a")
+
+    assert sup.poll_once() == [task.id]
+    assert captured_kwargs.get("no_pair") is True
+
+
 def test_protected_label_pool_does_not_claim_unlabeled_task(q, client):
     q.handoff_producer_scope(
         TEST_REPO,
@@ -195,6 +621,187 @@ def test_suspended_reservation_does_not_consume_supervisor_capacity(q, client):
     assert q.get(first.id).attempts == 1
 
 
+def test_live_releasing_reservation_consumes_supervisor_capacity(q, client):
+    first = q.create("releasing")
+    reservation, _ = q.reserve_spawn(first.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-created",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-live",
+        worktree="wt-created",
+    )
+    q.request_spawn_release(reservation.key, disposition="failed")
+    second = q.create("runnable")
+    spawn = _ok_spawn()
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=1,
+        machine="host-a",
+        local_body_verdict_fn=lambda _sid: "live",
+        local_body_activity_fn=lambda _sid: "ACTIVE",
+        local_acp_session_fn=lambda _sid: "acp-live",
+        local_end_fn=lambda _sid: False,
+    )
+
+    assert sup.poll_once() == []
+    assert spawn.calls == []
+    assert q.latest_reservation(first.id).state == SpawnState.RELEASING
+    assert q.latest_reservation(second.id) is None
+
+
+def _raise_probe_error(*_args):
+    raise RuntimeError("probe failed")
+
+
+@pytest.mark.parametrize(
+    ("session_handle", "worktree", "verdict_kwarg"),
+    [
+        (
+            "local-body:session-unknown",
+            None,
+            {"local_body_verdict_fn": lambda _sid: tracking.UNKNOWN},
+        ),
+        (
+            "local-body:session-error",
+            None,
+            {"local_body_verdict_fn": _raise_probe_error},
+        ),
+        (
+            "fleet-body:host-b:session-unknown",
+            None,
+            {"fleet_verdict_fn": lambda _host, _sid: tracking.UNKNOWN},
+        ),
+        (
+            "fleet-body:host-b:session-error",
+            None,
+            {"fleet_verdict_fn": _raise_probe_error},
+        ),
+        (
+            "session-unknown",
+            "wt-unknown",
+            {
+                "verdict_fn": lambda *_args: tracking.UNKNOWN,
+                # Pin the local agent-worktrees registry probe to "unresolved"
+                # so this stays a genuinely-unresolvable-probe case (this
+                # test's actual point), independent of whatever
+                # worktree_directory_present_fn's real default would report
+                # for a fabricated, never-created worktree id on this host.
+                "worktree_directory_present_fn": lambda _wt, _project: None,
+            },
+        ),
+        (
+            "session-error",
+            "wt-error",
+            {
+                "verdict_fn": _raise_probe_error,
+                "worktree_directory_present_fn": lambda _wt, _project: None,
+            },
+        ),
+    ],
+)
+def test_unknown_releasing_body_consumes_process_capacity(
+    q, client, session_handle, worktree, verdict_kwarg
+):
+    first = q.create("releasing")
+    reservation, _ = q.reserve_spawn(first.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle=session_handle,
+        worktree=worktree,
+    )
+    q.request_spawn_release(reservation.key, disposition="failed")
+    q.create("runnable")
+    spawn = _ok_spawn()
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=1,
+        **verdict_kwarg,
+    )
+
+    assert sup.poll_once() == []
+    assert spawn.calls == []
+    assert q.latest_reservation(first.id).state == SpawnState.RELEASING
+
+
+@pytest.mark.parametrize(
+    ("session_handle", "worktree", "verdict_kwarg"),
+    [
+        (
+            "local-body:session-gone",
+            None,
+            {"local_body_verdict_fn": lambda _sid: tracking.GONE},
+        ),
+        (
+            "fleet-body:host-b:session-gone",
+            None,
+            {"fleet_verdict_fn": lambda _host, _sid: tracking.GONE},
+        ),
+        (
+            "session-gone",
+            "wt-gone",
+            {"verdict_fn": lambda *_args: tracking.GONE},
+        ),
+    ],
+)
+def test_exact_gone_releasing_body_frees_process_capacity(
+    q, client, session_handle, worktree, verdict_kwarg
+):
+    first = q.create("releasing")
+    reservation, _ = q.reserve_spawn(first.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle=session_handle,
+        worktree=worktree,
+    )
+    q.request_spawn_release(reservation.key, disposition="failed")
+    q.create("runnable")
+    spawn = _ok_spawn()
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=1,
+        local_end_fn=lambda _sid: True,
+        **verdict_kwarg,
+    )
+
+    spawned = sup.poll_once()
+    assert len(spawned) == 1
+    assert spawn.calls == spawned
+
+
+def test_unknown_spawned_body_still_consumes_process_capacity(q, client):
+    first = q.create("spawned")
+    reservation, _ = q.reserve_spawn(first.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-unknown",
+    )
+    second = q.create("runnable")
+    spawn = _ok_spawn()
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=1,
+        local_body_verdict_fn=lambda _sid: tracking.UNKNOWN,
+    )
+
+    assert sup.poll_once() == []
+    assert spawn.calls == []
+    assert q.latest_reservation(second.id) is None
+
+
 def test_other_pool_reservation_does_not_consume_process_capacity(q, client):
     other = q.create("other pool", repo="github.com/example/other")
     reservation, _ = q.reserve_spawn(other.id)
@@ -206,6 +813,45 @@ def test_other_pool_reservation_does_not_consume_process_capacity(q, client):
     )
 
     assert sup.poll_once() == [runnable.id]
+
+
+def test_other_label_reservations_are_not_probed(q, client):
+    held = q.create("other held task", labels=["other"])
+    held_reservation, _ = q.reserve_spawn(held.id)
+    q.record_spawn(
+        held_reservation.key,
+        session_handle="other-session",
+        worktree="other-worktree",
+    )
+    owner = "other-machine/other-worktree"
+    q.claim_one(owner, task_id=held.id)
+    q.start(held.id, owner)
+
+    unclaimed = q.create("other unclaimed task", labels=["other"])
+    queued_reservation, _ = q.reserve_spawn(unclaimed.id)
+    q.record_spawn(
+        queued_reservation.key,
+        session_handle="queued-session",
+        worktree="queued-worktree",
+    )
+
+    probes: list[tuple[str, str]] = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        stall_seconds=1,
+        liveness_fn=lambda worktree, _machine: (
+            probes.append(("live", worktree)) or {"session_id": "session"}
+        ),
+        verdict_fn=lambda worktree, _machine, _session: (
+            probes.append(("verdict", worktree)) or tracking.LIVE
+        ),
+    )
+
+    assert sup.poll_once(now=held.created_at + 10) == []
+    assert probes == []
 
 
 def test_suspended_local_headless_body_is_cooled(q, client):
@@ -224,6 +870,7 @@ def test_suspended_local_headless_body_is_cooled(q, client):
         repo=TEST_REPO,
         labels=["review"],
         local_cold_fn=lambda session_id: stopped.append(session_id) or True,
+        local_body_verdict_fn=lambda _session_id: "live",
     )
 
     assert sup.cool_dormant_bodies() == 1
@@ -259,6 +906,7 @@ def test_cli_suspensions_do_not_consume_headless_cooling_budget(q, client):
         repo=TEST_REPO,
         labels=["review"],
         local_cold_fn=lambda session_id: stopped.append(session_id) or True,
+        local_body_verdict_fn=lambda _session_id: "live",
     )
 
     assert sup.cool_dormant_bodies() == 1
@@ -288,6 +936,7 @@ def test_blocking_card_cools_body_and_frees_process_capacity(q, client):
         labels=["review"],
         max_concurrent=1,
         local_cold_fn=lambda session_id: stopped.append(session_id) or True,
+        local_body_verdict_fn=lambda _session_id: "live",
     )
 
     assert sup.poll_once() == [runnable.id]
@@ -296,7 +945,33 @@ def test_blocking_card_cools_body_and_frees_process_capacity(q, client):
     assert q.get(blocked.id).awaiting_steer is True
 
 
-def test_steer_waits_for_cold_stop_before_reembodiment(q, client):
+def test_stopped_cold_body_does_not_consume_capacity_after_restart(q, client):
+    blocked = q.create("waiting", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:stopped-session",
+    )
+    q.claim_one("headless-owner", task_id=blocked.id)
+    q.start(blocked.id, "headless-owner")
+    q.suspend(blocked.id, "headless-owner", reason="waiting")
+    q.record_cold(reservation.key)
+    runnable = q.create("next", labels=["review"])
+    spawn = _ok_spawn()
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        labels=["review"],
+        max_concurrent=1,
+        local_body_verdict_fn=lambda _sid: tracking.GONE,
+    )
+
+    assert sup.poll_once() == [runnable.id]
+    assert spawn.calls == [runnable.id]
+
+
+def test_cold_steer_resumes_existing_acp_session(q, client):
     blocked = q.create("needs operator", labels=["review"])
     reservation, _ = q.reserve_spawn(blocked.id)
     q.record_spawn(
@@ -304,11 +979,8 @@ def test_steer_waits_for_cold_stop_before_reembodiment(q, client):
     )
     q.claim_one("headless-owner", task_id=blocked.id)
     q.start(blocked.id, "headless-owner")
-    q.set_card(
-        blocked.id,
-        "headless-owner",
-        card={"request_input": [{"name": "decision", "type": "text"}]},
-    )
+    q.suspend(blocked.id, "headless-owner", reason="turn ended")
+    q.record_cold(reservation.key)
     steered = q.submit_steer(
         blocked.id,
         fields={"decision": "continue"},
@@ -316,19 +988,1054 @@ def test_steer_waits_for_cold_stop_before_reembodiment(q, client):
     )
     assert steered.status == Status.SUSPENDED
     assert steered.resume_requested is True
+    assert q.get_reservation(reservation.key).state == SpawnState.COLD
+    spawn = _ok_spawn()
+    resumed = []
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_activity_fn=lambda _session_id: "ACTIVE",
+        local_body_verdict_fn=lambda _session_id: "live",
+        local_resume_fn=lambda session_id, prompt: (
+            resumed.append((session_id, prompt)) or True
+        ),
+    )
+    sup._cooled_reservations.add(reservation.key)
+
+    assert sup.poll_once() == []
+    assert spawn.calls == []
+    assert resumed and resumed[0][0] == "blocked-session"
     assert q.get_reservation(reservation.key).state == SpawnState.SPAWNED
+    assert q.get(blocked.id).status == Status.STARTED
+    assert q.get(blocked.id).resume_requested is False
+    assert reservation.key not in sup._cooled_reservations
+
+
+def test_cold_resume_missing_worktree_releases_same_task_for_fresh_embodiment(
+    q, client, tmp_path
+):
+    missing_worktree = tmp_path / "removed-review-worktree"
+    blocked = q.create(
+        "needs operator",
+        labels=["review"],
+        goal="finish the current review",
+        done_criteria="post a verdict for the current head",
+    )
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:blocked-session",
+        worktree="removed-review-worktree",
+    )
+    q.claim_one("headless-owner", task_id=blocked.id)
+    q.start(blocked.id, "headless-owner")
+    q.record_progress(
+        blocked.id,
+        "headless-owner",
+        phase="reviewing",
+        summary="reviewed the prior head",
+    )
+    q.suspend(blocked.id, "headless-owner", reason="turn ended")
+    q.record_cold(reservation.key)
+    q.submit_steer(
+        blocked.id,
+        fields={"head": "corrected-head"},
+        sender="producer",
+    )
+    before = q.get(blocked.id)
+    before_progress = q.progress_log(blocked.id)
+    before_steers = q.steer_log(blocked.id)
+    resumed: list[str] = []
     spawn = _ok_spawn()
     sup = Supervisor(
         client,
         spawn_fn=spawn,
         repo=TEST_REPO,
         labels=["review"],
-        local_cold_fn=lambda _session_id: True,
+        local_body_target_dir_fn=lambda _sid: str(missing_worktree),
+        local_body_verdict_fn=lambda _sid: "gone",
+        local_resume_fn=lambda sid, _prompt: resumed.append(sid) or True,
+    )
+    sup._cooled_reservations.add(reservation.key)
+
+    assert sup.release_resumed_cold_tasks(now=1000) == 1
+    released = q.get(blocked.id)
+    assert released.id == before.id
+    assert released.goal == before.goal
+    assert released.done_criteria == before.done_criteria
+    assert released.latest_progress == before.latest_progress
+    assert q.progress_log(blocked.id) == before_progress
+    assert q.steer_log(blocked.id) == before_steers
+    assert released.status == Status.QUEUED
+    assert released.owner is None
+    assert resumed == []
+    held = q.get_reservation(reservation.key)
+    assert held.state == SpawnState.RELEASING
+    assert held.release_requested is True
+    assert held.conclusion_state == "complete"
+
+    assert sup.poll_once(now=1001) == [blocked.id]
+    assert spawn.calls == [blocked.id]
+    reservations = q.list_reservations(task_id=blocked.id)
+    assert len(reservations) == 2
+    assert sum(r.state == SpawnState.SPAWNED for r in reservations) == 1
+
+
+@pytest.mark.parametrize("target_kind", ["unknown", "present", "relative"])
+def test_cold_resume_preserves_unknown_or_present_worktree(
+    q, client, tmp_path, target_kind
+):
+    blocked = q.create("needs operator", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(
+        reservation.key, session_handle="local-body:blocked-session"
+    )
+    q.claim_one("headless-owner", task_id=blocked.id)
+    q.start(blocked.id, "headless-owner")
+    q.suspend(blocked.id, "headless-owner", reason="turn ended")
+    q.record_cold(reservation.key)
+    q.submit_steer(blocked.id, fields={"decision": "continue"}, sender="operator")
+    resumed: list[str] = []
+    target_dir = {
+        "unknown": None,
+        "present": str(tmp_path),
+        "relative": "relative/worktree",
+    }[target_kind]
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_target_dir_fn=lambda _sid: target_dir,
+        local_resume_fn=lambda sid, _prompt: resumed.append(sid) or True,
+    )
+
+    assert sup.release_resumed_cold_tasks() == 1
+    assert resumed == ["blocked-session"]
+    assert q.get(blocked.id).status == Status.STARTED
+    assert q.get_reservation(reservation.key).state == SpawnState.SPAWNED
+
+
+def test_cold_resume_preserves_worktree_on_stat_error(q, client, monkeypatch):
+    blocked = q.create("needs operator", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(
+        reservation.key, session_handle="local-body:blocked-session"
+    )
+    q.claim_one("headless-owner", task_id=blocked.id)
+    q.start(blocked.id, "headless-owner")
+    q.suspend(blocked.id, "headless-owner", reason="turn ended")
+    q.record_cold(reservation.key)
+    q.submit_steer(blocked.id, fields={"decision": "continue"}, sender="operator")
+
+    def deny_stat(_path):
+        raise PermissionError("temporarily inaccessible")
+
+    monkeypatch.setattr(supervisor_module.Path, "stat", deny_stat)
+    resumed: list[str] = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_target_dir_fn=lambda _sid: "/inaccessible/worktree",
+        local_resume_fn=lambda sid, _prompt: resumed.append(sid) or True,
+    )
+
+    assert sup.release_resumed_cold_tasks() == 1
+    assert resumed == ["blocked-session"]
+    assert q.get(blocked.id).status == Status.STARTED
+
+
+def test_cold_resume_missing_worktree_release_failure_backs_off(
+    q, client, tmp_path, monkeypatch
+):
+    blocked = q.create("needs operator", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(
+        reservation.key, session_handle="local-body:blocked-session"
+    )
+    q.claim_one("headless-owner", task_id=blocked.id)
+    q.start(blocked.id, "headless-owner")
+    q.suspend(blocked.id, "headless-owner", reason="turn ended")
+    q.record_cold(reservation.key)
+    q.submit_steer(blocked.id, fields={"decision": "continue"}, sender="operator")
+    attempts: list[str] = []
+
+    def fail_release(task_id, _owner, *, reason=None):
+        attempts.append(task_id)
+        raise DispatchError(500, reason or "release failed")
+
+    monkeypatch.setattr(client, "release", fail_release)
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_target_dir_fn=lambda _sid: str(tmp_path / "missing"),
+    )
+
+    assert sup.release_resumed_cold_tasks(now=1000) == 0
+    assert sup.release_resumed_cold_tasks(now=1299) == 0
+    assert attempts == [blocked.id]
+    assert sup.release_resumed_cold_tasks(now=1300) == 0
+    assert attempts == [blocked.id, blocked.id]
+    assert q.get(blocked.id).status == Status.SUSPENDED
+
+
+# -- recover_stranded_cold_reservations: the queued+cold orphan gap ---------
+#
+# Confirmed live (the downstream PR's stall, 5+ hours, survived a full
+# supervisor restart): a COLD reservation whose task ends up QUEUED/unowned
+# instead of the SUSPENDED-with-owner shape release_resumed_cold_tasks()
+# expects is a permanent orphan no other sweep ever revisits --
+# release_resumed_cold_tasks() requires resume_requested (set only by a
+# steer landing while the task is STILL suspended) and requires status ==
+# SUSPENDED with a live owner; recover_gone() only looks at SPAWNED
+# reservations and explicitly skips SUSPENDED; reconcile() only settles
+# TERMINAL tasks. None of them ever touch this combination.
+
+
+def test_recover_stranded_cold_reservation_releases_confirmed_gone_body(q, client):
+    """A reservation can go COLD (a pure reservation-state operation, see
+    ``record_cold``) independent of its task's own status -- exactly the gap
+    this sweep closes: whatever upstream path leaves a queued/unowned task
+    paired with a stale COLD reservation for its exclusive_key, nothing else
+    ever revisits it.
+
+    Uses ``defer_spawn`` (state ``deferred``), not ``fail_spawn`` (rubber-duck
+    review, 2026-09-28): the task/reservation bookkeeping fell out of sync,
+    but no spawn attempt actually failed, so this repair must never count
+    toward dead-lettering -- see
+    ``test_recover_stranded_cold_reservation_never_counts_toward_dead_letter``
+    below."""
+    blocked = q.create("needs operator", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(
+        reservation.key, session_handle="local-body:blocked-session"
+    )
+    q.record_cold(reservation.key)
+    assert q.get(blocked.id).status == Status.QUEUED
+    assert q.get(blocked.id).owner is None
+    assert q.get_reservation(reservation.key).state == SpawnState.COLD
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_verdict_fn=lambda _sid: "gone",
+    )
+
+    assert sup.recover_stranded_cold_reservations() == 1
+    assert q.get_reservation(reservation.key).state == SpawnState.DEFERRED
+
+    # Freed for a fresh attempt on the very next cycle.
+    assert sup.poll_once() == [blocked.id]
+    assert q.latest_reservation(blocked.id).state == SpawnState.SPAWNED
+    assert q.latest_reservation(blocked.id).attempt == 2
+
+
+def test_recover_stranded_cold_reservation_ignores_unconfirmed_liveness(q, client):
+    """Never act on an unknown/live verdict -- only a COMPLETED-gone (or
+    cold-probe-confirmed) body is released."""
+    blocked = q.create("needs operator", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(
+        reservation.key, session_handle="local-body:blocked-session"
+    )
+    q.record_cold(reservation.key)
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_verdict_fn=lambda _sid: "unknown",
+        local_cold_fn=lambda _sid: False,
+    )
+
+    assert sup.recover_stranded_cold_reservations() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.COLD
+
+
+def test_recover_stranded_cold_reservation_ignores_still_suspended_tasks(q, client):
+    """A reservation that's COLD because its task is genuinely still
+    SUSPENDED (the normal, intentional dormancy) is release_resumed_cold_tasks's
+    job, never this sweep's -- even with a confirmed-gone body."""
+    blocked = q.create("needs operator", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(
+        reservation.key, session_handle="local-body:blocked-session"
+    )
+    q.claim_one("headless-owner", task_id=blocked.id)
+    q.start(blocked.id, "headless-owner")
+    q.suspend(blocked.id, "headless-owner", reason="turn ended")
+    q.record_cold(reservation.key)
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_verdict_fn=lambda _sid: "gone",
+    )
+
+    assert sup.recover_stranded_cold_reservations() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.COLD
+    assert q.get(blocked.id).status == Status.SUSPENDED
+
+
+def test_recover_stranded_cold_reservation_ignores_terminal_tasks(q, client):
+    blocked = q.create("needs operator", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(
+        reservation.key, session_handle="local-body:blocked-session"
+    )
+    q.record_cold(reservation.key)
+    q.claim_one("headless-owner-2", task_id=blocked.id)
+    q.start(blocked.id, "headless-owner-2")
+    q.complete(blocked.id, "headless-owner-2", result_ref="done")
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_verdict_fn=lambda _sid: "gone",
+    )
+
+    assert sup.recover_stranded_cold_reservations() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.COLD
+
+
+def test_recover_stranded_cold_reservation_never_counts_toward_dead_letter(
+    q, client
+):
+    """Repeatedly repairing this benign cross-FSM inconsistency must never
+    dead-letter a task that never actually failed a spawn attempt
+    (rubber-duck review, 2026-09-28): the sweep uses ``defer_spawn``, which
+    -- unlike ``fail_spawn`` -- never counts toward
+    ``Supervisor._failed_spawn_counts``'s dead-letter budget."""
+    blocked = q.create("needs operator", labels=["review"])
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_verdict_fn=lambda _sid: "gone",
+        max_attempts=3,
+    )
+
+    # Repeat the stranded-cold shape (a fresh reservation each time, cooled,
+    # then repaired) many more times than max_attempts -- none of it may
+    # dead-letter, because none of it is an actual spawn failure.
+    for _ in range(10):
+        reservation = q.latest_reservation(blocked.id)
+        if reservation is None or reservation.state not in (
+            SpawnState.RESERVING,
+            SpawnState.SPAWNED,
+        ):
+            reservation, _ = q.reserve_spawn(blocked.id)
+        q.record_spawn(
+            reservation.key, session_handle=f"local-body:{reservation.key}"
+        )
+        q.record_cold(reservation.key)
+        assert sup.recover_stranded_cold_reservations() == 1
+
+    assert q.get(blocked.id).status == Status.QUEUED
+    assert len(q.list_reservations(task_id=blocked.id, state="failed")) == 0
+    assert (
+        len(q.list_reservations(task_id=blocked.id, state="deferred")) == 10
+    )
+    # Still freely spawnable -- never dead-lettered by repair debt.
+    assert sup.poll_once() == [blocked.id]
+
+
+# -- recover_stranded_releasing_reservations: the no-handle releasing gap ---
+#
+# Confirmed live (copilot-extensions#3179): a
+# RELEASING reservation that never recorded a session_handle (the spawn
+# itself crashed/errored before ever launching a body) has nothing an
+# automatic exact-absence proof could ever check -- there's no handle to
+# probe liveness against -- so it sits RELEASING forever with no other sweep
+# ever revisiting it, permanently blocking its exclusive_key across every
+# future task sharing that key, not just its own retry. The CLI's own
+# `reservations fail --force` already carries the correct judgment for this
+# exact shape; this sweep applies it automatically past a bounded age.
+
+
+def test_recover_stranded_releasing_reservation_with_no_handle(q, client):
+    blocked = q.create("needs recovery", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.request_spawn_release(reservation.key, disposition="failed")
+    assert q.get_reservation(reservation.key).state == SpawnState.RELEASING
+    assert not q.get_reservation(reservation.key).session_handle
+
+    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO, labels=["review"])
+
+    old_enough = time.time() + 601
+    assert sup.recover_stranded_releasing_reservations(now=old_enough) == 1
+    assert q.get_reservation(reservation.key).state == SpawnState.FAILED
+
+    # Freed for a fresh attempt on the very next cycle.
+    assert sup.poll_once() == [blocked.id]
+
+
+def test_recover_stranded_releasing_reservation_ignores_handle_carrying(q, client):
+    """A RELEASING reservation that DOES carry a session_handle is a
+    liveness-checkable case -- never this sweep's job (it would otherwise
+    cut off a release that's genuinely still in flight)."""
+    blocked = q.create("needs recovery", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(reservation.key, session_handle="local-body:still-live")
+    q.request_spawn_release(reservation.key, disposition="failed")
+    assert q.get_reservation(reservation.key).session_handle
+
+    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO, labels=["review"])
+
+    old_enough = time.time() + 601
+    assert sup.recover_stranded_releasing_reservations(now=old_enough) == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.RELEASING
+
+
+def test_recover_stranded_releasing_reservation_respects_the_age_bound(q, client):
+    """Never cut off a release call that might still be genuinely in
+    flight -- only a reservation past the bound is stranded."""
+    blocked = q.create("needs recovery", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.request_spawn_release(reservation.key, disposition="failed")
+
+    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO, labels=["review"])
+
+    still_fresh = time.time() + 1  # well under the 600s bound
+    assert sup.recover_stranded_releasing_reservations(now=still_fresh) == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.RELEASING
+
+
+def test_recover_stranded_releasing_reservation_never_blocks_other_lanes(q, client):
+    """The exact blast-radius shape confirmed live: a stranded no-handle
+    RELEASING reservation for one task permanently blocks `reserve_spawn`
+    for every OTHER task sharing its exclusive_key, even brand-new ones --
+    this sweep clearing it must free the whole exclusive_key, not just the
+    one stuck task."""
+    stuck = q.create("stuck", labels=["review"], exclusive_key="pr-42")
+    reservation, _ = q.reserve_spawn(stuck.id)
+    q.request_spawn_release(reservation.key, disposition="failed")
+
+    # A fresh task sharing the same exclusive_key (the real-world shape: the
+    # original task got abandoned/recreated, but the stale reservation still
+    # fences the key) cannot even be reserved while the stuck one stands.
+    fresh = q.create("fresh retry", labels=["review"], exclusive_key="pr-42")
+    blocked_reservation, reserved = q.reserve_spawn(fresh.id)
+    assert reserved is False
+
+    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO, labels=["review"])
+    old_enough = time.time() + 601
+    assert sup.recover_stranded_releasing_reservations(now=old_enough) == 1
+
+    # Now a fresh reservation for the other task succeeds.
+    _, reserved_after = q.reserve_spawn(fresh.id)
+    assert reserved_after is True
+
+
+def test_reconcile_settles_reservation_once_task_is_confirmed(q, client):
+    """``COMPLETED`` is the true completion terminal (superseding the
+    provisional ``SUBMITTED``, see queue_records.py) -- reconcile() must
+    settle a still-active reservation once a task reaches it, exactly like
+    it already does for ``SUBMITTED``, or the reservation (and its
+    exclusive_key) is fenced forever (rubber-duck review, 2026-09-28:
+    ``Supervisor._TERMINAL`` had never been updated when ``COMPLETED`` was
+    introduced)."""
+    t = q.create("work")
+    reservation, _ = q.reserve_spawn(t.id)
+    q.record_spawn(reservation.key, session_handle="local-body:sess")
+    q.claim_one("owner", task_id=t.id)
+    q.start(t.id, "owner")
+    q.complete(t.id, "owner", result_ref="done")
+    q.confirm(t.id, actor="evaluator")
+    assert q.get(t.id).status == Status.COMPLETED
+    assert q.get_reservation(reservation.key).state == SpawnState.SPAWNED
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        local_body_verdict_fn=lambda _sid: "live",
+        local_end_fn=lambda _sid: True,
+    )
+
+    assert sup.reconcile() == 1
+    settled = q.get_reservation(reservation.key)
+    assert settled.state in (SpawnState.RELEASING, SpawnState.SETTLED)
+
+
+def test_reconcile_settles_abandoned_cold_reservation(q, client):
+    """The generic terminal reconciliation path settles a COLD reservation
+    after liveness-cap exhaustion abandons its task."""
+    t = q.create("work")
+    stale_reservation, _ = q.reserve_spawn(t.id)
+    q.record_spawn(stale_reservation.key)
+    q.record_cold(stale_reservation.key)
+
+    q.abandon(t.id, permitted=True, reason="test")
+    assert q.get(t.id).status == Status.ABANDONED
+    assert q.get_reservation(stale_reservation.key).state == SpawnState.COLD
+
+    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO)
+    assert sup.reconcile() == 1
+    assert q.get_reservation(stale_reservation.key).state == SpawnState.SETTLED
+
+
+def test_pool_reservations_transient_transport_error_does_not_abort_cycle(
+    q, client, monkeypatch
+):
+    """A connection blip listing reservations must not propagate.
+
+    Regression test for copilot-extensions#2857: `_pool_reservations` (and
+    every `release_resumed_cold_tasks`-style caller built on it) used to let
+    a raw `httpx.TransportError` escape uncaught, which aborted the entire
+    per-cycle sweep -- not just this one sub-check -- whenever the
+    coordinator was briefly unreachable (e.g. during a version-restart
+    race). It must instead be treated like "nothing to report this cycle."
+    """
+    blocked = q.create("needs operator", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(reservation.key, session_handle="local-body:blocked-session")
+    q.claim_one("headless-owner", task_id=blocked.id)
+    q.start(blocked.id, "headless-owner")
+    q.suspend(blocked.id, "headless-owner", reason="turn ended")
+    q.record_cold(reservation.key)
+    q.submit_steer(blocked.id, fields={"decision": "continue"}, sender="operator")
+
+    def refused(*_args, **_kwargs):
+        raise httpx.ConnectError(
+            "[WinError 10061] No connection could be made because the target "
+            "machine actively refused it"
+        )
+
+    monkeypatch.setattr(client, "list_reservations", refused)
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+    )
+
+    assert sup._pool_reservations(state=SpawnState.COLD, resume_requested=True) == []
+    # The whole cycle must not raise either -- this is the actual bug shape:
+    # release_resumed_cold_tasks previously let the ConnectError propagate.
+    assert sup.release_resumed_cold_tasks() == 0
+    assert q.get(blocked.id).status == Status.SUSPENDED
+
+
+def test_active_reservations_fails_closed_on_transport_error(q, client, monkeypatch):
+    """Capacity gating must not treat "unknown" as "zero active".
+
+    `_active_reservations` feeds directly into the active >= max_concurrent
+    capacity gate in `poll_once`. Swallowing a transient transport error into
+    an empty list there (as the generic `_pool_reservations` resilience does
+    for every other, non-capacity-critical caller) would make the supervisor
+    believe it has full spare capacity during an outage and over-spawn past
+    max_concurrent. It must instead fail closed: report capacity as fully
+    consumed so this cycle spawns nothing, and let the next interval retry
+    once the coordinator is reachable again.
+    """
+    queued = q.create("work")
+
+    def refused(*_args, **_kwargs):
+        raise httpx.ConnectError(
+            "[WinError 10061] No connection could be made because the target "
+            "machine actively refused it"
+        )
+
+    monkeypatch.setattr(client, "list_reservations", refused)
+    spawn = _ok_spawn()
+    sup = Supervisor(client, spawn_fn=spawn, repo=TEST_REPO, max_concurrent=5)
+
+    active = sup._active_reservations()
+    assert len(active) == sup.max_concurrent
+
+    assert sup.poll_once() == []
+    assert spawn.calls == []
+    assert q.get(queued.id).status == Status.QUEUED
+
+
+def test_failed_spawn_counts_fails_closed_on_transport_error(q, client, monkeypatch):
+    """Dead-letter/retry gating must not treat "unknown" as "zero failures".
+
+    `_failed_spawn_counts` feeds `_is_dead_lettered` (via `max_attempts`).
+    Swallowing a transient transport error into `{}` there would make every
+    task look like it has zero failed attempts, letting one that has
+    already exhausted `max_attempts` keep retrying past its bound during an
+    outage. It must instead fail closed: block *new* spawns entirely this
+    cycle (existing active work is unaffected) rather than guess either way.
+    """
+    queued = q.create("work")
+
+    def refused(*_args, **_kwargs):
+        raise httpx.ConnectError(
+            "[WinError 10061] No connection could be made because the target "
+            "machine actively refused it"
+        )
+
+    monkeypatch.setattr(client, "list_reservations", refused)
+    spawn = _ok_spawn()
+    sup = Supervisor(client, spawn_fn=spawn, repo=TEST_REPO, max_concurrent=5)
+
+    assert sup._failed_spawn_counts() is None
+
+    assert sup.poll_once() == []
+    assert spawn.calls == []
+    assert q.get(queued.id).status == Status.QUEUED
+
+
+def test_release_requested_legacy_missing_worktree_recovers_from_held_conclusion(
+    q, client, tmp_path
+):
+    blocked = q.create("needs operator", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:blocked-session",
+        worktree="removed-review-worktree",
+    )
+    q.claim_one("headless-owner", task_id=blocked.id)
+    q.start(blocked.id, "headless-owner")
+    q.suspend(blocked.id, "headless-owner", reason="turn ended")
+    q.record_cold(reservation.key)
+    q.release_suspended(
+        blocked.id,
+        "headless-owner",
+        reason="recorded worktree is missing",
+    )
+    q.record_spawn_conclusion(
+        reservation.key,
+        conclusion_state="held",
+        conclusion_detail=json.dumps(
+            {"action": "skipped", "reason": "allocation-ownership-unknown"}
+        ),
+    )
+    spawn = _ok_spawn()
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_target_dir_fn=lambda _sid: str(tmp_path / "missing"),
+        local_body_verdict_fn=lambda _sid: "gone",
+        local_end_fn=lambda _sid: True,
+    )
+
+    assert sup.release_requested_bodies() == 1
+    settled = q.get_reservation(reservation.key)
+    assert settled.state == SpawnState.SETTLED
+    assert settled.conclusion_state == "complete"
+    assert "recorded-target-directory-missing" in (
+        settled.conclusion_detail or ""
     )
 
     assert sup.poll_once() == [blocked.id]
-    assert q.get_reservation(reservation.key).state == SpawnState.SETTLED
-    assert q.get(blocked.id).resume_requested is False
+    assert spawn.calls == [blocked.id]
+
+
+def test_release_requested_rechecks_target_after_live_body_teardown(
+    q, client, tmp_path
+):
+    target_dir = tmp_path / "recreated-worktree"
+    blocked = q.create("needs operator", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:blocked-session",
+        worktree="recreated-worktree",
+    )
+    q.claim_one("headless-owner", task_id=blocked.id)
+    q.start(blocked.id, "headless-owner")
+    q.suspend(blocked.id, "headless-owner", reason="turn ended")
+    q.record_cold(reservation.key)
+    q.release_suspended(
+        blocked.id,
+        "headless-owner",
+        reason="recorded worktree is missing",
+    )
+
+    def end_and_recreate(_session_id):
+        target_dir.mkdir()
+        return True
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_target_dir_fn=lambda _sid: str(target_dir),
+        local_body_verdict_fn=lambda _sid: "live",
+        local_end_fn=end_and_recreate,
+    )
+
+    assert sup.release_requested_bodies() == 1
+    held = q.get_reservation(reservation.key)
+    assert held.state == SpawnState.SETTLED
+    assert held.conclusion_state == "held"
+    assert "allocation-ownership-unknown" in (
+        held.conclusion_detail or ""
+    )
+
+
+def test_cold_resume_does_not_start_process_before_reservation_transition(
+    q, client, monkeypatch
+):
+    blocked = q.create("needs operator", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(
+        reservation.key, session_handle="local-body:blocked-session"
+    )
+    q.claim_one("headless-owner", task_id=blocked.id)
+    q.start(blocked.id, "headless-owner")
+    q.suspend(blocked.id, "headless-owner", reason="turn ended")
+    q.record_cold(reservation.key)
+    q.submit_steer(blocked.id, fields={"decision": "continue"}, sender="operator")
+    resumed: list[str] = []
+
+    def fail_record_spawn(*_args, **_kwargs):
+        raise DispatchError(500, "write failed")
+
+    monkeypatch.setattr(
+        client,
+        "record_spawn",
+        fail_record_spawn,
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_resume_fn=lambda sid, _prompt: resumed.append(sid) or True,
+    )
+
+    assert sup.release_resumed_cold_tasks() == 0
+    assert resumed == []
+    assert q.get_reservation(reservation.key).state == SpawnState.COLD
+    assert q.get(blocked.id).status == Status.SUSPENDED
+
+
+def test_cold_resume_task_failure_is_recoolable(q, client, monkeypatch):
+    blocked = q.create("needs operator", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(
+        reservation.key, session_handle="local-body:blocked-session"
+    )
+    q.claim_one("headless-owner", task_id=blocked.id)
+    q.start(blocked.id, "headless-owner")
+    q.suspend(blocked.id, "headless-owner", reason="turn ended")
+    q.record_cold(reservation.key)
+    q.submit_steer(blocked.id, fields={"decision": "continue"}, sender="operator")
+
+    def fail_resume(*_args, **_kwargs):
+        raise DispatchError(500, "resume failed")
+
+    monkeypatch.setattr(
+        client,
+        "resume",
+        fail_resume,
+    )
+    stopped: list[str] = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_verdict_fn=lambda _sid: "live",
+        local_resume_fn=lambda _sid, _prompt: True,
+        local_cold_fn=lambda sid: stopped.append(sid) or True,
+    )
+
+    assert sup.release_resumed_cold_tasks() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.SPAWNED
+    assert q.get(blocked.id).status == Status.SUSPENDED
+    assert sup.cool_dormant_bodies() == 1
+    assert stopped == ["blocked-session"]
+    assert q.get_reservation(reservation.key).state == SpawnState.COLD
+
+
+def test_cold_resume_process_exception_is_recoolable(q, client):
+    blocked = q.create("needs operator", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(
+        reservation.key, session_handle="local-body:blocked-session"
+    )
+    q.claim_one("headless-owner", task_id=blocked.id)
+    q.start(blocked.id, "headless-owner")
+    q.suspend(blocked.id, "headless-owner", reason="turn ended")
+    q.record_cold(reservation.key)
+    q.submit_steer(blocked.id, fields={"decision": "continue"}, sender="operator")
+
+    def fail_process_resume(_sid, _prompt):
+        raise OSError("bridge unavailable")
+
+    stopped: list[str] = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_verdict_fn=lambda _sid: "live",
+        local_resume_fn=fail_process_resume,
+        local_cold_fn=lambda sid: stopped.append(sid) or True,
+    )
+
+    assert sup.release_resumed_cold_tasks() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.SPAWNED
+    assert q.get(blocked.id).status == Status.SUSPENDED
+    assert sup.cool_dormant_bodies() == 1
+    assert stopped == ["blocked-session"]
+    assert q.get_reservation(reservation.key).state == SpawnState.COLD
+
+
+def test_cold_resume_process_failure_backs_off_before_retry(q, client):
+    blocked = q.create("needs operator", labels=["review"])
+    reservation, _ = q.reserve_spawn(blocked.id)
+    q.record_spawn(
+        reservation.key, session_handle="local-body:blocked-session"
+    )
+    q.claim_one("headless-owner", task_id=blocked.id)
+    q.start(blocked.id, "headless-owner")
+    q.suspend(blocked.id, "headless-owner", reason="turn ended")
+    q.record_cold(reservation.key)
+    q.submit_steer(blocked.id, fields={"decision": "continue"}, sender="operator")
+    attempts: list[str] = []
+
+    def fail_process_resume(sid, _prompt):
+        attempts.append(sid)
+        raise OSError("bridge unavailable")
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_verdict_fn=lambda _sid: "live",
+        local_resume_fn=fail_process_resume,
+        local_cold_fn=lambda _sid: True,
+    )
+
+    assert sup.release_resumed_cold_tasks(now=1000) == 0
+    assert sup.cool_dormant_bodies() == 1
+    assert sup.release_resumed_cold_tasks(now=1299) == 0
+    assert attempts == ["blocked-session"]
+    assert sup.release_resumed_cold_tasks(now=1300) == 0
+    assert attempts == ["blocked-session", "blocked-session"]
+
+
+def test_idle_confirm_nudge_asks_whether_the_task_is_done(monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        "agent_dispatch.bridge.resume_session",
+        lambda target, message, **k: sent.append((target, k.get("host"), message))
+        or True,
+    )
+    from agent_dispatch.idle_confirm import default_idle_confirm_nudge
+
+    assert default_idle_confirm_nudge(
+        "sid-1",
+        {
+            "id": "abc",
+            "title": "do the thing",
+            "done_criteria": "comment posted",
+        },
+    )
+    assert sent[0][0] == "sid-1"
+    assert sent[0][1] is None
+    msg = sent[0][2]
+    assert "task abc (do the thing) is still in progress" in msg
+    assert "Re-read the task and continue from its recorded state" in msg
+    assert "agent-dispatch complete abc" in msg
+    assert "Done-criteria: comment posted" in msg
+    assert "do not complete just to clear this nudge" in msg
+    assert "steering card" not in msg
+
+
+def test_idle_confirm_nudge_without_goal_or_criteria_falls_back_to_title():
+    from agent_dispatch.idle_confirm import idle_confirm_message
+
+    msg = idle_confirm_message({"id": "abc", "title": "do the thing"})
+    assert "Your assignment: do the thing" in msg
+    assert "Re-read the task and continue from its recorded state" in msg
+    assert "Done-criteria" not in msg
+    assert "if the assignment is genuinely, fully complete" in msg
+    assert "if the done-criteria are genuinely met" not in msg
+
+
+def test_idle_headless_fleet_nudge_includes_remote_host(q, client):
+    task = q.create("review turn", labels=["review"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key, session_handle="fleet-body:host-a:sess-9"
+    )
+    q.claim_one("headless-owner", task_id=task.id)
+    q.start(task.id, "headless-owner")
+    nudged = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        fleet_activity_fn=lambda _host, _sid: "IDLE",
+        # Isolates this from the DEFAULT fleet_verdict_fn, which probes a
+        # REAL local agent-bridge carrier (embody.fleet_body_verdict) --
+        # on a machine where one happens to be running, "host-a"/"sess-9"
+        # genuinely resolves to GONE (session not found), triggering real
+        # recovery/respawn instead of the plain idle-nudge path this test
+        # means to exercise. An explicit unknown-liveness stub (matching
+        # the style already used elsewhere in this file) keeps the test's
+        # outcome independent of whatever bridge infrastructure happens to
+        # be reachable from the box running it.
+        fleet_verdict_fn=lambda _host, _sid: "unknown",
+        idle_nudge_fn=lambda target, t: nudged.append(
+            (target, t.get("_idle_host"))
+        )
+        or True,
+    )
+
+    assert sup.poll_once() == []
+    assert nudged == [("sess-9", "host-a")]
+    assert q.get(task.id).status == Status.STARTED
+
+
+def test_idle_confirm_nudge_routes_fleet_via_resume_session(monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        "agent_dispatch.bridge.resume_session",
+        lambda target, message, **k: sent.append((target, k.get("host"), message))
+        or True,
+    )
+    from agent_dispatch.idle_confirm import default_idle_confirm_nudge
+
+    assert default_idle_confirm_nudge(
+        "sess-9", {"id": "abc", "_idle_host": "host-a"}
+    )
+    assert sent[0][0] == "sess-9"
+    assert sent[0][1] == "host-a"
+    assert "task abc is still in progress" in sent[0][2]
+
+
+def test_idle_headless_turn_nudges_confirm_done_instead_of_suspend(q, client):
+    task = q.create("review turn", labels=["review"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key, session_handle="local-body:review-session"
+    )
+    q.claim_one("headless-owner", task_id=task.id)
+    q.start(task.id, "headless-owner")
+    stopped = []
+    nudged = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_activity_fn=lambda _session_id: "IDLE",
+        local_cold_fn=lambda session_id: stopped.append(session_id) or True,
+        local_body_verdict_fn=lambda _session_id: "live",
+        idle_nudge_fn=lambda target, t: nudged.append((target, t["id"])) or True,
+    )
+
+    assert sup.poll_once() == []
+    current = q.get(task.id)
+    assert current.status == Status.STARTED
+    assert current.activity == "IDLE"
+    assert q.get_reservation(reservation.key).state == SpawnState.SPAWNED
+    assert stopped == []
+    assert nudged == [("review-session", task.id)]
+    assert sup.poll_once() == []
+    assert nudged == [("review-session", task.id)]
+
+
+def test_idle_nudge_exempt_label_never_nudges(q, client):
+    """A task carrying an idle-nudge-exempt label owns its own resume path (an
+    in-process evaluator, or an external one driven entirely through this
+    CLI) -- going idle with no new activity is that task's correct resting
+    state, not an unfinished turn. Nudging it anyway can encourage the worker
+    to reach for a resolution its own charter never sanctioned (confirmed
+    live)."""
+    task = q.create("review turn", labels=["review"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key, session_handle="local-body:review-session"
+    )
+    q.claim_one("headless-owner", task_id=task.id)
+    q.start(task.id, "headless-owner")
+    nudged = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        idle_nudge_exempt_labels=["review"],
+        local_body_activity_fn=lambda _session_id: "IDLE",
+        local_body_verdict_fn=lambda _session_id: "live",
+        idle_nudge_fn=lambda target, t: nudged.append((target, t["id"])) or True,
+    )
+
+    assert sup.poll_once() == []
+    assert nudged == []
+    current = q.get(task.id)
+    assert current.status == Status.STARTED
+    assert q.get_reservation(reservation.key).state == SpawnState.SPAWNED
+
+
+def test_supervisor_binds_headless_owner_to_acp_session(q, client):
+    """Binds the durable ACP session id, not agent-bridge's own ephemeral
+    escrow handle -- see ``bind_headless_owner_sessions``'s docstring."""
+    task = q.create("review turn", labels=["review"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key, session_handle="local-body:review-session"
+    )
+    claimed = q.claim_one("headless-owner", task_id=task.id)
+    assert claimed is not None
+    q.start(task.id, "headless-owner")
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_activity_fn=lambda _session_id: "ACTIVE",
+        local_body_verdict_fn=lambda _session_id: "live",
+        local_acp_session_fn=lambda _sid: "acp-session-uuid",
+    )
+
+    assert sup.bind_headless_owner_sessions() == 1
+    assert q.get(task.id).owner_session_id == "acp-session-uuid"
+    assert sup.bind_headless_owner_sessions() == 0
+
+
+def test_supervisor_defers_headless_owner_bind_until_acp_session_known(q, client):
+    """The bridge hasn't reported its ACP session id back yet -- skip rather
+    than binding the ephemeral escrow handle as a placeholder."""
+    task = q.create("review turn", labels=["review"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key, session_handle="local-body:review-session"
+    )
+    q.claim_one("headless-owner", task_id=task.id)
+    q.start(task.id, "headless-owner")
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        local_body_activity_fn=lambda _session_id: "ACTIVE",
+        local_body_verdict_fn=lambda _session_id: "live",
+        local_acp_session_fn=lambda _sid: None,
+    )
+
+    assert sup.bind_headless_owner_sessions() == 0
+    assert q.get(task.id).owner_session_id is None
 
 
 def test_failed_cold_stop_keeps_live_process_capacity(q, client):
@@ -417,29 +2124,787 @@ def test_supervisor_settles_terminal_cold_reservation(q, client):
     q.complete(
         task.id, "headless-owner", result_ref="condition:satisfied"
     )
+    ended: list[str] = []
+
+    def end_session(session_id):
+        assert q.get_reservation(reservation.key).state == SpawnState.SETTLED
+        ended.append(session_id)
+        return True
+
     sup = Supervisor(
         client,
         spawn_fn=_ok_spawn(),
         repo=TEST_REPO,
         labels=["review"],
+        local_body_verdict_fn=lambda _sid: "gone",
+        local_end_fn=end_session,
     )
 
     assert sup.reconcile() == 1
+    assert ended == ["session-1"]
     assert q.get_reservation(reservation.key).state == SpawnState.SETTLED
+
+
+def test_terminal_conclusion_uses_exact_reservation_identity(q, client):
+    task = q.create("review", labels=["review"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="session-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one(
+        "host-a/worktree-exact",
+        task_id=task.id,
+        machine="host-a",
+        worktree="worktree-exact",
+    )
+    q.start(task.id, "host-a/worktree-exact")
+    q.complete(
+        task.id,
+        "host-a/worktree-exact",
+        result_ref="review:complete",
+    )
+    calls = []
+
+    def conclude(worktree, session):
+        calls.append((worktree, session))
+        return {"action": "primed", "reason": "managed-gc-candidate"}
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        labels=["review"],
+        disposable_cli_labels=["review"],
+        conclusion_fn=conclude,
+    )
+
+    assert sup.reconcile() == 1
+    assert calls == [("worktree-exact", "session-exact")]
+    settled = q.get_reservation(reservation.key)
+    assert settled.state == SpawnState.SETTLED
+    assert "terminal conclusion primed" in (settled.detail or "")
+    assert settled.conclusion_state == "complete"
+
+
+def test_terminal_refresh_does_not_replace_exact_reserved_session(q, client):
+    task = q.create("review", labels=["review"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="original-session",
+        worktree="worktree-exact",
+    )
+    q.claim_one("host-a/worktree-exact", task_id=task.id)
+    q.start(task.id, "host-a/worktree-exact")
+    q.complete(task.id, "host-a/worktree-exact")
+    calls = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        liveness_fn=lambda *_args: {
+            "session_id": "successor-session",
+            "worktree_id": "worktree-exact",
+        },
+        conclusion_fn=lambda *args: calls.append(args) or {
+            "action": "skipped",
+            "reason": "session-mismatch",
+        },
+    )
+
+    assert sup.reconcile() == 1
+    assert calls == [("worktree-exact", "original-session")]
+    settled = q.get_reservation(reservation.key)
+    assert settled.session_handle == "original-session"
+    assert settled.conclusion_state == "held"
+
+
+def test_terminal_refresh_uses_durable_owner_session_for_mux_placeholder(
+    q,
+    client,
+):
+    task = q.create("review", labels=["review"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="wt-worktree-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one("host-a/worktree-exact", task_id=task.id)
+    q.start(
+        task.id,
+        "host-a/worktree-exact",
+        owner_session_id="owner-session-exact",
+    )
+    q.complete(task.id, "host-a/worktree-exact")
+    calls = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        liveness_fn=lambda *_args: None,
+        conclusion_fn=lambda *args: calls.append(args) or {
+            "action": "primed",
+            "reason": "managed-gc-candidate",
+        },
+    )
+
+    assert sup.reconcile() == 1
+    assert calls == [("worktree-exact", "owner-session-exact")]
+    settled = q.get_reservation(reservation.key)
+    assert settled.session_handle == "owner-session-exact"
+    assert settled.conclusion_state == "complete"
+
+
+def test_terminal_refresh_preserves_headless_session_type_before_end(q, client):
+    task = q.create(
+        "review",
+        labels=["review"],
+    )
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="wt-worktree-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one("headless-worker", task_id=task.id)
+    q.start(
+        task.id,
+        "headless-worker",
+        owner_session_id="owner-session-exact",
+    )
+    q.complete(task.id, "headless-worker")
+    ended = []
+    concluded = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        conclusion_fn=lambda worktree, session: (
+            concluded.append((worktree, session))
+            or {"action": "removed", "reason": "managed-gc-removed"}
+        ),
+        verdict_fn=lambda *_args: tracking.UNKNOWN,
+        local_body_verdict_fn=lambda _sid: tracking.LIVE,
+        local_body_activity_fn=lambda _sid: "IDLE",
+        local_acp_session_fn=lambda _sid: "acp-session-exact",
+        local_end_fn=lambda sid: ended.append(sid) or True,
+    )
+
+    assert sup.reconcile() == 1
+    settled = q.get_reservation(reservation.key)
+    assert settled.session_handle == "local-body:owner-session-exact"
+    assert settled.state == SpawnState.SETTLED
+    assert settled.conclusion_state == "complete"
+    assert ended == ["owner-session-exact"]
+    assert concluded == [("worktree-exact", "acp-session-exact")]
+    detail = json.loads(settled.conclusion_detail or "{}")
+    assert detail["acp_session_id"] == "acp-session-exact"
+
+
+def test_terminal_conclusion_is_opt_in_only(q, client):
+    task = q.create("ordinary", labels=["ordinary"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="session-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one("host-a/worktree-exact", task_id=task.id)
+    q.start(task.id, "host-a/worktree-exact")
+    q.complete(task.id, "host-a/worktree-exact")
+    calls = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        conclusion_fn=lambda *args: calls.append(args) or {"action": "primed"},
+    )
+
+    assert sup.reconcile() == 1
+    assert calls == []
+
+
+def test_terminal_conclusion_is_terminal_only(q, client):
+    task = q.create("still working", labels=["review"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="session-exact",
+        worktree="worktree-exact",
+    )
+    calls = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        conclusion_fn=lambda *args: calls.append(args) or {"action": "primed"},
+    )
+
+    assert sup.reconcile() == 0
+    assert calls == []
+    assert q.get_reservation(reservation.key).state == SpawnState.SPAWNED
+
+
+def test_terminal_conclusion_failure_does_not_block_settlement(q, client):
+    task = q.create("review", labels=["review"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="session-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one("host-a/worktree-exact", task_id=task.id)
+    q.start(task.id, "host-a/worktree-exact")
+    q.complete(task.id, "host-a/worktree-exact")
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        conclusion_fn=lambda *_args: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    assert sup.reconcile() == 1
+    settled = q.get_reservation(reservation.key)
+    assert settled.state == SpawnState.SETTLED
+    assert "terminal conclusion failed (boom)" in (settled.detail or "")
+    assert settled.conclusion_state == "pending"
+
+
+def test_terminal_conclusion_reconcile_is_idempotent(q, client):
+    task = q.create("review", labels=["review"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="session-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one("host-a/worktree-exact", task_id=task.id)
+    q.start(task.id, "host-a/worktree-exact")
+    q.complete(task.id, "host-a/worktree-exact")
+    calls = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        conclusion_fn=lambda *args: calls.append(args) or {"action": "primed"},
+    )
+
+    assert sup.reconcile() == 1
+    assert sup.reconcile() == 0
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("action", ["removed", "already-removed"])
+def test_removed_conclusion_actions_are_complete(action):
+    assert Supervisor._conclusion_state({"action": action}) == "complete"
+
+
+def test_live_terminal_conclusion_retries_after_settlement(q, client):
+    task = q.create("review", labels=["review"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="session-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one("host-a/worktree-exact", task_id=task.id)
+    q.start(task.id, "host-a/worktree-exact")
+    q.complete(task.id, "host-a/worktree-exact")
+    outcomes = iter(
+        [
+            {"action": "skipped", "reason": "live-session"},
+            {"action": "primed", "reason": "managed-gc-candidate"},
+        ]
+    )
+    calls = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        conclusion_fn=lambda *args: calls.append(args) or next(outcomes),
+        liveness_fn=lambda *_args: None,
+    )
+
+    assert sup.reconcile() == 1
+    pending = q.get_reservation(reservation.key)
+    assert pending.state == SpawnState.SETTLED
+    assert pending.conclusion_state == "pending"
+    _, claimed, claim_token = q.claim_spawn_conclusion_retry(reservation.key)
+    assert claimed is True
+    q.settle_spawn(
+        reservation.key,
+        conclusion_state="pending",
+        conclusion_detail=json.dumps(
+            {
+                "action": "skipped",
+                "reason": "live-session",
+                "attempts": 1,
+                "next_attempt_at": 0,
+            }
+        ),
+        claim_token=claim_token,
+    )
+    assert sup.reconcile() == 0
+    complete = q.get_reservation(reservation.key)
+    assert complete.conclusion_state == "complete"
+    assert len(calls) == 2
+
+
+def test_nonexclusive_disposable_idle_body_ends_before_conclusion(q, client):
+    task = q.create(
+        "review",
+        labels=["review"],
+    )
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one("headless-worker", task_id=task.id)
+    q.start(task.id, "headless-worker", owner_session_id="session-exact")
+    q.complete(task.id, "headless-worker")
+    ended = []
+    conclusions = []
+
+    def conclude(worktree, session):
+        conclusions.append((worktree, session))
+        return {
+            "action": "removed",
+            "reason": "managed-gc-removed",
+        }
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        conclusion_fn=conclude,
+        local_body_verdict_fn=lambda _sid: tracking.LIVE,
+        local_body_activity_fn=lambda _sid: "IDLE",
+        local_acp_session_fn=lambda _sid: "acp-session-exact",
+        local_end_fn=lambda sid: ended.append(sid) or True,
+    )
+
+    assert sup.reconcile() == 1
+    complete = q.get_reservation(reservation.key)
+    assert complete.state == SpawnState.SETTLED
+    assert complete.conclusion_state == "complete"
+    assert ended == ["session-exact"]
+    assert conclusions == [("worktree-exact", "acp-session-exact")]
+
+
+def test_idle_disposable_end_failure_keeps_exclusive_fence(q, client):
+    task = q.create(
+        "review",
+        labels=["review"],
+        exclusive_key="review:repo:42",
+    )
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one("headless-worker", task_id=task.id)
+    q.start(task.id, "headless-worker", owner_session_id="session-exact")
+    q.complete(task.id, "headless-worker")
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        conclusion_fn=lambda *_args: pytest.fail(
+            "conclusion must wait until the body ends"
+        ),
+        local_body_verdict_fn=lambda _sid: tracking.LIVE,
+        local_body_activity_fn=lambda _sid: "IDLE",
+        local_acp_session_fn=lambda _sid: "acp-session-exact",
+        local_end_fn=lambda _sid: False,
+    )
+
+    assert sup.reconcile() == 0
+    still_active = q.get_reservation(reservation.key)
+    assert still_active.state == SpawnState.SPAWNED
+    assert still_active.conclusion_state == "pending"
+    detail = json.loads(still_active.conclusion_detail or "{}")
+    assert detail["attempts"] == 1
+    assert detail["reason"] == "terminal-body-end-failed"
+    assert detail["acp_session_id"] == "acp-session-exact"
+
+
+def test_failed_disposable_body_ends_reach_durable_held_bound(q, client):
+    task = q.create(
+        "review",
+        labels=["review"],
+        exclusive_key="review:repo:42",
+    )
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one("headless-worker", task_id=task.id)
+    q.start(task.id, "headless-worker", owner_session_id="session-exact")
+    q.complete(task.id, "headless-worker")
+
+    for attempt in range(12):
+        sup = Supervisor(
+            client,
+            spawn_fn=_ok_spawn(),
+            repo=TEST_REPO,
+            disposable_cli_labels=["review"],
+            conclusion_fn=lambda *_args: pytest.fail(
+                "conclusion must wait until the body ends"
+            ),
+            local_body_verdict_fn=lambda _sid: tracking.LIVE,
+            local_body_activity_fn=lambda _sid: "IDLE",
+            local_acp_session_fn=lambda _sid: "acp-session-exact",
+            local_end_fn=lambda _sid: False,
+        )
+        assert sup.reconcile() == 0
+        current = q.get_reservation(reservation.key)
+        assert current.state == SpawnState.SPAWNED
+        detail = json.loads(current.conclusion_detail or "{}")
+        assert detail["attempts"] == attempt + 1
+        if attempt < 11:
+            q.record_spawn_conclusion(
+                reservation.key,
+                conclusion_state="pending",
+                conclusion_detail=json.dumps(
+                    {
+                        **detail,
+                        "next_attempt_at": 0,
+                    }
+                ),
+            )
+
+    held = q.get_reservation(reservation.key)
+    assert held.conclusion_state == "held"
+
+
+def test_successful_disposable_body_end_runs_conclusion(q, client):
+    task = q.create(
+        "review",
+        labels=["review"],
+        exclusive_key="review:repo:42",
+    )
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one("headless-worker", task_id=task.id)
+    q.start(task.id, "headless-worker", owner_session_id="session-exact")
+    q.complete(task.id, "headless-worker")
+    ended = []
+    concluded = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        conclusion_fn=lambda worktree, session: (
+            concluded.append((worktree, session))
+            or {"action": "removed", "reason": "managed-gc-removed"}
+        ),
+        local_body_verdict_fn=lambda _sid: tracking.LIVE,
+        local_body_activity_fn=lambda _sid: "IDLE",
+        local_acp_session_fn=lambda _sid: "acp-session-exact",
+        local_end_fn=lambda sid: ended.append(sid) or True,
+    )
+
+    assert sup.reconcile() == 1
+    assert ended == ["session-exact"]
+    assert concluded == [("worktree-exact", "acp-session-exact")]
+    assert q.get_reservation(reservation.key).state == SpawnState.SETTLED
+
+
+def test_end_failure_counts_after_legacy_pending_attempts(q, client):
+    task = q.create(
+        "review",
+        labels=["review"],
+        exclusive_key="review:repo:42",
+    )
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-exact",
+        worktree="worktree-exact",
+    )
+    q.record_spawn_conclusion(
+        reservation.key,
+        conclusion_state="pending",
+        conclusion_detail=json.dumps(
+            {
+                "action": "failed",
+                "reason": "session-identity-unavailable",
+                "session": "acp-session-exact",
+                "attempts": 3,
+                "next_attempt_at": 0,
+            }
+        ),
+    )
+    q.claim_one("headless-worker", task_id=task.id)
+    q.start(task.id, "headless-worker", owner_session_id="session-exact")
+    q.complete(task.id, "headless-worker")
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        conclusion_fn=lambda *_args: pytest.fail(
+            "conclusion must wait until the body ends"
+        ),
+        local_body_verdict_fn=lambda _sid: tracking.LIVE,
+        local_body_activity_fn=lambda _sid: "IDLE",
+        local_acp_session_fn=lambda _sid: pytest.fail(
+            "legacy checkpoint must avoid a fresh identity lookup"
+        ),
+        local_end_fn=lambda _sid: False,
+    )
+
+    assert sup.reconcile() == 0
+    detail = json.loads(
+        q.get_reservation(reservation.key).conclusion_detail or "{}"
+    )
+    assert detail["attempts"] == 4
+    assert detail["reason"] == "terminal-body-end-failed"
+    assert detail["acp_session_id"] == "acp-session-exact"
+
+
+def test_nonexclusive_disposable_running_body_is_preserved(q, client):
+    task = q.create("review", labels=["review"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one("headless-worker", task_id=task.id)
+    q.start(task.id, "headless-worker", owner_session_id="session-exact")
+    q.complete(task.id, "headless-worker")
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        conclusion_fn=lambda *_args: pytest.fail(
+            "running body must not reach conclusion"
+        ),
+        local_body_verdict_fn=lambda _sid: tracking.LIVE,
+        local_body_activity_fn=lambda _sid: "RUNNING",
+        local_acp_session_fn=lambda _sid: "acp-session-exact",
+        local_end_fn=lambda _sid: pytest.fail("running body must not end"),
+    )
+
+    assert sup.reconcile() == 0
+    current = q.get_reservation(reservation.key)
+    assert current.state == SpawnState.SPAWNED
+    assert current.conclusion_state is None
+
+
+def test_pending_headless_conclusion_does_not_end_running_session(q, client):
+    task = q.create(
+        "review",
+        labels=["review"],
+        exclusive_key="review:repo:42",
+    )
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one("headless-worker", task_id=task.id)
+    q.start(task.id, "headless-worker", owner_session_id="session-exact")
+    q.complete(task.id, "headless-worker")
+    q.settle_spawn(
+        reservation.key,
+        conclusion_state="pending",
+        conclusion_detail=json.dumps(
+            {
+                "action": "skipped",
+                "reason": "live-session",
+                "attempts": 1,
+                "next_attempt_at": 0,
+                "same_owner_nudge": "delivered",
+            }
+        ),
+    )
+    ended = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        local_body_verdict_fn=lambda _sid: tracking.LIVE,
+        local_body_activity_fn=lambda _sid: "RUNNING",
+        local_end_fn=lambda sid: ended.append(sid) or True,
+    )
+
+    assert sup.reconcile() == 0
+    assert ended == []
+    assert q.get_reservation(reservation.key).conclusion_state == "pending"
+
+
+def test_nonidle_headless_conclusion_preserves_without_retry_budget(q, client):
+    task = q.create(
+        "review",
+        labels=["review"],
+        exclusive_key="review:repo:42",
+    )
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one("headless-worker", task_id=task.id)
+    q.start(task.id, "headless-worker", owner_session_id="session-exact")
+    q.complete(task.id, "headless-worker")
+
+    for _attempt in range(3):
+        sup = Supervisor(
+            client,
+            spawn_fn=_ok_spawn(),
+            repo=TEST_REPO,
+            disposable_cli_labels=["review"],
+            local_body_verdict_fn=lambda _sid: tracking.LIVE,
+            local_body_activity_fn=lambda _sid: "RUNNING",
+        )
+        assert sup.reconcile() == 0
+        current = q.get_reservation(reservation.key)
+        assert current.state == SpawnState.SPAWNED
+        assert current.conclusion_state is None
+        assert current.conclusion_detail is None
+
+
+def test_terminal_conclusion_retries_are_bounded(q, client):
+    task = q.create("review", labels=["review"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="session-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one("host-a/worktree-exact", task_id=task.id)
+    q.start(task.id, "host-a/worktree-exact")
+    q.complete(task.id, "host-a/worktree-exact")
+    calls = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        conclusion_fn=lambda *args: calls.append(args) or {
+            "action": "skipped",
+            "reason": "live-session",
+        },
+        liveness_fn=lambda *_args: None,
+    )
+
+    assert sup.reconcile() == 1
+    for attempt in range(1, 12):
+        _, claimed, claim_token = q.claim_spawn_conclusion_retry(
+            reservation.key
+        )
+        assert claimed is True
+        q.settle_spawn(
+            reservation.key,
+            conclusion_state="pending",
+            conclusion_detail=json.dumps(
+                {
+                    "action": "skipped",
+                    "reason": "live-session",
+                    "attempts": attempt,
+                    "next_attempt_at": 0,
+                }
+            ),
+            claim_token=claim_token,
+        )
+        assert sup.reconcile() == 0
+
+    held = q.get_reservation(reservation.key)
+    assert held.conclusion_state == "held"
+    assert len(calls) == 12
+
+
+def test_retired_cleanup_exhaustion_transitions_to_held_with_claim(q, client):
+    task = q.create("review", labels=["review"])
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="session-exact",
+        worktree="worktree-exact",
+    )
+    q.claim_one("worker", task_id=task.id)
+    q.start(task.id, "worker")
+    q.complete(task.id, "worker", result_ref="result/1")
+    q.settle_spawn(
+        reservation.key,
+        conclusion_state="pending",
+        conclusion_detail=json.dumps(
+            {
+                "action": "failed",
+                "reason": "live-session",
+                "attempts": supervisor_module._CONCLUSION_MAX_ATTEMPTS,
+                "next_attempt_at": 0,
+            }
+        ),
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        conclusion_fn=lambda *_args: pytest.fail(
+            "exhausted cleanup must not run another attempt"
+        ),
+        nudge=False,
+    )
+
+    assert sup.reconcile() == 0
+    held = q.get_reservation(reservation.key)
+    assert held.state == SpawnState.SETTLED
+    assert held.conclusion_state == "held"
+    assert held.cleanup_claim_token
+    assert held.cleanup_claim_expires_at == 0
 
 
 def test_requeued_task_is_not_double_spawned(q, client):
     """A spawned-but-requeued task (lease expired, embody maybe still alive)
     must never be spawned a second time."""
     t = q.create("work")
-    spawn = _ok_spawn()
-    sup = Supervisor(client, spawn_fn=spawn, repo=TEST_REPO, max_concurrent=5)
+    # Headless (local-body-prefixed handle): reconcile_liveness's requeue
+    # path is unchanged only for a headless body (Phase 1 item 2) -- a
+    # CLI-embodied one now auto-suspends instead.
+    spawn = _ok_spawn({"session": "local-body:sess-1", "worktree": "wt-1"})
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        local_body_verdict_fn=lambda _sid: "live",
+    )
     sup.poll_once()  # spawn #1
 
     # simulate: embody claimed + started, then its worker went away -> re-queued
     q.claim_one("m/wt", task_id=t.id, machine="m", worktree="wt")
     q.start(t.id, "m/wt")
-    q.reconcile_liveness(lambda wt, mc, sid: "gone")
+    q.reconcile_liveness(headless_local_verdict=lambda sid: "gone")
     assert q.get(t.id).status == Status.QUEUED  # back in the queue
 
     # the supervisor must NOT re-spawn it (reservation still 'spawned')
@@ -460,6 +2925,434 @@ def test_reconcile_settles_terminal_then_allows_respawn(q, client):
 
     settled = sup.reconcile()
     assert settled == 1
+    assert q.latest_reservation(t.id).state == SpawnState.SETTLED
+
+
+def test_reconcile_ends_terminal_local_body_before_settling(q, client):
+    t = q.create("work")
+    spawn = _local_spawn("local-body:brg-terminal")
+    ended: list[str] = []
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        machine="host-a",
+        local_body_verdict_fn=lambda _sid: "live",
+        local_end_fn=lambda sid: ended.append(sid) or True,
+    )
+    sup.poll_once()
+    q.claim_one("local-o", task_id=t.id)
+    q.start(t.id, "local-o")
+    q.complete(t.id, "local-o")
+
+    assert sup.reconcile() == 1
+    assert ended == ["brg-terminal"]
+    assert q.latest_reservation(t.id).state == SpawnState.SETTLED
+
+
+def test_disposable_terminal_local_body_ends_before_conclusion(q, client):
+    task = q.create(
+        "review",
+        labels=["review"],
+        exclusive_key="review:repo:42",
+    )
+    spawn = _ok_spawn(
+        {
+            "session": "local-body:brg-disposable",
+            "worktree": "worktree-disposable",
+        }
+    )
+    ended: list[str] = []
+    concluded: list[tuple[str, str | None]] = []
+
+    def end_body(sid):
+        checkpoint = q.get_reservation(
+            q.latest_reservation(task.id).key
+        )
+        detail = json.loads(checkpoint.conclusion_detail)
+        assert checkpoint.conclusion_state == "pending"
+        assert detail["acp_session_id"] == "session-exact"
+        ended.append(sid)
+        return True
+
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        disposable_cli_labels=["review"],
+        local_body_verdict_fn=lambda _sid: "live",
+        local_body_activity_fn=lambda _sid: "IDLE",
+        local_acp_session_fn=lambda _sid: "session-exact",
+        local_end_fn=end_body,
+        conclusion_fn=lambda worktree, session: (
+            concluded.append((worktree, session))
+            or {"action": "removed", "reason": "managed-gc-removed"}
+        ),
+    )
+    sup.poll_once()
+    q.claim_one("local-o", task_id=task.id)
+    q.start(task.id, "local-o", owner_session_id="session-exact")
+    q.complete(task.id, "local-o")
+
+    assert sup.reconcile() == 1
+    assert ended == ["brg-disposable"]
+    assert concluded == [("worktree-disposable", "session-exact")]
+    reservation = q.latest_reservation(task.id)
+    assert reservation.state == SpawnState.SETTLED
+    assert reservation.conclusion_state == "complete"
+    assert json.loads(reservation.conclusion_detail)["acp_session_id"] == (
+        "session-exact"
+    )
+
+
+def test_stopped_disposable_local_body_is_ended_before_conclusion(q, client):
+    task = q.create(
+        "review",
+        labels=["review"],
+        exclusive_key="review:repo:42",
+    )
+    spawn = _ok_spawn(
+        {
+            "session": "local-body:brg-stopped",
+            "worktree": "worktree-disposable",
+        }
+    )
+    ended = []
+    concluded = []
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        local_body_verdict_fn=lambda _sid: tracking.GONE,
+        local_acp_session_fn=lambda _sid: "session-exact",
+        local_end_fn=lambda sid: ended.append(sid) or True,
+        conclusion_fn=lambda worktree, session: (
+            concluded.append((worktree, session))
+            or {"action": "removed", "reason": "managed-gc-removed"}
+        ),
+    )
+    sup.poll_once()
+    q.claim_one("local-o", task_id=task.id)
+    q.start(task.id, "local-o", owner_session_id="session-exact")
+    q.complete(task.id, "local-o")
+
+    assert sup.reconcile() == 1
+    assert ended == ["brg-stopped"]
+    assert concluded == [("worktree-disposable", "session-exact")]
+    assert q.latest_reservation(task.id).conclusion_state == "complete"
+
+
+def test_disposable_terminal_retry_keeps_acp_identity_after_end(q, client):
+    task = q.create(
+        "review",
+        labels=["review"],
+        exclusive_key="review:repo:42",
+    )
+    spawn = _ok_spawn(
+        {
+            "session": "local-body:brg-disposable",
+            "worktree": "worktree-disposable",
+        }
+    )
+    outcomes = iter(
+        [
+            RuntimeError("transient"),
+            {"action": "removed", "reason": "managed-gc-removed"},
+        ]
+    )
+    sessions_seen = []
+
+    def conclude(_worktree, session):
+        sessions_seen.append(session)
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        disposable_cli_labels=["review"],
+        local_body_verdict_fn=lambda _sid: "live",
+        local_body_activity_fn=lambda _sid: "IDLE",
+        local_acp_session_fn=lambda _sid: "session-exact",
+        local_end_fn=lambda _sid: True,
+        conclusion_fn=conclude,
+    )
+    sup.poll_once()
+    q.claim_one("local-o", task_id=task.id)
+    q.start(task.id, "local-o", owner_session_id="session-exact")
+    q.complete(task.id, "local-o")
+
+    assert sup.reconcile() == 1
+    pending = q.latest_reservation(task.id)
+    assert pending.conclusion_state == "pending"
+    assert json.loads(pending.conclusion_detail)["acp_session_id"] == (
+        "session-exact"
+    )
+    _, claimed, claim_token = q.claim_spawn_conclusion_retry(pending.key)
+    assert claimed is True
+    q.settle_spawn(
+        pending.key,
+        detail=pending.detail,
+        conclusion_state="pending",
+        conclusion_detail=json.dumps(
+            {
+                **json.loads(pending.conclusion_detail),
+                "next_attempt_at": 0,
+            }
+        ),
+        claim_token=claim_token,
+    )
+
+    assert sup.reconcile() == 0
+    assert sessions_seen == ["session-exact", "session-exact"]
+    assert q.latest_reservation(task.id).conclusion_state == "complete"
+
+
+def test_gone_terminal_retry_preserves_terminal_cleanup_envelope(q, client):
+    task = q.create(
+        "review",
+        labels=["review"],
+        exclusive_key="review:repo:42",
+    )
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:brg-disposable",
+        worktree="worktree-disposable",
+    )
+    q.claim_one("local-o", task_id=task.id)
+    q.start(task.id, "local-o", owner_session_id="session-exact")
+    q.complete(task.id, "local-o")
+    outcomes = iter(
+        [
+            RuntimeError("transient"),
+            {"action": "removed", "reason": "managed-gc-removed"},
+        ]
+    )
+    sessions_seen = []
+    ended = []
+
+    def conclude(_worktree, session):
+        sessions_seen.append(session)
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        local_body_verdict_fn=lambda _sid: tracking.GONE,
+        local_acp_session_fn=lambda _sid: "session-exact",
+        local_end_fn=lambda sid: ended.append(sid) or True,
+        conclusion_fn=conclude,
+        nudge=False,
+    )
+
+    assert sup.reconcile() == 1
+    pending = q.get_reservation(reservation.key)
+    envelope = json.loads(pending.conclusion_detail or "{}")
+    assert pending.state == SpawnState.SETTLED
+    assert pending.conclusion_state == "pending"
+    assert envelope["cleanup_kind"] == "terminal"
+    assert envelope["acp_session_id"] == "session-exact"
+    assert envelope["session_end"]["state"] == "complete"
+    assert envelope["worktree_cleanup"]["state"] == "pending"
+    assert ended == ["brg-disposable"]
+    assert sessions_seen == ["session-exact"]
+
+    worktree_next_attempt = envelope["worktree_cleanup"]["next_attempt_at"]
+    assert sup.release_requested_bodies(
+        now=worktree_next_attempt - 0.1
+    ) == 0
+    assert sessions_seen == ["session-exact"]
+    assert sup.release_requested_bodies(
+        now=worktree_next_attempt
+    ) == 0
+    complete = q.get_reservation(reservation.key)
+    final_envelope = json.loads(complete.conclusion_detail or "{}")
+    assert complete.conclusion_state == "complete"
+    assert final_envelope["cleanup_kind"] == "terminal"
+    assert final_envelope["acp_session_id"] == "session-exact"
+    assert final_envelope["session_end"]["state"] == "complete"
+    assert final_envelope["worktree_cleanup"]["state"] == "complete"
+    assert sessions_seen == ["session-exact", "session-exact"]
+
+
+def test_disposable_terminal_end_failure_is_bounded_and_retryable(q, client):
+    task = q.create(
+        "review",
+        labels=["review"],
+        exclusive_key="review:repo:42",
+    )
+    spawn = _ok_spawn(
+        {
+            "session": "local-body:brg-disposable",
+            "worktree": "worktree-disposable",
+        }
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        disposable_cli_labels=["review"],
+        local_body_verdict_fn=lambda _sid: "live",
+        local_body_activity_fn=lambda _sid: "IDLE",
+        local_acp_session_fn=lambda _sid: "session-exact",
+        local_end_fn=lambda _sid: False,
+        conclusion_fn=lambda *_args: pytest.fail(
+            "conclusion must wait until the body ends"
+        ),
+    )
+    sup.poll_once()
+    q.claim_one("local-o", task_id=task.id)
+    q.start(task.id, "local-o", owner_session_id="session-exact")
+    q.complete(task.id, "local-o")
+
+    assert sup.reconcile() == 0
+    pending = q.latest_reservation(task.id)
+    assert pending.state == SpawnState.SPAWNED
+    assert pending.conclusion_state == "pending"
+    detail = json.loads(pending.conclusion_detail)
+    assert detail["reason"] == "terminal-body-end-failed"
+    assert detail["acp_session_id"] == "session-exact"
+    assert detail["attempts"] == 1
+    assert detail["next_attempt_at"] > 0
+
+
+def test_disposable_terminal_missing_acp_identity_is_bounded(q, client):
+    task = q.create(
+        "review",
+        labels=["review"],
+        exclusive_key="review:repo:42",
+    )
+    spawn = _ok_spawn(
+        {
+            "session": "local-body:brg-disposable",
+            "worktree": "worktree-disposable",
+        }
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        disposable_cli_labels=["review"],
+        local_body_verdict_fn=lambda _sid: "live",
+        local_body_activity_fn=lambda _sid: "IDLE",
+        local_acp_session_fn=lambda _sid: None,
+        local_end_fn=lambda _sid: pytest.fail(
+            "body must not end without a durable ACP identity"
+        ),
+    )
+    sup.poll_once()
+    q.claim_one("local-o", task_id=task.id)
+    q.start(task.id, "local-o")
+    q.complete(task.id, "local-o")
+
+    assert sup.reconcile() == 0
+    pending = q.latest_reservation(task.id)
+    assert pending.state == SpawnState.SPAWNED
+    assert pending.conclusion_state == "pending"
+    detail = json.loads(pending.conclusion_detail)
+    assert detail["reason"] == "session-identity-unavailable"
+    assert detail["attempts"] == 1
+    assert detail["next_attempt_at"] > 0
+
+
+def test_disposable_terminal_acp_identity_error_is_bounded(q, client):
+    task = q.create(
+        "review",
+        labels=["review"],
+        exclusive_key="review:repo:42",
+    )
+    spawn = _ok_spawn(
+        {
+            "session": "local-body:brg-disposable",
+            "worktree": "worktree-disposable",
+        }
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        disposable_cli_labels=["review"],
+        local_body_verdict_fn=lambda _sid: "live",
+        local_body_activity_fn=lambda _sid: "IDLE",
+        local_acp_session_fn=lambda _sid: (_ for _ in ()).throw(
+            RuntimeError("bridge unavailable")
+        ),
+        local_end_fn=lambda _sid: pytest.fail(
+            "body must not end without a durable ACP identity"
+        ),
+    )
+    sup.poll_once()
+    q.claim_one("local-o", task_id=task.id)
+    q.start(task.id, "local-o")
+    q.complete(task.id, "local-o")
+
+    assert sup.reconcile() == 0
+    pending = q.latest_reservation(task.id)
+    assert pending.state == SpawnState.SPAWNED
+    assert pending.conclusion_state == "pending"
+    detail = json.loads(pending.conclusion_detail)
+    assert detail["reason"] == "session-identity-unavailable"
+    assert detail["attempts"] == 1
+    assert detail["next_attempt_at"] > 0
+
+
+def test_reconcile_retains_terminal_local_reservation_when_end_fails(q, client):
+    t = q.create("work")
+    spawn = _local_spawn("local-body:brg-terminal")
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        local_body_verdict_fn=lambda _sid: "live",
+        local_end_fn=lambda _sid: False,
+    )
+    sup.poll_once()
+    q.claim_one("local-o", task_id=t.id)
+    q.start(t.id, "local-o")
+    q.complete(t.id, "local-o")
+
+    assert sup.reconcile() == 0
+    assert q.latest_reservation(t.id).state == SpawnState.SPAWNED
+
+
+def test_reconcile_ends_cold_terminal_local_body_before_settling(q, client):
+    t = q.create("work")
+    spawn = _local_spawn("local-body:brg-cold")
+    ended: list[str] = []
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        local_body_verdict_fn=lambda _sid: "gone",
+        local_end_fn=lambda sid: ended.append(sid) or True,
+    )
+    sup.poll_once()
+    q.claim_one("local-o", task_id=t.id)
+    q.start(t.id, "local-o")
+    q.suspend(t.id, "local-o", reason="turn ended")
+    q.record_cold(q.latest_reservation(t.id).key)
+    q.complete(t.id, "local-o")
+
+    assert sup.reconcile() == 1
+    assert ended == ["brg-cold"]
     assert q.latest_reservation(t.id).state == SpawnState.SETTLED
 
 
@@ -536,6 +3429,57 @@ def test_dead_letter_after_max_attempts(q, client):
     # a fourth cycle must NOT reserve a 4th attempt
     assert sup.poll_once() == []
     assert q.latest_reservation(t.id).attempt == 3  # still only 3 attempts made
+
+
+def test_deferred_spawn_never_dead_letters(q, client):
+    """A carried session that is confirmed live/busy (not gone) declines the
+    spawn -- that's a legitimate deferral, not a failure. Unlike an ordinary
+    spawn failure, it must never count toward dead-lettering (#2056): the same
+    exclusive-key task should be able to re-check liveness indefinitely while
+    its predecessor is genuinely still working, without ever being starved by
+    a bound meant for real failures."""
+    t = q.create("work")
+
+    def always_busy(task):
+        return False, {"error": "carried session remains live", "deferred": True}
+
+    sup = Supervisor(
+        client, spawn_fn=always_busy, repo=TEST_REPO, max_concurrent=5, max_attempts=3
+    )
+    # Many more cycles than the failure bound: none of them may dead-letter,
+    # because none of them actually failed.
+    for _ in range(10):
+        assert sup.poll_once() == []
+    assert len(q.list_reservations(task_id=t.id, state="failed")) == 0
+    assert len(q.list_reservations(task_id=t.id, state="deferred")) == 10
+    # A fresh attempt is still reserved every cycle (never dead-lettered).
+    assert q.latest_reservation(t.id).attempt == 10
+
+
+def test_bridge_failure_during_spawn_preparation_releases_reservation(
+    q, client, monkeypatch
+):
+    task = q.create("work")
+    spawn = _ok_spawn()
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=1,
+    )
+
+    def fail_preparation(_task, _reservation):
+        raise bridge.BridgeUnavailable("registry unavailable")
+
+    monkeypatch.setattr(sup, "_prepare_spawn_task", fail_preparation)
+
+    assert sup.poll_once() == []
+    reservation = q.latest_reservation(task.id)
+    assert reservation.state == SpawnState.FAILED
+    assert reservation.detail == (
+        "reusable worktree preparation failed: registry unavailable"
+    )
+    assert spawn.calls == []
 
 
 def test_dead_letter_summary_is_compact_and_only_repeats_on_change(
@@ -781,10 +3725,12 @@ def test_make_embody_spawn_records_handle_on_success(monkeypatch):
         worker_id,
         driver,
         project=None,
+        worktree_id=None,
         route="",
         repo=None,
         all_repos=False,
         verify_timeout=0,
+        charter=None,
     ):
         return subprocess.CompletedProcess(
             args=[], returncode=0,
@@ -798,6 +3744,34 @@ def test_make_embody_spawn_records_handle_on_success(monkeypatch):
     assert ok is True
     assert handle["worktree"] == "wt-9"
     assert handle["session"] == "sess-9"
+
+
+def test_make_embody_spawn_fails_when_a_zero_exit_yields_no_session_id(
+    monkeypatch,
+):
+    # A zero exit with no recognizable session id (e.g. an embody JSON shape
+    # this parser doesn't recognize) must not be reported as a usable
+    # success: record_spawn would otherwise persist a SPAWNED reservation
+    # with session_handle=None -- indistinguishable from a reservation that
+    # never reached spawning anything at all, which release_requested_bodies'
+    # absent-worktree shortcut could then wrongly treat as confirmed-gone
+    # without ever resolving whether a real, unidentifiable body exists.
+    import subprocess
+
+    from agent_dispatch import embody
+    from agent_dispatch.supervisor import make_embody_spawn
+
+    def fake_spawn_embodied_worker(task_id, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="{}", stderr="",
+        )
+
+    monkeypatch.setattr(embody, "spawn_embodied_worker", fake_spawn_embodied_worker)
+    ok, handle = make_embody_spawn()(
+        {"id": "t", "repo": "gitea.example/org/widgets"}
+    )
+    assert ok is False
+    assert "error" in handle
 
 
 def test_parse_handle_accepts_nested_worktree_object():
@@ -863,6 +3837,28 @@ def test_resolving_client_rejects_unknown_attribute():
         client.definitely_not_a_method
 
 
+def test_dispatch_client_skips_tls_setup_only_for_plain_http(monkeypatch):
+    from agent_dispatch import client as client_module
+    from agent_dispatch.client import DispatchClient
+
+    created: list[dict] = []
+
+    class FakeHttpClient:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(client_module.httpx, "Client", FakeHttpClient)
+
+    DispatchClient("http://127.0.0.1:9847").close()
+    DispatchClient("https://dispatch.example.com").close()
+
+    assert created[0]["verify"] is False
+    assert created[1]["verify"] is True
+
+
 # -- headless-ACP embody backend ---------------------------------------------
 
 
@@ -889,7 +3885,8 @@ def test_make_headless_spawn_uses_bridge_with_autopilot_seed(monkeypatch):
     monkeypatch.setattr(bridge, "spawn_worker", fake_spawn_worker)
     monkeypatch.setattr(
         embody, "autopilot_worker_prompt",
-        lambda task_id, *, worker_id, route="", repo=None, all_repos=False: (
+        lambda task_id, *, worker_id, route="", repo=None, all_repos=False,
+        explicit_worker_identity=False: (
             f"SEED::{task_id}"
         ),
     )
@@ -904,7 +3901,176 @@ def test_make_headless_spawn_uses_bridge_with_autopilot_seed(monkeypatch):
     assert calls["wait"] is False  # fire-and-forget; the worker drives itself
 
 
-def test_make_headless_spawn_reports_failure_on_nonzero(monkeypatch):
+def test_make_script_spawn_launches_runtime_python_with_task_context(monkeypatch, tmp_path):
+    from agent_dispatch import spawn_factories
+    from agent_dispatch.supervisor import make_script_spawn
+
+    script_path = tmp_path / "worker.py"
+    script_path.write_text("print('ok')\n", encoding="utf-8")
+
+    started = {}
+
+    class FakeProcess:
+        pid = 4321
+
+    monkeypatch.setattr(
+        spawn_factories,
+        "subprocess",
+        SimpleNamespace(DEVNULL=None, Popen=lambda argv, **kwargs: started.update(
+            argv=argv, kwargs=kwargs
+        ) or FakeProcess()),
+    )
+    monkeypatch.setattr(
+        spawn_factories,
+        "_process_tree_kwargs",
+        lambda: {"creationflags": 0},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        spawn_factories,
+        "Path",
+        Path,
+    )
+    monkeypatch.setattr(
+        "agent_dispatch.procutil.resolve_own_runtime_python",
+        lambda: "C:\\runtime\\python.exe",
+    )
+    monkeypatch.setattr(
+        "agent_dispatch.companion.process_start_token",
+        lambda pid: f"token-{pid}",
+    )
+
+    spawn = make_script_spawn(route=" --shared", all_repos=False)
+    ok, handle = spawn(
+        {
+            "id": "task-1",
+            "repo": TEST_REPO,
+            "payload_inline": json.dumps({"path": str(script_path)}),
+        }
+    )
+
+    assert ok is True
+    assert started["argv"] == ["C:\\runtime\\python.exe", str(script_path)]
+    env = started["kwargs"]["env"]
+    assert env["AGENT_DISPATCH_SCRIPT_TASK_ID"] == "task-1"
+    assert env["AGENT_DISPATCH_SCRIPT_WORKER_ID"].startswith("script-")
+    assert env["AGENT_DISPATCH_SCRIPT_ROUTE"] == "shared"
+    assert env["AGENT_DISPATCH_SCRIPT_REPO"] == TEST_REPO
+    assert Path(env["AGENT_DISPATCH_SCRIPT_TASK_FILE"]).is_file()
+    parsed = spawn_factories._parse_script_body_handle(handle["session"])
+    assert parsed == (
+        env["AGENT_DISPATCH_SCRIPT_WORKER_ID"],
+        4321,
+        "token-4321",
+        env["AGENT_DISPATCH_SCRIPT_TASK_FILE"],
+    )
+    Path(env["AGENT_DISPATCH_SCRIPT_TASK_FILE"]).unlink(missing_ok=True)
+
+
+def test_make_script_spawn_rejects_missing_inline_payload():
+    from agent_dispatch.supervisor import make_script_spawn
+
+    ok, handle = make_script_spawn()({"id": "task-1", "repo": TEST_REPO})
+
+    assert ok is False
+    assert "payload_inline" in handle["error"]
+
+
+def test_make_script_spawn_clears_repo_for_all_repos(monkeypatch, tmp_path):
+    from agent_dispatch import spawn_factories
+    from agent_dispatch.supervisor import make_script_spawn
+
+    script_path = tmp_path / "worker.py"
+    script_path.write_text("print('ok')\n", encoding="utf-8")
+    started = {}
+
+    class FakeProcess:
+        pid = 4321
+
+    monkeypatch.setattr(
+        spawn_factories,
+        "subprocess",
+        SimpleNamespace(DEVNULL=None, Popen=lambda argv, **kwargs: started.update(
+            argv=argv, kwargs=kwargs
+        ) or FakeProcess()),
+    )
+    monkeypatch.setattr(
+        "agent_dispatch.procutil.resolve_own_runtime_python",
+        lambda: "C:\\runtime\\python.exe",
+    )
+    monkeypatch.setattr(
+        "agent_dispatch.companion.process_start_token",
+        lambda pid: None,
+    )
+
+    ok, handle = make_script_spawn(route="", all_repos=True)(
+        {
+            "id": "task-1",
+            "repo": TEST_REPO,
+            "payload_inline": json.dumps({"path": str(script_path)}),
+        }
+    )
+
+    assert ok is True
+    assert started["kwargs"]["env"]["AGENT_DISPATCH_SCRIPT_REPO"] == ""
+    task_file = spawn_factories._parse_script_body_handle(handle["session"])[3]
+    Path(task_file).unlink(missing_ok=True)
+
+
+def test_make_headless_spawn_resolves_allocation_project_lazily(monkeypatch):
+    from agent_dispatch import bridge
+    from agent_dispatch.supervisor import make_headless_spawn
+
+    calls = []
+    monkeypatch.setattr(
+        bridge,
+        "registered_agent_project",
+        lambda agent, **kwargs: calls.append((agent, kwargs)) or "review-harness",
+    )
+
+    spawn = make_headless_spawn(agent="review-worker")
+
+    assert calls == []
+    assert spawn.allocation_project_for({"id": "task-1"}) == "review-harness"
+    assert calls == [
+        ("review-worker", {"strict": True}),
+    ]
+
+
+def test_make_headless_spawn_exposes_allocation_agent():
+    from agent_dispatch.supervisor import make_headless_spawn
+
+    spawn = make_headless_spawn(agent="review-worker")
+
+    assert spawn.allocation_agent == "review-worker"
+
+
+def test_make_headless_spawn_charter_overrides_allocation_agent():
+    """Regression for the venue/charter split: the worktree
+    binding (`agent-worktrees create --agent <name>`, exposed here as
+    `allocation_agent`) must bind the CHARTER when one is set, not the venue
+    -- a pool's venue (`agent=`) is where it spawns, never what persona
+    drives it. A pool with no charter still falls back to the venue,
+    preserving pre-split behavior."""
+    from agent_dispatch.supervisor import make_headless_spawn
+
+    with_charter = make_headless_spawn(agent="Atlas-Core-wsl", charter="cab-sweep-reconciler")
+    assert with_charter.allocation_agent == "cab-sweep-reconciler"
+
+    without_charter = make_headless_spawn(agent="Atlas-Core-wsl")
+    assert without_charter.allocation_agent == "Atlas-Core-wsl"
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "[FAIL] Session failed-123 entered failed: Connection closed",
+        "[FAIL] Session failed-123 entered ended",
+        "[FAIL] Session failed-123 entered stopped",
+        "[FAIL] Timed out waiting for session failed-123 to become idle",
+    ],
+)
+def test_make_headless_spawn_reports_failure_on_nonzero(monkeypatch, stderr):
     import subprocess
 
     from agent_dispatch import bridge, embody
@@ -913,11 +4079,143 @@ def test_make_headless_spawn_reports_failure_on_nonzero(monkeypatch):
     monkeypatch.setattr(embody, "autopilot_worker_prompt", lambda *a, **k: "seed")
     monkeypatch.setattr(
         bridge, "spawn_worker",
-        lambda *a, **k: subprocess.CompletedProcess([], 1, "", "boom"),
+        lambda *a, **k: subprocess.CompletedProcess([], 1, "", stderr),
     )
     ok, handle = make_headless_spawn()({"id": "t"})
     assert ok is False
-    assert "boom" in handle["error"]
+    assert "failed-123" in handle["error"]
+    assert handle["session"] == "local-body:failed-123"
+
+
+def test_make_headless_spawn_reuses_carried_session(monkeypatch):
+    from agent_dispatch import bridge, embody
+    from agent_dispatch.supervisor import make_headless_spawn
+
+    resumed = []
+    created = []
+    monkeypatch.setattr(embody, "local_body_verdict", lambda _sid: "live")
+    monkeypatch.setattr(
+        bridge,
+        "resume_worker",
+        lambda sid, prompt, **_kwargs: resumed.append((sid, prompt)) or True,
+    )
+    monkeypatch.setattr(
+        bridge,
+        "spawn_worker",
+        lambda *args, **kwargs: created.append((args, kwargs)),
+    )
+
+    ok, handle = make_headless_spawn()(
+        {
+            "id": "next-task",
+            "repo": TEST_REPO,
+            "spawn_worktree": "wt-review",
+            "spawn_worktree_path": "/tmp/wt-review",
+            "spawn_session_handle": "local-body:session-old",
+        }
+    )
+
+    assert ok is True
+    assert handle == {
+        "session": "local-body:session-old",
+        "worktree": "wt-review",
+    }
+    assert resumed and resumed[0][0] == "session-old"
+    assert "next-task" in resumed[0][1]
+    assert created == []
+
+
+def test_make_headless_spawn_does_not_replace_live_busy_session(monkeypatch):
+    from agent_dispatch import bridge, embody
+    from agent_dispatch.supervisor import make_headless_spawn
+
+    created = []
+    monkeypatch.setattr(embody, "local_body_verdict", lambda _sid: "live")
+    monkeypatch.setattr(bridge, "resume_worker", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        bridge,
+        "spawn_worker",
+        lambda *args, **kwargs: created.append((args, kwargs)),
+    )
+
+    ok, handle = make_headless_spawn()(
+        {
+            "id": "next-task",
+            "spawn_worktree": "wt-review",
+            "spawn_worktree_path": "/tmp/wt-review",
+            "spawn_session_handle": "local-body:session-busy",
+        }
+    )
+
+    assert ok is False
+    assert "remains live" in handle["error"]
+    assert handle.get("deferred") is True
+    assert created == []
+
+
+def test_make_headless_spawn_replaces_confirmed_gone_session(monkeypatch):
+    import subprocess
+
+    from agent_dispatch import bridge, embody
+    from agent_dispatch.supervisor import make_headless_spawn
+
+    created = []
+    monkeypatch.setattr(embody, "local_body_verdict", lambda _sid: "gone")
+    monkeypatch.setattr(bridge, "resume_worker", lambda *_args, **_kwargs: False)
+
+    def create(*args, **kwargs):
+        created.append((args, kwargs))
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            '{"session_id":"session-new"}',
+            "",
+        )
+
+    monkeypatch.setattr(bridge, "spawn_worker", create)
+
+    ok, handle = make_headless_spawn()(
+        {
+            "id": "next-task",
+            "spawn_worktree": "wt-review",
+            "spawn_worktree_path": "/tmp/wt-review",
+            "spawn_session_handle": "local-body:session-gone",
+        }
+    )
+
+    assert ok is True
+    assert handle == {
+        "session": "local-body:session-new",
+        "worktree": "wt-review",
+    }
+    assert created[0][1]["target_dir"] == "/tmp/wt-review"
+    assert created[0][1]["worktree_id"] == "wt-review"
+
+
+def test_make_headless_spawn_holds_on_unknown_carried_session(monkeypatch):
+    from agent_dispatch import bridge, embody
+    from agent_dispatch.supervisor import make_headless_spawn
+
+    created = []
+    monkeypatch.setattr(embody, "local_body_verdict", lambda _sid: "unknown")
+    monkeypatch.setattr(
+        bridge,
+        "spawn_worker",
+        lambda *args, **kwargs: created.append((args, kwargs)),
+    )
+
+    ok, handle = make_headless_spawn()(
+        {
+            "id": "next-task",
+            "spawn_worktree": "wt-review",
+            "spawn_worktree_path": "/tmp/wt-review",
+            "spawn_session_handle": "local-body:session-unknown",
+        }
+    )
+
+    assert ok is False
+    assert "could not determine" in handle["error"]
+    assert created == []
 
 
 def test_make_headless_spawn_degrades_when_bridge_absent(monkeypatch):
@@ -944,12 +4242,33 @@ def test_make_label_routed_spawn_routes_by_label():
     def headless(_task):
         return True, {"session": "headless", "worktree": None}
 
+    default.allocation_project = "default-project"
+    headless.allocation_project_for = lambda _task: "headless-project"
     routed = make_label_routed_spawn(default, overrides={"sweep": headless})
 
     assert routed({"id": "a", "labels": ["sweep"]})[1]["session"] == "headless"
     assert routed({"id": "b", "labels": ["other"]})[1]["session"] == "cli"
     assert routed({"id": "c", "labels": []})[1]["session"] == "cli"
     assert routed({"id": "d"})[1]["session"] == "cli"  # no labels key
+    assert routed.allocation_project_for({"labels": ["sweep"]}) == "headless-project"
+    assert routed.allocation_project_for({"labels": ["other"]}) == "default-project"
+
+
+def test_make_label_routed_spawn_routes_script_by_label():
+    from agent_dispatch.supervisor import make_label_routed_spawn
+
+    def default(_task):
+        return True, {"session": "headless", "worktree": None}
+
+    def script(_task):
+        return True, {"session": "script", "worktree": None}
+
+    script.allocation_interface = "script"
+    routed = make_label_routed_spawn(default, overrides={"maintenance": script})
+
+    assert routed({"labels": ["maintenance"]})[1]["session"] == "script"
+    assert routed.allocation_interface_for({"labels": ["maintenance"]}) == "script"
+    assert routed({"labels": ["other"]})[1]["session"] == "headless"
 
 
 def test_make_label_routed_spawn_no_overrides_returns_default_unwrapped():
@@ -999,6 +4318,130 @@ def test_cli_supervise_headless_is_default(monkeypatch, q, client):
     assert m._cmd_supervise(args) == 0
     assert set(headless_calls) == {a.id, b.id}  # both headless by default
     assert embody_calls == []
+
+
+def test_ordinary_headless_task_records_created_worktree_before_launch(
+    monkeypatch, q, client
+):
+    from agent_dispatch import embody
+
+    task = q.create("ordinary")
+    spawn = _ok_spawn({"session": "local-body:s1", "worktree": "wt-created"})
+    spawn.requires_reusable_worktree = True
+    spawn.allocation_interface = "acp"
+    spawn.allocation_project = "worker-harness"
+    prepared = {}
+
+    def prepare(*_args, **kwargs):
+        prepared.update(kwargs)
+        return {
+            "worktree": "wt-created",
+            "path": "/tmp/wt-created",
+            "created": True,
+            "replaced": False,
+            "ownership": "created",
+        }
+
+    monkeypatch.setattr(
+        embody,
+        "prepare_reusable_worktree",
+        prepare,
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        machine="host-a",
+    )
+
+    assert sup.poll_once() == [task.id]
+    reservation = q.latest_reservation(task.id)
+    assert reservation.worktree == "wt-created"
+    assert reservation.worktree_ownership == "created"
+    assert reservation.driver == "agent-dispatch"
+    assert reservation.creating_host == "host-a"
+    assert prepared["project"] == "worker-harness"
+
+
+def test_exclusive_spawn_records_precreated_worktree_before_launch(
+    monkeypatch, q, client
+):
+    from agent_dispatch import embody
+
+    task = q.create("review", exclusive_key="review:repo:42")
+    observed = {}
+
+    def spawn(spawn_task):
+        reservation = q.latest_reservation(task.id)
+        observed.update(task=spawn_task, reservation=reservation)
+        return True, {
+            "session": "local-body:session-new",
+            "worktree": spawn_task["spawn_worktree"],
+        }
+
+    spawn.requires_reusable_worktree = True
+    monkeypatch.setattr(
+        embody,
+        "prepare_reusable_worktree",
+        lambda _task, _reservation, **_kwargs: {
+            "worktree": "wt-precreated",
+            "path": "/tmp/wt-precreated",
+            "created": True,
+            "replaced": False,
+            "ownership": "created",
+        },
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        machine="host-a",
+    )
+
+    assert sup.poll_once() == [task.id]
+    assert observed["reservation"].state == SpawnState.RESERVING
+    assert observed["reservation"].worktree == "wt-precreated"
+    assert observed["task"]["spawn_worktree_path"] == "/tmp/wt-precreated"
+
+
+def test_created_worktree_bookkeeping_failure_retains_spawn_fence(
+    monkeypatch, q, client
+):
+    from agent_dispatch import embody
+
+    task = q.create("work")
+    spawn = _ok_spawn()
+    spawn.requires_reusable_worktree = True
+    monkeypatch.setattr(
+        embody,
+        "prepare_reusable_worktree",
+        lambda *_args, **_kwargs: {
+            "worktree": "wt-created",
+            "path": "/tmp/wt-created",
+            "created": True,
+            "replaced": False,
+            "ownership": "created",
+        },
+    )
+    monkeypatch.setattr(
+        client,
+        "record_spawn_worktree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            DispatchError(503, "coordinator unavailable")
+        ),
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        machine="host-a",
+    )
+
+    assert sup.poll_once() == []
+    assert spawn.calls == []
+    assert q.latest_reservation(task.id).state == SpawnState.RESERVING
 
 
 def test_cli_supervise_cli_label_opts_out(monkeypatch, q, client):
@@ -1083,6 +4526,112 @@ def test_cli_supervise_headless_label_routes(monkeypatch, q, client):
     assert marked.id not in embody_calls
 
 
+def test_cli_supervise_script_label_routes(monkeypatch, q, client):
+    import types
+
+    from agent_dispatch import __main__ as m
+    from agent_dispatch import supervisor as sup_mod
+
+    marked = q.create("maintenance work", labels=["maintenance"])
+    plain = q.create("sweep work")
+
+    headless_calls: list[str] = []
+    script_calls: list[str] = []
+
+    def headless_spawn(task):
+        headless_calls.append(task["id"])
+        return True, {"session": "headless", "worktree": None}
+
+    def script_spawn(task):
+        script_calls.append(task["id"])
+        return True, {"session": "script", "worktree": None}
+
+    monkeypatch.setattr(m, "_client", lambda _args, **_kw: client)
+    monkeypatch.setattr(m, "client_url", lambda: "http://coord")
+    monkeypatch.setattr(m, "_scope_repo", lambda _args: TEST_REPO)
+    monkeypatch.setattr(sup_mod, "make_headless_spawn", lambda **_kw: headless_spawn)
+    monkeypatch.setattr(sup_mod, "make_script_spawn", lambda **_kw: script_spawn)
+
+    args = types.SimpleNamespace(
+        all_repos=False, repo=None, url=None, token=None, label=None,
+        max_concurrent=5, verify_timeout=0, once=True, interval=30.0,
+        no_heartbeat=False, max_attempts=3,
+        embody_backend=None, headless_label=None, cli_label=None, script_label=["maintenance"],
+        headless_agent="task-worker",
+    )
+    assert m._cmd_supervise(args) == 0
+    assert script_calls == [marked.id]
+    assert plain.id in headless_calls
+
+
+def test_cli_supervise_script_backend_is_lane_default(monkeypatch, q, client):
+    import types
+
+    from agent_dispatch import __main__ as m
+    from agent_dispatch import supervisor as sup_mod
+
+    task = q.create("maintenance work")
+    script_calls: list[str] = []
+
+    def script_spawn(task):
+        script_calls.append(task["id"])
+        return True, {"session": "script", "worktree": None}
+
+    monkeypatch.setattr(m, "_client", lambda _args, **_kw: client)
+    monkeypatch.setattr(m, "client_url", lambda: "http://coord")
+    monkeypatch.setattr(m, "_scope_repo", lambda _args: TEST_REPO)
+    monkeypatch.setattr(sup_mod, "make_script_spawn", lambda **_kw: script_spawn)
+
+    args = types.SimpleNamespace(
+        all_repos=False, repo=None, url=None, token=None, label=None,
+        max_concurrent=5, verify_timeout=0, once=True, interval=30.0,
+        no_heartbeat=False, max_attempts=3,
+        embody_backend="script", headless_label=None, cli_label=None, script_label=None,
+        headless_agent="task-worker",
+    )
+    assert m._cmd_supervise(args) == 0
+    assert script_calls == [task.id]
+
+
+def test_cli_supervise_rejects_script_backend_in_pool_mode(monkeypatch, capsys):
+    import types
+
+    from agent_dispatch import __main__ as m
+
+    monkeypatch.setattr(m, "_scope_repo", lambda _args: TEST_REPO)
+
+    args = types.SimpleNamespace(
+        all_repos=False, repo=None, url=None, token=None, label=["maintenance"],
+        max_concurrent=5, verify_timeout=0, once=True, interval=30.0,
+        no_heartbeat=False, max_attempts=3,
+        pool="pool-a", origin="origin", headless=False,
+        embody_backend="script", headless_label=None, cli_label=None, script_label=None,
+        disposable_cli_label=None, headless_agent="task-worker", no_pair=False,
+    )
+    assert m._cmd_supervise(args) == 2
+    assert "script embodiment is supported only for local" in capsys.readouterr().err
+
+
+def test_cli_supervise_rejects_idle_nudge_exempt_label_not_watched(monkeypatch, capsys):
+    import types
+
+    from agent_dispatch import __main__ as m
+
+    monkeypatch.setattr(m, "_scope_repo", lambda _args: TEST_REPO)
+
+    args = types.SimpleNamespace(
+        all_repos=False, repo=None, url=None, token=None, label=["maintenance"],
+        max_concurrent=5, verify_timeout=0, once=True, interval=30.0,
+        no_heartbeat=False, max_attempts=3,
+        pool=None, origin=None, headless=False,
+        embody_backend="headless", headless_label=None, cli_label=None, script_label=None,
+        disposable_cli_label=None, idle_nudge_exempt_label=["other-label"],
+        headless_agent="task-worker", charter=None, no_pair=False,
+    )
+    assert m._cmd_supervise(args) == 2
+    assert "every --idle-nudge-exempt-label must also be watched" in capsys.readouterr().err
+
+
 def test_cli_supervise_pool_headless_builds_headless_fleet(monkeypatch, q, client):
     """--pool --headless constructs a headless FleetSpawner with the configured
     --headless-agent (the headless-fleet embodiment for a remote pool host)."""
@@ -1098,12 +4647,12 @@ def test_cli_supervise_pool_headless_builds_headless_fleet(monkeypatch, q, clien
     class FakeFleet:
         def __init__(
             self, pool, *, origin, headless=False, agent="task-worker",
-            all_repos=False, verify_timeout=0,
+            charter=None, all_repos=False, verify_timeout=0,
         ):
             self.pool = list(pool)
             captured.update(
                 pool=pool, origin=origin, headless=headless, agent=agent,
-                all_repos=all_repos,
+                charter=charter, all_repos=all_repos,
             )
 
         def __call__(self, task):
@@ -1135,8 +4684,2045 @@ def test_cli_supervise_pool_headless_builds_headless_fleet(monkeypatch, q, clien
     assert captured["origin"] == "mantis-counter"
 
 
+def test_hold_live_leases_heartbeats_live_script_body(q, client):
+    task = q.create("maintenance")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle='script-body:{"pid":4321,"start_token":"tok","worker_id":"script-1"}',
+        worktree=None,
+    )
+    q.claim_one("script-1", repo=TEST_REPO, task_id=task.id)
+    q.start(task.id, "script-1")
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        script_body_verdict_fn=lambda pid, token: tracking.LIVE,
+    )
+
+    assert sup.hold_live_leases() == 1
+
+
+def test_recover_gone_script_body_abandons_task_without_explicit_terminal_call(q, client, tmp_path):
+    task = q.create("maintenance")
+    reservation, _ = q.reserve_spawn(task.id)
+    task_file = tmp_path / "task-script.json"
+    task_file.write_text("{}", encoding="utf-8")
+    q.record_spawn(
+        reservation.key,
+        session_handle=(
+            '{"pid":4321,"start_token":"tok","task_file":"'
+            + str(task_file).replace("\\", "\\\\")
+            + '","worker_id":"script-1"}'
+        ).join(("script-body:", "")),
+        worktree=None,
+    )
+    q.claim_one("script-1", repo=TEST_REPO, task_id=task.id)
+    q.start(task.id, "script-1")
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        script_body_verdict_fn=lambda pid, token: tracking.GONE,
+    )
+
+    assert sup.recover_gone() == 1
+    assert q.get(task.id).status == Status.ABANDONED
+    assert q.latest_reservation(task.id).state == SpawnState.SETTLED
+    assert not task_file.exists()
+
+
+def test_reconcile_settles_terminal_script_body_and_cleans_task_file(q, client, tmp_path):
+    task = q.create("maintenance")
+    reservation, _ = q.reserve_spawn(task.id)
+    task_file = tmp_path / "task-terminal.json"
+    task_file.write_text("{}", encoding="utf-8")
+    handle = (
+        '{"pid":4321,"start_token":"tok","task_file":"'
+        + str(task_file).replace("\\", "\\\\")
+        + '","worker_id":"script-1"}'
+    ).join(("script-body:", ""))
+    q.record_spawn(reservation.key, session_handle=handle, worktree=None)
+    q.claim_one("script-1", repo=TEST_REPO, task_id=task.id)
+    q.start(task.id, "script-1")
+    q.complete(task.id, "script-1")
+
+    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO)
+
+    assert sup.reconcile() == 1
+    assert q.latest_reservation(task.id).state == SpawnState.SETTLED
+    assert not task_file.exists()
+
 
 # -- Slice 2: liveness-gated auto-recovery -----------------------------------
+
+
+@pytest.mark.parametrize("verdict", ["live", "unknown"])
+def test_superseded_task_does_not_release_exclusive_live_reservation(
+    q, client, verdict
+):
+    old = q.create("old", exclusive_key="review:repo:42")
+    reservation, _ = q.reserve_spawn(old.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-old",
+        worktree="wt-review",
+    )
+    new = q.create(
+        "new",
+        exclusive_key="review:repo:42",
+        supersede_exclusive_key=True,
+    )
+    ended = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        local_body_verdict_fn=lambda _sid: verdict,
+        local_end_fn=lambda sid: ended.append(sid) or False,
+        nudge=False,
+    )
+
+    assert q.get(old.id).status == Status.ABANDONED
+    assert sup.reconcile() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.SPAWNED
+    blocked, acquired = q.reserve_spawn(new.id)
+    assert acquired is False
+    assert blocked.key == reservation.key
+    assert ended == (["session-old"] if verdict == "live" else [])
+
+
+def test_confirmed_gone_superseded_body_releases_exclusive_key(q, client):
+    old = q.create("old", exclusive_key="review:repo:42")
+    reservation, _ = q.reserve_spawn(old.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-old",
+        worktree="wt-review",
+    )
+    new = q.create(
+        "new",
+        exclusive_key="review:repo:42",
+        supersede_exclusive_key=True,
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        local_body_verdict_fn=lambda _sid: "gone",
+        local_end_fn=lambda _sid: True,
+        nudge=False,
+    )
+
+    assert sup.reconcile() == 1
+    assert q.get_reservation(reservation.key).state == SpawnState.SETTLED
+    fresh, acquired = q.reserve_spawn(new.id)
+    assert acquired is True
+    assert fresh.worktree == "wt-review"
+
+
+def test_explicit_end_releases_live_exclusive_body(q, client):
+    task = q.create("work", exclusive_key="review:repo:42")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-live",
+        worktree="wt-review",
+    )
+    q.abandon(task.id, permitted=True, reason="superseded")
+    ended = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        local_body_verdict_fn=lambda _sid: "live",
+        local_end_fn=lambda sid: ended.append(sid) or True,
+        nudge=False,
+    )
+
+    assert sup.reconcile() == 1
+    assert ended == ["session-live"]
+    assert q.get_reservation(reservation.key).state == SpawnState.SETTLED
+
+
+@pytest.mark.parametrize("verdict", ["live", "unknown"])
+def test_yielded_fleet_body_is_not_replaced_before_safe_teardown(
+    q, client, verdict
+):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="fleet-body:worker-host:session-live",
+    )
+    q.claim_one("fleet-owner", task_id=task.id)
+    q.start(task.id, "fleet-owner")
+    q.yield_task(task.id, "fleet-owner")
+    ended = []
+    spawn = _ok_spawn()
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        fleet_verdict_fn=lambda _host, _sid: verdict,
+        fleet_end_fn=lambda host, sid: ended.append((host, sid)) or False,
+        nudge=False,
+    )
+
+    assert sup.poll_once() == []
+    assert spawn.calls == []
+    assert q.get_reservation(reservation.key).state == SpawnState.RELEASING
+    assert ended == (
+        [("worker-host", "session-live")] if verdict == "live" else []
+    )
+
+
+def test_yielded_fleet_body_respawns_only_after_explicit_end(q, client):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="fleet-body:worker-host:session-live",
+    )
+    q.claim_one("fleet-owner", task_id=task.id)
+    q.start(task.id, "fleet-owner")
+    q.yield_task(task.id, "fleet-owner")
+    ended = []
+    spawn = _ok_spawn()
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        fleet_verdict_fn=lambda _host, _sid: "live",
+        fleet_end_fn=lambda host, sid: ended.append((host, sid)) or True,
+        nudge=False,
+    )
+
+    assert sup.poll_once() == [task.id]
+    assert ended == [("worker-host", "session-live")]
+    assert spawn.calls == [task.id]
+    assert q.get_reservation(reservation.key).state == SpawnState.SETTLED
+    assert q.latest_reservation(task.id).attempt == 2
+
+
+def test_yielded_created_worktree_is_concluded_before_respawn(q, client):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-created",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:bridge-1",
+        worktree="wt-created",
+    )
+    q.claim_one("host-a/wt-created", task_id=task.id)
+    q.start(
+        task.id,
+        "host-a/wt-created",
+        owner_session_id="acp-session-1",
+    )
+    q.yield_task(task.id, "host-a/wt-created")
+    conclusions = []
+    spawn = _ok_spawn()
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        machine="host-a",
+        local_body_verdict_fn=lambda _sid: "gone",
+        local_acp_session_fn=lambda _sid: "acp-session-1",
+        local_end_fn=lambda _sid: True,
+        attempt_conclusion_fn=lambda *args: conclusions.append(args) or {
+            "action": "primed",
+            "reason": "managed-gc-candidate",
+        },
+        nudge=False,
+    )
+
+    assert sup.poll_once() == [task.id]
+    first = q.get_reservation(reservation.key)
+    assert first.state == SpawnState.SETTLED
+    assert first.conclusion_state == "complete"
+    assert conclusions == [
+        (
+            "wt-created",
+            "acp-session-1",
+            reservation.key,
+            "agent-dispatch",
+        )
+    ]
+    assert q.latest_reservation(task.id).attempt == 2
+
+
+def test_failed_attempt_cleanup_retries_after_body_release(q, client):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-created",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.request_spawn_release(
+        reservation.key,
+        detail="launch failed",
+        disposition="failed",
+    )
+    spawn = _ok_spawn()
+    first = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: "gone",
+        attempt_conclusion_fn=lambda *_args: {
+            "action": "failed",
+            "reason": "lifecycle lock busy",
+        },
+        nudge=False,
+    )
+
+    assert first.release_requested_bodies() == 1
+    pending = q.get_reservation(reservation.key)
+    assert pending.state == SpawnState.FAILED
+    assert pending.conclusion_state == "pending"
+    assert spawn.calls == []
+    replacement, acquired = q.reserve_spawn(task.id)
+    assert acquired is True
+    assert replacement.attempt == 2
+
+    second = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: "gone",
+        attempt_conclusion_fn=lambda *_args: {
+            "action": "primed",
+            "reason": "managed-gc-candidate",
+        },
+        nudge=False,
+    )
+
+    pending_detail = json.loads(
+        q.get_reservation(reservation.key).conclusion_detail or "{}"
+    )
+    worktree_next_attempt = pending_detail["worktree_cleanup"]["next_attempt_at"]
+    assert second.release_requested_bodies(
+        now=worktree_next_attempt - 0.1
+    ) == 0
+    assert q.get_reservation(reservation.key).conclusion_state == "pending"
+    assert second.release_requested_bodies(
+        now=worktree_next_attempt
+    ) == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.FAILED
+    assert q.get_reservation(reservation.key).conclusion_state == "complete"
+    assert replacement.worktree is None
+
+
+# -- unleased worktree-only retirement: no captured owner_session_id --------
+#
+# A RESERVING-stage spawn failure (worktree preparation failed before any
+# claim/session ever existed) leaves the task without an owner_session_id.
+# verdict_fn alone can never resolve this to "gone" (identity-keyed, by
+# design), so release_requested_bodies additionally cross-checks the local
+# agent-worktrees registry directly for this reservation's own recorded
+# worktree -- see supervisor.py's worktree_directory_present_fn.
+
+
+def test_retires_unleased_worktree_reservation_when_directory_confirmed_absent(
+    q, client
+):
+    from agent_dispatch import embody
+
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-gone",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.request_spawn_release(
+        reservation.key,
+        detail="worktree preparation failed",
+        disposition="failed",
+    )
+    assert q.get(task.id).owner is None  # never claimed -> no owner_session_id
+    probe_calls = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: "unknown",
+        worktree_directory_present_fn=lambda wt, project: probe_calls.append(
+            (wt, project)
+        ) or False,
+        attempt_conclusion_fn=lambda *_args: {
+            "action": "failed",
+            "reason": "lifecycle lock busy",
+        },
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 1
+    assert q.get_reservation(reservation.key).state == SpawnState.FAILED
+    # The project (derived from the task's repo, not the CWD) must be threaded
+    # through -- this daemon is CWD-neutral.
+    assert probe_calls == [("wt-gone", embody.project_for_task({"repo": TEST_REPO}))]
+
+
+def test_probes_the_spawn_fns_own_allocation_project_when_overridden(q, client):
+    # A routed/headless spawn_fn can select an allocation project different
+    # from plain embody.project_for_task(task) (e.g. via an
+    # `allocation_project_for` selector) -- the same one _prepare_spawn_task
+    # would have used to actually create this worktree. The absence probe
+    # must be scoped to THAT project, not silently re-derive a possibly
+    # different one, or it can query the wrong project's registry and
+    # wrongly retire a still-present worktree.
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-routed",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.request_spawn_release(
+        reservation.key,
+        detail="worktree preparation failed",
+        disposition="failed",
+    )
+    spawn = _ok_spawn()
+    spawn.allocation_project_for = lambda _task: "routed-project"
+    probe_calls = []
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: "unknown",
+        worktree_directory_present_fn=lambda wt, project: probe_calls.append(
+            (wt, project)
+        ) or False,
+        attempt_conclusion_fn=lambda *_args: {
+            "action": "failed",
+            "reason": "lifecycle lock busy",
+        },
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 1
+    assert probe_calls == [("wt-routed", "routed-project")]
+
+
+def test_allocation_project_resolution_failure_degrades_to_unknown(q, client):
+    # `_spawn_attribute` can invoke an I/O-backed `allocation_project_for`
+    # selector (the default headless one calls a strict registry lookup)
+    # that may raise when a backing registry is unavailable. That failure
+    # must degrade this reservation to unknown for this cycle -- never
+    # propagate out of release_requested_bodies and abort the whole polling
+    # pass over every other reservation.
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    other_task = q.create("other-work")
+    other_reservation, _ = q.reserve_spawn(other_task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-project-resolution-fails",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.record_spawn_worktree(
+        other_reservation.key,
+        "wt-other",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.request_spawn_release(
+        reservation.key,
+        detail="worktree preparation failed",
+        disposition="failed",
+    )
+    q.request_spawn_release(
+        other_reservation.key,
+        detail="worktree preparation failed",
+        disposition="failed",
+    )
+
+    def raising_project_selector(task_dict):
+        if task_dict.get("id") == task.id:
+            raise RuntimeError("bridge registry unavailable")
+        return "other-project"
+
+    spawn = _ok_spawn()
+    spawn.allocation_project_for = raising_project_selector
+    probed = []
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: "unknown",
+        worktree_directory_present_fn=lambda wt, project: probed.append(wt) or False,
+        attempt_conclusion_fn=lambda *_args: {
+            "action": "failed",
+            "reason": "lifecycle lock busy",
+        },
+        nudge=False,
+    )
+
+    # Both reservations get processed this cycle -- the raising selector for
+    # the first must not abort the loop before reaching the second.
+    assert sup.release_requested_bodies() == 1
+    assert q.get_reservation(reservation.key).state == SpawnState.RELEASING
+    assert q.get_reservation(other_reservation.key).state == SpawnState.FAILED
+    assert probed == ["wt-other"]
+
+
+def test_keeps_unleased_worktree_reservation_when_directory_still_present(
+    q, client
+):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-finalized-but-present",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.request_spawn_release(
+        reservation.key,
+        detail="worktree preparation failed",
+        disposition="failed",
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: "unknown",
+        worktree_directory_present_fn=lambda _wt, _project: True,
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.RELEASING
+
+
+def test_keeps_unleased_worktree_reservation_when_directory_probe_unresolved(
+    q, client
+):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-unresolved",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.request_spawn_release(
+        reservation.key,
+        detail="worktree preparation failed",
+        disposition="failed",
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: "unknown",
+        worktree_directory_present_fn=lambda _wt, _project: None,
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.RELEASING
+
+
+def test_does_not_confirm_absence_for_a_captured_owner_session(q, client):
+    # Once owner_session_id IS captured, this exception must not apply --
+    # verdict_fn's ordinary identity-keyed contract governs alone, exactly as
+    # before this change.
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-claimed",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.claim_one("host-a/wt-claimed", machine="host-a", worktree="wt-claimed",
+                task_id=task.id)
+    q.start(task.id, "host-a/wt-claimed", owner_session_id="S1")
+    q.request_spawn_release(
+        reservation.key,
+        detail="worktree preparation failed",
+        disposition="failed",
+    )
+
+    def forbidden(_wt, _project):
+        raise AssertionError(
+            "must not probe worktree_directory_present_fn once owner_session_id "
+            "is captured"
+        )
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: "unknown",
+        worktree_directory_present_fn=forbidden,
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.RELEASING
+
+
+def test_does_not_confirm_absence_for_a_remote_owner(q, client):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-remote",
+        ownership="created",
+        creating_host="peer-box",
+        driver="agent-dispatch",
+    )
+    q.request_spawn_release(
+        reservation.key,
+        detail="worktree preparation failed",
+        disposition="failed",
+    )
+    # Claim (but never start) the task under a remote-machine owner, leaving
+    # owner_session_id uncaptured -- the claim-before-registration race window
+    # -- while `_machine_from_owner` still resolves non-None from the stored
+    # "<machine>/<worktree>" owner string.
+    q.claim_one("peer-box/wt-remote", machine="peer-box", worktree="wt-remote",
+                task_id=task.id)
+
+    def forbidden(_wt, _project):
+        raise AssertionError(
+            "must not probe the local agent-worktrees registry for a remote owner"
+        )
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: "unknown",
+        worktree_directory_present_fn=forbidden,
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.RELEASING
+
+
+def test_does_not_confirm_absence_when_creating_host_is_a_different_machine(
+    q, client
+):
+    # The reviewer's exact scenario: the task is never claimed (owner is
+    # None, so `_machine_from_owner` alone can't gate this), but the
+    # reservation's worktree was created on a DIFFERENT host than this
+    # supervisor's own. A supervisor polling a shared cross-machine queue
+    # must not probe its own local registry for a worktree that in fact
+    # lives elsewhere.
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-on-other-host",
+        ownership="created",
+        creating_host="peer-box",
+        driver="agent-dispatch",
+    )
+    q.request_spawn_release(
+        reservation.key,
+        detail="worktree preparation failed",
+        disposition="failed",
+    )
+    assert q.get(task.id).owner is None
+
+    def forbidden(_wt, _project):
+        raise AssertionError(
+            "must not probe the local agent-worktrees registry for a "
+            "reservation created on a different host"
+        )
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: "unknown",
+        worktree_directory_present_fn=forbidden,
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.RELEASING
+
+
+def test_does_not_confirm_absence_for_a_spawned_body_with_a_session_handle(
+    q, client
+):
+    # The reviewer's exact scenario: a body was actually spawned (a raw
+    # CLI/mux session handle recorded -- not the "fleet-body:"/"local-body:"
+    # prefixes the branches above already special-case) but never claimed
+    # its task, so owner/owner_session_id are both still None, same as a
+    # pure RESERVING-stage failure. Unlike that case, a real body may still
+    # be alive under this handle; the worktree-directory-only shortcut must
+    # not bypass resolving it and wrongly retire a still-live reservation.
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-spawned-unclaimed",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.record_spawn(
+        reservation.key,
+        session_handle="cli-session-xyz",
+        worktree="wt-spawned-unclaimed",
+    )
+    assert q.get_reservation(reservation.key).state == SpawnState.SPAWNED
+    q.request_spawn_release(
+        reservation.key,
+        detail="yielded",
+        disposition="failed",
+    )
+    assert q.get(task.id).owner is None
+
+    def forbidden(_wt, _project):
+        raise AssertionError(
+            "must not probe the local agent-worktrees registry for a "
+            "reservation with a recorded session_handle"
+        )
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: "unknown",
+        worktree_directory_present_fn=forbidden,
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.RELEASING
+
+
+    # claim_one accepts arbitrary worker IDs (e.g. "worker-1", no
+    # "<machine>/<worktree>" separator) -- `_machine_from_owner` on such a
+    # string returns None just like an actually-unset owner, so the gate must
+    # check `task.get("owner") is None` explicitly rather than relying on
+    # that parse result alone.
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-malformed-owner",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.claim_one("worker-1", task_id=task.id)
+    assert q.get(task.id).owner == "worker-1"
+    q.request_spawn_release(
+        reservation.key,
+        detail="worktree preparation failed",
+        disposition="failed",
+    )
+
+    def forbidden(_wt, _project):
+        raise AssertionError(
+            "must not probe the local agent-worktrees registry for a claimed "
+            "(even if malformed-owner) task"
+        )
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: "unknown",
+        worktree_directory_present_fn=forbidden,
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.RELEASING
+
+
+def test_confirms_absence_with_case_insensitive_creating_host_match(q, client):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-mixed-case-host",
+        ownership="created",
+        creating_host="Host-A",
+        driver="agent-dispatch",
+    )
+    q.request_spawn_release(
+        reservation.key,
+        detail="worktree preparation failed",
+        disposition="failed",
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: "unknown",
+        worktree_directory_present_fn=lambda _wt, _project: False,
+        attempt_conclusion_fn=lambda *_args: {
+            "action": "failed",
+            "reason": "lifecycle lock busy",
+        },
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 1
+    assert q.get_reservation(reservation.key).state == SpawnState.FAILED
+
+
+def test_held_attempt_cleanup_remains_visible_without_fencing_replacement(
+    q, client
+):
+    task = q.create("work", exclusive_key="stable:resource")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-created",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.request_spawn_release(
+        reservation.key,
+        detail="launch failed",
+        disposition="failed",
+    )
+    conclusions = []
+    spawn = _ok_spawn()
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: "gone",
+        attempt_conclusion_fn=lambda *args: conclusions.append(args) or {
+            "action": "preserved",
+            "reason": "dirty-worktree",
+        },
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 1
+    held = q.get_reservation(reservation.key)
+    assert held.state == SpawnState.FAILED
+    assert held.conclusion_state == "held"
+    assert "dirty-worktree" in (held.conclusion_detail or "")
+    assert len(conclusions) == 1
+    assert spawn.calls == []
+
+    replacement_task = q.create(
+        "replacement",
+        exclusive_key="stable:resource",
+    )
+    replacement, acquired = q.reserve_spawn(replacement_task.id)
+    assert acquired is True
+    assert replacement.exclusive_key == "stable:resource"
+    assert replacement.worktree == "wt-created"
+    assert replacement.session_handle is None
+    assert replacement.attempt == 1
+
+    assert sup.release_requested_bodies() == 0
+    assert len(conclusions) == 1
+    assert q.get_reservation(reservation.key).state == SpawnState.FAILED
+    assert spawn.calls == []
+
+
+def test_pending_cleanup_fences_successor_before_claim(q, client):
+    old = q.create("old", exclusive_key="stable:resource")
+    old_reservation, _ = q.reserve_spawn(old.id)
+    q.record_spawn_worktree(
+        old_reservation.key,
+        "wt-shared",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.request_spawn_release(
+        old_reservation.key,
+        disposition="failed",
+    )
+    q.retire_spawn(
+        old_reservation.key,
+        exact_absence=True,
+        conclusion_state="pending",
+        conclusion_detail='{"action":"failed","reason":"lifecycle-lock-busy"}',
+    )
+    successor = q.create("successor", exclusive_key="stable:resource")
+    successor_reservation, acquired = q.reserve_spawn(successor.id)
+    assert acquired is True
+    assert successor_reservation.state == SpawnState.RESERVING
+    assert successor_reservation.worktree is None
+    conclusions = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        attempt_conclusion_fn=lambda *args: conclusions.append(args) or {
+            "action": "removed",
+            "reason": "must-not-run",
+        },
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 0
+    complete = q.get_reservation(old_reservation.key)
+    assert complete.state == SpawnState.FAILED
+    assert complete.conclusion_state == "complete"
+    assert conclusions
+    assert q.get_reservation(successor_reservation.key).state == SpawnState.RESERVING
+
+
+def test_terminal_cleanup_retry_does_not_touch_reserving_successor(q, client):
+    old = q.create(
+        "old",
+        labels=["review"],
+        exclusive_key="stable:resource",
+    )
+    old_reservation, _ = q.reserve_spawn(old.id)
+    q.record_spawn(
+        old_reservation.key,
+        session_handle="session-old",
+        worktree="wt-shared",
+    )
+    q.claim_one("worker-old", task_id=old.id)
+    q.start(old.id, "worker-old")
+    q.complete(old.id, "worker-old", result_ref="result/old")
+    q.settle_spawn(
+        old_reservation.key,
+        conclusion_state="pending",
+        conclusion_detail='{"action":"failed","reason":"lifecycle-lock-busy"}',
+    )
+    successor = q.create("successor", exclusive_key="stable:resource")
+    successor_reservation, acquired = q.reserve_spawn(successor.id)
+    assert acquired is True
+    assert successor_reservation.worktree is None
+    conclusions = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        disposable_cli_labels=["review"],
+        conclusion_fn=lambda *args: conclusions.append(args) or {
+            "action": "removed",
+            "reason": "must-not-run",
+        },
+        nudge=False,
+    )
+
+    assert sup.reconcile() == 0
+    complete = q.get_reservation(old_reservation.key)
+    assert complete.conclusion_state == "complete"
+    assert conclusions
+
+
+def test_cleanup_retry_does_not_touch_settled_successor_worktree(q, client):
+    old = q.create("old", exclusive_key="stable:resource")
+    old_reservation, _ = q.reserve_spawn(old.id)
+    q.record_spawn_worktree(
+        old_reservation.key,
+        "wt-shared",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.request_spawn_release(old_reservation.key, disposition="failed")
+    q.retire_spawn(
+        old_reservation.key,
+        exact_absence=True,
+        conclusion_state="pending",
+        conclusion_detail='{"action":"failed","reason":"lifecycle-lock-busy"}',
+    )
+    successor = q.create("successor", exclusive_key="stable:resource")
+    successor_reservation, acquired = q.reserve_spawn(successor.id)
+    assert acquired is True
+    with q._connect() as conn:
+        conn.execute(
+            "UPDATE spawn_reservations SET worktree = ?, "
+            "inherited_worktree = ? WHERE key = ?",
+            ("wt-shared", "wt-shared", successor_reservation.key),
+        )
+    q.settle_spawn(successor_reservation.key)
+    conclusions = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        attempt_conclusion_fn=lambda *args: conclusions.append(args) or {
+            "action": "removed",
+            "reason": "must-not-run",
+        },
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 0
+    held = q.get_reservation(old_reservation.key)
+    assert held.conclusion_state == "held"
+    held_detail = json.loads(held.conclusion_detail or "{}")
+    assert held_detail["reason"] == "worktree-carried-by-newer-reservation"
+    assert held_detail["blocking_reservation_key"] == successor_reservation.key
+    assert conclusions == []
+
+
+def test_cleanup_retry_tracks_successor_inherited_worktree_after_replacement(
+    q, client
+):
+    old = q.create("old", exclusive_key="stable:resource")
+    old_reservation, _ = q.reserve_spawn(old.id)
+    q.record_spawn_worktree(
+        old_reservation.key,
+        "wt-shared",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.request_spawn_release(old_reservation.key, disposition="failed")
+    q.retire_spawn(
+        old_reservation.key,
+        exact_absence=True,
+        conclusion_state="pending",
+        conclusion_detail='{"action":"failed","reason":"lifecycle-lock-busy"}',
+    )
+    successor = q.create("successor", exclusive_key="stable:resource")
+    successor_reservation, acquired = q.reserve_spawn(successor.id)
+    assert acquired is True
+    with q._connect() as conn:
+        conn.execute(
+            "UPDATE spawn_reservations SET worktree = ?, "
+            "inherited_worktree = ? WHERE key = ?",
+            ("wt-shared", "wt-shared", successor_reservation.key),
+        )
+    q.record_spawn_worktree(
+        successor_reservation.key,
+        "wt-replacement",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    assert q.get_reservation(successor_reservation.key).worktree == (
+        "wt-replacement"
+    )
+    conclusions = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        attempt_conclusion_fn=lambda *args: conclusions.append(args) or {
+            "action": "removed",
+            "reason": "must-not-run",
+        },
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 0
+    held = q.get_reservation(old_reservation.key)
+    assert held.conclusion_state == "held"
+    assert conclusions == []
+
+
+def test_unknown_release_liveness_keeps_exclusive_key_fenced(q, client):
+    task = q.create("work", exclusive_key="stable:resource")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-unknown",
+        worktree="wt-review",
+    )
+    q.request_spawn_release(
+        reservation.key,
+        disposition="settled",
+    )
+    replacement_task = q.create(
+        "replacement",
+        exclusive_key="stable:resource",
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        local_body_verdict_fn=lambda _sid: tracking.UNKNOWN,
+        local_end_fn=lambda _sid: pytest.fail(
+            "unknown liveness must not issue teardown"
+        ),
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 0
+    blocked, acquired = q.reserve_spawn(replacement_task.id)
+    assert acquired is False
+    assert blocked.key == reservation.key
+    assert blocked.state == SpawnState.RELEASING
+
+
+def test_absent_local_release_calls_idempotent_end(q, client):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-stopped",
+    )
+    q.request_spawn_release(
+        reservation.key,
+        disposition="settled",
+    )
+    ended = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        local_body_verdict_fn=lambda _sid: tracking.GONE,
+        local_end_fn=lambda sid: ended.append(sid) or True,
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 1
+    assert ended == ["session-stopped"]
+    complete = q.get_reservation(reservation.key)
+    assert complete.state == SpawnState.SETTLED
+    assert complete.conclusion_state == "complete"
+    assert complete.cleanup_claim_token
+
+
+def test_retired_pending_without_worktree_claims_before_completion(q, client):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.request_spawn_release(reservation.key, disposition="failed")
+    q.retire_spawn(
+        reservation.key,
+        exact_absence=True,
+        conclusion_state="pending",
+        conclusion_detail='{"action":"failed","reason":"legacy-cleanup"}',
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 0
+    complete = q.get_reservation(reservation.key)
+    assert complete.state == SpawnState.FAILED
+    assert complete.conclusion_state == "complete"
+    assert complete.cleanup_claim_token
+    assert "reservation-has-no-worktree" in (
+        complete.conclusion_detail or ""
+    )
+
+
+def test_failed_absent_session_end_retries_after_exclusive_release(q, client):
+    task = q.create("work", exclusive_key="stable:resource")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-shared",
+        ownership="targeted",
+    )
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-stopped",
+        worktree="wt-shared",
+    )
+    q.request_spawn_release(
+        reservation.key,
+        disposition="settled",
+    )
+    end_results = iter([False, True])
+    ended = []
+
+    def end_session(session_id):
+        ended.append(session_id)
+        return next(end_results)
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        local_body_verdict_fn=lambda _sid: tracking.GONE,
+        local_end_fn=end_session,
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 1
+    pending = q.get_reservation(reservation.key)
+    assert pending.state == SpawnState.SETTLED
+    assert pending.conclusion_state == "pending"
+    pending_detail = json.loads(pending.conclusion_detail or "{}")
+    assert pending_detail["reason"] == "retired-body-cleanup"
+    assert pending_detail["session_end"]["state"] == "pending"
+    assert pending_detail["session_end"]["session_id"] == "session-stopped"
+    assert pending_detail["session_end"]["attempts"] == 1
+    assert pending_detail["worktree_cleanup"]["state"] == "complete"
+
+    replacement_task = q.create(
+        "replacement",
+        exclusive_key="stable:resource",
+    )
+    replacement, acquired = q.reserve_spawn(replacement_task.id)
+    assert acquired is True
+    assert replacement.worktree is None
+    assert replacement.session_handle is None
+
+    session_next_attempt = pending_detail["session_end"]["next_attempt_at"]
+    assert sup.release_requested_bodies(
+        now=session_next_attempt - 0.1
+    ) == 0
+    assert ended == ["session-stopped"]
+    assert sup.release_requested_bodies(
+        now=session_next_attempt
+    ) == 0
+    complete = q.get_reservation(reservation.key)
+    assert complete.conclusion_state == "complete"
+    assert ended == ["session-stopped", "session-stopped"]
+    assert q.get_reservation(replacement.key).state == SpawnState.RESERVING
+
+
+def test_retired_session_end_failure_backs_off_and_becomes_held(q, client):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-stopped",
+    )
+    q.request_spawn_release(reservation.key, disposition="settled")
+    ended = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        local_body_verdict_fn=lambda _sid: tracking.GONE,
+        local_end_fn=lambda sid: ended.append(sid) or False,
+        nudge=False,
+    )
+
+    now = 1000.0
+    assert sup.release_requested_bodies(now=now) == 1
+    while True:
+        current = q.get_reservation(reservation.key)
+        payload = json.loads(current.conclusion_detail or "{}")
+        session = payload["session_end"]
+        attempts = session["attempts"]
+        assert attempts == len(ended)
+        if current.conclusion_state == "held":
+            assert attempts == supervisor_module._CONCLUSION_MAX_ATTEMPTS
+            assert payload["session_end"]["state"] == "held"
+            break
+        assert current.conclusion_state == "pending"
+        next_attempt_at = session["next_attempt_at"]
+        assert sup.release_requested_bodies(
+            now=next_attempt_at - 0.1
+        ) == 0
+        assert len(ended) == attempts
+        now = next_attempt_at
+        assert sup.release_requested_bodies(now=now) == 0
+
+
+def test_failing_session_end_allows_worktree_cleanup_immediately(q, client):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-created",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-stopped",
+        worktree="wt-created",
+    )
+    q.request_spawn_release(reservation.key, disposition="failed")
+    ended = []
+    conclusions = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        local_body_verdict_fn=lambda _sid: tracking.GONE,
+        local_end_fn=lambda sid: ended.append(sid) or False,
+        attempt_conclusion_fn=lambda *args: conclusions.append(args) or {
+            "action": "removed",
+            "reason": "managed-gc-removed",
+        },
+        nudge=False,
+    )
+
+    now = 3000.0
+    assert sup.release_requested_bodies(now=now) == 1
+    first = q.get_reservation(reservation.key)
+    first_envelope = json.loads(first.conclusion_detail or "{}")
+    assert conclusions
+    assert first.conclusion_state == "pending"
+    assert first_envelope["session_end"]["state"] == "pending"
+    assert first_envelope["worktree_cleanup"]["state"] == "complete"
+    while len(ended) < supervisor_module._CONCLUSION_MAX_ATTEMPTS:
+        current = q.get_reservation(reservation.key)
+        payload = json.loads(current.conclusion_detail or "{}")
+        now = payload["session_end"]["next_attempt_at"]
+        assert sup.release_requested_bodies(now=now) == 0
+
+    pending = q.get_reservation(reservation.key)
+    envelope = json.loads(pending.conclusion_detail or "{}")
+    assert pending.conclusion_state == "held"
+    assert envelope["session_end"]["state"] == "held"
+    assert envelope["worktree_cleanup"]["state"] == "complete"
+    assert len(conclusions) == 1
+
+
+def test_due_session_cleanup_runs_while_worktree_cleanup_is_backed_off(
+    q, client
+):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-created",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-stopped",
+        worktree="wt-created",
+    )
+    q.request_spawn_release(reservation.key, disposition="failed")
+    q.retire_spawn(
+        reservation.key,
+        exact_absence=True,
+        conclusion_state="pending",
+        conclusion_detail=json.dumps(
+            {
+                "action": "pending",
+                "reason": "retired-body-cleanup",
+                "cleanup_kind": "attempt",
+                "session_end": {
+                    "state": "pending",
+                    "session_id": "session-stopped",
+                    "attempts": 0,
+                    "next_attempt_at": 0,
+                },
+                "worktree_cleanup": {
+                    "state": "pending",
+                    "attempts": 1,
+                    "next_attempt_at": 5000,
+                },
+            }
+        ),
+    )
+    ended = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        local_end_fn=lambda sid: ended.append(sid) or True,
+        attempt_conclusion_fn=lambda *_args: pytest.fail(
+            "backed-off worktree cleanup must not run"
+        ),
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies(now=4000) == 0
+    pending = q.get_reservation(reservation.key)
+    envelope = json.loads(pending.conclusion_detail or "{}")
+    assert ended == ["session-stopped"]
+    assert pending.conclusion_state == "pending"
+    assert envelope["session_end"]["state"] == "complete"
+    assert envelope["worktree_cleanup"]["state"] == "pending"
+    assert envelope["worktree_cleanup"]["next_attempt_at"] == 5000
+
+
+def test_retired_worktree_cleanup_failure_backs_off_and_becomes_held(q, client):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-created",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.record_spawn(
+        reservation.key,
+        session_handle="session-gone",
+        worktree="wt-created",
+    )
+    q.request_spawn_release(reservation.key, disposition="failed")
+    conclusions = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: tracking.GONE,
+        attempt_conclusion_fn=lambda *args: conclusions.append(args) or {
+            "action": "failed",
+            "reason": "lifecycle-lock-busy",
+        },
+        nudge=False,
+    )
+
+    now = 2000.0
+    assert sup.release_requested_bodies(now=now) == 1
+    while True:
+        current = q.get_reservation(reservation.key)
+        payload = json.loads(current.conclusion_detail or "{}")
+        worktree = payload["worktree_cleanup"]
+        attempts = worktree["attempts"]
+        assert attempts == len(conclusions)
+        if current.conclusion_state == "held":
+            assert attempts == supervisor_module._CONCLUSION_MAX_ATTEMPTS
+            break
+        assert current.conclusion_state == "pending"
+        next_attempt_at = worktree["next_attempt_at"]
+        assert sup.release_requested_bodies(
+            now=next_attempt_at - 0.1
+        ) == 0
+        assert len(conclusions) == attempts
+        now = next_attempt_at
+        assert sup.release_requested_bodies(now=now) == 0
+
+
+def test_gone_body_retires_before_session_cleanup_uses_capacity(q, client):
+    task = q.create("work", exclusive_key="stable:resource")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-stopped",
+        worktree="wt-shared",
+    )
+    q.request_spawn_release(reservation.key, disposition="failed")
+    replacement_task = q.create(
+        "replacement",
+        exclusive_key="stable:resource",
+    )
+    replacement_keys = []
+
+    def interrupted_end(_session_id):
+        retired = q.get_reservation(reservation.key)
+        assert retired.state == SpawnState.FAILED
+        replacement, acquired = q.reserve_spawn(replacement_task.id)
+        assert acquired is True
+        replacement_keys.append(replacement.key)
+        return False
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        local_body_verdict_fn=lambda _sid: tracking.GONE,
+        local_end_fn=interrupted_end,
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 1
+    pending = q.get_reservation(reservation.key)
+    assert pending.state == SpawnState.FAILED
+    assert pending.conclusion_state == "pending"
+    assert replacement_keys
+
+
+def test_gone_body_retires_before_worktree_cleanup(q, client):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-created",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-stopped",
+        worktree="wt-created",
+    )
+    q.request_spawn_release(reservation.key, disposition="failed")
+    conclusions = []
+
+    def conclude(*args):
+        retired = q.get_reservation(reservation.key)
+        assert retired.state == SpawnState.FAILED
+        conclusions.append(args)
+        return {"action": "removed", "reason": "managed-gc-removed"}
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        local_body_verdict_fn=lambda _sid: tracking.GONE,
+        local_end_fn=lambda _sid: True,
+        attempt_conclusion_fn=conclude,
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 1
+    assert conclusions
+    complete = q.get_reservation(reservation.key)
+    assert complete.state == SpawnState.FAILED
+    assert complete.conclusion_state == "complete"
+
+
+def test_gone_fleet_body_retires_before_worktree_cleanup(q, client):
+    task = q.create("work", exclusive_key="stable:fleet")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-fleet",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.record_spawn(
+        reservation.key,
+        session_handle="fleet-body:host-b:session-gone",
+        worktree="wt-fleet",
+    )
+    q.request_spawn_release(reservation.key, disposition="failed")
+    conclusions = []
+
+    def conclude(*args):
+        assert q.get_reservation(reservation.key).state == SpawnState.FAILED
+        conclusions.append(args)
+        return {"action": "removed", "reason": "managed-gc-removed"}
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        fleet_verdict_fn=lambda _host, _sid: tracking.GONE,
+        fleet_end_fn=lambda *_args: pytest.fail(
+            "confirmed-gone fleet cleanup starts after retirement"
+        ),
+        attempt_conclusion_fn=conclude,
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 1
+    assert conclusions
+    complete = q.get_reservation(reservation.key)
+    assert complete.state == SpawnState.FAILED
+    assert complete.conclusion_state == "complete"
+
+
+def test_gone_worktree_body_retires_before_cleanup(q, client):
+    task = q.create("work", exclusive_key="stable:worktree")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-gone",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.record_spawn(
+        reservation.key,
+        session_handle="session-gone",
+        worktree="wt-gone",
+    )
+    q.request_spawn_release(reservation.key, disposition="failed")
+    conclusions = []
+
+    def conclude(*args):
+        assert q.get_reservation(reservation.key).state == SpawnState.FAILED
+        conclusions.append(args)
+        return {"action": "removed", "reason": "managed-gc-removed"}
+
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        verdict_fn=lambda *_args: tracking.GONE,
+        attempt_conclusion_fn=conclude,
+        nudge=False,
+    )
+
+    assert sup.release_requested_bodies() == 1
+    assert conclusions
+    complete = q.get_reservation(reservation.key)
+    assert complete.state == SpawnState.FAILED
+    assert complete.conclusion_state == "complete"
+
+
+def test_terminal_created_worktree_uses_attempt_cleanup_without_label(
+    q, client
+):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(
+        reservation.key,
+        "wt-created",
+        ownership="created",
+        creating_host="host-a",
+        driver="agent-dispatch",
+    )
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:bridge-1",
+        worktree="wt-created",
+    )
+    q.claim_one("host-a/wt-created", task_id=task.id)
+    q.start(
+        task.id,
+        "host-a/wt-created",
+        owner_session_id="acp-session-1",
+    )
+    q.complete(task.id, "host-a/wt-created")
+    conclusions = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        machine="host-a",
+        local_body_verdict_fn=lambda _sid: "gone",
+        local_acp_session_fn=lambda _sid: "acp-session-1",
+        local_end_fn=lambda _sid: True,
+        attempt_conclusion_fn=lambda *args: conclusions.append(args) or {
+            "action": "primed",
+            "reason": "managed-gc-candidate",
+        },
+        nudge=False,
+    )
+
+    assert sup.poll_once() == []
+    settled = q.get_reservation(reservation.key)
+    assert settled.state == SpawnState.SETTLED
+    assert settled.conclusion_state == "complete"
+    assert conclusions
+
+
+def test_yielded_targeted_worktree_is_preserved_without_conclusion(q, client):
+    task = q.create("work", affinity={"worktree": "wt-target"})
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:bridge-1",
+        worktree="wt-target",
+    )
+    q.claim_one("host-a/wt-target", task_id=task.id)
+    q.start(task.id, "host-a/wt-target")
+    q.yield_task(task.id, "host-a/wt-target")
+    spawn = _ok_spawn()
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        machine="host-a",
+        local_body_verdict_fn=lambda _sid: "gone",
+        local_end_fn=lambda _sid: True,
+        attempt_conclusion_fn=lambda *_args: pytest.fail(
+            "targeted worktree must never be concluded as dispatch-owned"
+        ),
+        nudge=False,
+    )
+
+    assert sup.poll_once() == [task.id]
+    settled = q.get_reservation(reservation.key)
+    assert settled.state == SpawnState.SETTLED
+    assert settled.conclusion_state == "complete"
+    assert "targeted-worktree" in (settled.conclusion_detail or "")
+
+
+def test_yielded_cli_worker_is_not_redriven_while_release_is_pending(
+    q, client
+):
+    task = q.create("work")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="session-live",
+        worktree="wt-live",
+    )
+    q.claim_one("host/wt-live", task_id=task.id)
+    q.start(task.id, "host/wt-live")
+    q.yield_task(task.id, "host/wt-live", exclude="worktree:wt-live")
+    redriven = []
+    spawn = _ok_spawn()
+    sup = Supervisor(
+        client,
+        spawn_fn=spawn,
+        repo=TEST_REPO,
+        max_concurrent=5,
+        verdict_fn=lambda *_args: "live",
+        liveness_fn=lambda worktree, _machine: {
+            "session_id": "session-live",
+            "worktree_id": worktree,
+        },
+        redrive_fn=lambda *args: redriven.append(args) or True,
+        nudge=False,
+    )
+
+    assert sup.poll_once() == []
+    assert redriven == []
+    assert spawn.calls == []
+    active = q.get_reservation(reservation.key)
+    assert active.state == SpawnState.RELEASING
+    assert active.release_requested is True
+
+
+def test_completed_idle_exclusive_body_is_carried_to_next_episode(q, client):
+    task = q.create("old", exclusive_key="review:repo:42")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="local-body:session-idle",
+        worktree="wt-review",
+    )
+    q.claim_one("headless-owner", task_id=task.id)
+    q.start(task.id, "headless-owner")
+    q.complete(task.id, "headless-owner", result_ref="result/1")
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        local_body_verdict_fn=lambda _sid: "live",
+        local_body_activity_fn=lambda _sid: "IDLE",
+        local_end_fn=lambda _sid: pytest.fail(
+            "idle completed session should remain reusable"
+        ),
+        nudge=False,
+    )
+
+    assert sup.reconcile() == 1
+    next_task = q.create("new", exclusive_key="review:repo:42")
+    carried, acquired = q.reserve_spawn(next_task.id)
+    assert acquired is True
+    assert carried.worktree == "wt-review"
+    assert carried.session_handle == "local-body:session-idle"
+
+
+def test_completed_live_exclusive_fleet_body_is_ended_before_release(
+    q, client
+):
+    task = q.create("old", exclusive_key="review:repo:42")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn(
+        reservation.key,
+        session_handle="fleet-body:worker-host:session-live",
+    )
+    q.claim_one("fleet-owner", task_id=task.id)
+    q.start(task.id, "fleet-owner")
+    q.complete(task.id, "fleet-owner", result_ref="result/1")
+    ended = []
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        fleet_verdict_fn=lambda _host, _sid: "live",
+        fleet_activity_fn=lambda _host, _sid: "IDLE",
+        fleet_end_fn=lambda host, sid: ended.append((host, sid)) or True,
+        nudge=False,
+    )
+
+    assert sup.reconcile() == 1
+    assert ended == [("worker-host", "session-live")]
+    assert q.get_reservation(reservation.key).state == SpawnState.SETTLED
+
+
+@pytest.mark.parametrize(
+    ("verdict", "expected_state"),
+    [
+        ("gone", SpawnState.FAILED),
+        ("unknown", SpawnState.RESERVING),
+    ],
+)
+def test_reconcile_reserving_fails_only_confirmed_gone_worktree(
+    q, client, verdict, expected_state
+):
+    task = q.create("work", exclusive_key="resource:42")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(reservation.key, "wt-precreated")
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        verdict_fn=lambda *_args: verdict,
+        nudge=False,
+    )
+
+    expected_count = 1 if verdict == "gone" else 0
+    assert sup.reconcile_reserving() == expected_count
+    assert q.get_reservation(reservation.key).state == expected_state
+
+
+def test_reconcile_reserving_adopts_confirmed_live_worktree(q, client):
+    task = q.create("work", exclusive_key="resource:42")
+    reservation, _ = q.reserve_spawn(task.id)
+    q.record_spawn_worktree(reservation.key, "wt-precreated")
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        verdict_fn=lambda *_args: "live",
+        liveness_fn=lambda worktree, _machine: {
+            "session_id": "session-live",
+            "worktree_id": worktree,
+        },
+        nudge=False,
+    )
+
+    assert sup.reconcile_reserving() == 1
+    adopted = q.get_reservation(reservation.key)
+    assert adopted.state == SpawnState.SPAWNED
+    assert adopted.session_handle == "session-live"
+    assert adopted.worktree == "wt-precreated"
+
+
+def test_reconcile_reserving_rearms_idle_carried_local_session(q, client):
+    prior_task = q.create("old", exclusive_key="resource:42")
+    prior, _ = q.reserve_spawn(prior_task.id)
+    q.record_spawn(
+        prior.key,
+        session_handle="local-body:session-idle",
+        worktree="wt-review",
+    )
+    q.settle_spawn(prior.key)
+    task = q.create("new", exclusive_key="resource:42")
+    reservation, _ = q.reserve_spawn(task.id)
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        local_body_verdict_fn=lambda _sid: "live",
+        local_body_activity_fn=lambda _sid: "IDLE",
+        nudge=False,
+    )
+
+    assert sup.reconcile_reserving() == 1
+    assert q.get_reservation(reservation.key).state == SpawnState.FAILED
+    fresh, acquired = q.reserve_spawn(task.id)
+    assert acquired is True
+    assert fresh.worktree == "wt-review"
+    assert fresh.session_handle == "local-body:session-idle"
+
+
+def test_reconcile_recent_reserving_without_durable_handle_stays_reserved(q, client):
+    task = q.create("ordinary")
+    reservation, _ = q.reserve_spawn(task.id, reserved_by="supervisor-test")
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        supervisor_id="supervisor-test",
+        verdict_fn=lambda *_args: pytest.fail(
+            "unbound reservation cannot be classified"
+        ),
+        nudge=False,
+    )
+
+    assert sup.reconcile_reserving() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.RESERVING
+
+
+def test_reconcile_stale_own_reserving_without_durable_handle_fails(q, client):
+    task = q.create("ordinary")
+    reservation, _ = q.reserve_spawn(
+        task.id,
+        reserved_by="supervisor-test",
+        now=time.time() - 601,
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        supervisor_id="supervisor-test",
+        reserving_timeout=600,
+        nudge=False,
+    )
+
+    assert sup.reconcile_reserving() == 1
+    failed = q.get_reservation(reservation.key)
+    assert failed.state == SpawnState.FAILED
+    assert "no durable handle" in failed.detail
+
+
+def test_reconcile_stale_foreign_reserving_without_durable_handle_stays_reserved(
+    q, client
+):
+    task = q.create("ordinary")
+    reservation, _ = q.reserve_spawn(
+        task.id,
+        reserved_by="supervisor-other",
+        now=time.time() - 601,
+    )
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        supervisor_id="supervisor-test",
+        reserving_timeout=600,
+        nudge=False,
+    )
+
+    assert sup.reconcile_reserving() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.RESERVING
+
+
+def test_reconcile_stale_handleless_reservation_is_idempotent(q, client):
+    task = q.create("ordinary")
+    reservation, _ = q.reserve_spawn(
+        task.id,
+        reserved_by="supervisor-test",
+        now=time.time() - 601,
+    )
+    first = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        supervisor_id="supervisor-test",
+        reserving_timeout=600,
+        nudge=False,
+    )
+    second = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        supervisor_id="supervisor-test",
+        reserving_timeout=600,
+        nudge=False,
+    )
+
+    assert first.reconcile_reserving() == 1
+    assert second.reconcile_reserving() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.FAILED
+
+
+def test_reconcile_stale_own_reserving_worktree_with_no_session_fails(
+    q, client
+):
+    """Regression for a confirmed field incident: a stale, sessionless
+    worktree reservation with a live-owner verdict.
+
+    A reservation whose owner is confirmed LIVE (``verdict_fn`` returns
+    ``live``) but whose worktree never actually produces a session (the
+    embody/spawn call silently failed or hung) previously had no timeout at
+    all in this branch -- unlike the handle-less case above, it could sit
+    in ``reserving`` forever. It now shares the same ``reserving_timeout``
+    bound.
+    """
+    task = q.create("ordinary")
+    reservation, _ = q.reserve_spawn(
+        task.id,
+        reserved_by="supervisor-test",
+        now=time.time() - 601,
+    )
+    q.record_spawn_worktree(reservation.key, "wt-precreated")
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        supervisor_id="supervisor-test",
+        verdict_fn=lambda *_args: "live",
+        liveness_fn=lambda _worktree, _machine: None,
+        reserving_timeout=600,
+        nudge=False,
+    )
+
+    assert sup.reconcile_reserving() == 1
+    failed = q.get_reservation(reservation.key)
+    assert failed.state == SpawnState.FAILED
+    assert "no session" in failed.detail
+    # A fresh attempt is immediately eligible.
+    fresh, acquired = q.reserve_spawn(task.id)
+    assert acquired is True
+
+
+def test_reconcile_young_own_reserving_worktree_with_no_session_stays_reserved(
+    q, client
+):
+    task = q.create("ordinary")
+    reservation, _ = q.reserve_spawn(task.id, reserved_by="supervisor-test")
+    q.record_spawn_worktree(reservation.key, "wt-precreated")
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        supervisor_id="supervisor-test",
+        verdict_fn=lambda *_args: "live",
+        liveness_fn=lambda _worktree, _machine: None,
+        reserving_timeout=600,
+        nudge=False,
+    )
+
+    assert sup.reconcile_reserving() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.RESERVING
+
+
+def test_reconcile_stale_foreign_reserving_worktree_with_no_session_stays_reserved(
+    q, client
+):
+    task = q.create("ordinary")
+    reservation, _ = q.reserve_spawn(
+        task.id,
+        reserved_by="supervisor-other",
+        now=time.time() - 601,
+    )
+    q.record_spawn_worktree(reservation.key, "wt-precreated")
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        supervisor_id="supervisor-test",
+        verdict_fn=lambda *_args: "live",
+        liveness_fn=lambda _worktree, _machine: None,
+        reserving_timeout=600,
+        nudge=False,
+    )
+
+    assert sup.reconcile_reserving() == 0
+    assert q.get_reservation(reservation.key).state == SpawnState.RESERVING
 
 
 @pytest.mark.parametrize(
@@ -1186,10 +6772,13 @@ def test_recover_gone_releases_stale_reservation_and_respawns(q, client):
     """A *confirmed-gone* embody's stale reservation is released so the task is
     re-embodied (the replacement resumes from progress_log)."""
     t = q.create("work")
-    spawn = _ok_spawn()
+    # Headless (local-body-prefixed handle) -- see
+    # test_requeued_task_is_not_double_spawned's comment.
+    spawn = _ok_spawn({"session": "local-body:sess-1", "worktree": "wt-1"})
     sup = Supervisor(
         client, spawn_fn=spawn, repo=TEST_REPO, max_concurrent=5,
         verdict_fn=lambda wt, mc, sid: "gone",
+        local_body_verdict_fn=lambda sid: "gone",
     )
     sup.poll_once()  # spawn #1 -> reservation SPAWNED
     assert spawn.calls == [t.id]
@@ -1197,7 +6786,7 @@ def test_recover_gone_releases_stale_reservation_and_respawns(q, client):
     # embody claimed + started, then its worker vanished -> coordinator GC requeues
     q.claim_one("m/wt-1", task_id=t.id, machine="m", worktree="wt-1")
     q.start(t.id, "m/wt-1")
-    q.reconcile_liveness(lambda wt, mc, sid: "gone")
+    q.reconcile_liveness(headless_local_verdict=lambda sid: "gone")
     assert q.get(t.id).status == Status.QUEUED
 
     # next cycle: recover_gone releases the stale reservation, then re-embodies
@@ -1230,6 +6819,41 @@ def test_recover_gone_worktree_started_requeues_then_reembodies(q, client):
     assert sup.poll_once() == [t.id]
     assert spawn.calls == [t.id, t.id]
     assert q.latest_reservation(t.id).attempt == 2
+
+
+def test_make_redrive_sender_builds_concise_seed(monkeypatch):
+    """A re-drive targets an already-embodied worker, so its seed should pull
+    the charter on demand (``concise=True``) rather than re-inline the whole
+    behavioral essay a second time."""
+    from agent_dispatch import bridge, embody
+
+    captured = {}
+
+    def fake_autopilot_worker_prompt(task_id, *, worker_id, route, **kwargs):
+        captured["task_id"] = task_id
+        captured["route"] = route
+        captured["kwargs"] = kwargs
+        return "concise-seed"
+
+    def fake_redrive_embodied_worker(worktree, prompt, **kwargs):
+        captured["worktree"] = worktree
+        captured["prompt"] = prompt
+        return True
+
+    monkeypatch.setattr(embody, "autopilot_worker_prompt", fake_autopilot_worker_prompt)
+    monkeypatch.setattr(bridge, "redrive_embodied_worker", fake_redrive_embodied_worker)
+
+    redrive = supervisor_module.make_redrive_sender(route=" --shared")
+    result = redrive(
+        "wt-1", None, {"id": "task-1"}, {"session_id": "s1"}, {"key": "r1"}
+    )
+
+    assert result is True
+    assert captured["task_id"] == "task-1"
+    assert captured["route"] == " --shared"
+    assert captured["kwargs"] == {"concise": True}
+    assert captured["prompt"] == "concise-seed"
+    assert captured["worktree"] == "wt-1"
 
 
 def test_redrive_live_spawned_worker_that_never_claimed(q, client):
@@ -1314,17 +6938,20 @@ def test_recover_leaves_live_or_unknown(q, client, verdict):
     """Recovery never fires on a live or can't-tell verdict (the safety guarantee
     behind liveness-not-lease): the reservation is held, no re-spawn."""
     t = q.create("work")
-    spawn = _ok_spawn()
+    # Headless (local-body-prefixed handle) -- see
+    # test_requeued_task_is_not_double_spawned's comment.
+    spawn = _ok_spawn({"session": "local-body:sess-1", "worktree": "wt-1"})
     sup = Supervisor(
         client, spawn_fn=spawn, repo=TEST_REPO, max_concurrent=5,
         verdict_fn=lambda *_: verdict,
+        local_body_verdict_fn=lambda *_: verdict,
     )
     sup.poll_once()  # spawn #1
     assert spawn.calls == [t.id]
 
     q.claim_one("m/wt-1", task_id=t.id, machine="m", worktree="wt-1")
     q.start(t.id, "m/wt-1")
-    q.reconcile_liveness(lambda wt, mc, sid: "gone")  # queue requeues
+    q.reconcile_liveness(headless_local_verdict=lambda sid: "gone")  # queue requeues
     assert q.get(t.id).status == Status.QUEUED
 
     # supervisor's OWN verdict is not 'gone' -> hold, never re-spawn on ignorance
@@ -1456,115 +7083,141 @@ def test_nudge_skips_when_not_confirmed_alive(q, client):
     assert sent == []
 
 
-# -- reactive-on-turn-end (event-driven supervision) -------------------------
+# -- push-driven turn-state wake ---------------------------------------------
 
 
-def _virtual_clock():
-    """A deterministic (clock, sleep) pair: sleep advances the virtual clock."""
-    t = [0.0]
+def test_wait_for_turn_end_uses_push_client_without_polling(q, client, monkeypatch):
+    """The reactive path waits on one aggregate client and never probes workers."""
+    class _Wake:
+        def __init__(self):
+            self.waits = []
 
-    def clock() -> float:
-        return t[0]
+        def wait(self, timeout):
+            self.waits.append(timeout)
+            return True
 
-    def sleep(d: float) -> None:
-        t[0] += d
+        def update(self, subscriptions):
+            pass
 
-    return clock, sleep
+        def acknowledge(self):
+            pass
 
+        def close(self):
+            pass
 
-def _lease(q, task_id, *, machine="m", worktree="wt-1"):
-    """Drive a spawned task to leased+started so it is an embodied owner."""
-    q.claim_one(f"{machine}/{worktree}", task_id=task_id, machine=machine, worktree=worktree)
-    q.start(task_id, f"{machine}/{worktree}")
-
-
-def test_embodied_owners_only_leased_workers(q, client):
-    """_embodied_owners lists a spawned reservation's worker only once its task is
-    leased; a merely-queued (not yet claimed) spawn contributes nothing."""
-    t = q.create("work")
-    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO, max_concurrent=5)
+    event_wake = _Wake()
+    task = q.create("work")
+    sup = Supervisor(
+        client,
+        spawn_fn=_ok_spawn(),
+        repo=TEST_REPO,
+        max_concurrent=5,
+        reactive=True,
+        event_wake=event_wake,
+    )
     sup.poll_once()
-    assert sup._embodied_owners() == []  # spawned but not yet claimed -> no live turn
-    _lease(q, t.id)
-    assert sup._embodied_owners() == [("wt-1", "m")]
+    q.claim_one("m/wt-1", task_id=task.id, machine="m", worktree="wt-1")
+    q.start(task.id, "m/wt-1")
+    monkeypatch.setattr(
+        tracking,
+        "resolve_live_session",
+        lambda *_args, **_kwargs: pytest.fail("turn-state polling is forbidden"),
+    )
+    assert sup.wait_for_turn_end(30.0) is True
+    assert event_wake.waits == [30.0]
 
 
-def test_wait_for_turn_end_wakes_on_running_to_idle(q, client):
-    """A worker observed transitioning running -> idle settles a turn -> wake early."""
-    t = q.create("work")
-    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO, max_concurrent=5)
-    sup.poll_once()
-    _lease(q, t.id)
-    states = iter(["running", "idle"])  # baseline running, then idle
-    sup.turn_state_fn = lambda wt, mc: next(states, "idle")
-    clock, sleep = _virtual_clock()
-    assert sup.wait_for_turn_end(30.0, sleep=sleep, clock=clock) is True
-
-
-def test_wait_for_turn_end_times_out_without_transition(q, client):
-    """A worker that stays running never wakes the wait -> False at timeout."""
-    t = q.create("work")
-    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO, max_concurrent=5)
-    sup.poll_once()
-    _lease(q, t.id)
-    sup.turn_state_fn = lambda wt, mc: "running"
-    clock, sleep = _virtual_clock()
-    assert sup.wait_for_turn_end(6.0, sleep=sleep, clock=clock) is False
-
-
-def test_wait_for_turn_end_ignores_already_idle_worker(q, client):
-    """A worker already idle at entry is not a fresh turn-end (no busy-wake)."""
-    t = q.create("work")
-    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO, max_concurrent=5)
-    sup.poll_once()
-    _lease(q, t.id)
-    sup.turn_state_fn = lambda wt, mc: "idle"  # idle at baseline and after
-    clock, sleep = _virtual_clock()
-    assert sup.wait_for_turn_end(6.0, sleep=sleep, clock=clock) is False
-
-
-def test_wait_for_turn_end_no_workers_is_a_plain_sleep(q, client):
-    """With nothing embodied, the wait is a single plain sleep of the full interval."""
-    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO, max_concurrent=5)
-    slept: list[float] = []
-    assert sup.wait_for_turn_end(30.0, sleep=slept.append, clock=lambda: 0.0) is False
-    assert slept == [30.0]
-
-
-def test_wait_for_turn_end_degrades_when_turn_state_unavailable(q, client):
-    """A None turn state (no reachable bridge) yields no signal -> plain timeout."""
-    t = q.create("work")
-    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO, max_concurrent=5)
-    sup.poll_once()
-    _lease(q, t.id)
-    sup.turn_state_fn = lambda wt, mc: None
-    clock, sleep = _virtual_clock()
-    assert sup.wait_for_turn_end(6.0, sleep=sleep, clock=clock) is False
-
-
-def test_wait_for_turn_end_swallows_probe_errors(q, client):
-    """A raising turn-state resolver is treated as no signal, never fatal."""
-    t = q.create("work")
-    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO, max_concurrent=5)
-    sup.poll_once()
-    _lease(q, t.id)
-
-    def boom(wt, mc):
-        raise RuntimeError("bridge down")
-
-    sup.turn_state_fn = boom
-    clock, sleep = _virtual_clock()
-    assert sup.wait_for_turn_end(4.0, sleep=sleep, clock=clock) is False
-
-
-def test_wait_for_turn_end_disabled_returns_immediately(q, client):
-    """reactive=False makes the wait a no-op (serve falls back to a fixed sleep)."""
+def test_wait_for_turn_end_ignores_retired_reactive_flag(q, client):
+    """reactive=False performs exactly one fixed-interval sleep."""
     sup = Supervisor(
         client, spawn_fn=_ok_spawn(), repo=TEST_REPO, max_concurrent=5, reactive=False
     )
     slept: list[float] = []
-    assert sup.wait_for_turn_end(30.0, sleep=slept.append, clock=lambda: 0.0) is False
+    assert sup.wait_for_turn_end(30.0, sleep=slept.append) is False
+    assert slept == [30.0]
+
+
+def test_wait_for_turn_end_zero_interval_yields(q, client):
+    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO)
+    slept: list[float] = []
+
+    assert sup.wait_for_turn_end(0.0, sleep=slept.append) is False
+    assert slept == [0.0]
+
+
+def test_wait_for_turn_end_rejects_negative_interval(q, client):
+    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO)
+    slept: list[float] = []
+
+    with pytest.raises(ValueError, match="interval must be non-negative"):
+        sup.wait_for_turn_end(-0.1, sleep=slept.append)
     assert slept == []
+
+
+def test_serve_uses_one_full_interval_wait(q, client):
+    sup = Supervisor(client, spawn_fn=_ok_spawn(), repo=TEST_REPO, max_concurrent=5)
+    polls = 0
+    waits: list[float] = []
+
+    def poll_once():
+        nonlocal polls
+        polls += 1
+        if polls == 2:
+            raise KeyboardInterrupt
+        return []
+
+    sup.poll_once = poll_once
+    sup.wait_for_turn_end = lambda timeout: waits.append(timeout) or False
+
+    sup.serve(interval=30.0)
+
+    assert waits == [30.0]
+
+
+def test_supervisor_syncs_fleet_subscriptions_and_acks_after_cycle(q, client):
+    class _Wake:
+        def __init__(self):
+            self.calls = []
+
+        def wait(self, timeout):
+            return False
+
+        def update(self, subscriptions):
+            self.calls.append(("update", tuple(subscriptions)))
+
+        def acknowledge(self):
+            self.calls.append(("ack",))
+
+        def close(self):
+            pass
+
+    wake = _Wake()
+    task = q.create("work")
+    sup = Supervisor(
+        client,
+        spawn_fn=_fleet_spawn("fleet-body:host-a:session-a"),
+        repo=TEST_REPO,
+        max_concurrent=5,
+        reactive=True,
+        supervisor_id="registration-a",
+        event_wake=wake,
+    )
+
+    assert sup.poll_once() == [task.id]
+
+    assert wake.calls[0] == ("ack",)
+    subscriptions = wake.calls[1][1]
+    assert len(subscriptions) == 1
+    assert subscriptions[0].host == "host-a"
+    assert subscriptions[0].session_id == "session-a"
+    assert subscriptions[0].caller_id.startswith("agent-dispatch:")
+
+    q.claim_one("host-a/wt-1", task_id=task.id, machine="host-a", worktree="wt-1")
+    q.start(task.id, "host-a/wt-1")
+    q.complete(task.id, "host-a/wt-1")
+    sup.poll_once()
+
+    assert wake.calls[-2:] == [("ack",), ("update", ())]
 
 
 # -- Slice 5: headless fleet-body recovery (confirmed-gone over SSH) ----------
@@ -1983,7 +7636,7 @@ def test_supervisor_publishes_local_body_activity_while_task_is_queued(
         "liveness": "idle",
     }
     assert sup.hold_live_leases() == 0
-    assert q.get(t.id).activity is None
+    assert q.get(t.id).activity == "IDLE"
 
 
 def test_hold_live_leases_degrades_when_local_session_listing_fails(
@@ -2081,7 +7734,7 @@ def _spec_evaluator(rules):
 
 
 _REVIEWER_DONE_RULE = {
-    "on": "task.completed",
+    "on": "task.submitted",
     "when": {"labels_any": ["recipe:reviewer"]},
     "emit": {
         "title_template": "unstick follow-up for {title}",
@@ -2092,10 +7745,16 @@ _REVIEWER_DONE_RULE = {
 
 
 def _complete(q, title, *, labels=None, **fields):
+    fields.setdefault("require_verification", True)
     t = q.create(title, labels=labels or [], **fields)
     q.claim_one("m/wt-1", task_id=t.id, machine="m", worktree="wt-1")
     q.start(t.id, "m/wt-1")
     q.complete(t.id, "m/wt-1")
+    with sqlite3.connect(q.db_path) as conn:
+        conn.execute(
+            "UPDATE tasks SET require_verification = 0 WHERE id = ?",
+            (t.id,),
+        )
     return t
 
 

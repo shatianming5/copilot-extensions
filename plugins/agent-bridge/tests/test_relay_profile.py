@@ -10,11 +10,15 @@ it against the providers' EXACT logic across a token matrix.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
+from credential_relay.server import ScopeDenied
 
 from agent_bridge.agent_registry import (
     FileTokenAuthorizer,
@@ -176,6 +180,34 @@ def test_apply_relay_profile_container_two_sources(tmp_path):
     assert b.port is None and b.azure == ["*"]
 
 
+def test_apply_relay_profile_passes_github_profile_to_gh_auth():
+    b = _FakeBuilder()
+    with patch("credential_relay.sources.gh_auth.GhAuthSource") as gh_source:
+        gh_source.return_value.name = "gh-auth"
+        _apply_relay_profile(b, {
+            "sources": ["gh-auth"],
+            "github_hosts": ["github.com"],
+            "azure_resources": [],
+        })
+
+    assert b.sources == ["gh-auth"]
+    gh_source.assert_called_once_with(github_hosts=["github.com"])
+
+
+def test_apply_relay_profile_passes_github_profile_to_git_credential():
+    b = _FakeBuilder()
+    with patch("credential_relay.sources.git_credential.GitCredentialSource") as git_source:
+        git_source.return_value.name = "git-credential"
+        _apply_relay_profile(b, {
+            "sources": ["git-credential"],
+            "github_hosts": ["github.com"],
+            "azure_resources": [],
+        })
+
+    assert b.sources == ["git-credential"]
+    git_source.assert_called_once_with(github_hosts=["github.com"])
+
+
 def test_apply_relay_profile_skips_unknown_source():
     b = _FakeBuilder()
     _apply_relay_profile(b, {"sources": ["bogus"], "azure_resources": []})
@@ -217,10 +249,10 @@ def test_apply_relay_profile_scoped_azure_uses_authorizer(tmp_path):
     assert b.validator is None
     assert isinstance(b.authorizer, FileTokenAuthorizer)
     assert b.authorizer("TOK", "get-azure-token", {"scope": ado}) is True
-    # A resource outside the token's allowlist is denied even for a valid token.
-    assert b.authorizer(
-        "TOK", "get-azure-token", {"scope": "https://graph.microsoft.com/"},
-    ) is False
+    # A resource outside the token's allowlist is denied even for a valid
+    # token -- raising ScopeDenied (#4367), not a plain False.
+    with pytest.raises(ScopeDenied):
+        b.authorizer("TOK", "get-azure-token", {"scope": "https://graph.microsoft.com/"})
     assert b.authorizer("nope", "get-azure-token", {"scope": ado}) is False
 
 
@@ -236,9 +268,12 @@ def test_file_token_authorizer_enforces_per_token_scope(tmp_path):
     assert fa("TOK", "get-azure-token", {"scope": ado + "/.default"}) is True
     assert fa("TOK", "get-azure-token",
               {"resource": "https://storage.azure.com/"}) is True
-    assert fa("TOK", "get-azure-token",
-              {"scope": "https://graph.microsoft.com/.default"}) is False
-    # Non-Azure actions and unknown tokens are never authorized here.
+    # #4367: a recognized token whose specific scope is denied raises
+    # ScopeDenied (a wire-visible denial), not a plain False.
+    with pytest.raises(ScopeDenied):
+        fa("TOK", "get-azure-token", {"scope": "https://graph.microsoft.com/.default"})
+    # Non-Azure actions and unknown tokens are never authorized here (and
+    # never raise: an unrecognized token stays fully silent over the wire).
     assert fa("TOK", "get-github-token", {}) is False
     assert fa("wrong", "get-azure-token", {"scope": ado}) is False
 
@@ -251,8 +286,60 @@ def test_file_token_authorizer_legacy_entry_falls_back_to_static(tmp_path):
     _write_store(store, {"cs-legacy": "LTOK"})
     fa = FileTokenAuthorizer(store, [ado])
     assert fa("LTOK", "get-azure-token", {"scope": ado}) is True
-    assert fa("LTOK", "get-azure-token",
-              {"scope": "https://graph.microsoft.com/"}) is False
+    with pytest.raises(ScopeDenied):
+        fa("LTOK", "get-azure-token", {"scope": "https://graph.microsoft.com/"})
+
+
+@pytest.mark.asyncio
+async def test_cli_profile_scope_denial_is_wire_visible_end_to_end(tmp_path):
+    """#4367: the real CLI-profile path (``_apply_relay_profile`` +
+    ``FileTokenAuthorizer``, exactly what a running bridge installs for a
+    CodeSpace discovered via ``agent-codespaces relay-profile``) must reach a
+    live server round trip that states a known-token/denied-scope response
+    explicitly, while an unknown token stays fully silent."""
+    from credential_relay import RelayBuilder
+    from credential_relay.server import ACCESS_DENIED_RESPONSE
+
+    ado = "499b84ac-1321-427f-aa17-267ca6975798"
+    store = tmp_path / "relay-tokens.json"
+    _write_store(store, {
+        "cs": {"token": "TOK", "repository": "o/r", "allowed_resources": [ado]},
+    })
+    b = RelayBuilder()
+    _apply_relay_profile(b, {
+        "sources": ["git-credential"],
+        "port": 0,
+        "ado_host": None,
+        "azure_resources": [ado],
+        "gated_actions": ["get-azure-token"],
+        "token_store": str(store),
+        "scoped_azure": True,
+    })
+    srv = b.build()
+    await srv.start()
+    srv.port = srv._server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", srv.port,
+        )
+        writer.write(
+            b"get-azure-token\nauth=TOK\nscope=https://graph.microsoft.com/\n\n",
+        )
+        await writer.drain()
+        data = await reader.read(4096)
+        writer.close()
+        assert data.decode() == ACCESS_DENIED_RESPONSE
+
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", srv.port,
+        )
+        writer.write(f"get-azure-token\nauth=nope\nscope={ado}\n\n".encode())
+        await writer.drain()
+        data = await reader.read(4096)
+        writer.close()
+        assert data == b""  # unknown token: fully silent, no wire response
+    finally:
+        await srv.stop()
 
 
 # --- _relay_profile_via_cli + _register_provider_relay -----------------------
@@ -305,3 +392,86 @@ def test_register_provider_relay_no_import_when_cli_unavailable():
         _register_provider_relay(b, "agent-codespaces")
     imp.assert_not_called()
     assert b.sources == [] and b.port is None and b.validator is None
+
+
+# --- #5405: registered provider whose seam is momentarily unavailable -------
+
+def _register_manifest(tmp_path, monkeypatch, name="agent-codespaces"):
+    d = tmp_path / "providers.d"
+    d.mkdir(exist_ok=True)
+    (d / f"{name}.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("AGENT_BRIDGE_PROVIDERS_DIR", str(d))
+
+
+def test_registered_provider_retries_until_profile_available(tmp_path, monkeypatch):
+    _register_manifest(tmp_path, monkeypatch)
+    store = tmp_path / "s.json"
+    _write_store(store, {"cs": "TOK"})
+    prof = {
+        "sources": ["git-credential"], "port": 1,
+        "azure_resources": ["r"], "gated_actions": ["get-azure-token"],
+        "token_store": str(store),
+    }
+    # Binstub missing for the first two probes (mid-update), then healthy.
+    which = iter([None, None, "/bin/agent-codespaces"])
+    sleeps: list[float] = []
+    b = _FakeBuilder()
+    with patch("shutil.which", side_effect=lambda _n: next(which)), \
+         patch("subprocess.run", return_value=_cp(0, json.dumps(prof))):
+        _register_provider_relay(b, "agent-codespaces", sleep=sleeps.append)
+    assert len(sleeps) == 2
+    assert b.port == 1 and isinstance(b.validator, FileTokenValidator)
+
+
+def test_registered_provider_warns_after_bounded_retries(tmp_path, monkeypatch, caplog):
+    _register_manifest(tmp_path, monkeypatch)
+    sleeps: list[float] = []
+    b = _FakeBuilder()
+    with patch("shutil.which", return_value="/bin/agent-codespaces"), \
+         patch("subprocess.run", return_value=_cp(1, "", "mid-update")), \
+         caplog.at_level("WARNING", logger="agent-bridge"):
+        _register_provider_relay(b, "agent-codespaces", sleep=sleeps.append)
+    assert sleeps and sum(sleeps) <= 30
+    assert b.sources == [] and b.validator is None
+    assert any(
+        r.levelname == "WARNING" and "agent-codespaces" in r.getMessage()
+        and "service restart" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_unregistered_provider_does_not_retry():
+    sleeps: list[float] = []
+    b = _FakeBuilder()
+    with patch("shutil.which", return_value=None):
+        _register_provider_relay(b, "agent-codespaces", sleep=sleeps.append)
+    assert sleeps == []
+    assert b.sources == []
+
+
+def test_registered_provider_retries_stay_within_total_budget(tmp_path, monkeypatch):
+    from agent_bridge import agent_registry_relay as relay
+
+    _register_manifest(tmp_path, monkeypatch)
+    now = [0.0]
+    probe_timeouts: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    def hung_probe(*_args, timeout, **_kwargs):
+        # Every probe hangs for its full timeout (a wedged mid-update binstub).
+        probe_timeouts.append(timeout)
+        now[0] += timeout
+        raise subprocess.TimeoutExpired("agent-codespaces", timeout)
+
+    b = _FakeBuilder()
+    with patch("shutil.which", return_value="/bin/agent-codespaces"), \
+         patch("subprocess.run", side_effect=hung_probe):
+        relay._register_provider_relay(
+            b, "agent-codespaces", sleep=sleep, clock=lambda: now[0],
+        )
+    retry_elapsed = now[0] - probe_timeouts[0]  # exclude the initial probe
+    assert retry_elapsed <= relay._PROFILE_RETRY_BUDGET
+    assert all(t <= relay._PROFILE_RETRY_PROBE_TIMEOUT for t in probe_timeouts[1:])
+    assert b.sources == [] and b.validator is None

@@ -18,6 +18,7 @@ import pytest
 
 from agent_codespaces import relay_token
 from agent_codespaces.codespace_assets import asset_text, build_provision_command
+from credential_relay.server import ScopeDenied
 
 
 @pytest.fixture
@@ -45,6 +46,27 @@ class TestRelayToken:
         tok = relay_token.token_for("cs-1")
         relay_token.revoke("cs-1")
         assert relay_token.validate(tok) is False
+
+    def test_connect_path_token_authorizes_the_default_azure_scope(self, isolated_tokens):
+        """The ssh/copilot connect paths mint through ``scoped_relay_token``: an
+        unscoped mint recorded ``allowed_resources: []`` and the relay denied
+        every get-azure-token, so a CodeSpace's cloud-cache login fell through
+        to an interactive browser flow that hangs unattended."""
+        from agent_codespaces import config as cfg
+        from agent_codespaces.relay_launch import scoped_relay_token
+
+        stale = relay_token.token_for("cs-1")  # the old unscoped mint
+        storage = {"scope": "https://storage.azure.com/.default"}
+        with pytest.raises(ScopeDenied):
+            relay_token.authorize_azure(stale, "get-azure-token", storage)
+        tok = scoped_relay_token("cs-1", cfg.CodespacesConfig())
+        assert tok == stale  # same secret, re-scoped in place
+        assert relay_token.authorize_azure(tok, "get-azure-token", storage) is True
+        with pytest.raises(ScopeDenied):
+            relay_token.authorize_azure(
+                tok, "get-azure-token",
+                {"scope": "https://graph.microsoft.com/.default"},
+            )
 
 
 class TestRegisterRelay:
@@ -80,10 +102,11 @@ class TestRegisterRelay:
             tok, "get-azure-token",
             {"scope": "https://storage.azure.com/.default"},
         ) is True
-        assert srv.token_authorizer(
-            tok, "get-azure-token",
-            {"scope": "https://graph.microsoft.com/.default"},
-        ) is False
+        with pytest.raises(ScopeDenied):
+            srv.token_authorizer(
+                tok, "get-azure-token",
+                {"scope": "https://graph.microsoft.com/.default"},
+            )
         assert srv.token_authorizer(
             "wrong", "get-azure-token", {"scope": ado},
         ) is False
@@ -227,19 +250,122 @@ class TestProvisioningAndClient:
 
     def test_relay_client_has_scoped_azure_branch(self):
         client = asset_text("ado-auth-helper-relay")
-        assert 'SCOPE="${2:-}"' in client
-        assert 'HELPER_NAME="${LC_GIT_CREDENTIAL_RELAY_HELPER:-}"' in client
+        assert 'SCOPE="${1:-}"' in client
         assert 'RELAY_TOKEN="${LC_GIT_CREDENTIAL_RELAY_TOKEN:-}"' in client
         # Scoped get-access-token routes to the gated get-azure-token action.
         assert "get-azure-token" in client
         assert "scope=" in client
         assert "auth=" in client
 
-    def test_relay_client_defaults_unscoped_azure_helper_to_ado_resource(self):
+    def test_relay_client_parses_resource_flag_for_get_access_token(self):
+        """`get-access-token --resource <guid>` (the downstream npm-token helper's exact
+        invocation) must resolve SCOPE to the guid, not the literal
+        ``--resource`` string (#384): a bare positional mis-parse silently
+        denied the allowlist lookup and returned empty output."""
+        def _is_shell_launcher_stub(path):
+            p = (path or "").lower()
+            return "windowsapps" in p or "system32" in p
+
+        bash = next(
+            (
+                b for b in _bash_candidates()
+                if _bash_runs(b) and not _is_wsl_bash(b)
+                and not _is_shell_launcher_stub(b)
+            ),
+            None,
+        )
+        if not bash:
+            pytest.skip("no non-WSL bash found for shell-script parsing test")
+        prologue = asset_text("ado-auth-helper-relay").split(
+            'DEFAULT_RELAY_PORT=9857', 1
+        )[0]
+        script = prologue + '\necho "ACTION=$ACTION SCOPE=$SCOPE"\n'
+        for args, expected_scope in (
+            (["get-access-token", "--resource", "499b84ac-guid"], "499b84ac-guid"),
+            (["get-access-token", "--scope", "https://x/.default"], "https://x/.default"),
+            (["get-access-token", "--resource=499b84ac-guid"], "499b84ac-guid"),
+            (["get-access-token", "bare-scope"], "bare-scope"),
+            (["get-access-token"], ""),
+        ):
+            result = subprocess.run(
+                [bash, "-c", script, "ado-auth-helper-relay", *args],
+                capture_output=True, text=True, timeout=10,
+            )
+            assert result.returncode == 0, result.stderr
+            assert f"SCOPE={expected_scope}" in result.stdout, result.stdout
+
+    def test_relay_client_fails_loudly_on_denied_azure_token(self):
+        """A denied/empty get-azure-token response prints a diagnostic instead
+        of silently exiting 1 (#384 direction 3)."""
         client = asset_text("ado-auth-helper-relay")
-        assert 'ADO_REST_RESOURCE="499b84ac-1321-427f-aa17-267ca6975798"' in client
-        assert '[ "$HELPER_NAME" = "azure-auth-helper" ]' in client
-        assert 'SCOPE="$ADO_REST_RESOURCE"' in client
+        assert "get-azure-token denied for scope=" in client
+        assert "no ADO access token available for host=" in client
+        assert "no credential relay reachable and no cached" in client
+
+    def test_relay_client_states_confirmed_denial_when_relay_replies_explicitly(
+        self, tmp_path,
+    ):
+        """#4367: when the relay's response carries an explicit
+        ``error=access_denied`` line (rather than closing with zero bytes),
+        the client states the denial with certainty instead of the older
+        "likely" heuristic."""
+        with _OneShotRelay("error=access_denied\nreason=resource_not_allowed\n\n") as relay:
+            result = _run_bare_token(
+                relay.port, "azure", "https://denied.example.com/.default",
+                tmp_path / "cache",
+            )
+
+        assert result.returncode == 1
+        assert result.stdout == ""
+        assert "confirmed this resource is not in the host's Azure allowlist" in (
+            result.stderr
+        )
+        assert relay.request.decode("utf-8") == (
+            "get-azure-token\nscope=https://denied.example.com/.default\n\n"
+        )
+
+    def test_relay_client_still_diagnoses_denial_against_an_older_relay(
+        self, tmp_path,
+    ):
+        """A relay predating the explicit ``error=`` response line (a bare
+        empty reply) still gets the pre-#4367 "likely" diagnostic -- the new
+        client-side logic must not regress compatibility with an
+        unpatched/older relay."""
+        with _OneShotRelay("\n\n") as relay:
+            result = _run_bare_token(
+                relay.port, "azure", "https://denied.example.com/.default",
+                tmp_path / "cache",
+            )
+
+        assert result.returncode == 1
+        assert result.stdout == ""
+        assert "resource likely not in the host's Azure allowlist" in result.stderr
+
+    def test_relay_client_skips_stale_cache_on_explicit_denial(self, tmp_path):
+        """#4367: an explicit policy denial must never fall through to a
+        stale cached token from before this scope's allowlist entry was
+        revoked -- the relay just said, in-band, that it's no longer
+        authorized."""
+        cache_dir = tmp_path / "cache"
+        keymat = "https://revoked.example.com/.default"
+        with _OneShotRelay("protocol=https\nhost=x\ntoken=STALE-TOKEN\n\n") as relay:
+            first = _run_bare_token(relay.port, "azure", keymat, cache_dir)
+        assert first.returncode == 0
+        assert first.stdout.strip() == "STALE-TOKEN"
+
+        with _OneShotRelay(
+            "error=access_denied\nreason=resource_not_allowed\n\n"
+        ) as relay:
+            second = _run_bare_token(relay.port, "azure", keymat, cache_dir)
+
+        assert second.returncode == 1
+        assert second.stdout == ""
+        assert "STALE-TOKEN" not in second.stdout
+
+    def test_relay_client_does_not_impersonate_azure_helper(self):
+        client = asset_text("ado-auth-helper-relay")
+        assert "LC_GIT_CREDENTIAL_RELAY_HELPER" not in client
+        assert "azure-auth-helper" not in client
 
     def test_relay_client_discovers_ado_host_for_bare_token(self):
         """The host-less get-access-token path supplies an ADO host so the
@@ -337,9 +463,16 @@ class TestProvisioningAndClient:
         assert "unlinkSync" in wrapper  # prune a dead channel's stale mapping
         # A discovered token/host is restored into the relay client's env.
         assert "LC_GIT_CREDENTIAL_RELAY_TOKEN" in wrapper
-        # The relay client can distinguish ado-auth-helper from azure-auth-helper.
-        assert "LC_GIT_CREDENTIAL_RELAY_HELPER" in wrapper
-        assert "path.basename(process.argv[1]" in wrapper
+        assert "LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT" in wrapper
+        assert "LC_GIT_CREDENTIAL_RELAY_HELPER" not in wrapper
+
+    def test_relay_client_plumbs_github_account_to_git_get(self):
+        client = asset_text("ado-auth-helper-relay")
+        assert "LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT" in client
+        assert "username=\" + github_account" in client
+        assert 'm.get("github_account", "")' in client
+        assert "IFS=$'\\x1f' read -r _dport _dtoken _dhost _dghaccount" in client
+        assert "IFS=$'\\t' read -r _dport _dtoken _dhost _dghaccount" in client
 
 
 def _git_cache_python() -> str:
@@ -348,6 +481,24 @@ def _git_cache_python() -> str:
     start = client.index(marker) + len(marker)
     end = client.index('\n\' "$RELAY_PORT" "$RELAY_TOKEN_CACHE_DIR"', start)
     return client[start:end]
+
+
+def _bare_token_python() -> str:
+    """Extract the ``get-access-token``/``get-azure-token`` embedded script
+    (the second heredoc), for direct invocation in a live-relay test."""
+    client = asset_text("ado-auth-helper-relay")
+    marker = '"$RELAY_TOKEN_CACHE_DIR" "$RELAY_TOKEN_CACHE_TTL" <<\'PY\'\n'
+    start = client.index(marker) + len(marker)
+    end = client.index("\nPY\n", start)
+    return client[start:end]
+
+
+def _run_bare_token(port: int, mode: str, keymat: str, cache_dir, ttl: int = 1500):
+    return subprocess.run(
+        [sys.executable, "-c", _bare_token_python(),
+         str(port), mode, keymat, "", str(cache_dir), str(ttl)],
+        text=True, capture_output=True, timeout=10, check=False,
+    )
 
 
 def _decoded_chunked_payloads(cmd: str) -> list[str]:
@@ -430,15 +581,57 @@ class _SilentRelay:
                     pass
 
 
-def _run_git_cache(cache_dir, port: int, ttl: int, request: str):
+def _run_git_cache(cache_dir, port: int, ttl: int, request: str, *, github_account: str = ""):
+    env = {k: v for k, v in os.environ.items() if k != "LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT"}
+    if github_account:
+        env["LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT"] = github_account
     return subprocess.run(
         [sys.executable, "-c", _git_cache_python(), str(port), str(cache_dir), str(ttl)],
         input=request,
         text=True,
         capture_output=True,
-        timeout=10,
+        timeout=20,
         check=False,
+        env=env,
     )
+
+
+class _ScriptedRelay:
+    """Answers successive connections with successive responses."""
+
+    def __init__(self, *responses: str) -> None:
+        self.responses = [r.encode("utf-8") for r in responses]
+        self.requests: list[bytes] = []
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self.port = 0
+
+    def __enter__(self):
+        self._thread.start()
+        if not self._ready.wait(timeout=5):  # pragma: no cover
+            raise RuntimeError("relay did not start")
+        return self
+
+    def __exit__(self, *_exc):
+        self._thread.join(timeout=10)
+
+    def _serve(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(2)
+            self.port = sock.getsockname()[1]
+            self._ready.set()
+            for response in self.responses:
+                conn, _addr = sock.accept()
+                with conn:
+                    request = b""
+                    while b"\n\n" not in request:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        request += chunk
+                    self.requests.append(request)
+                    conn.sendall(response)
 
 
 def _bash_candidates():
@@ -479,11 +672,16 @@ def _require_bash():
 
 
 def _is_wsl_bash(bash) -> bool:
-    """The Microsoft Store WSL launcher lives under ``WindowsApps`` and runs the
-    shell *inside* the WSL VM, whose loopback is a separate network namespace
-    from the Windows host -- so its ``/dev/tcp/127.0.0.1`` cannot reach a
-    host-bound relay -- so the host-relay probe tests must skip on it."""
-    return "windowsapps" in (bash or "").lower()
+    """A WSL launcher runs the shell *inside* the WSL VM -- a genuinely
+    different runtime from a host-native shell (MSYS2/Git Bash), even when
+    its network namespace happens to reach the host (e.g. this machine's
+    `.wslconfig` sets `networkingMode=mirrored`, which lets WSL's loopback
+    reach the Windows host's -- so a bare loopback-reachability probe alone
+    is NOT a reliable WSL exclusion here). Exclude both known WSL launcher
+    locations: the Microsoft Store alias under ``WindowsApps``, and the
+    classic ``C:\\Windows\\System32\\bash.exe`` launcher."""
+    lowered = (bash or "").lower()
+    return "windowsapps" in lowered or "\\system32\\bash.exe" in lowered
 
 
 def _bash_reaches_host_loopback(bash) -> bool:
@@ -561,9 +759,16 @@ def _extract_js_function(src: str, name: str) -> str:
     raise AssertionError(f"could not extract {name}")
 
 
-def _write_mapping(path, port: int, token: str = "", ado_host: str = "") -> None:
+def _write_mapping(
+    path, port: int, token: str = "", ado_host: str = "", github_account: str = ""
+) -> None:
     path.write_text(
-        json.dumps({"port": port, "token": token, "ado_host": ado_host}),
+        json.dumps({
+            "port": port,
+            "token": token,
+            "ado_host": ado_host,
+            "github_account": github_account,
+        }),
         encoding="utf-8",
     )
 
@@ -581,7 +786,7 @@ class TestRelayServingLiveness:
     def test_bash_env_liveness_is_connect_not_ping_gated(self):
         bash = _require_host_loopback_bash()
         probe = _extract_bash_relay_connects() + '\n_relay_connects "$1"\n'
-        env = {**os.environ, "LC_GIT_CREDENTIAL_RELAY_PING_TIMEOUT": "0.1"}
+        env = {**os.environ, "LC_GIT_CREDENTIAL_RELAY_PING_TIMEOUT": "0.5"}
 
         with _OneShotRelay("pong\n\n") as relay:
             live = subprocess.run(
@@ -607,7 +812,7 @@ class TestRelayServingLiveness:
         code = _extract_discovery_python()
         ports_dir = tmp_path / "relay-ports"
         ports_dir.mkdir()
-        env = {**os.environ, "LC_GIT_CREDENTIAL_RELAY_PING_TIMEOUT": "0.1"}
+        env = {**os.environ, "LC_GIT_CREDENTIAL_RELAY_PING_TIMEOUT": "0.5"}
 
         closed = _unused_closed_port()
         with _OneShotRelay("pong\n\n") as serving, _OneShotRelay("not-pong\n\n") as old_relay:
@@ -626,12 +831,12 @@ class TestRelayServingLiveness:
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=5,
+                timeout=15,
                 check=False,
             )
 
         assert result.returncode == 0
-        assert result.stdout.strip() == f"{serving.port}\ttok\thost"
+        assert result.stdout.rstrip("\r\n") == f"{serving.port}\x1ftok\x1fhost\x1f"
         assert serving_file.exists()
         assert old_file.exists()
         assert not closed_file.exists()
@@ -640,7 +845,7 @@ class TestRelayServingLiveness:
         code = _extract_discovery_python()
         ports_dir = tmp_path / "relay-ports"
         ports_dir.mkdir()
-        env = {**os.environ, "LC_GIT_CREDENTIAL_RELAY_PING_TIMEOUT": "0.1"}
+        env = {**os.environ, "LC_GIT_CREDENTIAL_RELAY_PING_TIMEOUT": "0.5"}
 
         with _OneShotRelay("not-pong\n\n") as old_relay:
             mapping = ports_dir / "old.json"
@@ -656,8 +861,72 @@ class TestRelayServingLiveness:
             )
 
         assert result.returncode == 0
-        assert result.stdout.strip() == f"{old_relay.port}\ttok\thost"
+        assert result.stdout.rstrip("\r\n") == f"{old_relay.port}\x1ftok\x1fhost\x1f"
         assert mapping.exists()
+
+    def test_python_discovery_preserves_empty_ado_host_with_github_account(self, tmp_path):
+        code = _extract_discovery_python()
+        ports_dir = tmp_path / "relay-ports"
+        ports_dir.mkdir()
+        env = {**os.environ, "LC_GIT_CREDENTIAL_RELAY_PING_TIMEOUT": "0.5"}
+
+        with _OneShotRelay("pong\n\n") as relay:
+            _write_mapping(
+                ports_dir / "mapping.json",
+                relay.port,
+                token="tok",
+                ado_host="",
+                github_account="alice",
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", code, str(ports_dir)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == f"{relay.port}\x1ftok\x1f\x1falice"
+
+    def test_python_discovery_preserves_both_and_neither_optional_fields(self, tmp_path):
+        code = _extract_discovery_python()
+        env = {**os.environ, "LC_GIT_CREDENTIAL_RELAY_PING_TIMEOUT": "0.5"}
+
+        ports_dir = tmp_path / "both"
+        ports_dir.mkdir()
+        with _OneShotRelay("pong\n\n") as relay:
+            _write_mapping(
+                ports_dir / "mapping.json",
+                relay.port,
+                token="tok",
+                ado_host="ado.example",
+                github_account="alice",
+            )
+            both = subprocess.run(
+                [sys.executable, "-c", code, str(ports_dir)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+        assert both.stdout.rstrip("\r\n") == f"{relay.port}\x1ftok\x1fado.example\x1falice"
+
+        ports_dir = tmp_path / "neither"
+        ports_dir.mkdir()
+        with _OneShotRelay("pong\n\n") as relay:
+            _write_mapping(ports_dir / "mapping.json", relay.port, token="tok")
+            neither = subprocess.run(
+                [sys.executable, "-c", code, str(ports_dir)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+        assert neither.stdout.rstrip("\r\n") == f"{relay.port}\x1ftok\x1f\x1f"
 
     def test_wrapper_probe_distinguishes_pong_connect_dead(self, tmp_path):
         bash = _require_host_loopback_bash()
@@ -673,7 +942,7 @@ class TestRelayServingLiveness:
         env = {
             **os.environ,
             "PATH": os.path.dirname(bash) + os.pathsep + os.environ.get("PATH", ""),
-            "LC_GIT_CREDENTIAL_RELAY_PING_TIMEOUT": "0.1",
+            "LC_GIT_CREDENTIAL_RELAY_PING_TIMEOUT": "0.5",
         }
 
         with _OneShotRelay("pong\n\n") as relay:
@@ -687,17 +956,6 @@ class TestRelayServingLiveness:
             )
         assert live.stdout.strip() == "pong"
 
-        with _SilentRelay() as relay:
-            accepted = subprocess.run(
-                [node, str(probe), str(relay.port)],
-                env=env,
-                text=True,
-                capture_output=True,
-                timeout=5,
-                check=False,
-            )
-        assert accepted.stdout.strip() == "connect"
-
         dead = subprocess.run(
             [node, str(probe), str(_unused_closed_port())],
             env=env,
@@ -708,7 +966,7 @@ class TestRelayServingLiveness:
         )
         assert dead.stdout.strip() == "dead"
 
-    def test_wrapper_discovery_adopts_only_serving_and_prunes_silent(
+    def test_wrapper_discovery_adopts_serving_and_prunes_dead(
         self, tmp_path
     ):
         bash = _require_host_loopback_bash()
@@ -733,19 +991,16 @@ class TestRelayServingLiveness:
         env = {
             **os.environ,
             "PATH": os.path.dirname(bash) + os.pathsep + os.environ.get("PATH", ""),
-            "LC_GIT_CREDENTIAL_RELAY_PING_TIMEOUT": "0.1",
+            "LC_GIT_CREDENTIAL_RELAY_PING_TIMEOUT": "0.5",
         }
 
         closed = _unused_closed_port()
-        with _OneShotRelay("pong\n\n") as serving, _OneShotRelay("not-pong\n\n") as old_relay:
+        with _OneShotRelay("pong\n\n") as serving:
             serving_file = ports_dir / "serving.json"
-            old_file = ports_dir / "old.json"
             closed_file = ports_dir / "closed.json"
             _write_mapping(serving_file, serving.port, token="tok", ado_host="host")
-            _write_mapping(old_file, old_relay.port, token="bad")
             _write_mapping(closed_file, closed, token="closed")
             os.utime(serving_file, (100, 100))
-            os.utime(old_file, (200, 200))
             os.utime(closed_file, (300, 300))
 
             result = subprocess.run(
@@ -764,7 +1019,6 @@ class TestRelayServingLiveness:
             "adoHost": "host",
         }
         assert serving_file.exists()
-        assert old_file.exists()
         assert not closed_file.exists()
 
     def test_wrapper_env_port_without_ping_routes_to_relay_client(self, tmp_path):
@@ -801,7 +1055,7 @@ class TestRelayServingLiveness:
         env = {
             **os.environ,
             "PATH": os.path.dirname(bash) + os.pathsep + os.environ.get("PATH", ""),
-            "LC_GIT_CREDENTIAL_RELAY_PING_TIMEOUT": "0.1",
+            "LC_GIT_CREDENTIAL_RELAY_PING_TIMEOUT": "0.5",
             "LC_GIT_CREDENTIAL_RELAY_TOKEN": "tok",
         }
 
@@ -905,3 +1159,44 @@ class TestGitCredentialCache:
         assert result.stdout == self.RESPONSE
         assert "fresh-token" in next(cache_dir.glob("*.gitcred")).read_text(encoding="utf-8")
 
+    def test_account_named_only_when_relay_caches_by_username(self, tmp_path):
+        request = "protocol=https\nhost=github.com\n\n"
+        caps = "capabilities=git-credential-username-cache\n\n"
+        with _ScriptedRelay(caps, self.RESPONSE) as relay:
+            result = _run_git_cache(
+                tmp_path / "cache", relay.port, 1500, request, github_account="alice",
+            )
+
+        assert result.returncode == 0
+        assert relay.requests[0] == b"capabilities\n\n"
+        assert relay.requests[1].decode("utf-8") == (
+            "protocol=https\nhost=github.com\nusername=alice\n\n"
+        )
+
+    def test_older_relay_never_receives_an_account(self, tmp_path):
+        """An older relay caches by (protocol, host) only and answers the
+        unknown capabilities action with nothing, so no account is named."""
+        request = "protocol=https\nhost=github.com\n\n"
+        with _ScriptedRelay("", self.RESPONSE) as relay:
+            result = _run_git_cache(
+                tmp_path / "cache", relay.port, 1500, request, github_account="alice",
+            )
+
+        assert result.returncode == 0
+        assert relay.requests[1].decode("utf-8") == request
+
+    def test_relay_outage_still_serves_the_selected_accounts_cached_credential(self, tmp_path):
+        request = "protocol=https\nhost=github.com\n\n"
+        caps = "capabilities=git-credential-username-cache\n\n"
+        cache_dir = tmp_path / "cache"
+        with _ScriptedRelay(caps, self.RESPONSE) as relay:
+            assert _run_git_cache(
+                cache_dir, relay.port, 1500, request, github_account="alice",
+            ).returncode == 0
+
+        result = _run_git_cache(cache_dir, 0, 1500, request, github_account="alice")
+        assert result.returncode == 0
+        assert result.stdout == self.RESPONSE
+        assert "served git credential from short-TTL cache" in result.stderr
+        other = _run_git_cache(cache_dir, 0, 1500, request, github_account="bob")
+        assert other.returncode == 1 and other.stdout == ""  # never another account's

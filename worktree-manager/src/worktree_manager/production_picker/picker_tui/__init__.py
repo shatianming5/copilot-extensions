@@ -5,20 +5,14 @@ Ported from the test-chamber ``worktree-picker-tty-overhaul`` prototype. The
 ``machines()`` / ``load()`` / ``bucket`` / ``for_machine`` (and ``make_loader``
 for live multi-machine). ``data_local`` is the real local source.
 
-Rollout: the Textual picker is the **default everywhere** -- no opt-in needed.
-- ``picker disable`` writes ``new_picker: false`` (machine-local or global) to
-  opt a machine *out* to the legacy ANSI picker; ``picker enable`` restores the
-  default.
-- ``AGENT_WORKTREES_LEGACY_PICKER=1`` forces the legacy picker for one
-  invocation (manual rollback; always wins).
-- ``AGENT_WORKTREES_NEW_PICKER=1`` forces the new picker for one invocation
-  (e.g. on a machine that opted out).
-- Windows over SSH always auto-falls-back to legacy (Textual can't read the
-  keyboard over Windows OpenSSH ConPTY -- see ``_new_picker_blocked_by_ssh``).
+The Textual picker is the **only supported picker** -- there is no opt-out.
+Its legacy ANSI predecessor is retired everywhere it can be, but its rendering
+code remains solely as the automatic fallback for Windows-over-SSH sessions,
+where Textual can't read the keyboard over the OpenSSH ConPTY (see
+``_new_picker_blocked_by_ssh`` in ``__main__.py``). That fallback is
+unconditional and not user-configurable.
 """
 from __future__ import annotations
-
-import os
 
 
 def _interactive_stdin(stream) -> bool:
@@ -31,42 +25,12 @@ def _interactive_stdin(stream) -> bool:
         return False
 
 
-def new_picker_enabled(config=None) -> bool:
-    """True when the TUI picker should be used instead of the legacy ANSI one.
-
-    The Textual picker is the **default** (True); a machine opts *out* to legacy
-    via ``picker disable`` (persisted ``new_picker: false``). Precedence
-    (first match wins):
-      1. ``AGENT_WORKTREES_LEGACY_PICKER`` env -> legacy (the rollback switch).
-      2. ``AGENT_WORKTREES_NEW_PICKER`` env -> TUI.
-      3. ``config.new_picker`` (persistent, machine-local > global; default True).
-      4. default: TUI.
-    """
-    if os.environ.get("AGENT_WORKTREES_LEGACY_PICKER"):
-        return False
-    if os.environ.get("AGENT_WORKTREES_NEW_PICKER"):
-        return True
-    if config is not None:
-        return bool(getattr(config, "new_picker", True))
-    # Cheap peek of machine-local/global yaml only -- never ``load_config``
-    # (related grafting) just to decide TUI vs legacy (#1504).
-    try:
-        from .. import config as cfg_mod
-        import yaml
-
-        for path in (cfg_mod.default_config_path(), cfg_mod.global_config_path()):
-            try:
-                raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-            except Exception:
-                continue
-            if isinstance(raw, dict) and "new_picker" in raw:
-                return bool(raw["new_picker"])
-    except Exception:
-        pass
-    return True
-
-
-def run_tui_picker(source=None, live=False, mock_mode=None):
+def run_tui_picker(
+    source=None,
+    live=False,
+    mock_mode=None,
+    after_first_refresh=None,
+):
     """Run the TUI picker and return its result (a launch decision or None).
 
     With no source: ``live=True`` selects the multi-machine SSH source
@@ -78,6 +42,13 @@ def run_tui_picker(source=None, live=False, mock_mode=None):
     explicit dev sandbox: real data is shown but mutating actions are simulated
     (no side effects). It never turns on implicitly -- see
     ``engine._resolve_mock_mode``.
+
+    ``after_first_refresh`` is an optional no-argument housekeeping callback.
+    The screen starts it on a daemon worker only after Textual completes its
+    first refresh. It must not mutate Textual widgets; UI changes still
+    belong on the render thread via the screen's ``Inbox`` (``inbox.py`` --
+    see its module docstring and ``inbox.Inbox.post()``), never a raw
+    ``app.call_from_thread`` call.
 
     Launch-channel handling: this runs inside ``resolve``, whose **stdout
     (fd 1) is captured by the launcher for the JSON plan**. Textual's driver
@@ -113,7 +84,13 @@ def run_tui_picker(source=None, live=False, mock_mode=None):
     try:
         if redirect:
             sys.__stdout__ = sys.stderr
-        app = PickerApp(source, live=live, mock_mode=mock_mode)
+        app_kwargs = {"live": live, "mock_mode": mock_mode}
+        if after_first_refresh is not None:
+            app_kwargs["after_first_refresh"] = after_first_refresh
+        app = PickerApp(source, **app_kwargs)
+        from .frame_health import append_launch_event
+
+        append_launch_event("textual_app_start", live=live)
         app.run()
     except Exception as exc:
         # The launcher sends the picker's stderr straight to the terminal and
@@ -142,7 +119,7 @@ def _write_picker_crash_log(exc, *, live, mock_mode, app=None):
     from datetime import datetime, timezone
 
     try:
-        from .. import config as cfg
+        from .. import project_config as cfg
 
         logs_dir = cfg.install_dir() / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)

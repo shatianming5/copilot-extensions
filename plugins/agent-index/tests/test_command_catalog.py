@@ -13,16 +13,40 @@ import pytest
 PLUGIN = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX catalog test")
-def test_posix_catalog_uses_exact_payload_command() -> None:
+def _repo(path: Path, *, active: bool = True) -> Path:
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    if active:
+        config = path / ".agent-index" / "config.yaml"
+        config.parent.mkdir(parents=True)
+        config.write_text(
+            "indexers:\n  - machine: host-a\n",
+            encoding="utf-8",
+        )
+    return path
+
+
+def _env() -> dict[str, str]:
     env = os.environ.copy()
+    for name in (
+        "AGENT_INDEX_CONFIG_DATA_B64",
+        "AGENT_INDEX_EFFECTIVE_CONFIG",
+        "AGENT_INDEX_REPO",
+    ):
+        env.pop(name, None)
     env["COPILOT_PLUGIN_ROOT"] = str(PLUGIN)
+    return env
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX catalog test")
+def test_posix_catalog_uses_exact_payload_command(tmp_path: Path) -> None:
+    env = _env()
     result = subprocess.run(
         ["bash", str(PLUGIN / "scripts" / "emit-command-catalog.sh")],
         check=True,
         capture_output=True,
         text=True,
         env=env,
+        cwd=_repo(tmp_path),
     )
     envelope = json.loads(result.stdout)
     assert "\r" not in envelope["additionalContext"]
@@ -37,8 +61,13 @@ def test_posix_catalog_uses_exact_payload_command() -> None:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX catalog test")
-def test_catalog_rejects_conflicting_payload_context() -> None:
-    env = os.environ.copy()
+def test_catalog_ignores_a_different_plugins_copilot_plugin_root(
+    tmp_path: Path,
+) -> None:
+    """A different plugin's COPILOT_PLUGIN_ROOT must never suppress this
+    plugin's own catalog -- see payload-invocation's own equivalent fix
+    (copilot-extensions #2650 fallout)."""
+    env = _env()
     env["COPILOT_PLUGIN_ROOT"] = str(PLUGIN.parent)
     result = subprocess.run(
         ["bash", str(PLUGIN / "scripts" / "emit-command-catalog.sh")],
@@ -46,8 +75,10 @@ def test_catalog_rejects_conflicting_payload_context() -> None:
         capture_output=True,
         text=True,
         env=env,
+        cwd=_repo(tmp_path),
     )
-    assert json.loads(result.stdout) == {}
+    envelope = json.loads(result.stdout)
+    assert envelope.get("additionalContext")
 
 
 def test_powershell_catalog_declares_same_schema_and_command() -> None:
@@ -56,15 +87,13 @@ def test_powershell_catalog_declares_same_schema_and_command() -> None:
     )
     assert "copilot-extensions.session-command-catalog" in source
     assert "bin\\agent-index.ps1" in source
-    assert "COPILOT_PLUGIN_ROOT" in source
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is not installed")
-def test_powershell_catalog_uses_exact_payload_command() -> None:
+def test_powershell_catalog_uses_exact_payload_command(tmp_path: Path) -> None:
     pwsh = shutil.which("pwsh")
     assert pwsh
-    env = os.environ.copy()
-    env["COPILOT_PLUGIN_ROOT"] = str(PLUGIN)
+    env = _env()
     result = subprocess.run(
         [
             pwsh,
@@ -76,6 +105,7 @@ def test_powershell_catalog_uses_exact_payload_command() -> None:
         capture_output=True,
         text=True,
         env=env,
+        cwd=_repo(tmp_path),
     )
     envelope = json.loads(result.stdout)
     match = re.search(r"```json\n(.*)\n```", envelope["additionalContext"])
@@ -86,13 +116,52 @@ def test_powershell_catalog_uses_exact_payload_command() -> None:
     assert command["availability"] == "ready"
 
 
-def test_hooks_use_runtime_payload_context_and_emit_catalog() -> None:
+@pytest.mark.parametrize("shell", ["bash", "pwsh"])
+@pytest.mark.parametrize("malformed", [False, True], ids=["inactive", "malformed"])
+def test_catalog_is_empty_without_valid_opt_in(
+    tmp_path: Path, shell: str, malformed: bool
+) -> None:
+    if shell == "bash":
+        if os.name == "nt" or shutil.which("bash") is None:
+            pytest.skip("POSIX catalog test")
+        command = ["bash", str(PLUGIN / "scripts" / "emit-command-catalog.sh")]
+    else:
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            pytest.skip("pwsh is not installed")
+        command = [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(PLUGIN / "scripts" / "emit-command-catalog.ps1"),
+        ]
+    repo = _repo(tmp_path, active=False)
+    if malformed:
+        config = repo / ".agent-index" / "config.yaml"
+        config.parent.mkdir(parents=True)
+        config.write_text("indexers: [\n", encoding="utf-8")
+    env = _env()
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=repo,
+    )
+    assert json.loads(result.stdout) == {}
+
+
+def test_hooks_keep_only_runtime_side_effects() -> None:
     hooks = json.loads((PLUGIN / "hooks.json").read_text(encoding="utf-8"))
     session_start = hooks["hooks"]["sessionStart"]
-    assert any("emit-command-catalog.sh" in hook["bash"] for hook in session_start)
-    assert any(
-        "emit-command-catalog.ps1" in hook["powershell"] for hook in session_start
-    )
+    assert len(session_start) == 2
+    assert "write-session-guidance" in session_start[0]["bash"]
+    assert "write-session-guidance" in session_start[0]["powershell"]
+    assert 'bash "$s" ensure' in session_start[1]["bash"]
+    assert "install.ps1'); try" in session_start[1]["powershell"]
+    assert not any("emit-command-catalog" in str(hook) for hook in session_start)
+    assert not any("emit-scope-binding" in str(hook) for hook in session_start)
     for hook in session_start:
         assert "COPILOT_PLUGIN_ROOT" in hook["bash"]
         assert "COPILOT_PLUGIN_ROOT" in hook["powershell"]

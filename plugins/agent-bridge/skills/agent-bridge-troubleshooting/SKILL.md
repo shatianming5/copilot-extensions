@@ -36,12 +36,23 @@ failure modes -- jump to the matching section:
   then **cannot fetch/push/PR**: git fails with `unable to get password` /
   `relay unreachable`. -> *Is this the credential-relay flap?* below.
 
-Identify the mode and capture the trace. The resume-hang root cause is the
-Copilot CLI startup race
-github/copilot-agent-runtime **#13492** (fix **#13494**), originally scoped to
-*headed* sessions but it reproduces on **ACP** sessions too. The relay-flap fix
-(sticky port + buffered token-fetch + single-owner republish) is tracked in
-**#580**.
+If a **headed or interactive** Copilot CLI is stuck on `Loading...` or
+`Resuming...`, invoke
+`customizing-copilot:diagnosing-copilot-cli-startup` first. That skill owns mux
+capture, interactive process/session logs, and startup-boundary classification;
+return here when the differential reaches bridge-owned ACP recovery or
+live-session registration.
+
+Identify the mode and capture the trace. A resume-hang can stem from more than
+one root cause -- do not assume it is a specific historical race without
+evidence. One current known cause is a **Copilot enterprise management-policy
+check that fails closed on permitting extension usage** (even for
+already-approved extensions), where the policy API call **itself** then fails
+on an auth timeout -- unstable auth produces failed extension loads and hangs.
+Confirm via the process/session logs (see
+`customizing-copilot:diagnosing-copilot-cli-startup`) rather than guessing.
+The relay-flap fix (sticky port + buffered token-fetch + single-owner
+republish) is tracked in **#580**.
 
 > The examples use Windows PowerShell (the primary control-plane host). On a
 > POSIX daemon host substitute the obvious equivalents: `ss -tlnp` / `lsof -i`
@@ -171,21 +182,28 @@ Look at:
   - `acp_resume_retry` -- a stop->resume ladder round fired.
   - `acp_resume_recreated` -- the end+create last resort fired.
 - **The daemon log** -- the always-logged child stderr lives in
-  **`~/.agent-bridge/agent-bridge-err.log`**.
+  **`~/.agent-bridge/agent-bridge-err.log`**. <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 
 > **Known gap:** for **CodeSpace** targets the child runs in the Session Host on
 > the far side, so its stderr does not yet relay into the local `sessions.db`
 > `acp_child_log`. For a CodeSpace, read the child stderr on the box, or use
 > `peek` (which reads `events.jsonl` directly).
 
-## Operator-authorized mitigations (attack the race at the source)
+## Operator-authorized mitigations (attack the hang at the source)
 
-- **Bump the CodeSpace Copilot CLI past the #13494 fix.** This changes the
-  target environment and therefore requires explicit authorization. The race is a CLI
-  startup bug; a CLI carrying the fix stops reproducing it.
+> Extension-load hangs can have more than one cause. Confirm the actual
+> failure signature (session logs, `diagnosing-copilot-cli-startup`) before
+> picking a mitigation -- don't reach for a fix blind.
+
+- **Stabilize auth first.** A known current cause is unstable
+  authentication: the CLI's enterprise management-policy check for permitting
+  extension usage fails closed (even for already-approved extensions) when
+  its own policy API call times out, and that auth instability is what
+  produces the failed extension loads / hang. Re-authenticating or waiting
+  out a transient auth outage resolves this class before anything else does.
 - **ACP `--no-experimental`** -- an operator-authorized diagnostic that disables
-  extensions and sidesteps the extension-load leg of the startup generation
-  race.
+  extensions and sidesteps the extension-load leg of startup entirely (useful
+  to confirm the hang is extension-load-related at all).
 
 ---
 
@@ -246,7 +264,8 @@ log. Count the flaps and read the port churn -- from the daemon log (simplest,
 PowerShell):
 
 ```powershell
-Select-String -Path "$env:USERPROFILE\.agent-bridge\agent-bridge-err.log" `
+$_log = "$env:USERPROFILE\.agent-bridge\agent-bridge-err.log"  # marketplace-isolation: allow deployed-runtime-diagnostics
+Select-String -Path $_log `
   -Pattern "reverse-forward|host relay port changed|relay unreachable"
 ```
 
@@ -255,7 +274,7 @@ quoting of the SQL; run with `python flaps.py`):
 
 ```python
 import sqlite3, os
-d = os.path.expanduser("~/.agent-bridge/sessions.db")
+d = os.path.expanduser("~/.agent-bridge/sessions.db")  # marketplace-isolation: allow deployed-runtime-diagnostics
 rows = sqlite3.connect(d).execute(
     "SELECT data_json FROM events WHERE event_type='acp_child_log'"
 ).fetchall()
@@ -272,7 +291,7 @@ reverse-forward up ... (-R P:127.0.0.1:P)` and then stays quiet.
 
 ## Deeper checks -- split-brain / stale published port
 
-The host relay port is published to **`~/.agent-bridge/relay-port`** and resolved
+The host relay port is published to **`~/.agent-bridge/relay-port`** and resolved <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 by `get_live_relay_port()`. Two ways it goes bad:
 
 - **Stale/dead published port.** Compare the file against what's actually
@@ -281,7 +300,7 @@ by `get_live_relay_port()`. Two ways it goes bad:
   that didn't republish). Sub-daemons resolve via this file, so they forward to
   a dead port.
   ```powershell
-  Get-Content "$env:USERPROFILE\.agent-bridge\relay-port"          # published port
+  Get-Content "$env:USERPROFILE\.agent-bridge\relay-port"          # published port # marketplace-isolation: allow deployed-runtime-diagnostics
   Get-NetTCPConnection -State Listen | ? { $_.LocalPort -eq <that port> }   # is anything there?
   Get-CimInstance Win32_Process -Filter "Name='python.exe'" | ? CommandLine -match 'agent_bridge' | select ProcessId,ParentProcessId,CommandLine
   ```
@@ -297,7 +316,7 @@ by `get_live_relay_port()`. Two ways it goes bad:
 
 > **Valid state, not a bug: on Windows the two `python.exe` show DIFFERENT
 > interpreter paths.** The supervisor (parent) runs from the versioned-slot path
-> `~/.agent-bridge/versions/<v>/Scripts/python.exe`; its worker **child** runs
+> `~/.agent-bridge/versions/<v>/Scripts/python.exe`; its worker **child** runs <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 > from the **base interpreter** `C:\Program Files\Python3XX\python.exe` -- and the
 > *base-path child is the one bound to port 9280*. This interpreter-path
 > difference is the **normal Windows stdlib-venv launcher redirect**, NOT version
@@ -343,7 +362,7 @@ legacy 9280 (fixed separately) -- always confirm via the routing table.
   next command brings the bridge back. Confirm live state, don't assume "down":
 
   ```pwsh
-  Get-Content ~/.agent-bridge/active.json | ConvertFrom-Json | Select -Expand active
+  Get-Content ~/.agent-bridge/active.json | ConvertFrom-Json | Select -Expand active  # marketplace-isolation: allow deployed-runtime-diagnostics
   # then GET http://127.0.0.1:<that port>/health
   ```
 

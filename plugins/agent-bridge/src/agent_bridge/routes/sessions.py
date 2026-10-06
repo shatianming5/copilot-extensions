@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -12,8 +13,18 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
 from .. import elevated
+from ..cold_store_views import cold_store_session_info
+from ..attention_wait import (
+    AttentionHistoryChangedError,
+    AttentionTokenError,
+    attention_position_session_id,
+    evaluate_owned_attention,
+)
 from ..models import (
     AnswerAskUserRequest,
+    AnswerPermissionRequest,
+    AttentionReason,
+    AttentionWaitResponse,
     CursorAckRequest,
     CursorInfo,
     DelegatedResultSnapshot,
@@ -40,6 +51,7 @@ from ..result_snapshot import (
 )
 from ..session_manager import (
     DaemonDrainingError,
+    ProviderTargetRefreshError,
     SessionBusyError,
     SessionConflictError,
 )
@@ -49,17 +61,42 @@ from ..worktree_head import resolve_head
 if TYPE_CHECKING:
     from ..session_manager import Session, SessionManager
 
+log = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
 
-# Sentinel cursor key for callers that supply no caller_id. Keeps the
-# delivery_cursors primary key non-null while still giving anonymous
-# callers a single shared resume point per session.
+# Sentinel cursor key for callers with no caller_id -- keeps delivery_cursors'
+# primary key non-null while giving anonymous callers a shared resume point.
 _CURSOR_DEFAULT_KEY = "__default__"
 
 
 def _cursor_key(caller_id: str | None) -> str:
     """Normalize a caller_id into a non-null delivery_cursors key."""
     return caller_id if caller_id else _CURSOR_DEFAULT_KEY
+
+
+def _rows_to_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert durable event rows to the wire event-dict shape."""
+    return [
+        {"id": r["event_id"], "event": r["event_type"], "data": r["data"],
+         "timestamp": r["timestamp"]}
+        for r in rows
+    ]
+
+
+def _controlled_cursor_key(caller_id: str | None) -> str:
+    """Require a distinct caller identity for continuity-qualified delivery."""
+    if not caller_id:
+        raise HTTPException(
+            status_code=422,
+            detail="controlled cursor operations require caller_id",
+        )
+    if caller_id == _CURSOR_DEFAULT_KEY:
+        raise HTTPException(
+            status_code=422,
+            detail="caller_id is reserved for legacy anonymous delivery",
+        )
+    return caller_id
 
 
 def _resolve_result_session(mgr: SessionManager, ref: str) -> Session | None:
@@ -72,7 +109,14 @@ def _resolve_result_session(mgr: SessionManager, ref: str) -> Session | None:
         item for item in mgr.list_sessions()
         if item.target.worktree_id == ref
     ]
-    live_session_id = mgr.db.current_live_session_for_worktree(
+    if ownership:
+        owned = mgr.get_session(ownership.get("session_id") or "")
+        if owned is not None and owned.status in {
+            SessionStatus.RUNNING,
+            SessionStatus.IDLE,
+        }:
+            return owned
+    live_session_id = mgr.db.current_represented_session_for_worktree(
         ref, now=time.time()
     )
     if live_session_id:
@@ -80,8 +124,8 @@ def _resolve_result_session(mgr: SessionManager, ref: str) -> Session | None:
             status_code=409,
             detail=(
                 "The authoritative worktree head is a represented session; "
-                "represented-session result parity is unavailable in this "
-                "protocol generation"
+                "use the represented result surface or the result CLI's "
+                "automatic target selection"
             ),
         )
     if ownership is None and not candidates:
@@ -101,9 +145,8 @@ def _resolve_result_session(mgr: SessionManager, ref: str) -> Session | None:
     if len(candidates) == 1:
         return candidates[0]
 
-    # Multiple unlinked owned candidates are genuinely ambiguous. Consult the
-    # ground-layer authority only for that exceptional case; ordinary result
-    # reads stay local and cannot inherit the subprocess timeout.
+    # Multiple unlinked owned candidates: consult the ground-layer
+    # authority only for this exceptional case.
     head = resolve_head(ref)
     if head.tracked:
         if not head.head_session:
@@ -116,9 +159,9 @@ def _resolve_result_session(mgr: SessionManager, ref: str) -> Session | None:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "The authoritative worktree head is not a bridge-owned "
-                    "session; represented-session result parity is unavailable "
-                    "in this protocol generation"
+                    "The authoritative worktree head is a represented session; "
+                    "use the represented result surface or the result CLI's "
+                    "automatic target selection"
                 ),
             )
         return session
@@ -134,16 +177,13 @@ def _resolve_result_session(mgr: SessionManager, ref: str) -> Session | None:
 def _tool_progress_sse(active: dict, now: float) -> str:
     """Frame an in-flight tool call as a cursor-neutral SSE *comment*.
 
-    ``active`` is :meth:`EventLog.active_tool_call`'s return value. The line is
-    an SSE comment (``: tool_progress <json>``), not an ``event:``/``data:``
-    block -- so it is invisible to spec-compliant ``EventSource`` consumers
-    (which ignore ``:`` lines, like the existing ``: heartbeat``) and
-    structurally cannot carry an ``id:``. It is pure transport liveness: it
-    tells a watcher what the remote is working on (and that it is still alive)
-    during a quiet, output-buffered tool call, without injecting a synthetic,
-    non-relay event into the durable, replayable event stream or moving any
-    delivery cursor. Only the agent-bridge CLI renderer opts in to parsing it;
-    HTTP API consumers (e.g. Neuron Forge) ignore the comment for free.
+    ``active`` is :meth:`EventLog.active_tool_call`'s return value. The
+    line is an SSE comment (``: tool_progress <json>``), not an
+    ``event:``/``data:`` block -- invisible to spec-compliant
+    ``EventSource`` consumers, and cannot carry an ``id:``. Pure transport
+    liveness, telling a watcher what the remote is doing without injecting
+    a synthetic event into the durable, replayable event stream. Only the
+    CLI renderer parses it; HTTP consumers ignore it for free.
     """
     progress = dict(active)
     started = progress.pop("started_at", None)
@@ -154,25 +194,61 @@ def _tool_progress_sse(active: dict, now: float) -> str:
     return f": tool_progress {payload}\n\n"
 
 
-async def _sse_event_stream(session, start, *, server, is_disconnected, mgr=None):  # noqa: ANN001
+def _control_sse(code: str, message: str, **details: Any) -> str:
+    """Frame a cursor-neutral subscription control signal."""
+    payload = {
+        "code": code,
+        "message": message,
+        "action": "full_reconcile",
+        **details,
+    }
+    return (
+        "event: bridge_control\n"
+        f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
+    )
+
+
+async def _sse_event_stream(  # noqa: ANN001
+    session,
+    start,
+    *,
+    server,
+    is_disconnected,
+    mgr=None,
+    signal_gaps: bool = False,
+    expected_continuity_id: str | None = None,
+    heartbeat_interval: float = 30.0,
+):
     """The SSE event generator for ``GET /{id}/events`` (extracted for testing).
 
     Streams durable events past ``start``; on each quiet ``wait_for_events``
-    return it emits a liveness beat (tool-progress or heartbeat). Crucially it
-    **closes promptly on daemon shutdown or client disconnect**: it races the
-    (up to 30s) event wait against a fine poll of uvicorn's ``server.should_exit``
-    (set on SIGTERM *before* uvicorn waits on in-flight requests). Without this a
-    long-lived stream pins the daemon's graceful shutdown open until systemd's
-    TimeoutStopSec SIGKILL (#1789) -- which also starves the lifespan
-    graceful-cancel on a bare ``systemctl restart``. The per-cycle beat cadence
-    is unchanged.
-
-    While a stream is live it counts as an active **subscriber** (#1826) via
-    ``mgr.add_subscriber``/``remove_subscriber`` so the idle reaper never reaps
-    a session someone is watching. The decrement is in a ``finally`` so it runs
-    on shutdown, client disconnect, or generator close.
+    return it emits a liveness beat (tool-progress or heartbeat). It
+    **closes promptly on daemon shutdown or client disconnect**: it races
+    the (up to 30s) event wait against a fine poll of uvicorn's
+    ``server.should_exit`` -- without this a long-lived stream pins
+    graceful shutdown open until systemd's TimeoutStopSec SIGKILL (#1789).
+    While live it counts as an active **subscriber** (#1826) via
+    ``mgr.add_subscriber``/``remove_subscriber`` so the idle reaper never
+    reaps a session someone is watching. The decrement is in a ``finally``.
     """
     cursor = start
+    continuity_id = (
+        getattr(session.event_log, "continuity_id", None)
+        if signal_gaps
+        else None
+    )
+    if (
+        signal_gaps
+        and expected_continuity_id is not None
+        and expected_continuity_id != continuity_id
+    ):
+        yield _control_sse(
+            "cursor_invalidated",
+            "the authoritative event log continuity changed",
+            prior_continuity_id=expected_continuity_id,
+            continuity_id=continuity_id,
+        )
+        return
 
     if mgr is not None:
         mgr.add_subscriber(session.session_id)
@@ -193,8 +269,19 @@ async def _sse_event_stream(session, start, *, server, is_disconnected, mgr=None
         while True:
             if await _closing():
                 return
-            wait_task = asyncio.ensure_future(
-                session.event_log.wait_for_events(cursor, timeout=30.0))
+            wait_snapshot = getattr(
+                session.event_log, "wait_for_events_snapshot", None
+            )
+            if callable(wait_snapshot):
+                wait_task = asyncio.ensure_future(
+                    wait_snapshot(cursor, timeout=heartbeat_interval)
+                )
+            else:
+                wait_task = asyncio.ensure_future(
+                    session.event_log.wait_for_events(
+                        cursor, timeout=heartbeat_interval
+                    )
+                )
             while True:
                 done, _pending = await asyncio.wait({wait_task}, timeout=0.5)
                 if done:
@@ -204,14 +291,70 @@ async def _sse_event_stream(session, start, *, server, is_disconnected, mgr=None
                     with contextlib.suppress(BaseException):
                         await wait_task
                     return
-            events = wait_task.result()
+            wait_result = wait_task.result()
+            if (
+                isinstance(wait_result, tuple)
+                and len(wait_result) == 2
+            ):
+                current_continuity_id, events = wait_result
+            else:
+                events = wait_result
+                current_continuity_id = (
+                    getattr(session.event_log, "continuity_id", None)
+                    if signal_gaps
+                    else None
+                )
+            if signal_gaps and current_continuity_id != continuity_id:
+                if continuity_id is None and cursor == 0 and events:
+                    continuity_id = current_continuity_id
+                else:
+                    yield _control_sse(
+                        "cursor_invalidated",
+                        "the authoritative event log was rebuilt",
+                        prior_continuity_id=continuity_id,
+                        continuity_id=current_continuity_id,
+                    )
+                    return
             if events:
+                if signal_gaps and events[0].id != cursor + 1:
+                    yield _control_sse(
+                        "replay_gap",
+                        "the authoritative event stream is not contiguous",
+                        after=cursor,
+                        next_event_id=events[0].id,
+                        continuity_id=continuity_id,
+                    )
+                    return
                 for evt in events:
-                    data = json.dumps({
+                    if signal_gaps:
+                        current_continuity_id = getattr(
+                            session.event_log, "continuity_id", None
+                        )
+                        if current_continuity_id != continuity_id:
+                            yield _control_sse(
+                                "cursor_invalidated",
+                                "the authoritative event log was rebuilt",
+                                prior_continuity_id=continuity_id,
+                                continuity_id=current_continuity_id,
+                            )
+                            return
+                        if evt.id != cursor + 1:
+                            yield _control_sse(
+                                "replay_gap",
+                                "the authoritative event stream is not contiguous",
+                                after=cursor,
+                                next_event_id=evt.id,
+                                continuity_id=continuity_id,
+                            )
+                            return
+                    event_payload = {
                         "event": evt.event,
                         "data": evt.data,
                         "timestamp": evt.timestamp,
-                    })
+                    }
+                    if signal_gaps:
+                        event_payload["continuity_id"] = continuity_id
+                    data = json.dumps(event_payload)
                     yield f"id: {evt.id}\nevent: {evt.event}\ndata: {data}\n\n"
                     cursor = evt.id
                 continue
@@ -230,12 +373,14 @@ def _session_info(s) -> SessionInfo:  # noqa: ANN001
     """Convert an internal Session to the public SessionInfo model."""
     from datetime import datetime, timezone
 
+    status, at_rest, liveness = s.public_state()
     return SessionInfo(
         session_id=s.session_id,
         name=s.name,
         agent_name=s.agent_name,
         caller_id=s.caller_id,
         acp_session_id=s.acp_session_id,
+        durable_session_id=s.acp_session_id or s.session_id,
         target_dir=s.target.cwd,
         target_type=s.target.type,
         target_host=s.target.host,
@@ -243,7 +388,7 @@ def _session_info(s) -> SessionInfo:  # noqa: ANN001
         worktree_id=s.target.worktree_id,
         elevated=s.target.elevated,
         read_only=False,
-        status=s.status,
+        status=status,
         pid=s.pid,
         turn_count=s.turn_count,
         context_size=s.context_size,
@@ -264,7 +409,8 @@ def _session_info(s) -> SessionInfo:  # noqa: ANN001
             datetime.fromtimestamp(s.last_heartbeat_at, tz=timezone.utc).isoformat()
             if s.last_heartbeat_at else None
         ),
-        liveness=s.liveness_state(),
+        liveness=liveness,
+        at_rest=at_rest,
     )
 
 
@@ -307,6 +453,7 @@ def _persisted_session_info(
         agent_name=row.get("agent_name"),
         caller_id=row.get("caller_id"),
         acp_session_id=row.get("acp_session_id"),
+        durable_session_id=row.get("acp_session_id") or row["id"],
         target_dir=target.cwd,
         target_type=target.type,
         target_host=target.host,
@@ -330,9 +477,8 @@ def _persisted_session_info(
     )
 
 
-# Session states considered "alive" and therefore reusable for caller affinity.
-# Terminal/stopped states are excluded -- reusing them would hand back a session
-# with no running process, so the caller should get a fresh spawn instead.
+# Session states considered "alive"/reusable for caller affinity. Terminal
+# states are excluded -- reusing one would hand back a no-process session.
 _REUSABLE_STATES = frozenset({
     SessionStatus.CREATED,
     SessionStatus.STARTING,
@@ -357,21 +503,38 @@ def _find_reusable_session(mgr, agent_name, caller_id):
     return None
 
 
-def _enforce_worktree_head_guard(worktree_id: str) -> None:
+def _enforce_worktree_head_guard(worktree_id: str, mgr=None) -> None:
     """Refuse a create into a worktree with an active head or pending handoff.
 
-    Derives the head from agent-worktrees (see :mod:`..worktree_head`). When the
-    worktree is occupied by a current session or handoff, raises an ``HTTPException``
-    409 whose structured detail enumerates the three deliberate resolutions
-    (reuse / handoff / sunset) plus the ``reclaim`` break-glass. Fails **open**:
-    an untracked worktree or an unreadable ground layer yields ``occupied=False``
-    and this returns without raising, so create proceeds exactly as before.
+    Derives the head from agent-worktrees. When occupied, raises
+    ``HTTPException`` 409 enumerating the three deliberate resolutions
+    (reuse / handoff / sunset); the sole take-over mechanism is
+    ``resume ... --force`` (agent-bridge-cold-resume Phase 3). Fails
+    **open**: an untracked worktree or unreadable ground layer yields
+    ``occupied=False``.
+
+    An asserted ``active`` head naming a session id is cross-checked,
+    when ``mgr`` is supplied, against agent-bridge's own live session
+    store: a pointer can go stale (a session ended or never existed
+    here, with no conclude told to the ground layer), leaving a phantom
+    "active" head blocking creation forever. Absent entirely, treat it
+    as unverifiable -- only a known session still blocks.
     """
     from ..worktree_head import resolve_head
 
     head = resolve_head(worktree_id)
     if not head.occupied:
         return
+    if head.active and head.head_session and mgr is not None:
+        known_ids = {session.session_id for session in mgr.list_sessions()}
+        if head.head_session not in known_ids:
+            log.warning(
+                "worktree %s head guard: asserted head session %s is absent "
+                "from agent-bridge's own session store; treating as stale "
+                "and permitting the create",
+                worktree_id, head.head_session,
+            )
+            return
     pending = head.occupied and not head.active
     raise HTTPException(
         status_code=409,
@@ -387,15 +550,15 @@ def _enforce_worktree_head_guard(worktree_id: str) -> None:
                 (
                     f"Worktree {worktree_id} has a pending handoff; starting "
                     "another session could race the intended successor. "
-                    "Consume or explicitly supersede the handoff, or pass "
-                    "reclaim=true to take over."
+                    "Consume or explicitly supersede the handoff, or take "
+                    "over per 'override' below."
                 )
                 if pending else
                 (
                     f"Worktree {worktree_id} already has a current session "
                     f"({head.head_session}); starting a new one would run in "
                     "parallel with it. Resolve the incumbent first (reuse / "
-                    "handoff / sunset), or pass reclaim=true to take over."
+                    "handoff / sunset), or take over per 'override' below."
                 )
             ),
             "choices": [
@@ -425,7 +588,7 @@ def _enforce_worktree_head_guard(worktree_id: str) -> None:
                     ),
                 },
             ],
-            "override": "reclaim=true",
+            "override": f"agent-bridge resume {worktree_id} --force",
         },
     )
 
@@ -447,9 +610,9 @@ async def start_session(req: StartSessionRequest, request: Request):
             if isinstance(canonical, str) and canonical:
                 agent_name = canonical
 
-    # Refuse new sessions fast while draining -- before any agent resolution or
-    # spawn work -- so a zero-downtime redeploy stops growing the daemon it is
-    # about to retire. (The manager enforces the same gate as a backstop.)
+    # Refuse new sessions fast while draining, before any agent resolution
+    # or spawn work, so a redeploy stops growing the daemon about to
+    # retire (the manager enforces the same gate as a backstop).
     if mgr.is_draining:
         raise HTTPException(
             status_code=503,
@@ -490,10 +653,9 @@ async def start_session(req: StartSessionRequest, request: Request):
 
     # Caller-affinity reuse: if the caller supplies a caller_id (e.g. a
     # Neuron-Forge worktree GUID) and an alive session already exists for
-    # that (agent, caller_id) pair, return it instead of spawning a new one.
-    # This makes create idempotent for HTTP consumers -- a duplicate POST
-    # from a reload or double-click resolves to the same session/worktree
-    # rather than creating a second one.  Pass force_new to opt out.
+    # that (agent, caller_id) pair, return it instead of spawning a new
+    # one -- makes create idempotent for HTTP consumers. Pass force_new
+    # to opt out.
     if req.caller_id and not req.force_new:
         existing = _find_reusable_session(mgr, agent_name, req.caller_id)
         if existing is not None:
@@ -504,23 +666,16 @@ async def start_session(req: StartSessionRequest, request: Request):
             )
 
     # Session-lifecycle head guard (agent-fabric
-    # `single-current-session-per-worktree`). Creating a session *into an
-    # existing worktree* (``worktree_id`` set -- e.g. a Neuron-Forge session
-    # roll) whose ground-layer head is still ``active`` would silently spawn a
-    # second, parallel session in a worktree that already has a current one.
-    # Refuse it: the caller must reuse (preferred), hand off, or sunset the
-    # incumbent -- ``reclaim=true`` is the deliberate break-glass take-over. The
-    # head is *derived* from agent-worktrees (the ground-layer owner); agent-
-    # bridge keeps no rival pointer (``derive-dont-duplicate``). Fails open: if
-    # the ground layer can't be read, ``active`` is False and create proceeds.
-    #
-    # This is the create-time sibling of the ``resume_worktree`` liveness guard
-    # (409 ``live_cli_holds_worktree``, also reclaim-bypassed): that one refuses
-    # owning a worktree a live *process* holds; this one refuses spawning atop a
-    # worktree an *asserted* head owns. Together they are one story -- a worktree
-    # has one current session, and taking it over is an explicit act.
-    if req.worktree_id and not req.reclaim:
-        _enforce_worktree_head_guard(req.worktree_id)
+    # `single-current-session-per-worktree`). Creating a session into an
+    # existing worktree whose ground-layer head is still `active` would
+    # silently spawn a second, parallel session -- refuse it: reuse
+    # (preferred), hand off, or sunset the incumbent (`create` has no
+    # break-glass; the sole take-over mechanism is `resume ... --force`,
+    # agent-bridge-cold-resume Phase 3). Head is *derived* from
+    # agent-worktrees; fails open if unreadable. Sibling of
+    # `resume_worktree`'s `live_cli_holds_worktree` liveness guard.
+    if req.worktree_id:
+        _enforce_worktree_head_guard(req.worktree_id, mgr)
 
     if agent_name:
         # Resolve agent via registry
@@ -537,6 +692,14 @@ async def start_session(req: StartSessionRequest, request: Request):
             raise HTTPException(status_code=404, detail=str(exc))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            # A namespace provider (e.g. agent-containers) refused readiness --
+            # "not ready", a stale/mismatched image, a missing fleet config,
+            # etc. This is a real, actionable client-facing condition, not an
+            # unexpected server fault -- previously fell through the bare
+            # `except Exception: raise` below and surfaced as an opaque,
+            # untraceable 500 (#7708).
+            raise HTTPException(status_code=409, detail=str(exc))
         except Exception as exc:
             # Ambiguous bare name (collision across namespaces): balk with the
             # enumerated candidates so the caller can disambiguate (#50).
@@ -550,6 +713,7 @@ async def start_session(req: StartSessionRequest, request: Request):
             target.worktree_id = req.worktree_id
         if req.target_dir:
             target.cwd = req.target_dir
+            target.explicit_cwd = True
     else:
         target = SpawnTarget(
             type="local",
@@ -572,8 +736,7 @@ async def start_session(req: StartSessionRequest, request: Request):
             )
 
     # Per-session env overrides (e.g. BYOK provider selection) merge onto the
-    # resolved agent's declared env, per-session winning. Applied to the spawned
-    # Copilot process by the transport (``env.update(target.env)``).
+    # agent's declared env, per-session winning (applied by the transport).
     if req.env:
         target.env = {**target.env, **req.env}
 
@@ -582,6 +745,7 @@ async def start_session(req: StartSessionRequest, request: Request):
             target, agent_name=agent_name, caller_id=req.caller_id,
             mcp_servers=req.mcp_servers,
             copilot_args=req.copilot_args,
+            env_overrides=req.env,
             caller_owner_ref=req.caller_owner_ref,
             model=req.model, effort=req.effort,
             parity_fault=req.parity_fault,
@@ -619,16 +783,13 @@ async def list_sessions(request: Request, status: str | None = None):
     mgr: SessionManager = request.app.state.session_manager
     status = status or None
     primary_sessions = mgr.list_sessions()
-    infos = [
-        _session_info(session)
-        for session in primary_sessions
-        if status is None or session.status.value == status
-    ]
+    infos = [_session_info(session) for session in primary_sessions]
+    if status is not None:
+        infos = [info for info in infos if info.status.value == status]
 
-    # Elevated sessions live in a separate daemon/database. The primary daemon
-    # remains their discovery surface after that daemon idle-exits; rows already
-    # represented by a primary relay session are omitted to avoid showing the
-    # same conversation twice.
+    # Elevated sessions live in a separate daemon/database; the primary
+    # daemon remains their discovery surface after it idle-exits. Rows
+    # already represented by a primary relay session are omitted.
     if not elevated.is_subdaemon():
         rows = await asyncio.to_thread(elevated.persisted_session_rows)
         if rows:
@@ -656,9 +817,53 @@ async def list_sessions(request: Request, status: str | None = None):
 async def get_session(session_id: str, request: Request):
     mgr: SessionManager = request.app.state.session_manager
     session = mgr.get_session(session_id)
-    if not session:
+    if session:
+        return _session_info(session)
+    # Nothing live -- ask a registered cold-store provider before giving up.
+    cold = await mgr.fetch_cold_store_session(session_id)
+    if cold is not None:
+        return cold_store_session_info(cold)
+    raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+
+@router.get("/{session_id}/transcript")
+async def get_session_transcript(session_id: str, request: Request) -> dict[str, Any]:
+    """Return a bare (non-worktree-scoped) session's rendered transcript.
+
+    Checks agent-bridge's own live ledger first (a solo session can be a
+    live ACP session with no owning agent to shell into); falls through
+    to the registered cold-store provider only when nothing is live -- so
+    a bare-session consumer (Neuron Forge's `/sessions/:sid`) can retire
+    its direct Permanent Record dependency.
+    """
+    mgr: SessionManager = request.app.state.session_manager
+    session = mgr.get_session(session_id)
+    if session is not None:
+        status, at_rest, _liveness = session.public_state()
+        rows = mgr.db.get_events_range(session.session_id, 0, None)
+        return {
+            "session_id": session.session_id,
+            "events": _rows_to_events(rows),
+            "meta": {
+                "worktree_id": session.target.worktree_id,
+                "status": status.value,
+                "read_only": False,
+                "at_rest": at_rest,
+            },
+        }
+    cold = await mgr.fetch_cold_store_session(session_id)
+    if cold is None:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
-    return _session_info(session)
+    return {
+        "session_id": session_id,
+        "events": list(cold.events),
+        "meta": {
+            "worktree_id": cold.worktree_id,
+            "status": cold.status,
+            "read_only": True,
+            "at_rest": True,
+        },
+    }
 
 
 @router.get("/{session_id}/usage")
@@ -670,6 +875,7 @@ async def get_session_usage(session_id: str, request: Request):
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
     from datetime import datetime, timezone
 
+    status, at_rest, _liveness = session.public_state()
     return {
         "session_id": session.session_id,
         "context_size": session.context_size,
@@ -681,7 +887,8 @@ async def get_session_usage(session_id: str, request: Request):
             if session.last_usage_at else None
         ),
         "turn_count": session.turn_count,
-        "status": session.status.value,
+        "status": status.value,
+        "at_rest": at_rest,
     }
 
 
@@ -691,13 +898,11 @@ async def get_session_status(
 ):
     """Compact, single-screen status for a dispatch.
 
-    Returns session state, turn count, the caller's delivery-cursor position
-    vs the head (so a watcher knows how far behind it is), and -- crucially --
-    the *in-flight tool call with elapsed time*. That liveness is otherwise
-    only emitted as a cursor-neutral SSE ``: tool_progress`` comment (invisible
-    to ``read``), so a watcher could not previously tell a busy agent from a
-    hung one without dumping the whole feed. This endpoint surfaces it cheaply
-    (#46.1).
+    Returns session state, turn count, delivery-cursor position vs head,
+    and the *in-flight tool call with elapsed time* -- otherwise only
+    emitted as a cursor-neutral SSE ``: tool_progress`` comment (invisible
+    to ``read``), so a watcher could not tell a busy from a hung agent
+    without dumping the whole feed (#46.1).
     """
     import time as _time
     from datetime import datetime, timezone
@@ -707,6 +912,7 @@ async def get_session_status(
     if not session:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
+    status, at_rest, _liveness = session.public_state()
     active = session.event_log.active_tool_call() if session.event_log else None
     if active and active.get("started_at") is not None:
         active = {**active, "elapsed_s": max(0.0, _time.time() - active["started_at"])}
@@ -719,7 +925,8 @@ async def get_session_status(
         "name": session.name,
         "agent_name": session.agent_name,
         "caller_id": session.caller_id,
-        "status": session.status.value,
+        "status": status.value,
+        "at_rest": at_rest,
         "turn_count": session.turn_count,
         "context_pct": session.context_pct,
         "usage_model": session.usage_model,
@@ -732,9 +939,7 @@ async def get_session_status(
             session.client.pending_ask_user() if session.client else []
         ),
         "progress": dict(session.progress),
-        "updated_at": datetime.fromtimestamp(
-            session.updated_at, tz=timezone.utc
-        ).isoformat(),
+        "updated_at": datetime.fromtimestamp(session.updated_at, tz=timezone.utc).isoformat(),
     }
 
 
@@ -812,6 +1017,75 @@ def get_result_detail(
         raise HTTPException(status_code=404, detail=detail) from exc
 
 
+@router.get(
+    "/{session_ref}/attention",
+    response_model=AttentionWaitResponse,
+)
+async def wait_for_attention(
+    session_ref: str,
+    request: Request,
+    reason: list[AttentionReason] = Query(min_length=1),
+    position: str | None = Query(default=None, max_length=2048),
+    timeout_seconds: float = Query(default=30.0, ge=0.0, le=30.0),
+):
+    """Wait for the earliest selected durable attention boundary."""
+    mgr: SessionManager = request.app.state.session_manager
+    try:
+        if position is None:
+            session = _resolve_result_session(mgr, session_ref)
+        else:
+            observed_session_id = attention_position_session_id(position)
+            session = mgr.get_session(observed_session_id)
+            if (
+                session is not None
+                and session_ref != session.target.worktree_id
+            ):
+                requested_session = _resolve_result_session(mgr, session_ref)
+                if (
+                    requested_session is None
+                    or requested_session.session_id != session.session_id
+                ):
+                    raise AttentionTokenError(
+                        "attention position targets a different delegate"
+                    )
+    except AttentionTokenError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session or worktree {session_ref} not found",
+        )
+    if session.event_log is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Session history is not loaded in the active bridge generation",
+        )
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        after = session.event_log.latest_id
+        try:
+            result = evaluate_owned_attention(
+                db=mgr.db,
+                session=session,
+                requested_ref=session_ref,
+                reasons=reason,
+                position=position,
+            )
+        except AttentionHistoryChangedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except AttentionTokenError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if result.settled or result.identity.successor_id:
+            return result
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return result
+        await session.event_log.wait_for_events(
+            after, timeout=min(remaining, 30.0)
+        )
+
+
 @router.post("/{session_id}/turns", response_model=SubmitPromptResponse)
 async def submit_prompt(
     session_id: str,
@@ -821,10 +1095,10 @@ async def submit_prompt(
 ):
     """Submit a prompt to a session.
 
-    Default (``queue=false``) preserves the legacy contract: run now, or 409 if
-    the session is busy. With ``queue=true`` the prompt is durably queued when
-    the session is busy (persisted to ``pending_prompts``, delivered FIFO on
-    settle -- surviving remount/crash/restart); the response is 202 with
+    Default (``queue=false``) preserves the legacy contract: run now, or
+    409 if the session is busy. With ``queue=true`` the prompt is durably
+    queued when busy (persisted to ``pending_prompts``, delivered FIFO on
+    settle, surviving remount/crash/restart); response is 202 with
     ``queued=true`` and the queue position.
     """
     mgr: SessionManager = request.app.state.session_manager
@@ -842,6 +1116,11 @@ async def submit_prompt(
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except ProviderTargetRefreshError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=ProviderTargetRefreshError.public_message,
+        ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -914,6 +1193,11 @@ async def resync_session(session_id: str, request: Request):
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except ProviderTargetRefreshError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=ProviderTargetRefreshError.public_message,
+        ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -936,40 +1220,129 @@ async def get_events(
     request: Request,
     after: int | None = None,
     caller_id: str | None = None,
+    controlled: bool = False,
+    continuity_id: str | None = Query(
+        default=None, min_length=1, max_length=128
+    ),
+    transient: bool = False,
 ):
     """SSE event stream with durable event IDs.
 
     Resume semantics:
 
-    - ``?after=<id>`` -- explicit start point (back-compat). Streams events
-      with id > after.
-    - omitted ``after`` + ``caller_id`` -- resume from the caller's last
-      *acked* delivery cursor, so a reconnect picks up exactly where the
-      host left off (nothing skipped on ungraceful death).
+    - ``?after=<id>`` -- explicit start point (back-compat).
+    - omitted ``after`` + ``caller_id`` -- resume from the last acked cursor.
     - omitted ``after`` + no caller_id -- start from the beginning (0).
 
     The stream never advances the delivery cursor itself; the client acks
-    delivered events via ``POST /{id}/cursor`` after flushing them, which
-    is what makes delivery confirmation (not server-side production) drive
-    the cursor.
+    delivered events via ``POST /{id}/cursor`` after flushing them, so
+    delivery confirmation (not server-side production) drives the cursor.
     """
     mgr: SessionManager = request.app.state.session_manager
     session = mgr.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    controlled_caller_id = (
+        _controlled_cursor_key(caller_id) if controlled else None
+    )
     if not session.event_log:
         raise HTTPException(status_code=500, detail="No event log for session")
 
+    cursor_state = None
+    current_continuity_id = None
+    if controlled:
+        if transient and (after is None or continuity_id is None):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "transient controlled resume requires after and continuity_id"
+                ),
+            )
+        cursor_state = mgr.db.get_controlled_cursor_state(
+            controlled_caller_id, session_id
+        )
+        invalidation = cursor_state.get("invalidation")
+        if invalidation:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "cursor_invalidated",
+                    "message": "the caller cursor was invalidated by an event-log rebuild",
+                    "action": "full_reconcile",
+                    **invalidation,
+                },
+            )
+        current_continuity_id = cursor_state["continuity_id"]
+        if (
+            continuity_id is not None
+            and continuity_id != current_continuity_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "cursor_invalidated",
+                    "message": "the authoritative event log continuity changed",
+                    "action": "full_reconcile",
+                    "prior_continuity_id": continuity_id,
+                    "continuity_id": current_continuity_id,
+                },
+            )
+
     if after is None:
-        start = mgr.db.get_cursor(_cursor_key(caller_id), session_id)
+        start = (
+            cursor_state["last_acked_id"]
+            if cursor_state is not None
+            else mgr.db.get_cursor(_cursor_key(caller_id), session_id)
+        )
     else:
         start = after
+    if controlled:
+        durable_cursor = int(cursor_state["last_acked_id"])
+        transient_resume = (
+            transient
+            and after is not None
+            and after >= durable_cursor
+            and continuity_id == current_continuity_id
+        )
+        if after is not None and after != durable_cursor and not transient_resume:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "cursor_mismatch",
+                    "message": "the requested start does not match the durable caller cursor",
+                    "action": "full_reconcile",
+                    "requested_after": after,
+                    "last_acked_id": durable_cursor,
+                },
+            )
+        head_id = int(cursor_state["head_id"])
+        if start > head_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "replay_gap",
+                    "message": "the durable caller cursor is beyond the authoritative event head",
+                    "action": "full_reconcile",
+                    "last_acked_id": start,
+                    "head_id": head_id,
+                },
+            )
+        mgr.db.ensure_cursor(
+            _cursor_key(caller_id), session_id, time.time()
+        )
 
     server = getattr(request.app.state, "uvicorn_server", None)
     return StreamingResponse(
         _sse_event_stream(session, start, server=server,
                           is_disconnected=getattr(request, "is_disconnected", None),
-                          mgr=mgr),
+                          mgr=mgr,
+                          signal_gaps=controlled,
+                          expected_continuity_id=(
+                              current_continuity_id
+                              if controlled
+                              else continuity_id
+                          ),
+                          heartbeat_interval=5.0 if controlled else 30.0),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -993,18 +1366,10 @@ async def get_events_range(
     session = mgr.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
-    rows = mgr.db.get_events_range(session_id, start, end)
+    rows = mgr.db.get_events_range(session.session_id, start, end)
     return {
-        "session_id": session_id,
-        "events": [
-            {
-                "id": r["event_id"],
-                "event": r["event_type"],
-                "data": r["data"],
-                "timestamp": r["timestamp"],
-            }
-            for r in rows
-        ],
+        "session_id": session.session_id,
+        "events": _rows_to_events(rows),
     }
 
 
@@ -1015,10 +1380,17 @@ async def get_cursor(session_id: str, request: Request, caller_id: str | None = 
     session = mgr.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
-    last = mgr.db.get_cursor(_cursor_key(caller_id), session_id)
+    state = mgr.db.get_controlled_cursor_state(
+        _cursor_key(caller_id), session_id
+    )
     return CursorInfo(
-        session_id=session_id, caller_id=caller_id, last_acked_id=last,
-        head_id=mgr.db.get_max_event_id(session_id),
+        session_id=session_id,
+        caller_id=caller_id,
+        last_acked_id=state["last_acked_id"],
+        head_id=state["head_id"],
+        continuity_id=state["continuity_id"],
+        cursor_registered=state["registered"],
+        invalidation=state["invalidation"],
     )
 
 
@@ -1035,11 +1407,59 @@ async def ack_cursor(
     session = mgr.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
-    effective = mgr.db.set_cursor(
-        _cursor_key(req.caller_id), session_id, req.last_id, time.time()
+    if req.continuity_id is None:
+        effective = mgr.db.set_cursor(
+            _cursor_key(req.caller_id),
+            session_id,
+            req.last_id,
+            time.time(),
+        )
+        state = mgr.db.get_controlled_cursor_state(
+            _cursor_key(req.caller_id), session_id
+        )
+        return CursorInfo(
+            session_id=session_id,
+            caller_id=req.caller_id,
+            last_acked_id=effective,
+            head_id=state["head_id"],
+            continuity_id=state["continuity_id"],
+            cursor_registered=True,
+            invalidation=state["invalidation"],
+        )
+
+    result = mgr.db.acknowledge_controlled_cursor(
+        _controlled_cursor_key(req.caller_id),
+        session_id,
+        req.last_id,
+        time.time(),
+        continuity_id=req.continuity_id,
     )
+    if not result["accepted"]:
+        code = result["code"]
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": code,
+                "message": (
+                    "the acknowledgement names a replaced event log"
+                    if code == "cursor_invalidated"
+                    else "the acknowledgement is beyond the event head"
+                ),
+                "action": "full_reconcile",
+                "prior_continuity_id": req.continuity_id,
+                "continuity_id": result["continuity_id"],
+                "head_id": result["head_id"],
+                **(result["invalidation"] or {}),
+            },
+        )
+    effective = result["last_acked_id"]
     return CursorInfo(
-        session_id=session_id, caller_id=req.caller_id, last_acked_id=effective
+        session_id=session_id,
+        caller_id=req.caller_id,
+        last_acked_id=effective,
+        head_id=result["head_id"],
+        continuity_id=result["continuity_id"],
+        cursor_registered=True,
     )
 
 
@@ -1050,13 +1470,13 @@ async def stop_session(
     """Stop a session, preserving state for resume.
 
     ``reap_host=true`` additionally FREES the Session-Host child immediately
-    (the same primitive the idle-reaper uses) instead of merely detaching it to
-    keep it reattachable. A caller that never reattaches over the bridge (e.g.
-    the AI reviewer, which resumes from on-disk session-state
-    + worktree via a fresh child) uses this to reclaim the ~280 MB child on the
-    spot rather than waiting out the idle-reaper TTL -- while the session stays
-    STOPPED and resumable via ``load_session`` replay. Default ``false`` keeps
-    the reattach-friendly behavior for fronts like Neuron Forge.
+    (the same primitive the idle-reaper uses) instead of merely detaching
+    it. A caller that never reattaches over the bridge (e.g. the AI
+    reviewer, which resumes from on-disk session-state + worktree via a
+    fresh child) uses this to reclaim the ~280 MB child on the spot rather
+    than waiting out the idle-reaper TTL -- while the session stays
+    STOPPED and resumable via ``load_session`` replay. Default ``false``
+    keeps the reattach-friendly behavior for fronts like Neuron Forge.
     """
     mgr: SessionManager = request.app.state.session_manager
     try:
@@ -1138,9 +1558,8 @@ async def answer_ask_user(
     """Answer a parked ``ask_user`` elicitation, unblocking the agent's turn.
 
     Resolves the session's pending ACP ``elicitation/create`` for the given
-    tool call with the human's answer so the agent's ``ask_user`` completes.
-    ``409`` if no matching request is outstanding (already answered, withdrawn,
-    or never asked).
+    tool call with the human's answer. ``409`` if no matching request is
+    outstanding (already answered, withdrawn, or never asked).
     """
     mgr: SessionManager = request.app.state.session_manager
     try:
@@ -1162,6 +1581,31 @@ async def answer_ask_user(
     return {"status": "answered"}
 
 
+@router.post("/{session_id}/permission")
+async def answer_permission(
+    session_id: str, req: AnswerPermissionRequest, request: Request,
+):
+    """Resolve the currently parked correlated permission request."""
+    mgr: SessionManager = request.app.state.session_manager
+    try:
+        resolved = await mgr.answer_permission(
+            session_id, req.request_id, req.option_id
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if not resolved:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"No pending permission request {req.request_id} "
+                f"on session {session_id}"
+            ),
+        )
+    return {"status": "answered"}
+
+
 @router.post("/{session_id}/resume", response_model=SessionInfo)
 async def resume_session(session_id: str, request: Request):
     """Resume a stopped session by spawning a new agent process."""
@@ -1172,6 +1616,11 @@ async def resume_session(session_id: str, request: Request):
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except ProviderTargetRefreshError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=ProviderTargetRefreshError.public_message,
+        ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -1187,16 +1636,13 @@ async def handoff_session(
 ):
     """Hand a hosted session off to a fresh successor in the SAME worktree.
 
-    The in-place, bridge-native analogue of the interactive context handoff:
-    the retiring child authors a continuation brief, a successor is spawned in
-    the same worktree/agent/caller, a ``session_handoff`` event announces the
-    changeover on both event streams, the successor is seeded with the brief,
-    and the predecessor is retired (STOPPED, resumable). Returns the
-    **successor** session so a caller can follow the baton in place.
-
-    ``reason`` is an optional free-form label carried on the event (defaults to
-    ``context-pressure``). ``seed=false`` skips seeding the successor's opening
-    turn (the caller drives it instead).
+    The bridge-native analogue of an interactive context handoff: the
+    retiring child authors a continuation brief, a successor is spawned
+    in the same worktree/agent/caller, a ``session_handoff`` event
+    announces the changeover, and the predecessor retires (STOPPED,
+    resumable). Returns the **successor** to follow the baton. ``reason``
+    is an optional free-form label (default ``context-pressure``);
+    ``seed=false`` skips seeding the successor's opening turn.
 
     Errors: 404 (no such session), 409 (single-checkout agent or mid-turn),
     502 (successor failed to spawn -- predecessor retained), 503 (draining).
@@ -1216,13 +1662,23 @@ async def handoff_session(
 
 
 @router.delete("/{session_id}", status_code=204)
-async def end_session(session_id: str, request: Request, force: bool = False):
+async def end_session(
+    session_id: str,
+    request: Request,
+    force: bool = False,
+    if_idle: bool = False,
+):
     mgr: SessionManager = request.app.state.session_manager
     try:
-        await mgr.end_session(session_id, force=force)
+        if if_idle:
+            await mgr.end_session_if_idle(session_id, force=force)
+        else:
+            await mgr.end_session(session_id, force=force)
     except SessionBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
     except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))

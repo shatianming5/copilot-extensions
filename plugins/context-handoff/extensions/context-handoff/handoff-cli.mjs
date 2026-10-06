@@ -3,7 +3,7 @@
 // without the context-handoff session extension.
 //
 // Why this exists: the handoff tools (generate_handoff_prompt /
-// save_handoff_prompt / continue_handoff) are provided by the context-handoff
+// save_handoff_prompt / trigger_handoff) are provided by the context-handoff
 // EXTENSION. When that extension does not resolve or fails to load -- most
 // notably a Bare-resumed session, where NO extensions load and
 // `extensions list` shows nothing -- an agent has no in-session way to hand off.
@@ -17,10 +17,17 @@
 // passes it in via --prompt-file / --prompt / stdin.
 //
 // Usage:
-//   node handoff-cli.mjs cutover  --title "<t>" --prompt-file <f>   # store + live cutover (default)
-//   node handoff-cli.mjs save     --title "<t>" --prompt-file <f>   # store + print seed + paste prompt (no cutover)
-//   node handoff-cli.mjs continue --seed "<HANDOFF_SEED>"           # trigger the cutover for an existing seed
-//   node handoff-cli.mjs consume  --handoff-id <id> | --path <f>    # load a file handoff, mark consumed, print brief
+//   node handoff-cli.mjs trigger --title "<t>" --prompt-file <f>  # store + signal pickup
+//   node handoff-cli.mjs save    --title "<t>" --prompt-file <f>  # store only
+//   node handoff-cli.mjs consume --locator "task:<id>"            # consume a task baton
+//   node handoff-cli.mjs consume --locator "file:<id>"            # consume a file baton
+//   node handoff-cli.mjs facts --json                             # basic extension-free handoff facts
+//   node handoff-cli.mjs check-heads --json                       # audit pending-handoff head alignment
+//   node handoff-cli.mjs retry-cutover --json                     # refocus/live-retry a superseded session
+//   node handoff-cli.mjs sync-worktree --json                     # shared lock/rebase-safe worktree sync
+//   node handoff-cli.mjs list-sessions --json                     # this worktree's session + handoff chain
+//   node handoff-cli.mjs get-previous-session --json              # this (or a named) session's predecessor
+//   node handoff-cli.mjs abort --locator "task:<id>"              # cancel a pending handoff, unconsumed
 //   node handoff-cli.mjs help
 //
 // Options:
@@ -28,19 +35,64 @@
 //   --title <t>            short topic (leads the seed / task title)
 //   --session-id <sid>     default: $COPILOT_AGENT_SESSION_ID
 //   --cwd <dir>            default: current directory
-//   --no-task             force the file store (skip an agent-dispatch task)
-//   --seed <s>            (continue) the exact HANDOFF_SEED to spawn a successor with
-//   --handoff-id <id> | --path <f>   (consume) which file-backed handoff to load
-//   --json                machine-readable output
+//   --no-task              force the file store (skip an agent-dispatch task)
+//   --handoff-token <id>   reuse an already stored baton when triggering
+//   --locator "task:<id>"|"file:<id>" | --task-id <id> | --handoff-id <id> | --path <f>
+//                          stored handoff to consume/abort
+//   --worktree <id>        explicit worktree id (list-sessions/get-previous-session;
+//                          default: resolved from --cwd)
+//   --reason <text>        why (abort only; recorded on the handoff/task)
+//   --defer-complete       retain an agent-dispatch task until the handoff goal completes
+//   --json                 machine-readable output
 
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { parseRecoveryLocator } from "./cutover-seed.mjs";
+import { loadContextHandoffConfig } from "./config.mjs";
 import {
-  storeHandoff, buildSeedForStored, runHandoffCutover,
-  consumeFileHandoffOnce, decodeHandoffPayload, readFileHandoff,
-  safePathSegment, readSessionStateHandoff,
+  checkHeadAlignment,
+  storeHandoff, buildSeedForStored,
+  consumeFileHandoff, consumeDispatchHandoffTask,
+  collectCliHandoffFacts, formatConsumeResult,
+  normalizeHandoffTitle,
+  retryStoredHandoffCutover,
+  triggerHandoff,
+  attemptWorktreeSync,
+  waitForWorktreeSyncToSettle,
+  listWorktreeSessions,
+  getPreviousSession,
+  abortHandoffTask,
+  abortFileHandoff,
+  readFileHandoff,
+  readSessionStateHandoff,
+  safePathSegment,
 } from "./handoff-core.mjs";
+
+// Native goals (Copilot /goal) move only through the in-session extension,
+// which freezes the objective, mode and permissions; this SDK-free fallback
+// must neither drop them on save nor consume or relaunch a native baton.
+function nativeObjectiveExists(sid) {
+  if (!sid) return false;
+  const base = process.env.COPILOT_HOME || join(homedir(), ".copilot");
+  return existsSync(join(base, "session-state", safePathSegment(sid), "autopilot-objective.json"));
+}
+
+function nativeRequestPending(sid) {
+  const request = sid ? readSessionStateHandoff(sid)?.record : null;
+  return Boolean(request?.nativeGoal || request?.nativeState || request?.nativeContinuation);
+}
+
+function fileHandoffHasNativeContinuation(cwd, sid, handoffId, path) {
+  const found = readFileHandoff(cwd, sid, handoffId, path || null);
+  return Boolean(found?.record?.nativeContinuation || found?.record?.nativeState
+    || found?.record?.nativeGoalCheckpoint);
+}
+
+function refuseNative(command, message) {
+  process.stderr.write(`handoff-cli ${command}: ${message}\n`);
+  process.exit(1);
+}
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -48,7 +100,9 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a.startsWith("--")) {
       const key = a.slice(2);
-      const flags = new Set(["no-task", "json", "no-cutover"]);
+      const flags = new Set([
+        "no-task", "json", "defer-complete", "force",
+      ]);
       if (flags.has(key)) { out[key] = true; continue; }
       out[key] = argv[++i];
     } else {
@@ -70,181 +124,459 @@ function readPrompt(args) {
 }
 
 function resolveSid(args) {
-  return args["session-id"] || process.env.COPILOT_AGENT_SESSION_ID || null;
+  return args["session-id"]
+    || process.env.GROK_SESSION_ID
+    || process.env.COPILOT_AGENT_SESSION_ID
+    || process.env.CLAUDE_SESSION_ID
+    || process.env.CLAUDE_CODE_SESSION_ID
+    || null;
 }
 
 function emit(obj, args) {
-  if (args.json) { process.stdout.write(JSON.stringify(obj, null, 2) + "\n"); return; }
+  if (args.json) {
+    process.stdout.write(JSON.stringify(obj, null, 2) + "\n");
+    return;
+  }
   return obj;
-}
-
-function nativeObjectivePath(sid) {
-  if (!sid) return null;
-  const base = process.env.COPILOT_HOME || join(homedir(), ".copilot");
-  return join(base, "session-state", safePathSegment(sid), "autopilot-objective.json");
-}
-
-function nativeObjectiveExists(sid) {
-  const path = nativeObjectivePath(sid);
-  return Boolean(path && existsSync(path));
-}
-
-function fileHandoffHasNativeContinuation(cwd, sid, handoffId, path) {
-  const found = readFileHandoff(cwd, sid, handoffId, path || null);
-  return Boolean(found?.record?.nativeContinuation || found?.record?.nativeState
-    || found?.record?.nativeGoalCheckpoint);
 }
 
 const HELP = `handoff-cli -- invoke a context handoff from the CLI (extension-free fallback).
 
-  node handoff-cli.mjs cutover  --title "<t>" --prompt-file <f>   store + live cutover (default)
-  node handoff-cli.mjs save     --title "<t>" --prompt-file <f>   store + print seed + paste prompt
-  node handoff-cli.mjs continue --seed "<HANDOFF_SEED>"           trigger the cutover for a seed
-  node handoff-cli.mjs consume  --handoff-id <id> | --path <f>    load a file handoff + mark consumed
+  node handoff-cli.mjs trigger --title "<t>" --prompt-file <f>  store + signal pickup
+  node handoff-cli.mjs save    --title "<t>" --prompt-file <f>  store + print seed
+  node handoff-cli.mjs consume --locator "task:<id>"            consume a task baton
+  node handoff-cli.mjs consume --locator "file:<id>"            consume a file baton
+  node handoff-cli.mjs facts --json                             emit basic extension-free facts
+  node handoff-cli.mjs check-heads --json                       audit pending-handoff head alignment
+  node handoff-cli.mjs retry-cutover --json                     refocus or respawn a stuck cutover
+  node handoff-cli.mjs sync-worktree --json                     shared lock/rebase-safe worktree sync
+  node handoff-cli.mjs list-sessions --json                     this worktree's sessions + handoff chain
+  node handoff-cli.mjs get-previous-session --json              this (or a named) session's predecessor
+  node handoff-cli.mjs abort --locator "task:<id>"              cancel a pending handoff, unconsumed
 
-Options: --prompt-file|--prompt|stdin, --title, --session-id (\$COPILOT_AGENT_SESSION_ID),
-         --cwd, --no-task, --seed, --handoff-id|--path, --json`;
+Options: --prompt-file|--prompt|stdin, --title, --session-id ($COPILOT_AGENT_SESSION_ID),
+         --cwd, --no-task, --handoff-token, --force (trigger: arm live-cutover
+         signaling as if mode were "auto", regardless of the configured mode --
+         a deliberate, explicit, human-gated bypass for diagnostics; never set
+         this from an agent-invoked call),
+         --locator|--task-id|--handoff-id|--path, --worktree, --reason,
+         --defer-complete, --json`;
 
-function cmdStore(args, { cutover }) {
+function requireSid(command, args) {
+  const sid = resolveSid(args);
+  if (sid) return sid;
+  process.stderr.write(
+    `handoff-cli ${command}: --session-id or COPILOT_AGENT_SESSION_ID is required\n`,
+  );
+  process.exit(2);
+}
+
+// Manual entry points are always available, in every mode including `off`
+// (see mode.mjs's `manualHandoffEnabled` docstring) -- this just resolves the
+// config every command needs, with no mode-based gate.
+function resolveHandoffConfig(cwd) {
+  return loadContextHandoffConfig(cwd);
+}
+
+function cmdSave(args) {
   const promptText = readPrompt(args);
   if (!promptText) {
-    process.stderr.write("handoff-cli: no handoff text (use --prompt-file, --prompt, or pipe stdin)\n");
+    process.stderr.write("handoff-cli save: no handoff text (use --prompt-file, --prompt, or pipe stdin)\n");
     process.exit(2);
   }
-  const sid = resolveSid(args);
-  if (!sid) {
-    process.stderr.write("handoff-cli: no session id (pass --session-id or set COPILOT_AGENT_SESSION_ID)\n");
-    process.exit(2);
-  }
+  const sid = requireSid("save", args);
   if (nativeObjectiveExists(sid)) {
-    process.stderr.write(
-      "handoff-cli: this session has a native autopilot objective. The SDK-free " +
+    refuseNative("save", "this session has a native autopilot objective. The SDK-free " +
       "fallback cannot transfer native mode and permissions; use the in-session " +
-      "context-handoff tools instead. Nothing was written.\n",
-    );
-    process.exit(1);
+      "context-handoff tools instead. Nothing was written.");
   }
   const cwd = args.cwd || process.cwd();
   const stored = storeHandoff({
-    promptText, sid, cwd, title: args.title || "",
+    promptText,
+    sid,
+    cwd,
+    title: normalizeHandoffTitle(args.title),
     preferTask: !args["no-task"],
   });
   if (!stored?.storage) {
     process.stderr.write(
-      "handoff-cli: could not store the handoff. " +
-      `${stored?.error || "No safe machine-local state directory resolved."}\n`);
-    process.exit(1);
-  }
-  const seed = buildSeedForStored(stored, { retry: true });
-  const pastePrompt = buildSeedForStored(stored, { retry: false });
-  const result = { ok: true, storage: stored.storage, id: stored.id, seed, pastePrompt };
-  if (stored.path) result.path = stored.path;
-
-  if (cutover && !args["no-cutover"]) {
-    const cut = runHandoffCutover(cwd, seed, sid);
-    result.cutover = cut;
-    if (args.json) return emit(result, args);
-    if (cut.ok) {
-      const lifecycle = cut.host === "herdr"
-        ? "the successor stops the identity-matched predecessor after consumption"
-        : "the successor retires this pane after it consumes the handoff";
-      process.stdout.write(
-        `Handoff stored (${stored.storage}: ${stored.id}) and live cutover started ` +
-        `(pane ${cut.new_pane || "?"}). End your turn now; ${lifecycle}.\n`);
-    } else {
-      process.stdout.write(
-        `Handoff stored (${stored.storage}: ${stored.id}), but the live cutover could not run ` +
-        `(reason: ${cut.reason}${cut.error ? " -- " + cut.error : ""}). ` +
-        `Resume it in a new session with this paste prompt:\n\n${pastePrompt}\n`);
-    }
-    return;
-  }
-
-  if (args.json) return emit(result, args);
-  process.stdout.write(
-    `Handoff stored (${stored.storage}: ${stored.id}).\n\n` +
-    `-- Paste prompt (for a new session) --\n${pastePrompt}\n\n` +
-    `-- HANDOFF_SEED (for \`handoff-cli continue --seed\` under Herdr or mux) --\n${seed}\n`);
-}
-
-function cmdContinue(args) {
-  const seed = args.seed;
-  if (!seed) {
-    process.stderr.write("handoff-cli continue: --seed <HANDOFF_SEED> required\n");
-    process.exit(2);
-  }
-  const cwd = args.cwd || process.cwd();
-  const sid = resolveSid(args);
-  const request = sid ? readSessionStateHandoff(sid)?.record : null;
-  if (nativeObjectiveExists(sid) || request?.nativeGoal || request?.nativeState || request?.nativeContinuation) {
-    throw new Error("Native handoff must be continued by the in-session extension. Nothing was launched.");
-  }
-  const match = String(seed).match(/(\{"path":.+?\})/);
-  if (match) {
-    try {
-      const target = JSON.parse(match[1]);
-      if (fileHandoffHasNativeContinuation(cwd, sid, "", target.path)) {
-        process.stderr.write(
-          "handoff-cli continue: this baton carries native session state and " +
-          "must be continued by the in-session extension. Nothing was launched.\n",
-        );
-        process.exit(1);
-      }
-    } catch {
-      // The normal cutover path validates the seed.
-    }
-  }
-  const cut = runHandoffCutover(cwd, seed, sid);
-  if (args.json) return emit({ ok: cut.ok, cutover: cut }, args);
-  if (cut.ok) {
-    process.stdout.write(`Live cutover started (pane ${cut.new_pane || "?"}). End your turn now.\n`);
-  } else {
-    process.stderr.write(`Cutover could not run (reason: ${cut.reason}${cut.error ? " -- " + cut.error : ""}).\n`);
-    process.exit(1);
-  }
-}
-
-function cmdConsume(args) {
-  const cwd = args.cwd || process.cwd();
-  const sid = resolveSid(args);
-  if (fileHandoffHasNativeContinuation(
-    cwd, sid, args["handoff-id"], args.path,
-  )) {
-    process.stderr.write(
-      "handoff-cli consume: this baton carries native session state and must " +
-      "be consumed by the in-session extension. It remains unconsumed.\n",
+      "handoff-cli save: could not store the handoff. " +
+      `${stored?.error || "No safe machine-local state directory resolved."}\n`,
     );
     process.exit(1);
   }
-  const consumed = consumeFileHandoffOnce(
-    cwd, sid, args["handoff-id"], args.path || null,
+  const seed = buildSeedForStored(stored);
+  const result = {
+    ok: true,
+    storage: stored.storage,
+    id: stored.id,
+    seed,
+    handoffToken: stored.id,
+  };
+  if (stored.path) result.path = stored.path;
+  if (args.json) return emit(result, args);
+  process.stdout.write(
+    `Handoff stored (${stored.storage}: ${stored.id}).\n\n` +
+    "This preserves the baton without requesting pickup yet. Later, either " +
+    "trigger it explicitly or continue manually by opening the successor " +
+    "session and running `/consume-handoff` (or the payload-local CLI with the " +
+    "recovery locator embedded in the seed).\n\n" +
+    `HANDOFF_SEED: ${seed}\n` +
+    `HANDOFF_TOKEN: ${stored.id}\n`,
   );
-  if (!consumed.ok) {
-    process.stderr.write(`handoff-cli consume: ${consumed.message}\n`);
-    process.exit(1);
-  }
-  const brief = consumed.record.promptText
-    || decodeHandoffPayload(consumed.record.payload || "").text
-    || "";
-  if (args.json) return emit({ ok: true, id: consumed.record.id, brief }, args);
-  process.stdout.write(brief.endsWith("\n") ? brief : brief + "\n");
 }
 
-function main() {
+async function cmdTrigger(args) {
+  const sid = requireSid("trigger", args);
+  if (nativeObjectiveExists(sid) || nativeRequestPending(sid)) {
+    refuseNative("trigger", "this session has a native autopilot objective; native " +
+      "handoff must be continued by the in-session extension. Nothing was written or launched.");
+  }
+  const cwd = args.cwd || process.cwd();
+  const config = resolveHandoffConfig(cwd);
+  const promptText = readPrompt(args);
+  if (!promptText && !args["handoff-token"]) {
+    process.stderr.write(
+      "handoff-cli trigger: pass --prompt-file/--prompt/stdin or --handoff-token <id>\n",
+    );
+    process.exit(2);
+  }
+  const result = await triggerHandoff({
+    promptText,
+    sid,
+    cwd,
+    title: normalizeHandoffTitle(args.title),
+    preferTask: !args["no-task"],
+    mode: config.mode,
+    force: Boolean(args.force),
+    handoffToken: args["handoff-token"] || null,
+  });
+  if (!result.ok) {
+    process.stderr.write(
+      `handoff-cli trigger: ${result.error || result.reason || "failed"}\n`,
+    );
+    process.exit(1);
+  }
+  if (args.json) return emit(result, args);
+
+  const pickup = result.pickup || { via: [], waitedMs: 0 };
+  const header = result.automaticCutoverDisabled
+    ? `Handoff stored (automatic cutover disabled) (${result.stored.storage}: ${result.stored.id}); no live-cutover signal was sent (mode is not \`auto\`).`
+    : pickup.pickedUp
+      ? `Handoff request signaled (${result.stored.storage}: ${result.stored.id}); pickup acknowledged via ${pickup.via.join(", ")} after ${(pickup.waitedMs / 1000).toFixed(1)}s.`
+      : `Handoff request signaled (${result.stored.storage}: ${result.stored.id}); no pickup signal arrived within ${(pickup.waitedMs / 1000).toFixed(1)}s.`;
+  process.stdout.write(
+    `${header}\n\n` +
+    (
+      result.manualInstructions
+        ? `${result.manualInstructions}\n\n`
+        : "A control system appears to have picked the request up. Keep the same seed available in case manual continuation is still needed.\n\n"
+    ) +
+    "Final short handoff prompt/seed:\n\n" +
+    "```text\n" +
+    `${result.seed}\n` +
+    "```\n",
+  );
+}
+
+// Consume-time defensive wait: mirrors the extension's consume_handoff
+// handler (round 31 finding: this extension-free path called the consume
+// helpers directly with no such check at all, unlike the extension
+// handler's bounded wait). No certainty a sync is in flight, so a small
+// grace only -- see extension.mjs's CONSUME_HANDOFF_START_GRACE_MS for
+// the full reasoning.
+const CLI_CONSUME_SYNC_WAIT_TIMEOUT_MS = 15000;
+const CLI_CONSUME_SYNC_START_GRACE_MS = 500;
+
+// Shared by consume/abort: resolve exactly one handoff target from
+// --locator (parsed via the recovery-locator grammar) or explicit
+// --task-id/--handoff-id/--path flags. Exits (never returns) on a usage
+// error so callers don't need to repeat the same validation.
+function resolveHandoffTarget(command, args) {
+  let taskId = args["task-id"];
+  let handoffId = args["handoff-id"];
+  let deferComplete = Boolean(args["defer-complete"]);
+  if (args.locator) {
+    let parsed;
+    try {
+      parsed = parseRecoveryLocator(args.locator);
+    } catch (error) {
+      process.stderr.write(`handoff-cli ${command}: ${error.message}\n`);
+      process.exit(2);
+    }
+    if (taskId || handoffId || args.path) {
+      process.stderr.write(
+        `handoff-cli ${command}: --locator cannot be combined with --task-id, ` +
+        "--handoff-id, or --path\n",
+      );
+      process.exit(2);
+    }
+    if (parsed.kind === "task") {
+      taskId = parsed.id;
+      deferComplete = true;
+    } else {
+      handoffId = parsed.id;
+    }
+  }
+  const targetCount = [taskId, handoffId, args.path].filter(Boolean).length;
+  if (targetCount !== 1) {
+    process.stderr.write(
+      `handoff-cli ${command}: exactly one of --locator, --task-id, ` +
+      "--handoff-id, or --path is required\n",
+    );
+    process.exit(2);
+  }
+  return { taskId, handoffId, path: args.path || null, deferComplete };
+}
+
+async function cmdConsume(args) {
+  const cwd = args.cwd || process.cwd();
+  const sid = requireSid("consume", args);
+  const { taskId, handoffId, path, deferComplete } = resolveHandoffTarget("consume", args);
+  if (!taskId && fileHandoffHasNativeContinuation(cwd, sid, handoffId, path)) {
+    refuseNative("consume", "this baton carries native session state and must be " +
+      "consumed by the in-session extension. It remains unconsumed.");
+  }
+  if (deferComplete && !taskId) {
+    process.stderr.write(
+      "handoff-cli consume: --defer-complete is only valid with a task target\n",
+    );
+    process.exit(2);
+  }
+  // Defensive: the predecessor's worktree sync could still be settling
+  // (see this function's own doc comment above). Never blocks
+  // indefinitely -- just narrows the window before reading/marking the
+  // stored baton or touching the worktree.
+  const settleResult = await waitForWorktreeSyncToSettle(cwd, {
+    timeoutMs: CLI_CONSUME_SYNC_WAIT_TIMEOUT_MS,
+    startGraceMs: CLI_CONSUME_SYNC_START_GRACE_MS,
+  });
+  if (settleResult.waited && !settleResult.settled) {
+    process.stderr.write(
+      "handoff-cli consume: the predecessor's worktree sync still appears " +
+      "to be in progress after the wait window; proceeding anyway -- " +
+      "verify the worktree yourself if anything looks unexpectedly stale " +
+      "or mid-rebase.\n",
+    );
+  } else if (settleResult.needsInspection) {
+    process.stderr.write(
+      "handoff-cli consume: the predecessor's worktree sync lock recorded " +
+      "a holder that is no longer running, AND an in-progress rebase was " +
+      "found -- the predecessor may have crashed mid-sync. Inspect the " +
+      "worktree before trusting it; a conflicted rebase may need `git " +
+      "rebase --abort` before continuing.\n",
+    );
+  }
+  const consumed = taskId
+    ? consumeDispatchHandoffTask(cwd, taskId, sid, deferComplete)
+    : consumeFileHandoff(cwd, sid, handoffId, path);
+  if (!consumed.ok) {
+    if (args.json) return emit(consumed, args);
+    process.stderr.write(
+      `handoff-cli consume: ${formatConsumeResult(consumed, { deferComplete })}\n`,
+    );
+    process.exit(1);
+  }
+  if (args.json) return emit(consumed, args);
+  process.stdout.write(
+    formatConsumeResult(consumed, {
+      deferComplete,
+    }) + "\n",
+  );
+}
+
+function cmdFacts(args) {
+  const cwd = args.cwd || process.cwd();
+  const result = collectCliHandoffFacts(cwd, resolveSid(args));
+  if (args.json) return emit(result, args);
+  process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+}
+
+function cmdCheckHeads(args) {
+  const cwd = args.cwd || process.cwd();
+  const result = checkHeadAlignment(cwd);
+  if (args.json) return emit(result, args);
+  if (!result.findings.length) {
+    process.stdout.write(
+      `Checked ${result.checked} worktree(s); no pending-handoff head alignment findings.\n`,
+    );
+    return;
+  }
+  process.stdout.write(
+    `Checked ${result.checked} worktree(s); found ${result.findings.length} pending-handoff alignment issue(s).\n`,
+  );
+  for (const finding of result.findings) {
+    const worktreeId = finding?.worktree?.id || "<unknown>";
+    const reason = finding?.reason || "unknown";
+    const monitorPath = finding?.monitorPath || "<none>";
+    process.stdout.write(
+      `- ${worktreeId}: ${reason} (monitor path: ${monitorPath})\n`,
+    );
+  }
+}
+
+function cmdRetryCutover(args) {
+  const cwd = args.cwd || process.cwd();
+  const sid = requireSid("retry-cutover", args);
+  if (nativeObjectiveExists(sid) || nativeRequestPending(sid)) {
+    refuseNative("retry-cutover", "native handoff must be continued by the in-session " +
+      "extension (retry_handoff_cutover). Nothing was launched.");
+  }
+  const result = retryStoredHandoffCutover(cwd, sid);
+  if (!result.ok) {
+    process.stderr.write(
+      `handoff-cli retry-cutover: ${result.error || "failed"}\n`,
+    );
+    process.exit(1);
+  }
+  if (args.json) return emit(result, args);
+  if (result.outcome === "refocused") {
+    process.stdout.write(
+      `Refocused live successor ${result.successor_session || "<unknown>"} ` +
+      `(${result.successor_pane || "<unknown-pane>"}) in ${result.session || "<unknown-session>"}.\n`,
+    );
+    return;
+  }
+  process.stdout.write(
+    `Retried cutover by spawning a fresh successor in ${result.session || "<unknown-session>"}.\n`,
+  );
+}
+
+// One shared entry point for BOTH the fully-automated force-tier path
+// (autoForceHandoff, which calls attemptWorktreeSync directly) and the
+// agent-guided skill flow (SKILL.md's "Sync before triggering" step) --
+// review finding: without this, the skill flow invoked `agent-worktrees git
+// sync` directly, bypassing attemptWorktreeSync's lock, rebase check, and
+// sanitized environment entirely, so a force-tier sync and a skill-guided
+// sync could still race each other and rebase the same worktree
+// concurrently. The skill flow commits its own reviewed WIP itself (never
+// this command's job); by the time it calls this, the tree is expected to
+// already be clean, matching attemptWorktreeSync's own precondition.
+async function cmdSyncWorktree(args) {
+  const cwd = args.cwd || process.cwd();
+  const result = await attemptWorktreeSync(cwd);
+  if (args.json) {
+    emit(result, args);
+    // process.exitCode (not process.exit()) -- Node lets stdout drain to a
+    // pipe naturally before exiting on this code, whereas an immediate
+    // process.exit() call right after a write can terminate the process
+    // before that write flushes, truncating the documented --json output.
+    if (!result.synced) process.exitCode = 1;
+    return;
+  }
+  if (result.synced) {
+    process.stdout.write("Worktree synced onto the latest default branch.\n");
+    return;
+  }
+  process.stdout.write(
+    `Worktree sync ${result.attempted ? "failed" : "was skipped"}: ${result.reason}\n`,
+  );
+  // Nonzero for EVERY non-synced outcome (attempted-and-failed AND
+  // skipped), not just the "attempted" case -- a caller using this command
+  // as a gate (e.g. "only proceed once synced") must see a real failure
+  // exit status regardless of why the sync did not happen.
+  process.exitCode = 1;
+}
+
+function cmdListSessions(args) {
+  const cwd = args.cwd || process.cwd();
+  const result = listWorktreeSessions(cwd, args.worktree || null, resolveSid(args));
+  if (!result.available) process.exitCode = 1;
+  if (args.json) return emit(result, args);
+  if (!result.available) {
+    process.stderr.write(`handoff-cli list-sessions: unavailable -- ${result.reason}\n`);
+    return;
+  }
+  const sessions = Array.isArray(result.sessions) ? result.sessions : [];
+  process.stdout.write(
+    `Worktree ${result.worktree}: ${sessions.length} session(s), ` +
+    `${(result.handoffs || []).length} recorded handoff(s).\n\n`,
+  );
+  for (const session of sessions) {
+    const head = session.is_head ? " [head]" : "";
+    process.stdout.write(
+      `- ${session.id}${head} -- "${session.name || "(untitled)"}" ` +
+      `(${session.state}, started ${session.created_at || "?"})\n`,
+    );
+  }
+}
+
+function cmdGetPreviousSession(args) {
+  const cwd = args.cwd || process.cwd();
+  const sid = args["session-id"] || resolveSid(args);
+  if (!sid) {
+    process.stderr.write(
+      "handoff-cli get-previous-session: --session-id or COPILOT_AGENT_SESSION_ID is required\n",
+    );
+    process.exit(2);
+  }
+  const result = getPreviousSession(cwd, sid, args.worktree || null);
+  if (!result.available) process.exitCode = 1;
+  if (args.json) return emit(result, args);
+  if (!result.available) {
+    process.stderr.write(`handoff-cli get-previous-session: unavailable -- ${result.reason}\n`);
+    return;
+  }
+  if (!result.predecessorSession) {
+    process.stdout.write(
+      `No recorded predecessor for session ${sid} in worktree ${result.worktree} ` +
+      `(${result.reason}).\n`,
+    );
+    return;
+  }
+  process.stdout.write(
+    `Predecessor of ${sid}: ${result.predecessorSession} ` +
+    `(handoff ${result.handoff?.token || "?"}, ` +
+    `linked ${result.handoff?.linked_at || "?"}).\n`,
+  );
+}
+
+async function cmdAbort(args) {
+  const cwd = args.cwd || process.cwd();
+  const sid = resolveSid(args);
+  const { taskId, handoffId, path } = resolveHandoffTarget("abort", args);
+  const reason = args.reason || null;
+  const result = taskId
+    ? abortHandoffTask(cwd, taskId, reason)
+    : abortFileHandoff(cwd, sid, handoffId, path, reason);
+  if (!result.ok) {
+    process.exitCode = 1;
+    if (args.json) return emit(result, args);
+    process.stderr.write(`handoff-cli abort: ${result.message || result.error || "failed"}\n`);
+    return;
+  }
+  if (args.json) return emit(result, args);
+  process.stdout.write(
+    `Aborted ${result.kind}-backed handoff ${result.id}. It will not be offered for consumption again.\n` +
+    (result.ledgerCancelled ? "Cancelled the matching agent-worktrees pending-handoff ledger entry.\n" : "") +
+    (result.ledgerNote ? `\n${result.ledgerNote}\n` : ""),
+  );
+}
+
+async function main() {
   const argv = process.argv.slice(2);
   const args = parseArgs(argv);
-  const cmd = args._[0] || "cutover";
+  const cmd = args._[0] || "trigger";
   switch (cmd) {
-    case "cutover": return cmdStore(args, { cutover: true });
-    case "save":    return cmdStore(args, { cutover: false });
-    case "continue": return cmdContinue(args);
-    case "consume": return cmdConsume(args);
-    case "help": case "-h": case "--help":
-      process.stdout.write(HELP + "\n"); return;
+    case "trigger": return await cmdTrigger(args);
+    case "save": return cmdSave(args);
+    case "consume": return await cmdConsume(args);
+    case "facts": return cmdFacts(args);
+    case "check-heads": return cmdCheckHeads(args);
+    case "retry-cutover": return cmdRetryCutover(args);
+    case "sync-worktree": return await cmdSyncWorktree(args);
+    case "list-sessions": return cmdListSessions(args);
+    case "get-previous-session": return cmdGetPreviousSession(args);
+    case "abort": return await cmdAbort(args);
+    case "help":
+    case "-h":
+    case "--help":
+      process.stdout.write(HELP + "\n");
+      return;
     default:
       process.stderr.write(`handoff-cli: unknown command '${cmd}'\n\n${HELP}\n`);
       process.exit(2);
   }
 }
 
-main();
+await main();

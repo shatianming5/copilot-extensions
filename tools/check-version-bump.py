@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
-"""Require a version bump whenever a plugin's content changes (CONTRIBUTING.md
+"""Require a version bump whenever a plugin's content changes (docs/pipelines.md
 § Release & Versioning).
+
+**Retired as the per-PR enforcement guard** in favor of
+`check-changefile-presence.py` (which requires a pending changefile instead
+of a hand-applied bump); this module now serves two roles: (1) the shared
+diff engine `check-changefile-presence.py` and `accumulate_bumps.py` both
+import for "which consumer(s) does this diff touch", and (2) a standalone
+release/recovery check for directly verifying or enforcing an actual version
+bump outside the ordinary changefile-driven PR flow (its own CLI below still
+reports a real version-mismatch, it just no longer gates an ordinary PR).
 
 The marketplace only redeploys a plugin's runtime when its declared version
 **advances**: `<repo> update` refreshes the payload but the versioned-runtime
@@ -22,7 +31,7 @@ What requires a bump, for a push/PR diff (`<base>..HEAD`):
 
 What does **not** require a bump: repo-root files that are not vendored into any
 plugin -- `tools/`, `.github/`, the repo-root `docs/`, `CONTRIBUTING.md`,
-`README.md`, etc. (CONTRIBUTING.md § Version scheme). Also exempt, even under
+`README.md`, etc. (docs/pipelines.md § Version scheme). Also exempt, even under
 `plugins/<p>/`: build/venv/cache artifacts (`build/`, `dist/`, `.venv*/`,
 `.test-venvs/`, `__pycache__/`, `.pytest_cache/`, `.ruff_cache/`, `*.pyc`) and
 dev-hygiene files that never ship (`.gitignore`) -- none change the runtime
@@ -35,8 +44,8 @@ compare).
 
 Usage::
 
-    python tools/check-version-bump.py                 # diff vs origin/main (pre-push/CI)
-    python tools/check-version-bump.py --base <sha>     # diff vs an explicit base
+    python tools/check-version-bump.py                 # diff vs origin/dev (this repo's real trunk)
+    python tools/check-version-bump.py --base <sha>     # diff vs an explicit base (e.g. origin/main for a release/recovery check)
     python tools/check-version-bump.py --list           # show the plugin<->vendored-lib map
 
 Exit code 0 = conformant (or nothing to check), 1 = a touched plugin didn't bump.
@@ -48,6 +57,16 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import installer_engine_ref as ier  # noqa: E402
+import uv_editable_ref as uer  # noqa: E402
+
+try:  # tomllib is stdlib on 3.11+; tomli backports it for this repo's
+    # 3.10 support floor -- mirrors uv_editable_ref's own identical fallback.
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised only on 3.10
+    import tomli as tomllib
 
 REPO = Path(__file__).resolve().parent.parent
 PLUGINS_DIR = REPO / "plugins"
@@ -101,17 +120,130 @@ def _plugin_json_version_at(ref: str, plugin: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _pyproject_project_version_at(ref: str, rel_pyproject: str) -> str | None:
+    """The ``[project].version`` field of ``rel_pyproject`` (a repo-relative
+    path) at ``ref`` -- for a top-level, out-of-plugin consumer (e.g.
+    ``worktree-manager``) that has no ``plugin.json`` at all and instead
+    carries its own release version directly in its ``pyproject.toml``.
+    ``None`` on a missing file, unparseable TOML, or a manifest with no
+    ``[project].version`` -- same "skip, don't crash" contract as
+    ``_plugin_json_version_at``."""
+    r = _git("show", f"{ref}:{rel_pyproject}")
+    if r.returncode != 0:
+        return None
+    try:
+        data = tomllib.loads(r.stdout)
+    except tomllib.TOMLDecodeError:
+        return None
+    version = data.get("project", {}).get("version")
+    return version if isinstance(version, str) else None
+
+
+def _consumer_version_at(ref: str, consumer: str) -> str | None:
+    """The release version for any consumer `_vendored_consumers()` can
+    name -- a ``plugins/<consumer>`` plugin (``plugin.json``) or a
+    top-level, out-of-plugin consumer tree like ``worktree-manager`` (its
+    own ``pyproject.toml`` ``[project].version``, since it has no
+    ``plugin.json`` at all)."""
+    if (PLUGINS_DIR / consumer).is_dir():
+        return _plugin_json_version_at(ref, consumer)
+    return _pyproject_project_version_at(ref, f"{consumer}/pyproject.toml")
+
+
 def _vendored_consumers() -> dict[str, list[str]]:
-    """Map ``lib name -> [plugins that vendor it]`` from ``plugins/*/libs/*``."""
+    """Map ``lib name -> [consumers that vendor it]`` -- both an ordinary
+    in-tree ``<consumer>/libs/*`` real copy AND a `uv`-editable canonical-
+    reference pointer in a consumer's own ``pyproject.toml`` (vendor-
+    pointer-generalization effort, Phase 1: no local copy at all in a dev
+    checkout). A consumer using only the pointer form still gets `<lib>`'s
+    payload materialized into it at promotion time
+    (`tools/materialize_main.py`), so it must be charged for a bump the
+    same as a real-copy consumer -- skipping this half missed every
+    editable-pointer consumer from the version-bump guard entirely (PR
+    #4465 review).
+
+    The real-copy half scans EVERY ``plugins/*`` directory directly
+    (never ``uv_editable_ref.iter_consumer_dirs()``, which requires a
+    root ``pyproject.toml`` and so silently drops a payload-only plugin
+    like `customizing-copilot` that ships real vendored copies with no
+    ``pyproject.toml`` of its own at all -- PR #4465 review). The
+    editable-ref half legitimately needs `iter_consumer_dirs()` (plugins
+    with a ``pyproject.toml`` + every top-level, out-of-plugin consumer
+    tree, e.g. ``worktree-manager``) since a pointer can only ever live
+    inside a real ``pyproject.toml``."""
     consumers: dict[str, list[str]] = {}
-    if not PLUGINS_DIR.is_dir():
-        return consumers
-    for plugin in sorted(p for p in PLUGINS_DIR.iterdir() if p.is_dir()):
-        libs = plugin / "libs"
-        if not libs.is_dir():
-            continue
-        for lib in sorted(x for x in libs.iterdir() if x.is_dir()):
-            consumers.setdefault(lib.name, []).append(plugin.name)
+    if PLUGINS_DIR.is_dir():
+        for plugin in sorted(p for p in PLUGINS_DIR.iterdir() if p.is_dir()):
+            libs = plugin / "libs"
+            if libs.is_dir():
+                for lib in sorted(x for x in libs.iterdir() if x.is_dir()):
+                    consumers.setdefault(lib.name, []).append(plugin.name)
+    # Out-of-plugin consumer trees (e.g. `worktree-manager`) can carry
+    # real vendored copies under their own top-level `libs/` too -- the
+    # `plugins/*` scan above never reaches them, so a canonical lib
+    # change would otherwise ship without charging them (mirrors
+    # `check-vendored-libs-sync.py`'s own identical extra-consumer scan,
+    # PR #4465 review).
+    for extra in uer._EXTRA_CONSUMER_DIRS:
+        extra_libs = REPO / extra / "libs"
+        if extra_libs.is_dir():
+            for lib in sorted(x for x in extra_libs.iterdir() if x.is_dir()):
+                consumers.setdefault(lib.name, []).append(extra)
+    # `iter_consumer_dirs()` filters candidates by `pyproject.toml.is_file()`,
+    # which returns False for a symlink to a directory OR a dangling symlink
+    # (broken target) -- both would silently vanish from its results before
+    # ever reaching the symlink check below, contradicting the guarantee
+    # that ANY symlinked manifest is rejected, not just one that also
+    # happens to resolve to a real file (PR #4514 review). Scan every
+    # candidate manifest path directly first, unfiltered.
+    candidate_dirs = []
+    if PLUGINS_DIR.is_dir():
+        candidate_dirs.extend((p.name, p) for p in sorted(PLUGINS_DIR.iterdir()) if p.is_dir())
+    candidate_dirs.extend(
+        (extra, REPO / extra) for extra in uer._EXTRA_CONSUMER_DIRS if (REPO / extra).is_dir()
+    )
+    for name, consumer_dir in candidate_dirs:
+        pyproject = consumer_dir / "pyproject.toml"
+        if pyproject.is_symlink():
+            raise SystemExit(
+                f"check-version-bump: {pyproject} is a symlink -- cannot "
+                f"safely determine {name}'s uv-editable consumers; "
+                "replace it with a real file."
+            )
+    for name, consumer_dir in uer.iter_consumer_dirs():
+        try:
+            refs = uer.find_uv_editable_refs(consumer_dir)
+        except uer.ManifestUnreadable as exc:
+            # Fail closed, never silently drop this consumer from the
+            # map -- an unreadable manifest could genuinely reference
+            # `<lib>`, and skipping it would let a shared-lib change
+            # ship without charging a real consumer (PR #4465 review).
+            raise SystemExit(
+                f"check-version-bump: {exc} -- cannot safely determine "
+                f"{name}'s uv-editable consumers; fix its pyproject.toml "
+                "[tool.uv.sources] table."
+            ) from exc
+        for _name, _raw_path, lib, _editable in refs:
+            if name not in consumers.get(lib, ()):
+                consumers.setdefault(lib, []).append(name)
+    for lib in consumers:
+        consumers[lib] = sorted(consumers[lib])
+    installer_engine_consumers = [
+        plugin for plugin in ier.ADOPTERS if (PLUGINS_DIR / plugin).is_dir()
+    ]
+    if installer_engine_consumers:
+        consumers["installer-engine"] = sorted(
+            set(consumers.get("installer-engine", ())) | set(installer_engine_consumers)
+        )
+    packaged_peers = [
+        plugin for plugin in (
+            "agent-bridge", "agent-dispatch", "agent-codespaces", "agent-containers",
+            "agent-logger", "agent-index", "agent-machines",
+        )
+        if (PLUGINS_DIR / plugin).is_dir()
+    ]
+    if packaged_peers:
+        consumers["peer-launch"] = packaged_peers
     return consumers
 
 
@@ -127,7 +259,12 @@ def _plugins_needing_bump(changed: list[str], consumers: dict[str, list[str]]) -
     """Map ``plugin -> {reasons}`` for every plugin whose content changed.
 
     A path under ``plugins/<p>/`` charges ``<p>``; a path under a top-level
-    shared ``libs/<lib>/`` charges every plugin that vendors ``<lib>``."""
+    shared ``libs/<lib>/`` charges every plugin that vendors ``<lib>``; a
+    path under a recognized standalone consumer's own top-level tree (e.g.
+    ``worktree-manager/``) charges that consumer directly -- without this,
+    a direct payload change to a standalone consumer was invisible to both
+    this guard and `check-changefile-presence.py`/`compute_from_diff()`,
+    which both depend on this same map (PR #4514 review)."""
     needing: dict[str, set[str]] = {}
     for path in changed:
         parts = tuple(path.split("/"))
@@ -148,6 +285,12 @@ def _plugins_needing_bump(changed: list[str], consumers: dict[str, list[str]]) -
                 continue
             for plugin in consumers.get(lib, ()):
                 needing.setdefault(plugin, set()).add(f"libs/{lib}/ (vendored)")
+        elif parts[0] in uer._EXTRA_CONSUMER_DIRS and (REPO / parts[0] / "pyproject.toml").exists():
+            consumer = parts[0]
+            inner = parts[1:]
+            if inner and _is_ignored(inner, parts[-1]):
+                continue
+            needing.setdefault(consumer, set()).add(f"{consumer}/")
     return needing
 
 
@@ -159,14 +302,36 @@ def check(base_ref: str, head_ref: str) -> tuple[int, list[str]]:
         return 0, []
     base = _rev_parse(base_ref)
     if base is None:
-        # The base (default origin/main) is unavailable -- a fresh clone or a
+        # The base (default origin/dev) is unavailable -- a fresh clone or a
         # detached state. Degrade to a no-op rather than wedge the push.
         print(
             f"check-version-bump: base '{base_ref}' unavailable; skipping "
             "(fetch it to enable the guard).",
         )
         return 0, []
-    mbase = _merge_base(base, head) or base
+    mbase = _merge_base(base, head)
+    if mbase is None:
+        # `base` resolves but shares no common ancestor with `head`: `main`
+        # is a generated/promoted artifact (see `tools/promote_release.py`'s
+        # own docstring), never a fork point, so a branch's only shared
+        # ancestor with `main` was always just the repo's original root --
+        # and a `main` history rewrite (docs/pipelines.md's "If main's
+        # history is force-rewritten") changes every commit's SHA on
+        # `main`'s own line, severing even that. Silently falling back to a
+        # literal two-dot diff against the raw base's CURRENT snapshot
+        # would produce a large, misleading "changed" set spanning every
+        # plugin that happens to differ between that snapshot and this
+        # branch, not this branch's own actual changes -- degrade instead
+        # the same way an unresolvable base already does just below (this
+        # tool's own established "never wedge the push over an
+        # infra/topology hiccup" stance).
+        print(
+            f"check-version-bump: base '{base_ref}' shares no common history with "
+            f"HEAD (e.g. after a main history rewrite, or because this base is "
+            f"unrelated to this branch's real trunk) -- skipping. For a release/"
+            f"recovery check against a specific target, pass an explicit --base.",
+        )
+        return 0, []
 
     changed = _changed_files(mbase, head)
     if not changed:
@@ -181,18 +346,45 @@ def check(base_ref: str, head_ref: str) -> tuple[int, list[str]]:
 
     violations: list[str] = []
     for plugin in sorted(needing):
-        head_ver = _plugin_json_version_at(head, plugin)
-        base_ver = _plugin_json_version_at(mbase, plugin)
+        head_ver = _consumer_version_at(head, plugin)
+        base_ver = _consumer_version_at(mbase, plugin)
         if head_ver is None or base_ver is None:
             # Plugin added or removed across the range -- no bump obligation.
             continue
         if head_ver == base_ver:
             reasons = ", ".join(sorted(needing[plugin]))
-            violations.append(
-                f"{plugin}: content changed ({reasons}) but version is still "
-                f"{head_ver} -- bump it (plugin.json + pyproject.toml + "
-                "marketplace.json, per CONTRIBUTING.md)."
-            )
+            # This standalone tool only compares base/head versions -- it
+            # never reads .changefiles, so a changefile alone does not clear
+            # ITS OWN failure; check-changefile-presence.py is what actually
+            # gates an ordinary PR today (see docs/pipelines.md § Release &
+            # Versioning). Naming both keeps this diagnostic honest about
+            # what each check requires without prescribing a fix the other
+            # branch can't follow (plugin.json/marketplace.json don't exist
+            # for a standalone consumer -- PR #4514 review).
+            if (PLUGINS_DIR / plugin).is_dir():
+                has_pyproject = (PLUGINS_DIR / plugin / "pyproject.toml").is_file()
+                direct_fix = (
+                    "plugin.json + pyproject.toml + marketplace.json"
+                    if has_pyproject
+                    # A payload-only plugin (e.g. copilot-extensions-harness)
+                    # has no pyproject.toml at all -- naming it here would
+                    # prescribe a file that doesn't exist (docs/pipelines.md's
+                    # payload-only/runtime plugin distinction).
+                    else "plugin.json + marketplace.json"
+                )
+                fix = (
+                    "for ordinary PR compliance, add a changefile for it "
+                    "(python tools/changefile.py add --plugin <name> --type patch "
+                    f"--comment '...'); to clear THIS check directly, bump {direct_fix}"
+                )
+            else:
+                fix = (
+                    "for ordinary PR compliance, add a changefile naming it "
+                    "(python tools/changefile.py add --plugin <name> --type patch "
+                    "--comment '...'); to clear THIS check directly, bump its own "
+                    "pyproject.toml [project].version (+ source __version__ fallback)"
+                )
+            violations.append(f"{plugin}: content changed ({reasons}) but version is still {head_ver} -- {fix}.")
     return (1 if violations else 0), violations
 
 
@@ -208,8 +400,10 @@ def _print_list() -> None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base", default="origin/main",
-                    help="base ref to diff against (default: origin/main)")
+    ap.add_argument("--base", default="origin/dev",
+                    help="base ref to diff against (default: origin/dev -- "
+                         "this repo's real contribution trunk; pass "
+                         "origin/main explicitly for a release/recovery check)")
     ap.add_argument("--head", default="HEAD", help="head ref (default: HEAD)")
     ap.add_argument("--list", action="store_true",
                     help="print the plugin<->vendored-lib map and exit")
@@ -225,11 +419,15 @@ def main(argv: list[str] | None = None) -> int:
         for v in violations:
             print(f"  - {v}", file=sys.stderr)
         print(
-            "\nEvery plugin whose content changes must bump its version so the "
-            "marketplace redeploys it (an un-bumped change serves stale, "
-            "dotfiles #1025). Use a patch `-devN` bump (CONTRIBUTING.md § "
-            "'Default: bump patch with -devN'). A shared `libs/<lib>` change "
-            "must bump every plugin that vendors it.",
+            "\nThis standalone tool's own CI-enforcement role is retired in favor "
+            "of tools/check-changefile-presence.py -- for ordinary PR compliance, "
+            "a touched plugin needs a pending changefile, not a hand-applied "
+            "version bump: python tools/changefile.py add --plugin <name> --type "
+            "patch --comment '...' (see docs/pipelines.md § Release & "
+            "Versioning). To clear THIS script's own exit code directly (e.g. "
+            "release/recovery tooling), apply the actual version bump each "
+            "violation above names instead. A shared `libs/<lib>` change needs "
+            "one for every plugin that vendors it.",
             file=sys.stderr,
         )
         return 1

@@ -11,6 +11,7 @@ SSE event log for agent-bridge sessions.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass, field
 from threading import Lock
@@ -64,7 +65,9 @@ class EventLog:
         self._open_tool_calls: dict[str, SseEvent] = {}
         self._lock = Lock()
         self._next_id = 1
-        self._waiters: list[asyncio.Event] = []
+        self._waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
+        #: Set when this log was merged into another: (target log, old id -> new id).
+        self.merged_into: tuple[EventLog, dict[int, int]] | None = None
         self._db = db
         self._session_id = session_id
         self._telemetry = telemetry.SessionTraceReducer(
@@ -114,13 +117,16 @@ class EventLog:
             log._next_id = max_id + 1
         return log
 
-    def append(self, event_type: str, data: dict[str, Any]) -> SseEvent:
-        """Append an event and return it with its assigned ID.
+    def append(
+        self, event_type: str, data: dict[str, Any], *, timestamp: float | None = None,
+    ) -> SseEvent:
+        """Append an event and return it with its assigned ID. `timestamp`
+        keeps a replayed event's original occurrence time (default: now).
 
         Adds the event to the in-memory list and wakes SSE consumers before
         queueing the durable write, so live delivery is not blocked by SQLite.
         """
-        ts = time.time()
+        ts = time.time() if timestamp is None else timestamp
 
         with self._lock:
             event_id = self._next_id
@@ -135,12 +141,20 @@ class EventLog:
                 event_type, data, event_id=event_id
             )
 
-        for waiter in waiters:
-            waiter.set()
+        for loop, waiter in waiters:
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(waiter.set)
         if self._db is not None and self._session_id is not None:
             self._db.append_event(
                 self._session_id, event_id, event_type, data, ts,
             )
+            if event_id == 1 and self._telemetry.log_epoch:
+                self._db.flush()
+                self._db.update_delivery_cursor_invalidation_continuity(
+                    self._session_id,
+                    self._telemetry.log_epoch,
+                    timestamp=ts,
+                )
         # Generic telemetry seam: emit only the reducer's content-free
         # structural transitions (no-op unless a consumer registered a sink).
         for record in telemetry_records:
@@ -173,6 +187,22 @@ class EventLog:
                 return list(self._events)
             return [e for e in self._events if e.id > after]
 
+    def snapshot_history(
+        self, *, durable: bool = False
+    ) -> tuple[str | None, list[SseEvent]]:
+        """Atomically snapshot one event-log history and its continuity."""
+        with self._lock:
+            visible_count = len(self._events)
+            if durable and self._db is not None and self._session_id is not None:
+                durable_head = self._db.get_max_event_id(self._session_id)
+                visible_count = min(visible_count, max(0, durable_head))
+            continuity = (
+                (self._telemetry.log_epoch or None)
+                if visible_count > 0
+                else None
+            )
+            return (continuity, list(self._events[:visible_count]))
+
     def rebuild(self, events: list[tuple[str, dict[str, Any]]]) -> int:
         """Replace the entire log with ``events`` (event_type, data) pairs.
 
@@ -183,19 +213,28 @@ class EventLog:
         disconnect. Returns the number of events written.
         """
         with self._lock:
+            prior_head_id = self._events[-1].id if self._events else 0
+            prior_origin_timestamp = (
+                self._events[0].timestamp if self._events else None
+            )
+            prior_epoch = self._telemetry.log_epoch
+            ts = time.time()
+            if prior_origin_timestamp is not None:
+                ts = max(
+                    ts,
+                    math.nextafter(prior_origin_timestamp, math.inf),
+                )
             if self._db is not None and self._session_id is not None:
-                self._db.flush()
-                self._db.delete_events(self._session_id)
-                # The rebuilt log renumbers event ids from 1; monotonic delivery
-                # cursors would then point past the log and orphan consumers
-                # (NF's "odd states"). Reset them so consumers re-read the
-                # authoritative rebuilt log instead of silently stalling.
-                self._db.reset_delivery_cursors(self._session_id)
+                self._db.begin_event_rebuild(
+                    self._session_id,
+                    prior_head_id=prior_head_id,
+                    prior_continuity_id=prior_epoch or None,
+                    timestamp=ts,
+                )
+            self._telemetry.begin_rebuild()
             self._events = []
             self._open_tool_calls = {}
             self._next_id = 1
-            prior_epoch = self._telemetry.begin_rebuild()
-            ts = time.time()
             for event_type, data in events:
                 event_id = self._next_id
                 self._next_id += 1
@@ -214,15 +253,27 @@ class EventLog:
                 # emit historical telemetry again.
                 self._telemetry.observe(event_type, data, event_id=event_id)
             count = len(self._events)
-            if self._db is not None and self._session_id is not None:
-                self._db.flush()
             rebuild_marker = self._telemetry.complete_rebuild(
                 prior_epoch, count
             )
-        for waiter in self._waiters:
-            waiter.set()
+            if self._db is not None and self._session_id is not None:
+                self._db.flush()
+                if self._telemetry.log_epoch:
+                    self._db.update_delivery_cursor_invalidation_continuity(
+                        self._session_id,
+                        self._telemetry.log_epoch,
+                        timestamp=ts,
+                    )
+        self.wake_waiters()
         telemetry.emit(rebuild_marker)
         return count
+
+    def wake_waiters(self) -> None:
+        """Wake every pending reader so it re-reads (e.g. after a rebuild, or
+        after this log was merged into another one)."""
+        for loop, waiter in list(self._waiters):
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(waiter.set)
 
     @property
     def latest_id(self) -> int:
@@ -305,7 +356,9 @@ class EventLog:
                     event = candidate
             return (continuity, event)
 
-    def active_tool_call(self) -> dict[str, Any] | None:
+    def active_tool_call(
+        self, *, include_nested: bool = True
+    ) -> dict[str, Any] | None:
         """Return the most recent in-flight tool call, or ``None`` if idle.
 
         A tool call is *in-flight* once a ``tool_call_start`` is seen and until
@@ -319,9 +372,15 @@ class EventLog:
         and never assigned an event id (so it cannot move a delivery cursor).
         """
         with self._lock:
-            if not self._open_tool_calls:
+            open_calls = list(self._open_tool_calls.values())
+            if not include_nested:
+                open_calls = [
+                    event for event in open_calls
+                    if not event.data.get("agent_id")
+                ]
+            if not open_calls:
                 return None
-            start = max(self._open_tool_calls.values(), key=lambda ev: ev.id)
+            start = max(open_calls, key=lambda ev: ev.id)
         raw = start.data.get("raw_input") or {}
         command = None
         if isinstance(raw, dict):
@@ -351,16 +410,40 @@ class EventLog:
         self, after: int, timeout: float = 30.0
     ) -> list[SseEvent]:
         """Wait until events with ID > ``after`` are available, or timeout."""
-        events = self.get_events(after)
-        if events:
-            return events
-
+        loop = asyncio.get_running_loop()
         waiter = asyncio.Event()
-        self._waiters.append(waiter)
+        registration = (loop, waiter)
+        with self._lock:
+            events = [event for event in self._events if event.id > after]
+            if events:
+                return events
+            self._waiters.append(registration)
+        # A merge sets ``merged_into`` before waking this log's waiters: one that
+        # completed after the reader chose this log, but before it registered,
+        # woke nobody. Seen here, the reader returns now and follows the merge
+        # (a later merge wakes the registration above).
+        if self.merged_into is not None:
+            with self._lock:
+                if registration in self._waiters:
+                    self._waiters.remove(registration)
+            return self.get_events(after)
         try:
             await asyncio.wait_for(waiter.wait(), timeout=timeout)
             return self.get_events(after)
         except (TimeoutError, asyncio.TimeoutError):
             return []
         finally:
-            self._waiters.remove(waiter)
+            with self._lock:
+                if registration in self._waiters:
+                    self._waiters.remove(registration)
+
+    async def wait_for_events_snapshot(
+        self, after: int, timeout: float = 30.0
+    ) -> tuple[str | None, list[SseEvent]]:
+        """Wait, then snapshot one internally consistent event generation."""
+        await self.wait_for_events(after, timeout=timeout)
+        continuity, _head, events = self.snapshot_window(
+            after=after,
+            limit=2**31 - 1,
+        )
+        return continuity, events

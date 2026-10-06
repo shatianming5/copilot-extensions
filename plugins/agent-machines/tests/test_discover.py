@@ -8,6 +8,24 @@ from agent_machines.manifest import ManifestError
 
 from ._helpers import base_package, enable_plugin, write_package
 
+#: Captured before the autouse `_isolated_user_scope` fixture below patches
+#: ``discover.user_package_root`` on every test, so the one test that checks
+#: the real implementation can still reach it.
+_REAL_USER_PACKAGE_ROOT = discover.user_package_root
+
+
+@pytest.fixture(autouse=True)
+def _isolated_user_scope(tmp_path, monkeypatch):
+    """Redirect ``user_package_root()`` -- always scanned by ``discover()`` --
+    so it never reads this developer/CI machine's real
+    ``~/.agent-machines/config``. Tests that exercise the user-scoped source
+    itself override this with their own ``monkeypatch`` as needed. Patches
+    ``user_package_root`` itself (not ``discover.home``, which other tests
+    rely on for unrelated ``~/.agent-worktrees/config.yaml`` resolution)."""
+    monkeypatch.setattr(
+        discover, "user_package_root", lambda home_dir=None: tmp_path / "isolated-user-scope"
+    )
+
 
 def _registry(srcroot, **repos):
     return {"schema_version": 1, "srcroot": {"windows": str(srcroot), "linux": str(srcroot),
@@ -77,6 +95,55 @@ def test_discover_combines_all_and_matching_machine_packages(tmp_path):
     assert [pkg.name for pkg in found[0].packages] == ["acme/shared", "acme/specific"]
 
 
+def test_discover_machine_directory_accepts_topology_alias(tmp_path):
+    srcroot = tmp_path / "Src"
+    repo = srcroot / "acme"
+    write_package(
+        repo,
+        "specific.yaml",
+        base_package(name="acme/specific", gate=["generated-host"]),
+        machine="owner-workstation",
+    )
+    reg = _registry(srcroot, acme={"class": "worktree"})
+
+    found = discover.discover(
+        machine="owner-workstation",
+        accepted_machines=(
+            "owner-workstation",
+            "generated-host",
+            "workstation",
+        ),
+        registry=reg,
+        projects=_projects("acme"),
+    )
+
+    assert [pkg.name for pkg in found[0].packages] == ["acme/specific"]
+
+
+def test_discover_rejects_multiple_alias_machine_directories(tmp_path):
+    repo = tmp_path / "acme"
+    write_package(
+        repo,
+        "canonical.yaml",
+        base_package(name="acme/canonical", gate=["*"]),
+        machine="owner-workstation",
+    )
+    write_package(
+        repo,
+        "hostname.yaml",
+        base_package(name="acme/hostname", gate=["*"]),
+        machine="generated-host",
+    )
+
+    with pytest.raises(ManifestError, match="multiple machine directories"):
+        discover.packages_in_repo(
+            repo,
+            "acme",
+            "owner-workstation",
+            accepted_machines=("owner-workstation", "generated-host"),
+        )
+
+
 def test_machine_directory_rejects_contradictory_explicit_gate(tmp_path):
     srcroot = tmp_path / "Src"
     repo = srcroot / "acme"
@@ -120,9 +187,56 @@ def test_canonical_root_suppresses_legacy_layout(tmp_path):
     assert [pkg.name for pkg in found[0].packages] == ["acme/current"]
 
 
+def test_repo_legacy_root_is_fallback_when_canonical_root_absent(tmp_path):
+    srcroot = tmp_path / "Src"
+    repo = srcroot / "acme"
+    write_package(
+        repo,
+        "legacy.yaml",
+        base_package(name="acme/legacy", gate=["*"]),
+        repo_legacy=True,
+    )
+    reg = _registry(srcroot, acme={"class": "worktree"})
+    found = discover.discover(machine="box-1", registry=reg, projects=_projects("acme"))
+    assert [pkg.name for pkg in found[0].packages] == ["acme/legacy"]
+
+
+def test_marketplace_overlay_replaces_base_package(tmp_path, monkeypatch):
+    srcroot = tmp_path / "Src"
+    repo = srcroot / "acme"
+    write_package(
+        repo,
+        "base.yaml",
+        base_package(name="acme/shared", gate=["*"], manage={"copilot.settings": {"values": {"model": "base"}}}),
+    )
+    overlay = (
+        repo
+        / ".copilot-extensions"
+        / "agent-machines"
+        / "marketplaces"
+        / "mp-test"
+        / "all"
+    )
+    overlay.mkdir(parents=True, exist_ok=True)
+    (overlay / "overlay.yaml").write_text(
+        yaml.safe_dump(
+            base_package(
+                name="acme/shared",
+                gate=["*"],
+                manage={"copilot.settings": {"values": {"model": "overlay"}}},
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", '{"marketplaceId":"mp-test"}')
+    packages = discover.packages_in_repo(repo, "acme", "box-1")
+    assert [pkg.name for pkg in packages] == ["acme/shared"]
+    assert packages[0].manage["copilot.settings"]["values"]["model"] == "overlay"
+
+
 def test_flat_package_under_canonical_root_fails_closed(tmp_path):
     repo = tmp_path / "acme"
-    path = repo / ".agent-machines" / "defaults.yaml"
+    path = repo / ".copilot-extensions" / "agent-machines" / "defaults.yaml"
     path.parent.mkdir(parents=True)
     path.write_text("schema_version: 1\npackage: acme/defaults\n", encoding="utf-8")
     with pytest.raises(ManifestError, match="packages belong directly under all/"):
@@ -131,7 +245,7 @@ def test_flat_package_under_canonical_root_fails_closed(tmp_path):
 
 def test_nested_package_under_all_fails_closed(tmp_path):
     repo = tmp_path / "acme"
-    path = repo / ".agent-machines" / "all" / "nested" / "defaults.yaml"
+    path = repo / ".copilot-extensions" / "agent-machines" / "all" / "nested" / "defaults.yaml"
     path.parent.mkdir(parents=True)
     path.write_text("schema_version: 1\npackage: acme/defaults\n", encoding="utf-8")
     with pytest.raises(ManifestError, match="must be direct children"):
@@ -178,6 +292,64 @@ def test_discover_only_considers_adopted_projects(tmp_path):
     assert len(discover.discover(machine="box-1", registry=reg, projects=_projects("acme"))) == 1
 
 
+def test_user_package_root_is_home_relative_no_repo_needed(tmp_path):
+    home_dir = tmp_path / "home"
+    assert _REAL_USER_PACKAGE_ROOT(home_dir) == home_dir / ".agent-machines" / "config"
+
+
+def test_discover_finds_no_user_scoped_packages_when_root_absent(tmp_path):
+    # The autouse `_isolated_user_scope` fixture already points
+    # `user_package_root()` at a directory that does not exist.
+    assert discover.discover(machine="box-1", registry={}, projects={}) == []
+
+
+def test_discover_includes_user_scoped_packages_with_no_adopted_repo(monkeypatch, tmp_path):
+    root = tmp_path / "user-scope"
+    monkeypatch.setattr(discover, "user_package_root", lambda home_dir=None: root)
+    (root / "all").mkdir(parents=True)
+    (root / "all" / "self-update.yaml").write_text(
+        yaml.safe_dump(base_package(name="user/self-update-defaults", gate=["*"])),
+        encoding="utf-8",
+    )
+
+    # No registry, no projects -- no adopted repo of any kind -- yet the
+    # user-scoped source still surfaces, unlike every repo-based source.
+    found = discover.discover(machine="box-1", registry={}, projects={})
+    assert len(found) == 1
+    assert found[0].name == discover.USER_SCOPE_NAME
+    assert found[0].enabled is True
+    assert found[0].packages[0].name == "user/self-update-defaults"
+
+
+def test_discover_gates_user_scoped_packages_like_any_other_source(monkeypatch, tmp_path):
+    root = tmp_path / "user-scope"
+    monkeypatch.setattr(discover, "user_package_root", lambda home_dir=None: root)
+    (root / "all").mkdir(parents=True)
+    (root / "all" / "self-update.yaml").write_text(
+        yaml.safe_dump(base_package(name="user/self-update-defaults", gate=["other-box"])),
+        encoding="utf-8",
+    )
+    assert discover.discover(machine="box-1", registry={}, projects={}) == []
+
+
+def test_discover_combines_adopted_repo_and_user_scoped_packages(tmp_path, monkeypatch):
+    root = tmp_path / "user-scope"
+    monkeypatch.setattr(discover, "user_package_root", lambda home_dir=None: root)
+    (root / "all").mkdir(parents=True)
+    (root / "all" / "self-update.yaml").write_text(
+        yaml.safe_dump(base_package(name="user/self-update-defaults", gate=["*"])),
+        encoding="utf-8",
+    )
+
+    srcroot = tmp_path / "Src"
+    repo = srcroot / "acme"
+    write_package(repo, "defaults.yaml", base_package(gate=["*"]))
+    reg = _registry(srcroot, acme={"class": "worktree"})
+
+    found = discover.discover(machine="box-1", registry=reg, projects=_projects("acme"))
+    assert {repo.name for repo in found} == {"acme", discover.USER_SCOPE_NAME}
+
+
 def test_discover_grafts_bound_supplemental_repo(tmp_path):
     srcroot = tmp_path / "Src"
     harness = srcroot / "harness"
@@ -207,6 +379,35 @@ def test_discover_grafts_bound_supplemental_repo(tmp_path):
         "harness",
         "knowledge",
     ]
+
+
+def test_discover_grafts_bound_supplemental_repo_from_canonical_worktrees_config(tmp_path):
+    srcroot = tmp_path / "Src"
+    harness = srcroot / "harness"
+    knowledge = srcroot / "knowledge"
+    write_package(harness, "harness.yaml", base_package(name="harness/base", gate=["*"]))
+    config = harness / ".copilot-extensions" / "agent-worktrees" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("stateless: true\n", encoding="utf-8")
+    write_package(
+        knowledge,
+        "knowledge.yaml",
+        base_package(name="knowledge/preferences", gate=["*"]),
+    )
+    reg = _registry(
+        srcroot,
+        harness={"class": "worktree"},
+        knowledge={"class": "worktree"},
+    )
+    projects = {
+        "projects": {
+            "harness": _bind_knowledge(tmp_path, "harness", "knowledge"),
+        }
+    }
+
+    found = discover.discover(machine="box-1", registry=reg, projects=projects)
+
+    assert [repo.name for repo in found] == ["harness", "knowledge"]
 
 
 def test_project_scope_resolves_only_direct_bound_supplement(tmp_path):

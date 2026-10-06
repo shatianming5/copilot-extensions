@@ -51,6 +51,84 @@ _fail() { printf '  [FAIL] %s\n' "$1" >&2; }
 _warn() { printf '  [WARN] %s\n' "$1" >&2; }
 _step() { printf '  ...    %s\n' "$1"; }
 
+# Stable, documented contract (ThomasMichon/copilot-extensions#5066): a file
+# containing a single epoch-seconds expiry, present for the duration of a
+# live-service update/start lifecycle (do_update/do_start) -- any downstream
+# consumer (a local liveness watchdog, a diagnostic tool) can check
+# `[[ -f "$INSTALL_DIR/update-in-progress" ]] && (( $(cat ...) > $(date +%s) ))`
+# without needing any plugin-specific caller-side wrapping. UPDATE_MARKER
+# itself is set once INSTALL_DIR is finalized below; these two helpers only
+# reference it at call time, so defining them here (alongside the other
+# early helpers) is safe.
+#
+# Process-local: true once THIS invocation holds a refcount slot.
+_UPDATE_MARKER_HELD=false
+#
+# Reference-counted, not single-owner: do_update holding the marker for a
+# long cutover and a separate, brief do_start both legitimately want it
+# live at once, and a single-owner/last-writer-wins scheme would let the
+# SHORT invocation's own exit delete the marker while the LONG one is
+# still mid-transition -- the marker must stay present until every
+# concurrent holder has released its own slot, not just the most recent
+# one. The refcount file + its own dedicated flock (fd 9, separate from
+# the main install lock so a brief do_start never needs to contend for --
+# or risk reentering -- that longer-held lock) make increment/decrement
+# atomic across processes.
+#
+# `mkdir -p` first: on a fresh or deleted install root, $INSTALL_DIR itself
+# may not exist yet at the point either live-service lifecycle starts (its
+# own provisioning step is what would normally create it) -- the marker
+# must not fail BEFORE that provisioning ever gets a chance to run.
+_write_update_marker() {
+    if [[ "$_UPDATE_MARKER_HELD" == true ]]; then
+        return 0
+    fi
+    local ttl="${1:-${UPDATE_MARKER_TTL_DEFAULT}}"
+    mkdir -p "$(dirname "${UPDATE_MARKER}")"
+    exec 9>"${UPDATE_MARKER_REFCOUNT_LOCK}"
+    flock -w 10 9 || true   # best-effort: proceed even if briefly uncontended-but-slow
+    local count tmp
+    count="$(cat "${UPDATE_MARKER_REFCOUNT}" 2>/dev/null || echo 0)"
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    if (( count == 0 )); then
+        # First holder: stamp a fresh marker. A later joiner deliberately
+        # does NOT refresh the expiry -- the TTL is a safety-net backstop,
+        # not a per-holder renewal lease.
+        tmp="$(mktemp "${UPDATE_MARKER}.XXXXXX")"
+        echo "$(( $(date +%s) + ttl ))" > "${tmp}"
+        mv -f "${tmp}" "${UPDATE_MARKER}"
+    fi
+    tmp="$(mktemp "${UPDATE_MARKER_REFCOUNT}.XXXXXX")"
+    echo "$(( count + 1 ))" > "${tmp}"
+    mv -f "${tmp}" "${UPDATE_MARKER_REFCOUNT}"
+    exec 9>&-
+    _UPDATE_MARKER_HELD=true
+}
+# Releases this invocation's own refcount slot; only the holder that takes
+# the count to zero actually removes the marker file, so it stays present
+# for the full duration of whichever concurrent transition runs longest.
+# Best-effort: a read/write race here is never fatal to the caller's own
+# exit (the TTL remains the backstop if the refcount file itself is ever
+# lost or corrupted).
+_clear_update_marker() {
+    [[ "$_UPDATE_MARKER_HELD" == true ]] || return 0
+    _UPDATE_MARKER_HELD=false
+    exec 9>"${UPDATE_MARKER_REFCOUNT_LOCK}" 2>/dev/null || return 0
+    flock -w 10 9 || true
+    local count tmp
+    count="$(cat "${UPDATE_MARKER_REFCOUNT}" 2>/dev/null || echo 0)"
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    (( count > 0 )) && (( count-- ))
+    if (( count <= 0 )); then
+        rm -f "${UPDATE_MARKER}" "${UPDATE_MARKER_REFCOUNT}"
+    else
+        tmp="$(mktemp "${UPDATE_MARKER_REFCOUNT}.XXXXXX")"
+        echo "${count}" > "${tmp}"
+        mv -f "${tmp}" "${UPDATE_MARKER_REFCOUNT}"
+    fi
+    exec 9>&-
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -197,6 +275,7 @@ shift || true
 NO_SERVICE=0
 NO_SUPERVISOR=0
 PURGE=0
+DRY_RUN=0
 INSTALL_DIR=""
 FORCE="${AGENT_DISPATCH_ALLOW_DOWNGRADE:-0}"
 [[ "$FORCE" == "1" ]] && FORCE=1 || FORCE=0
@@ -206,19 +285,42 @@ while [[ $# -gt 0 ]]; do
         --no-supervisor) NO_SUPERVISOR=1; shift ;;
         --purge) PURGE=1; shift ;;
         --force) FORCE=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
         --install-dir) INSTALL_DIR="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.agent-dispatch}"
+if [[ "$INSTALL_DIR" != /* ]]; then
+    INSTALL_DIR="$PWD/$INSTALL_DIR"
+fi
+LEGACY_INSTALL_DIR="$HOME/.agent-dispatch"
+legacy_cmp="$(printf '%s' "$LEGACY_INSTALL_DIR" | tr '\\' '/' | tr '[:upper:]' '[:lower:]')"
+install_cmp="$(printf '%s' "$INSTALL_DIR" | tr '\\' '/' | tr '[:upper:]' '[:lower:]')"
+if [[ "$install_cmp" == "$legacy_cmp" ]]; then
+    SERVICE_SUFFIX=""
+else
+    if command -v sha256sum >/dev/null 2>&1; then
+        SERVICE_SUFFIX="$(printf '%s' "$install_cmp" | sha256sum | awk '{print substr($1,1,12)}')"
+    elif command -v shasum >/dev/null 2>&1; then
+        SERVICE_SUFFIX="$(printf '%s' "$install_cmp" | shasum -a 256 | awk '{print substr($1,1,12)}')"
+    else
+        SERVICE_SUFFIX="$(printf '%s' "$install_cmp" | cksum | awk '{print $1}')"
+    fi
+fi
 VENV_DIR="$INSTALL_DIR/.venv"
+UPDATE_MARKER="${INSTALL_DIR}/update-in-progress"
+UPDATE_MARKER_TTL_DEFAULT=1200  # 20 min -- generous past any observed real cutover
+UPDATE_MARKER_REFCOUNT="${UPDATE_MARKER}.refcount"
+UPDATE_MARKER_REFCOUNT_LOCK="${UPDATE_MARKER}.refcount.lock"
 LOCAL_BIN="$HOME/.local/bin"
 VENV_PYTHON="$VENV_DIR/bin/python"
 STUB="$LOCAL_BIN/agent-dispatch"
 BOARD_STUB="$LOCAL_BIN/agent-dispatch-board"
-SYSTEMD_UNIT="agent-dispatch.service"
-SUPERVISOR_UNIT="agent-dispatch-supervisor.service"
+SYSTEMD_UNIT="agent-dispatch${SERVICE_SUFFIX:+-$SERVICE_SUFFIX}.service"
+SUPERVISOR_UNIT_BASE="agent-dispatch-supervisor${SERVICE_SUFFIX:+-$SERVICE_SUFFIX}"
+SUPERVISOR_UNIT="$SUPERVISOR_UNIT_BASE.service"
 UNIT_DIR="$HOME/.config/systemd/user"
 ENV_FILE="$INSTALL_DIR/service.env"
 SUPERVISOR_ENV_FILE="$INSTALL_DIR/supervisor.env"
@@ -231,6 +333,7 @@ SUPERVISOR_LAUNCHER="$INSTALL_DIR/supervise-service.sh"
 # copilot-extensions#89). Placed BEFORE the EnvironmentFile in the unit so an
 # operator can still override PATH in supervisor.env.
 SUPERVISOR_PATH="$LOCAL_BIN:$HOME/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export AGENT_DISPATCH_INSTALL_DIR="$INSTALL_DIR"
 
 # === install-contract:v3 versioned-venv (agent-dispatch: .venv-as-symlink) ===
 # Immutable per-version runtime (#581): build the venv into versions/<version>
@@ -378,6 +481,22 @@ _source_kind() {
 # === end install-contract:v4 source-kind ===
 
 # -- Version helpers + downgrade guard (parity with agent-bridge #1790) ------
+_resolve_runtime_python() {
+    # The canonical, junction-free versioned-runtime resolver (uniform-runtime-
+    # resolution, #765) -- the same one the binstub uses: current-version ->
+    # last-known-good -> newest complete slot. Prints the resolved interpreter
+    # path and returns 0, or returns 1 with nothing printed when no slot is
+    # installed. Deployed to $INSTALL_DIR/bin at install time; absent only on a
+    # never-installed host.
+    local resolver="$INSTALL_DIR/bin/resolve-runtime.sh"
+    [[ -f "$resolver" ]] || return 1
+    local AGENT_RT_PY="" AGENT_RT_ROOT="$INSTALL_DIR"
+    # shellcheck disable=SC1090
+    . "$resolver"
+    [[ -n "$AGENT_RT_PY" ]] || return 1
+    printf '%s' "$AGENT_RT_PY"
+}
+
 _installed_version() {
     # The version currently ACTIVE (via the current-version marker), for the
     # downgrade guard. Marker-only -- the `.venv` link is retired (#765).
@@ -403,14 +522,43 @@ _source_version() {
 }
 
 # True (0) if version $1 is strictly older than $2. Normalizes the PEP 440 dev
-# separator (plugin.json `0.1.0-dev19` vs importlib `0.1.0.dev19`) so `sort -V`
-# orders the devN build stream correctly.
+# separator (plugin.json `0.1.0-dev19` vs importlib `0.1.0.dev19`), then
+# compares MAJOR.MINOR.PATCH[.devN] component-by-component as integers.
+#
+# This deliberately avoids `sort -V`: GNU coreutils orders a trailing `devN`
+# stream numerically, but Apple's `sort -V` (macOS) orders it lexically, so
+# e.g. "0.1.2.dev102" sorts *before* "0.1.2.dev74" on macOS -- a false
+# "source is older" positive that permanently blocks legitimate upgrades
+# (#377). A component-wise integer compare gives the same, correct answer on
+# every platform.
 _version_lt() {
     local a="${1//-/.}" b="${2//-/.}"
     [[ "$a" == "$b" ]] && return 1
-    local lower
-    lower="$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n1)"
-    [[ "$lower" == "$a" ]]
+    local -a pa pb
+    IFS='.' read -r -a pa <<< "$a"
+    IFS='.' read -r -a pb <<< "$b"
+    local len=${#pa[@]}
+    (( ${#pb[@]} > len )) && len=${#pb[@]}
+    local i ca cb na nb
+    for (( i = 0; i < len; i++ )); do
+        ca="${pa[i]:-}"
+        cb="${pb[i]:-}"
+        [[ -z "$ca" && -z "$cb" ]] && continue
+        # A version that ran out of components here (e.g. "0.1.2" vs
+        # "0.1.2.dev5") is the finished release; a release outranks any
+        # devN pre-release build of the same prefix.
+        [[ -z "$ca" ]] && return 1
+        [[ -z "$cb" ]] && return 0
+        na="${ca//[!0-9]/}"
+        nb="${cb//[!0-9]/}"
+        na="${na:-0}"
+        nb="${nb:-0}"
+        na=$((10#$na))
+        nb=$((10#$nb))
+        (( na < nb )) && return 0
+        (( na > nb )) && return 1
+    done
+    return 1
 }
 
 _downgrade_guard() {
@@ -502,6 +650,21 @@ _ensure_uv_index() {
     if [[ -n "$idx" ]]; then export UV_DEFAULT_INDEX="$idx"; _step "uv index derived from pip config (governed-feed bridge)"; fi
 }
 
+# The adopted-project names from agent-worktrees' adoption registry, one per
+# line (empty when the registry is absent). Used only to give `agent-worktrees
+# get machine` a project so it can resolve the machine registry from any CWD.
+_adopted_projects() {
+    local reg="$HOME/.agent-worktrees/projects.yaml"
+    [[ -f "$reg" ]] || return 0
+    awk '
+        /^projects:[[:space:]]*$/ { inp = 1; next }
+        /^[^[:space:]#]/          { inp = 0 }
+        inp && /^  [A-Za-z0-9._-]+:[[:space:]]*$/ {
+            sub(/:[[:space:]]*$/, "", $1); print $1
+        }
+    ' "$reg" 2>/dev/null || true
+}
+
 # Deploy the self-provisioning binstub (install-on-first-use). Fast path execs the
 # venv's `python -m agent_dispatch`; otherwise it provisions on first use --
 # announcing (a human line + a machine-readable ::agent-provisioning:: signal so a
@@ -511,6 +674,22 @@ deploy_binstub() {
     local machine="${AGENT_DISPATCH_SUPERVISE_MACHINE:-}"
     if [[ -z "$machine" ]] && command -v agent-worktrees >/dev/null 2>&1; then # marketplace-isolation: allow installer-management
         machine="$(agent-worktrees get machine 2>/dev/null | head -n1 || true)"
+        # `get machine` resolves the machine registry THROUGH a project and
+        # discovers context from the CWD, so it yields nothing when the installer
+        # runs outside an adopted repo/worktree -- the common case. Falling
+        # straight through to `hostname` then pins the raw OS name, which on a
+        # host reporting a domain suffix (e.g. mDNS `host.local`) never matches
+        # the registry key (`host`) the Picker substitutes for `{machine}`; the
+        # board then reads this host as a remote peer and tries to SSH to itself.
+        # Every adopted project resolves the same machine identity, so retry with
+        # an explicit --project before giving up on the authority.
+        if [[ -z "$machine" ]]; then
+            local p
+            for p in $(_adopted_projects); do
+                machine="$(agent-worktrees --project "$p" get machine 2>/dev/null | head -n1 || true)" # marketplace-isolation: allow installer-management
+                [[ -n "$machine" ]] && break
+            done
+        fi
     fi
     [[ -n "$machine" ]] || machine="$(hostname 2>/dev/null || true)"
     [[ -n "$machine" ]] &&
@@ -622,12 +801,113 @@ _ensure_runtime() {
     # surface must not abort the whole install: fall back to a base install so
     # the coordinator CLI still deploys; only `agent-dispatch mcp` stays dark
     # until the toolchain is present.
+    # --reinstall-package/--refresh-package (uv only): this installs from a
+    # local PATH source (not a registry), and uv's local-path build cache is
+    # keyed by source path, not source content. A version string that was
+    # ever built before -- at this exact path, or a different one -- can
+    # silently serve a stale cached wheel instead of rebuilding from what's
+    # actually on disk right now. This is the confirmed root cause behind
+    # ThomasMichon/copilot-extensions#2863: a deployed package was missing a
+    # function its own import site required, even though every verified copy
+    # of that release's actual source (git history and the exact snapshot
+    # used for the install alike) defined it correctly. Force a fresh
+    # build/install every time so a stale cache entry can never silently ship
+    # again -- covering agent-dispatch itself AND its own local
+    # `[tool.uv.sources]` workspace path deps (agent-procutil, agent-zdd,
+    # agent-dropin-registry, agent-plugin-activation, agent-plugin-resolve,
+    # agent-single-instance-lease), which are equally local PATH sources and
+    # equally vulnerable. #2863 also flagged a second, same-class ImportError
+    # in the self-update fallback (`from agent_procutil import ...`) --
+    # agent-procutil is exactly one of these.
+    _STALE_CACHE_REFRESH_PACKAGES=(
+        agent-dispatch
+        agent-procutil
+        agent-zdd
+        agent-dropin-registry
+        agent-plugin-activation
+        agent-plugin-resolve
+        agent-single-instance-lease
+    )
+    _scrub_payload_build_artifacts() {
+        # Installing FROM the pristine payload directory ("$PLUGIN_DIR",
+        # under ~/.copilot/installed-plugins/) leaves setuptools' own
+        # build/lib + *.egg-info staging behind IN that tree -- pip's build
+        # isolation covers the *environment* the build runs in, not where
+        # the legacy build_meta backend writes intermediate files (CWD-
+        # relative to the project root being built). Left in place, a stale
+        # build/lib/ can silently shadow fresh src/ on a later install if
+        # setuptools' incremental-build mtime check decides nothing
+        # "changed" (the exact failure mode that crashed agent-bridge's
+        # deployed daemon in a restart loop, and later agent-dispatch's
+        # supervisor daemon -- see copilot-extensions#3444).
+        # The src-layout egg-info (src/agent_dispatch.egg-info) sits ONE
+        # LEVEL DEEPER than the root-level glob reaches -- a bare
+        # "$PLUGIN_DIR"/*.egg-info never matches it, so it survived every
+        # cleanup pass and shadowed a real upstream fix (registrar.py's
+        # `no_pair` field) on a live deployment. Clean both locations.
+        rm -rf "$PLUGIN_DIR/build" "$PLUGIN_DIR"/*.egg-info \
+               "$PLUGIN_DIR"/src/*.egg-info 2>/dev/null || true
+        # Every vendored `[tool.uv.sources]` workspace path dep under
+        # libs/<name>/ is its OWN independent setuptools build root -- it
+        # accumulates the exact same build/lib + *.egg-info residue as
+        # $PLUGIN_DIR, equally shadowing its own fresh src/ on a later
+        # install, and _STALE_CACHE_REFRESH_PACKAGES' --reinstall-package /
+        # --refresh-package flags do nothing to prevent it (those bust
+        # uv's resolution/build cache, not a stale build artifact sitting
+        # directly in the source tree uv builds FROM). Confirmed live
+        # (2026-09-27): agent-procutil's own libs/agent-procutil/build/lib
+        # silently shipped a version missing windowless_python_env even
+        # after a fully clean `uv cache clean` + forced rebuild, because
+        # every rebuild kept reading the stale build/lib copy instead of
+        # the fresh src/. Directory names under libs/ don't map 1:1 to
+        # package names (e.g. agent-zdd -> libs/zdd), so glob every
+        # immediate child rather than trying to enumerate them.
+        local lib_dir
+        for lib_dir in "$PLUGIN_DIR"/libs/*/; do
+            [[ -d "$lib_dir" ]] || continue
+            rm -rf "${lib_dir}build" "${lib_dir}"*.egg-info \
+                   "${lib_dir}"src/*.egg-info 2>/dev/null || true
+        done
+    }
     _pip_install() {  # $1 = package spec
+        local rc
+        # Scrub BEFORE installing too, not just after: residue left behind by
+        # an earlier attempt (a marketplace resync, a failed prior install, a
+        # concurrent process) is already sitting in "$PLUGIN_DIR" the moment
+        # THIS install starts, so an after-only scrub cleans up for next time
+        # but does nothing to stop setuptools' incremental-build mtime check
+        # from shadowing THIS build with that stale build/lib -- confirmed
+        # live (2026-09-23): a truncated recipes_cli.py (missing
+        # register_recipes_commands, present in the fresh src/ copy the whole
+        # time) got installed this way, crash-looping the supervisor daemon
+        # for ~8h before anyone noticed. See #2863 background below.
+        _scrub_payload_build_artifacts
         if [[ "$have_uv" -eq 1 ]]; then
-            uv pip install --python "$VENV_PYTHON" "$1"
+            local refresh_flags=()
+            local pkg
+            for pkg in "${_STALE_CACHE_REFRESH_PACKAGES[@]}"; do
+                refresh_flags+=(--reinstall-package "$pkg" --refresh-package "$pkg")
+            done
+            uv pip install --python "$VENV_PYTHON" "${refresh_flags[@]}" "$1"
+            rc=$?
         else
-            "$VENV_PYTHON" -m pip install "$1"
+            # Two sequential pip calls, not one: the first (--force-reinstall
+            # --no-deps) can itself recreate build/egg-info residue before the
+            # second call's own build starts, so that second build can still
+            # shadow-consume stale artifacts the way the pre-first-call scrub
+            # above exists to prevent. Re-scrub between the two calls too.
+            "$VENV_PYTHON" -m pip install --force-reinstall --no-deps "$1"
+            rc=$?
+            if [[ "$rc" -eq 0 ]]; then
+                _scrub_payload_build_artifacts
+                "$VENV_PYTHON" -m pip install "$1"
+                rc=$?
+            fi
         fi
+        # Scrub after too (success or not) so the payload directory stays the
+        # pristine clone it's supposed to be for the NEXT install attempt.
+        _scrub_payload_build_artifacts
+        return "$rc"
     }
     if _pip_install "${PLUGIN_DIR}[mcp]" >/dev/null 2>&1; then
         _ok 'Package installed: agent-dispatch [mcp]'
@@ -658,9 +938,25 @@ _ensure_runtime() {
     # systemd units, binstub) resolves through `.venv` (the link). No-op in legacy
     # mode. Remember the previous active version as the gc keep target.
     local prev_version=""
+    # `embody` is only ever imported lazily, inside spawn_factories.
+    # make_headless_spawn -- so a bare `import agent_dispatch` never touches
+    # it, and a slot that is broken ONLY at that import (as in #2863) would
+    # otherwise sail through this gate and only fail on the first real
+    # spawn attempt, invisibly to `agent-dispatch health`/`daemon-status`.
+    # `__main__` is the CLI entry point (argparse wiring, e.g. the
+    # `recipes_cli.register_recipes_commands` import) -- a bare `import
+    # agent_dispatch` never touches it either, so a slot whose package
+    # content got truncated/corrupted in a way that only breaks `__main__`'s
+    # own top-level imports (as in #3419: a partially-written source file
+    # produced a published payload silently missing a whole function) would
+    # otherwise sail through this gate and only surface on the very next
+    # `agent-dispatch <anything>` invocation -- including inside the
+    # coordinator's own systemd unit, which then crash-loops. Import both
+    # explicitly here so each class of defect is caught before a slot is
+    # ever activated.
     if [[ "$VERSIONED_RUNTIME" == 1 ]]; then
         prev_version="$(_versioned_current)"
-        if ! "$VENV_PYTHON" -c 'import agent_dispatch' 2>/dev/null; then
+        if ! "$VENV_PYTHON" -c 'import agent_dispatch, agent_dispatch.embody, agent_dispatch.__main__' 2>/dev/null; then
             _fail "Fresh runtime slot failed its health gate (versions/$SRC_VERSION) -- not activating"
             exit 1
         fi
@@ -670,7 +966,7 @@ _ensure_runtime() {
 
     _write_manifest
 
-    if "$LINK_PYTHON" -c 'import agent_dispatch' 2>/dev/null; then
+    if "$LINK_PYTHON" -c 'import agent_dispatch, agent_dispatch.embody, agent_dispatch.__main__' 2>/dev/null; then
         _ok 'Verification: module imports successfully'
     else
         _fail 'Verification: module import failed'
@@ -817,7 +1113,10 @@ AGENT_DISPATCH_HOST=127.0.0.1
 # AGENT_DISPATCH_PORT=9847  # unset = OS-assigned dynamic port (Stage C), advertised via the rendezvous file; uncomment to pin
 # AGENT_DISPATCH_DB=%h/.agent-dispatch/tasks.db   # default; uncomment to override
 # AGENT_DISPATCH_TOKEN=                            # set to require bearer auth
-# AGENT_DISPATCH_CONTROL_TOKEN=                    # required to manage producer scopes
+# AGENT_DISPATCH_CONTROL_TOKEN=                    # required to manage producer scopes (and to register evaluators)
+# AGENT_DISPATCH_CONTROL_TOKEN_COMMAND=            # or fetch it on demand (e.g. a vault CLI) instead of a raw value above
+# refuse task creation against an unregistered repo lane; register every real lane first with 'agent-dispatch registrar add-pointer'
+# AGENT_DISPATCH_ENFORCE_REGISTERED_REPOS=1
 ENVEOF
         _ok "Service env: $ENV_FILE (defaults; edit to expose on the network / add a token)"
     else
@@ -840,6 +1139,7 @@ After=network.target
 
 [Service]
 Type=simple
+Environment=AGENT_DISPATCH_INSTALL_DIR=$INSTALL_DIR
 EnvironmentFile=-$ENV_FILE
 Environment=PYTHONUTF8=1
 ExecStart=$VENV_PYTHON -m agent_dispatch serve
@@ -938,7 +1238,7 @@ _supervisor_profile_name_valid() {
 
 _supervisor_unit_for_profile() {
     local name="$1"
-    printf 'agent-dispatch-supervisor-%s.service' "$name"
+    printf '%s-%s.service' "$SUPERVISOR_UNIT_BASE" "$name"
 }
 
 _supervisor_profile_env_files() {
@@ -1011,7 +1311,7 @@ AGENT_DISPATCH_SUPERVISE_EXTRA_ARGS=
 AGENT_DISPATCH_SUPERVISE_MODE=
 # MODE=serve only: explicit machine scope for this host's daemon. Recommended in a
 # service context -- CWD-based identity resolution can fail there, and without a
-# machine the daemon SKIPS every machine-pinned declaration (aperture-labs #5001).
+# machine the daemon SKIPS every machine-pinned declaration (the downstream tracker).
 # Leave blank to fall back to the host node name at runtime; set to this host's
 # alias (e.g. mantis-counter) to pin it explicitly.
 AGENT_DISPATCH_SUPERVISE_MACHINE=
@@ -1037,6 +1337,7 @@ export PYTHONUTF8=1
 # if this launcher is run outside the unit (hand-enable / different invocation):
 # ~/.local/bin and ~/.bun/bin are prepended (copilot-extensions#89).
 export PATH="\$HOME/.local/bin:\$HOME/.bun/bin:\$PATH"
+export AGENT_DISPATCH_INSTALL_DIR="$INSTALL_DIR"
 
 labels="\${AGENT_DISPATCH_SUPERVISE_LABELS:-}"
 interval="\${AGENT_DISPATCH_SUPERVISE_INTERVAL:-30}"
@@ -1057,10 +1358,10 @@ extra="\${AGENT_DISPATCH_SUPERVISE_EXTRA_ARGS:-}"
 # no label opt-in to be safe.
 mode="\${AGENT_DISPATCH_SUPERVISE_MODE:-}"
 if [[ "\$mode" == "serve" ]]; then
-    serve_args=(supervise serve --legacy-env)
+    serve_args=(supervise serve --legacy-env --interval "\$interval")
     # Explicit machine scope (recommended for a service context, where CWD-based
     # identity resolution can fail and leave the daemon unable to scope
-    # machine-pinned declarations -- aperture-labs #5001). Falls back to the host
+    # machine-pinned declarations -- the downstream tracker). Falls back to the host
     # node name at runtime when unset.
     smachine="\${AGENT_DISPATCH_SUPERVISE_MACHINE:-}"
     [[ -n "\$smachine" ]] && serve_args+=(--machine "\$smachine")
@@ -1135,7 +1436,7 @@ _remove_all_supervisor_units() {
     _remove_supervisor_unit "$SUPERVISOR_UNIT"
     local unit_path unit
     if [[ -d "$UNIT_DIR" ]]; then
-        for unit_path in "$UNIT_DIR"/agent-dispatch-supervisor-*.service; do
+        for unit_path in "$UNIT_DIR"/"$SUPERVISOR_UNIT_BASE"-*.service; do
             [[ -e "$unit_path" ]] || continue
             unit="${unit_path##*/}"
             _remove_supervisor_unit "$unit"
@@ -1158,6 +1459,7 @@ Wants=$SYSTEMD_UNIT
 [Service]
 Type=simple
 Environment=PATH=$SUPERVISOR_PATH
+Environment=AGENT_DISPATCH_INSTALL_DIR=$INSTALL_DIR
 Environment=AGENT_DISPATCH_SUPERVISOR_ENV_FILE=$env_file
 EnvironmentFile=-$env_file
 Environment=PYTHONUTF8=1
@@ -1208,10 +1510,10 @@ _install_supervisor_profiles() {
 _reconcile_supervisor_profiles() {
     local unit_path unit name env_file
     [[ -d "$UNIT_DIR" ]] || return 0
-    for unit_path in "$UNIT_DIR"/agent-dispatch-supervisor-*.service; do
+    for unit_path in "$UNIT_DIR"/"$SUPERVISOR_UNIT_BASE"-*.service; do
         [[ -e "$unit_path" ]] || continue
         unit="${unit_path##*/}"
-        name="${unit#agent-dispatch-supervisor-}"
+        name="${unit#"$SUPERVISOR_UNIT_BASE"-}"
         name="${name%.service}"
         env_file="$SUPERVISOR_PROFILE_DIR/$name.env"
         if ! _supervisor_profile_name_valid "$name" || [[ ! -f "$env_file" ]]; then
@@ -1229,7 +1531,7 @@ _reconcile_supervisor_profiles() {
 _retire_supervisor_profile_units() {
     local unit_path unit
     [[ -d "$UNIT_DIR" ]] || return 0
-    for unit_path in "$UNIT_DIR"/agent-dispatch-supervisor-*.service; do
+    for unit_path in "$UNIT_DIR"/"$SUPERVISOR_UNIT_BASE"-*.service; do
         [[ -e "$unit_path" ]] || continue
         unit="${unit_path##*/}"
         _remove_supervisor_unit "$unit"
@@ -1360,6 +1662,12 @@ do_install() {
 
 do_update() {
     echo ''; echo '=== agent-dispatch update ==='; echo ''
+    # Mark the live-service update lifecycle as in-progress (ce#5066) so a
+    # local liveness watchdog never force-restarts a daemon that is
+    # legitimately, briefly mid-cutover. The EXIT trap covers every path
+    # below uniformly, including an unhandled error under `set -euo pipefail`.
+    _write_update_marker
+    trap _clear_update_marker EXIT
     _downgrade_guard
     _ensure_runtime
     # Thread B (parity with install.ps1): a version update must never kill an
@@ -1380,25 +1688,62 @@ do_update() {
 }
 
 do_start() {
-    command -v systemctl >/dev/null 2>&1 || { _fail 'systemd not available'; exit 1; }
-    if [[ ! -f "$UNIT_DIR/$SYSTEMD_UNIT" ]]; then
-        _fail "No service unit installed -- run: $0 install"
+    # Mark the live-service start lifecycle as in-progress (ce#5066) --
+    # unlike agent-bridge's do_start, this one has no "already healthy,
+    # nothing to do" early return, so the marker covers the whole function.
+    _write_update_marker
+    trap _clear_update_marker EXIT
+
+    if command -v systemctl >/dev/null 2>&1 && [[ -f "$UNIT_DIR/$SYSTEMD_UNIT" ]]; then
+        systemctl --user start "$SYSTEMD_UNIT"
+        if systemctl --user is-active "$SYSTEMD_UNIT" &>/dev/null; then
+            _ok "Coordinator started"
+            _for_each_present_supervisor_unit _start_supervisor_callback
+            return 0
+        fi
+        _warn "systemd start did not activate the unit -- falling back to a direct start"
+    elif command -v systemctl >/dev/null 2>&1; then
+        _warn "No service unit installed -- falling back to a direct start"
+    else
+        _warn "systemd not available -- falling back to a direct start"
+    fi
+
+    # Direct-start fallback (systemd unavailable, unit missing, or activation
+    # failed): user-mode ensure must be sufficient to start the daemon on its
+    # own -- scheduled activation (the systemd unit above) is only a login-time
+    # convenience layered on top, never a prerequisite (service-lifecycle-
+    # supervision's rule 7; #2524). Reuses the CLI's own tier-1 lazy-autostart
+    # path via the internal `_ensure-coordinator` entrypoint -- the exact same
+    # code path every ordinary client command already triggers -- rather than
+    # re-implementing a detached spawn here (parity with agent-bridge's
+    # `do_start`, which has the equivalent direct-launch fallback).
+    local rt_py
+    rt_py="$(_resolve_runtime_python)" || { _fail "agent-dispatch not installed. Run: $0 install"; exit 1; }
+    if "$rt_py" -m agent_dispatch _ensure-coordinator >/dev/null 2>&1; then
+        _ok "Coordinator started (direct)"
+    else
+        _fail "Failed to start coordinator directly"
         exit 1
     fi
-    systemctl --user start "$SYSTEMD_UNIT"
-    systemctl --user is-active "$SYSTEMD_UNIT" &>/dev/null \
-        && _ok "Coordinator started" || { _fail "Failed to start coordinator"; exit 1; }
-    # Start every supervisor that is enabled (label-gated). Inert/disabled
-    # primary/profile supervisors are left alone.
     _for_each_present_supervisor_unit _start_supervisor_callback
 }
 
+
 do_stop() {
-    command -v systemctl >/dev/null 2>&1 || { _fail 'systemd not available'; exit 1; }
     _for_each_present_supervisor_unit _stop_supervisor_callback
-    if systemctl --user is-active "$SYSTEMD_UNIT" &>/dev/null; then
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active "$SYSTEMD_UNIT" &>/dev/null; then
         systemctl --user stop "$SYSTEMD_UNIT" 2>/dev/null || true
         _ok "Coordinator stopped"
+        return 0
+    fi
+    # Not managed by (or not currently active under) systemd: it may still be a
+    # directly-spawned coordinator (the tier-1 do_start fallback above, #2524,
+    # or plain CLI lazy-autostart) that systemctl was never going to reach.
+    # Stop it gracefully over its own HTTP /shutdown route instead of leaving
+    # it running unmanaged.
+    local rt_py
+    if rt_py="$(_resolve_runtime_python)" && "$rt_py" -m agent_dispatch _stop-coordinator >/dev/null 2>&1; then
+        _ok "Coordinator stopped (direct, or already down)"
     else
         _skip "Coordinator not running"
     fi
@@ -1429,31 +1774,59 @@ do_status() {
 }
 
 do_uninstall() {
-    echo ''; echo '=== agent-dispatch uninstall ==='; echo ''
+    echo ''; echo '=== agent-dispatch uninstall ==='
+    [[ "$DRY_RUN" -eq 1 ]] && echo '(dry run -- nothing will be changed)'
+    echo ''
     if command -v systemctl >/dev/null 2>&1; then
-        _remove_all_supervisor_units
-        _ok "Embody supervisor services removed"
-        systemctl --user stop "$SYSTEMD_UNIT" 2>/dev/null || true
-        systemctl --user disable "$SYSTEMD_UNIT" 2>/dev/null || true
-        rm -f "$UNIT_DIR/$SYSTEMD_UNIT"
-        systemctl --user daemon-reload 2>/dev/null || true
-        _ok "Coordinator service removed"
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            echo "[dry-run] would stop supervisors + remove supervisor systemd units"
+            [[ -f "$UNIT_DIR/$SYSTEMD_UNIT" ]] && echo "[dry-run] would stop + disable + remove coordinator unit: $SYSTEMD_UNIT"
+        else
+            _remove_all_supervisor_units
+            _ok "Embody supervisor services removed"
+            systemctl --user stop "$SYSTEMD_UNIT" 2>/dev/null || true
+            systemctl --user disable "$SYSTEMD_UNIT" 2>/dev/null || true
+            rm -f "$UNIT_DIR/$SYSTEMD_UNIT"
+            systemctl --user daemon-reload 2>/dev/null || true
+            _ok "Coordinator service removed"
+        fi
     fi
-    rm -f "$STUB" "$BOARD_STUB"; _ok "Binstubs removed"
-    rm -f "$HOME/.agent-worktrees/pivots/agent-dispatch.json" 2>/dev/null || true
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        [[ -e "$STUB" || -e "$BOARD_STUB" ]] && echo "[dry-run] would remove binstubs: $STUB $BOARD_STUB"
+        [[ -f "$HOME/.agent-worktrees/pivots/agent-dispatch.json" ]] && \
+            echo "[dry-run] would remove pivot: $HOME/.agent-worktrees/pivots/agent-dispatch.json"
+    else
+        rm -f "$STUB" "$BOARD_STUB"; _ok "Binstubs removed"
+        rm -f "$HOME/.agent-worktrees/pivots/agent-dispatch.json" 2>/dev/null || true
+    fi
     if [[ "$PURGE" -eq 1 ]]; then
-        rm -rf "$INSTALL_DIR"; _ok "Runtime purged: $INSTALL_DIR (config + DB deleted)"
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            echo "[dry-run] would PURGE (config + DB): $INSTALL_DIR"
+        else
+            rm -rf "$INSTALL_DIR"; _ok "Runtime purged: $INSTALL_DIR (config + DB deleted)"
+        fi
     else
         # Versioned: the `.venv` link + the versions/ tree; else the real venv dir.
-        if [[ "$VERSIONED_RUNTIME" == 1 ]]; then
-            [[ -L "$LINK_DIR" ]] && rm -f "$LINK_DIR"
-            [[ -d "$LINK_DIR" && ! -L "$LINK_DIR" ]] && rm -rf "$LINK_DIR"
-            [[ -d "$INSTALL_DIR/versions" ]] && rm -rf "$INSTALL_DIR/versions"
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            if [[ "$VERSIONED_RUNTIME" == 1 ]]; then
+                [[ -e "$LINK_DIR" ]] && echo "[dry-run] would remove: $LINK_DIR"
+                [[ -d "$INSTALL_DIR/versions" ]] && echo "[dry-run] would remove: $INSTALL_DIR/versions"
+            else
+                [[ -d "$VENV_DIR" ]] && echo "[dry-run] would remove venv: $VENV_DIR"
+            fi
+            echo "[dry-run] config + DB at $INSTALL_DIR would be kept (--purge to delete)"
         else
-            rm -rf "$VENV_DIR"
+            if [[ "$VERSIONED_RUNTIME" == 1 ]]; then
+                [[ -L "$LINK_DIR" ]] && rm -f "$LINK_DIR"
+                [[ -d "$LINK_DIR" && ! -L "$LINK_DIR" ]] && rm -rf "$LINK_DIR"
+                [[ -d "$INSTALL_DIR/versions" ]] && rm -rf "$INSTALL_DIR/versions"
+            else
+                rm -rf "$VENV_DIR"
+            fi
+            _ok "Venv removed (config + DB kept; --purge to delete)"
         fi
-        _ok "Venv removed (config + DB kept; --purge to delete)"
     fi
+    [[ "$DRY_RUN" -eq 1 ]] && echo "agent-dispatch uninstall dry run complete -- nothing was changed"
 }
 
 case "$ACTION" in

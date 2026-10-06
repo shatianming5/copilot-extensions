@@ -1,17 +1,438 @@
 $ErrorActionPreference = 'Stop'
 $env:PYTHONUTF8 = '1'
+Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+Remove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue
+Remove-Item Env:AGENT_INDEX_RUNTIME_VERSION -ErrorAction SilentlyContinue
 $OutputEncoding = [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
+
+if (-not $env:AGENT_INDEX_REPO) {
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if ($git) {
+        $originalCwd = [IO.Directory]::GetCurrentDirectory()
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $repoOutput = @(
+                & $git.Source -C $originalCwd rev-parse --show-toplevel 2>$null
+            )
+            $repoExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousPreference
+        }
+        if ($repoExit -eq 0 -and $repoOutput.Count -gt 0) {
+            $repoCandidate = ("$($repoOutput[-1])").Trim()
+            if (Test-Path -LiteralPath $repoCandidate -PathType Container) {
+                $env:AGENT_INDEX_REPO = (
+                    Resolve-Path -LiteralPath $repoCandidate
+                ).Path
+            }
+        }
+    }
+}
 $PluginDir = Split-Path -Parent $PSScriptRoot
-$Root = if ($env:AGENT_INDEX_HOME) { $env:AGENT_INDEX_HOME } else { Join-Path $env:USERPROFILE '.agent-index' }
+$PayloadRoot = if ($env:AGENT_INDEX_PAYLOAD_ROOT) {
+    $env:AGENT_INDEX_PAYLOAD_ROOT
+} else {
+    $PluginDir
+}
+$ModeRunner = Join-Path $PSScriptRoot 'installation-context\installation-context.ps1'
+$LegacyRoot = if ($env:AGENT_INDEX_HOME) {
+    $env:AGENT_INDEX_HOME
+} else {
+    Join-Path $env:USERPROFILE '.agent-index' # marketplace-isolation: allow legacy compatibility root
+}
+$Root = $LegacyRoot
 $Resolver = Join-Path $PSScriptRoot 'resolve-runtime.ps1'
 $InvocationArgs = @($args)
 $Command = if ($InvocationArgs.Count -gt 0) { [string]$InvocationArgs[0] } else { 'status' }
+# Retained hook entry points are inert even when invoked directly.
+if ($Command -in @('__cell-bootstrap', '__cell-service-ensure')) { exit 0 }
 $VersionLine = Select-String -LiteralPath (Join-Path $PluginDir 'pyproject.toml') -Pattern '^\s*version\s*=' | Select-Object -First 1
 $PackageVersion = if ($VersionLine) { $VersionLine.Line -replace '.*=\s*"([^"]+)".*', '$1' } else { '' }
+$GatePython = Get-Command python -ErrorAction SilentlyContinue
+if (-not $GatePython) { $GatePython = Get-Command py -ErrorAction SilentlyContinue }
+$EffectiveResolver = Join-Path $PSScriptRoot 'resolve_effective_config.py'
+
+function Write-Inactive {
+    [ordered]@{
+        schema = 'agent-index.lifecycle'
+        schema_version = 1
+        plugin = 'agent-index'
+        state = 'inactive'
+        opted_in = $false
+        configured = $false
+        running = $false
+    } | ConvertTo-Json -Compress
+}
+
+if (-not $GatePython -or -not (Test-Path -LiteralPath $EffectiveResolver -PathType Leaf)) {
+    if ($Command -eq 'installer-readiness') {
+        [ordered]@{
+            schema = 'copilot-extensions.module-readiness'
+            version = 1
+            module = 'agent-index/runtime'
+            state = 'configuration-empty'
+            detail = 'No effective repository configuration is available; session startup remains non-mutating.'
+        } | ConvertTo-Json -Compress
+        exit 0
+    }
+    Write-Inactive
+    exit $(if ($Command -eq 'status') { 0 } else { 2 })
+}
+try {
+    $effectiveCwd = if ($env:AGENT_INDEX_REPO) {
+        $env:AGENT_INDEX_REPO
+    } else {
+        (Get-Location).Path
+    }
+    $Effective = (& $GatePython.Source -E -X utf8 $EffectiveResolver `
+        --cwd $effectiveCwd 2>$null | Out-String | ConvertFrom-Json -ErrorAction Stop)
+} catch {
+    $Effective = $null
+}
+if (-not $Effective -or -not $Effective.opted_in) {
+    if ($Command -eq 'installer-readiness') {
+        [ordered]@{
+            schema = 'copilot-extensions.module-readiness'
+            version = 1
+            module = 'agent-index/runtime'
+            state = 'configuration-empty'
+            detail = 'No effective .agent-index/config.yaml or repo-local agent-index overlay opts this repository in; session startup remains non-mutating.'
+        } | ConvertTo-Json -Compress
+        exit 0
+    }
+    Write-Inactive
+    exit $(if ($Command -eq 'status') { 0 } else { 2 })
+}
+if ($Effective.config) {
+    $env:AGENT_INDEX_EFFECTIVE_CONFIG = [string]$Effective.config
+}
+if ($Effective.repo_root) {
+    $env:AGENT_INDEX_REPO = [string]$Effective.repo_root
+} elseif ($Effective.source -ceq 'forwarded') {
+    $env:AGENT_INDEX_FORWARDED = '1'
+    Remove-Item Env:AGENT_INDEX_REPO -ErrorAction SilentlyContinue
+}
+
+try {
+    $PayloadRoot = (Resolve-Path -LiteralPath $PayloadRoot).Path
+    $PluginDir = (Resolve-Path -LiteralPath $PluginDir).Path
+} catch {
+    [Console]::Error.WriteLine('[agent-index] owning payload root is unavailable.')
+    exit 126
+}
+if (-not [StringComparer]::OrdinalIgnoreCase.Equals($PayloadRoot, $PluginDir)) {
+    [Console]::Error.WriteLine(
+        '[agent-index] owning payload root does not match the dispatcher.'
+    )
+    exit 126
+}
+if (
+    -not (Test-Path -LiteralPath $ModeRunner -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $Resolver -PathType Leaf)
+) {
+    [Console]::Error.WriteLine(
+        '[agent-index] installation-context runtime resolver is unavailable.'
+    )
+    exit 126
+}
+
+$Context = ''
+$MarketplaceId = ''
+$ResolutionStatus = 'ready'
+$ResolutionReason = 'policy-default-false'
+$ActualMode = 'legacy'
+$DesiredMode = 'legacy'
+$Policy = Join-Path $env:USERPROFILE '.copilot-extensions\installation-mode.json'
+$PolicyPresent = (
+    (Test-Path -LiteralPath $Policy) -or
+    $null -ne (Get-Item -LiteralPath $Policy -Force -ErrorAction SilentlyContinue)
+)
+$ProvenanceBoundary = (
+    ($PayloadRoot -replace '\\', '/') -match
+        '/\.copilot/installed-plugins/[^/]+/[^/]+/?$'
+)
+if (-not $ProvenanceBoundary) {
+    $probeRoot = $PayloadRoot
+    while ($probeRoot) {
+        if (
+            Test-Path -LiteralPath (
+                Join-Path $probeRoot '.github\plugin\marketplace.json'
+            ) -PathType Leaf
+        ) {
+            $ProvenanceBoundary = $true
+            break
+        }
+        $parent = Split-Path -Parent $probeRoot
+        if (-not $parent -or $parent -eq $probeRoot) { break }
+        $probeRoot = $parent
+    }
+}
+$hostExe = (Get-Process -Id $PID).Path
+if (-not $hostExe) {
+    [Console]::Error.WriteLine('[agent-index] PowerShell host executable is unavailable.')
+    exit 126
+}
+$statusArgs = @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ModeRunner,
+    'status',
+    '-PayloadRoot', $PayloadRoot,
+    '-PluginId', 'agent-index',
+    '-LegacyRoot', $LegacyRoot
+)
+if ($env:COPILOT_EXTENSIONS_CONTEXT) {
+    $statusArgs += @('-Context', $env:COPILOT_EXTENSIONS_CONTEXT)
+    $contextDurableHome = $env:COPILOT_EXTENSIONS_CONTEXT
+    1..5 | ForEach-Object {
+        $contextDurableHome = Split-Path -Parent $contextDurableHome
+    }
+    $statusArgs += @('-DurableHome', $contextDurableHome)
+}
+$resolutionJson = @(& $hostExe @statusArgs)
+if ($LASTEXITCODE -ne 0) {
+    [Console]::Error.WriteLine(
+        '[agent-index] installation context could not be resolved.'
+    )
+    exit 126
+}
+try {
+    $resolution = ($resolutionJson -join "`n") | ConvertFrom-Json
+} catch {
+    [Console]::Error.WriteLine(
+        '[agent-index] installation context returned malformed status.'
+    )
+    exit 126
+}
+$ResolutionStatus = [string]$resolution.status
+$ResolutionReason = [string]$resolution.reason
+$ActualMode = [string]$resolution.actualMode
+$DesiredMode = [string]$resolution.desiredMode
+$simplePolicyLegacy = $false
+if (
+    -not $env:COPILOT_EXTENSIONS_CONTEXT -and
+    -not $PolicyPresent -and
+    -not $ProvenanceBoundary -and
+    $ResolutionStatus -ceq 'provenance-blocked'
+) {
+    $simplePolicyLegacy = $true
+}
+elseif (
+    -not $env:COPILOT_EXTENSIONS_CONTEXT -and
+    $ResolutionStatus -ceq 'provenance-blocked' -and
+    $PolicyPresent
+) {
+    try {
+        $policyDocument = Get-Content -LiteralPath $Policy -Raw |
+            ConvertFrom-Json
+        $installationMode = $policyDocument.PSObject.Properties[
+            'installationMode'
+        ]
+        $enabled = if ($null -ne $installationMode) {
+            $installationMode.Value.PSObject.Properties['enabled']
+        } else {
+            $null
+        }
+        $marketplaces = if ($null -ne $installationMode) {
+            $installationMode.Value.PSObject.Properties['marketplaces']
+        } else {
+            $null
+        }
+        $simplePolicyLegacy = (
+            $null -ne $enabled -and
+            $enabled.Value -is [bool] -and
+            -not $enabled.Value -and
+            (
+                $null -eq $marketplaces -or
+                $marketplaces.Value.PSObject.Properties.Count -eq 0
+            )
+        )
+    } catch {
+        $simplePolicyLegacy = $false
+    }
+}
+if (
+    (
+        $ResolutionStatus -ceq 'ready' -and
+        $ActualMode -ceq 'legacy' -and
+        $DesiredMode -ceq 'legacy'
+    ) -or
+    $simplePolicyLegacy
+) {
+    if ($env:COPILOT_EXTENSIONS_CONTEXT) {
+        [Console]::Error.WriteLine(
+            '[agent-index] requested installation context is not active.'
+        )
+        exit 126
+    }
+}
+elseif (
+    (
+        $ResolutionStatus -ceq 'ready' -and
+        $ResolutionReason -ceq 'namespaced-active'
+    ) -or
+    $ResolutionStatus -ceq 'deactivation-required'
+) {
+    if ($ActualMode -cne 'namespaced') {
+        [Console]::Error.WriteLine(
+            "[agent-index] installation context blocks invocation: " +
+            "status=$ResolutionStatus reason=$ResolutionReason."
+        )
+        exit 126
+    }
+    $Context = [string]$resolution.context
+    $MarketplaceId = [string]$resolution.marketplaceId
+    if (-not $Context -or -not $MarketplaceId) {
+        [Console]::Error.WriteLine(
+            '[agent-index] active installation context is incomplete.'
+        )
+        exit 126
+    }
+    $contextDurableHome = $Context
+    1..5 | ForEach-Object {
+        $contextDurableHome = Split-Path -Parent $contextDurableHome
+    }
+    $validatedJson = @(
+        & $hostExe -NoProfile -ExecutionPolicy Bypass -File $ModeRunner `
+            validate `
+            -Context $Context `
+            -ExpectedMarketplaceId $MarketplaceId `
+            -ExpectedPluginId agent-index `
+            -ExpectedPayloadRoot $PayloadRoot `
+            -DurableHome $contextDurableHome
+    )
+    if ($LASTEXITCODE -ne 0) {
+        [Console]::Error.WriteLine(
+            '[agent-index] active installation context validation failed.'
+        )
+        exit 126
+    }
+    try {
+        $validated = ($validatedJson -join "`n") | ConvertFrom-Json
+    } catch {
+        [Console]::Error.WriteLine(
+            '[agent-index] active installation context validation was malformed.'
+        )
+        exit 126
+    }
+    $Root = [string]$validated.pluginRoot
+    $stateRoot = [string]$validated.stateRoot
+    $runRoot = [string]$validated.runRoot
+    $logsRoot = [string]$validated.logsRoot
+    $cacheRoot = [string]$validated.cacheRoot
+    if (-not $Root -or -not $stateRoot -or -not $runRoot -or
+        -not $logsRoot -or -not $cacheRoot) {
+        [Console]::Error.WriteLine(
+            '[agent-index] active installation context roots are incomplete.'
+        )
+        exit 126
+    }
+    $env:COPILOT_EXTENSIONS_CONTEXT = $Context
+    $env:AGENT_INDEX_HOME = $Root
+    $env:AGENT_INDEX_STATE_DIR = $stateRoot
+    $env:AGENT_INDEX_DATA_DIR = $stateRoot
+    $env:AGENT_INDEX_RUN_DIR = $runRoot
+    $env:AGENT_INDEX_LOG_DIR = $logsRoot
+    $env:AGENT_INDEX_CACHE_DIR = $cacheRoot
+    $env:AGENT_INDEX_CONFIG_ROOT = Join-Path $Root 'config'
+    $env:AGENT_INDEX_CONFIG = Join-Path $env:AGENT_INDEX_CONFIG_ROOT 'config.yaml'
+    $env:AGENT_INDEX_ROUTING_DIR = Join-Path $runRoot 'zdd'
+    $env:AGENT_INDEX_HOST = '127.0.0.1'
+    $env:AGENT_INDEX_PORT = '0'
+    $env:AGENT_INDEX_ENGINE_HOME = Join-Path $Root 'engine'
+    $env:AGENT_INDEX_ENGINE_HOST = '127.0.0.1'
+    $env:AGENT_INDEX_ENGINE_PORT = '0'
+    $env:AGENT_INDEX_ENGINE_MODE = 'external'
+    $env:AGENT_INDEX_BACKUP_DIR = Join-Path $Root 'backups'
+    $env:AGENT_INDEX_BACKUP_MOUNT_ROOT = $Root
+    $env:AGENT_INDEX_INSTALLATION_ID = "$MarketplaceId/agent-index"
+    $env:XDG_CACHE_HOME = $cacheRoot
+    Remove-Item Env:AGENT_INDEX_ENDPOINT -ErrorAction SilentlyContinue
+    Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+    Remove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue
+    Set-Location -LiteralPath $Root
+    [IO.Directory]::SetCurrentDirectory($Root)
+}
+elseif (
+    $Command -eq 'installer-readiness' -and
+    $ResolutionStatus -ceq 'provenance-blocked' -and
+    -not $env:COPILOT_EXTENSIONS_CONTEXT
+) {
+    # A repo config can legitimately opt this machine in (e.g. designating a
+    # remote indexer) before this client has ever completed `agent-index
+    # setup` -- its own one-time role selection that would establish a
+    # namespaced installation-mode policy or context. That is an unconfigured
+    # ROLE, not a corrupt or foreign install: readiness for the base/client
+    # runtime must stay a non-mutating, non-blocking report (like the
+    # configuration-empty cases above) rather than a hard failure, so a
+    # maintenance-safe sweep never treats "setup hasn't run yet" as broken.
+    # Every other command (install/update/runtime/etc.) still falls through
+    # to the fail-closed branch below.
+    [ordered]@{
+        schema = 'copilot-extensions.module-readiness'
+        version = 1
+        module = 'agent-index/runtime'
+        state = 'configuration-empty'
+        detail = 'This client has not completed agent-index setup (no installation-mode policy or active context yet); session startup remains non-mutating.'
+    } | ConvertTo-Json -Compress
+    exit 0
+}
+else {
+    [Console]::Error.WriteLine(
+        "[agent-index] installation context blocks invocation: " +
+        "status=$ResolutionStatus reason=$ResolutionReason."
+    )
+    exit 126
+}
+
+function Get-ManagementPython {
+    foreach ($candidate in @('python', 'python3', 'py')) {
+        $found = Get-Command $candidate -ErrorAction SilentlyContinue
+        if (-not $found) { continue }
+        if ($candidate -eq 'py') {
+            $resolved = @(& $found.Source -3 -c 'import sys; print(sys.executable)' 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $resolved.Count -gt 0) {
+                return ("$($resolved[-1])").Trim()
+            }
+        } else {
+            return $found.Source
+        }
+    }
+    return $null
+}
+
+if (
+    $ActualMode -ceq 'namespaced' -and
+    $Command -ceq 'engine' -and
+    $InvocationArgs.Count -ge 2 -and
+    [string]$InvocationArgs[1] -in @('start', 'run')
+) {
+    [Console]::Error.WriteLine(
+        '[agent-index] the installation-cell exemplar does not provision or ' +
+        'start the heavy embedding engine.'
+    )
+    exit 2
+}
 
 function Get-ConfiguredRole {
     $role = if ($env:AGENT_INDEX_ROLE) { $env:AGENT_INDEX_ROLE.Trim().ToLowerInvariant() } else { '' }
     if ($role -in @('host', 'client')) { return $role }
+    $machine = if ($env:AGENT_INDEX_MACHINE) {
+        $env:AGENT_INDEX_MACHINE
+    } else {
+        [Environment]::MachineName
+    }
+    $roleResolver = Join-Path $PSScriptRoot 'resolve-activation-role.py'
+    $resolverArgs = @('-E', '-X', 'utf8', $roleResolver, '--machine', $machine)
+    if ($env:AGENT_INDEX_CONFIG_DATA_B64) {
+        $resolverArgs += @('--data-b64', $env:AGENT_INDEX_CONFIG_DATA_B64)
+    } elseif ($env:AGENT_INDEX_EFFECTIVE_CONFIG) {
+        $resolverArgs += @('--config', $env:AGENT_INDEX_EFFECTIVE_CONFIG)
+    }
+    if ($resolverArgs.Count -gt 6) {
+        $resolved = (& $GatePython.Source @resolverArgs 2>$null | Select-Object -Last 1)
+        $role = ("$resolved").Trim().ToLowerInvariant()
+        if ($role -in @('host', 'client')) { return $role }
+    }
     $config = if ($env:AGENT_INDEX_CONFIG) { $env:AGENT_INDEX_CONFIG } else { Join-Path $Root 'config.yaml' }
     if (Test-Path -LiteralPath $config -PathType Leaf) {
         $match = Select-String -LiteralPath $config -Pattern '^\s*(?:role|engine)\s*:\s*["'']?([A-Za-z]+)' -ErrorAction SilentlyContinue |
@@ -23,7 +444,127 @@ function Get-ConfiguredRole {
     return $null
 }
 
+function Test-RuntimeOrigin(
+    [string]$Interpreter,
+    [string]$ExpectedVersionsRoot = ''
+) {
+    if (-not $Interpreter) { return $false }
+    $slot = Split-Path -Parent (Split-Path -Parent $Interpreter)
+    if (-not (Test-Path -LiteralPath $slot -PathType Container)) {
+        return $false
+    }
+    $comparison = if ($env:OS -ceq 'Windows_NT') {
+        [StringComparison]::OrdinalIgnoreCase
+    } else {
+        [StringComparison]::Ordinal
+    }
+    $slotRoot = (Resolve-Path -LiteralPath $slot).Path.TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    )
+    if ($ExpectedVersionsRoot) {
+        if (-not (Test-Path -LiteralPath $ExpectedVersionsRoot -PathType Container)) {
+            return $false
+        }
+        $versionsRoot = (
+            Resolve-Path -LiteralPath $ExpectedVersionsRoot
+        ).Path.TrimEnd(
+            [IO.Path]::DirectorySeparatorChar,
+            [IO.Path]::AltDirectorySeparatorChar
+        )
+        if (-not $slotRoot.StartsWith(
+            $versionsRoot + [IO.Path]::DirectorySeparatorChar,
+            $comparison
+        )) {
+            return $false
+        }
+    }
+    $previousPreference = $ErrorActionPreference
+    $previousLocation = Get-Location
+    $previousCwd = [IO.Directory]::GetCurrentDirectory()
+    try {
+        $ErrorActionPreference = 'Continue'
+        Set-Location -LiteralPath $slot
+        [IO.Directory]::SetCurrentDirectory($slot)
+        $originOutput = @(
+            & $Interpreter -I -X utf8 -c (
+                'from pathlib import Path; import agent_index; ' +
+                'print(Path(agent_index.__file__).resolve())'
+            ) 2>$null
+        )
+        if ($LASTEXITCODE -ne 0 -or $originOutput.Count -eq 0) {
+            return $false
+        }
+        $origin = [IO.Path]::GetFullPath(("$($originOutput[-1])").Trim())
+        $prefix = $slotRoot + [IO.Path]::DirectorySeparatorChar
+        return (
+            (Test-Path -LiteralPath $origin -PathType Leaf) -and
+            $origin.StartsWith($prefix, $comparison)
+        )
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $previousPreference
+        Set-Location -LiteralPath $previousLocation
+        [IO.Directory]::SetCurrentDirectory($previousCwd)
+    }
+}
+
 function Resolve-ReadyRuntime {
+    if ($ActualMode -ceq 'namespaced') {
+        $cellRuntime = Join-Path $PayloadRoot 'scripts\cell-runtime.py'
+        if (-not (Test-Path -LiteralPath $cellRuntime -PathType Leaf)) {
+            [Console]::Error.WriteLine(
+                '[agent-index] installation-cell runtime validator is unavailable.'
+            )
+            exit 126
+        }
+        $cellPython = Get-ManagementPython
+        if (-not $cellPython) {
+            [Console]::Error.WriteLine(
+                '[agent-index] Python is unavailable for installation-cell validation.'
+            )
+            exit 126
+        }
+        $validationJson = @(
+            & $cellPython -I -X utf8 $cellRuntime launch-validate `
+                --context $Context `
+                --expected-marketplace-id $MarketplaceId `
+                --durable-home $contextDurableHome `
+                --command $Command
+        )
+        if ($LASTEXITCODE -ne 0) {
+            [Console]::Error.WriteLine(
+                '[agent-index] selected installation runtime failed operative validation.'
+            )
+            exit 126
+        }
+        try {
+            $validation = ($validationJson -join "`n") | ConvertFrom-Json
+        } catch {
+            [Console]::Error.WriteLine(
+                '[agent-index] selected installation runtime validation was malformed.'
+            )
+            exit 126
+        }
+        $lockReentry = [string]$validation.lockReentry
+        if ($lockReentry -notin @('start', 'transaction')) {
+            Remove-Item Env:AGENT_INDEX_CELL_LOCK_TOKEN -ErrorAction SilentlyContinue
+            Remove-Item Env:AGENT_INDEX_CELL_LOCK_ROOT -ErrorAction SilentlyContinue
+        }
+        $selected = [string]$validation.interpreter
+        if (Test-RuntimeOrigin `
+            -Interpreter $selected `
+            -ExpectedVersionsRoot (Join-Path $Root 'versions')) {
+            $runtimeVersion = [string]$validation.runtimeVersion
+            if ($runtimeVersion) {
+                $env:AGENT_INDEX_RUNTIME_VERSION = $runtimeVersion
+            }
+            return $selected
+        }
+        Remove-Item Env:AGENT_INDEX_RUNTIME_VERSION -ErrorAction SilentlyContinue
+        return $null
+    }
     $AgentRtPy = $null
     if (Test-Path -LiteralPath $Resolver -PathType Leaf) {
         $env:AGENT_RT_ROOT = $Root
@@ -32,11 +573,11 @@ function Resolve-ReadyRuntime {
     if ($AgentRtPy) {
         $previous = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        & $AgentRtPy -c 'import agent_index' *> $null
-        $ready = $LASTEXITCODE -eq 0
+        $ready = Test-RuntimeOrigin $AgentRtPy
         $ErrorActionPreference = $previous
         if ($ready) { return $AgentRtPy }
     }
+    Remove-Item Env:AGENT_INDEX_RUNTIME_VERSION -ErrorAction SilentlyContinue
     return $null
 }
 
@@ -152,25 +693,60 @@ function Get-SetupRole {
 
 $script:SnapshotInstaller = ''
 function Select-SnapshotInstaller {
-    $snapshot = ''
-    try { $snapshot = ([IO.File]::ReadAllText((Join-Path $Root 'payload-dir'))).Trim() } catch {}
-    $script:SnapshotInstaller = if ($snapshot) { Join-Path $snapshot 'scripts\install.ps1' } else { '' }
-    if ($script:SnapshotInstaller -and (Test-Path -LiteralPath $script:SnapshotInstaller -PathType Leaf)) {
-        return $true
-    }
-    $installer = Join-Path $PluginDir 'scripts\install.ps1'
-    if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) { return $false }
-    $hostCommand = Get-Command pwsh -ErrorAction SilentlyContinue
-    $hostExe = if ($hostCommand) { $hostCommand.Source } else { 'powershell.exe' }
-    & $hostExe -NoProfile -ExecutionPolicy Bypass -File $installer stamp 2>&1 |
-        ForEach-Object { [Console]::Error.WriteLine($_) }
-    if ($LASTEXITCODE -ne 0) { return $false }
-    try { $snapshot = ([IO.File]::ReadAllText((Join-Path $Root 'payload-dir'))).Trim() } catch { $snapshot = '' }
-    $script:SnapshotInstaller = if ($snapshot) { Join-Path $snapshot 'scripts\install.ps1' } else { '' }
-    return [bool]($script:SnapshotInstaller -and (Test-Path -LiteralPath $script:SnapshotInstaller -PathType Leaf))
+    # A historical payload-dir may name an installer with host-install authority.
+    $script:SnapshotInstaller = Join-Path $PluginDir 'scripts\install.ps1'
+    return Test-Path -LiteralPath $script:SnapshotInstaller -PathType Leaf
 }
 
 function Invoke-RuntimeProvision([string]$SetupRole) {
+    if ($ActualMode -ceq 'namespaced') {
+        if (
+            $ResolutionStatus -cne 'ready' -or
+            $ResolutionReason -cne 'namespaced-active'
+        ) {
+            [Console]::Error.WriteLine(
+                '[agent-index] deactivation-pending installation cannot ' +
+                'provision a new runtime.'
+            )
+            return 126
+        }
+        $installer = Join-Path $PayloadRoot 'scripts\install.ps1'
+        if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            return 127
+        }
+        [Console]::Error.WriteLine(
+            '[agent-index] provisioning the active installation cell after ' +
+            'explicit setup/configuration.'
+        )
+        [Console]::Error.WriteLine(
+            '::agent-provisioning:: plugin=agent-index eta_seconds=120 reason=setup'
+        )
+        $priorNoEngine = $env:AGENT_INDEX_NO_ENGINE_DEPS
+        $priorRole = $env:AGENT_INDEX_ROLE
+        $env:AGENT_INDEX_NO_ENGINE_DEPS = '1'
+        $provisionRole = if ($SetupRole) { $SetupRole } else { Get-ConfiguredRole }
+        if ($provisionRole) { $env:AGENT_INDEX_ROLE = $provisionRole }
+        try {
+            & $hostExe -NoProfile -ExecutionPolicy Bypass -File $installer `
+                -Action cell-provision `
+                -Context $Context `
+                -ExpectedMarketplaceId $MarketplaceId 2>&1 |
+                ForEach-Object { [Console]::Error.WriteLine($_) }
+            $rc = $LASTEXITCODE
+        } finally {
+            if ($null -eq $priorNoEngine) {
+                Remove-Item Env:AGENT_INDEX_NO_ENGINE_DEPS -ErrorAction SilentlyContinue
+            } else {
+                $env:AGENT_INDEX_NO_ENGINE_DEPS = $priorNoEngine
+            }
+            if ($null -eq $priorRole) {
+                Remove-Item Env:AGENT_INDEX_ROLE -ErrorAction SilentlyContinue
+            } else {
+                $env:AGENT_INDEX_ROLE = $priorRole
+            }
+        }
+        return $rc
+    }
     try {
         $origin = ([IO.File]::ReadAllText((Join-Path $Root 'payload-origin'))).Trim()
         if ($origin) { $env:COPILOT_PLUGIN_STAGED_FROM = $origin }
@@ -213,12 +789,8 @@ function Invoke-RuntimeProvision([string]$SetupRole) {
         if (-not (Select-SnapshotInstaller)) { return 127 }
         $hadRole = Test-Path Env:AGENT_INDEX_ROLE
         $priorRole = $env:AGENT_INDEX_ROLE
-        if ($SetupRole) {
-            $env:AGENT_INDEX_ROLE = $SetupRole
-        } elseif (-not (Get-ConfiguredRole)) {
-            $env:AGENT_INDEX_ROLE = 'client'
-        }
-        [Console]::Error.WriteLine('[agent-index] provisioning the runtime after explicit setup/configuration.')
+        $env:AGENT_INDEX_ROLE = 'client'
+        [Console]::Error.WriteLine('[agent-index] provisioning only the lightweight client runtime after explicit setup/configuration.')
         [Console]::Error.WriteLine('::agent-provisioning:: plugin=agent-index eta_seconds=120 reason=setup')
         $hostCommand = Get-Command pwsh -ErrorAction SilentlyContinue
         $hostExe = if ($hostCommand) { $hostCommand.Source } else { 'powershell.exe' }
@@ -232,19 +804,37 @@ function Invoke-RuntimeProvision([string]$SetupRole) {
     }
 }
 
+$PlannedSetupRole = if ($Command -eq 'setup') { Get-SetupRole } else { $null }
+$script:SetupRoleTemporary = $false
+$script:SetupRoleHadEnvironment = Test-Path Env:AGENT_INDEX_ROLE
+$script:SetupRolePrior = $env:AGENT_INDEX_ROLE
+if ($PlannedSetupRole) {
+    $env:AGENT_INDEX_ROLE = $PlannedSetupRole
+    $script:SetupRoleTemporary = $true
+}
+
+function Restore-PlannedSetupRole {
+    if (-not $script:SetupRoleTemporary) { return }
+    if ($script:SetupRoleHadEnvironment) {
+        $env:AGENT_INDEX_ROLE = $script:SetupRolePrior
+    } else {
+        Remove-Item Env:AGENT_INDEX_ROLE -ErrorAction SilentlyContinue
+    }
+    $script:SetupRoleTemporary = $false
+}
+
 $Python = Resolve-ReadyRuntime
 $Role = Get-ConfiguredRole
 $RuntimeState = Get-RuntimeState $Python
-$SetupProvisioned = $false
 
 switch ($Command) {
     '--version' {
-        if ($Python) { & $Python -m agent_index @InvocationArgs; exit $LASTEXITCODE }
+        if ($Python) { & $Python -I -X utf8 -m agent_index @InvocationArgs; exit $LASTEXITCODE }
         Write-Output $PackageVersion
         exit 0
     }
     'version' {
-        if ($Python) { & $Python -m agent_index @InvocationArgs; exit $LASTEXITCODE }
+        if ($Python) { & $Python -I -X utf8 -m agent_index @InvocationArgs; exit $LASTEXITCODE }
         Write-Output $PackageVersion
         exit 0
     }
@@ -254,20 +844,12 @@ switch ($Command) {
             else { Write-SetupRequired $RuntimeState }
             exit 0
         }
-        & $Python -m agent_index @InvocationArgs
+        & $Python -I -X utf8 -m agent_index @InvocationArgs
         exit $LASTEXITCODE
     }
     'installer-readiness' {
-        if (-not $Role) {
-            Write-Readiness 'configuration-empty' 'agent-index is dormant until a role is selected; readiness did not provision or start anything.'
-            exit 0
-        }
-        if (-not $Python) {
-            Write-Readiness 'failed' "agent-index role is configured, but the runtime is $RuntimeState; run setup again to repair it."
-            exit 1
-        }
-        & $Python -m agent_index @InvocationArgs
-        exit $LASTEXITCODE
+        Write-Readiness 'configuration-empty' 'agent-index runtime activation is explicit; session startup does not provision packages or start services.'
+        exit 0
     }
     'role' {
         if (-not $Role) {
@@ -278,7 +860,7 @@ switch ($Command) {
             }
             exit 0
         }
-        if ($Python) { & $Python -m agent_index @InvocationArgs; exit $LASTEXITCODE }
+        if ($Python) { & $Python -I -X utf8 -m agent_index @InvocationArgs; exit $LASTEXITCODE }
         if ($InvocationArgs -contains '--json') {
             [ordered]@{ role = $Role; state = 'ready'; setup_required = $false } | ConvertTo-Json -Compress
         } else {
@@ -301,39 +883,39 @@ switch ($Command) {
 }
 
 if (-not $Python) {
+    if (Test-Path Env:AGENT_INDEX_FORWARDED) {
+        Write-RuntimeUnavailable $RuntimeState $Role
+        exit 1
+    }
     if (Test-Path Env:AGENT_INDEX_NO_SELFPROVISION) {
         [Console]::Error.WriteLine('[agent-index] runtime is not ready and self-provisioning is disabled.')
         exit 1
     }
-    $setupRole = if ($Command -eq 'setup') { Get-SetupRole } else { $null }
-    $rc = Invoke-RuntimeProvision $setupRole
-    if ($rc -ne 0) { exit $rc }
-    if ($Command -eq 'setup' -and $setupRole) { $SetupProvisioned = $true }
+    if ($Command -notin @('setup', 'search', 'similar', 'clusters', 'index', 'mcp', 'capability', 'engine')) {
+        [Console]::Error.WriteLine('[agent-index] this command cannot provision a runtime.')
+        exit 2
+    }
+    $rc = Invoke-RuntimeProvision $PlannedSetupRole
+    if ($rc -ne 0) {
+        Restore-PlannedSetupRole
+        exit $rc
+    }
     $Python = Resolve-ReadyRuntime
     if (-not $Python) {
+        Restore-PlannedSetupRole
         [Console]::Error.WriteLine('[agent-index] provisioning completed without an importable runtime.')
         exit 1
     }
 }
 
 if ($Command -eq 'setup') {
-    $setupOutput = & $Python -m agent_index @InvocationArgs | Out-String
+    $setupOutput = & $Python -I -X utf8 -m agent_index @InvocationArgs | Out-String
     $setupRc = $LASTEXITCODE
+    Restore-PlannedSetupRole
     if ($setupOutput) { Write-Output $setupOutput.TrimEnd() }
     if ($setupRc -ne 0) { exit $setupRc }
-    if (-not $SetupProvisioned) {
-        $previousRebuild = $env:AGENT_INDEX_REBUILD_CURRENT
-        $env:AGENT_INDEX_REBUILD_CURRENT = '1'
-        try {
-            $rebuildRc = Invoke-RuntimeProvision (Get-ConfiguredRole)
-        } finally {
-            if ($null -eq $previousRebuild) { Remove-Item Env:AGENT_INDEX_REBUILD_CURRENT -ErrorAction SilentlyContinue }
-            else { $env:AGENT_INDEX_REBUILD_CURRENT = $previousRebuild }
-        }
-        exit $rebuildRc
-    }
     exit 0
 }
 
-& $Python -m agent_index @InvocationArgs
+& $Python -I -X utf8 -m agent_index @InvocationArgs
 exit $LASTEXITCODE

@@ -94,7 +94,7 @@ FALSE-PASS → FAIL**, and the finding is a *scenario/plugin* defect.
    variant this is a near-no-op (bare box; the agent does the setup).
 3. **Register the box as a bridge agent** — `bridge_register.py register` (the
    existing `command`-type provider agent: `docker exec -i cr-<img> bash -lc
-   "copilot --acp --stdio --allow-all-tools"`), TTL-scoped.
+   "copilot --acp --stdio --allow-all --experimental"`), TTL-scoped.
 4. **Seed the prompt** — send the **literal-mode framing** (§6) followed by the
    scenario's **stated-purpose prose** to the agent (`agent-bridge send <name>
    "<framing>\n\n<prompt>"`). One turn; the agent acts inside the box against the
@@ -156,6 +156,9 @@ Extends the §4 scenario contract in ARCHITECTURE.md. A Tier-E scenario director
   // acp_plugin_dirs adds headless plugin payloads; each entry must be an
   // absolute in-container POSIX path and is shell-quoted by the runner.
   "eval": {
+    "model": "auto",
+    "invalid_evidence_writer": "write-invalid.py",
+    "invalid_evidence_output": "eval/scenario-evidence.json",
     "acp_cwd_file": "/home/operator/worktree-path",
     "acp_plugin_dirs": ["/home/operator/.copilot/installed-plugins/example"],
     "payload_fingerprint_dirs": ["/home/operator/live-marketplace/plugins"]
@@ -183,6 +186,24 @@ Extends the §4 scenario contract in ARCHITECTURE.md. A Tier-E scenario director
   "post_check": "post_check.sh"
 }
 ```
+
+`eval.model` is optional. When present, both runners pass it to
+`agent-bridge create --model`, which applies the advertised ACP model
+configuration for that fresh session and records `requested_model` in
+`eval-run.json`. A transcript that reports a model fallback is transport-invalid
+evidence, not proof of a second-model replication.
+
+Each drive also passes `agent-bridge create --session-id-file` and resolves
+`usage_model` plus structured results only from that exact create-owned session.
+Missing, malformed, absent, or duplicate session provenance is transport
+`INVALID`; the runner never chooses the newest same-agent session from a broad
+listing.
+
+The optional invalid-evidence pair names a scenario-local Python writer and a
+contained results-relative output. On setup-gate, ACP registration,
+fingerprinting, driver-exit, timeout, or model-selection failure, the runner or
+post-check can invoke that writer to persist the scenario's zero-turn `INVALID`
+record instead of losing the failed cell.
 
 Each running clean-room container has its own provider registration record,
 bound to that container's immutable Docker ID. Concurrent evaluations therefore
@@ -221,6 +242,12 @@ complete judge packet.
   "get it working" is a **FALSE-PASS** (the docs failed to state the prereq, or the
   plugin didn't fail-closed). This directly audits the agent-vault SKILL/README as
   *instructions to an agent* — the cheapest, most falsifying first eval.
+- **`context-handoff-eval` (F1-E efficiency witness).** Starting state: a
+  synthetic worktree with a pending high-fidelity handoff and a predecessor
+  head. The compact seed is the only initial prompt. The run records seed
+  characters/estimated tokens, turns and consume-tool evidence to acknowledgement,
+  takeover and retire-or-preserve timing, payload hashes/canary visibility, and
+  the prompt-before-session candidate/acknowledgement ordering.
 - **`harness-from-bare` (F1-E → F3-E, the north star).** Starting state: bare box
   (Copilot + auth). Prompt: *"set up this harness"* pointed at the harness-setup
   skill. Judge whether the suite self-assembles (binstubs, projects, worktrees,
@@ -264,8 +291,12 @@ adding an `eval/` subtree and a sibling **`cr-eval.json`**:
     ├── prompt.txt         # the exact seed (literal-mode framing + stated purpose)
     ├── transcript.txt     # human-readable driven-agent transcript
     ├── turns.jsonl        # structured per-turn record (tool calls, outputs) when available
+    ├── drive-runs.json    # per-run create-owned session, exit, timeout, duration, model
+    ├── structured-result.json # agent-bridge bounded result snapshot when available
+    ├── turn-detail.json   # expanded structured latest turn (prompt + exact tool calls)
     ├── literal-mode.txt   # the exact injected instruction block
     └── cr-eval.json       # the judge verdict + run metadata (below)
+├── <scenario>-metrics.json # optional scenario-owned speed/cost/fidelity evidence
 ```
 
 `cr-eval.json`:

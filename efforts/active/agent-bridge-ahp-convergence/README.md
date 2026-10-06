@@ -18,7 +18,9 @@
   [#1138](https://github.com/ThomasMichon/copilot-extensions/issues/1138)
   (immutable event identity) ·
   [#1454](https://github.com/ThomasMichon/copilot-extensions/issues/1454)
-  (delegation attention/result projection)
+  (delegation attention/result projection) ·
+  [#1308](https://github.com/ThomasMichon/copilot-extensions/issues/1308)
+  (AHP 0.8 contract lock)
 
 ## Guiding Intent
 
@@ -78,10 +80,11 @@ resources, tools, confirmations, and durable elicitation.
 
 The released baseline for this effort is
 [AHP 0.8.0](https://github.com/microsoft/agent-host-protocol/tree/v0.8.0).
-The specification remains a working draft and the repository is developing an
-unreleased 1.0 line. The implementation therefore targets 0.8 first, negotiates
-versions explicitly, and isolates version-specific codecs rather than allowing
-draft behavior to leak through one mutable schema.
+The specification remains a working draft. AHP 0.9.0 was released after this
+target was reviewed; the implementation deliberately remains on 0.8.0 for the
+first slice. Adopting 0.9.0 or a later line requires a separately pinned and
+reviewed codec rather than allowing behavior from another version to leak
+through one mutable schema.
 
 The detailed current-state comparison and ownership decisions are in
 [compatibility-baseline.md](compatibility-baseline.md).
@@ -113,35 +116,38 @@ rather than binding to private implementation details.
       and state-prerequisite rules authoritative. If the registry has not landed
       yet, pin them locally here and register them before the first AHP writer is
       enabled.
-- [ ] Pin the released AHP 0.8 tag, generated JSON schemas, exported method
+- [x] Pin the released AHP 0.8 tag, generated JSON schemas, exported method
       maps, and reducer fixtures as test inputs; record an explicit precedence
       rule for disagreements among tagged prose, types, SDKs, and fixtures.
-- [ ] Record every baseline, named-capability-gated, state-prerequisite-gated,
+- [x] Record every baseline, named-capability-gated, state-prerequisite-gated,
       `x-` extension, version-sensitive, and explicitly out-of-scope surface.
       Do not invent a generic capability advertisement mechanism.
-- [ ] Define the compatibility policy for unreleased 1.0 changes: isolated
+- [x] Define the compatibility policy for later protocol changes: isolated
       codecs, no silent semantic drift, and no named capability or optional
       state surface without its complete state machine.
 - [ ] Establish bidirectional conformance probes using an independent AHP
       client and server implementation where available.
 
-### Phase 1 — Add the AHP edge
+### Phase 1 — Build the internal AHP kernel
 
-- [ ] Add an attributable AHP server command/endpoint alongside existing CLI,
-      REST/SSE, ACP, and Session Host surfaces.
+- [ ] Add internal JSON-RPC framing and channel routing without registering a
+      production endpoint.
 - [ ] Do not enable an AHP state writer until #1460's tolerant-reader,
       old-writer-fencing, and rollback prerequisites cover every shared durable
       record the adapter will change.
-- [ ] Implement JSON-RPC framing, channel routing, `ping`, `initialize`,
-      version selection, implementation metadata, client capabilities, and the
-      exact named agent capabilities defined by the selected version.
+- [ ] Implement `ping`, `initialize`, version selection, implementation
+      metadata, client capabilities, and the exact named agent capabilities
+      defined by the selected version.
 - [ ] Project agent discovery into authoritative `ahp-root://` state without
       exposing session resources before their ownership and URI mapping are
       defined.
-- [ ] Preserve the repository's local-first transport and endpoint-discovery
-      invariants; AHP must not introduce a fixed or globally exposed port.
+- [ ] Allocate every server action once in one durable, monotonically ordered
+      `serverSeq` space per future AHP endpoint, shared across all channels and
+      persisted before any observer can receive it.
+- [ ] Keep the kernel transport-neutral and preserve the repository's
+      local-first endpoint-discovery invariants for the later exposure phase.
 
-### Phase 2 — Define authority, identity, and the default chat
+### Phase 2 — Define authority, identity, and the read-only catalog
 
 - [ ] Define the ownership matrix before the ledger: bridge-owned resources use
       bridge domain state; native-host-owned resources remain authoritative in
@@ -153,8 +159,8 @@ rather than binding to private implementation details.
       when defining those mappings; do not introduce a second bridge lifecycle
       identity inside the AHP adapter.
 - [ ] After that identity contract is fixed, implement paginated `listSessions`
-      plus ephemeral `root/sessionAdded`, `root/sessionRemoved`, and
-      `root/sessionSummaryChanged` notifications.
+      plus the internal production of ephemeral `root/sessionAdded`,
+      `root/sessionRemoved`, and `root/sessionSummaryChanged` notifications.
 - [ ] Create every ready session with a catalogued `defaultChat`; treat
       additional chats, fork, and side-chat creation as optional behavior gated
       only by the exact `multipleChats` capability fields.
@@ -172,14 +178,17 @@ rather than binding to private implementation details.
       metadata, and occupancy. Keep Git worktrees optional and require
       `multipleWorkingDirectories` before multi-directory mutation.
 
-### Phase 3 — Build durable ordering and reconciliation
+### Phase 3 — Expose the read-only edge and reconciliation
 
-- [ ] Define root/session/chat snapshots and allocate each server action once
-      in one durable, monotonically ordered `serverSeq` space per exposed AHP
-      server endpoint, shared across every state channel, client, and transport
-      reconnection on that endpoint.
-- [ ] Persist actions before delivery and remove the current crash window where
-      a live consumer can observe an event before durable commit.
+- [ ] Register an attributable, local-first AHP server command/endpoint only
+      after the internal ordering, root-state, identity, and catalog contracts
+      are coherent.
+- [ ] Initially expose only `ping`, `initialize`, subscriptions, reconnect, root
+      state, and the read-only session/default-chat catalog; do not enable
+      create, mutation, or turn-driving methods in this phase.
+- [ ] Define root/session/chat snapshots against the durable `serverSeq`
+      outbox, preserving the persist-before-delivery invariant across every
+      connection and transport reconnection.
 - [ ] Implement subscribe, unsubscribe, reconnect replay, snapshot fallback,
       missing-resource handling, catalog re-fetch after reconnect, and
       optimistic client-action reconciliation.
@@ -236,6 +245,20 @@ rather than binding to private implementation details.
       controller while exposing standard AHP state/actions to multiple clients.
 
 ### Phase 7 — Converge with native hosts and migrate consumers
+
+> **Scoping note (2026-09-13):** this phase's native-host-proxy leg (agent-bridge
+> dialing *out* to a real `copilotd`/native AHP host as a client, then federating
+> or proxying its sessions) is architecturally independent of Phases 1-6, which
+> build the *ingress* side (agent-bridge as an AHP *host* for external clients).
+> Ingress and egress are orthogonal capabilities that both land under the same
+> "protocol-neutral domain state" core in the target architecture
+> ([compatibility-baseline.md](compatibility-baseline.md#target-internal-architecture)),
+> but dialing an external native host does not require this bridge's own AHP
+> host kernel to exist first. Consider pulling the native-host-proxy leg forward
+> as an earlier, smaller, parallel slice rather than strictly serializing it
+> after Phase 6, if a concrete consumer needs it sooner (see the 2026-09-13
+> journal entry below for the motivating case and a convergence note with
+> `worktree-manager`'s existing hand-rolled `AhpController`).
 
 - [ ] Probe released native AHP hosts and classify baseline behavior, exact
       named capabilities, optional state, and `x-` extensions before delegating
@@ -303,7 +326,52 @@ The initial architecture and compatibility matrix are captured in
 baseline as AHP versions evolve, but implementation must not begin from an
 uncited or version-neutral interpretation of the protocol.
 
+The pinned 0.8.0 corpus, source hashes, method classification, capability
+policy, version decision, and exception ledger live in
+[`plugins/agent-bridge/tests/fixtures/ahp/v0.8.0/`](../../../plugins/agent-bridge/tests/fixtures/ahp/v0.8.0/).
+
 ## Journal
+
+### 2026-09-13 — Confirmed no built-in remote-subagent path in the Copilot CLI runtime; propose decoupling the native-host-proxy leg
+
+- Motivating question, from a separate CPU/process-architecture audit session:
+  can a Copilot CLI agent already create-and-pilot *another* Copilot CLI
+  session as a sub-agent, over AHP, ACP, or A2A, without agent-bridge?
+- Checked the Copilot CLI runtime's source directly. `--fleet`/`/fleet`
+  (parallel subagent orchestration) is generated straight off the native Rust
+  runtime's `SessionFleetApi` -- local, in-process subagent spawning within one
+  CLI session only. Nothing in the Copilot CLI runtime wires a subagent to a remote AHP host or an
+  ACP peer. Confirms there is no built-in remote-subagent mechanism for this; the control
+  layer has to be provided by us, as this effort already assumes.
+- Checked agent-bridge's own provider/target registry
+  (`agent_registry.py`/`admin_resolver.py`): today's only target types are
+  `local`, `ssh`, `codespace`, `container`. No `ahp` target exists yet, so
+  agent-bridge cannot currently dispatch to a `copilotd`-hosted session at all
+  -- confirming the "native-host proxy" leg in the target architecture
+  (compatibility-baseline.md) is a real, currently-unbuilt gap, not already
+  covered by another provider.
+- A parallel non-Copilot project, [`a2a-wrapper`](https://github.com/shashikanth-gs/a2a-wrapper),
+  exposes Copilot CLI as an A2A *server* so an external A2A controller can drive
+  it -- one-directional, and not a substitute: it does not give Copilot CLI its
+  own A2A client leg either, so it does not close this gap.
+- **Proposal, agreed with the operator:** AHP-host (Phases 1-6, ingress) and
+  AHP-client/native-host-proxy (Phase 7, egress) are orthogonal goals, and
+  since AHP is an open, versioned protocol, agent-bridge does not need to wait
+  on `copilotd`'s own runtime changes to be a legitimate AHP *host* itself -- only work
+  that depends on `copilotd`'s own internals (e.g. closing the
+  materialization-vs-activation gap recorded in the superseded
+  `dotfiles`/`agent-host-protocol-convergence` journal) requires diving into
+  the Copilot CLI runtime and pushing changes upstream there. See the scoping note added to Phase 7
+  above proposing the native-host-proxy leg run as an earlier, decoupled slice
+  rather than strictly after Phase 6.
+- **Convergence note for a follow-up pass:** `worktree-manager` already carries
+  a hand-rolled AHP JSON-RPC client, `AhpController`
+  (`worktree-manager/src/worktree_manager/ahp_provider.py`), built for Phase 3b
+  mux-relocation/AHP-provider work in the `worktree-manager-control-plane`
+  effort. When the native-host-proxy leg is scoped, it should converge on (or
+  explicitly supersede) that existing client rather than agent-bridge growing a
+  second, independent hand-rolled AHP JSON-RPC implementation -- one dial-out
+  AHP client for the whole harness, not two.
 
 ### 2026-08-31 — Compatibility-foundation reconciliation
 
@@ -325,3 +393,73 @@ uncited or version-neutral interpretation of the protocol.
 - Pinned released AHP 0.8 as the first compatibility target while keeping
   version-specific codecs ready for the unreleased 1.0 line.
 - No implementation begins until this plan clears review.
+
+### 2026-08-28 — Phase 0 contract lock
+
+- Started implementation under #1308 after the architecture plan cleared
+  review.
+- Pinned AHP 0.8.0 at commit
+  `7153143f1c6993fa886d7d59870811cdad479d83`, including schemas, specification
+  documents, SDK release metadata, and the reducer and round-trip corpora.
+- Recorded AHP 0.9.0 as a later release and deliberately retained 0.8.0 as the
+  only accepted first-slice version; another version requires an isolated,
+  reviewed codec.
+- Classified every exported command and notification and recorded all named
+  capabilities separately from optional state and runtime prerequisites.
+- Adjudicated the tagged `disposeChat` contradiction as recognized wire
+  vocabulary with no handler, `MethodNotFound`, and no `multipleChats`
+  advertisement until lifecycle semantics are reviewed again.
+- Kept runtime endpoint registration, ordering, replay, and live conformance
+  probes out of this contract-only slice.
+
+### 2026-09-02 — Trusted self-hosted CI gate
+
+- Added a default-branch `pull_request_target` workflow that accepts only
+  same-repository pull requests whose author and current event sender both have
+  effective `write`, `maintain`, or `admin` repository authority, checked on a
+  GitHub-hosted runner.
+- The self-hosted job uses only the dedicated `copilot-extensions-ci` label,
+  checks out the immutable pull-request head SHA without persisting a
+  credential, receives no secret, and remains disabled behind the explicit
+  `TRUSTED_SELF_HOSTED_CI=enabled` repository-variable latch until runner
+  activation.
+- Added a GitHub-hosted static contract guard and mutation tests for the event,
+  permission query, authorization dependency, activation latch, exact label,
+  immutable checkout, and credential boundary.
+- Runner activation remains conditional on repository settings requiring
+  approval for all external contributors. The static guard also rejects any
+  other checked-in workflow job that routes to `self-hosted` or the dedicated
+  label; this supplements repository policy but does not replace it.
+- The workflow now warns that deployments may pin its Git blob SHA, and
+  CODEOWNERS routes edits through the repository owner before consumers update
+  their reviewed pins.
+
+### 2026-09-11/12 — External native-host reliance confirmed insufficient; reinforces this effort's direction
+
+- A parallel, independent investigation tried the alternative of depending on
+  a released native local host's own client-contributed-plugin/customization
+  surface directly, instead of agent-bridge exposing its own AHP host face.
+  That path hit two concrete, reproduced limits rather than a mere
+  implementation gap:
+  1. **Materialization-vs-activation gap.** The native host will read a
+     client-contributed plugin/customization tree in full (confirmed by
+     tracing its reverse resource-read calls end to end), but nothing wires
+     the received customizations into the agent runtime it actually spawns --
+     the runtime's own installed/enabled-plugin telemetry never reflects the
+     contributed set, for the lifetime of a session. Whether or when a
+     released native host closes this gap is outside this effort's control.
+  2. **No ACP path around a native host.** Confirmed architecturally (native
+     host's own documentation, plus the published AHP specification's own
+     host/agent layering guidance) that ACP cannot substitute as a
+     client-facing control surface for a native-host-owned session: ACP is
+     strictly the host-to-agent leg beneath an AHP host, never a
+     client-to-host alternative above it. A client that must drive (not just
+     observe) a session has to speak AHP itself.
+- **Net effect: this confirms, rather than changes, this effort's existing
+  direction.** agent-bridge owning its own AHP host face (this effort) does
+  not depend on an external native host closing its activation gap, and gives
+  full control over plugin/customization fidelity, which a native-host-proxy
+  strategy cannot guarantee today. No plan or phase change follows from this;
+  it is corroborating evidence for the architecture already chosen at
+  kickoff. Recorded here so a future contributor doesn't re-attempt the
+  external-host-reliance path without first checking this entry.

@@ -1,7 +1,7 @@
 """Config loading and machine detection.
 
 Reads per-project config from ~/.{project}/config.yaml and provides
-typed access.  Runtime lives at ~/.agent-worktrees/ (shared across
+typed access. Runtime lives at ~/.agent-worktrees/ (shared across
 projects); per-project state at ~/.{project}/.
 
 The active project is resolved from the current working directory (git-like),
@@ -17,11 +17,17 @@ import re
 import socket
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
-from . import config_migrations
+from . import config_migrations, inrepo_config_source, project_state, registry_paths
+from .codename_config import CodenameConfig, parse_codename
+from .config_cache import (  # noqa: F401 (re-exported)
+    ConfigCacheSession,
+    cached_load_config_scope,
+    memoize_in_scope,
+)
 
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
@@ -34,17 +40,23 @@ _ASSIGNMENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 # ``repos.<name>`` block overrides it per key. The schema is **flat
 # repo-settings** (no ``anchor`` / ``worktree_root`` -- those are machine
 # paths -- and no ``repos:`` map).
-#
-# Preferred location is the **directory form**
-# ``<anchor>/.agent-worktrees/config.yaml``; the legacy single-file
-# ``<anchor>/.agent-worktrees.yaml`` (which carried only a ``pr:`` block) is
-# still read as a back-compat fallback.
-INREPO_CONFIG_DIRNAME = ".agent-worktrees"        # <anchor>/.agent-worktrees/config.yaml
+# Preferred location is the shared plugin namespace
+# ``<anchor>/.copilot-extensions/agent-worktrees/config.yaml``. Legacy
+# ``<anchor>/.agent-worktrees/config.yaml`` and the older single-file
+# ``<anchor>/.agent-worktrees.yaml`` (which carried only a ``pr:`` block) are
+# still read as back-compat fallbacks. ``.agent-worktrees/`` remains the
+# canonical home for sibling committed files such as ``machines.yaml``.
+CANONICAL_INREPO_CONFIG_DIR = Path(".copilot-extensions") / "agent-worktrees"
+LEGACY_INREPO_CONFIG_DIRNAME = (
+    "." "agent-worktrees"  # marketplace-isolation: allow legacy-compatibility
+)
+INREPO_CONFIG_DIRNAME = LEGACY_INREPO_CONFIG_DIRNAME
 INREPO_CONFIG_FILENAME = ".agent-worktrees.yaml"  # legacy single-file fallback
-
+MARKETPLACE_OVERLAYS_DIR = CANONICAL_INREPO_CONFIG_DIR / "marketplaces"
 # Global, machine-wide config: the user-owned BASE layer holding only
 # machine-wide settings -- top-level ``srcroot`` / ``machine`` / ``platform`` /
-# ``copilot_profiles`` / ``auto_fast_forward`` / ``headless``. It never carries
+# ``copilot_profiles`` / ``auto_fast_forward`` /
+# ``headless``. It never carries
 # per-repo settings or a registry of repos/machines; the full merged config for
 # a target repo is computed on demand by ``load_config``. Lives at
 # ``~/.agent-worktrees/config.yaml`` (the shared runtime root).
@@ -77,6 +89,69 @@ class ProfileAssignmentPolicy:
 # Synthetic default when no profiles are configured.
 DEFAULT_PROFILE = CopilotProfile(name="cloud", label="☁️  Cloud (GitHub)")
 
+# The vocabulary ``pr_contract.RepoPolicy.viewer_permission`` /
+# ``providers.actor_viewer_permission()`` normalize every provider's live,
+# per-identity permission read to (see #2433's ``actor_merge_authority``).
+# ``"none"`` is a confident no-access read, distinct from an *unresolved* read
+# (empty string / unsupported provider), which callers must treat as unknown,
+# never as this level. Ordered lowest -> highest so a resolver can
+# compare/clamp against it. Excluding ``"none"``, this also matches the role
+# vocabulary the GitHub Inside Microsoft ACL policy uses for its own ``role:``
+# values (Read/Triage/Write/Maintain -- Admin is never grantable via that ACL).
+GITHUB_ROLE_LEVELS: tuple[str, ...] = (
+    "none", "read", "triage", "write", "maintain", "admin",
+)
+
+
+@dataclass(frozen=True)
+class ForkConfig:
+    """How ``create-pr`` should publish a PR head when a role can't push to
+    the repo directly (see ``efforts/active/role-aware-fork-pr-flow`` in
+    copilot-extensions).
+
+    ``enabled`` on the base ``pr.fork`` block is a repo-wide default; a role
+    override (``pr.roles.<role>.fork``) may turn it on/off for just that role
+    without repeating the other fields. When active, ``create-pr`` publishes
+    the PR head to the caller's fork instead of ``repo.remote`` and opens the
+    PR with a ``<fork-owner>:<branch>`` head. GitHub-only today; the
+    fork-push/PR-open integration in ``create_pr`` itself is a later phase of
+    the same effort, not yet implemented -- this config shape is accepted and
+    parsed now so repos can declare intent ahead of that landing. Other
+    providers ignore this block.
+    """
+
+    enabled: bool = False
+    remote: str = "fork"    # local git remote name used for the fork
+    owner: str = ""         # explicit fork-owner override; "" = caller's own account
+
+
+@dataclass(frozen=True)
+class PRRoleOverride:
+    """Per-role overrides layered onto the repo's base ``PRConfig`` (see
+    ``efforts/active/role-aware-fork-pr-flow`` in copilot-extensions).
+
+    Keyed in ``PRConfig.roles`` by one of ``GITHUB_ROLE_LEVELS``. Every field
+    is optional (``None`` = inherit the base ``PRConfig`` value unchanged) so a
+    role only needs to state what's *different* about its flow -- e.g. a
+    ``write``-permission "Contributor" role might set ``merge_actor=""`` (never
+    self-merge; derive to reviewer/consent-gate) and ``fork=ForkConfig(enabled=True)``,
+    while a ``maintain``-permission "Maintainer" role keeps the repo's default
+    ``submitter-direct`` merge_actor and leaves ``fork`` unset (direct push).
+    """
+
+    reviewer: str | None = None
+    review_blocking: bool | None = None
+    self_approve: bool | None = None
+    merge_actor: str | None = None
+    fork: ForkConfig | None = None
+
+
+#: The three supported `pr.source_attribution` values -- see `PRConfig`'s
+#: docstring for what each means. Tightened from a bare `bool | str` so the
+#: type itself documents (and a type checker enforces) that no other string
+#: is ever a valid value here.
+SourceAttribution = bool | Literal["codename"]
+
 
 @dataclass(frozen=True)
 class PRConfig:
@@ -99,16 +174,16 @@ class PRConfig:
     it does not control squash timing (squashing always happens at
     ``create-pr``):
 
-    - ``detach``    -- finalize the worktree immediately; resume later via a
-                       fresh ``create`` workflow if the PR needs more work.
-    - ``keep-alive`` -- keep the worktree open to iterate on review feedback,
-                        pushing updates to the feature branch.
+    - ``detach``    -- finalize immediately (rare opt-out; needs operator
+                       approval); resume via a fresh ``create`` workflow.
+    - ``keep-alive`` -- keep iterating on review feedback. Safe default;
+                        unset falls back here, never to ``detach``.
     """
 
     enabled: bool = False
     required: bool = False         # enforce PRs: refuse direct-to-master
     provider: str = "gitea"        # gitea | github | azure-devops
-    strategy: str = "detach"       # default disposition: keep-alive | detach
+    strategy: str = "keep-alive"   # default disposition: keep-alive | detach
     branch_prefix: str = "feature"
     # ``head_scheme`` selects how create-pr *publishes* the PR head (#1815) --
     # its NAME + push mechanism. It does NOT change the local worktree, which
@@ -128,13 +203,16 @@ class PRConfig:
     #   ``worktree/<id>`` keeps the squashed commit either way (sits ahead of
     #   master while the PR is open; a later ``git sync`` reconciles it on merge).
     #
-    # ``head_pattern`` is the PR head-name template (tokens ``{prefix}``,
-    # ``{slug}``, ``{suffix}``, ``{username}``, ``{machine}``). Empty means the
-    # scheme default: ``pr/{slug}-{suffix}`` under ``refspec`` and
-    # ``{prefix}/{slug}-{suffix}`` under ``snapshot`` (``feature/<slug>``).
-    # Repos that want e.g. ``user/<username>/<slug>-<suffix>`` set it explicitly.
+    # ``head_pattern`` is the PR head-name template (tokens ``{prefix}``, ``{slug}``,
+    # ``{suffix}``, ``{username}``, ``{machine}``, ``{topic}``). Empty means the
+    # provider-aware default: Azure DevOps uses ``user/{username}/{slug}-{suffix}``;
+    # all other providers fall back to the scheme default (``pr/{slug}-{suffix}``
+    # under ``refspec`` and ``{prefix}/{slug}-{suffix}`` under ``snapshot`` /
+    # ``feature/<slug>``). A caller-supplied ``--topic`` is only folded into those
+    # generated defaults automatically; an explicit pattern must reference
+    # ``{topic}`` itself to use it.
     head_scheme: str = "refspec"   # refspec (default) | snapshot
-    head_pattern: str = ""         # empty -> scheme default (see above)
+    head_pattern: str = ""         # empty -> provider-aware default (see above)
     # Provider-plugin settings (PR creation via a provider CLI). ``api_base``
     # is the hosting endpoint -- required for self-hosted Gitea
     # (e.g. https://host/gitea) and Azure DevOps org URLs; GitHub defaults to
@@ -150,9 +228,32 @@ class PRConfig:
     token_command: str = ""
     labels: tuple[str, ...] = ()
     auto_open: bool = False        # opt-in: open the PR via the provider after push
-    # Embed raw worktree/machine/session provenance in a hidden PR-body marker.
-    # Closed-circuit systems may opt in; public repos should leave this false.
-    source_attribution: bool = False
+    # Embed source-worktree provenance in a hidden PR-body marker:
+    # - "codename" (default, effort codename-attribution-by-default) -- a
+    #   public-safe marker carrying ONLY the worktree's assigned codename
+    #   (see `agent_worktrees.codename`) -- no machine, worktree id,
+    #   session, or timestamp. Lets an author trace a stalled PR back to
+    #   its worktree without publishing anything that decodes on its own.
+    #   A repo with a custom `codename.wordlist_path` configured is
+    #   excluded from this implicit default at ALLOCATION time (see
+    #   `codename_tracking`/`CodenameAttributionPolicyError`) -- it must
+    #   set this key explicitly before a new codename may be assigned.
+    # - False -- no marker at all. The fully anonymous opt-out.
+    # - True -- the full raw marker (worktree id, machine, session, head).
+    #   Closed-circuit systems only; never a public repo.
+    source_attribution: SourceAttribution = "codename"
+    # Whether ``pr.source_attribution`` was an explicit key in the merged
+    # raw config, versus omitted entirely (both parse ``source_attribution``
+    # above to the same ``"codename"`` value, indistinguishable from each
+    # other on that field alone). The migration audit (Phase 5,
+    # `providers.attribution.audit_source_attribution_risk`) needs this
+    # distinction to report "absent (defaults to 'codename')" accurately
+    # rather than always describing an omitted key as an explicit
+    # `codename`.
+    source_attribution_configured: bool = False
+    # Markdown headings whose sections must contain visible text before
+    # create-pr may auto-open a PR. Empty keeps the generic default permissive.
+    required_body_sections: tuple[str, ...] = ()
     # Review-vocabulary binding (the "multi-machine system hook" for the pr-* command
     # family: pr-watch / pr-merge / pr-status). The plugin ships these EMPTY so
     # it stays provider-generic -- a repo with no binding gets a no-op, never a
@@ -188,11 +289,21 @@ class PRConfig:
     #   completion? True (default) preserves the review-gated shape. False suits
     #   a self-complete repo (we own the merge): eligible when simply not
     #   changes-requested (no approval vote needed).
+    # - ``allow_stale_approval`` -- may an approval submitted against an older
+    #   head still authorize completion when the live PR is otherwise mergeable?
+    #   False by default; enable only where repository policy permits it.
+    # - ``dismiss_stale_reviews`` -- does THIS repo's branch protection
+    #   dismiss an approval on head movement? ``None`` (default) = unknown;
+    #   ``adopt`` writes ``true``/``false`` from a live read. Confirmed
+    #   ``false`` lets an approval survive a clean rebase (copilot-extensions
+    #   #2060) -- layered under ``allow_stale_approval``, not a replacement.
     # - ``squash`` / ``delete_source_branch`` -- ADO auto-complete options.
     # - ``bypass_policy`` / ``bypass_reason`` -- complete PAST branch policies
     #   (for a default branch whose policy never auto-satisfies for our own PRs,
     #   e.g. a central governance status policy). ADO-only; ignored elsewhere.
     approval_required: bool = True
+    allow_stale_approval: bool = False
+    dismiss_stale_reviews: bool | None = None
     squash: bool = True
     delete_source_branch: bool = True
     bypass_policy: bool = False
@@ -252,6 +363,25 @@ class PRConfig:
     branch_update_strategy: str = "rebase"
     merge_strategy: str = "squash"
     prefer_auto_merge: bool = True
+    # ── Role-aware PR flow (see ``efforts/active/role-aware-fork-pr-flow`` in
+    # copilot-extensions). ``roles`` maps a GitHub permission level
+    # (``GITHUB_ROLE_LEVELS``) to a ``PRRoleOverride`` layered onto this
+    # PRConfig for a caller resolved at that level. Empty (the default) means
+    # every caller gets the same flow, exactly today's behavior. ``fork`` is
+    # the repo-wide fork-publish default (see ``ForkConfig``); a role may
+    # override it via its own ``fork`` field.
+    roles: dict[str, PRRoleOverride] = field(default_factory=dict)
+    fork: ForkConfig = field(default_factory=ForkConfig)
+    # ── Free-text repo-specific guidance (#pr-conduct-guidance-consolidation).
+    # Agents interact with PR config via ``agent-worktrees repos get``/the
+    # ``pr-*`` verbs, not by reading this file's comments directly -- so a
+    # comment explaining a non-obvious repo choice (e.g. "why bypass_mode:
+    # pull_request, not always/exempt") never reaches a calling agent unless
+    # it rides along through a command's own output. ``notes`` is that ride:
+    # free text surfaced as an extra ``Note:`` line in every ``pr_reminder``
+    # (the "Reminder [...]" text every pr-* verb already prints) whenever it's
+    # non-empty. Keep it short -- one or two sentences, not a policy essay.
+    notes: str = ""
 
 
 @dataclass(frozen=True)
@@ -312,8 +442,20 @@ class RepoConfig:
     validate_paths: list[str] = field(default_factory=list)
     validate_hook: dict[str, list[str]] = field(default_factory=dict)
     service_paths: list[str] = field(default_factory=list)
+    bootstrap_services: list[str] = field(default_factory=list)
+    """Optional additional service names (from ``service_paths`` manifests)
+    that the normalized launcher's pre-launch check must keep current before
+    starting Copilot, alongside agent-worktrees itself. The launcher is
+    provider-neutral and declares no facility- or repo-specific service names
+    by default; a repo opts a service into this launch-blocking check
+    explicitly here (e.g. ``bootstrap_services: [vault]``) rather than the
+    launcher assuming any particular name exists."""
     post_install_hook: dict[str, list[str]] = field(default_factory=dict)
     pr: PRConfig = field(default_factory=PRConfig)
+    codename: CodenameConfig = field(default_factory=CodenameConfig)
+    """Per-repo codename-generation settings (built-in neutral generator by
+    default; an adopter may configure a declarative wordlist file -- see
+    ``codename_config.py`` / ``codename.py``)."""
     base_repo: bool = False
     """When true, this repo is driven in **base-repo (no-worktree)** mode: the
     anchor checkout is used directly and no worktree is ever created. Used to
@@ -322,31 +464,51 @@ class RepoConfig:
     ``launch`` command. Configured entirely from the user-local
     ``~/.<project>/config.yaml`` overlay -- nothing is written into the repo."""
     stateless: bool = False
-    """When true, this repo is a **stateless harness**: it holds the shareable
-    control-plane intelligence (instructions, config, skills, sub-agents) but no
-    personal state (efforts, logs, visions, artifacts). Personal state is routed
-    to a separately-bound **knowledge repo** (top-level ``knowledge_repo`` in the
-    machine-local config; see :attr:`Config.knowledge_repo`). Consumed by the
-    state-root resolver (``agent-worktrees state-root``) so effort/vision/log
-    plugins default their writes into the bound knowledge checkout instead of the
-    harness tree. Declared in the repo's own committed
-    ``<anchor>/.agent-worktrees/config.yaml`` (``stateless: true``) -- it is a
-    property of the harness, not of a machine. **Implies**
-    :attr:`requires_external_state_root` (a stateless harness by definition
-    requires an external state root). See the ``stateless-harness`` vision /
-    ``citadel-harness-split`` effort."""
+    """When true, this repo is a **stateless harness**: shareable control-plane
+    intelligence only, no personal state -- routed to a separately-bound
+    **knowledge repo** (top-level ``knowledge_repo``; see
+    :attr:`Config.knowledge_repo`). The state-root resolver defaults
+    effort/vision/log writes into that checkout instead of the harness tree.
+    Declared in the repo's own committed ``<anchor>/.agent-worktrees/config.yaml``
+    (``stateless: true``). **Implies** :attr:`requires_external_state_root`.
+    See the ``stateless-harness`` vision."""
     requires_external_state_root: bool = False
     """When true, personal state (efforts/visions/logs) **must** be written to a
     separately-bound external **knowledge repo**, not into this repo's checkout.
-    The state-root resolver routes to the bound knowledge repo and **refuses**
-    (rather than falling back to the launch repo) when nothing is bound. This is
-    the explicit, plugin-facing knob the ``efforts`` and ``visions`` plugins key
-    on; it is **decoupled** from :attr:`stateless` (a repo can require external
-    state without being a fully guarded/linted stateless harness), but
-    ``stateless: true`` **implies** it, so a harness never has to set both.
-    **Default false** -- a normal repo is its own state home (fully
-    backward-compatible). Declared in the repo's committed
-    ``<anchor>/.agent-worktrees/config.yaml``."""
+    The state-root resolver routes there and **refuses** (rather than falling
+    back to the launch repo) when nothing is bound. The explicit,
+    plugin-facing knob ``efforts``/``visions`` key on; **decoupled** from
+    :attr:`stateless` (a repo can require external state without being a
+    fully guarded stateless harness), but ``stateless: true`` **implies** it.
+    **Default false**. Declared in ``<anchor>/.agent-worktrees/config.yaml``."""
+    compose_knowledge_plugins: bool = True
+    """When false, never graft the paired knowledge repo's own
+    marketplaces/plugins into the harness session overlay (retiring any
+    prior composition) -- state (:attr:`requires_external_state_root`) is
+    unaffected. **Default true**; declare in ``~/.<project>/config.yaml``."""
+    knowledge_only: bool = False
+    """When true, this repo is a **knowledge-only companion**: it exists
+    solely to be carved as the paired ``-k`` knowledge worktree of some other
+    project's **stateless harness** (see :attr:`stateless` /
+    :attr:`Config.knowledge_repo`), never to be driven directly. Declaring it
+    (in the repo's own committed ``<anchor>/.agent-worktrees/config.yaml``):
+
+    * ``cmd_create``/the interactive new-worktree flow **refuses** a
+      standalone worktree for this repo (the internal pairing carve in
+      :func:`_carve_paired_knowledge` bypasses this gate, so pairing is
+      unaffected).
+    * binstub install/reconcile **skips** installing this repo's own
+      ``<repo>`` binstub.
+    * the Picker/Worktree Manager's top-level launchable project list
+      **excludes** it (a paired ``-k`` sibling row -- the existing ``⚭``
+      marker -- still renders it).
+
+    **Default false.** Orthogonal to :attr:`stateless`/
+    :attr:`requires_external_state_root` (those describe the *harness* side of
+    a pairing; this describes the *knowledge* side). The registry-level
+    ``repo_class`` counterpart is ``"knowledge"`` (see
+    ``agent_worktrees.repos.VALID_CLASSES``) -- set that too via
+    ``repos add/update --class knowledge`` so ``repos list`` reflects it."""
 
 
 @dataclass(frozen=True)
@@ -381,15 +543,15 @@ class Config:
     the session and setup script see an up-to-date tree.  Only ever a
     fast-forward (clean + no local commits ahead); dirty/ahead/diverged
     worktrees are left untouched.  Set false to opt out of auto-update."""
-    new_picker: bool = True
-    """Whether the bare binstub launches the overhauled Textual worktree picker.
-    **True by default** -- the Textual picker is the default everywhere; no
-    opt-in is needed.  ``picker disable`` writes ``new_picker: false`` to opt a
-    machine *out* to the legacy ANSI picker (persistent, machine-local > global);
-    ``picker enable`` restores the default.  The env vars still override for a
-    single invocation: ``AGENT_WORKTREES_LEGACY_PICKER`` forces the legacy picker
-    (rollback) and ``AGENT_WORKTREES_NEW_PICKER`` forces the new one.  (Windows
-    over SSH always auto-falls-back to legacy -- see _new_picker_blocked_by_ssh.)"""
+    default_copilot_account: str = ""
+    """This machine's default **Copilot CLI** login (distinct from ``gh``'s
+    ``account_map``) for a repo with no explicit per-repo override.
+    Machine-local policy, not a portable knowledge-repo preference. Resolves
+    machine-local ``config.yaml`` > global ``~/.agent-worktrees/config.yaml``
+    only. Empty means no machine-wide preference. See
+    ThomasMichon/copilot-extensions#3296."""
+    copilot_identity_switch_enabled: bool = False
+    """Master switch for :mod:`copilot_identity`; default false, config-file based. See docs/config-reference.md."""
 
     @property
     def default_repo(self) -> RepoConfig:
@@ -428,7 +590,7 @@ class MachineEntry:
     environment: str
     alias: str = ""
     # Raw OS hostname (COMPUTERNAME) when it differs from ``key``. Lets a machine
-    # be keyed by a stable friendly name (e.g. ``host-augloop1``) while the box
+    # be keyed by a stable friendly name (e.g. ``host-box1``) while the box
     # reports a different, unrenameable COMPUTERNAME (e.g. ``cpc-tmich-oixui``).
     # Empty means ``key`` is the hostname (the common case).
     hostname: str = ""
@@ -507,18 +669,8 @@ def _overlay_machines_yaml_path(repo_dir: str | Path) -> Path | None:
     return None
 
 
-def load_machines_yaml(repo_dir: str | Path) -> dict[str, MachineEntry]:
-    """Load the machine registry from ``machines.yaml``.
-
-    Reads the canonical ``<repo>/.agent-worktrees/machines.yaml`` (falling back to
-    the legacy repo-root ``<repo>/machines.yaml`` -- see :func:`machines_yaml_path`).
-    Returns a dict mapping machine key → MachineEntry.
-    Raises FileNotFoundError if machines.yaml is missing.
-    """
-    path = machines_yaml_path(repo_dir)
-    if not path.exists():
-        raise FileNotFoundError(f"Machine registry not found at {path}")
-
+def _parse_machines_yaml_file(path: Path) -> dict[str, MachineEntry]:
+    """Parse one ``machines.yaml`` file's ``machines:`` block into entries."""
     with open(path, encoding="utf-8") as f:
         raw: dict[str, Any] = yaml.safe_load(f)
 
@@ -577,6 +729,29 @@ def load_machines_yaml(repo_dir: str | Path) -> dict[str, MachineEntry]:
             ssh_ready=bool(ssh_block.get("ready", False)),
             copilot=bool(data.get("copilot", True)),
         )
+    return entries
+
+
+def load_machines_yaml(repo_dir: str | Path) -> dict[str, MachineEntry]:
+    """Additively merge the canonical in-repo + legacy root ``machines.yaml``
+    (returning only whichever was found first -- the prior bug, #7914 --
+    silently dropped every machine in the other file facility-wide). The
+    canonical entry wins a key collision; the two files carry disjoint keys
+    in practice.
+    """
+    canonical = Path(repo_dir) / INREPO_CONFIG_DIRNAME / "machines.yaml"
+    legacy = Path(repo_dir) / "machines.yaml"
+    have_canonical, have_legacy = canonical.is_file(), legacy.is_file()
+    if not have_canonical and not have_legacy:
+        path = machines_yaml_path(repo_dir)  # overlay fallback, or the error path
+        if not path.exists():
+            raise FileNotFoundError(f"Machine registry not found at {path}")
+        return _parse_machines_yaml_file(path)
+    entries: dict[str, MachineEntry] = {}
+    if have_legacy:
+        entries.update(_parse_machines_yaml_file(legacy))
+    if have_canonical:
+        entries.update(_parse_machines_yaml_file(canonical))
     return entries
 
 
@@ -770,14 +945,21 @@ def project_name() -> str:
     return name
 
 
+def legacy_install_dir() -> Path:
+    """Legacy shared runtime root (``~/.agent-worktrees/``)."""
+    return _home() / ".agent-worktrees"  # marketplace-isolation: allow legacy compatibility root
+
+
 def install_dir() -> Path:
-    """Shared runtime root (``~/.agent-worktrees/``)."""
-    return _home() / ".agent-worktrees"
+    """Selected legacy or installation-cell runtime/state root."""
+    return registry_paths.registry_root(legacy_install_dir())
 
 
 def project_dir(name: str | None = None) -> Path:
-    """Per-project config/state root (``~/.{name}/``)."""
-    return _home() / f".{name or project_name()}"
+    """Per-project config/state root in legacy or validated cell scope."""
+    project = name or project_name()
+    legacy = _home() / f".{project}"
+    return project_state.project_state_root(project, legacy)
 
 
 def default_config_path() -> Path:
@@ -787,15 +969,22 @@ def default_config_path() -> Path:
 
 def global_config_path() -> Path:
     """Return the global, machine-wide config path (lowest config tier)."""
-    return install_dir() / GLOBAL_CONFIG_FILENAME
+    return registry_paths.registry_path(
+        GLOBAL_CONFIG_FILENAME, legacy_root=legacy_install_dir()
+    )
 
 
 def inrepo_config_path(anchor: str | Path) -> Path:
-    """Return the preferred in-repo config path (directory form) for an anchor."""
-    return Path(anchor) / INREPO_CONFIG_DIRNAME / GLOBAL_CONFIG_FILENAME
+    """Return the preferred in-repo config path for an anchor."""
+    return Path(anchor) / CANONICAL_INREPO_CONFIG_DIR / GLOBAL_CONFIG_FILENAME
 
 
-def load_config(
+def legacy_inrepo_config_path(anchor: str | Path) -> Path:
+    """Return the legacy directory-form in-repo config path for an anchor."""
+    return Path(anchor) / LEGACY_INREPO_CONFIG_DIRNAME / GLOBAL_CONFIG_FILENAME
+
+
+def _load_config_uncached(
     path: Path | None = None,
     *,
     include_control_plane_related_pr: bool = True,
@@ -813,12 +1002,16 @@ def load_config(
     1b. **Knowledge overlay (E1e, #947)** -- for a **stateless harness** bound to
        a knowledge repo, the knowledge repo's ``config.yaml`` contributes portable
        **operator-preference** keys (``copilot_profiles``/``headless``/
-       ``auto_fast_forward``/``new_picker``) as a tier BETWEEN the in-repo base and
+       ``auto_fast_forward``) as a tier BETWEEN the in-repo base and
        machine-local, so those prefs can be versioned in the knowledge repo while
        machine-local stays minimal. Machine-specifics + the binding never graft;
        ``{}`` (no effect) for a normal repo.
-    2. ``<anchor>/.agent-worktrees/config.yaml`` (in-repo; the repo's own
-       committed config -- the base for its settings).
+    2. ``<anchor>/.copilot-extensions/agent-worktrees/config.yaml`` (in-repo;
+       the repo's own committed config -- the base for its settings), with
+       legacy fallback to ``<anchor>/.agent-worktrees/config.yaml`` and
+       ``<anchor>/.agent-worktrees.yaml`` plus an explicit marketplace overlay
+       at
+       ``<anchor>/.copilot-extensions/agent-worktrees/marketplaces/<marketplace-id>/config.yaml``.
     3. ``~/.agent-worktrees/config.yaml`` (global; machine-wide defaults).
 
     Top-level fields (``srcroot``/``machine``/``platform``/``copilot_profiles``
@@ -985,7 +1178,7 @@ def load_config(
         raise ValueError(
             f"No repo could be resolved for project {repo_name or '?'!r}.\n"
             f"Checked machine-local config ({path}) and the repos registry "
-            f"({install_dir() / 'repos.yaml'}).\n"
+            f"({registry_paths.registry_path('repos.yaml', legacy_root=legacy_install_dir())}).\n"
             "Run the installer / register the repo first:\n"
             "  pwsh -File <repo>/plugins/agent-worktrees/scripts/install.ps1 install"
         )
@@ -1051,23 +1244,56 @@ def load_config(
                 ),
             )
         ),
-        new_picker=bool(
+        default_copilot_account=str(
             machine_raw.get(
-                "new_picker",
-                knowledge_raw.get(
-                    "new_picker", global_raw.get("new_picker", True)
-                ),
+                "default_copilot_account",
+                global_raw.get("default_copilot_account", ""),
             )
+            or ""
         ),
+        copilot_identity_switch_enabled=bool(machine_raw.get("copilot_identity_switch_enabled", global_raw.get("copilot_identity_switch_enabled", False))),
     )
 
 
-def load_project_config(name: str) -> Config:
-    """Load one project's layered config without inheriting caller identity."""
+def load_config(
+    path: Path | None = None,
+    *,
+    include_control_plane_related_pr: bool = True,
+    project: str | None = None,
+) -> Config:
+    """Load config; memoized inside ``cached_load_config_scope()`` (see
+    :mod:`agent_worktrees.config_cache`), else identical to the unwrapped loader."""
+    with inrepo_config_source.resolution_budget():  # one git-probe budget per whole load
+        return memoize_in_scope(
+            _load_config_uncached, path,
+            include_control_plane_related_pr=include_control_plane_related_pr,
+            project=project,
+        )
+
+
+def load_project_config(
+    name: str, *, include_control_plane_related_pr: bool = True
+) -> Config:
+    """Load one project's layered config without inheriting caller identity.
+    Args:
+        name: Project identity to load.
+        include_control_plane_related_pr: Forwarded to :func:`load_config`.
+            Callers resolving the *control-plane project itself* (see
+            ``_control_plane_related_pr_map``) must pass ``False`` here --
+            otherwise, when the control-plane anchor is the same project
+            already being loaded (the common case: a harness resolving
+            itself as its own control plane), this recurses into
+            ``_control_plane_related_pr_map`` -> ``load_project_config`` ->
+            ``load_config`` -> ``_control_plane_related_pr_map`` without end.
+    """
     previous = active_project()
     set_active_project(name)
     try:
-        return load_config(project_dir(name) / "config.yaml", project=name)
+        return load_config(
+            project_dir(name) / "config.yaml",
+            project=name,
+            include_control_plane_related_pr=include_control_plane_related_pr,
+        )
     finally:
         set_active_project(previous)
 
@@ -1087,6 +1313,48 @@ def _load_yaml_safe(path: Path) -> dict[str, Any]:
         return raw if isinstance(raw, dict) else {}
     except Exception:
         return {}
+
+
+def _load_inrepo_config(anchor: str) -> dict[str, Any]:
+    """Return the repo's in-repo flat settings dict, or ``{}``.
+
+    Prefers the config as **committed** on the resolved default branch
+    (:mod:`inrepo_config_source`) over the anchor's working tree -- a stale
+    or wrong local checkout can never shadow the real settings -- falling
+    back to disk (dir form, legacy dir form, legacy single file) only when
+    that resolves nothing (no remote/fetch/non-git). A marketplace overlay
+    still deep-merges on top either way. Never raises.
+    """
+    root = Path(anchor)
+    rel_candidates = (
+        inrepo_config_path(Path()),
+        legacy_inrepo_config_path(Path()),
+        Path(INREPO_CONFIG_FILENAME),
+    )
+
+    merged = inrepo_config_source.load_inrepo_config_from_committed_ref(
+        root, rel_candidates
+    )
+    if not merged:
+        base_path = next((root / rel for rel in rel_candidates if (root / rel).exists()), None)
+        merged = _load_yaml_safe(base_path) if base_path is not None else {}
+
+    context = registry_paths.installation_context()
+    marketplace_id = (
+        str(context.get("marketplaceId", "")).strip()
+        if isinstance(context, dict)
+        else ""
+    )
+    if marketplace_id:
+        overlay_path = (
+            root
+            / MARKETPLACE_OVERLAYS_DIR
+            / marketplace_id
+            / GLOBAL_CONFIG_FILENAME
+        )
+        if overlay_path.exists():
+            merged = _deep_merge(merged, _load_yaml_safe(overlay_path))
+    return merged
 
 
 def _load_config_d(
@@ -1179,7 +1447,6 @@ def _resolve_anchor_from_registry(name: str, platform: str) -> str | None:
 # not dictate a machine's paths, its own binding, or another repo's settings).
 _KNOWLEDGE_OVERLAY_TOP_KEYS: tuple[str, ...] = (
     "copilot_profiles", "profile_assignment", "headless", "auto_fast_forward",
-    "new_picker",
 )
 
 
@@ -1271,6 +1538,60 @@ def _resolve_adoption_defaults_from_registry(
     return out
 
 
+def peek_base_repo(project: str | None = None) -> bool | None:
+    """Read only the layers that can define ``base_repo``.
+
+    This is the pre-Picker fast path: unlike :func:`load_config`, it never
+    resolves knowledge overlays, related-repo PR policy, profiles, or other
+    settings. ``None`` means the shallow read was inconclusive and the caller
+    must fall back to the full loader.
+    """
+    try:
+        machine_path = default_config_path()
+        global_raw = _load_yaml_safe(global_config_path())
+        machine_raw = _load_yaml_safe(machine_path)
+        name = (
+            project
+            or machine_raw.get("repo_name")
+            or global_raw.get("repo_name")
+            or _project_name_safe()
+        )
+        if not name:
+            return None
+        dropins = _load_config_d(
+            machine_path.parent / "config.d",
+            project_name=str(name),
+            warn=False,
+        )
+        if dropins:
+            machine_raw = _deep_merge(dropins, machine_raw)
+        platform_name = (
+            machine_raw.get("platform")
+            or global_raw.get("platform")
+            or detect_platform()
+        )
+        machine_repos = machine_raw.get("repos") or {}
+        machine_repo = (
+            machine_repos.get(name) or {}
+            if isinstance(machine_repos, dict)
+            else {}
+        )
+        if not isinstance(machine_repo, dict):
+            machine_repo = {}
+        anchor = machine_repo.get("anchor") or _resolve_anchor_from_registry(
+            name, platform_name
+        )
+        inrepo = _load_inrepo_config(anchor) if anchor else {}
+        merged = _deep_merge(inrepo, machine_repo)
+        for key, value in _resolve_adoption_defaults_from_registry(
+            name, platform_name
+        ).items():
+            merged.setdefault(key, value)
+        return bool(merged.get("base_repo", False))
+    except Exception:
+        return None
+
+
 def _build_repo_config(
     data: dict[str, Any], anchor: str, worktree_root: str
 ) -> RepoConfig:
@@ -1330,6 +1651,11 @@ def _build_repo_config(
         [str(p) for p in raw_spaths] if isinstance(raw_spaths, list) else []
     )
 
+    raw_bootstrap = data.get("bootstrap_services", [])
+    bootstrap_services = (
+        [str(s) for s in raw_bootstrap] if isinstance(raw_bootstrap, list) else []
+    )
+
     post_install_hook: dict[str, list[str]] = {}
     for plat_key, cmd_list in (data.get("post_install_hook") or {}).items():
         if isinstance(cmd_list, list):
@@ -1350,29 +1676,20 @@ def _build_repo_config(
         validate_paths=validate_paths,
         validate_hook=validate_hook,
         service_paths=service_paths,
+        bootstrap_services=bootstrap_services,
         post_install_hook=post_install_hook,
         pr=_parse_pr(data.get("pr")),
+        codename=parse_codename(data.get("codename")),
         base_repo=bool(data.get("base_repo", False)),
         stateless=bool(data.get("stateless", False)),
         requires_external_state_root=bool(
             data.get("requires_external_state_root", False)
         ),
+        compose_knowledge_plugins=bool(
+            data.get("compose_knowledge_plugins", True)
+        ),
+        knowledge_only=bool(data.get("knowledge_only", False)),
     )
-
-
-def _load_inrepo_config(anchor: str) -> dict[str, Any]:
-    """Return the repo's in-repo flat settings dict, or ``{}``.
-
-    Reads ``<anchor>/.agent-worktrees/config.yaml`` (preferred, directory form).
-    Falls back to the legacy single-file ``<anchor>/.agent-worktrees.yaml``
-    (which carried only a ``pr:`` block -- still a valid, minimal flat
-    settings dict). Never raises: a missing or malformed file degrades to an
-    empty mapping so config loading cannot be broken by a bad committed file.
-    """
-    dir_form = _load_yaml_safe(inrepo_config_path(anchor))
-    if dir_form:
-        return dir_form
-    return _load_yaml_safe(Path(anchor) / INREPO_CONFIG_FILENAME)
 
 
 def _control_plane_related_pr_map() -> dict[str, dict[str, Any]]:
@@ -1386,20 +1703,56 @@ def _control_plane_related_pr_map() -> dict[str, dict[str, Any]]:
     once (installed-plugin contributions + the control-plane ``related.yaml``)
     and returns only the entries that carry a ``pr`` block.
 
-    Config-free and fail-safe: it uses ``find_control_plane_anchor`` /
-    ``installed_plugin_related_anchors`` (registry + file reads only, never
-    ``load_config``), and degrades to ``{}`` on any error so the hot config path
-    can never be broken by control-plane discovery. ``load_config`` layers each
-    block ABOVE the foreign repo's own in-repo ``pr`` and BELOW a machine-local
+    Fail-safe: it resolves the control-plane project without PR grafting, then
+    uses the standard config-source seam to include its knowledge overlay. An
+    unregistered control-plane anchor falls back to the original anchor-only
+    behavior rather than inheriting the caller's active project. Any error
+    degrades to the available anchors (or ``{}``) so the hot config path cannot
+    be broken by control-plane discovery. ``load_config`` layers each block
+    ABOVE the foreign repo's own in-repo ``pr`` and BELOW a machine-local
     ``repos.<name>.pr`` override.
     """
     try:
         from . import related
+        from . import repos
+        from . import state_root
 
         cp = related.find_control_plane_anchor()
         anchors: list[str] = list(related.installed_plugin_related_anchors())
         if cp:
-            anchors.append(cp)
+            try:
+                cp_key = related._anchor_key(cp)
+                cp_project = next(
+                    (
+                        entry.name
+                        for entry in repos.list_repos()
+                        if entry.local_path()
+                        and related._anchor_key(entry.local_path()) == cp_key
+                    ),
+                    None,
+                )
+                cp_sources = (
+                    state_root.config_source_anchors(
+                        load_project_config(
+                            cp_project, include_control_plane_related_pr=False
+                        ),
+                        base_anchor=cp,
+                    )
+                    if cp_project
+                    else []
+                )
+            except Exception:
+                cp_sources = []
+            if cp_sources:
+                anchors.extend(
+                    related.config_contribution_anchor(source.anchor, source.origin)
+                    for source in cp_sources
+                    if source.anchor
+                )
+            else:
+                anchors.append(
+                    related.config_contribution_anchor(cp, "harness")
+                )
         if not anchors:
             return {}
         rc = related.read_related_grafted(anchors)
@@ -1446,6 +1799,18 @@ def _parse_pr(raw: Any) -> PRConfig:
         s = str(value).strip().lower()
         return s if s in allowed else default
 
+    def _source_attribution(value: Any) -> SourceAttribution:
+        """Normalize ``pr.source_attribution`` to ``False``, ``True``, or
+        the literal string ``"codename"`` -- anything else (any other
+        string, including a quoted ``"true"``/``"1"``/``"yes"``, or a
+        truthy non-bool YAML value like ``1``/``[1]``/a mapping) is rejected
+        back to ``False``, never silently promoted to the full raw-marker
+        mode. Only an actual YAML-native boolean ``true`` enables raw
+        attribution."""
+        if isinstance(value, str):
+            return "codename" if value.strip().lower() == "codename" else False
+        return value is True
+
     head_scheme = str(raw.get("head_scheme", "refspec")).strip().lower()
     if head_scheme not in ("snapshot", "refspec"):
         # A present-but-garbage value signals misconfiguration -- fall back to
@@ -1457,7 +1822,7 @@ def _parse_pr(raw: Any) -> PRConfig:
         enabled=enabled,
         required=required,
         provider=str(raw.get("provider", "gitea")),
-        strategy=str(raw.get("strategy", "detach")),
+        strategy=str(raw.get("strategy", "keep-alive")),
         branch_prefix=str(raw.get("branch_prefix", "feature")),
         head_scheme=head_scheme,
         head_pattern=str(raw.get("head_pattern", "")),
@@ -1466,11 +1831,18 @@ def _parse_pr(raw: Any) -> PRConfig:
         token_command=str(raw.get("token_command", "")),
         labels=labels,
         auto_open=bool(raw.get("auto_open", False)),
-        source_attribution=bool(raw.get("source_attribution", False)),
+        source_attribution=_source_attribution(raw.get("source_attribution", "codename")),
+        source_attribution_configured=("source_attribution" in raw),
+        required_body_sections=_str_tuple(raw.get("required_body_sections", ())),
         automerge_label=str(raw.get("automerge_label", "")).strip(),
         hold_labels=_str_tuple(raw.get("hold_labels", ())),
         wip_title_prefixes=_str_tuple(raw.get("wip_title_prefixes", ())),
         approval_required=bool(raw.get("approval_required", True)),
+        allow_stale_approval=bool(raw.get("allow_stale_approval", False)),
+        dismiss_stale_reviews=(
+            bool(raw["dismiss_stale_reviews"])
+            if raw.get("dismiss_stale_reviews") is not None else None
+        ),
         squash=bool(raw.get("squash", True)),
         delete_source_branch=bool(raw.get("delete_source_branch", True)),
         bypass_policy=bool(raw.get("bypass_policy", False)),
@@ -1488,7 +1860,80 @@ def _parse_pr(raw: Any) -> PRConfig:
             raw.get("merge_strategy", "squash"), ("squash", "merge", "rebase"),
             "squash"),
         prefer_auto_merge=bool(raw.get("prefer_auto_merge", True)),
+        roles=_parse_pr_roles(raw.get("roles")),
+        fork=_parse_fork(raw.get("fork")),
+        notes=str(raw.get("notes", "")).strip(),
     )
+
+
+def _parse_fork(raw: Any) -> ForkConfig:
+    """Parse an optional ``pr.fork`` (or ``pr.roles.<role>.fork``) block."""
+    if not isinstance(raw, dict):
+        return ForkConfig()
+    return ForkConfig(
+        enabled=bool(raw.get("enabled", False)),
+        remote=str(raw.get("remote", "fork")).strip() or "fork",
+        owner=str(raw.get("owner", "")).strip(),
+    )
+
+
+def _parse_pr_roles(raw: Any) -> dict[str, PRRoleOverride]:
+    """Parse the optional ``pr.roles`` map into ``{role: PRRoleOverride}``.
+
+    Unknown role keys (not in ``GITHUB_ROLE_LEVELS``) are dropped rather than
+    raising -- a typo'd role name should degrade to "no override for anyone
+    matching it", not break config loading for the whole repo.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, PRRoleOverride] = {}
+    for role, block in raw.items():
+        role_key = str(role).strip().lower()
+        if role_key not in GITHUB_ROLE_LEVELS or not isinstance(block, dict):
+            continue
+        fork_raw = block.get("fork")
+        result[role_key] = PRRoleOverride(
+            reviewer=(str(block["reviewer"]).strip()
+                      if "reviewer" in block else None),
+            review_blocking=(bool(block["review_blocking"])
+                              if "review_blocking" in block else None),
+            self_approve=(bool(block["self_approve"])
+                          if "self_approve" in block else None),
+            merge_actor=(str(block["merge_actor"]).strip().lower()
+                         if "merge_actor" in block else None),
+            fork=(_parse_fork(fork_raw) if fork_raw is not None else None),
+        )
+    return result
+
+
+def resolve_role_pr_config(prcfg: PRConfig, role: str | None) -> PRConfig:
+    """Layer ``prcfg.roles[role]`` (if any) onto the base ``PRConfig``.
+
+    Pure and total: an unrecognized/``None``/unconfigured ``role`` returns
+    ``prcfg`` unchanged (today's single-flow behavior). Only the fields the
+    matching :class:`PRRoleOverride` actually sets (non-``None``) are
+    replaced; everything else -- including ``fork`` when the override leaves
+    it ``None`` -- is inherited from ``prcfg``.
+    """
+    if not role:
+        return prcfg
+    override = prcfg.roles.get(str(role).strip().lower())
+    if override is None:
+        return prcfg
+    from dataclasses import replace
+
+    changes: dict[str, Any] = {}
+    if override.reviewer is not None:
+        changes["reviewer"] = override.reviewer
+    if override.review_blocking is not None:
+        changes["review_blocking"] = override.review_blocking
+    if override.self_approve is not None:
+        changes["self_approve"] = override.self_approve
+    if override.merge_actor is not None:
+        changes["merge_actor"] = override.merge_actor
+    if override.fork is not None:
+        changes["fork"] = override.fork
+    return replace(prcfg, **changes) if changes else prcfg
 
 
 def _parse_profiles(raw_list: list[Any]) -> list[CopilotProfile]:
@@ -1684,9 +2129,17 @@ def derive_worktree_root(anchor: str | Path) -> str:
     return f"{str(anchor).rstrip('/').rstrip(chr(92))}.worktrees"
 
 
-def tracking_dir() -> Path:
-    """Return the worktree tracking directory path (per-project)."""
-    return project_dir() / "worktrees"
+def tracking_dir(name: str | None = None) -> Path:
+    """Return the worktree tracking directory path (per-project).
+
+    ``name`` lets a caller that already has an explicit project/repo
+    identifier (e.g. a ``Config.repo_name`` passed via ``--config``) resolve
+    the right project's tracking directory instead of silently falling back
+    to the ambient active project, which may differ (#4949 follow-up: a
+    pre-merge safety lookup that silently missed another project's tracking
+    record because it always resolved the ambient one).
+    """
+    return project_dir(name) / "worktrees"
 
 
 def venv_python() -> Path:

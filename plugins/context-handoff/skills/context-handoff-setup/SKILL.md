@@ -12,6 +12,7 @@ description: >
   - 'handoff guidance missing'
   - 'no handoff reminders'
   - 'generate_handoff_prompt missing'
+  - 'trigger_handoff missing'
   - 'enable context-handoff'
   - 'set up context-handoff'
 ---
@@ -21,84 +22,68 @@ description: >
 The plugin has two independently loaded ambient components with no runtime
 install step:
 
-- A declarative `sessionStart` hook injects the concise owner-marked continuity
-  kernel through `additionalContext`.
-- The **context-handoff extension** provides the live context-window monitor: token
-tracking + percentage-based 55%/70% defaults with optional repository config +
-`generate_handoff_prompt` /
-`save_handoff_prompt` / `continue_handoff` tools, plus `/handoff-continue` and
-`/resume-handoff`.
+- A declarative `sessionStart` hook writes the full owner-marked continuity
+  contract to the exact session folder, where a static pointer instructs the
+  agent to read it. The hook emits only `{}`.
+- The **context-handoff extension** provides the live context-window monitor:
+  token tracking + percentage-based 55%/70% defaults with optional repository
+  config + `generate_handoff_prompt` / `save_handoff_prompt` /
+  `consume_handoff` / `trigger_handoff`, plus `/handoff-continue` and
+  `/resume-handoff`.
 
-For the `/handoff` authoring workflow itself, see the **context-handoff** skill.
+Native live handoff requires Node.js, the tested Copilot CLI 1.0.84-3 native API,
+and either the native-aware Herdr `copilot-pane` launcher or agent-worktrees.
+On Grok inside Herdr, use `grok-pane` (`--kind grok`) instead; never start Copilot.
+This plugin does not install those hosts. Legacy text-only signal pickup does
+not require them. Do not reload an older CLI and claim that its runtime upgraded.
+
+Use official `copilot plugin list`, `install`, `update`, and `uninstall`
+commands, or the native plugin management UI, to resolve duplicate direct/
+marketplace copies; never edit an installed cache.
+For a versioned local candidate, `copilot plugin install <source-plugin-dir>`
+is the official source install. Disable the competing marketplace entry through
+the native plugin UI first.
+Verify the enabled source/version in a fresh CLI, without changing its model or
+permission defaults. Roll back through the original official install source,
+not by undoing consumed handoffs or reviving retired sessions.
+
+An empty profile may ask for native first-use trust in the extension's existing
+capabilities. This is separate from session permission mode; never widen the
+latter to make a test pass. Paused/exhausted/completed GoalPanel is intentionally
+hidden and must not be made visible by granting credits or enabling autopilot.
 
 ## How it loads
 
 When `context-handoff@copilot-extensions` is enabled, the CLI reads the
-plugin-declared `hooks.json` and invokes its engine-v2 producer wrapper at
-session start. Before aggregate-authority proof, the wrapper runs
-`scripts/emit-guidance.sh` or `scripts/emit-guidance.ps1` directly. That
-standalone output retains the bounded adjacent agent-worktrees compatibility
-catalog when its exact payload is present. After proof of the compatible
-`context-injection@copilot-extensions` authority, context-handoff contributes
-only its compact continuity kernel and agent-worktrees contributes its own
-catalog to the deterministic aggregate. The POSIX standalone compatibility
-catalog requires a system `python3` or `python`; the continuity kernel still
-emits without it. Standalone context-handoff installations remain independent.
+plugin-declared `hooks.json`. One hook invokes the full `emit-guidance`
+producer with `--own-only` and atomically writes its result beneath the exact
+session's `instructions/context-handoff/` folder. The projected static pointer
+directs the agent to that file. No cross-plugin authority or competing startup
+output is involved.
 
 Separately, the CLI scans
 `~/.copilot/installed-plugins/copilot-extensions/context-handoff/extensions/`
-at session startup and loads `context-handoff/extension.mjs` as a `plugin`-source
-extension. No installed runtime, venv, binstub, copy to
-`~/.copilot/extensions/`, `scripts/install.*`, or manifest.
+at session startup and loads `context-handoff/extension.mjs` as a `plugin`
+source extension. No installed runtime, venv, binstub, copy to
+`~/.copilot/extensions/`, `scripts/install.*`, or manifest is involved.
 
-## Loading gates
-
-The hook and extension have different gates. Check the component that is
-missing, then start a fresh session.
-
-### 1. The plugin must be enabled for both components
-
-A marketplace plugin's hooks and `extensions/` dir load only when the plugin is
-in `enabledPlugins`. Confirm `copilot plugin list` shows
-`context-handoff@copilot-extensions`. If missing, fetch/enable the marketplace
-plugin (this is not a context-handoff runtime installer):
-
-```bash
-copilot plugin install context-handoff@copilot-extensions
-```
-
-To enable it everywhere on a machine, add it to the user settings file
-`~/.copilot/settings.json`:
-
-```json
-{ "enabledPlugins": { "context-handoff@copilot-extensions": true } }
-```
-
-Or enable it per-repo in that repo's `.github/copilot/settings.json`.
-
-### 2. Experimental mode is required only for the extension
-
-The CLI gates **all** extension loading behind `"experimental": true` in
-`~/.copilot/settings.json`. If extensions are not loading at all, set it there
-directly (or use whatever repo/machine bootstrap normally manages your Copilot
-settings) and start a fresh session. The `sessionStart` continuity hook does
-not require experimental mode. Neither component requires worktree registration.
+If extension registration fails, the enabled plugin payload still contains
+`extensions/context-handoff/handoff-cli.mjs`. Resolve it relative to the
+verified `COPILOT_PLUGIN_ROOT` (or an installed `context-handoff/plugin.json`
+whose `name` is exactly `context-handoff`) and invoke it with `node`; do not
+look for a PATH binstub or run an installer.
 
 ## Verify
 
-Start a fresh Copilot CLI session. When the hook loads, the agent's additional
-context begins with `[owner: context-handoff@<version>]`. A payload failure
-emits `{}` and the stderr diagnostic
-`[context-handoff] no guidance context emitted` instead of blocking startup.
-With a sibling agent-worktrees plugin, the additional context also contains
-`## agent-worktrees session command catalog` when the platform can construct
-the compatibility catalog.
+Start a fresh Copilot CLI session. When the writer hook loads, the exact
+session folder contains
+`instructions/context-handoff/session-guidance.instructions.md`, beginning
+with the `# Context handoff session guidance` heading and an
+`[owner: context-handoff@<version>]` marker.
 
-A loaded extension exposes
-`generate_handoff_prompt`, `save_handoff_prompt`, and `continue_handoff`, and
-registers `/handoff-continue` and `/resume-handoff`. `/extensions` lists
-`context-handoff` with source **plugin** (exactly once -- if you see it twice, a
-stale copy exists under `~/.copilot/extensions/context-handoff/` or a project
-`.github/extensions/`; the CLI loads every source with no dedup, so remove the
-redundant copy). It intentionally does **not** log a user-visible "Session
-started" breadcrumb.
+A loaded extension exposes `generate_handoff_prompt`, `save_handoff_prompt`,
+`consume_handoff`, `continue_handoff`, `retry_handoff_cutover`, and
+`trigger_handoff`, and registers `/handoff-continue`
+and `/resume-handoff`. `/extensions` lists `context-handoff` with source
+**plugin**. It intentionally does **not** log a user-visible "Session started"
+breadcrumb.

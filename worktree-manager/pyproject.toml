@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "copilot-extensions-worktree-manager"
-version = "0.1.0-dev26"
+version = "0.6.1-dev1"
 description = "Standalone, out-of-plugin control plane (installer, configurator & worktree launcher) for the copilot-extensions harness."
 readme = "README.md"
 license = "MIT"
@@ -21,10 +21,94 @@ dependencies = [
     # Read the harness's own YAML registries/config (repos.yaml, projects.yaml,
     # per-project config.yaml) for the Manager state views.
     "pyyaml>=6",
+    # Manager-owned same-machine Agent Host Protocol provider.
+    "websocket-client>=1.8.0",
+    # Resolve a repo's own committed Copilot/Claude plugin config so AHP
+    # sessions can replicate it (client-contributed plugins), the same way
+    # agent-bridge stages a repo's plugin stack for a standalone launch.
+    "agent-plugin-resolve",
+    # Shared Windows-headless / detached process-spawn kwargs (module
+    # ``agent_procutil``). This is a `uv`-editable canonical reference
+    # (vendor-pointer-generalization effort, Phase 1): `path` escapes this
+    # plugin's own root and resolves live to `libs/agent-procutil`, so this
+    # `dev`-branch checkout has nothing to keep manually in sync -- only a
+    # real `main`-branch release (tools/materialize_main.py) ever gets a
+    # real local copy. Used by the production Picker's SSH/maintenance/task
+    # subprocess spawns (copilot-extensions#3359).
+    "agent-procutil",
+    # Resilient scan authority, entry decisions, and bounded warning tracking
+    # for filesystem registries (module ``dropin_registry``). Used by the
+    # production Picker's pivot-registry scan/materialization
+    # (copilot-extensions#3359).
+    "agent-dropin-registry",
+    # Effective global-or-adopted-project plugin eligibility and
+    # identity-verified roots for attributed registry entries (module
+    # ``plugin_activation``). Used by the production Picker's pivot-registry
+    # scan/materialization (copilot-extensions#3359).
+    "agent-plugin-activation",
+    # Coalesce/refcount/idle-exit daemon wire protocol + client (module
+    # ``work_coalescing_singleton``). Used by the Manager mux-companion
+    # daemon (``mux_daemon.py``, Phase 3b Sub-slice 3 Step 2) to serve
+    # ``mux-status-v1`` requests from agent-worktrees, mirroring
+    # ``agent_worktrees.mux_link``'s own use of the same shared library.
+    "agent-work-coalescing-singleton",
+    # Zero-downtime active/passive cutover primitives (routing table +
+    # orchestrator). This is a `uv`-editable canonical reference on `dev`
+    # (shared with the runtime plugins), and only a materialized `main`
+    # payload carries the real local vendored tree. Used by the resident
+    # mux-daemon update path.
+    "agent-zdd",
+    # Shared POSIX login-shell command wrapping for remote SSH exec (module
+    # ``remote_login_shell``, copilot-extensions#5207). Used transitively via
+    # the vendored ``agent_worktrees.resolve_machine_cli`` module this product
+    # ships its own copy of.
+    "agent-remote-login-shell",
 ]
 
+[tool.uv.sources]
+# Always resolve the vendored lib from the local path, never an index.
+# Copilot CLI + Claude plugin resolution -- marketplaces, plugins, repo settings
+# (module ``plugin_resolve``). Vendored per the harness's shared-lib convention
+# (dotfiles#929); kept byte-identical to every other copy by
+# tools/check-vendored-libs-sync.py.
+agent-plugin-resolve = { path = "libs/plugin-resolve" }
+# `path` escapes this plugin's own root and resolves live to
+# `libs/agent-procutil`, so this `dev`-branch checkout has nothing to keep
+# manually in sync -- only a real `main`-branch release
+# (tools/materialize_main.py) ever gets a real local copy.
+agent-procutil = { path = "libs/agent-procutil" }
+# Resilient scan authority, entry decisions, and bounded warning tracking for
+# filesystem registries (module ``dropin_registry``).
+agent-dropin-registry = { path = "libs/dropin-registry" }
+# Effective global-or-adopted-project plugin eligibility and identity-verified
+# roots for attributed registry entries (module ``plugin_activation``).
+agent-plugin-activation = { path = "libs/plugin-activation" }
+# Coalesce/refcount/idle-exit daemon wire protocol + client (module
+# ``work_coalescing_singleton``). This is a `uv`-editable canonical reference
+# (vendor-pointer-generalization effort, Phase 1): `path` escapes this
+# project's own root and resolves live to `libs/work-coalescing-singleton`,
+# so this `dev`-branch checkout has nothing to keep manually in sync -- only
+# a real `main`-branch release (tools/materialize_main.py) ever gets a real
+# local copy.
+agent-work-coalescing-singleton = { path = "libs/work-coalescing-singleton" }
+# Zero-downtime active/passive cutover primitives (module ``zdd``). This is a
+# `uv`-editable canonical reference (vendor-pointer-generalization effort,
+# Phase 1): `path` escapes this project's own root and resolves live to
+# `libs/zdd`, so this `dev`-branch checkout has nothing to keep manually in
+# sync -- only a real `main`-branch release (tools/materialize_main.py)
+# ever gets a real local copy.
+agent-zdd = { path = "libs/zdd" }
+# Shared POSIX login-shell command wrapping for remote SSH exec (module
+# ``remote_login_shell``, copilot-extensions#5207). This is a `uv`-editable
+# canonical reference (vendor-pointer-generalization effort, Phase 1): `path`
+# escapes this project's own root and resolves live to
+# `libs/remote-login-shell`, so this `dev`-branch checkout has nothing to
+# keep manually in sync -- only a real `main`-branch release
+# (tools/materialize_main.py) ever gets a real local copy.
+agent-remote-login-shell = { path = "libs/remote-login-shell" }
+
 [project.scripts]
-worktree-manager = "worktree_manager.__main__:main"
+worktree-manager = "worktree_manager.__main__:console_entry"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

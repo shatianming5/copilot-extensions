@@ -49,14 +49,18 @@ then re-run adoption when the machine-local projection needs refreshing.
 | File | Purpose | Written by |
 |------|---------|-----------|
 | `.github/copilot/settings.json` | Which plugins the repo enables + the marketplace (`enabledPlugins`, `extraKnownMarketplaces`) | `customizing-copilot:installing-plugins` skill / normal repo edit |
-| `<repo>/.agent-worktrees/config.yaml` | The repo's own worktree settings — PR mode (`pr:`), workflow, defaults shared by every machine | agent-worktrees repo bootstrap / normal repo edit |
+| `<repo>/.copilot-extensions/agent-worktrees/config.yaml` | The repo's own worktree settings — PR mode (`pr:`), workflow, defaults shared by every machine. Legacy `<repo>/.agent-worktrees/config.yaml` and `<repo>/.agent-worktrees.yaml` remain readable. Explicit marketplace-specific overrides live under `.copilot-extensions/agent-worktrees/marketplaces/<marketplace-id>/config.yaml`. | agent-worktrees repo bootstrap / normal repo edit |
 | `<repo>/.agent-logger.yaml` (or documented aliases) | Shared session-log location, naming/template, and optional writer voice seams | agent-logger repo setup / normal repo edit |
-| `<repo>/.agent-worktrees/related.yaml` | The related-repo index (role, locus, delegate) from this repo's POV | `related add` |
+| `<repo>/.copilot-extensions/agent-worktrees/related.yaml` | The related-repo index (role, locus, delegate, ownership, audience, ai_attribution) from this repo's POV, with narrative docs under `.copilot-extensions/agent-worktrees/related/`. Legacy `.agent-worktrees/related.yaml` remains readable. Explicit marketplace-specific overrides live under `.copilot-extensions/agent-worktrees/marketplaces/<marketplace-id>/related.yaml`. | `related add` |
 | `machines.yaml` | SSH machine topology the mesh plugins read (control repo) | normal repo edit; agent-bridge adoption only reads it |
-| `<repo>/.agent-codespaces/config.yaml` | **Supplementary** Codespace overrides + credential-relay policy (control repo). Most repos need none — machine defaults, `/workspaces/<basename>`, and the git-credential relay are convention-derived. Legacy repo-root `codespaces.yaml` still read (relocate with `config migrate`). | `codespaces-setup` |
+| `<repo>/.copilot-extensions/agent-bridge/config.yaml` | Repo-owned multi-machine spawn defaults (`default_copilot_args`, `default_env`) for rosters derived from that repo's `machines.yaml`. Legacy `<repo>/.agent-bridge/config.yaml` remains readable. Explicit marketplace-specific overrides live under `.copilot-extensions/agent-bridge/marketplaces/<marketplace-id>/config.yaml`. | normal repo edit |
+| `<repo>/.copilot-extensions/agent-codespaces/config.yaml` | **Supplementary** Codespace overrides + credential-relay policy (control repo). Most repos need none — machine defaults, `/workspaces/<basename>`, and the git-credential relay are convention-derived. Legacy `.agent-codespaces/config.yaml` and repo-root `codespaces.yaml` remain readable (relocate with `config migrate`). Explicit marketplace-specific overrides live under `.copilot-extensions/agent-codespaces/marketplaces/<marketplace-id>/config.yaml`. | `codespaces-setup` |
+| `<repo>/.copilot-extensions/agent-dispatch/registrar/` · `identities/` | Repo-owned declarative supervisor registrations and reusable worker identities. Legacy `.agent-dispatch/registrar/` and `.agent-dispatch/identities/` remain readable. Explicit marketplace-specific overrides live under `.copilot-extensions/agent-dispatch/marketplaces/<marketplace-id>/...`. | normal repo edit / `agent-dispatch ... setup` |
+| `<repo>/.copilot-extensions/agent-index/config.yaml` | Repo-owned indexer designation and corpus scopes. Legacy `<repo>/.agent-index/config.yaml` remains readable. Explicit marketplace-specific overrides live under `.copilot-extensions/agent-index/marketplaces/<marketplace-id>/config.yaml`. | `agent-index setup` / normal repo edit |
+| `<repo>/.copilot-extensions/agent-machines/` | Repo-owned requirement packages under `all/` and `machines/<machine>/`. Legacy `.agent-machines/` and `.github/machine-state/` remain readable. Explicit marketplace-specific overlays live under `.copilot-extensions/agent-machines/marketplaces/<marketplace-id>/`. | normal repo edit / `agent-machines migrate` |
 | `containers.yaml` | Container fleet defaults (control repo) | `containers-fleet` |
 | `.github/agents/<name>.mcp.yaml` | A **repo-scoped** agent-mcp bridge config | you (per the `agent-mcp:agent-mcp` skill) |
-| `<repo>/.context-handoff/config.yaml` | Optional repository-owned soft/hard context utilization percentages | context-handoff repo setup / normal repo edit |
+| `<repo>/.context-handoff/config.yaml` | Optional repository-owned context-handoff policy (`mode`, percent or absolute-token thresholds). Merges per key over the user-global `~/.context-handoff/config.yaml` defaults. | context-handoff repo setup / normal repo edit |
 | `<repo>/.copilot-extensions/efforts/config.json` | Exact repository adoption marker for required effort-backed planning (`version: 1`, `enforcement: required`) | `efforts:efforts-setup` / normal repo edit |
 | `tools/setup/setup.{ps1,sh}` | The session setup script run before Copilot launches | `create-setup-script` |
 
@@ -72,7 +76,9 @@ then re-run adoption when the machine-local projection needs refreshing.
 | `~/.{project}/config.yaml` | Per-machine overrides + the adapter that makes a *foreign* repo compatible | `register` (machine wiring) |
 | `~/.agent-bridge/config.yaml` · `auth.yaml` | Bridge service config + bearer token (**secret**) | `install`, `agent-bridge config adopt`, and the service |
 | `~/.agent-logger/config.yaml` | Session-logging config (store dir, sync target) | `install` / you |
+| `~/.context-handoff/config.yaml` | User-global default context-handoff policy for payload-only sessions (lower priority than a repo's `.context-handoff/config.yaml`) | you |
 | `~/.agent-mcp/bridges/<name>` | A **personal / cross-repo** agent-mcp bridge config | you (per the `agent-mcp:agent-mcp` skill) |
+| `~/.budget-guidance/config.json` | Inert, per-user current budget readings and source authority | you / `budget-guidance-setup` |
 | `~/.agent-*/deploy-manifest.json`, runtime state | Per-machine runtime footprint (version, source, venv) | `install` / `update` |
 
 ### Marketplace installation cells
@@ -111,13 +117,21 @@ Committed repository policy remains distribution-neutral. New plugin-owned
 repository configuration converges on
 `<repo>/.copilot-extensions/<plugin-id>/...`; a marketplace-specific overlay is
 an explicit adoption decision, never an install-time fork of ordinary committed
-configuration.
+configuration. `install` and `update` continue to leave committed repository
+configuration untouched.
 
 Machine-local project adoption belongs to the adopting cell and uses stable
 repository identity rather than basename alone. Two cells may adopt the same
 repository without sharing registry, worktree, session, lease, or generated
 invocation state. A singleton committed integration surface must carry
 attributable ownership or use an intentionally composable format.
+
+For agent-codespaces specifically, namespaced adoption writes a per-repository
+receipt under
+`~/.copilot-extensions/marketplaces/<marketplace-id>/repos/<stable-repo-id>/agent-codespaces/adoption.json`
+and resolves the live checkout by stable remote identity. The legacy
+`~/.agent-codespaces/adopted-repos.yaml` manifest remains the bounded fallback
+while a repo has not yet been adopted into the active installation cell.
 
 The `~/.agent-*` and `~/.{project}` rows above document the current legacy
 layout during migration. New-first, legacy-fallback readers may preserve a
@@ -136,7 +150,7 @@ unqualified state automatically. See
   `.github/copilot/settings.json` vs personal ones in `~/.copilot/settings.json`.
 - **Layering, not either/or (agent-worktrees).** agent-worktrees actually merges
   **three** tiers per key — machine-local `~/.{project}/config.yaml` (highest) >
-  in-repo `<anchor>/.agent-worktrees/config.yaml` > global
+  in-repo `<anchor>/.copilot-extensions/agent-worktrees/config.yaml` > global
   `~/.agent-worktrees/config.yaml` (lowest). A repo designed for this system needs
   **no** machine-local file; you add one only to *override* on a specific machine
   or to adapt a foreign repo. Full precedence rules:

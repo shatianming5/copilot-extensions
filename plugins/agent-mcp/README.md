@@ -75,9 +75,15 @@ Identity-affecting values belong in the bridge config/overlay, not only in
 `mcp-servers.env`, because shell fallback does not inherit frontmatter-only env.
 
 Use an existing fleet first. Re-materialize when the expected stub is absent or
-`manifest.json.generated_by` differs from `agent-mcp --version`; repositories
-that need config/schema/overlay drift detection should own a digest of the
-effective post-overlay config.
+`manifest.json.generated_by` differs from `agent-mcp --version`.
+`agent-mcp materialize` also records `manifest.json.bridge_source_digest`, a
+machine-keyed HMAC of the effective post-overlay config and, for `type: cli`,
+the declared sidecars plus path-qualified relative helper content/modes. The
+machine-local key prevents low-entropy secrets in a bridge declaration from
+becoming guessable through the published fingerprint. Repository deploy tools
+can compare the manifest value with `agent-mcp source-digest <bridge>` to detect
+declaration drift without `--force`; losing the local key safely makes existing
+fleets stale.
 Materialize standing fleets from a stable checkout or plugin-shipped named
 bridge; use `--windows` for PowerShell/CMD shims. On Windows pass arguments via
 `--request-file` to the `.ps1` shim. Use `--no-serve` for identity-sensitive
@@ -108,7 +114,7 @@ boundaries, and deploy/drift checklist are in
 
 | `auth.kind` | Source | http injects | stdio injects |
 |-------------|--------|--------------|---------------|
-| `entra` / `az` | `az account get-access-token` | `Authorization: Bearer` | env var |
+| `entra` / `az` | on-PATH `ado-auth-helper` (Codespace-guest relay client) if present, else `az account get-access-token`; always the latter when `tenant` is configured, since the relay has no tenant parameter | `Authorization: Bearer` | env var |
 | `gh` | `gh auth token` | `Authorization: Bearer` | env var |
 | `git-credential` | Git Credential Manager | `Authorization: Basic` | env var |
 | `command` | any git-credential-fill-shaped command | templated header | target env var |
@@ -198,21 +204,19 @@ auth:
 
 Invoke the sibling through an interpreter (`${python}`/`node`/`pwsh`) rather than
 as `argv[0]` directly (a bare `.ps1`/`.py` is not itself executable). `${python}`
-resolves to a full interpreter path (an absolute `sys.executable` when neither
-`python`/`python3` is on `PATH`); `node`/`pwsh` are looked up on `PATH`. The
+resolves to the absolute interpreter running agent-mcp; `node`/`pwsh` are looked
+up on `PATH`. The
 `${config_dir}` token is only expanded when the config is loaded from a file (its
 directory is known); a `--config <path>` or plugin-discovered bridge both qualify.
 
 #### Portable interpreter (`${python}`)
 
 Prefer the `${python}` token over a bare `python` in the command: it expands at
-load time to a **working Python 3 interpreter for the current platform** — probing
-`python3` then `python` on POSIX (many Linux/CodeSpaces installs ship only
-`python3`), and `python` then `python3` on Windows, falling back to the interpreter
-running agent-mcp itself (`sys.executable`) if neither is on `PATH`. This keeps a
-plugin's bridge YAML portable across Windows and POSIX without a per-OS launcher.
-`${python}` is path-independent, so it resolves even for a bare-dict config (where
-`${config_dir}` is left intact).
+load time to the **absolute interpreter running agent-mcp**. It never consults
+the daemon's inherited `PATH`, so a config-local trusted helper cannot be
+redirected into an unrelated virtual environment. The runtime interpreter is
+already provisioned and cross-platform, and the token resolves even for a
+bare-dict config (where `${config_dir}` is left intact).
 
 ## Config location — in-repo vs. user-global
 
@@ -223,7 +227,7 @@ lookup differs):
 |------|-----------|----------|---------|
 | **In-repo `--config`** (preferred) | `bridge --config <path>` | the repo (e.g. `.github/agents/<name>.mcp.yaml`) | **repo-scoped agents** — version-controlled, travels with the repo, no deploy |
 | **Named bridge** | `bridge <name>` | `~/.agent-mcp/bridges/<name>.{yaml,yml,json}` | **personal / cross-repo** MCPs not tied to one checkout |
-| **Plugin-shipped** | `bridge <name>` | `<plugin>/agents/<name>.mcp.yaml` (installed under `~/.copilot/installed-plugins/*/*/`) | **a plugin that ships its own sub-agent + MCP** — no user-space copy needed |
+| **Plugin-shipped** | `bridge <name>` | `<plugin>/agents/<name>.mcp.yaml` (live directory marketplace or copied under `~/.copilot/installed-plugins/*/*/`) | **a plugin that ships its own sub-agent + MCP** — no user-space copy needed |
 
 Prefer the in-repo `--config` form for any agent that ships inside a repo;
 reserve named bridges for MCPs you use across many repos.
@@ -231,8 +235,11 @@ reserve named bridges for MCPs you use across many repos.
 **Plugin-shipped bridges (no install step).** A Copilot CLI plugin can ship its
 bridge config *inside the plugin* at `agents/<name>.mcp.yaml` (or `mcp/…`) and its
 sub-agent just runs `agent-mcp bridge <name>`. A bare name resolves in order:
-(1) `~/.agent-mcp/bridges/<name>.…` (user-space override wins), then (2) the
-installed-plugins tree `*/*/{agents,mcp}/<name>[.mcp].{yaml,yml,json}`. The spawned
+(1) `~/.agent-mcp/bridges/<name>.…` (user-space override wins), (2) directory
+marketplaces declared by the nearest workspace's
+`.github/copilot/settings.json`, then (3) the installed-plugins tree
+`*/*/{agents,mcp}/<name>[.mcp].{yaml,yml,json}`. Live directory matches take
+precedence over stale copied payloads. The spawned
 MCP's cwd is the session repo (not the plugin), so a plugin-relative `--config`
 path can't work — the named-bridge search is what makes a plugin's MCP resolve
 with **zero** setup. Override the search roots with `AGENT_MCP_PLUGIN_ROOTS`
@@ -310,6 +317,7 @@ headers: {}
 tools: { allow: ["repo_*", "wit_*", "search_*"], deny: [] }
 timeout: 30
 retries: 1
+idle_timeout: 300                        # exit if idle this long (#3876); <=0 disables
 ```
 
 stdio example (wrap a child-process MCP, inject a token by env):
@@ -751,6 +759,66 @@ tool itself — something a static `filter`/`transform` can't see.
 > result. `gate` never prunes `tools/list`; a gated tool stays advertised and
 > returns the deny action for calls that fail the predicate.
 
+### `input_gate` — deny a call whose OWN arguments match a predicate
+
+`gate` judges a call by an out-of-band **preflight** fact (a different tool's
+response). Some authorization invariants instead need to judge the call by its
+**own request arguments** — e.g. "never let a metadata-write call itself
+introduce a specific marker value into a `tags`/`title` argument", so a marker
+meant to be human-set can't be self-granted by the same session that also
+benefits from it being present. Neither `filter` (static per-tool allow/deny,
+no argument inspection) nor `transform` (reshapes a tool's OUTPUT only) can
+express that. `input_gate` closes that specific gap: it evaluates a boolean
+`deny_when` predicate over the call's **own arguments**, using the same
+path/op mini-language as `gate`'s `allow_when`, and denies the call before it
+ever reaches the upstream if the predicate matches.
+
+```yaml
+- type: input_gate
+  match_tools: [update_incident]                # globs; which tools/call to gate
+  deny_when:                                     # boolean predicate over the call's OWN args
+    any:
+      - { path: "tags[*]", matches: "(?i)^ai-safe$" }
+      - { path: "title", matches: "(?i)(^|[^A-Za-z0-9_-])ai-safe([^A-Za-z0-9_-]|$)" }
+  on_deny: error                                  # error | stub | drop (default: error)
+  reason: "the ai-safe tag/keyword is human-only; an agent must never self-grant it"
+```
+
+- **`match_tools`** — globs; only a matching `tools/call` is evaluated
+  (everything else passes straight through; `input_gate` never prunes
+  `tools/list`).
+- **`deny_when`** — the same predicate tree/leaf-op language as `gate`'s
+  `allow_when` (§ above), evaluated against the call's **arguments object**
+  directly (no preflight round-trip — there is nothing out-of-band to fetch).
+- **`on_deny`** — `error` (JSON-RPC error, **default** — this decorator
+  protects a WRITE, so the default is the opposite of `gate`'s READ-oriented
+  `stub` default), `stub` (return the `stub`/`reason` payload as the result),
+  or `drop` (empty result).
+- **`reason`** — a short human-readable string used as the JSON-RPC error
+  message (`on_deny: error`) or the default `stub` payload's `reason` field.
+
+Complementary to `gate`, not a replacement: `gate` decides "is this record's
+own state safe to read"; `input_gate` decides "does this write attempt
+introduce a value it must never introduce", independent of any preflight
+lookup or the record's current state.
+
+> **Placement — enforced, not just documented.** Put `input_gate` **last** in
+> the `decorators:` list (innermost, closest to upstream) — after
+> `code-mode`/`defer` (whose synthesized
+> `tools/call` sub-requests only reach decorators BELOW their own position, so
+> an `input_gate` placed above them never sees those calls), after `storage`
+> (which may rehydrate a `$stream` argument handle into its real value on the
+> way to upstream — an `input_gate` placed above `storage` would evaluate
+> `deny_when` against the un-rehydrated handle instead), and after `rename`
+> (which rewrites the client-visible tool name back to the real upstream name
+> — an `input_gate` placed above `rename` would see the RENAMED name instead
+> of the real one its `match_tools` glob names, so the gate could silently
+> never trigger). Last position guarantees `input_gate` always sees the
+> fully-resolved arguments AND the real tool name the upstream is actually
+> about to receive. **Config validation enforces this** — a stack with
+> `input_gate` positioned before any of `code-mode`/`defer`/`storage`/`rename`
+> is rejected at load time, not just discouraged in docs.
+
 
 
 ## Use from a Copilot agent
@@ -783,9 +851,50 @@ through stdin or `--request-file`, never as inline JSON.
 
 ## Troubleshooting
 
-There is no special bridge resolver, agent-bridge daemon, or
-`agent-mcp-troubleshooting` command. Diagnose the exact bridge process the agent
-will spawn:
+`agent-mcp diagnose <bridge>` runs the same config/auth/transport/protocol
+path `call`/`bridge` use, one layer at a time, and reports exactly which layer
+failed instead of one opaque top-level error:
+
+```sh
+agent-mcp diagnose .github/agents/ado.mcp.yaml
+```
+
+```text
+[1/5] config: OK -- .github/agents/ado.mcp.yaml -> http https://dev.azure.com/...
+[2/5] auth: OK
+[3/5] transport-connect: OK
+[4/5] handshake: FAILED -- initialize: HTTP error: <urlopen error [Errno 111] Connection refused>
+  hint: The transport connected but no valid MCP response came back before
+  timeout -- for http/sse this covers both network reachability
+  (refused/timed out/5xx) and auth (401/403): check the upstream service is
+  running and reachable, and that the resolved credential is valid.
+```
+
+The five layers, and what a failure at each one means:
+
+| Stage | What it proves when it succeeds | A failure here means |
+|-------|----------------------------------|-----------------------|
+| `config` | The bridge file parses and schema-validates (same as `validate`) | Fix the config -- run `agent-mcp validate <bridge>` for the exact error |
+| `auth` | The configured auth injector constructed without raising | The `auth:` block itself is malformed (an unknown `kind`, a bad URL for `git-credential`, etc.) |
+| `transport-connect` | The transport started -- for `stdio` this is a successful subprocess spawn; for `http`/`sse` this stage is a no-op (the transport is stateless, so a real connection only happens on the first request -- see below) | The upstream binary couldn't be spawned, or is missing from `PATH` |
+| `handshake` | The MCP `initialize`/`discover` exchange completed and returned a `serverInfo` | For `stdio`: the child process didn't speak MCP correctly. For `http`/`sse`: this is where auth headers are actually sent and the network round-trip actually happens, so a connection-refused, timeout, 5xx, or 401/403 all surface **here**, not at `transport-connect` |
+| `catalog` | `tools/list` returned successfully | An upstream-side error on an otherwise healthy connection |
+
+Because `http`/`sse` transports are stateless (`Transport.start()` is a no-op --
+there's no persistent connection to hold open between requests), the
+network-reachability and credential checks for those bridges both land on the
+`handshake` stage, not `transport-connect`. Only a `stdio` bridge's process
+spawn is a genuinely separate step from its handshake.
+
+`--no-tools` stops after a successful handshake (skips `tools/list`);
+`--json` emits a machine-readable report (`{"bridge", "ok", "tool_count",
+"stages": [{"name", "ok", "detail"}, ...]}`) instead of the staged text
+progress -- useful for scripted health checks. Exit code is `0` when every
+attempted stage succeeded, `1` otherwise.
+
+There is no separate bridge resolver or agent-bridge daemon. `diagnose` above
+covers the staged connectivity check; for a lower-level look at the exact
+bridge process the agent will spawn:
 
 ```sh
 agent-mcp validate .github/agents/ado.mcp.yaml
@@ -826,6 +935,14 @@ never sees EOF, so it (and its helpers) leak. Two guards close this gap:
 - **Parent-death watchdog** — a daemon thread polls the launch-time parent's
   liveness and, when it goes away, drives the *same* graceful teardown as stdin
   EOF, with a hard-exit backstop if teardown wedges.
+- **Idle self-reap (#3876)** — neither guard above fires for the most common
+  leak today: a sub-agent's `task()` delegation finishes without ever closing
+  its bridge's stdin or killing the still-live top-level `copilot` process
+  that holds it open. So the bridge also exits itself after `idle_timeout`
+  seconds (default 300, config field or `AGENT_MCP_BRIDGE_IDLE_TIMEOUT`; `<=0`
+  disables) with no client traffic **and** no in-flight dispatch — the
+  in-flight check is authoritative, so a slow upstream call is never reaped
+  mid-flight regardless of how long it runs past the idle window.
 - **Descendant reaping** — on Windows the bridge assigns itself to a
   kill-on-close **Job Object**, so the upstream stdio child and any `az`/`gh`/`git`
   mint helpers die when the bridge exits. On POSIX the graceful path already
@@ -839,6 +956,7 @@ Tunables (all optional):
 | `AGENT_MCP_PARENT_WATCHDOG_INTERVAL` | `5` | parent-liveness poll interval, seconds (`<=0` disables) |
 | `AGENT_MCP_PARENT_WATCHDOG_GRACE` | `10` | hard-exit backstop after signalling, seconds (`0` = graceful-only) |
 | `AGENT_MCP_REAP_DESCENDANTS` | on | `0`/`false`/`off` disables the Windows kill-on-close job |
+| `AGENT_MCP_BRIDGE_IDLE_TIMEOUT` | `300` | idle self-reap seconds when a bridge config doesn't set `idle_timeout` (`<=0` disables) |
 | `AGENT_MCP_NO_VERSION_REAP` | unset | set to skip the on-upgrade reap of stale-version bridges (see below) |
 
 **Why the watchdog and not a direct launch?** The obvious "just don't interpose
@@ -895,6 +1013,11 @@ mcp:
 ---
 # vei-search  (human doc body — ignored by the bridge)
 ```
+
+A path-qualified `invoke.command` (for example `scripts/vei-search`) resolves
+relative to the declaring sidecar. A bare command such as `vei-search` keeps the
+normal `PATH` lookup. This lets a plugin ship a helper beside its sidecar without
+hardcoding its installed location.
 
 The bridge config points at the sidecar set:
 
@@ -983,6 +1106,10 @@ cold path with `--no-serve` or `AGENT_MCP_NO_SERVE=1`.
   wrapped in a synthetic envelope.
 - **Errors** are a non-zero exit + a stderr message. The wait is bounded by the
   config `timeout`, so a dead or silent upstream fails fast instead of hanging.
+- **Honors the full `decorators:` stack**, including `gate`/`input_gate`'s
+  authorization decisions and `transform`'s reshaping — the cold path is not a
+  bypass. (When routed to a live `agent-mcp serve` daemon it goes through that
+  daemon's own pipeline instead, to the same effect.)
 
 ```sh
 agent-mcp call gitea list_issues '{"owner":"me","repo":"x"}'
@@ -1022,6 +1149,82 @@ list_issues '{"owner":"me","repo":"x"}' | jq '.[].number'
 Re-running `materialize` rebuilds the tree in a temp dir and swaps it in
 atomically, so it doubles as a drift refresh (no partial-write window). The
 bridge's `tools:` allow/deny filter gates which tools are materialized.
+
+### `clean-tool-cache` — purge stale-schema MCP tool-snapshot cache entries
+
+```sh
+agent-mcp clean-tool-cache [--apply] [--cache-dir PATH] [--json] [--quiet]
+```
+
+Copilot CLI's own runtime persists each MCP server's `tools/list` result to
+disk (`mcp-tools/` under its cache home) so a session doesn't re-discover
+tools cold on every startup. The runtime's loader purges an entry once it
+ages out (14 days), but it never purges one whose `schemaVersion` no longer
+matches what the running CLI writes (e.g. after a CLI upgrade bumps the
+schema) — those entries are re-read, re-parsed, and re-rejected on *every*
+cache hydration attempt, forever, wasting disk I/O inside the runtime's own
+2-second hydration timeout budget.
+
+`clean-tool-cache` detects and (with `--apply`) purges those dead entries.
+The "current" schema version is never hardcoded — it's the *maximum* seen
+among cached entries, since the runtime only ever increments the schema
+version on a CLI upgrade, so the highest value present is always current
+regardless of how much stale garbage has accumulated (a machine long overdue
+for a cleanup can easily have more stale entries than current ones; treating
+the *most common* version as authoritative would silently pick the wrong one
+and delete good, current entries instead).
+
+```sh
+agent-mcp clean-tool-cache                 # report only, default (safe)
+agent-mcp clean-tool-cache --apply          # actually delete stale entries
+agent-mcp clean-tool-cache --json           # machine-readable summary
+```
+
+Exit codes: `0` nothing stale (or `--apply` cleaned everything found); `1`
+stale entries found and not fully cleaned (dry-run, or a delete failed); `2`
+the cache directory couldn't be resolved/read (expected on a fresh install).
+
+### `mcp-health` — sweep the CLI's own logs for MCP-lifecycle warning signals
+
+```sh
+agent-mcp mcp-health [--since-hours N] [--log-dir PATH] [--cache-dir PATH] [--json] [--quiet]
+```
+
+Read-only diagnostic: sweeps Copilot CLI's own process log
+(`$COPILOT_HOME/logs`, default `~/.copilot/logs/`) for a known set of
+MCP-lifecycle signals, and reports the tool-snapshot cache's current
+staleness ratio alongside it (the same scan `clean-tool-cache` uses, without
+touching anything). Meant to be run periodically -- by hand, or on a
+schedule -- so an operator can tell whether a maintenance action like
+`clean-tool-cache` is actually improving MCP session reliability over time,
+instead of guessing from anecdote.
+
+Signals tracked:
+
+- `stale_schema_cache_entry` -- a persisted tool-cache entry rejected for a
+  schema-version mismatch (the exact class `clean-tool-cache` purges; a
+  regularly-cleaned cache should trend this toward zero).
+- `cache_hydration_timeout` -- the persisted tool cache's own load timed out
+  (a tight, hardcoded runtime budget).
+- `pending_snapshot` -- a reload/reconcile snapshot showing zero connected
+  servers and at least one still `pending`. A single hit is normal (every
+  connect briefly passes through `pending`); treat this as a rate/persistence
+  signal, not proof of a stuck server on its own -- `--json` reports
+  first/last-seen timestamps so a caller can judge how long an elevated
+  window lasted.
+- `explicit_failed_retry` -- a server with a nonzero failed-retry count on a
+  reload snapshot: an explicit, not merely suspected, failure.
+
+```sh
+agent-mcp mcp-health                    # last 24h (default), text report
+agent-mcp mcp-health --since-hours 168  # last week
+agent-mcp mcp-health --since-hours 0    # all available log history
+agent-mcp mcp-health --json             # machine-readable, for trend tracking across runs
+```
+
+`--json` output is designed to be safely re-run on a cadence (e.g. daily) and
+diffed/archived externally to build a trend -- this subcommand itself keeps
+no history of its own.
 
 ### `serve` — the resident warmth tier
 
@@ -1087,7 +1290,7 @@ stdin/stdout        Bridge        Decorator pipeline           UpstreamClient   
                                  ^                                                   or cli responder
                           filter/rename/defer/                                      Auth injector -> credential_relay.sources
                           code-mode/storage/
-                          transform/gate
+                          transform/gate/input_gate
 ```
 
 - `config.py` — load + validate the per-bridge config file (incl. `decorators:`).
@@ -1097,8 +1300,9 @@ stdin/stdout        Bridge        Decorator pipeline           UpstreamClient   
 - `pipeline.py` — `UpstreamClient` (JSON-RPC id correlation over a transport) +
   `Pipeline` (compose decorators around the upstream core call).
 - `decorators/` — `base` (Decorator + BridgeContext), `_catalog` (catalog
-  pagination + JSON-Schema→TS), and the `filter`/`rename`/`defer`/`code-mode`/
-  `storage`/`transform`/`gate` decorators.
+  pagination + JSON-Schema→TS), `_predicate` (the shared path/op predicate
+  engine used by `gate` and `input_gate`), and the `filter`/`rename`/`defer`/
+  `code-mode`/`storage`/`transform`/`gate`/`input_gate` decorators.
 - `bridge.py` — stdio framing, per-request dispatch through the pipeline,
   unsolicited-message passthrough.
 - `protocol.py` — the dual-era version model: modern (`2026-07-28`, per-request
@@ -1108,5 +1312,10 @@ stdin/stdout        Bridge        Decorator pipeline           UpstreamClient   
 - `client.py` — `OneShotSession`: connect + **negotiate era** (`server/discover`
   probe / forced) + one `tools/list` / `tools/call` against an upstream, then exit
   (the engine under `call` and the introspection step of `materialize`).
+  **Only `call_tool`** runs through the same `Pipeline`/`decorators:` stack the
+  long-lived bridge does, so `gate`/`input_gate`/etc. apply on the cold `call`
+  path too; `list_tools` (materialize's introspection, and `call`'s own catalog
+  fetch) still calls the upstream directly and does not go through
+  `rename`/`defer`/`transform` — only the legacy top-level `tools:` filter.
 - `materialize.py` — project a `tools/list` catalog into the on-disk stub fleet
   (symlink farm on POSIX, `.ps1`/`.cmd` shim farm on Windows) + plated sidecars.

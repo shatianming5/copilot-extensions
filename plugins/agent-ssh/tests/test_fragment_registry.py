@@ -103,6 +103,65 @@ def test_valid_managed_fragment_survives_malformed_peer_and_ignores_unrelated(
     assert unrelated.read_text(encoding="utf-8") == "this is intentionally not parsed\n"
 
 
+def test_find_shadowed_aliases_flags_alias_duplicated_in_root_config(
+    tmp_path: Path,
+) -> None:
+    config_d = tmp_path / "config.d"
+    registry, module_path, registry_data, module_data = _sources(
+        tmp_path, "dtssh", aliases=("owner_user-cloud1",)
+    )
+    fragment = _managed_fragment(
+        config_d,
+        registry,
+        module_path,
+        registry_data,
+        module_data,
+    )
+    ssh_config = tmp_path / "config"
+    ssh_config.write_text(
+        "Include ~/.ssh/config.d/*\n"
+        "Host owner_user-cloud1\n"
+        "    ProxyCommand dtssh.exe proxy fresh-tunnel-id --port 2222\n",
+        encoding="utf-8",
+    )
+
+    report = fragment_registry.scan_fragment_registry(
+        config_d,
+        syntax_check=_no_syntax_error,
+    )
+    shadow_findings = fragment_registry.find_shadowed_aliases(report, ssh_config)
+
+    assert [finding.entry for finding in shadow_findings] == [str(fragment)]
+    finding = shadow_findings[0]
+    assert finding.reason == "shadowed-alias"
+    assert "owner_user-cloud1" in finding.remedy
+    assert str(ssh_config) in finding.remedy
+
+    payload = fragment_registry.doctor_payload(report, config_d, ssh_config=ssh_config)
+    assert any(f["reason"] == "shadowed-alias" for f in payload["findings"])
+    rendered = fragment_registry.format_doctor(report, config_d, ssh_config=ssh_config)
+    assert "[WARN]" in rendered
+
+
+def test_find_shadowed_aliases_is_empty_when_no_collision(tmp_path: Path) -> None:
+    config_d = tmp_path / "config.d"
+    registry, module_path, registry_data, module_data = _sources(
+        tmp_path, "dtssh", aliases=("owner_user-cloud1",)
+    )
+    _managed_fragment(config_d, registry, module_path, registry_data, module_data)
+    ssh_config = tmp_path / "config"
+    ssh_config.write_text(
+        "Include ~/.ssh/config.d/*\nHost some-other-alias\n    User example\n",
+        encoding="utf-8",
+    )
+
+    report = fragment_registry.scan_fragment_registry(
+        config_d,
+        syntax_check=_no_syntax_error,
+    )
+    assert fragment_registry.find_shadowed_aliases(report, ssh_config) == ()
+
+
 def test_missing_source_withdraws_fragment_and_blocks_its_alias(tmp_path: Path) -> None:
     config_d = tmp_path / "config.d"
     registry, module_path, registry_data, module_data = _sources(tmp_path, "direct")
@@ -1085,6 +1144,31 @@ def test_persistent_warning_recovery_is_fingerprint_based(tmp_path: Path) -> Non
     assert batch.emitted == ()
 
 
+def test_warning_state_file_uses_selected_runtime_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime_root = tmp_path / "cell-a" / "plugins" / "agent-ssh"
+    monkeypatch.delenv(fragment_registry.WARNING_STATE_ENV, raising=False)
+    monkeypatch.setenv("AGENT_SSH_HOME", str(runtime_root))
+
+    assert fragment_registry.warning_state_file() == (
+        runtime_root / "fragment-warning-state.json"
+    )
+
+
+def test_warning_state_file_ignores_relative_runtime_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.delenv(fragment_registry.WARNING_STATE_ENV, raising=False)
+    monkeypatch.setenv("AGENT_SSH_HOME", "relative-root")
+    monkeypatch.setattr(fragment_registry.Path, "home", lambda: home)
+
+    assert fragment_registry.warning_state_file() == (
+        home / ".agent-ssh" / "fragment-warning-state.json"
+    )
+
+
 def test_warning_state_lock_failure_falls_back_in_memory(tmp_path: Path) -> None:
     blocker = tmp_path / "not-a-directory"
     blocker.write_text("block parent creation", encoding="utf-8")
@@ -1171,12 +1255,12 @@ def test_verify_network_failure_does_not_reclassify_active_fragment(
         calls.append(command)
         return SimpleNamespace(returncode=1)
 
-    monkeypatch.setattr("agent_ssh.__main__.subprocess.run", unreachable)
+    monkeypatch.setattr("agent_ssh.probe.subprocess.run", unreachable)
     assert main(["verify", "--config-d", str(config_d), "host-a"]) == 1
     output = capsys.readouterr().out
     assert "host-a unreachable" in output
     assert "inactive managed SSH profile" not in output
-    assert calls and calls[0][-2:] == ["host-a", "true"]
+    assert calls and calls[0][-2:] == ["host-a", "exit 0"]
 
 
 def test_verify_fails_closed_on_unscoped_registry_uncertainty(
@@ -1194,7 +1278,7 @@ def test_verify_fails_closed_on_unscoped_registry_uncertainty(
     def must_not_probe(*_args, **_kwargs):
         raise AssertionError("SSH must not run under unscoped registry uncertainty")
 
-    monkeypatch.setattr("agent_ssh.__main__.subprocess.run", must_not_probe)
+    monkeypatch.setattr("agent_ssh.probe.subprocess.run", must_not_probe)
     assert main(["verify", "--config-d", str(config_d), "fresh-alias"]) == 1
     captured = capsys.readouterr()
     assert "not permitted by current managed-profile evidence" in captured.out

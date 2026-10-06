@@ -12,11 +12,33 @@ import yaml
 
 from . import config as cfg
 from . import installer
+from . import session_projection
 from . import sessions
 from . import tracking
 
 _DEFAULT_RECORD_BUDGET = 16
 _DEFAULT_SESSION_BUDGET = 32
+_DEFAULT_PROJECTION_BUDGET = 16
+_MAX_VERIFIED_PROJECTIONS = 1024
+_LIVE_RETRY_STEPS = 4
+
+# fsmonitor reap throttling (see _maybe_reap_fsmonitor): bound how often a
+# persistently-dark record re-spawns `git fsmonitor--daemon stop`, and cap the
+# per-worktree cooldown map so an ever-growing fleet of worktree_ids across a
+# long-lived resident monitor cannot leak memory.
+_FSMONITOR_REAP_COOLDOWN_S = 300.0
+_MAX_FSMONITOR_REAP_TRACKED = 2048
+
+# Repo-scoped freshness sweep throttling (worktree-finality-and-obligations
+# Phase 9; see _maybe_refresh_repo_freshness): bound how often ANY record of
+# the same repo triggers a real `git fetch` for the freshness ledger, and cap
+# the per-repo cooldown map the same way the fsmonitor reap cooldown map is
+# capped.
+_REPO_FRESHNESS_SWEEP_COOLDOWN_S = 60.0
+_MAX_REPO_FRESHNESS_TRACKED = 512
+#: Bound each sweep fetch so one stalled `git fetch` (network down, a slow
+#: remote) cannot hang the resident monitor's tick.
+_REPO_FRESHNESS_FETCH_TIMEOUT_S = 15.0
 
 
 def _path_key(path: str) -> str:
@@ -90,11 +112,13 @@ class ResidentSessionReconciler:
         *,
         record_budget: int = _DEFAULT_RECORD_BUDGET,
         session_budget: int = _DEFAULT_SESSION_BUDGET,
+        projection_budget: int = _DEFAULT_PROJECTION_BUDGET,
         register_monitor_session: Callable[[str, str | None], bool] | None = None,
         mux_max_age: float = 45.0,
     ) -> None:
         self.record_budget = max(1, record_budget)
         self.session_budget = max(1, session_budget)
+        self.projection_budget = max(1, projection_budget)
         self.register_monitor_session = register_monitor_session
         self.mux_max_age = mux_max_age
         self._projects: list[str] = []
@@ -110,6 +134,16 @@ class ResidentSessionReconciler:
         self._session_iter = None
         self._live_mux: set[str] | None = None
         self._live_mux_at: float | None = None
+        self._projection_queue: dict[
+            tuple[str, str, str], tuple[Path, int, int, int]
+        ] = {}
+        self._projection_verified: dict[
+            tuple[str, str, str], tuple[int, int, int]
+        ] = {}
+        self._projection_cooldown: dict[tuple[str, str, str], int] = {}
+        self._step_number = 0
+        self._fsmonitor_reap_checked: dict[str, float] = {}
+        self._repo_freshness_checked: dict[str, float] = {}
 
     def observe_mux(self, session_names: set[str]) -> None:
         """Publish a successful full mux observation for later record stamps."""
@@ -123,6 +157,11 @@ class ResidentSessionReconciler:
             self._live_mux is not None
             and any(name.startswith("wt-") for name in self._live_mux)
         )
+
+    @property
+    def has_mux_observation(self) -> bool:
+        """Whether a successful mux catalog is available for dark proof."""
+        return self._live_mux is not None
 
     def _refresh_projects(self) -> None:
         try:
@@ -193,15 +232,273 @@ class ResidentSessionReconciler:
     def _repair_head(self, record: tracking.WorktreeRecord) -> bool:
         return tracking.repair_head_cache(record)
 
+    def _queue_projection_repairs(
+        self,
+        project: str,
+        yaml_path: Path,
+        record: tracking.WorktreeRecord,
+    ) -> None:
+        limit = self.projection_budget * 4
+        added = 0
+        revisions = (
+            record.lifecycle_revision,
+            record.head_revision,
+            record.controller_revision,
+        )
+        for entry in record.sessions or ():
+            if (
+                len(self._projection_queue) >= limit
+                or added >= self.projection_budget
+            ):
+                break
+            key = (project, entry.session_id, "bound")
+            if self._projection_cooldown.get(key, 0) > self._step_number:
+                continue
+            if self._projection_verified.get(key) == revisions:
+                continue
+            self._projection_queue[key] = (yaml_path, *revisions)
+            added += 1
+        for relation in record.controllers:
+            session_id = relation.controller_session_id
+            if (
+                len(self._projection_queue) >= limit
+                or added >= self.projection_budget
+            ):
+                break
+            if not session_id:
+                continue
+            key = (project, session_id, "controller")
+            if self._projection_cooldown.get(key, 0) > self._step_number:
+                continue
+            if self._projection_verified.get(key) == revisions:
+                continue
+            self._projection_queue[key] = (yaml_path, *revisions)
+            added += 1
+
+    def _record_dark_state(
+        self,
+        record: tracking.WorktreeRecord,
+    ) -> str:
+        mux_fresh = (
+            self._live_mux is not None
+            and self._live_mux_at is not None
+            and time.monotonic() - self._live_mux_at <= self.mux_max_age
+        )
+        if not mux_fresh:
+            return "unknown"
+        if sessions.mux_session_name(record.worktree_id) in self._live_mux:
+            return "live"
+        return (
+            "live"
+            if sessions.worktree_has_live_session(record)
+            else "dark"
+        )
+
+    def _remember_projection_verified(
+        self,
+        key: tuple[str, str, str],
+        revisions: tuple[int, int, int],
+    ) -> None:
+        self._projection_verified.pop(key, None)
+        self._projection_verified[key] = revisions
+        while len(self._projection_verified) > _MAX_VERIFIED_PROJECTIONS:
+            self._projection_verified.pop(next(iter(self._projection_verified)))
+
+    def _cooldown_projection(
+        self,
+        key: tuple[str, str, str],
+    ) -> None:
+        self._projection_cooldown.pop(key, None)
+        self._projection_cooldown[key] = (
+            self._step_number + _LIVE_RETRY_STEPS
+        )
+        while len(self._projection_cooldown) > _MAX_VERIFIED_PROJECTIONS:
+            self._projection_cooldown.pop(next(iter(self._projection_cooldown)))
+
+    def _scan_projections(self) -> dict[str, int]:
+        result = {
+            "projection_checked": 0,
+            "projection_written": 0,
+            "projection_current": 0,
+            "projection_blocked": 0,
+            "projection_deferred": 0,
+            "projection_live_conflicts": 0,
+            "projection_liveness_unknown": 0,
+            "projection_revision_conflicts": 0,
+        }
+        for key in list(self._projection_queue)[: self.projection_budget]:
+            project, session_id, role = key
+            yaml_path, lifecycle_revision, head_revision, controller_revision = (
+                self._projection_queue.pop(key)
+            )
+            result["projection_checked"] += 1
+            try:
+                cfg.set_active_project(project)
+                with tracking._RecordLock(yaml_path, blocking=False) as lock:
+                    if not lock.acquired:
+                        result["projection_deferred"] += 1
+                        continue
+                    record = tracking.load_record(yaml_path)
+                    if (
+                        record.lifecycle_revision != lifecycle_revision
+                        or record.head_revision != head_revision
+                        or record.controller_revision != controller_revision
+                    ):
+                        result["projection_revision_conflicts"] += 1
+                        continue
+                    dark_state = self._record_dark_state(record)
+                    if dark_state != "dark":
+                        if dark_state == "unknown":
+                            result["projection_liveness_unknown"] += 1
+                        else:
+                            result["projection_live_conflicts"] += 1
+                        self._cooldown_projection(key)
+                        continue
+                    if role == "bound":
+                        outcome = session_projection.sync_bound(
+                            record, session_id, blocking=False
+                        )
+                    else:
+                        outcome = session_projection.sync_controller(
+                            record, session_id, blocking=False
+                        )
+            except Exception:
+                outcome = "deferred"
+            result[f"projection_{outcome}"] += 1
+            if outcome in {"written", "current", "blocked"}:
+                self._remember_projection_verified(
+                    key,
+                    (
+                        lifecycle_revision,
+                        head_revision,
+                        controller_revision,
+                    ),
+                )
+        return result
+
+    def _maybe_reap_fsmonitor(
+        self, record: tracking.WorktreeRecord, live: bool,
+    ) -> None:
+        """Best-effort, cooldown-throttled fsmonitor reap for a dark worktree.
+
+        **Level-triggered, not edge-triggered**: acts on whatever the
+        CURRENT fresh mux observation says, not on whether it *changed*
+        since the last tick. An edge-only check (this reconciler's first cut,
+        #2270) misses every worktree that was *already* dark before the
+        reconciler ever started watching it -- overwhelmingly the common
+        case: a `finalized` worktree deliberately keeps its directory (see
+        `ephemeral-process-reaping.md`), and `core.fsmonitor=true` means any
+        later *incidental* git command against that path (an unrelated
+        doctor/status probe, a stray `git -C <path> ...`) quietly restarts
+        its daemon with nothing left watching for that worktree ever again
+        (confirmed live: a worktree finalized 2026-08-28 still had its daemon
+        running under the edge-triggered version). Runs for every record
+        status -- unlike the rest of `_index_record`'s active-only
+        bookkeeping -- since a finalized record is exactly the case this
+        must still catch.
+
+        Corroborates with `sessions.worktree_has_live_session` (a real PID
+        check) before reaping, and throttles via `_fsmonitor_reap_checked` so
+        a persistently-dark record costs one `git` invocation per cooldown
+        window, not one per tick.
+        """
+        if live:
+            return
+        now = time.monotonic()
+        last = self._fsmonitor_reap_checked.get(record.worktree_id)
+        if last is not None and now - last < _FSMONITOR_REAP_COOLDOWN_S:
+            return
+        self._fsmonitor_reap_checked[record.worktree_id] = now
+        while len(self._fsmonitor_reap_checked) > _MAX_FSMONITOR_REAP_TRACKED:
+            self._fsmonitor_reap_checked.pop(
+                next(iter(self._fsmonitor_reap_checked)))
+        if sessions.worktree_has_live_session(record):
+            return
+        tracking.stop_fsmonitor_daemon(record.worktree_path)
+
+    def _maybe_refresh_repo_freshness(
+        self, record: tracking.WorktreeRecord,
+    ) -> None:
+        """Best-effort, cooldown-throttled per-repo freshness-ledger sweep
+        (worktree-finality-and-obligations Phase 9).
+
+        Complements the ad hoc writer wired into `__main__.py`'s
+        closure-descriptor call sites (a fetch that happens to occur there
+        because a caller asked for `--fetch`) with an ACTIVE sweep: this
+        resident monitor proactively fetches once per repo per cooldown
+        window, so a repo's `upstream_containment` freshness stays current
+        for every one of its worktrees even when none of them ever pass
+        `--fetch` themselves (the default `status-interval` poll never
+        does). An addition to the existing resident accelerator's own tick,
+        not a second daemon or thread.
+
+        Unlike `_maybe_reap_fsmonitor`, this does NOT gate on mux liveness --
+        git-fetch freshness has nothing to do with session liveness, and
+        gating it the same way would silently stop sweeping whenever a mux
+        observation goes stale, defeating the point of an ACTIVE sweep.
+        Throttled per-REPO (not per-worktree-id, unlike the fsmonitor reap
+        cooldown) via `_repo_freshness_checked`, so N worktrees of the same
+        repo cost one `git fetch` per cooldown window, not N. Skips the
+        fetch entirely when the ledger is already fresh (another sweep tick,
+        or a `__main__.py` call, beat this one to it), so this never adds a
+        redundant fetch on top of one that already happened moments ago.
+        Never raises -- a missing/timed-out git, a removed directory, or a
+        failed fetch are all silently fine outcomes; the ledger entry simply
+        stays (or goes) stale until a later successful attempt.
+        """
+        repo = record.repo
+        if not repo or not record.worktree_path:
+            return
+        now = time.monotonic()
+        last = self._repo_freshness_checked.get(repo)
+        if last is not None and now - last < _REPO_FRESHNESS_SWEEP_COOLDOWN_S:
+            return
+        self._repo_freshness_checked[repo] = now
+        while len(self._repo_freshness_checked) > _MAX_REPO_FRESHNESS_TRACKED:
+            self._repo_freshness_checked.pop(
+                next(iter(self._repo_freshness_checked)))
+        if tracking.is_repo_fetch_fresh(repo):
+            return
+        if not os.path.isdir(record.worktree_path):
+            return
+        from . import git_ops
+        try:
+            result = git_ops.git(
+                "fetch", "origin", "--quiet",
+                cwd=record.worktree_path, check=False, capture=True,
+                timeout=_REPO_FRESHNESS_FETCH_TIMEOUT_S,
+            )
+        except Exception:
+            return
+        if result.returncode == 0:
+            tracking.record_repo_fetch_confirmed(repo)
+
     def _index_record(self, project: str, yaml_path: Path) -> dict:
         result = {"records": 0, "heads": 0, "mux": 0, "registered_mux": 0}
         try:
             record = tracking.load_record(yaml_path)
         except Exception:
             return result
-        if (record.platform != cfg.detect_platform()
-                or record.status != "active"
-                or not record.worktree_path):
+        if record.platform != cfg.detect_platform() or not record.worktree_path:
+            return result
+
+        # Phase 9: unconditional (not mux-gated -- see the method's own
+        # docstring for why) per-repo freshness sweep, runs for every record
+        # regardless of status/mux freshness.
+        self._maybe_refresh_repo_freshness(record)
+
+        mux_fresh = (
+            self._live_mux is not None
+            and self._live_mux_at is not None
+            and time.monotonic() - self._live_mux_at <= self.mux_max_age
+        )
+        live = False
+        if mux_fresh:
+            live = sessions.mux_session_name(record.worktree_id) in self._live_mux
+            # Runs regardless of record.status -- see docstring.
+            self._maybe_reap_fsmonitor(record, live)
+
+        if record.status != "active":
             return result
         result["records"] = 1
         key = _path_key(record.worktree_path)
@@ -209,6 +506,7 @@ class ResidentSessionReconciler:
             project, record.worktree_id, yaml_path, record.worktree_path)
         self._pending_heads[(project, record.worktree_id)] = (
             record.resolved_head_session)
+        self._queue_projection_repairs(project, yaml_path, record)
 
         if self._repair_head(record):
             try:
@@ -221,13 +519,7 @@ class ResidentSessionReconciler:
             except Exception:
                 pass
 
-        mux_fresh = (
-            self._live_mux is not None
-            and self._live_mux_at is not None
-            and time.monotonic() - self._live_mux_at <= self.mux_max_age
-        )
         if mux_fresh:
-            live = sessions.mux_session_name(record.worktree_id) in self._live_mux
             tracking.stamp_mux_live(
                 record.worktree_id, live, refresh=live, sync=True)
             result["mux"] = 1
@@ -340,7 +632,8 @@ class ResidentSessionReconciler:
                         )],
                     )
                     self._insert_session(record.sessions, entry)
-                    tracking._next_lifecycle_revision(record)
+                    tracking._next_lifecycle_revision(
+                        record, observation["session_id"])
                     result["registered"] = 1
                     changed = True
                 else:
@@ -358,7 +651,8 @@ class ResidentSessionReconciler:
                             source="reconciled",
                         )
                         if activation_added:
-                            tracking._next_lifecycle_revision(record)
+                            tracking._next_lifecycle_revision(
+                                record, observation["session_id"])
                         result["pids"] = 1
                         changed = True
                 if (protected_head is not None
@@ -430,10 +724,12 @@ class ResidentSessionReconciler:
         """Advance both cursors by one bounded batch and return repair counts."""
         prior = cfg.active_project()
         try:
+            self._step_number += 1
             self._refresh_projects()
             result = self._scan_records()
+            projection_result = self._scan_projections()
             session_result = self._scan_sessions()
-            for key, value in session_result.items():
+            for key, value in {**projection_result, **session_result}.items():
                 if key in result and isinstance(value, int):
                     result[key] += value
                 else:

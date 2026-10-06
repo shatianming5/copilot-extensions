@@ -2,26 +2,29 @@
 
 Most repos need no config: agent-codespaces derives machine/location defaults,
 the ``/workspaces/<basename>`` checkout, and the git-credential relay by
-convention. Supplementary, CodeSpace-specific config lives **in the adopting
-repo** at the canonical ``.agent-codespaces/config.yaml`` (aligned with the
-sibling ``agent-*`` plugins), with the legacy repo-root ``codespaces.yaml`` still
-read as a back-compat fallback. The runtime directory (``~/.agent-codespaces/``)
-holds only the adoption manifest (``adopted-repos.yaml``) -- a list of repo
-paths. On every start/reload the service reads each repo's config live and
-merges in memory; a CLI run inside a repo also auto-discovers that repo's config.
+convention. Supplementary, CodeSpace-specific config can live **in the adopting
+repo** at the canonical ``.copilot-extensions/agent-codespaces/config.yaml`` or
+be exposed by an active plugin's ``codespaceConfig`` manifest declaration.
+Legacy ``.agent-codespaces/config.yaml``, repo-root ``codespaces.yaml``, and
+user-level ``config.d`` providers remain compatibility inputs. Provider
+declarations merge below adopted-repo and current-repo config. On every
+start/reload the service reads each source live and merges in memory.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 import stat
+import subprocess
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 from dropin_registry import (
@@ -33,7 +36,12 @@ from dropin_registry import (
     WarningTracker,
     scan_directory,
 )
-from plugin_activation import ActivationReport, ActivePlugin, resolve_active_plugins
+from plugin_activation import (
+    ActivationReport,
+    ActivePlugin,
+    normalize_remote,
+    resolve_active_plugins,
+)
 
 log = logging.getLogger("agent-codespaces")
 
@@ -41,55 +49,62 @@ log = logging.getLogger("agent-codespaces")
 def _home() -> Path:
     """Root under which agent-codespaces state lives, with a sandbox override.
 
-    ``AGENT_HOME`` (when set) replaces ``~/`` as the state root -- the same
-    fabric-wide override agent-worktrees honors -- so an isolated test deployment
-    relocates ``~/.agent-codespaces`` (leases, sockets, logs) without touching the
-    real home (``gh``/``ssh``/git auth still resolve from the actual ``~/``).
-    Read at import so a freshly-spawned ``agent-codespaces`` subprocess inside a
-    sandbox picks it up.
+    ``AGENT_HOME`` remains the suite-wide sandbox override so isolated test
+    deployments can relocate ``~/.agent-codespaces`` (leases, sockets, logs)
+    without touching the real home (``gh``/``ssh``/git auth still resolve from
+    the actual ``~/``). Read at import so a freshly-spawned
+    ``agent-codespaces`` subprocess inside a sandbox picks it up.
     """
-    import os
-
     override = os.environ.get("AGENT_HOME", "").strip()
     return Path(override) if override else Path.home()
 
 
+def _runtime_dir() -> Path:
+    """The selected runtime root for this process."""
+    override = os.environ.get("AGENT_CODESPACES_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return _home() / ".agent-codespaces"  # marketplace-isolation: allow legacy compatibility root
+
+
 # Canonical paths
-RUNTIME_DIR = _home() / ".agent-codespaces"
+RUNTIME_DIR = _runtime_dir()
 ADOPTED_REPOS_FILE = RUNTIME_DIR / "adopted-repos.yaml"
 SOCKET_DIR = RUNTIME_DIR / "sockets"
 LOG_FILE = RUNTIME_DIR / "agent-codespaces.log"
 
-# In-repo config, aligned with the sibling agent-* plugins' ``.agent-<name>/``
-# convention (e.g. ``.agent-worktrees/config.yaml``). This is the **canonical**
-# home for a repo's CodeSpace config; it carries only the *supplementary*,
-# CodeSpace-specific bits that convention can't derive (workspace_repo/split-repo
-# mapping, devcontainer pin, ado_host, provision hooks). A repo that matches
-# convention (machine defaults, ``/workspaces/<basename>`` checkout, git-credential
-# relay) needs no file at all.
-CONFIG_DIR_NAME = ".agent-codespaces"
+# In-repo config moves toward the shared ``.copilot-extensions/<plugin>/``
+# namespace. The neutral base config remains repo-owned and distribution-neutral;
+# a marketplace-specific override is an explicit opt-in overlay beneath the same
+# plugin namespace. Legacy locations remain readable during the compatibility
+# window.
+CONFIG_DIR_NAME = str(Path(".copilot-extensions") / "agent-codespaces")
 CONFIG_FILE_IN_DIR = "config.yaml"
 CANONICAL_CONFIG_REL = f"{CONFIG_DIR_NAME}/{CONFIG_FILE_IN_DIR}"
+LEGACY_CONFIG_DIR_NAME = ".agent-codespaces"  # marketplace-isolation: allow legacy-compatibility
+LEGACY_CONFIG_REL = f"{LEGACY_CONFIG_DIR_NAME}/{CONFIG_FILE_IN_DIR}"
+MARKETPLACE_OVERLAYS_DIR = (
+    Path(".copilot-extensions") / "agent-codespaces" / "marketplaces"
+)
 
 # Legacy repo-root config filename, still read as a back-compat fallback.
 # ``agent-codespaces config migrate`` relocates it to CANONICAL_CONFIG_REL.
 CONFIG_FILENAME = "codespaces.yaml"
 NO_SUPPLEMENTAL_CONFIG_ADVISORY = (
-    "No CodeSpace config found (no .agent-codespaces/config.yaml in the "
-    "current repo and no adopted repos). Standard repos need none; add "
+    "No CodeSpace config found (no .copilot-extensions/agent-codespaces/"
+    "config.yaml in the current repo and no adopted repos). Standard repos need none; add "
     "one only for supplementary CodeSpace-specific config."
 )
+ADOPTION_RECEIPT_SCHEMA = "agent-codespaces/repo-adoption"
+ADOPTION_RECEIPT_VERSION = 1
+ADOPTION_RECEIPT_NAME = "adoption.json"
 
-# ── User-level drop-in config providers (config.d) ──────────────────────────
-# A harness plugin can make its shipped CodeSpace *target* config discoverable
-# WITHOUT a control-plane repo and WITHOUT writing into any repo: it drops a small
-# **pointer** file into ``~/.agent-codespaces/config.d/`` naming its config.yaml.
-# agent-codespaces reads each pointer, loads the referenced config, and merges it
-# at the LOWEST precedence (a provider default -- any adopted-repo / cwd config
-# still overrides). This keeps the provider edge one-way and dependency-free: the
-# plugin ships a default and points at it in place; agent-codespaces discovers it
-# dynamically; neither writes into the other's repo, and a plugin update keeps the
-# pointed config live (no stale copy).
+# ── Supplementary config providers ──────────────────────────────────────────
+# An active plugin can expose its shipped CodeSpace target config directly from
+# plugin.json. Legacy/operator config.d entries remain supported, but are not
+# required authority for active plugin payloads.
+PLUGIN_CONFIG_MANIFEST_FIELD = "codespaceConfig"
+PLUGIN_CONFIG_REGISTRY_NAME = "plugin-manifests"
 CONFIG_D_DIR_NAME = "config.d"
 CONFIG_D_REGISTRY_NAME = "config.d"
 CONFIG_D_POINTER_SCHEMA_VERSION = 1
@@ -166,7 +181,7 @@ class ConfigDropinRegistryReport:
                     item["owner"] = decision.value.owner
             entries.append(item)
         return {
-            "registry": CONFIG_D_REGISTRY_NAME,
+            "registry": self.snapshot.registry,
             "authority": self.authority.value,
             "active_entries": [
                 contribution.to_dict() for contribution in self.active_configs
@@ -176,12 +191,38 @@ class ConfigDropinRegistryReport:
         }
 
 
+@dataclass(frozen=True)
+class ConfigProviderReports:
+    """Active-plugin and compatibility config-provider diagnostics."""
+
+    active_plugins: ConfigDropinRegistryReport
+    config_d: ConfigDropinRegistryReport
+
+    @property
+    def active_configs(self) -> list[ConfigDropin]:
+        """Return provider configs in precedence order."""
+        return [
+            *self.active_plugins.active_configs,
+            *self.config_d.active_configs,
+        ]
+
+    @property
+    def findings(self) -> tuple[Finding, ...]:
+        """Return exhaustive findings from both provider surfaces."""
+        return (
+            *self.active_plugins.findings,
+            *self.config_d.findings,
+        )
+
+
 # Config loading is normally one-shot, but a daemon can reload it while a
 # registry entry is transiently unreadable. Keep only the last selected value
 # per entry, and clear it on an authoritative absent scan.
 _CONFIG_D_LAST_KNOWN: dict[str, ConfigDropin] = {}
 _CONFIG_D_LAST_KNOWN_ROOT: Path | None = None
 _CONFIG_D_WARNING_TRACKER = WarningTracker()
+_PLUGIN_CONFIG_LAST_KNOWN: dict[str, ConfigDropin] = {}
+_PLUGIN_CONFIG_WARNING_TRACKER = WarningTracker()
 
 
 def config_d_dir() -> Path:
@@ -446,17 +487,14 @@ def _validate_dropin_config(raw: object) -> str | None:
     for index, plugin in enumerate(raw.get("codespace_plugins", [])):
         if not isinstance(plugin, dict):
             return f"codespace_plugins[{index}] must be a mapping"
-
     credentials = raw.get("credentials", {})
-    if "feed_token_env" in credentials and not isinstance(
-        credentials["feed_token_env"], list
-    ):
-        return "credentials.feed_token_env must be a list"
-    if "feed_token_env" in credentials:
-        error = _validate_dropin_string_list(
-            credentials["feed_token_env"],
-            location="credentials.feed_token_env",
-        )
+    for key in ("feed_token_env", "identity_env"):
+        value = credentials.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, list):
+            return f"credentials.{key} must be a list"
+        error = _validate_dropin_string_list(value, location=f"credentials.{key}")
         if error is not None:
             return error
     sources = credentials.get("sources", {})
@@ -482,6 +520,12 @@ def _validate_dropin_config(raw: object) -> str | None:
         or not isinstance(connection_owner["reconcile_interval"], (int, float))
     ):
         return "connection_owner.reconcile_interval must be a number"
+    if "idle_shutdown_after" in connection_owner:
+        idle_val = connection_owner["idle_shutdown_after"]
+        if idle_val is not None and (
+            isinstance(idle_val, bool) or not isinstance(idle_val, (int, float))
+        ):
+            return "connection_owner.idle_shutdown_after must be a number or null"
 
     repos = raw.get("repos", {})
     for repo_name, repo in repos.items():
@@ -501,6 +545,269 @@ def _validate_dropin_config(raw: object) -> str | None:
     return None
 
 
+def _plugin_config_remedy(source: str, manifest: Path) -> str:
+    """Return the report-only remedy for one manifest declaration."""
+    return (
+        f"Fix or remove {PLUGIN_CONFIG_MANIFEST_FIELD} in {manifest} for "
+        f"{source}, then update or re-enable that plugin."
+    )
+
+
+def _plugin_config_finding(
+    source: str,
+    manifest: Path,
+    reason: str,
+    *,
+    status: str = "inactive",
+    target: Path | str | None = None,
+    detail: str | None = None,
+) -> Finding:
+    """Create an exact active-plugin declaration finding."""
+    return Finding(
+        registry=PLUGIN_CONFIG_REGISTRY_NAME,
+        entry=str(manifest),
+        status=status,
+        reason=reason,
+        target=str(target) if target is not None else None,
+        owner=source,
+        remedy=_plugin_config_remedy(source, manifest),
+        detail=detail,
+    )
+
+
+def _active_plugin_config_decision(
+    active: ActivePlugin,
+) -> EntryDecision[ConfigDropin] | None:
+    """Read and validate one active plugin's optional config declaration."""
+    manifest = active.root / "plugin.json"
+    try:
+        info = manifest.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return EntryDecision.indeterminate(
+            _plugin_config_finding(
+                active.source,
+                manifest,
+                "entry-indeterminate",
+                status="indeterminate",
+                detail=f"plugin manifest could not be inspected: {exc}",
+            )
+        )
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or _is_reparse(info)
+    ):
+        return EntryDecision.inactive(
+            _plugin_config_finding(
+                active.source,
+                manifest,
+                "invalid-entry",
+                detail="plugin.json must be a regular non-reparse file",
+            )
+        )
+    try:
+        raw_manifest = json.loads(manifest.read_text(encoding="utf-8"))
+    except UnicodeDecodeError as exc:
+        return EntryDecision.inactive(
+            _plugin_config_finding(
+                active.source,
+                manifest,
+                "invalid-entry",
+                detail=f"plugin.json is not valid UTF-8: {exc}",
+            )
+        )
+    except json.JSONDecodeError as exc:
+        return EntryDecision.inactive(
+            _plugin_config_finding(
+                active.source,
+                manifest,
+                "invalid-entry",
+                detail=f"plugin.json is not valid JSON: {exc}",
+            )
+        )
+    except OSError as exc:
+        return EntryDecision.indeterminate(
+            _plugin_config_finding(
+                active.source,
+                manifest,
+                "entry-indeterminate",
+                status="indeterminate",
+                detail=f"plugin.json could not be read: {exc}",
+            )
+        )
+    if not isinstance(raw_manifest, dict):
+        return EntryDecision.inactive(
+            _plugin_config_finding(
+                active.source,
+                manifest,
+                "invalid-entry",
+                detail="plugin.json must contain a JSON object",
+            )
+        )
+    if PLUGIN_CONFIG_MANIFEST_FIELD not in raw_manifest:
+        return None
+
+    declared = raw_manifest.get(PLUGIN_CONFIG_MANIFEST_FIELD)
+    if not isinstance(declared, str) or not declared.strip():
+        return EntryDecision.inactive(
+            _plugin_config_finding(
+                active.source,
+                manifest,
+                "invalid-entry",
+                target=str(declared),
+                detail=f"{PLUGIN_CONFIG_MANIFEST_FIELD} must be a non-empty relative path",
+            )
+        )
+    relative = Path(declared.strip())
+    if relative.is_absolute():
+        return EntryDecision.inactive(
+            _plugin_config_finding(
+                active.source,
+                manifest,
+                "identity-mismatch",
+                target=relative,
+                detail=f"{PLUGIN_CONFIG_MANIFEST_FIELD} must be relative to the plugin root",
+            )
+        )
+    target = active.root / relative
+    canonical_target, verdict = _regular_target(
+        manifest,
+        target,
+        entry_class="active-plugin",
+        owner=active.source,
+    )
+    if verdict is not None:
+        finding = verdict.findings[0]
+        replacement = _plugin_config_finding(
+            active.source,
+            manifest,
+            finding.reason,
+            status=finding.status,
+            target=target,
+            detail=finding.detail,
+        )
+        if verdict.status is EntryStatus.INDETERMINATE:
+            return EntryDecision.indeterminate(replacement)
+        return EntryDecision.inactive(replacement)
+    canonical_target = cast(Path, canonical_target)
+    try:
+        canonical_target.relative_to(active.root)
+    except ValueError:
+        return EntryDecision.inactive(
+            _plugin_config_finding(
+                active.source,
+                manifest,
+                "identity-mismatch",
+                target=canonical_target,
+                detail="declared config escapes the identity-verified plugin root",
+            )
+        )
+
+    validated = _validated_config_target(
+        manifest,
+        canonical_target,
+        entry_class="active-plugin",
+        owner=active.source,
+    )
+    if validated.status in (EntryStatus.ACTIVE, EntryStatus.ACTIVE_WITH_ADVISORY):
+        contribution = cast(ConfigDropin, validated.value)
+        return EntryDecision.active(replace(contribution, entry=manifest))
+    finding = validated.findings[0]
+    replacement = _plugin_config_finding(
+        active.source,
+        manifest,
+        finding.reason,
+        status=finding.status,
+        target=canonical_target,
+        detail=finding.detail,
+    )
+    if validated.status is EntryStatus.INDETERMINATE:
+        return EntryDecision.indeterminate(replacement)
+    return EntryDecision.inactive(replacement)
+
+
+def scan_active_plugin_config_registry(
+    *,
+    previous: dict[str, ConfigDropin] | None = None,
+) -> ConfigDropinRegistryReport:
+    """Resolve supplementary configs declared by currently active plugins."""
+    global _PLUGIN_CONFIG_LAST_KNOWN
+
+    activation = resolve_active_plugins()
+    decisions: dict[str, EntryDecision[ConfigDropin]] = {}
+    entry_classes: dict[str, str] = {}
+    findings: list[Finding] = []
+
+    for source, activation_decision in sorted(activation.decisions.items()):
+        if activation_decision.status is EntryStatus.INDETERMINATE:
+            manifest = (
+                activation_decision.value.root / "plugin.json"
+                if activation_decision.value is not None
+                else Path(f"<active-plugin:{source}>")
+            )
+            decision = EntryDecision.indeterminate(
+                _plugin_config_finding(
+                    source,
+                    manifest,
+                    "entry-indeterminate",
+                    status="indeterminate",
+                    detail="plugin activation could not be determined authoritatively",
+                )
+            )
+        elif activation_decision.status is EntryStatus.INACTIVE:
+            continue
+        else:
+            active = cast(ActivePlugin, activation_decision.value)
+            decision = None
+            for selected in active.live_roots:
+                scoped = replace(
+                    active,
+                    root=selected.root,
+                    scopes=selected.scopes,
+                    roots=(selected,),
+                )
+                decision = _active_plugin_config_decision(scoped)
+                if decision is not None:
+                    break
+            if decision is None:
+                continue
+        decisions[source] = decision
+        entry_classes[source] = "active-plugin"
+        findings.extend(decision.findings)
+
+    if activation.authority is ScanAuthority.INDETERMINATE:
+        findings.append(Finding(
+            registry=PLUGIN_CONFIG_REGISTRY_NAME,
+            entry=PLUGIN_CONFIG_REGISTRY_NAME,
+            status="indeterminate",
+            reason="registry-indeterminate",
+            remedy=(
+                "Restore readable plugin activation settings and payload roots, "
+                "then run `agent-codespaces doctor` again; current declarations "
+                "are retained."
+            ),
+            detail="active plugins could not be enumerated authoritatively",
+        ))
+
+    snapshot = ScanSnapshot(
+        registry=PLUGIN_CONFIG_REGISTRY_NAME,
+        authority=activation.authority,
+        decisions=decisions,
+        findings=tuple(findings),
+    )
+    prior = dict(_PLUGIN_CONFIG_LAST_KNOWN if previous is None else previous)
+    active_entries = snapshot.reconcile(prior)
+    if previous is None:
+        _PLUGIN_CONFIG_LAST_KNOWN = dict(active_entries)
+    return ConfigDropinRegistryReport(
+        snapshot=snapshot,
+        active_entries=active_entries,
+        entry_classes=entry_classes,
+    )
+
+
 def _legacy_target(entry: Path, text: str) -> Path | None:
     """Recognize only the documented pre-v1 harness pointer shape."""
     if not _LEGACY_PROVIDER_RE.fullmatch(entry.name):
@@ -515,12 +822,18 @@ def _legacy_target(entry: Path, text: str) -> Path | None:
     target = Path(candidates[0]).expanduser()
     if not target.is_absolute():
         return None
-    if (
-        target.name != CONFIG_FILE_IN_DIR
-        or target.parent.name != CONFIG_DIR_NAME.removeprefix(".")
-        or target.parent.parent.name != "references"
-    ):
+    canonical_tail = Path("references") / CONFIG_DIR_NAME / CONFIG_FILE_IN_DIR
+    legacy_tail = Path("references") / "agent-codespaces" / CONFIG_FILE_IN_DIR
+    if target.name != CONFIG_FILE_IN_DIR:
         return None
+    try:
+        tail = Path(*target.parts[-len(canonical_tail.parts) :])
+    except TypeError:
+        return None
+    if tail != canonical_tail:
+        tail = Path(*target.parts[-len(legacy_tail.parts) :])
+        if tail != legacy_tail:
+            return None
     return target
 
 
@@ -682,7 +995,8 @@ def _managed_pointer_decision(
                 detail=f"pointer plugin_root could not be read: {exc}",
             )
         )
-    if canonical_stored_root != active.root:
+    live_roots = {selected.root for selected in active.live_roots}
+    if canonical_stored_root not in live_roots:
         return EntryDecision.inactive(
             _config_d_finding(
                 entry,
@@ -691,8 +1005,10 @@ def _managed_pointer_decision(
                 entry_class="managed-plugin",
                 owner=source,
                 detail=(
-                    "pointer plugin_root differs from the current identity-verified "
-                    f"root ({active.root})"
+                    "pointer plugin_root differs from current identity-verified "
+                    "roots ("
+                    + ", ".join(str(root) for root in sorted(live_roots))
+                    + ")"
                 ),
             )
         )
@@ -704,7 +1020,7 @@ def _managed_pointer_decision(
         return verdict
     canonical_target = cast(Path, canonical_target)
     try:
-        canonical_target.relative_to(active.root)
+        canonical_target.relative_to(canonical_stored_root)
     except ValueError:
         return EntryDecision.inactive(
             _config_d_finding(
@@ -910,6 +1226,93 @@ def scan_config_dropin_registry(
     )
 
 
+def _shadow_config_d_with_active_plugins(
+    report: ConfigDropinRegistryReport,
+    active_plugins: ConfigDropinRegistryReport,
+) -> ConfigDropinRegistryReport:
+    """Make valid active-plugin declarations authoritative over old pointers."""
+    authoritative = {
+        contribution.owner
+        for contribution in active_plugins.active_configs
+        if contribution.owner
+    }
+    if not authoritative:
+        return report
+
+    active_entries = dict(report.active_entries)
+    decisions = dict(report.snapshot.decisions)
+    findings = list(report.findings)
+    for key, contribution in tuple(active_entries.items()):
+        if contribution.owner not in authoritative:
+            continue
+        active_entries.pop(key)
+        superseded = _config_d_finding(
+            contribution.entry,
+            "superseded",
+            status="active-with-advisory",
+            target=contribution.target,
+            entry_class=contribution.entry_class,
+            owner=contribution.owner,
+            detail=(
+                f"{contribution.owner} now declares "
+                f"{PLUGIN_CONFIG_MANIFEST_FIELD} in its active plugin.json; "
+                "this compatibility pointer is ignored"
+            ),
+        )
+        decisions[key] = EntryDecision.advisory(contribution, superseded)
+        findings = [finding for finding in findings if finding.entry != key]
+        findings.append(superseded)
+    snapshot = ScanSnapshot(
+        registry=report.snapshot.registry,
+        authority=report.snapshot.authority,
+        decisions=decisions,
+        findings=tuple(findings),
+    )
+    return ConfigDropinRegistryReport(
+        snapshot=snapshot,
+        active_entries=active_entries,
+        entry_classes=report.entry_classes,
+    )
+
+
+def scan_config_providers() -> ConfigProviderReports:
+    """Scan active plugin declarations and compatibility config.d entries."""
+    active_plugins = scan_active_plugin_config_registry()
+    config_d = _shadow_config_d_with_active_plugins(
+        scan_config_dropin_registry(),
+        active_plugins,
+    )
+    return ConfigProviderReports(
+        active_plugins=active_plugins,
+        config_d=config_d,
+    )
+
+
+def _warn_active_plugin_config_findings(
+    report: ConfigDropinRegistryReport,
+) -> None:
+    """Emit bounded declaration findings during config loading."""
+    batch = _PLUGIN_CONFIG_WARNING_TRACKER.select(report.findings)
+    for finding in batch.emitted:
+        target = f" target={finding.target}" if finding.target else ""
+        log.warning(
+            "%s plugin=%s manifest=%s reason=%s%s; "
+            "run `agent-codespaces doctor`",
+            PLUGIN_CONFIG_REGISTRY_NAME,
+            finding.owner or "unknown",
+            finding.entry,
+            finding.reason,
+            target,
+        )
+    if batch.suppressed:
+        log.warning(
+            "%s: %d additional findings suppressed; "
+            "run `agent-codespaces doctor`",
+            PLUGIN_CONFIG_REGISTRY_NAME,
+            batch.suppressed,
+        )
+
+
 def _warn_config_dropin_findings(report: ConfigDropinRegistryReport) -> None:
     """Emit bounded, deduplicated operational findings for config loading."""
     batch = _CONFIG_D_WARNING_TRACKER.select(report.findings)
@@ -969,30 +1372,25 @@ def discover_dropin_configs() -> list[Path]:
 def repo_config_path(repo_path: Path) -> Path | None:
     """Return a repo's CodeSpace config file, or ``None`` if it has none.
 
-    Prefers the canonical ``.agent-codespaces/config.yaml``; falls back to the
-    legacy repo-root ``codespaces.yaml`` (back-compat). The returned path is the
-    *file*; the repo root (used to resolve provision ``src`` paths) stays
-    ``repo_path`` regardless of which location the file lives in.
+    Prefers the canonical ``.copilot-extensions/agent-codespaces/config.yaml``;
+    falls back to legacy ``.agent-codespaces/config.yaml`` and repo-root
+    ``codespaces.yaml``. If no neutral base config exists but an explicit
+    marketplace overlay does, returns that overlay path.
     """
-    canonical = repo_path / CONFIG_DIR_NAME / CONFIG_FILE_IN_DIR
-    if canonical.exists():
-        return canonical
-    legacy = repo_path / CONFIG_FILENAME
-    if legacy.exists():
-        return legacy
-    return None
+    layers = _repo_config_layers(repo_path)
+    return layers[0] if layers else None
 
 
 def repo_has_config(repo_path: Path) -> bool:
-    """Whether ``repo_path`` carries a CodeSpace config (canonical or legacy)."""
-    return repo_config_path(repo_path) is not None
+    """Whether ``repo_path`` carries a CodeSpace config or explicit overlay."""
+    return bool(_repo_config_layers(repo_path))
 
 
 def cwd_repo_root() -> Path | None:
     """The git repo root for the current directory, or ``None`` when not in one.
 
     Backs config **auto-discovery**: a CLI run inside a repo that carries a
-    ``.agent-codespaces/config.yaml`` picks it up without a manual ``config
+    ``.copilot-extensions/agent-codespaces/config.yaml`` picks it up without a manual ``config
     adopt`` (the adoption manifest remains for extra/multi repos and for the
     detached daemon paths, which pass ``include_cwd=False``).
     """
@@ -1123,22 +1521,41 @@ class CredentialsConfig:
     # Left empty (default), nothing is exported and behavior is unchanged.
     # dotfiles#1221.
     feed_token_env: list[str] = field(default_factory=list)
-
+    # Env var names to populate at launch with the host Azure-login identity
+    # behind relay-minted Azure tokens (user principals export the short alias).
+    identity_env: list[str] = field(default_factory=list)
 
 @dataclass
 class ConnectionOwnerConfig:
     """Persistent Connection Owner relay daemon (dotfiles#1320 / #1333).
 
-    Default OFF. When ``enabled``, a single per-machine daemon owns + self-heals
-    each CodeSpace's credential-relay independent of any one agent-bridge
-    dispatch, so a caller disconnect / bridge restart no longer drops the relay
-    mid-task. Nothing starts it by default; enabling is "flip the config, run
-    install/update" (the cutover contract). ``reconcile_interval`` bounds how
-    quickly the live relay set tracks the hold registry.
+    Default ON. A single per-machine daemon owns + self-heals each CodeSpace's
+    credential-relay independent of any one agent-bridge dispatch, so a caller
+    disconnect / bridge restart no longer drops the relay mid-task -- this is
+    also the correctness prerequisite for a remote-venue CLI-mode session's
+    daemon-port reverse-forward staying up for the session's whole lifetime,
+    not just one dispatch (agent-bridge-cli-mode-sessions Phase 4). Was
+    deploy-gated default-off while the daemon + defer wiring were rolled out
+    incrementally (#1333/#1345, both landed); this flips the already-built
+    cutover contract ("flip the config, run install/update") to its intended
+    end state rather than leaving a finished feature permanently opt-in. An
+    operator/repo can still set ``enabled: false`` explicitly to opt back out.
+    ``reconcile_interval`` bounds how quickly the live relay set tracks the
+    hold registry.
+
+    The daemon is deliberately **on-demand, not indefinitely resident**: a
+    tenant that finds it not live spins it up itself
+    (:func:`connection_owner.ensure_owner_running`), and the reconcile loop
+    exits cleanly on its own once no CodeSpace has been held for
+    ``idle_shutdown_after`` seconds (nothing bridge-controlled or
+    direct-driven currently needs it) -- a login-triggered service is a
+    convenience, not a requirement to keep it running forever. ``None``
+    disables idle shutdown (run until stopped).
     """
 
-    enabled: bool = False
+    enabled: bool = True
     reconcile_interval: float = 15.0
+    idle_shutdown_after: float | None = 300.0
 
 
 @dataclass
@@ -1416,10 +1833,11 @@ class CodespacesConfig:
           missing-remote misconfiguration rather than silently launching in the
           wrong place.
 
-        ``--allow-all-tools`` is required for headless dispatch: there is no
-        human to answer interactive tool-permission prompts.
+        ``--allow-all --experimental`` are required for headless dispatch:
+        there is no human to answer interactive tool-permission prompts, and
+        SDK extensions do not load without ``--experimental``.
         """
-        copilot = "copilot --acp --stdio --allow-all-tools"
+        copilot = "copilot --acp --stdio --allow-all --experimental"
 
         if requested_repo is not None:
             folder, prepopulated = self.workspace_folder_for_request(
@@ -1466,10 +1884,272 @@ class AdoptedRepo:
 
     path: Path
     adopted_at: str | None = None
+    normalized_remote: str | None = None
+
+
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(
+                cast(dict[str, Any], merged[key]),
+                cast(dict[str, Any], value),
+            )
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_installation_context() -> dict[str, Any] | None:
+    raw = os.environ.get("COPILOT_EXTENSIONS_CONTEXT", "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.startswith("{"):
+            data = json.loads(raw)
+        else:
+            data = json.loads(Path(raw).expanduser().read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _installation_marketplace_id() -> str | None:
+    context = _load_installation_context()
+    if context is None:
+        return None
+    marketplace_id = context.get("marketplaceId")
+    if not isinstance(marketplace_id, str) or not marketplace_id.strip():
+        return None
+    return marketplace_id.strip()
+
+
+def _cell_root() -> Path | None:
+    context = _load_installation_context()
+    if context is None:
+        return None
+    cell_root = context.get("cellRoot")
+    if not isinstance(cell_root, str) or not cell_root.strip():
+        return None
+    path = Path(cell_root).expanduser()
+    return path if path.is_absolute() else None
+
+
+def _repo_base_config_path(repo_path: Path) -> Path | None:
+    for candidate in (
+        repo_path / CONFIG_DIR_NAME / CONFIG_FILE_IN_DIR,
+        repo_path / LEGACY_CONFIG_DIR_NAME / CONFIG_FILE_IN_DIR,
+        repo_path / CONFIG_FILENAME,
+    ):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _repo_marketplace_overlay_path(repo_path: Path) -> Path | None:
+    marketplace_id = _installation_marketplace_id()
+    if not marketplace_id:
+        return None
+    candidate = repo_path / MARKETPLACE_OVERLAYS_DIR / marketplace_id / CONFIG_FILE_IN_DIR
+    return candidate if candidate.exists() else None
+
+
+def _repo_config_layers(repo_path: Path) -> list[Path]:
+    layers: list[Path] = []
+    base = _repo_base_config_path(repo_path)
+    if base is not None:
+        layers.append(base)
+    overlay = _repo_marketplace_overlay_path(repo_path)
+    if overlay is not None:
+        layers.append(overlay)
+    return layers
+
+
+def _git_origin_remote(repo_path: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    remote = (result.stdout or "").strip()
+    return remote if result.returncode == 0 and remote else None
+
+
+def _normalize_repository_remote(raw_remote: str) -> str | None:
+    remote = raw_remote.strip()
+    if not remote:
+        return None
+    try:
+        parsed = urlsplit(remote)
+        default_port = {
+            "http": 80,
+            "https": 443,
+            "ssh": 22,
+            "git": 9418,
+        }.get(parsed.scheme.casefold())
+        if default_port is not None and parsed.port == default_port:
+            host = parsed.hostname or ""
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            if parsed.username:
+                host = f"{parsed.username}@{host}"
+            remote = urlunsplit(
+                (parsed.scheme, host, parsed.path, parsed.query, parsed.fragment)
+            )
+    except ValueError:
+        pass
+    normalized = normalize_remote(remote)
+    if not normalized or normalized.startswith("file-relative:"):
+        return None
+    if normalized.startswith("network:github.com/"):
+        return normalized.casefold()
+    return normalized
+
+
+def _normalized_repository_remote(repo_path: Path) -> str | None:
+    remote = _git_origin_remote(repo_path)
+    if not remote:
+        return None
+    return _normalize_repository_remote(remote)
+
+
+def _repo_identity_components(repo_path: Path) -> tuple[str, str, Path] | None:
+    normalized_remote = _normalized_repository_remote(repo_path)
+    cell_root = _cell_root()
+    marketplace_id = _installation_marketplace_id()
+    if not normalized_remote or cell_root is None or not marketplace_id:
+        return None
+    digest = hashlib.sha256(normalized_remote.encode("utf-8")).hexdigest()[:24]
+    repository_id = f"repo-{digest}"
+    return normalized_remote, marketplace_id, cell_root / "repos" / repository_id
+
+
+def _namespaced_adoption_path(repo_path: Path) -> Path | None:
+    components = _repo_identity_components(repo_path)
+    if components is None:
+        return None
+    _normalized, _marketplace, repository_root = components
+    return repository_root / "agent-codespaces" / ADOPTION_RECEIPT_NAME
+
+
+def adoption_storage_path(repo_path: Path | None = None) -> Path:
+    if repo_path is not None:
+        namespaced = _namespaced_adoption_path(repo_path)
+        if namespaced is not None:
+            return namespaced
+    return ADOPTED_REPOS_FILE
+
+
+def adoption_storage_summary() -> str:
+    cell_root = _cell_root()
+    if cell_root is None:
+        return str(ADOPTED_REPOS_FILE)
+    return str(cell_root / "repos" / "<stable-repo-id>" / "agent-codespaces" / ADOPTION_RECEIPT_NAME)
+
+
+def _repo_matches_identity(path: Path, normalized_remote: str) -> bool:
+    try:
+        return _normalized_repository_remote(path) == normalized_remote
+    except OSError:
+        return False
+
+
+def _registered_repo_paths(normalized_remote: str) -> list[Path]:
+    try:
+        from agent_worktrees import repos as worktree_repos
+    except ImportError:
+        return []
+    matches: list[Path] = []
+    seen: set[str] = set()
+    for entry in worktree_repos.read_registry().repos.values():
+        local = entry.local_path()
+        if not local:
+            continue
+        if _normalize_repository_remote(entry.remote or "") != normalized_remote:
+            continue
+        candidate = Path(local).expanduser()
+        key = os.path.normcase(str(candidate))
+        if key in seen:
+            continue
+        seen.add(key)
+        matches.append(candidate)
+    return matches
+
+
+def _resolve_namespaced_repo_path(
+    normalized_remote: str,
+    last_path: Path,
+) -> Path:
+    candidates = _registered_repo_paths(normalized_remote)
+    last_key = os.path.normcase(str(last_path))
+    for candidate in candidates:
+        if os.path.normcase(str(candidate)) == last_key:
+            return candidate
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    if _repo_matches_identity(last_path, normalized_remote):
+        return last_path
+    return candidates[0] if candidates else last_path
+
+
+def _load_namespaced_adopted_repos() -> list[AdoptedRepo] | None:
+    cell_root = _cell_root()
+    marketplace_id = _installation_marketplace_id()
+    if cell_root is None or not marketplace_id:
+        return None
+    repos_root = cell_root / "repos"
+    if not repos_root.is_dir():
+        return None
+    adopted: list[AdoptedRepo] = []
+    found = False
+    for receipt_path in sorted(
+        repos_root.glob(f"*/agent-codespaces/{ADOPTION_RECEIPT_NAME}"),
+        key=lambda path: os.path.normcase(str(path)),
+    ):
+        try:
+            raw = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("schema") != ADOPTION_RECEIPT_SCHEMA:
+            continue
+        if raw.get("version") != ADOPTION_RECEIPT_VERSION:
+            continue
+        if raw.get("marketplaceId") != marketplace_id:
+            continue
+        normalized_remote = raw.get("normalizedRemote")
+        last_path = raw.get("path")
+        if not isinstance(normalized_remote, str) or not normalized_remote.strip():
+            continue
+        if not isinstance(last_path, str) or not last_path.strip():
+            continue
+        found = True
+        resolved = _resolve_namespaced_repo_path(
+            normalized_remote.strip(),
+            Path(last_path).expanduser(),
+        )
+        adopted.append(
+            AdoptedRepo(
+                path=resolved,
+                adopted_at=cast(str | None, raw.get("adoptedAt")),
+                normalized_remote=normalized_remote.strip(),
+            )
+        )
+    return adopted if found else None
 
 
 def load_adopted_repos() -> list[AdoptedRepo]:
-    """Load the adoption manifest from the runtime directory."""
+    """Load adopted repos from the active cell, with legacy fallback."""
+    namespaced = _load_namespaced_adopted_repos()
+    if namespaced is not None:
+        return namespaced
     if not ADOPTED_REPOS_FILE.exists():
         return []
 
@@ -1488,12 +2168,42 @@ def load_adopted_repos() -> list[AdoptedRepo]:
         repos.append(AdoptedRepo(
             path=Path(entry["path"]),
             adopted_at=entry.get("adopted_at"),
+            normalized_remote=entry.get("normalized_remote"),
         ))
     return repos
 
 
 def save_adopted_repos(repos: list[AdoptedRepo]) -> None:
-    """Write the adoption manifest to the runtime directory."""
+    """Persist adopted repos to the active cell, or the legacy manifest."""
+    if _cell_root() is not None and _installation_marketplace_id():
+        for repo in repos:
+            receipt_path = _namespaced_adoption_path(repo.path)
+            if receipt_path is None:
+                raise ValueError(
+                    f"repository {repo.path} has no stable remote identity"
+                )
+            normalized_remote = repo.normalized_remote or _normalized_repository_remote(
+                repo.path
+            )
+            if not normalized_remote:
+                raise ValueError(
+                    f"repository {repo.path} has no stable remote identity"
+                )
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            receipt = {
+                "schema": ADOPTION_RECEIPT_SCHEMA,
+                "version": ADOPTION_RECEIPT_VERSION,
+                "marketplaceId": _installation_marketplace_id(),
+                "normalizedRemote": normalized_remote,
+                "path": str(repo.path),
+                "adoptedAt": repo.adopted_at,
+            }
+            receipt_path.write_text(
+                json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        return
+
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     from . import config_migrations
 
@@ -1513,16 +2223,23 @@ def save_adopted_repos(repos: list[AdoptedRepo]) -> None:
 def load_repo_config(repo_path: Path) -> dict[str, Any] | None:
     """Load a repo's CodeSpace config. Returns None if missing.
 
-    Reads the canonical ``.agent-codespaces/config.yaml`` or the legacy
-    repo-root ``codespaces.yaml`` (see :func:`repo_config_path`).
+    Reads the canonical ``.copilot-extensions/agent-codespaces/config.yaml``
+    first, then legacy fallbacks. When an explicit installation context names a
+    marketplace-specific overlay, it is merged on top of the neutral base
+    config.
     """
-    config_file = repo_config_path(repo_path)
-    if config_file is None:
+    config_files = _repo_config_layers(repo_path)
+    if not config_files:
         log.warning("No %s found in %s", CANONICAL_CONFIG_REL, repo_path)
         return None
 
-    with open(config_file) as f:
-        return yaml.safe_load(f) or {}
+    merged: dict[str, Any] = {}
+    for config_file in config_files:
+        with open(config_file) as f:
+            loaded = yaml.safe_load(f) or {}
+        if isinstance(loaded, dict):
+            merged = _deep_merge_dicts(merged, loaded)
+    return merged
 
 
 def _state_root_config_dir(repo_path: Path) -> Path | None:
@@ -1534,10 +2251,12 @@ def _state_root_config_dir(repo_path: Path) -> Path | None:
     ``agent-worktrees state-root`` (run with cwd=repo_path) only to LOCATE the
     knowledge checkout -- the config-READ axis, distinct from where personal state
     is written -- returning it only when it actually declares a CodeSpace config
-    (canonical ``.agent-codespaces/config.yaml`` or legacy ``codespaces.yaml``).
+    (canonical ``.copilot-extensions/agent-codespaces/config.yaml`` or legacy
+    fallbacks).
 
     Best-effort + fail-open: a missing ``agent-worktrees`` binstub, a
-    non-stateless / unbound repo, or any error yields ``None``. Never raises.
+    non-stateless / unbound repo, or legacy error yields ``None``. Explicit
+    installation context refusals propagate instead of selecting legacy state.
     Only the config *content* + its ``src``/provision ``repo_dir`` graft here;
     plugin-settings sourcing (``source_paths``) stays the harness's own, so
     generic CodeSpace plugins remain harness-sourced.
@@ -1546,16 +2265,23 @@ def _state_root_config_dir(repo_path: Path) -> Path | None:
     import shutil
     import subprocess
 
-    exe = shutil.which("agent-worktrees")
-    if not exe:
-        return None
-    try:
-        proc = subprocess.run(
-            [exe, "state-root", "--json"], cwd=str(repo_path),
-            capture_output=True, text=True, timeout=20,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
+    from . import worktrees
+
+    if worktrees.explicit_context():
+        proc = worktrees.run("state-root", "--json", cwd=str(repo_path), timeout=20)
+        if proc is None:
+            return None
+    else:
+        exe = shutil.which("agent-worktrees")  # marketplace-isolation: allow no-context legacy state-root lookup; explicit context uses worktrees.run
+        if not exe:
+            return None
+        try:
+            proc = subprocess.run(
+                [exe, "state-root", "--json"], cwd=str(repo_path),
+                capture_output=True, text=True, timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
     if proc.returncode != 0 or not (proc.stdout or "").strip():
         return None
     try:
@@ -1650,16 +2376,22 @@ def _parse_repo_config(raw: dict[str, Any], repo_dir: Path | None = None) -> Rep
     )
 
 
-def load_merged_config(include_cwd: bool = True) -> CodespacesConfig:
+def load_merged_config(
+    include_cwd: bool = True,
+    *,
+    provider_reports: ConfigProviderReports | None = None,
+) -> CodespacesConfig:
     """Load and merge CodeSpace config from all adopted repos.
 
-    Reads each repo's config (``.agent-codespaces/config.yaml``, or legacy
-    ``codespaces.yaml``) live. First repo's values win on conflicts (except
+    Reads each repo's config (``.copilot-extensions/agent-codespaces/config.yaml``,
+    with legacy fallbacks and optional marketplace overlay) live. First repo's
+    neutral values win on conflicts (except
     credential sources, which are unioned).
 
     ``include_cwd`` (default True) also **auto-discovers** the current git repo:
     if the cwd's repo carries a config and isn't already adopted, it is merged
-    last -- so a CLI run inside a repo picks up its ``.agent-codespaces/config.yaml``
+    last -- so a CLI run inside a repo picks up its
+    ``.copilot-extensions/agent-codespaces/config.yaml``
     with no manual ``config adopt``. Detached daemon paths (relay/resolver) pass
     ``include_cwd=False`` so they stay driven purely by the adoption manifest.
     """
@@ -1678,10 +2410,10 @@ def load_merged_config(include_cwd: bool = True) -> CodespacesConfig:
     connection_owner_set = False
 
     # Ordered list of (raw_config, config_dir, source_path) to merge; order =
-    # precedence. Adopted repos + cwd first, then USER-LEVEL drop-in providers
-    # (config.d) LAST so an adopted-repo / cwd config always wins on conflicts.
-    # The drop-in seam makes a plugin-shipped target config discoverable with NO
-    # control-plane repo (the golden-path config-provider seam).
+    # precedence. Adopted repos + cwd first, then active plugin declarations,
+    # then compatibility config.d providers. All provider config is a default
+    # below repository-owned config; active payload declarations outrank stale
+    # user-level pointers for the same provider.
     sources: list[tuple[dict[str, Any], Path, Path]] = []
     for repo_root in roots:
         # E1e knowledge overlay (config-graft, #947): read the config from the
@@ -1699,11 +2431,12 @@ def load_merged_config(include_cwd: bool = True) -> CodespacesConfig:
         if raw is None:
             continue
         sources.append((raw, config_dir, repo_root))
-    dropin_report = scan_config_dropin_registry()
-    _warn_config_dropin_findings(dropin_report)
-    for contribution in dropin_report.active_configs:
-        # The registry classifier already read and structurally validated this
-        # target. Re-use its exact result so runtime and doctor cannot diverge.
+    provider_reports = provider_reports or scan_config_providers()
+    _warn_active_plugin_config_findings(provider_reports.active_plugins)
+    _warn_config_dropin_findings(provider_reports.config_d)
+    for contribution in provider_reports.active_configs:
+        # The provider classifiers already read and structurally validated each
+        # target. Re-use their exact results so runtime and doctor cannot diverge.
         sources.append((
             contribution.raw_config,
             contribution.target.parent,
@@ -1755,10 +2488,11 @@ def load_merged_config(include_cwd: bool = True) -> CodespacesConfig:
                 "enforce_ado_rest_login",
                 merged.credentials.enforce_ado_rest_login,
             ))
-            # Union feed-token env var names across adopted repos (dotfiles#1221).
-            for _var in creds_raw.get("feed_token_env", []) or []:
-                if _var and _var not in merged.credentials.feed_token_env:
-                    merged.credentials.feed_token_env.append(_var)
+            for attr in ("feed_token_env", "identity_env"):
+                target = getattr(merged.credentials, attr)
+                for _var in creds_raw.get(attr, []) or []:
+                    if _var and _var not in target:
+                        target.append(_var)
             for source_name, source_raw in creds_raw.get("sources", {}).items():
                 if source_name not in merged.credentials.sources:
                     merged.credentials.sources[source_name] = _parse_credential_source(
@@ -1776,7 +2510,7 @@ def load_merged_config(include_cwd: bool = True) -> CodespacesConfig:
                     )
                     existing.allowed_resources = sorted(new_resources)
 
-        # Connection Owner (first repo with a block wins; default off). An
+        # Connection Owner (first repo with a block wins; default on). An
         # explicit block claims the slot even when empty ({} -> defaults), so a
         # later repo cannot override a deliberate empty declaration.
         if "connection_owner" in raw and not connection_owner_set:
@@ -1789,6 +2523,12 @@ def load_merged_config(include_cwd: bool = True) -> CodespacesConfig:
                     "reconcile_interval",
                     merged.connection_owner.reconcile_interval,
                 )
+            )
+            idle_raw = co_raw.get(
+                "idle_shutdown_after", merged.connection_owner.idle_shutdown_after
+            )
+            merged.connection_owner.idle_shutdown_after = (
+                None if idle_raw is None else float(idle_raw)
             )
             connection_owner_set = True
 

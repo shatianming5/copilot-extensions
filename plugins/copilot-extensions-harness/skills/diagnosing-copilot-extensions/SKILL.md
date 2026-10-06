@@ -2,11 +2,13 @@
 name: diagnosing-copilot-extensions
 description: >
   Diagnose problems with deployed copilot-extensions plugins -- a plugin update
-  that "succeeds" but changes nothing, a missing binstub or command-not-found, a
-  skill that won't load, the agent-bridge service not responding, MCP tools
-  unavailable in a sub-agent, or a stale runtime. Symptom -> cause -> action, the
-  key paths and diagnostic commands, and the baseline-reset escape hatch. Use
-  when something is wrong with an installed plugin or its runtime.
+  that "succeeds" but changes nothing, a missing binstub, a skill that won't
+  load, the agent-bridge service not responding, MCP tools unavailable in a
+  sub-agent, or a stale runtime. The primary, hard-guidance skill for any
+  consumer: identify what belongs to this system, and never hand-patch a
+  deployed copy -- file a bug upstream or auto-update instead. Symptom -> cause
+  -> action, key paths, diagnostic commands, and the baseline-reset escape
+  hatch. Use when something is wrong with an installed plugin or its runtime.
   Trigger phrases include:
   - 'agent-worktrees not found'
   - 'agent-bridge not responding'
@@ -18,6 +20,9 @@ description: >
   - 'mcp tools unavailable'
   - 'diagnose copilot-extensions'
   - 'reset copilot extensions'
+  - 'should I patch this myself'
+  - 'hotfix a plugin locally'
+  - 'work around a copilot-extensions bug'
 ---
 
 # Diagnosing copilot-extensions
@@ -27,14 +32,45 @@ error names a symptom, not a root cause. Read the literal error, form a
 hypothesis, gather evidence, and only then act. For an idempotent step a single
 retry is a fine first move; never force-deploy or kill a process on a hunch.
 
+## Hard rule: identify it, don't patch it
+
+This is the primary purpose of this skill, and it binds **every** consumer of
+the suite, whether or not they ever contribute:
+
+1. **Identify what belongs to this system first.** Before reasoning about any
+   local script, process, config file, or running service, check it against
+   **Where things live** below. If a path, binstub, or process isn't listed
+   there, don't assume it's ours.
+2. **Never monkey-patch.** Do not hand-edit an installed/deployed plugin
+   payload (`~/.copilot/installed-plugins/...`) or a running runtime
+   (`~/.agent-*`) to work around a bug, "just this once" or otherwise. A local
+   edit is invisible to every other consumer, gets silently overwritten by the
+   next update, and leaves the real defect unfixed. There are exactly two
+   sanctioned responses when something is actually broken:
+   - **File a bug upstream** — open (or find and comment on) a GitHub issue on
+     `ThomasMichon/copilot-extensions`, written in generic, sanitized terms: no
+     PII, internal paths/hostnames, account details, or proprietary/downstream
+     context (see `contributing-to-copilot-extensions`'s *Sanitization* rule
+     and its worked examples in
+     [`references/sanitization-examples.md`](../../references/sanitization-examples.md)). This is the right move even if
+     you never intend to fix it yourself.
+   - **Run the auto-update/reset path** — `<repo> update` (or `--force`), or
+     the baseline reset below, if the deployed copy is simply stale or
+     corrupted rather than genuinely buggy.
+   - The **only** other sanctioned path is becoming a real contributor: fixing
+     the repo source itself and landing it through
+     `contributing-to-copilot-extensions`'s worktree/PR flow — never the
+     deployed copy directly.
+
 ## Where things live
 
 | What | Path |
 |------|------|
 | Installed plugin payloads | `~/.copilot/installed-plugins/copilot-extensions/<plugin>/` |
-| Runtime roots | `~/.agent-*` (for example `~/.agent-worktrees/`, `~/.agent-bridge/`, `~/.agent-codespaces/`, `~/.agent-containers/`, `~/.agent-mcp/`, `~/.agent-logger/`, `~/.agent-dispatch/`, `~/.agent-index/`, `~/.agent-vault/`) |
+| Runtime roots | `~/.agent-*` (for example `~/.agent-worktrees/`, `~/.agent-bridge/`, `~/.agent-codespaces/`, `~/.agent-containers/`, `~/.agent-mcp/`, `~/.agent-logger/`, `~/.agent-dispatch/`, `~/.agent-index/`, `~/.agent-vault/`) <!-- marketplace-isolation: allow deployed-runtime-diagnostics --> |
+| **Writable source checkout** | Resolve it, don't assume it's undocumented -- run `<agent-worktrees catalog argv[0]> related resolve copilot-extensions` (the exact `argv[0]` from the session command catalog, never a bare PATH lookup; or the equivalent for another plugin-suite repo). A runtime-only path above is never the only copy; concluding a source-location gap without running this first is the mistake, not a real gap. <!-- marketplace-isolation: allow deployed-runtime-diagnostics --> |
 | Versioned slots | Python runtimes build immutable slots under `~/.agent-<name>/versions/<version>/`, publish `current-version`, and stamp `deploy-manifest.json` / completion markers |
-| Binstubs | `~/.local/bin/agent-*` (`.ps1` primary + `.cmd` fallback on Windows) |
+| Binstubs | `~/.local/bin/agent-*` (`.ps1` primary + `.cmd` fallback on Windows) <!-- marketplace-isolation: allow deployed-runtime-diagnostics --> |
 | Enablement | `~/.copilot/settings.json` (`experimental: true`) + repo `.github/copilot/settings.json` (`enabledPlugins` / `extraKnownMarketplaces`) |
 | Catalog | `.github/plugin/marketplace.json` in the repo |
 
@@ -44,7 +80,7 @@ retry is a fine first move; never force-deploy or kill a process on a hunch.
 |---------|--------------|--------|
 | `copilot plugin update` says **"already at latest"** but the code is stale | Version not bumped before merge (marketplace compares versions) | Check the plugin's `plugins[N].version` in the repo vs the deployed `plugin.json`; the fix is a version bump on the *source* side (see `contributing-to-copilot-extensions`). |
 | `plugin update` **succeeded** but the runtime behaves unchanged | Payload refreshed, **runtime not redeployed** — the CLI's "updated" message is payload-only | Use the unified deploy path: `<repo> update` (normally `agent-worktrees update`) on the machine. If the payload/runtime have the same version but content drift is suspected, use `<repo> update --force`. Per-plugin `install.*` / `init.*` is only a local-testing or recovery path. <!-- marketplace-isolation: allow deployment-management --> |
-| `agent-worktrees` / `agent-bridge` **command not found** | Runtime not installed, `~/.local/bin` not on PATH, or an earlier PATH entry shadows the binstub | Check `Get-Command agent-worktrees -All` / `which -a agent-worktrees`; ensure `~/.local/bin` wins; run `<repo> update` to reconcile missing runtime/binstubs. |
+| `agent-worktrees` / `agent-bridge` **command not found** | Runtime not installed, `~/.local/bin` not on PATH, or an earlier PATH entry shadows the binstub | Check `Get-Command agent-worktrees -All` / `which -a agent-worktrees`; ensure `~/.local/bin` wins; run `<repo> update` to reconcile missing runtime/binstubs. <!-- marketplace-isolation: allow deployed-runtime-diagnostics --> |
 | A **skill won't load** in a session | `experimental` off, plugin not enabled, or session not restarted (plugins scan at startup) | Confirm `experimental: true` in `~/.copilot/settings.json`; confirm the plugin in `enabledPlugins`; **restart the session**. |
 | **agent-bridge not responding** | Service not running, stale routing table, or client assuming an old fixed port | `agent-bridge status` (it resolves the live dynamic port); use `<repo> update` / `agent-bridge status` evidence before restarting. On POSIX check the user service; on Windows current service lifecycle may be user-mode, with legacy scheduled-task artifacts only if installed earlier. <!-- marketplace-isolation: allow deployed-runtime-diagnostics --> |
 | Bridge runs but a **remote send fails** | SSH transport, not the bridge | Test the SSH alias directly; check topology with `agent-bridge machines` / `agent-bridge agents`; fix the alias/key before touching the service. <!-- marketplace-isolation: allow deployed-runtime-diagnostics --> |
@@ -95,5 +131,6 @@ Your source repos and their `.worktrees` are never touched.
 
 `docs/architecture.md` (runtimes, ports, the payload/runtime split),
 `docs/install-contract.md` (the runtime-plugin contract), and each plugin's own
-`docs/getting-started.md`. To land a fix once you've found the cause, use
+`docs/getting-started.md`. **Only if you're actually contributing a real,
+versioned fix** — not patching the deployed copy — does the path continue to
 `contributing-to-copilot-extensions`.

@@ -4,9 +4,10 @@
   gives agents a durable, browsable, **claimable task queue** so many agents
   coordinate work under one shared identity, instead of racing through the
   version-control remote or minting an account per agent.
-- **Scope:** leaf (a per-plugin vision under the [agent-fabric](../../agent-fabric/README.md) branch)
+- **Scope:** branch (a per-plugin vision under the
+  [agent-fabric](../../agent-fabric/README.md) branch)
 - **Status:** Draft
-- **Last revised:** 2026-08-31
+- **Last revised:** 2026-09-25
 - **Reality docs:** [`docs/architecture.md`](../../../docs/architecture.md) ·
   the plugin's `plugins/agent-dispatch/` (skill `agent-dispatch`, `pick-and-claim`)
 
@@ -53,7 +54,11 @@ the work advances. The task is then a *resumable statement of an outcome to
 reach*, not just an instruction. That durability is what lets a task genuinely
 outlive the specific agent pursuing it: a worker that vanishes mid-goal is
 replaced by one that **resumes from the recorded progress**, not one that starts
-the goal over.
+the goal over. Every change of a task's *current* owner session is also
+recorded in a durable **attachment history** (see *durable-attachment-history*
+in Features) — `GET /tasks/{id}/attachments` — so a consumer resolving "what
+session worked this task" can still answer for a prior attempt even after the
+task has moved on to a new owner or been released.
 
 ### The coordinator — the single-writer store
 A **coordinator** owns the queue: a single-writer store that hands out
@@ -85,6 +90,14 @@ liveness of what it started. Like the coordinator it does **only** its own job �
 scheduling, emitting, evaluating, spawning, and keeping those alive — and it is
 reached over the fabric's secured mesh, never a public listener. The coordinator
 answers *what work exists*; the supervisor answers *what is running it here*.
+When a locally embodied headless task becomes terminal, the supervisor
+terminally reaps that exact ACP session before releasing its spawn reservation;
+a completed task never leaves an unowned process behind. This is agent-dispatch's
+realization of the suite-wide
+[*process-count-scales-with-services-not-sessions*](../../plugin-services/README.md#process-count-scales-with-services-not-sessions)
+guarantee: the coordinator and the supervisor are each exactly one process per
+host regardless of how many agent sessions, worktrees, or CLI invocations query
+or register against them.
 
 ### Worker identity — the worktree
 A worker's durable identity is the **worktree it occupies** (the same identity
@@ -137,16 +150,26 @@ claim candidates remain observably audited rather than silently skipped.
 
 ### The lifecycle
 A task moves through a small set of states: **proposed → queued → claimed**
-(held for evaluation) → **started** (under active work) → **completed**, with an
-**abandoned** terminal path for duplicates and dropped priorities. The two entry
-states are two deliberate operations: to **propose** is to draft a task — its
-concise **goal**, its detailed **goal payload**, the capabilities it **requires**,
-the work it **rejects**, and its other filter attributes — and get back a **task
-id**, *without* making it claimable; to **queue** it moves **proposed → queued**,
-at which point the layer **binds it to an agent whose pool filter accepts it**.
-The **claim→start** gap is then a deliberate **evaluation window**: a worker holds
+(held for evaluation) → **started** (under active work) → **completed** →
+**confirmed**, with an **abandoned** terminal path reachable from any
+non-terminal state for duplicates, dropped priorities, or a completion claim
+that doesn't hold up. The two entry states are two deliberate operations: to
+**propose** is to draft a task — its concise **goal**, its detailed **goal
+payload**, the capabilities it **requires**, the work it **rejects**, and its
+other filter attributes — and get back a **task id**, *without* making it
+claimable; to **queue** it moves **proposed → queued**, at which point the
+layer **binds it to an agent whose pool filter accepts it**. The
+**claim→start** gap is then a deliberate **evaluation window**: a worker holds
 a queued task exclusively while it decides whether to accept, decline (returning it
 with a "not me" so it isn't re-offered the same task), or retire it as a duplicate.
+**completed** is likewise a deliberate gap rather than a true terminal: it is
+the worker's *claim* that the goal is met, and the task only reaches the real
+terminal, **confirmed**, once that claim is corroborated — automatically, by
+an evaluator, for emitter-driven work, or explicitly, by whoever is tracking
+it, for self-tracked work with none (see *verify-the-completion-claim*). A
+completed-but-unconfirmed task may instead be **re-queued** — returning to
+**queued** with its progress and any newly added steering carried forward —
+or **abandoned**, exactly like any other non-terminal task.
 
 ### The recipe — an emitter/evaluator template
 The common **shapes** of long-running agentic work ship with the layer as named,
@@ -154,13 +177,11 @@ reusable **templates** — a recipe is **not a command you run**, it is a
 **template for an emitter/evaluator pair**. You **instantiate** one by
 **registering** a concrete emitter/evaluator pair, made real by the specifics its
 template leaves open: the target repo, the change-review technology, the issue
-backend, the actual machine and account names. Three archetypes are first-class:
+backend, the actual machine and account names. Four archetypes are first-class:
 
-1. **reviewer** — for a given change (a pull request, a branch diff), loop until
-   the change is merged or abandoned: review, post feedback or approve, suspend on
-   a verdict, resume when the change updates or the reviewer must own the merge.
-   The reviewer always has the full target-repo source (a local checkout,
-   container, or codespace) and acts through the repo's own review/merge tools.
+1. **reviewer** — a cooperative, verdict-bearing loop that carries one target
+   change to merge or deliberate abandonment. Its deeper contract lives in the
+   [reviewer-loop child vision](reviewer/README.md).
 2. **conflict-resolution** — for a change some *other* system opened but nobody is
    driving, take the last mile: check out the branch, rebase, resolve conflicts,
    answer review/build state, suspend while updates settle, resume on the next
@@ -169,6 +190,19 @@ backend, the actual machine and account names. Three archetypes are first-class:
    (fix a bug, document a package, reconcile a plan), stay within the goal's
    bounds and drive it through one or more pull requests — handling conflicts and
    review feedback — until the goal is met or abandoned.
+4. **repository-issue-loop** — a goal-driven specialization for an entire
+   backlog rather than one target: triage and drive a bounded, quiet batch of
+   a backlog's items to durable resolution per occurrence, over any backlog
+   reachable through a provider-neutral list/reserve/claim/release surface.
+   Its deeper contract lives in the
+   [repository-issue-loop child vision](repository-issue-loop/README.md).
+
+These archetypes are meant to be *selected and extended*, not recopied. The
+plugin ships named `extends:` bases for the four archetypes above, plus
+ready-made named instantiations such as `backlog-triager`,
+`issue-reproducer`, `effort-builder`, and the repo-local `effort-driver`
+execution lane. A consumer should author a thin declaration against one of
+those shipped bases whenever the shared loop contract already fits.
 
 A consumer **selects and parameterizes** a recipe rather than hand-rolling a loop,
 and may **extend** one where its domain needs more. An instantiated pair knows how
@@ -189,7 +223,30 @@ lifecycle, a standing domain automates a whole cycle without the layer needing a
 bespoke module per domain. The boundary is ownership — a task produced **through an
 emitter** gets that emitter's evaluator run over it automatically; a task
 **proposed and queued by hand, with no emitter behind it**, has no evaluator and is
-**tracked by its caller** (see *emitter-tasks-are-evaluated-mine-are-tracked*).
+**tracked by its caller** (see *emitter-tasks-are-evaluated-mine-are-tracked*). A
+human operator authoring a task **by hand** through the layer's own surfaces —
+not scripting an emitter — is simply the caller in this same sentence: the
+manual path is not a special mode, it is *this* path, walked by a person instead
+of a domain's automation. Closing that loop is what the **monitor** and
+**confirmed** primitives below exist for.
+
+### The monitor — a suspend's resolution handler
+Just as an **evaluator** is the emitter's companion handler for a task's
+*lifecycle*, a **monitor** is a **suspend's** companion handler for a *wait*: it
+names the specific, externally-observable condition that resolves the wait — a
+pull request merged or closed, a check/build run finishing, a scheduled time
+reached, a webhook posted — and it is the thing that actually watches for that
+condition and wakes the worker, rather than the layer trusting an unattended
+idle to eventually get noticed. A monitor is drawn from a **small, known
+vocabulary** of resolvable conditions, the same way a recipe is drawn from a
+small, known vocabulary of loop shapes — a wait is only ever "suspend on
+*this specific, checkable thing*," never "suspend and something will surely
+follow up." This is what makes *hibernate-the-wait*'s promise (no running
+process while parked, resumed the moment its condition resolves) actually
+**collectable** rather than aspirational: the monitor is the concrete
+component making the resolution observable, exactly as the evaluator is the
+concrete component making a lifecycle event actionable. A wait with no
+matching monitor is not suspendable — see *suspension-requires-a-monitor*.
 
 ## Features
 
@@ -242,6 +299,20 @@ A worker reports **progress toward the goal** at meaningful transitions and a
 the live transcript (the coordination layer's *summary-status-is-first-class*,
 seen from the delegation side). A caller or operator surveys the fleet's progress
 at a glance without reading each session.
+
+### durable-attachment-history
+A task's **current** owner session and worktree are only its latest chapter —
+the coordinator also retains a **queryable, append-only history** of every
+session and worktree that has ever attached to it: when each attachment began,
+when (and why) it ended, across every claim, suspend, resume, release, and
+re-embodiment the task lived through. Releasing a task for a fresh embodiment,
+or resuming it after a worker vanished, **never discards** the record of who
+held it before — only the mutable single-slot "current owner" a caller asks
+for by default. A consumer that needs the full lineage (an audit trail, a
+debugging session, a durable link to a specific past attempt) asks for the
+history explicitly; one that only needs "who has it now" is unaffected. This is
+the delegation-side counterpart of *terminal-worktree-reclamation*'s ownership
+bookkeeping — extended from "who owns it now" to "who has ever owned it."
 
 ### terminal-worktree-reclamation
 When the delegation layer causes a worker worktree to be allocated, that
@@ -326,14 +397,88 @@ not a shared runtime.
 
 ### loop-recipes
 The layer ships the **shapes** of long-running agentic work — **reviewer**,
-**conflict-resolution**, **goal-driven** — as reusable **emitter/evaluator
-templates** (see *The recipe*). A domain **instantiates** one by registering a
-concrete emitter/evaluator pair and supplying the specifics (which repo, which
-review technology, which issue backend, which machine and account); the template
-fixes the suspend/resume rhythm and the resolution target for its class of work.
-Extension is expected where a domain needs more, but the default is **reuse**: the
-same template is the engine behind a standing automated service and an on-demand
-instance alike.
+**conflict-resolution**, **goal-driven**, and **repository-issue-loop** — as
+reusable **emitter/evaluator templates** (see *The recipe*), and it ships a
+small named recipe library on top of them. A domain **instantiates** one by
+registering a concrete emitter/evaluator pair or by extending a plugin-shipped
+base, then supplying the specifics (which repo, which review technology, which
+issue backend, which machine and account); the template fixes the
+suspend/resume rhythm and the resolution target for its class of work.
+
+The default is **reuse** rather than repo-local re-derivation. A consumer
+adopts the raw archetype when it needs the bare engine, or selects a thinner
+named specialization when that shared contract already exists — for example
+`backlog-triager`, `issue-reproducer`, and `effort-builder` over the
+forge-backed backlog loop, and `effort-driver` for the distinct repo-local
+active-effort execution lane. Extension is expected where a domain needs more,
+but it extends a shipped base before it reimplements a loop.
+
+### extend-any-declaration
+Extension is not fenced to the plugin's own enumerated recipes: **any**
+already-resolved declaration — built-in or repo-authored, named or
+anonymous, direct or itself extension-derived — is a valid base to extend
+further. A consumer is never limited to the plugin's own archetypes, and
+chaining extension (a repo-local declaration extending a cross-repo one,
+extending a plugin-shipped recipe) is first-class, not a special case.
+
+An extending declaration's override values are not only scalars substituted
+into the base's template fields. A value may itself be a **script path** —
+code the consumer ships — that the **base's own emitter/evaluator engine
+invokes at a declared extension point** (a selection rule, a per-item
+filter, a verdict-application hook) instead of the declaration
+reimplementing the engine's loop shape from scratch. The base keeps
+ownership of the loop, the schedule, the suspend/resume rhythm, and the
+**contract** each hook must satisfy (what it receives, what it must return);
+the script owns only the domain-specific decision at that one point. This is
+what makes a genuinely new domain (a consumer polling its own internal
+state, not a forge) adoptable through extension instead of a wholly bespoke
+emitter.
+
+Extension is still optional, never mandatory: a domain whose shape fits no
+existing base, or one unwilling to be fenced by a base's loop contract,
+provides its **own full emitter and evaluator** directly (a direct
+`kind:`-only declaration, no extension at all) — the same no-template path
+that exists today. Extension is the preferred route *when* a close-enough
+base exists, never the only route.
+
+### concise-event-then-charter-pull
+The seed handed to a freshly embodied worker is a **short, event-classified
+notification**, not an inlined instructional essay. A recipe already knows the
+shape of the event it just produced a task for — new work assigned, a submitter
+update landed, a steer answer arrived — and states exactly that ("New bug work
+assigned.", "Assigned PR has updates from the submitter.") plus **one command**
+that resolves the worker's **full charter**: the task's goal, payload, policy,
+and behavioral contract, fetched on demand rather than paid for on every
+embodiment regardless of whether the worker ever needs all of it. This keeps the
+per-embodiment token cost proportional to the event, while the charter command
+itself remains the single, authoritative source the worker actually reads from.
+
+### preloaded-dispatch-supplement
+A worker's declared identity (*declarative-worker-identity*, repository-issue-loop
+child vision) carries the generic "how to behave as a dispatch worker"
+instruction supplement **by reference**, already loaded when the identity is
+selected — claim/evaluate/complete mechanics, decline/exclusion conventions,
+suspend-and-resume discipline. A worker never spends a tool call rediscovering
+this supplement per task; it is preloaded exactly once, by identity, and only
+the event-specific charter is fetched per embodiment (*concise-event-then-charter-pull*).
+Domain-specific policy still lives in the identity's own instructions, layered
+on top of the shared supplement rather than duplicating it.
+
+### reachability-tiered-charter-delivery
+*concise-event-then-charter-pull* assumes the worker can run the pull command
+itself. A worker without direct reach to agent-dispatch — a Codespace, a
+container, a genuinely different machine, or a cross-repo agent with no prior
+knowledge of this layer at all — cannot fetch a charter it cannot request, so
+the same short-event-plus-pull default silently fails for it. Such a worker
+instead needs its full operating procedure delivered inline (never assumed
+pre-known) **and** an explicit, concrete channel for issuing the structured
+status/lifecycle calls this layer requires (*status-through-tool-calls-not-prose*)
+without local CLI access — the existing SSH-to-origin relay a fleet body
+already uses (*cross-machine-federation*) is one instance of this, not the
+only one. Which tier a given worker falls into is a property of its
+reachability, not its role: a supervised headless worker and a supervised
+interactive one may each be in either tier depending on where they actually
+run.
 
 ### side-load-through-an-emitter
 A **registered emitter can be triggered on demand**, not only by its native event
@@ -376,6 +521,19 @@ request handed to it on demand — and either way it authors the task and its
 evaluator owns the follow-through. Direct **propose + queue** with no emitter stays
 available; that simply keeps the lifecycle responsibility with the caller
 (*emitter-tasks-are-evaluated-mine-are-tracked*).
+
+### emitter-command-receipts
+Authoring a task through an emitter is **not a one-way shout into the queue**: the
+domain's own backing state (a carved reservation, a tracked work item) often needs
+to know *which* dispatch task its own emitted description became, so it can close
+its own transaction (link an id, stop re-offering the same work). An emitter
+command-emitter gets **durable receipts** for exactly the tasks it caused to be
+created — keyed by the same `dedup_key` it emitted — readable on a **later**
+invocation, not just observed in the instant of creation and then lost. This is
+what makes *emitters-and-evaluators* a genuine two-way seam for a domain data
+source: the domain polls in (discovers and emits), and the layer hands back what
+became of it, so the domain never has to invent its own per-domain
+polling-by-dedup-key reconciliation just to learn an id it itself caused to exist.
 
 ### bounded-concurrency-wide-charters
 The pool of concurrently embodied workers is **capped** — a deliberate ceiling
@@ -467,6 +625,51 @@ exactly as it would a declaration authored by any other means. The declaration
 *is* the registration; there is **no second, in-memory registry** standing beside
 the files (*no-second-store*, applied to supervision).
 
+A pointer's **provenance** must be a repo's or system's **registered name**, never
+a raw filesystem path (or anything derived from one, like a directory's basename).
+The agent-fabric-wide
+[*identity-resolves-by-name-not-path*](../../plugin-services/README.md#identity-resolves-by-name-not-path)
+guarantee applies here directly: a pointer records *where to look today*, but the
+**identity** that names it must come from the registered repo name (resolved
+through the repo's owning registry, e.g. agent-worktrees), never be inferred from
+the path itself. A worktree checkout's directory name is per-session and
+per-machine; deriving a pointer's owner from it stamps every declaration
+discovered there with a throwaway identity that never reconciles with the next
+one, so declared registrations accumulate without bound instead of converging —
+the exact failure #2417 diagnosed and fixed.
+
+### cross-machine-federation
+A coordinator is **opt-in federatable**: a node declares a role
+(`peer`/`coordinator`/`standby`/`satellite`) and a background runner keeps it
+present in a **directory** other instances discover through, funneling the
+claim plane through a **single, fenced-epoch coordinator** rather than a full
+peer mesh or a leader election — single-user federation has no Byzantine
+actors, so crash/partition tolerance plus dedup suffice. The directory is
+reached over a pluggable **rendezvous** (a hosted coordinator's own directory,
+or a single-user relay such as Dev Tunnels), so the same federation logic
+runs identically over either substrate. A `satellite` is the most-constrained
+role: it registers itself outbound, is never selected as coordinator/standby,
+and is reachable only through work queued for it to pull — never a general
+inbound control surface. Federation is never required for a lone install to
+work: with no role configured, a coordinator behaves exactly as it always
+has, consistent with this fabric's à la carte install principle.
+
+### satellite-status-is-pushed-not-polled-and-gated-closed
+A satellite additionally publishes its **own live embodiment status**
+(worktrees + activity) on every heartbeat, sourced only from that machine's
+own local session list — never an inbound reach, never anything read *from*
+another machine. Two properties keep this trustworthy and inert by default.
+First, the pushed status must reflect **what's actually live right now**: a
+resumable-but-stopped session, a session whose transport has disconnected, or
+a stale duplicate row for an already-seen worktree must never be reported as
+an active embodiment — a satellite's fleet-wide status is a stronger claim
+than a purely local, best-effort display overlay, so it earns stricter
+filtering. Second, exposure is **default-closed**: a configured `satellite`
+role never registers, heartbeats, or reads local sessions until an operator
+explicitly opens its gate, and it withdraws on the very next tick if the gate
+closes mid-session — a satellite offers nothing back to the fleet merely
+because the capability exists, only when the operator has said so.
+
 ## Behaviors
 
 ### focus-is-an-early-signal-not-a-heartbeat
@@ -545,7 +748,38 @@ rather than silently accepted, so a worker that declares done without doing the
 work cannot quietly close a goal. This is *complete-means-done* made defensive:
 the worker still self-judges completion, but a goal's closure is corroborated, not
 assumed. (A plain one-shot task with no goal keeps the simple deferred-completion
-contract.)
+contract.) Corroboration is what turns **completed** into **confirmed**
+(*The lifecycle*): for emitter-driven work the evaluator runs this check
+automatically the moment completion is asserted; for **self-tracked** work with
+no evaluator, there is nothing else to run it — the caller tracking the task
+*is* the verifier, and a completed-but-unconfirmed self-tracked task sits
+waiting for exactly that person's review. Reviewing is one of three honest
+acts, never a fourth silent one: **confirm** it (the claim holds, close as
+confirmed), **re-queue** it (the claim doesn't hold, or more is wanted — back
+to queued, progress and any newly given steering carried forward), or
+**abandon** it (the claim doesn't matter anymore). Leaving it unreviewed
+indefinitely is a legitimate resting state — see *self-tracked-review-is-not-a-lane*
+— not a silent default that quietly counts as done.
+
+The explicit switch for which path a task takes is `require_verification`.
+When it is **false** (the default), the worker's `complete()` call performs
+the assertion and the caller-self-attested corroboration together: the task
+lands at `submitted` internally and is immediately confirmed in the same
+atomic transition, because in this path the caller tracking the task really
+*is* the verifier. When `require_verification` is **true**, `complete()`
+stops at `submitted` only and the task stays there until an evaluator or a
+manual reviewer explicitly **confirm**/**re-queue**/**abandon**s it. The
+existing prose above still governs *who* the verifier is; the flag makes the
+two routes first-class instead of leaving the self-attested one implicit.
+
+### self-tracked-review-is-not-a-lane
+A **completed-but-unconfirmed** task holds no lane and blocks no pool slot —
+the worker that completed it has already finished and released its claim; only
+the *review* remains outstanding, and review is a caller act, not agent work.
+An arbitrary backlog of unconfirmed completions may sit for as long as the
+caller needs before being confirmed, re-queued, or abandoned, exactly the way
+a *queued*, not-yet-embodied task may sit before a worker binds to it — waiting
+for review is cheap, unlike waiting for a worker.
 
 ### resume-the-goal-not-restart-it
 When a worker owning a goal-bearing task is confirmed gone (*liveness-not-lease*),
@@ -571,6 +805,16 @@ declares death. This is the graduated complement of *liveness-not-lease*: a
 slow-but-working worker is left alone, a quiet-but-live worker is prodded, and only
 a truly absent worker is replaced.
 
+**This entire ladder is scoped to bodies agent-dispatch itself spawned** (a
+spawn reservation exists) — never to an operator's own interactively-driven
+CLI session that happens to claim a task. A human driving their own session
+has no reservation behind that claim, so there is nothing for the recovery
+apparatus to nudge, monitor, or terminate; agent-dispatch only ever updates
+its own bookkeeping (the assignment mapping) to reflect that the task is now
+owned by that session. The distinction is structural, not a policy check to
+remember: recovery acts on a *reservation*, and a human's own claim never
+creates one.
+
 ### react-to-turn-end
 Supervision advances on the **worker's turn boundary, not only on a timer**. When
 the coordination layer exposes a worker's turn signal, the layer reacts to an
@@ -583,8 +827,85 @@ periodic reconcile remains the **floor** that catches missed signals, workers wh
 turn stream is unavailable, and workers with no live session at all. Correctness
 never depends on receiving a turn signal — only *promptness* improves — and the
 loop **degrades cleanly** to exactly the periodic reconcile where no turn signal is
-observable. *Which* signal (a raw event subscription, a derived turn-state sample)
-carries the turn boundary is spec-level, not fixed here.
+observable. A turn boundary is delivered by a cursor-based push subscription over
+a persistent shared carrier; repeated state sampling, especially per-owner SSH
+polling, is not event-driven supervision and is never an acceptable substitute.
+
+### suspend-idle-resume-same-session
+A headless worker that settles a turn without completing its task is
+**suspended, not replaced**. Supervision records the idle boundary, gracefully
+stops the Copilot process to release capacity, and retains the task owner,
+session handle, worktree, progress, and pending steering as one cold assignment.
+The next Resume or steer reattaches that exact ACP session in the same worktree;
+ordinary payload, revision, or target movement never creates a replacement
+session or workspace. Only confirmed context exhaustion permits an explicit
+handoff to a successor session within the same task/worktree lineage.
+
+### suspension-requires-a-monitor
+Settling a turn without completing is not, by itself, a **wait** — it is only
+ever legitimately parked cost-free (*hibernate-the-wait*) when a registered
+**monitor** (*The monitor*) recognizes the specific condition the worker is
+waiting on. A worker that settles a turn with unfinished work and states **no**
+monitored wait has not suspended in the sense this layer means: supervision
+still cold-parks the *session* (*suspend-idle-resume-same-session* is a
+process-lifecycle mechanism, not a verdict on the task), but the *task* is
+treated as a **stall**, not a legitimate hold — it falls straight into
+*nudge-before-recover*'s ladder like any other quiet-but-live worker, promptly
+nudged rather than left to sit indefinitely as if something were watching it.
+This is the line between "waiting on an externality" (a monitor-backed wait,
+free of charge, genuinely watched) and an implicit "end of turn" masquerading
+as one (an unmonitored idle nobody is actually watching) — a worker always has
+a named next act: keep working, **complete** (splitting remaining scope into a
+follow-up task if needed), **suspend** against a stated, monitored wait, or
+**abandon**. Falling silent with none of those is never a fourth option.
+
+### status-through-tool-calls-not-prose
+agent-dispatch is a **programmatic controller**, not a conversational partner:
+it acts on structured `agent-dispatch` commands, never on unstructured
+turn-ending prose. Every routine status change a worker reports — progress, a
+decline, a completion, a blocker — goes through the matching command
+(`progress`, `yield`, `complete`, a steering card), never a bare-prose turn end
+the layer has no way to read. This is the hard line between a dispatch-owned
+worker and an **agent-bridge-steered companion**: a companion's controlling
+agent is a live reader, so ending a turn on an open question is a legitimate
+answer *to that agent*; a dispatch worker has no such reader, so its only
+sanctioned way to ask something is a steering card, never a prose question
+nobody is watching for.
+
+### every-turn-ends-terminal-steered-or-waited
+A worker's turn never simply stops. It ends in exactly one of three states: a
+**terminal or lifecycle transition** (complete, abandon, yield, suspend
+against a monitor), a **steering card** that durably marks the task
+`awaiting_steer` (a card with no `--request-input` form never blocks the task
+and silently drops out of tracking — this is required, not optional), or an
+established **task-aware waiter/resume contract** a cold headless body can
+continue from (never a bare worktree-only nudge). Falling silent with none of
+those is never a fourth option — the same rule *suspension-requires-a-monitor*
+states for an unmonitored idle applies identically to a plain unstructured
+stop.
+
+### fail-fast-on-control-plane-failure
+A worker that cannot reach agent-dispatch — every status/lifecycle command
+failing, or the connection lost outright — does not treat that as its own
+problem to diagnose. It does not reinstall tooling, repair permissions, or
+debug the network on its own initiative **unless doing exactly that is the
+literal charter of the task at hand**. It stops immediately and fails loud: a
+single, clear, turn-ending statement of exactly what failed and what it was
+doing — the one sanctioned exception to *status-through-tool-calls-not-prose*,
+because there is no command left to make. This is the worker-side half of the
+crash-recovery contract; the layer's own honest acknowledgment of a
+control-plane death it caused is the coordinator-side half.
+
+### declared-safety-exceptions-not-improvised
+A task likely to run into a safety boundary its worker's normal
+fully-autonomous charter does not already cover — elevated permissions,
+production access, an irreversible action — states that exception **up
+front**, in its own prompt/goal, so a steering card raised there is a
+sanctioned pause the worker recognizes, not an improvisation. Without that
+upfront declaration, an unexpected safety boundary gets the same posture as
+*fail-fast-on-control-plane-failure*: stop, do not attempt to route around it
+or resolve it unilaterally, and say so plainly — never open a card the task
+never invited.
 
 ### repo-lane-isolation
 Every task belongs to the **repo lane** of the agent that produced it, and the
@@ -674,8 +995,9 @@ with no matching emitter, hand-authors a task by **propose + queue**) and the
 and its evaluator advances the work across events. The service tier is how
 *recurring* or *at-scale* work is automated; it is never a precondition for running
 a single loop. The minimum viable deployment is a **coordinator plus a worker
-body**, so the reviewer, conflict-resolution, and goal-driven templates are equally
-available to a full automated deployment and to a bare host that has none of it.
+body**, so the reviewer, conflict-resolution, goal-driven, and
+repository-issue-loop templates are equally available to a full automated
+deployment and to a bare host that has none of it.
 
 ### supervise-registers-and-returns
 Registering supervised work **adds the registration and completes**, emitting the
@@ -750,11 +1072,23 @@ does **not** quietly undo it.
   names, transport, storage engine, on-disk format, endpoints, or command
   grammar. Binding detail of that kind belongs to the reality docs or a future
   `specifications` layer.
+- **Not a fixed monitor taxonomy.** This vision does not enumerate the closed
+  set of monitor kinds a deployment ships (which webhook shapes, which CI
+  providers, which schedule grammar) — that catalog is reality-doc detail; the
+  vision fixes only that a monitor must name a specific, checkable condition.
 
 ## See Also
 
 - Parent vision: [agent-fabric](../../agent-fabric/README.md) — §Concepts/
   *agent-dispatch — the delegation layer*.
+- Child leaf: [reviewer loops](reviewer/README.md) — the cooperative reviewer
+  archetype's identity, verdict, reuse, and reliability contract.
+- Child leaf: [repository-issue-loops](repository-issue-loop/README.md) — the
+  backlog-batch archetype's declarative adoption, provider-neutral capability,
+  and declarative worker-identity contract.
+- Child leaf: [Tasks-pane UX](tasks-pane-ux/README.md) — the operator surface
+  that realizes manual, no-emitter task authoring and the completed→confirmed
+  review loop (*New Task* composer, *Completion Review* card).
 - Sibling leaf: [agent-ssh](../agent-ssh/README.md) — the connectivity layer this
   layer's cross-machine reach rides on.
 - Consumer: [agent-logger](../agent-logger/README.md) — the **chronicler**, a
@@ -762,9 +1096,121 @@ does **not** quietly undo it.
   tasks on this layer's mesh.
 - Reality docs: [`docs/architecture.md`](../../../docs/architecture.md) · the
   `plugins/agent-dispatch/` skills (`agent-dispatch`, `pick-and-claim`).
+- Realization effort:
+  [`efforts/active/declarative-dispatch-engine-generalization/`](../../../efforts/active/declarative-dispatch-engine-generalization/)
+  owns *concise-event-then-charter-pull* and *preloaded-dispatch-supplement*.
+- Realization effort:
+  [`efforts/active/agent-dispatch-worker-operating-procedures/`](../../../efforts/active/agent-dispatch-worker-operating-procedures/)
+  realizes *status-through-tool-calls-not-prose*,
+  *every-turn-ends-terminal-steered-or-waited*,
+  *fail-fast-on-control-plane-failure*,
+  *declared-safety-exceptions-not-improvised*, and
+  *reachability-tiered-charter-delivery* — the operating-procedures charter;
+  the shrunk event-descriptor seeds for the CLI-capable and interactive
+  tiers, each pointing at the charter rather than inlining it; the no-CLI
+  tier's full operating procedure and task charter inlined directly instead
+  (it cannot pull what it has no reach to fetch — the tiered-delivery
+  contract itself, not a shrunk seed); and a clean-room Tier-E behavioral
+  proof (`agent-dispatch-worker-lifecycle-eval` / `-cpfail`) that a fresh agent
+  actually honors the mechanical, tool-call-only completion contract and the
+  fail-fast-on-control-plane-failure posture under literal mode.
+- Realization effort:
+  [`efforts/active/agent-dispatch-recipe-composability/`](../../../efforts/active/agent-dispatch-recipe-composability/)
+  realizes *extend-any-declaration*, building on
+  `agent-dispatch-recipe-library`'s `extends:` mechanism.
 
 ## Provenance
 
+- **2026-10-02** — Added *extend-any-declaration*: generalizes the
+  plugin-shipped `extends:` mechanism (which today only resolves against a
+  small set of named, plugin-shipped recipes, with scalar-only override
+  values) to let any already-resolved declaration serve as an extension
+  base, and to let an override value name a script path the base's own
+  engine invokes at a declared extension point. Surfaced by a private
+  cross-repo motivating consumer needing to poll its own internal REST API
+  for pending work items and convert results into dispatch tasks — a shape
+  no existing recipe fits, previously forcing a wholly bespoke
+  `command:`-backed emitter with no shared loop contract. Tracked by
+  `efforts/active/agent-dispatch-recipe-composability` (issue #4959);
+  builds on, rather than replaces, `agent-dispatch-recipe-library`'s
+  `extends:` resolution mechanism. Implementation not yet landed by this
+  revision.
+- **2026-09-30** — Added *emitter-command-receipts*: a command-emitter that
+  authors tasks via `task_output=json` already computes the created-task
+  list (dedup_key -> real task id) every tick, but it was never durably
+  delivered back to the domain command on a later invocation. Surfaced by a
+  cross-repo motivating consumer (a private downstream repository's own
+  durable-record workflow, migrating off a bespoke push+poll dispatch
+  mechanism onto this layer's emitter/evaluator primitives) that needs to
+  link a discovered work item to the dispatch task it caused to exist. Tracked by
+  `efforts/active/agent-dispatch-emitter-receipts`; implementation not yet
+  landed by this revision.
+- **2026-09-26** — Added *status-through-tool-calls-not-prose*,
+  *every-turn-ends-terminal-steered-or-waited*,
+  *fail-fast-on-control-plane-failure*, *declared-safety-exceptions-not-improvised*,
+  and *reachability-tiered-charter-delivery*. Mined from a prompt-sweep
+  rubber-duck review that found the layer's initial/follow-up/nudge prompts
+  had drifted into two incompatible seed-builders (a thin one silently
+  missing the evaluation/goal-loop guardrails, reached whenever the rich
+  path's dependency was unavailable) with no single canonical statement of
+  *why* those guardrails exist. Clarifies the hard line between a
+  dispatch-owned worker (programmatic controller; status only through
+  structured commands) and an agent-bridge-steered companion (a live reader;
+  ordinary turn-ending prose is a legitimate answer) that *Not the
+  live-conversation layer* already implied but never stated from the
+  worker's side; canonicalizes the "every turn ends terminal, steered, or
+  waited" rule a single recipe prompt already enforced ad hoc; and names two
+  previously-undeclared failure postures (an unreachable control plane, an
+  undeclared safety boundary) that both resolve to the same "stop, don't
+  improvise, say so plainly" posture. *reachability-tiered-charter-delivery*
+  extends *concise-event-then-charter-pull*/*preloaded-dispatch-supplement*
+  to a worker that cannot run the pull command at all. Implementation
+  (the actual prompt/charter-doc restructuring) is carried by a tracked
+  effort, not this revision.
+- **2026-09-25** — Added **the monitor** (a suspend's companion resolution
+  handler, paired with the evaluator) and **confirmed** as the true lifecycle
+  terminal beyond a provisional **completed** (*verify-the-completion-claim*
+  extended, *self-tracked-review-is-not-a-lane*, *suspension-requires-a-monitor*).
+  Mined from an operator observation that an external, simpler force-fed
+  task-queue wrapper was somehow proving *more* reliable than this layer's own
+  richer machinery: its workers never suspend at all (they run to completion
+  or die), so it never accumulates the failure modes this revision closes —
+  a stalled "end of turn" masquerading as a legitimate wait, and a queue that
+  can't tell "the worker finished" from "the worker's claim was ever checked."
+  The fix generalizes rather than removing the richer machinery: suspension
+  stays available, but only for a *named, watched* wait; and self-tracked
+  completion (the default for hand-authored, no-emitter work) gets an actual
+  closing act instead of silently counting a claim as done.
+- **2026-09-21** — Added *cross-machine-federation* and
+  *satellite-status-is-pushed-not-polled-and-gated-closed*: retroactive
+  reconciliation for the opt-in federation runtime (rendezvous discovery,
+  fenced-epoch coordinator lease, pluggable Gateway/Dev-Tunnels backends) and
+  the satellite exposure gate + embodiment-status push, both already shipped
+  via the `agent-dispatch-federation` effort's Phases 1-4 but never
+  previously cited here. Below-altitude for the shipped mechanism itself (it
+  already matches the intent stated); vision-extending for the satellite's
+  default-closed exposure gate and its stricter live-status filtering, which
+  had no prior vision coverage in this repo.
+- **2026-09-19** — Added *durable-attachment-history*: a task's queryable
+  history of every session/worktree that has ever attached to it, distinct
+  from its mutable current-owner fields. Prompted by a stuck-review incident
+  (private-downstream-repo, Intelligence Dampener) where releasing a task for a fresh
+  embodiment twice discarded the prior sessions' identities entirely, and by
+  a would-be consumer (a Dampener UI link) reaching for a bespoke,
+  per-consumer naming convention instead of a shared resolution primitive
+  because no durable history existed to resolve through.
+- **2026-09-05** — Extracted the repository-issue-loop archetype's declarative
+  adoption, provider-neutral capability, and declarative worker-identity intent
+  into its own child vision, as a fourth named archetype alongside reviewer,
+  conflict-resolution, and goal-driven. Also added *concise-event-then-charter-pull*
+  and *preloaded-dispatch-supplement*: the per-embodiment seed should be a
+  short event notification plus a charter-pull command, not an inlined
+  instructional essay, and the generic "how to behave as a dispatch worker"
+  supplement belongs on the worker identity, loaded once, not rediscovered
+  per task.
+- **2026-09-02** — Promoted this vision from leaf to branch and moved the
+  reviewer archetype's cooperative identity, session-reuse, verdict, declarative
+  adoption, and bounded-reliability intent into the reviewer child vision.
 - **2026-08-31** — Added *terminal-worktree-reclamation* and
   *allocator-reclaims-what-it-creates*: terminal task settlement must not leave
   supervisor-created worktrees registered indefinitely. The producer decides
@@ -903,7 +1349,8 @@ does **not** quietly undo it.
   *layered on* the *liveness-not-lease* periodic reconcile (which stays the correctness
   floor and the degrade-clean fallback), so a completed goal is settled and the next
   task embodied without waiting out an interval. The signal carrying the turn boundary
-  (raw event subscription vs derived turn-state sample) is left spec-level. Mined from
+  is a cursor-based push subscription; repeated derived-state sampling does not satisfy
+  this behavior. Mined from
   the operator's "reactive-on-turn-end" steer as the fourth full-auto piece.
   Mined from an operator design conversation refining the recovery flow (heartbeat +
   state payloads → verify-or-mitigate on a bad "done" → nudge/re-embody on a stalled
@@ -936,3 +1383,13 @@ does **not** quietly undo it.
   overlapping work, and that concurrency is **capped** while charters stay wide.
   Mirrors the intent captured in the downstream fabric vision from the operator's
   loop-recipe design conversation; the implementing work then closes this delta.
+- **2026-09-10** — Clarified the scope of *nudge-before-recover*: the graduated
+  recovery ladder (nudge alive-but-quiet, re-embody confirmed-gone) is scoped to
+  bodies agent-dispatch itself spawned (a spawn reservation exists) and never
+  applies to an operator's own interactively-driven CLI session. The distinction
+  is structural (recovery acts on a reservation; a human's own claim never
+  creates one), not a policy check a future implementation could forget. Mined
+  from an operator design-review conversation on this effort's Phase 9
+  (`review-automation-reliability`, `phase-9-state-machine-architecture.md`),
+  which also produced the reservation/allocation-fencing coupling now declared
+  in that phase's sub-doc.

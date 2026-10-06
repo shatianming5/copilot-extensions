@@ -27,9 +27,6 @@ The daemon advertises both on ``/health``; ``BridgeClient`` reads them (see
 
 from __future__ import annotations
 
-# Current HTTP wire-contract version this build speaks.
-HTTP_PROTOCOL_VERSION = 6
-
 # First version that exposes the harness-owned relay interruption capability.
 RELAY_INTERRUPT_PROTOCOL_VERSION = 2
 
@@ -48,6 +45,96 @@ MACHINE_METADATA_PROTOCOL_VERSION = 5
 # First version that exposes bounded delegated-result snapshots and opaque
 # cursor-neutral result positions.
 RESULT_SNAPSHOT_PROTOCOL_VERSION = 6
+
+# First version that projects represented interactive sessions through the
+# bounded result snapshot shape.
+REPRESENTED_RESULT_SNAPSHOT_PROTOCOL_VERSION = 7
+
+# First version that reports provider-target refresh failures consistently
+# across direct session and worktree resume surfaces.
+PROVIDER_TARGET_REFRESH_PROTOCOL_VERSION = 8
+
+# First version that projects completed ACP turns as at rest on read surfaces.
+AT_REST_PROJECTION_PROTOCOL_VERSION = 9
+
+# First version that exposes cursor-neutral attention evaluation and waits.
+ATTENTION_WAIT_PROTOCOL_VERSION = 10
+
+# First version that exposes authenticated remote Bridge carrier operations.
+REMOTE_OPERATIONS_PROTOCOL_VERSION = 11
+
+# Carrier-backed mutating remote commands (create, stop/end, and live delivery).
+REMOTE_COMMANDS_PROTOCOL_VERSION = 14
+
+# First version that atomically ends a session only while it remains idle.
+CONDITIONAL_IDLE_END_PROTOCOL_VERSION = 12
+
+# First version that exposes one aggregate SSE connection for a caller's set of
+# remote carrier subscriptions.
+REMOTE_EVENT_MULTIPLEX_PROTOCOL_VERSION = 13
+
+# First version that exposes GET /api/v1/dispatch-tasks/{id}/session --
+# resolving an agent-dispatch task reference to its associated bridge session
+# (agent-dispatch-session-worktree-history Phase 2, resolve-by-any-origin-
+# reference).
+DISPATCH_TASK_SESSION_PROTOCOL_VERSION = 15
+
+# Generation 16: POST /api/v1/sessions no longer honors a "reclaim" request
+# field (agent-bridge-cold-resume Phase 3, #6744) -- create's own session-
+# lifecycle head-guard bypass was removed; the sole take-over primitive left
+# is POST /worktrees/{id}/resume?reclaim=true. No new capability constant is
+# exported for this (nothing to *gain*-detect) -- the generation bump alone
+# signals the behavior change to a version-aware client.
+
+# First version that exposes a bare (non-worktree-scoped) session transcript
+# route -- GET /api/v1/sessions/{id}/transcript -- letting a solo session
+# (one with no worktree_id) retire a direct archival-provider dependency in
+# favor of agent-bridge's own cold-store fallback (a downstream consumer's
+# session-worktree-archive-linkout Phase 2d follow-up).
+BARE_SESSION_TRANSCRIPT_PROTOCOL_VERSION = 17
+
+# First version whose remote fleet-carrier session.create request honors an
+# optional copilot_args field (a charter-overlay --agent <charter> pass
+# -through, mirroring BridgeClient.start_session's own copilot_args). Lets a
+# newer agent-dispatch caller detect the capability and refuse cleanly rather
+# than silently losing a requested charter against an older daemon.
+REMOTE_SESSION_COPILOT_ARGS_PROTOCOL_VERSION = 18
+
+# First version that exposes a represented live session's mode change
+# (``POST /live-sessions/{id}/mode``) and its extension-side control poll
+# (``/controls``, ``/controls/ack``). A caller gates ``/mode`` on it rather than
+# posting to an older daemon that would 404.
+LIVE_SESSION_MODE_PROTOCOL_VERSION = 19
+
+# First version whose CLI-mode reservation release route honors
+# ``unclaimed_only=true`` atomically in the DELETE predicate. A caller gates on
+# it rather than sending the parameter to an older daemon that would ignore it
+# and delete an already-claimed reservation.
+CLI_MODE_UNCLAIMED_RELEASE_PROTOCOL_VERSION = 20
+
+# First version that forwards a retired live-session id (a resume renamed the
+# session) to its current registration: messages, controls, events and result
+# tokens sent through the old handle reach the resumed session. A caller holding
+# a pre-rename handle gates on it; an older daemon rejects the old id instead.
+LIVE_SESSION_ALIAS_PROTOCOL_VERSION = 21
+
+# First version whose GET /api/v1/agents honors the ``force_refresh`` and
+# ``require_complete`` query parameters (pivot-streaming-transport Phase 3b:
+# the agent-roster daemon-side background cache). Both are real request
+# parameters with server behavior -- not an additive, tolerant-reader
+# response field -- so a caller gates sending either on this rather than
+# blind-sending them to an older daemon, which would silently ignore an
+# unrecognized ``require_complete=true`` and still return its own old-shape
+# response (harmless: the new client degrades to treating that ``200`` the
+# same way it always has). Reverse skew (an old CLI never sending either
+# parameter, talking to a new cached daemon) needs no gate at all -- the
+# cache's own opportunistic single-flight refresh on any incomplete/
+# uninitialized/stale namespace still fires for a plain, unparameterized GET.
+AGENT_ROSTER_CACHE_PROTOCOL_VERSION = 22
+
+# Current HTTP wire-contract version this build speaks -- bumped alongside the
+# constant just above it.
+HTTP_PROTOCOL_VERSION = 22
 
 # Oldest client HTTP-contract version this daemon still serves (the low end of
 # the supported range). Only ever raised after a deprecation window.

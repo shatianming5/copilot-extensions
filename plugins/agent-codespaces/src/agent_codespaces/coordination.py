@@ -8,21 +8,20 @@ imports ``agent_worktrees``, so it *shells* the binstub (the same loose-coupling
 seam as ``resolve_owner_worktree``).
 
 **Degrade-safe by construction.** When the ``agent-worktrees`` binstub is absent,
-the ``lease`` verb is unavailable, or no store origin is configured, L2 is
-treated as **UNAVAILABLE** and the caller falls back to L1-only (today's
-behavior). Only a *definitive* lease conflict (exit 3) blocks a claim. This keeps
-same-box behavior identical when the cross-machine store is not wired.
+older than the versioned coordination preflight, malformed, or otherwise
+unavailable, the caller falls back to standalone L1 behavior. A compatible
+preflight that explicitly rejects state-root binding blocks before any local
+claim or provider work. A definitive lease conflict also blocks.
 
 Holder identity is the qualified ClaimRef (``machine/project/worktree_id
 [#session]``) obtained from ``agent-worktrees get owner-ref`` -- the same
 identity ``claimant`` liveness resolves, so the fencing token (atomic acquire)
 and the holder ref (cross-machine liveness for stale takeover) compose.
 
-The store origin follows ``agent-worktrees lease``'s own resolution (the project
-remote, overridable via ``AGENT_WORKTREES_LEASE_ORIGIN`` / ``--origin``). Pin it
-to the harness control-plane repo via that env to coordinate *all* harness agents
-regardless of project; unset, agents coordinate per-project (the common
-same-project, cross-machine CodeSpace case).
+New agent-worktrees-owned operations first query the owner's project-scoped
+coordination readiness. The lease command then resolves the bound state
+repository; an explicit origin can identify that same repository but cannot
+bypass a required binding.
 """
 
 from __future__ import annotations
@@ -41,6 +40,12 @@ log = logging.getLogger("agent-codespaces")
 #: Exit codes from ``agent-worktrees lease`` (see lease_cli.run_lease).
 _EXIT_OK = 0
 _EXIT_CONFLICT = 3  # LeaseConflict / LeaseLost
+_EXIT_COORDINATION_REJECTED = 5
+_PREFLIGHT_VERSION = 1
+_PREFLIGHT_REJECTION_CODES = frozenset({
+    "knowledge_binding_required",
+    "state_root_resolution_failed",
+})
 
 #: The resource kind used for CodeSpace leases in the shared namespace.
 KIND = "codespace"
@@ -74,10 +79,8 @@ DEFAULT_CLEAN_TTL = 6 * 3600
 class L2Result:
     """Outcome of an L2 (cross-machine) lease operation.
 
-    ``status`` is one of ``"ok"`` (the op succeeded; ``token`` is the current
-    fencing token), ``"conflict"`` (a live lease is held by another holder;
-    ``holder`` names it), or ``"unavailable"`` (L2 is not wired / not reachable
-    -- the caller degrades to L1-only).
+    ``status`` is ``"ok"``, ``"conflict"``, ``"rejected"`` (a compatible
+    coordination preflight denied new ownership), or ``"unavailable"``.
     """
 
     status: str
@@ -96,6 +99,31 @@ class L2Result:
     @property
     def unavailable(self) -> bool:
         return self.status == "unavailable"
+
+    @property
+    def rejected(self) -> bool:
+        return self.status == "rejected"
+
+
+@dataclass(frozen=True)
+class PreflightResult:
+    """Versioned optional-peer readiness result."""
+
+    status: str
+    code: str = ""
+    detail: str = ""
+
+    @property
+    def ready(self) -> bool:
+        return self.status == "ready"
+
+    @property
+    def rejected(self) -> bool:
+        return self.status == "rejected"
+
+    @property
+    def absent(self) -> bool:
+        return self.status == "absent"
 
 
 @dataclass
@@ -117,7 +145,7 @@ class L2Lease:
 
 
 def _aw() -> str | None:
-    return shutil.which("agent-worktrees")
+    return shutil.which("agent-worktrees")  # marketplace-isolation: allow _run uses this only without explicit installation context
 
 
 def _creationflags() -> int:
@@ -126,6 +154,10 @@ def _creationflags() -> int:
 
 def _run(args: list[str], *, timeout: float = 45.0) -> subprocess.CompletedProcess[str] | None:
     """Run ``agent-worktrees <args>``; return the process, or None if unrunnable."""
+    from . import worktrees
+
+    if worktrees.explicit_context():
+        return worktrees.run(*args, timeout=timeout)
     aw = _aw()
     if not aw:
         return None
@@ -151,6 +183,9 @@ def owner_ref(explicit: str | None = None, session_id: str | None = None) -> str
     Returns None when unresolvable -- the caller then skips L2 (degrade-safe),
     preserving L1-only behavior.
     """
+    from .worktrees import validate_context
+
+    validate_context()
     if explicit and explicit.strip():
         return explicit.strip()
     ambient = os.environ.get("AGENT_WORKTREES_OWNER_REF")
@@ -163,6 +198,111 @@ def owner_ref(explicit: str | None = None, session_id: str | None = None) -> str
     if proc is None or proc.returncode != 0:
         return None
     return proc.stdout.strip() or None
+
+
+def _owner_project(holder_ref: str) -> str | None:
+    base = (holder_ref or "").split("#", 1)[0]
+    parts = base.split("/")
+    if len(parts) != 3 or any(not part.strip() for part in parts):
+        return None
+    return parts[1].strip()
+
+
+def preflight(holder_ref: str) -> PreflightResult:
+    """Query optional agent-worktrees readiness for the owning project."""
+    from .worktrees import ContextRefused, explicit_context, validate_context
+
+    try:
+        validate_context()
+    except ContextRefused as error:
+        return PreflightResult("rejected", code="context-refused", detail=str(error))
+    project = _owner_project(holder_ref)
+    if not project:
+        return PreflightResult("absent", detail="owner project is unavailable")
+    try:
+        proc = _run(
+            ["--project", project, "coordination-readiness"],
+            timeout=10,
+        )
+    except ContextRefused as error:
+        return PreflightResult("rejected", code="context-refused", detail=str(error))
+    if proc is None:
+        return PreflightResult("absent", detail="agent-worktrees is unavailable")
+    if explicit_context() and proc.returncode not in (_EXIT_OK, _EXIT_CONFLICT):
+        # Older peers may lack this optional command. Only its explicit argparse
+        # diagnostic is compatibility evidence, not arbitrary failure output.
+        if proc.returncode == 2 and "invalid choice: 'coordination-readiness'" in (proc.stderr or ""):
+            return PreflightResult("absent", detail="peer has no coordination-readiness command")
+        return PreflightResult(
+            "rejected", code="context-refused",
+            detail=proc.stderr.strip() or "Same-cell readiness probe failed",
+        )
+    try:
+        payload = json.loads(proc.stdout)
+    except (TypeError, ValueError):
+        if explicit_context() and proc.returncode != _EXIT_OK:
+            return PreflightResult(
+                "rejected", code="context-refused", detail="Same-cell readiness probe failed",
+            )
+        return PreflightResult("absent", detail="preflight output is not JSON")
+    if not isinstance(payload, dict) or payload.get("version") != _PREFLIGHT_VERSION:
+        if explicit_context() and proc.returncode != _EXIT_OK:
+            return PreflightResult(
+                "rejected", code="context-refused", detail="Same-cell readiness probe failed",
+            )
+        return PreflightResult(
+            "absent", detail="preflight version is absent or incompatible"
+        )
+    ready = payload.get("ready")
+    code = payload.get("code")
+    error = payload.get("error")
+    if ready is True and code == "ready" and proc.returncode == _EXIT_OK:
+        return PreflightResult("ready", code="ready")
+    if (
+        ready is False
+        and code in _PREFLIGHT_REJECTION_CODES
+        and proc.returncode == _EXIT_CONFLICT
+        and isinstance(error, str)
+        and error
+    ):
+        return PreflightResult("rejected", code=code, detail=error)
+    if explicit_context() and proc.returncode != _EXIT_OK:
+        return PreflightResult(
+            "rejected", code="context-refused", detail="Same-cell readiness probe failed",
+        )
+    return PreflightResult("absent", detail="preflight response is incompatible")
+
+
+def _bookkeeping_run(args: list[str]) -> subprocess.CompletedProcess[str] | None:
+    from .worktrees import ContextRefused
+
+    try:
+        return _run(args)
+    except ContextRefused as error:
+        log.warning("Skipping coordination bookkeeping after context refusal: %s", error)
+        return None
+
+
+def journal_claim(kind: str, ref: str, holder_ref: str | None) -> bool:
+    """Journal any existing agent-worktrees claim kind onto ``holder_ref``.
+
+    Best-effort + degrade-safe, matching :func:`journal_obligation`: no
+    holder-ref, no binstub, a context refusal, or a non-zero `claims add`
+    result all degrade to ``False`` without raising. Idempotent because the
+    underlying `claims add` verb deduplicates by ref.
+    """
+    if not kind or not ref or not holder_ref or not holder_ref.strip():
+        return False
+    proc = _bookkeeping_run(
+        ["claims", "add", kind, ref, "--owner-ref", holder_ref.strip(), "--json"],
+    )
+    if proc is None:
+        return False
+    if proc.returncode != 0:
+        log.debug("claims add %s %s degraded (exit %s): %s",
+                  kind, ref, proc.returncode, (proc.stderr or "").strip())
+        return False
+    return True
 
 
 def journal_obligation(name: str, holder_ref: str | None) -> bool:
@@ -179,18 +319,7 @@ def journal_obligation(name: str, holder_ref: str | None) -> bool:
     (deferred to the lease mirror), or any error -> ``False`` (never raises,
     never blocks the connect). Idempotent (``claims add`` dedups by ref).
     """
-    if not holder_ref or not holder_ref.strip():
-        return False
-    proc = _run(
-        ["claims", "add", KIND, name, "--owner-ref", holder_ref.strip(), "--json"],
-    )
-    if proc is None:
-        return False
-    if proc.returncode != 0:
-        log.debug("claims add for %s degraded (exit %s): %s",
-                  name, proc.returncode, (proc.stderr or "").strip())
-        return False
-    return True
+    return journal_claim(KIND, name, holder_ref)
 
 
 def settle_obligation(
@@ -210,7 +339,7 @@ def settle_obligation(
     args = ["claims", "settle", name, "--owner-ref", holder_ref.strip(), "--json"]
     if released:
         args.append("--released")
-    proc = _run(args)
+    proc = _bookkeeping_run(args)
     if proc is None:
         return False
     if proc.returncode != 0:
@@ -247,7 +376,7 @@ def mirror_disposition(
             "--disposition", disposition]
     if origin:
         args += ["--origin", origin]
-    proc = _run(args)
+    proc = _bookkeeping_run(args)
     if proc is None:
         return False
     if proc.returncode != _EXIT_OK:
@@ -351,9 +480,8 @@ def acquire(
 ) -> L2Result:
     """Attempt an atomic cross-machine acquire of the CodeSpace lease.
 
-    Returns ``ok`` (with the fencing ``token``), ``conflict`` (with the current
-    ``holder``), or ``unavailable`` (L2 not wired/reachable). A ``conflict`` is
-    the only blocking outcome; every degradation is ``unavailable``.
+    Returns ``ok``, ``conflict``, ``rejected`` (binding unavailable), or
+    ``unavailable`` (optional peer not wired/reachable).
     """
     args = ["lease", "acquire", KIND, key, "--holder", holder]
     if ttl is not None:
@@ -369,6 +497,19 @@ def acquire(
         rec = inspect(key, origin=origin)
         holder_of = str(rec.get("holder", "")) if rec else ""
         return L2Result("conflict", holder=holder_of, detail=(proc.stderr or "").strip())
+    if proc.returncode == _EXIT_COORDINATION_REJECTED:
+        try:
+            payload = json.loads(proc.stderr)
+        except (TypeError, ValueError):
+            payload = {}
+        code = str(payload.get("code", "")) if isinstance(payload, dict) else ""
+        detail = (
+            str(payload.get("error", ""))
+            if isinstance(payload, dict)
+            else ""
+        )
+        if code in _PREFLIGHT_REJECTION_CODES and detail:
+            return L2Result("rejected", detail=f"{code}: {detail}")
     # config/protocol (2) or git (4) error -> degrade to L1-only.
     log.debug("L2 acquire degraded (exit %s): %s", proc.returncode, (proc.stderr or "").strip())
     return L2Result("unavailable", detail=(proc.stderr or "").strip())

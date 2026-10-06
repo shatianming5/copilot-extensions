@@ -20,7 +20,10 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import shlex
 import subprocess
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING
@@ -28,7 +31,7 @@ from typing import TYPE_CHECKING
 from agent_procutil import no_window_flags
 
 from . import lifecycle
-from ._invoke import module_argv
+from ._invoke import payload_command_argv
 from .config import (
     RESTRICTED_PROFILE,
     SECURITY_PROFILE_LABEL,
@@ -143,6 +146,51 @@ def build_restricted_spawn_command(
     ]
 
 
+AGENT_CONTAINERS_EXEC_COPILOT_ARGS_ENV = "AGENT_CONTAINERS_EXEC_COPILOT_ARGS"
+
+
+def _append_copilot_args(acp_command: str, extra: list[str] | None) -> str:
+    """Append caller-supplied copilot CLI args onto a fleet's configured
+    ``acp_command`` shell string, shell-quoting each one.
+
+    This is the container-side half of forwarding a venue/charter overlay
+    (``--agent <charter>``, etc.) into a container session -- the other half
+    is ``agent_bridge.transport.spawn_raw`` appending ``target.copilot_args``
+    onto the ``agent-containers exec`` invocation when spawning a
+    container-backed target. Returns ``acp_command`` unchanged when ``extra``
+    is empty or ``None``, so this is a no-op for every existing caller that
+    never passes extra args.
+    """
+    if not extra:
+        return acp_command
+    return acp_command + " " + " ".join(shlex.quote(a) for a in extra)
+
+
+def resolve_extra_copilot_args(cli_args: list[str] | None) -> list[str] | None:
+    """The extra copilot args ``exec`` should forward, env-first.
+
+    ``agent_bridge.transport.spawn_raw`` forwards a charter overlay via
+    ``AGENT_CONTAINERS_EXEC_COPILOT_ARGS`` (JSON-encoded), never trailing
+    argv -- on Windows the wrapper is often a ``.cmd`` shim routed through
+    ``cmd.exe``, which reparses argv metacharacters but passes the
+    environment block through untouched. The ``copilot_args`` positional
+    stays as a direct-CLI convenience (manual/test invocations), used only
+    when the env var is absent.
+    """
+    raw = os.environ.get(AGENT_CONTAINERS_EXEC_COPILOT_ARGS_ENV)
+    if raw:
+        decoded = json.loads(raw)
+        if not isinstance(decoded, list) or not all(
+            isinstance(a, str) for a in decoded
+        ):
+            raise ValueError(
+                f"{AGENT_CONTAINERS_EXEC_COPILOT_ARGS_ENV} must be a JSON "
+                f"array of strings, got: {raw!r}"
+            )
+        return decoded
+    return cli_args
+
+
 def build_wrapper_command(name: str) -> list[str]:
     """Build the spawn command agent-bridge runs for a ``container:`` agent.
 
@@ -151,11 +199,10 @@ def build_wrapper_command(name: str) -> list[str]:
     injects it into the container's environment, so the token NEVER lands in
     the SpawnTarget (which agent-bridge persists to its SQLite DB) or in any log.
 
-    Invokes the module directly (``python -m agent_containers``), never the
-    ``.cmd`` binstub, so agent-bridge does not route the spawn through
-    cmd.exe and mangle forwarded arguments (see ``._invoke``).
+    Uses the exact payload-local shim instead of a machine-global command so the
+    same selected installation cell owns local and remote execution.
     """
-    return [*module_argv(), "exec", "--stdio", name]
+    return [*payload_command_argv(), "exec", "--stdio", name]
 
 
 def resolve_live_exec_target(
@@ -389,7 +436,7 @@ class ContainerResolver:
                 "user": user,
                 "acp_command": config.acp_command_for(fleet),
                 "ssh": asdict(ssh_config),
-                "provider_command": module_argv(),
+                "provider_command": payload_command_argv(),
                 "relay_remote_port": (
                     config.relay_port if relay_enabled else None
                 ),

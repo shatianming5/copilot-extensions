@@ -57,7 +57,8 @@ use plain git.
 | Operation | Do it via | Why |
 |-----------|-----------|-----|
 | `status`, `log`, `diff`, `show`, `branch -v` | **plain git** | read-only inspection; no shared state |
-| `add`, `commit`, `restore`, `stash`, local `switch`, `rebase -i` **on your own worktree branch** | **plain git** | local history; disposable until it lands |
+| `add`, `commit`, `restore`, local `switch`, `rebase -i` **on your own worktree branch** | **plain git** | local history; disposable until it lands |
+| `stash` | **avoid -- see below** | the stash stack is **shared across every worktree of the same clone**, not scoped to yours |
 | `fetch` | **plain git** | read-only; updates remote-tracking refs only |
 | Advance the worktree onto the merged default ("pull forward") | helper: `<agent-worktrees catalog argv[0]> git sync` | wraps fetch + rebase; drops squash-merged commits without losing local work |
 | Create / update / push a **shared** feature branch | helper: `<agent-worktrees catalog argv[0]> git feature-branch ...` | wraps create + ff + push; a real remote branch many agents build on |
@@ -115,6 +116,103 @@ uncommon.
 This is the **review-gate continuation** for efforts: submit the effort PR ->
 it's reviewed + merged -> confirm via `pr-status` -> `git sync` -> build Phase
 work on top.
+
+## Safe rebase in a high-velocity repo: backup branch, then cherry-pick
+
+`git sync`'s auto-abort-on-conflict keeps a *simple* rebase safe. But in a repo
+with many concurrent contributors -- commits (and version-bump races) landing
+on the default branch faster than you can rebase and push -- a rebase can
+still turn genuinely messy: real conflicts across several of your own commits,
+or the default branch moving again mid-resolution. Reaching for `git stash` to
+"get out of the way" while you sort it out is the wrong reflex here (see
+below); the durable-safe move instead is:
+
+1. **Commit everything first.** Nothing should be sitting only in the working
+   tree or a stash -- a rebase you abort partway through must never cost you
+   uncommitted work.
+2. **Tag a local backup branch** at your current tip before touching the
+   rebase: `git branch backup/<slug>`. Costs nothing, and it's your unconditional
+   fallback if the rebase goes sideways.
+3. **Rebase (or attempt the merge) against a freshly fetched default branch**,
+   resolving conflicts as they come.
+4. **If it gets messy -- multiple conflicting commits, or the base moved again
+   mid-resolution -- stop resolving in place.** Reset to the backup
+   (`git reset --hard backup/<slug>`), re-fetch, and
+   `git cherry-pick <your-commit(s)>` onto the fresh base instead. Cherry-pick
+   replays your own commits one at a time onto wherever the default branch
+   actually is *right now*, which is usually far less error-prone than
+   untangling an in-progress rebase's conflict markers across several commits.
+5. Delete the backup branch once your work is confirmed on the remote
+   (`git branch -D backup/<slug>`) -- it's scaffolding, not a permanent ref.
+
+### When the base has drifted *and* your target files were split upstream: squash first, then rebase
+
+**Applies only to an owned, private PR branch (your own `worktree/*` -> `pr/*`
+flow) -- never to a shared feature branch.** The squash + force-push below
+rewrites history, which the boundary table above forbids on any branch other
+agents build on; on a shared feature branch, use `git merge-to-feature`'s
+ff-only flow instead and skip this whole technique.
+
+The cherry-pick recovery above assumes your own commits still apply cleanly
+one at a time onto the fresh base. That assumption breaks down when a PR sits
+open long enough (tens to hundreds of commits behind) *and* one of this
+repo's own campaigns (its module-componentization-discipline effort, enforced
+by `tools/check-module-size.py`) has meanwhile split the exact file your PR
+touches into two or more successors. A multi-commit rebase or a per-commit
+cherry-pick then has to resolve the *same* relocation conflict repeatedly --
+once per commit -- turning a single real change (a file moved) into an
+enormous, largely spurious conflict fight that obscures the one genuine
+decision buried in it.
+
+The fix is to collapse the noise before touching the moved file at all:
+
+1. **Squash your PR's commits into one, against its *original* merge-base**
+   (not the current tip): tag a backup ref first (`git branch
+   backup/<slug>-presquash`), then `git reset --soft <original-merge-base>`
+   and a single `git commit` capturing the whole diff. This is a size
+   reduction, not a rebase -- it never touches the target branch, so do it
+   before fetching anything new.
+2. **Fetch and rebase that single squashed commit onto the current target
+   tip.** Now there is exactly one conflict to resolve per moved file, not
+   one per original commit -- because there is only one commit left.
+3. **Resolve the relocation conflict once**, understanding it as "this hunk
+   now belongs in `new_module_a.py` instead of `old_module.py`" rather than
+   fighting the rebase machinery's per-commit view of the same move.
+4. Continue as a normal single-commit rebase from here (`git rebase
+   --continue`), then force-push with lease **once the result is confirmed
+   correct locally** -- this genuinely rewrites *your own* published PR
+   branch's history down to one commit (the same single-commit-per-PR
+   invariant this repo's worktree/PR flow already expects, see the
+   `worktree` skill's own reference doc). Keep the `backup/<slug>-presquash`
+   ref around until that push lands and CI picks it up; only delete it once
+   the rewritten branch is confirmed on the remote.
+
+This is a variant of the same problem class as the backup-branch +
+cherry-pick technique above (many concurrent commits against a moving base),
+with a different failure mode: a file *relocation*, not just conflicting
+hunks within an unmoved file. Reach for cherry-pick when your own commits are
+still individually clean against the new base; reach for squash-first when
+the base has reorganized the very files you touched -- and, either way, only
+on a branch that is yours alone to rewrite.
+
+### `git stash` is a shared stack across every worktree of one clone -- don't reach for it here
+
+`git stash` is **not** scoped to the worktree you run it in: worktrees of the
+same repository share one `.git` directory, and the stash stack lives there,
+visible and poppable from *any* of them. A bare `git stash` / `git stash pop`
+during a rebase can silently interact with another agent's or another
+session's stash entry -- popping someone else's WIP into your tree, or (worse)
+resolving *their* conflicts and dropping *their* entry when you didn't mean to
+touch it at all.
+
+If you must set work aside momentarily, prefer a real commit on a scratch
+branch (`git commit -m wip` on `backup/<slug>` from step 2 above) over
+`git stash` -- it's exactly as disposable, but it can never collide with
+another worktree's stash entry. If you do end up needing to inspect the stash
+list for any reason, treat every entry that isn't unambiguously the one you
+just created as **someone else's** -- `git stash list` before and after any
+stash operation, and never run a bare `pop`/`drop`/`apply` unless you've
+confirmed `stash@{0}`'s message is yours.
 
 ## Iterating on an open PR (open it as a draft)
 

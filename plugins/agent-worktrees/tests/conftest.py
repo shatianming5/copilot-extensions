@@ -10,6 +10,28 @@ import pytest
 from agent_worktrees import tracking
 
 
+def _load_full_command_surface_once() -> None:
+    """Restore the pre-lazy-dispatch full eager module surface for tests.
+
+    Tests exercise `agent_worktrees.__main__` module attributes directly
+    (`m._some_helper`, `monkeypatch.setattr(m, "_x", ...)`) as white-box unit
+    tests of internal implementation, not as simulated CLI invocations. The
+    agent-cli-lazy-dispatch effort deferred that surface's construction
+    behind `main()`'s own dispatch decision (see `_load_full_command_surface`
+    / `_ensure_cluster_loaded` in `agent_worktrees/__main__.py`) so a real
+    fast-tracked invocation never pays for it -- but that means it is no
+    longer populated merely by `import agent_worktrees.__main__`. Force it
+    once, session-wide, so every test keeps seeing the same fully-populated
+    module it always has.
+    """
+    from agent_worktrees import __main__ as m
+
+    m._load_full_command_surface()
+
+
+_load_full_command_surface_once()
+
+
 @pytest.fixture(autouse=True)
 def _disable_resident_monitor_processes():
     """Unit tests opt in explicitly when resident monitor behavior is under test."""
@@ -25,6 +47,23 @@ def _disable_resident_monitor_processes():
             os.environ.pop(key, None)
         else:
             os.environ[key] = prior
+
+
+@pytest.fixture(autouse=True)
+def _assume_interactive_terminal(monkeypatch):
+    """Default the non-interactive-bare-invocation guard to "interactive".
+
+    Under pytest's default output capture, ``sys.stdin.isatty()`` is False
+    (confirmed empirically), which would make every bare-invocation test
+    that exercises the launch/Manager seam spuriously hit
+    :func:`agent_worktrees.__main__.cmd_noninteractive_bare` instead of the
+    behavior it actually means to test. Default the guard closed here, the
+    same way this file already isolates the resident-monitor default above;
+    a test of the guard itself opts back in explicitly.
+    """
+    from agent_worktrees import __main__ as m
+
+    monkeypatch.setattr(m, "_is_noninteractive_invocation", lambda: False)
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +148,16 @@ def pytest_unconfigure(config):
 # patches, and running the suite (even concurrently with an install) can never
 # mutate the host. Tests that need finer control still layer their own patches
 # (e.g. ``monkeypatch_config``) on top of this safe default.
+#
+# This ALSO isolates ``copilot_launch_prefs.resolve_launch_pref_flags()`` from
+# the real ``~/.copilot/settings.json`` plugin-wide, including in test modules
+# that never import ``copilot_launch_prefs`` directly (e.g.
+# ``test_profile_assignment.py``'s exact-command assertions). That module's
+# ``from pathlib import Path`` is the identical ``pathlib.Path`` class patched
+# below -- patching the classmethod once here therefore covers every caller,
+# with no second patch of the same global attribute needed (a second autouse
+# fixture doing so would instead *conflict* with this one, each overwriting
+# the other's fake home for the duration of a test).
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
@@ -173,22 +222,16 @@ def _reset_active_project():
 
     from agent_worktrees import config as _cfg
 
-    _saved = os.environ.get("WORKTREE_PROJECT")
-    _cfg.set_active_project(None)
-    # Also clear the WORKTREE_PROJECT env fallback that project_name() consults.
-    # Otherwise a value leaked from the launching shell (or a prior test that
-    # ran main()) satisfies project_name() and makes tests pass or fail
-    # depending on the ambient environment / test order. Tests that need a
-    # project set it explicitly (e.g. via monkeypatch_config or set_active_project).
-    os.environ.pop("WORKTREE_PROJECT", None)
+    reset_active_project = _cfg.set_active_project
+    _saved_handoff = os.environ.get("AGENT_WORKTREES_HANDOFF_TOKEN")
+    reset_active_project(None)
+    os.environ.pop("AGENT_WORKTREES_HANDOFF_TOKEN", None)
     yield
-    _cfg.set_active_project(None)
-    # main() writes WORKTREE_PROJECT into os.environ directly (for legacy shell
-    # consumers); restore the pre-test value so it never leaks between tests.
-    if _saved is None:
-        os.environ.pop("WORKTREE_PROJECT", None)
+    reset_active_project(None)
+    if _saved_handoff is None:
+        os.environ.pop("AGENT_WORKTREES_HANDOFF_TOKEN", None)
     else:
-        os.environ["WORKTREE_PROJECT"] = _saved
+        os.environ["AGENT_WORKTREES_HANDOFF_TOKEN"] = _saved_handoff
 
 # ---------------------------------------------------------------------------
 # Path fixtures — redirect config helpers to tmp dirs
@@ -229,6 +272,29 @@ def _isolate_pivots(tmp_path_factory):
         os.environ["AGENT_WORKTREES_PLUGINS_DIR"] = saved_plugins
 
 
+@pytest.fixture(autouse=True)
+def _assume_valid_claimant_worktree(monkeypatch):
+    """Default ``pr_cli.require_claimant_worktree``'s underlying CWD->worktree
+    resolution to "resolves cleanly" for every test.
+
+    :func:`agent_worktrees.worktree_identity._infer_worktree_id_from_cwd`
+    reads the REAL git worktree structure of wherever the test process's CWD
+    happens to be (unaffected by ``_isolate_agent_worktrees_home`` above,
+    which only isolates registries under HOME) -- so left unmocked, whether
+    a ``pr-watch``/``pr-merge`` dispatcher test's claimant check passes would
+    depend on the ambient checkout the suite happens to run from, not the
+    test's own fixtures. Default it to a fixed, deterministic worktree id; a
+    test of the claimant guard itself (or of CWD-identity resolution)
+    overrides this explicitly.
+    """
+    from agent_worktrees import worktree_identity
+
+    monkeypatch.setattr(
+        worktree_identity, "_infer_worktree_id_from_cwd",
+        lambda config=None: "test-claimant-worktree",
+    )
+
+
 @pytest.fixture
 def tmp_tracking_dir(tmp_path: Path) -> Path:
     """Temporary tracking directory for worktree YAMLs."""
@@ -248,9 +314,14 @@ def tmp_session_state_dir(tmp_path: Path) -> Path:
 @pytest.fixture
 def monkeypatch_config(monkeypatch, tmp_path: Path, tmp_tracking_dir: Path):
     """Patch config helpers to use tmp dirs."""
-    monkeypatch.setenv("WORKTREE_PROJECT", "test-project")
+    from agent_worktrees import config as _cfg
+
+    _cfg.set_active_project("test-project")
     monkeypatch.setattr("agent_worktrees.config.tracking_dir", lambda: tmp_tracking_dir)
-    monkeypatch.setattr("agent_worktrees.config.project_dir", lambda: tmp_path / ".test-project")
+    monkeypatch.setattr(
+        "agent_worktrees.config.project_dir",
+        lambda name=None: tmp_path / f".{name or 'test-project'}",
+    )
     monkeypatch.setattr(
         "agent_worktrees.config.install_dir", lambda: tmp_path / ".agent-worktrees"
     )
@@ -398,7 +469,9 @@ def pr_repo(tmp_path: Path, monkeypatch):
         )},
     )
 
-    monkeypatch.setattr("agent_worktrees.config.tracking_dir", lambda: tracking_d)
+    monkeypatch.setattr(
+        "agent_worktrees.config.tracking_dir", lambda name=None: tracking_d
+    )
     # pr_ops helpers that are called without an explicit ``config`` fall back to
     # ``cfg.load_config()``, which resolves the on-disk config for the active
     # project. In tests there is no active project, so pin load_config to this

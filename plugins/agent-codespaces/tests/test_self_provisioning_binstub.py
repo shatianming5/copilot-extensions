@@ -13,6 +13,27 @@ import pytest
 INSTALL_SH = Path(__file__).resolve().parents[1] / "scripts" / "install.sh"
 INSTALL_PS1 = INSTALL_SH.with_suffix(".ps1")
 pytestmark = pytest.mark.guard
+_BINSTUB_TIMEOUT_SECONDS = 20
+
+
+def _isolated_binstub_env(home: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    roots = {
+        "HOME": home,
+        "USERPROFILE": home,
+        "XDG_CONFIG_HOME": home / ".config",
+        "XDG_CACHE_HOME": home / ".cache",
+        "XDG_DATA_HOME": home / ".local" / "share",
+        "XDG_STATE_HOME": home / ".local" / "state",
+        "TEMP": home / "tmp",
+        "TMP": home / "tmp",
+        "TMPDIR": home / "tmp",
+    }
+    for path in roots.values():
+        path.mkdir(parents=True, exist_ok=True)
+    env.update({name: str(path) for name, path in roots.items()})
+    env["AGENT_CODESPACES_NO_SELFPROVISION"] = "1"
+    return env
 
 
 def test_binstub_resolves_marker_only_runtime_after_provision() -> None:
@@ -78,9 +99,7 @@ def test_posix_binstub_rejects_incomplete_marker_slot_without_running_it(
     (home / ".agent-codespaces" / "current-version").write_text(
         "1.0.0\n", encoding="utf-8"
     )
-    env = os.environ.copy()
-    env["HOME"] = str(home)
-    env["AGENT_CODESPACES_NO_SELFPROVISION"] = "1"
+    env = _isolated_binstub_env(home)
 
     result = subprocess.run(
         [shutil.which("bash"), str(binstub), "version"],
@@ -88,6 +107,7 @@ def test_posix_binstub_rejects_incomplete_marker_slot_without_running_it(
         text=True,
         capture_output=True,
         check=False,
+        timeout=_BINSTUB_TIMEOUT_SECONDS,
     )
 
     assert result.returncode != 0
@@ -120,9 +140,7 @@ def test_posix_binstub_tier3_prefers_dev10_over_dev9(tmp_path: Path) -> None:
             ),
             encoding="utf-8",
         )
-    env = os.environ.copy()
-    env["HOME"] = str(home)
-    env["AGENT_CODESPACES_NO_SELFPROVISION"] = "1"
+    env = _isolated_binstub_env(home)
 
     result = subprocess.run(
         [shutil.which("bash"), str(binstub), "version"],
@@ -130,6 +148,7 @@ def test_posix_binstub_tier3_prefers_dev10_over_dev9(tmp_path: Path) -> None:
         text=True,
         capture_output=True,
         check=False,
+        timeout=_BINSTUB_TIMEOUT_SECONDS,
     )
 
     assert result.returncode == 0, result.stderr
@@ -153,6 +172,7 @@ def test_posix_binstub_tier3_prefers_dev10_over_dev9(tmp_path: Path) -> None:
         text=True,
         capture_output=True,
         check=False,
+        timeout=_BINSTUB_TIMEOUT_SECONDS,
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "0.4.0"
@@ -170,3 +190,48 @@ def test_windows_binstubs_share_safe_resolution_and_locking() -> None:
     assert "System.Threading.Mutex" in ps1
     assert 'agent-codespaces.ps1" %*' in cmd
     assert "powershell" in cmd
+
+
+def test_installers_preinstall_uv_editable_workspace_dependencies() -> None:
+    install_sh = INSTALL_SH.read_text(encoding="utf-8")
+    install_ps1 = INSTALL_PS1.read_text(encoding="utf-8")
+
+    assert 'ZDD_DIR="$PLUGIN_DIR/libs/zdd"' in install_sh
+    assert '--editable "$ZDD_DIR"' in install_sh
+    assert '--reinstall-package agent-zdd "$ZDD_DIR"' in install_sh
+    assert 'VENUE_COPILOT_DIR="$PLUGIN_DIR/libs/venue-copilot"' in install_sh
+    assert '--editable "$VENUE_COPILOT_DIR"' in install_sh
+    assert '--reinstall-package agent-venue-copilot "$VENUE_COPILOT_DIR"' in install_sh
+    assert 'SESSION_LIVENESS_PROBE_DIR="$PLUGIN_DIR/libs/session-liveness-probe"' in install_sh
+    assert '--editable "$SESSION_LIVENESS_PROBE_DIR"' in install_sh
+    assert (
+        '--reinstall-package agent-session-liveness-probe "$SESSION_LIVENESS_PROBE_DIR"'
+        in install_sh
+    )
+    assert 'SINGLE_INSTANCE_LEASE_DIR="$PLUGIN_DIR/libs/single-instance-lease"' in install_sh
+    assert '--editable "$SINGLE_INSTANCE_LEASE_DIR"' in install_sh
+    assert (
+        '--reinstall-package agent-single-instance-lease "$SINGLE_INSTANCE_LEASE_DIR"'
+        in install_sh
+    )
+    assert 'REMOTE_LOGIN_SHELL_DIR="$PLUGIN_DIR/libs/remote-login-shell"' in install_sh
+    assert '--editable "$REMOTE_LOGIN_SHELL_DIR"' in install_sh
+    assert (
+        '--reinstall-package agent-remote-login-shell "$REMOTE_LOGIN_SHELL_DIR"'
+        in install_sh
+    )
+    assert "Join-Path $PluginDir 'libs\\zdd'" in install_ps1
+    assert "'agent-zdd'" in install_ps1
+    assert '"$ZddDir"' in install_ps1
+    assert "Join-Path $PluginDir 'libs\\venue-copilot'" in install_ps1
+    assert "'agent-venue-copilot'" in install_ps1
+    assert '"$VenueCopilotDir"' in install_ps1
+    assert "Join-Path $PluginDir 'libs\\session-liveness-probe'" in install_ps1
+    assert "'agent-session-liveness-probe'" in install_ps1
+    assert '"$SessionLivenessProbeDir"' in install_ps1
+    assert "Join-Path $PluginDir 'libs\\single-instance-lease'" in install_ps1
+    assert "'agent-single-instance-lease'" in install_ps1
+    assert '"$SingleInstanceLeaseDir"' in install_ps1
+    assert "Join-Path $PluginDir 'libs\\remote-login-shell'" in install_ps1
+    assert "'agent-remote-login-shell'" in install_ps1
+    assert '"$RemoteLoginShellDir"' in install_ps1

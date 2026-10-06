@@ -19,6 +19,7 @@ catalog; never resolve it through ambient `PATH`.
 - List Available Agents / Machines
 - Send a Prompt to an Agent (sync / async, sessions, timeouts)
 - Session management
+- Detached CLI-mode session on a CodeSpace; browser view (`ui`)
 - Config (adopt / show)
 - Service control
 
@@ -32,7 +33,7 @@ be running (the `start` management operation) for client commands to work.
 
 ```bash
 <agent-bridge catalog argv[0]> agents
-<agent-bridge catalog argv[0]> agents --json
+<agent-bridge catalog argv[0]> --json agents
 <agent-bridge catalog argv[0]> --project <repo> agents
 <agent-bridge catalog argv[0]> agents --all-projects
 ```
@@ -44,7 +45,7 @@ spawnable status).
 
 ```bash
 <agent-bridge catalog argv[0]> machines
-<agent-bridge catalog argv[0]> machines --json
+<agent-bridge catalog argv[0]> --json machines
 <agent-bridge catalog argv[0]> --project <repo> machines
 <agent-bridge catalog argv[0]> machines --all-projects
 ```
@@ -119,7 +120,16 @@ blocks, and tool call summaries.
 # ...or read the first prompt from a file (or '-' for stdin) -- robust for
 # multi-line / quote-heavy dispatch prompts (no argv mangling)
 <agent-bridge catalog argv[0]> create <agent-name> --prompt-file ./dispatch.md --no-wait
+
+# Orchestration seam: atomically capture the exact session this create owns
+<agent-bridge catalog argv[0]> create <agent-name> --prompt-file ./dispatch.md \
+  --session-id-file ./created-session-id
 ```
+
+`--session-id-file` is written immediately after the fresh session is created
+and before the first prompt is streamed. Use it when a caller must bind later
+status, model, or result reads to this exact create rather than selecting a
+same-agent session from a broad listing.
 
 `create` always spawns a fresh session, bypassing caller reuse. For agents
 that allow only **one session at a time** — CodeSpaces share a single
@@ -130,6 +140,95 @@ silently latching onto it, and tells you to end the existing one first:
 <agent-bridge catalog argv[0]> end <existing-session-id>   # free the CodeSpace
 <agent-bridge catalog argv[0]> create <agent-name> "..."   # then start clean
 ```
+
+For a **singleton repo** (one anchor checkout, no worktree isolation),
+`create` is also a declared refusal: there is no second checkout to create.
+Use `resume <repo-or-agent>` to load/take over the anchor's current head, or
+`handoff <repo-or-agent>` to roll it forward deliberately.
+
+### Detached CLI-mode session on a CodeSpace, trusted container, or SSH target (observable, steerable)
+
+`create <venue-target> --cli` delivers a real interactive Copilot CLI session
+on the venue into **this** terminal. An orchestrating agent that must not hand
+its terminal away adds `--detach`: the venue verb starts (or rejoins) the
+session in the background, seeds it with the prompt, waits until it is
+registered with this bridge, and prints a JSON handle. Supported venue targets
+are `codespace:<name>`, trusted `container:<name>` (restricted containers
+deliberately refuse CLI-mode session hosting), and `ssh:<name>` where `<name>`
+is the SSH host alias that agent-ssh's `copilot` verb accepts.
+
+```bash
+<agent-bridge catalog argv[0]> create codespace:<name> --cli --detach \
+  --prompt-file ./task.md --driver orchestrator
+<agent-bridge catalog argv[0]> create container:<name> --cli --detach \
+  --prompt-file ./task.md --driver orchestrator
+<agent-bridge catalog argv[0]> create ssh:<name> --cli --detach \
+  --prompt-file ./task.md --driver orchestrator
+# -> {"ok": true, "session_id": "<sid>", "scope_id": "anchor-<repo>@<name>",
+#     "commands": {"status": ..., "observe": ..., "nudge": ..., "attach": ..., "stop": ...}}
+```
+
+The session is an ordinary **live session** from then on -- observe and steer it
+with bounded reads instead of streaming its transcript into your context:
+
+```bash
+<agent-bridge catalog argv[0]> --json live-sessions resolve --handle <sid>   # status, liveness, turn_state, latest_progress
+<agent-bridge catalog argv[0]> result <sid> --json --max-items 5 --max-text-chars 2000 [--position <p>]
+<agent-bridge catalog argv[0]> send <sid> "focus on the failing test first" --no-wait   # default: queue after current turn
+<agent-bridge catalog argv[0]> send <sid> "check the next test step" --steer --no-wait  # join the running turn at its next step
+<agent-bridge catalog argv[0]> send <sid> "stop and handle this now" --interrupt --no-wait  # abort current turn first
+```
+
+Live-session `send` defaults to `--delivery queue`, preserving the receiver's
+current turn and running after it ends. `--steer` uses SDK immediate delivery to
+join the running turn at its next step without cancelling it. `--interrupt`
+aborts the current turn first, then sends the message as the fresh next turn.
+
+The handle's `commands.attach` lets a human attach the real terminal (tmux),
+and `commands.stop` is the verified stop (it deregisters the session and
+releases its forwards); run them exactly as printed.
+
+An abruptly killed CLI cannot deregister itself; a launcher that has verified
+its session's process is gone removes the row with
+`live-sessions deregister --session-id <sid>` (exact id, idempotent) instead of
+leaving it to the stale-heartbeat reaper.
+
+The underlying verb is the venue plugin's `copilot <name> --detach`
+(`agent-codespaces`, `agent-containers`, or `agent-ssh`; all support
+`--seed-file`, `--copilot-arg`, `--register-timeout`, and `--dry-run`, while
+CodeSpaces also support `--effort` for the CodeSpace claim). Use it directly
+when you need those extra flags -- `create --cli --detach` forwards only the
+prompt and `--driver` (`create --effort` is the session's reasoning effort, not
+a coordination effort). Each venue registers under a venue-qualified identity
+(`<identity>@<venue-name>`), so several venues of one repo stay distinct.
+
+### Browser view (`ui`)
+
+```bash
+<agent-bridge catalog argv[0]> ui              # start the daemon if needed; open /ui already signed in
+<agent-bridge catalog argv[0]> ui --print-url  # print a one-time signed-in link instead
+```
+
+Sign-in uses a one-time login code (single use, 60 s) in the URL fragment,
+which the page trades for the bearer token; the token itself never enters a
+URL or browser history. The page is a task board: each card is a worktree
+task, with its orchestrator session and the venue workers it supervises
+(joined through `venue.supervisor_ref`), grouped as **Needs you**, **Working**,
+**Monitoring PR**, **Done**, **Idle**, and **Earlier** (worktrees with no live
+session, with their PR's live title and state). Opening a task shows a session
+viewer that folds each stretch of tool calls into one collapsed line (expand
+it for inputs and outputs) and a composer that steers, queues, or interrupts.
+**New task** starts a Copilot session in a fresh Picker-visible worktree
+(`create --origin user`, then `embody --seed`). A repository can declare how
+tasks start in it in `.copilot-extensions/agent-bridge/task-modes.yaml` (for
+example "one task" and "campaign"): the dialog offers those modes, and the
+bridge builds the first message from the chosen mode's template (the page only
+names a mode). A repository that is another's bound knowledge repo is not
+offered, since its worktrees pair with tasks. An Earlier task shows what
+happened: its last session's transcript, read-only, when a cold-store provider
+(agent-logger) can supply it, plus the branch's own commits. It can be resumed
+or renamed. Filter with `/` (title, repo, id, branch, or PR), move with
+`j`/`k`, start a task with `n`.
 
 ### Choosing send vs create — check for an outstanding session first
 
@@ -177,14 +276,19 @@ be discarded (or the cancel signature *persists* across sends). See the
 # Stop a session (preserves state for resume)
 <agent-bridge catalog argv[0]> stop <session-id>
 
-# Resume a stopped session -- or load/take-over a worktree by handle.
-# The target may be an owned ACP session id OR a worktree handle. If it is a
-# worktree handle whose interactive CLI has stopped (e.g. after a reboot), the
-# worktree is loaded as a fresh owned session -- a dormant worktree is just a
-# note. If a *live* interactive CLI still holds the worktree, resume refuses
+# Resume a stopped session -- or load/take-over a worktree / singleton anchor.
+# The target may be an owned ACP session id, a worktree handle, or a
+# singleton repo key / agent name. Singleton repos are keyed internally by a
+# stable `<repo>@anchor` pseudo-worktree id, but the CLI accepts the repo key.
+# If the target's interactive CLI has stopped (e.g. after a reboot), resume
+# loads it as a fresh owned session -- a dormant target is just a note. If a
+# *live* interactive CLI still holds the checkout, resume refuses
 # (break-glass); stop that CLI first, then re-run with --force to take it over.
-<agent-bridge catalog argv[0]> resume <session-id|worktree-handle>
-<agent-bridge catalog argv[0]> resume <worktree-handle> --force   # affirmative take-over
+<agent-bridge catalog argv[0]> resume <session-id|worktree-handle|repo-or-agent>
+<agent-bridge catalog argv[0]> resume <worktree-handle|repo-or-agent> --force   # affirmative take-over
+
+# Retire the current session and continue in a fresh successor in place.
+<agent-bridge catalog argv[0]> handoff <session-id|worktree-handle|repo-or-agent>
 
 # End a session (full cleanup)
 <agent-bridge catalog argv[0]> end <session-id>
@@ -196,18 +300,34 @@ be discarded (or the cancel signature *persists* across sends). See the
 
 ### Service Control
 
-Use the `service` subcommands to control the long-running daemon. These
-delegate to the platform service manager (Windows scheduled task / Linux
-systemd user unit) that the installer registered, so they control the **same**
-instance that auto-starts at logon -- and they fall back to a detached spawn if
-no service manager is registered.
+Use the `service` subcommands to control the long-running daemon. `start`
+and `stop` delegate to the platform service manager (Windows scheduled task
+/ Linux systemd user unit) that the installer registered, so they control
+the **same** instance that auto-starts at logon -- and fall back to a
+detached spawn if no service manager is registered. `restart` is different:
+it never touches the platform service manager at all -- it invokes the same
+app-level ZDD cutover `deploy` uses, spawning a new daemon generation and
+handing off to it, leaving the platform-managed process replaced by that
+successor.
 
 ```bash
 agent-bridge service start      # start the daemon (no-op if already running) -- marketplace-isolation: allow service-management
 agent-bridge service stop       # stop the daemon (kills the worker + releases the port) -- marketplace-isolation: allow service-management
-agent-bridge service restart    # stop, wait for the port to release, start -- marketplace-isolation: allow service-management
+agent-bridge service restart    # zero-downtime cutover to a fresh daemon generation (same code path as `deploy`: spawn passive -> health-gate -> flip -> drain -> retire) -- marketplace-isolation: allow service-management
 agent-bridge service status     # running state + bound port + PID -- marketplace-isolation: allow service-management
 ```
+
+> **Never bypass `service restart` with the platform service manager
+> directly** -- `systemctl --user restart agent-bridge.service` on Linux, or
+> ending and rerunning the Windows scheduled task (`schtasks /End` then
+> `/Run` -- the task is registered `-MultipleInstances IgnoreNew`, so a bare
+> `schtasks /Run` while it's already active is simply ignored, not a
+> restart) -- that path is a raw stop-then-start with no health gate and no
+> coordinated cutover: existing sessions may still reattach after (the
+> shutdown path detaches for background recovery, and `KillMode=process` on
+> Linux lets a Session Host outlive the frontend), but callers see an
+> uncoordinated gap instead of `service restart`/`deploy`'s health-gated,
+> zero-downtime handoff.
 
 > **Note:** the payload-local `stop <session-id>` operation stops a *session*,
 > not the service. For the daemon, use the literal management command
@@ -283,7 +403,7 @@ rather than taking it over. Use a dedicated target with no existing session.
 ### Graceful Redeploy (routing table + drain + installer-driven cutover)
 
 A redeploy no longer has to hard-kill live work. Clients resolve the daemon
-through a **routing table** (`~/.agent-bridge/active.json`) instead of the
+through a **routing table** (`~/.agent-bridge/active.json`) instead of the <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 static config port: `BridgeClient.from_config()` reads the table first and falls
 back to `config.yaml` when it is absent (so the table is inert until a daemon
 publishes it). This lets a new daemon come up on a fresh port, the table flip to
@@ -394,12 +514,12 @@ agent-bridge elevated stop --deregister # marketplace-isolation: allow elevated-
 These commands modify **user-level bridge state**, not repository content.
 First edit and publish topology through the repository's normal worktree and
 contribution flow; then adopt from the canonical checkout to project that
-published state into `~/.agent-bridge/config.yaml`.
+published state into `~/.agent-bridge/config.yaml`. <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 
 ```bash
 # Show current config
 <agent-bridge catalog argv[0]> config show
-<agent-bridge catalog argv[0]> config show --json
+<agent-bridge catalog argv[0]> --json config show
 
 # Add/update a topology profile for a repo
 <agent-bridge catalog argv[0]> config adopt --repo /path/to/repo --profile multi-machine system
@@ -415,7 +535,7 @@ Explicit `--machines-yaml` and `--agents-config` arguments remain exact even
 when `--repo` itself is canonicalized to the anchor. If such a path names a
 temporary worktree, removing that worktree strands the profile; `config
 validate` reports the missing file. Before re-adopting from canonical source
-paths, back up the profile stanza in `~/.agent-bridge/config.yaml`, including
+paths, back up the profile stanza in `~/.agent-bridge/config.yaml`, including <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 `default_copilot_args` and `default_env`; adoption replaces the profile and
 those spawn defaults must be restored afterward.
 

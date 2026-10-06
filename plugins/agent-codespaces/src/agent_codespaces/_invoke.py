@@ -1,42 +1,121 @@
-"""Resolve a cmd.exe-free way to invoke this plugin as a module.
-
-On Windows, agent-bridge spawns provider commands via ``cmd.exe /d /s /c``
-whenever the executable is a ``.cmd`` (see
-``agent_bridge.transport._wrap_batch_for_windows``). ``cmd.exe`` expands
-``%VAR%`` tokens in the forwarded arguments -- e.g. inside the
-``--remote-cmd`` payload -- which mangles them before the Python CLI ever
-sees ``argv``. To avoid that layer entirely, callers invoke the venv
-interpreter directly with ``-m agent_codespaces`` rather than the
-``~/.local/bin/agent-codespaces.cmd`` binstub. ``CreateProcess`` runs the
-signed ``python.exe`` directly (no cmd.exe), so arguments are parsed with
-the same MSVCRT rules the caller used to quote them -- verbatim.
-"""
+"""Resolve payload-local and module launch paths for agent-codespaces."""
 
 from __future__ import annotations
 
+import json
+import os
+import re
 import sys
+from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 _PACKAGE = "agent_codespaces"
-_VENV_DIR = Path.home() / ".agent-codespaces" / ".venv"
-_BIN_DIR = Path.home() / ".local" / "bin"
+_DIST_NAME = "agent-codespaces"
+
+#: Slot-interpreter subpaths, POSIX then Windows (matches agent-dispatch's
+#: ``procutil._SLOT_PYTHON_SUBPATHS`` / ``resolve-runtime.ps1``).
+_SLOT_PYTHON_SUBPATHS = ("bin/python", "Scripts/python.exe")
+
+
+def _runtime_root() -> Path:
+    _legacy_dirname = ".agent-codespaces"  # marketplace-isolation: allow legacy compatibility root
+    override = os.environ.get("AGENT_CODESPACES_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    sandbox = os.environ.get("AGENT_HOME", "").strip()
+    if sandbox:
+        return Path(sandbox).expanduser() / _legacy_dirname
+    return Path.home() / _legacy_dirname
+
+
+def _slot_python(root: Path, version: str) -> Path | None:
+    """The interpreter inside ``<root>/versions/<version>``, or ``None``."""
+    if not version:
+        return None
+    vdir = root / "versions" / version
+    for sub in _SLOT_PYTHON_SUBPATHS:
+        p = vdir / sub
+        if p.is_file():
+            return p
+    return None
+
+
+def _read_marker(root: Path, name: str) -> str | None:
+    """Read a plain-text marker file (``current-version`` / ``last-known-good``)."""
+    try:
+        return (root / name).read_text(encoding="utf-8").strip() or None
+    except (OSError, ValueError):
+        return None
+
+
+def _version_sort_key(version: str) -> str:
+    """Version-aware sort key: zero-pad each numeric run (matches
+    agent-dispatch's ``procutil._version_sort_key`` / ``resolve-runtime.ps1``)."""
+    return re.sub(r"\d+", lambda m: m.group().zfill(10), version)
+
+
+def _list_versions(root: Path) -> list[str]:
+    """Installed version slot names, sorted oldest -> newest (newest last)."""
+    try:
+        names = [d.name for d in (root / "versions").iterdir() if d.is_dir()]
+    except OSError:
+        return []
+    return sorted(names, key=_version_sort_key)
+
+
+def _resolve_runtime_python(root: Path) -> Path | None:
+    """Canonically resolve this plugin's own versioned-runtime interpreter.
+
+    Mirrors agent-dispatch's ``procutil.resolve_runtime_python``: the
+    ``current-version`` marker is authoritative, ``last-known-good`` is the
+    fallback, then the newest complete installed slot, then any newest slot.
+    Never falls back to a PATH python -- returns ``None`` when no runtime is
+    installed so the caller degrades deliberately (to ``sys.executable``, the
+    one legitimate last resort -- see ``_venv_python``).
+    """
+    p = _slot_python(root, _read_marker(root, "current-version") or "")
+    if p is not None:
+        return p
+    p = _slot_python(root, _read_marker(root, "last-known-good") or "")
+    if p is not None:
+        return p
+    versions = _list_versions(root)  # newest last
+    for ver in reversed(versions):
+        if (root / "versions" / ver / ".install-complete.json").is_file():
+            p = _slot_python(root, ver)
+            if p is not None:
+                return p
+    for ver in reversed(versions):
+        p = _slot_python(root, ver)
+        if p is not None:
+            return p
+    return None
 
 
 def _venv_python() -> str:
     """Return the interpreter that has ``agent_codespaces`` installed.
 
-    Prefers the plugin's dedicated venv (the same interpreter the ``.cmd``
-    binstub targets); falls back to the current interpreter -- e.g. the
-    agent-bridge daemon venv, which carries the provider plugins as
-    siblings -- when the dedicated venv is absent.
+    Resolves the installed versioned-runtime slot (``versions/<current-
+    version>``, the same three-tier resolution the binstubs and service
+    launchers use) -- NOT a hard-coded legacy ``.venv`` path, which no longer
+    exists once a runtime migrates to the versioned-slot layout and would
+    silently fall through to ``sys.executable`` (the current process's own
+    interpreter) on every call. Trusting whatever interpreter happens to be
+    running the *current* process is a footgun: it can diverge from the
+    installed current-version slot and, because a detached self-relaunch
+    child inherits whatever its parent resolved, that divergence propagates
+    down the entire spawn tree -- the exact pattern already found and fixed
+    in ``agent_dispatch.procutil.resolve_own_runtime_python`` (a live
+    incident: a correctly-running coordinator/supervisor pair each spawning a
+    full duplicate tree under the system Python install instead of the
+    versioned slot). Falls back to ``sys.executable`` only when no installed
+    runtime resolves at all (e.g. a dev/test environment with no real
+    install).
     """
-    if sys.platform == "win32":
-        cand = _VENV_DIR / "Scripts" / "python.exe"
-    else:
-        cand = _VENV_DIR / "bin" / "python"
-    if cand.exists():
-        return str(cand)
-    return sys.executable
+    resolved = _resolve_runtime_python(_runtime_root())
+    return str(resolved) if resolved is not None else sys.executable
 
 
 def module_argv() -> list[str]:
@@ -48,30 +127,89 @@ def module_argv() -> list[str]:
     return [_venv_python(), "-m", _PACKAGE]
 
 
-def binstub() -> str | None:
-    """Absolute path to the version-stable agent-codespaces binstub, or None.
+def _deploy_manifest_source_root() -> Path | None:
+    manifest = _runtime_root() / "deploy-manifest.json"
+    if not manifest.is_file():
+        return None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+    source_path = str((data or {}).get("source", {}).get("path") or "").strip()
+    if not source_path:
+        return None
+    candidate = Path(source_path).expanduser()
+    if candidate.is_dir() and (candidate / "plugin.json").is_file():
+        return candidate.resolve()
+    return None
 
-    The binstub (``~/.local/bin/agent-codespaces[.cmd]``) resolves the CURRENT
-    versioned runtime at each launch, so a persisted command that routes through
-    it survives a runtime upgrade that prunes ``versions/<ver>/`` -- unlike the
-    versioned interpreter :func:`_venv_python` pins. Only safe to spawn when no
-    shell-mangling-prone payload rides in argv (see :func:`dispatch_argv`).
-    """
-    name = "agent-codespaces.cmd" if sys.platform == "win32" else "agent-codespaces"
-    cand = _BIN_DIR / name
+
+def _direct_url_source_root() -> Path | None:
+    try:
+        payload_dist = distribution(_DIST_NAME)
+    except PackageNotFoundError:
+        return None
+    try:
+        payload = payload_dist.read_text("direct_url.json")
+    except FileNotFoundError:
+        return None
+    if not payload:
+        return None
+    try:
+        data = json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    url = str((data or {}).get("url") or "").strip()
+    if not url:
+        return None
+    candidate = _path_from_file_url(url)
+    if candidate is None:
+        return None
+    if candidate.is_dir() and (candidate / "plugin.json").is_file():
+        return candidate.resolve()
+    return None
+
+
+def _path_from_file_url(url: str) -> Path | None:
+    parsed = urlparse(url)
+    if parsed.scheme != "file":
+        return None
+    path = url2pathname(parsed.path)
+    if parsed.netloc and parsed.netloc.casefold() != "localhost":
+        return Path(f"//{parsed.netloc}{path}")
+    return Path(path)
+
+
+def _payload_root() -> Path:
+    env_payload = os.environ.get("COPILOT_PLUGIN_ROOT", "").strip()
+    if env_payload:
+        candidate = Path(env_payload).expanduser()
+        if candidate.is_dir() and (candidate / "plugin.json").is_file():
+            return candidate.resolve()
+    candidate = Path(__file__).resolve().parents[2]
+    if candidate.is_dir() and (candidate / "plugin.json").is_file():
+        return candidate
+    direct_url_root = _direct_url_source_root()
+    if direct_url_root is not None:
+        return direct_url_root
+    manifest_root = _deploy_manifest_source_root()
+    if manifest_root is not None:
+        return manifest_root
+    return candidate
+
+
+def binstub() -> str | None:
+    """Absolute path to this payload's shim, or None when it is unavailable."""
+    name = (
+        "agent-codespaces.cmd"
+        if sys.platform == "win32"
+        else "agent-codespaces"
+    )
+    cand = _payload_root() / "bin" / name
     return str(cand) if cand.exists() else None
 
 
 def dispatch_argv() -> list[str]:
-    """Argv prefix for a *persisted* spawn that must survive a runtime upgrade.
-
-    Prefers the version-stable :func:`binstub` over the pinned versioned
-    interpreter of :func:`module_argv`, so a resume never launches a python.exe
-    under a ``versions/<ver>/`` slot a later upgrade pruned. Callers MUST keep
-    argv free of shell-mangling-prone tokens -- route any complex payload through
-    a file (e.g. ``ssh --remote-cmd-file``) -- because the binstub is invoked via
-    cmd.exe on Windows. Falls back to :func:`module_argv` when the binstub is
-    absent.
-    """
+    """Argv prefix for a persisted spawn pinned to this payload root."""
     stub = binstub()
     return [stub] if stub is not None else module_argv()

@@ -26,6 +26,29 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+# === install-contract:test-persistent-environment -- keep byte-identical across installers ===
+function Get-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    return [Environment]::GetEnvironmentVariable($Name, $effectiveTarget)
+}
+
+function Set-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [AllowNull()][string]$Value,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    [Environment]::SetEnvironmentVariable($Name, $Value, $effectiveTarget)
+}
+# === end install-contract:test-persistent-environment ===
+
 # === install-contract:v4 self-stage -- keep byte-identical across plugins ===
 # dotfiles #935: a plugin installer reads its own payload (src/, libs/,
 # pyproject.toml) to build the venv, so while it runs -- especially if it wedges
@@ -196,6 +219,7 @@ if (-not $env:UV_HTTP_TIMEOUT) { $env:UV_HTTP_TIMEOUT = '60' }
 function Write-Ok      { param([string]$Msg) Write-Host "  [OK]   $Msg" -ForegroundColor Green }
 function Write-Skip    { param([string]$Msg) Write-Host "  [SKIP] $Msg" -ForegroundColor Cyan }
 function Write-Fail    { param([string]$Msg) Write-Host "  [FAIL] $Msg" -ForegroundColor Red }
+function Write-Warn    { param([string]$Msg) Write-Host "  [WARN] $Msg" -ForegroundColor Yellow }
 function Write-Step    { param([string]$Msg) Write-Host "  ...    $Msg" -ForegroundColor DarkGray }
 
 # -- Paths --------------------------------------------------------------
@@ -257,6 +281,25 @@ if (-not (Test-Path (Join-Path $CredRelayDir 'pyproject.toml'))) {
 $CfgMigrateDir = Join-Path $PluginDir 'libs\config-migrate'
 if (-not (Test-Path (Join-Path $CfgMigrateDir 'pyproject.toml'))) {
     $CfgMigrateDir = Join-Path (Split-Path -Parent (Split-Path -Parent $PluginDir)) 'libs\config-migrate'
+}
+# zdd dir (uv-editable canonical reference in a dev checkout, real copy in a
+# materialized release payload): plugin-vendored or repo-root.
+$ZddDir = Join-Path $PluginDir 'libs\zdd'
+if (-not (Test-Path (Join-Path $ZddDir 'pyproject.toml'))) {
+    $ZddDir = Join-Path (Split-Path -Parent (Split-Path -Parent $PluginDir)) 'libs\zdd'
+}
+# venue-copilot dir (uv-editable canonical reference in a dev checkout, real
+# copy in a materialized release payload): plugin-vendored or repo-root.
+$VenueCopilotDir = Join-Path $PluginDir 'libs\venue-copilot'
+if (-not (Test-Path (Join-Path $VenueCopilotDir 'pyproject.toml'))) {
+    $VenueCopilotDir = Join-Path (Split-Path -Parent (Split-Path -Parent $PluginDir)) 'libs\venue-copilot'
+}
+# session-liveness-probe dir (uv-editable canonical reference in a dev
+# checkout, real copy in a materialized release payload): plugin-vendored or
+# repo-root.
+$SessionLivenessProbeDir = Join-Path $PluginDir 'libs\session-liveness-probe'
+if (-not (Test-Path (Join-Path $SessionLivenessProbeDir 'pyproject.toml'))) {
+    $SessionLivenessProbeDir = Join-Path (Split-Path -Parent (Split-Path -Parent $PluginDir)) 'libs\session-liveness-probe'
 }
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 
@@ -459,8 +502,10 @@ setlocal
 set "PYTHONUTF8=1"
 set "_PS1=%USERPROFILE%\.local\bin\agent-containers.ps1"
 if not exist "%_PS1%" (echo [agent-containers] binstub not found: %_PS1%>&2 & exit /b 127)
-where pwsh >nul 2>&1
-if %ERRORLEVEL%==0 (pwsh -NoProfile -ExecutionPolicy Bypass -File "%_PS1%" %*) else (powershell -NoProfile -ExecutionPolicy Bypass -File "%_PS1%" %*)
+set "_PSHOST="
+for /f "delims=" %%I in ('"%SystemRoot%\System32\where.exe" pwsh 2^>nul') do if not defined _PSHOST set "_PSHOST=%%I"
+if not defined _PSHOST set "_PSHOST=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+"%_PSHOST%" -NoProfile -ExecutionPolicy Bypass -File "%_PS1%" %*
 exit /b %ERRORLEVEL%
 '@
     [System.IO.File]::WriteAllText($cmdPath, $cmdContent, $utf8NoBom)
@@ -537,7 +582,21 @@ if (-not $pythonCmd) {
 Write-Ok "Python: $pythonCmd"
 
 if (Get-Command docker -ErrorAction SilentlyContinue) {
-    $dockerVer = & docker --version 2>$null
+    $dockerPath = (Get-Command docker -ErrorAction Stop).Source
+    $dockerStart = [Diagnostics.ProcessStartInfo]::new()
+    $dockerStart.FileName = $dockerPath
+    if ($dockerStart.PSObject.Properties.Name -contains 'ArgumentList') {
+        [void]$dockerStart.ArgumentList.Add('--version')
+    } else {
+        $dockerStart.Arguments = '--version'
+    }
+    $dockerStart.UseShellExecute = $false
+    $dockerStart.CreateNoWindow = $true
+    $dockerStart.RedirectStandardOutput = $true
+    $dockerStart.RedirectStandardError = $false
+    $dockerProcess = [Diagnostics.Process]::Start($dockerStart)
+    $dockerVer = $dockerProcess.StandardOutput.ReadToEnd().Trim()
+    $dockerProcess.WaitForExit()
     Write-Ok "Docker: $dockerVer"
 } else {
     # Non-fatal: an installer must not fail on a missing prerequisite other than
@@ -545,7 +604,7 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
     # venv still install fine on a machine without it (matches init.sh's
     # `command -v docker` guard). Calling `docker` unguarded here throws a
     # CommandNotFoundException under ErrorActionPreference=Stop and aborts the
-    # reconcile with exit 1 on every Docker-less box (e.g. augloop1).
+    # reconcile with exit 1 on every Docker-less box (e.g. box1).
     Write-Step 'docker CLI not found -- agent-containers fleet operations unavailable on this machine (non-fatal)'
 }
 
@@ -557,7 +616,7 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
         $ErrorActionPreference = 'Continue'
         & winget install --id astral-sh.uv --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
         $ErrorActionPreference = $prevEAP
-        $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+        $env:PATH = (Get-CopilotPersistentEnvironmentVariable -Name 'PATH' -Target 'Machine') + ';' + (Get-CopilotPersistentEnvironmentVariable -Name 'PATH' -Target 'User')
         if (Get-Command uv -ErrorAction SilentlyContinue) { Write-Ok 'uv installed' }
     }
 }
@@ -620,35 +679,161 @@ if ($Force -or -not (Test-Path $VenvPython)) {
 
 # -- 3. Install the package into the venv (uv pip install) -------------
 
+function Invoke-BoundedPackageCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$Executable,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+    $logPath = [System.IO.Path]::GetTempFileName()
+    try {
+        $global:LASTEXITCODE = 1
+        & $Executable @Arguments *> $logPath
+        $code = $LASTEXITCODE
+        $tail = @()
+        if ($code -ne 0) {
+            $tail = @(Get-Content -LiteralPath $logPath -Tail 40 -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    ([string]$_) `
+                        -replace '(?i)(https?://)[^/\s@]+@', '$1***@' `
+                        -replace '(?i)((?:token|password|secret)=)[^&\s]+', '$1***'
+                })
+        }
+        [pscustomobject]@{ Code = $code; Tail = $tail }
+    } finally {
+        Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Write-PackageDiagnostics {
+    param([string[]]$Lines)
+    foreach ($line in $Lines) {
+        Write-Warn "package-manager: $line"
+    }
+}
+
 $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 # Pre-strip any locked console-script trampoline so uv can overwrite it (os err 5).
 Remove-ConsoleTrampolines -VenvDir $VenvDir
 if (Get-Command uv -ErrorAction SilentlyContinue) {
-    # credential-relay first (vendored lib), force-reinstalled so local code
-    # changes propagate even without a version bump; then agent-containers.
+    # credential-relay/config-migrate/zdd/venue-copilot/session-liveness-probe
+    # first (workspace path deps), force-reinstalled so local code changes
+    # propagate even without a version bump; then agent-containers.
     if (Test-Path (Join-Path $CredRelayDir 'pyproject.toml')) {
-        & uv pip install --python $VenvPython --reinstall-package agent-credential-relay "$CredRelayDir" --quiet 2>&1 | Out-Null
+        $result = Invoke-BoundedPackageCommand -Executable 'uv' -Arguments @(
+            'pip', 'install', '--python', $VenvPython, '--reinstall-package',
+            'agent-credential-relay', "$CredRelayDir", '--quiet'
+        )
+        if ($result.Code -ne 0) {
+            Write-Fail 'credential-relay install failed'
+            Write-PackageDiagnostics $result.Tail
+            $ErrorActionPreference = $prevEAP
+            exit 1
+        }
     } else {
         Write-Fail "credential-relay source not found at $CredRelayDir"
         $ErrorActionPreference = $prevEAP
         exit 1
     }
     if (Test-Path (Join-Path $CfgMigrateDir 'pyproject.toml')) {
-        & uv pip install --python $VenvPython --reinstall-package agent-config-migrate "$CfgMigrateDir" --quiet 2>&1 | Out-Null
+        $result = Invoke-BoundedPackageCommand -Executable 'uv' -Arguments @(
+            'pip', 'install', '--python', $VenvPython, '--reinstall-package',
+            'agent-config-migrate', "$CfgMigrateDir", '--quiet'
+        )
+        if ($result.Code -ne 0) {
+            Write-Fail 'config-migrate install failed'
+            Write-PackageDiagnostics $result.Tail
+            $ErrorActionPreference = $prevEAP
+            exit 1
+        }
     } else {
         Write-Fail "config-migrate source not found at $CfgMigrateDir"
         $ErrorActionPreference = $prevEAP
         exit 1
     }
-    & uv pip install --python $VenvPython "$PluginDir" --quiet 2>&1 | Out-Null
+    if (Test-Path (Join-Path $ZddDir 'pyproject.toml')) {
+        $result = Invoke-BoundedPackageCommand -Executable 'uv' -Arguments @(
+            'pip', 'install', '--python', $VenvPython, '--reinstall-package',
+            'agent-zdd', "$ZddDir", '--quiet'
+        )
+        if ($result.Code -ne 0) {
+            Write-Fail 'zdd install failed'
+            Write-PackageDiagnostics $result.Tail
+            $ErrorActionPreference = $prevEAP
+            exit 1
+        }
+    } else {
+        Write-Fail "zdd source not found at $ZddDir"
+        $ErrorActionPreference = $prevEAP
+        exit 1
+    }
+    if (Test-Path (Join-Path $VenueCopilotDir 'pyproject.toml')) {
+        $result = Invoke-BoundedPackageCommand -Executable 'uv' -Arguments @(
+            'pip', 'install', '--python', $VenvPython, '--reinstall-package',
+            'agent-venue-copilot', "$VenueCopilotDir", '--quiet'
+        )
+        if ($result.Code -ne 0) {
+            Write-Fail 'venue-copilot install failed'
+            Write-PackageDiagnostics $result.Tail
+            $ErrorActionPreference = $prevEAP
+            exit 1
+        }
+    } else {
+        Write-Fail "venue-copilot source not found at $VenueCopilotDir"
+        $ErrorActionPreference = $prevEAP
+        exit 1
+    }
+    if (Test-Path (Join-Path $SessionLivenessProbeDir 'pyproject.toml')) {
+        $result = Invoke-BoundedPackageCommand -Executable 'uv' -Arguments @(
+            'pip', 'install', '--python', $VenvPython, '--reinstall-package',
+            'agent-session-liveness-probe', "$SessionLivenessProbeDir", '--quiet'
+        )
+        if ($result.Code -ne 0) {
+            Write-Fail 'session-liveness-probe install failed'
+            Write-PackageDiagnostics $result.Tail
+            $ErrorActionPreference = $prevEAP
+            exit 1
+        }
+    } else {
+        Write-Fail "session-liveness-probe source not found at $SessionLivenessProbeDir"
+        $ErrorActionPreference = $prevEAP
+        exit 1
+    }
+    $providerResult = Invoke-BoundedPackageCommand -Executable 'uv' -Arguments @(
+        'pip', 'install', '--python', $VenvPython,
+        "${PluginDir}[provider-exec]", '--quiet'
+    )
+    if ($providerResult.Code -eq 0) {
+        $pkgResult = 0
+    } else {
+        Write-Warn 'Could not install the optional provider-exec SSH transport; falling back to the base package'
+        Write-PackageDiagnostics $providerResult.Tail
+        $baseResult = Invoke-BoundedPackageCommand -Executable 'uv' -Arguments @(
+            'pip', 'install', '--python', $VenvPython, "$PluginDir", '--quiet'
+        )
+        $pkgResult = $baseResult.Code
+        $pkgTail = $baseResult.Tail
+    }
 } else {
-    & $VenvPython -m pip install --quiet "$PluginDir" 2>&1 | Out-Null
+    $providerResult = Invoke-BoundedPackageCommand -Executable $VenvPython -Arguments @(
+        '-m', 'pip', 'install', '--quiet', "${PluginDir}[provider-exec]"
+    )
+    if ($providerResult.Code -eq 0) {
+        $pkgResult = 0
+    } else {
+        Write-Warn 'Could not install the optional provider-exec SSH transport; falling back to the base package'
+        Write-PackageDiagnostics $providerResult.Tail
+        $baseResult = Invoke-BoundedPackageCommand -Executable $VenvPython -Arguments @(
+            '-m', 'pip', 'install', '--quiet', "$PluginDir"
+        )
+        $pkgResult = $baseResult.Code
+        $pkgTail = $baseResult.Tail
+    }
 }
-$pkgResult = $LASTEXITCODE
 $ErrorActionPreference = $prevEAP
 if ($pkgResult -ne 0) {
     Write-Fail 'Failed to install agent-containers package into venv'
+    Write-PackageDiagnostics $pkgTail
     exit 1
 }
 
@@ -766,9 +951,9 @@ $pathDirs = $env:PATH -split ';'
 if ($pathDirs -contains $LocalBin) {
     Write-Ok "PATH: $LocalBin is on PATH"
 } else {
-    $currentUserPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+    $currentUserPath = Get-CopilotPersistentEnvironmentVariable -Name 'PATH' -Target 'User'
     if (-not ($currentUserPath -split ';' | Where-Object { $_ -eq $LocalBin })) {
-        [System.Environment]::SetEnvironmentVariable('PATH', "$LocalBin;$currentUserPath", 'User')
+        Set-CopilotPersistentEnvironmentVariable -Name 'PATH' -Value "$LocalBin;$currentUserPath" -Target 'User'
         $env:PATH = "$LocalBin;$env:PATH"
         Write-Ok "PATH: Added $LocalBin to User PATH"
     }

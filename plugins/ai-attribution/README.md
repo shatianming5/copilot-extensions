@@ -4,40 +4,49 @@
 > agent works.
 
 `ai-attribution` is a payload-only Copilot CLI plugin. A dependency-free
-`sessionStart` hook emits a concise, attributable policy kernel in git
-repositories, while an on-demand skill supplies the detailed publication
-workflow. There is no runtime, venv, daemon, binstub, installer, network call,
-or authentication requirement.
+`sessionStart` hook writes a concise, attributable policy kernel to the exact
+session's guidance file and emits only `{}`, while a checked-in instruction
+pointer tells the agent where to read it. An on-demand skill supplies the
+detailed publication workflow. There is no runtime, venv, daemon, binstub,
+installer, network call, or authentication requirement.
 
 The plugin realizes the
 [`harness-guidance`](../../visions/harness-guidance/README.md) vision's
 authoritative ownership, concise context kernel, portable operator policy, and
-resilient safety boundary through the
-[`context-injection`](../../docs/patterns/context-injection.md) pattern.
+resilient safety boundary through the exact-session dynamic-guidance pattern.
 
 ## What it does (and how to use it)
 
 | Entry point | When it applies | Result |
 |-------------|-----------------|--------|
-| `sessionStart` hook | Every session whose launch payload names a git repository | Injects the generic publication-safety kernel, operator tightening, host-qualified local remote hint, and additive target-repo contribution-guide paths. |
+| `sessionStart` hook | Every session whose launch payload names a valid session and git repository | Writes the generic publication-safety kernel, operator tightening, host-qualified local remote hint, and additive target-repo contribution-guide paths to the exact session file; emits `{}`. The underlying policy computation is cached per repository (bounded TTL) so a session in an already-seen, unchanged repository skips re-spawning it. |
+| checked-in instruction projections | Every adopting repository | Preserve a static publication-safety fallback and a load-before-action pointer to the exact-session guidance file. |
 | `ai-attribution` skill | Preparing or auditing code, issues, pull requests, comments, releases, docs, or other published artifacts | Walks through audience and ownership classification, disclosure placement, public writing, sanitization, and live post-publication verification. |
 | `ai-attribution-setup` skill | Adopting or repairing the plugin in a repository | Idempotently reconciles the marked always-on fallback, configures host-qualified operator policy, and validates hook-less launch paths. |
 
 The ambient policy requires agents to:
 
-- determine audience and repository ownership before publishing;
-- prominently disclose AI assistance at the top of contributions to another
-  party's repository;
-- omit disclosure by default in **verified** operator-owned repositories unless
-  the operator explicitly requests it or policy tightens it to always;
+- determine the audience of this specific contribution (self-authored with no
+  other party's content or participation yet, a reply to an automated review
+  bot's own comment thread, or a response to another party's PR/issue/thread)
+  and whether the target host is configured as operator-only (`internal_host`)
+  before publishing;
+- prominently disclose AI assistance at the top of a contribution addressing
+  another party -- in every repository, public or private, including one the
+  operator owns -- even when it also engages with bot findings;
+- omit disclosure by default only for a genuinely self-authored contribution,
+  an inline bot-comment-only reply, or one on a configured `internal_host`,
+  unless the operator explicitly requests it or policy tightens it to always;
 - keep public artifacts persona-neutral and scrub private identifiers,
   credentials, paths, hosts, accounts, record IDs, and private rationale;
 - write public contributions in first-person singular and follow target-repo
   conventions;
 - audit the live published surface after publication.
 
-Local git remotes provide ownership hints only. No remote inference is treated
-as proof, and uncertainty uses the third-party policy.
+Local git remotes provide ownership and host hints only (resolved from the
+configured **push** target, not the fetch source, so an internal fetch mirror
+with an external push destination is never silently exempted). No remote
+inference is treated as proof, and uncertainty uses the third-party policy.
 
 ### Typical setup
 
@@ -55,9 +64,9 @@ as proof, and uncertainty uses the third-party policy.
 3. Optionally add the target repo's additive
    `.github/ai-attribution.conf`, following
    [`examples/repository.ai-attribution.conf`](examples/repository.ai-attribution.conf).
-4. Launch Copilot in a git repository. The hook supplies ambient policy
-   automatically; invoke **`ai-attribution`** for the detailed workflow before
-   publication.
+4. Launch Copilot in a git repository. The pointer loads the exact-session file
+   written by the hook; invoke **`ai-attribution`** for the detailed workflow
+   before publication.
 
 The safe generic policy is emitted when no config exists. See
 [docs/configuration.md](docs/configuration.md) for the exact `key=value`
@@ -76,7 +85,9 @@ grammar, keys, precedence, authority boundaries, and diagnostics.
 - Host-qualified local git remote hints without network access.
 - A detailed publication and sanitization skill.
 - An explicit setup skill for the stable static fallback and operator policy.
-- Equivalent dependency-free Bash and PowerShell hooks.
+- Equivalent dependency-free Bash and PowerShell writers and policy emitters.
+- A retained emitter seam for direct plugin-owned `additionalContext` after
+  native host composition is proven at the supported version floor.
 
 **Does not provide**
 
@@ -92,7 +103,8 @@ grammar, keys, precedence, authority boundaries, and diagnostics.
 
 ## Dependencies & assumptions
 
-- Copilot CLI must support command-type `sessionStart` hooks.
+- Copilot CLI must support command-type `sessionStart` hooks and expose
+  `sessionId` in the launch payload.
 - `git` must be available for repository gating and local remote inspection.
 - On POSIX, `bash` is required. On Windows, PowerShell 5.1 or `pwsh` is
   required.
@@ -105,9 +117,12 @@ grammar, keys, precedence, authority boundaries, and diagnostics.
 
 | Path | Purpose |
 |------|---------|
-| `hooks.json` | Registers the cross-platform `sessionStart` command. |
+| `hooks.json` | Registers the output-free cross-platform exact-session writer. |
+| `session-context.json` | Proves the writer is restart-safe and emits no model context. |
 | `scripts/emit-policy.sh` | Dependency-free Bash config parser, git gate, ownership hint, and JSON emitter. |
 | `scripts/emit-policy.ps1` | PowerShell implementation with parity-equivalent semantics and output. |
+| `scripts/write-session-guidance.*` | Cross-platform hook wrappers for the exact-session writer. |
+| `scripts/write_session_guidance.py` | Validates session identity and atomically writes the session guidance file. |
 | `skills/ai-attribution/SKILL.md` | Source of truth for the detailed on-demand publication workflow. |
 | `skills/ai-attribution-setup/SKILL.md` | Idempotent fallback adoption and operator-policy setup workflow. |
 | `docs/configuration.md` | Config grammar, keys, precedence, authority boundary, ownership inference, and failure behavior. |
@@ -116,14 +131,27 @@ grammar, keys, precedence, authority boundaries, and diagnostics.
 
 ## Troubleshooting, contributing & issues
 
-- **The hook emits `{}`:** run from inside a git worktree. Outside a repository,
-  the no-op is intentional.
+- **The hook emits `{}`:** that is the required output-free contract. Inspect the
+  exact session's `instructions/ai-attribution/session-guidance.instructions.md`
+  file to diagnose unavailable policy.
 - **A setting is ignored:** read stderr. Malformed, unknown, invalid, and
   unauthorized keys are diagnosed and ignored without weakening safe defaults.
-- **Ownership is unresolved or unexpectedly third-party:** configure the
-  public forge account as `owned_account=<host>/<account>` in operator scope; do
-  not place it in target-repo config. Still verify ownership before using the
-  disclosure-only own-repo exception.
+- **Ownership is unresolved or unexpectedly treated as addressing another
+  party:** configure the public forge account as
+  `owned_account=<host>/<account>` in operator scope; do not place it in
+  target-repo config. Still verify who this specific contribution actually
+  addresses before using the self-authored/bot-reply carve-out -- repository
+  ownership is a supporting hint, not the deciding fact.
+- **An internal-host repo still asks for disclosure:** configure the forge's
+  host as `internal_host=<host>` in operator scope.
+- **Guidance looks stale after a config/ownership change:** the computed
+  policy is cached per repository for up to
+  `AI_ATTRIBUTION_CACHE_TTL_SECONDS` (default 3600s) under
+  `~/.copilot/ai-attribution-cache/`, so the hook doesn't re-spawn the full
+  policy computation on every session start for an answer that hasn't
+  changed. Delete that cache directory, or set
+  `AI_ATTRIBUTION_FORCE_REFRESH=1` for one session, to force an immediate
+  recompute.
 
 Run the plugin suite and high-signal lint from the repository root:
 

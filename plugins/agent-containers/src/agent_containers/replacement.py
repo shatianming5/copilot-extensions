@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-import re
 import time
-import uuid
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 
-from .config import ContainersConfig, FleetConfig
+from session_liveness_probe import (
+    SessionLiveness,
+    build_probe_script,
+    parse_probe_output,
+)
+
+from .config import RESTRICTED_PROFILE, SECURITY_UID_LABEL, ContainersConfig, FleetConfig
 from .lease import (
     ProviderAdmissionError,
     active_session_admissions,
@@ -44,9 +48,6 @@ from .restricted_exec import (
     sanitized_exec_prefix,
 )
 
-_LOCK_LINE_RE = re.compile(
-    r"^LOCK\t([0-9a-fA-F-]{36})\t([1-9][0-9]*)\t(live|stale)$"
-)
 _CONFIRMATION_AND_CLEANUP_GRACE = 45.0
 _TERMINAL_STOPPED_STATES = {"exited", "created"}
 _ALLOWED_REPLACEMENT_DRIFT = {
@@ -55,17 +56,6 @@ _ALLOWED_REPLACEMENT_DRIFT = {
     "container image ID differs from provisioned image ID",
     "configured image reference differs from running image ID",
 }
-
-
-@dataclass
-class SessionLiveness:
-    """Non-cooperative in-container session-state probe result."""
-
-    state: str
-    active_sessions: list[str]
-    stale_sessions: list[str]
-    reason: str | None = None
-    session_state: str = "unknown"
 
 
 @dataclass
@@ -90,6 +80,10 @@ def probe_session_liveness(
 
     Docker executes the probe from the host. The session does not need to
     cooperate or publish provider/bridge state.
+
+    The probe script and output parser are shared with agent-codespaces via
+    the vendored ``session_liveness_probe`` lib (session-rescue-parity Phase
+    2); only the ``docker exec`` transport below is container-specific.
     """
     state = getattr(info, "state", "")
     if state == "paused":
@@ -101,48 +95,7 @@ def probe_session_liveness(
             [],
             "container is not running and tmpfs evidence is unavailable",
         )
-    script = r"""
-set -o pipefail
-root="$HOME/.copilot/session-state"
-test -d /proc
-if [ ! -e "$root" ]; then
-  printf 'ROOT\tabsent\n'
-else
-  test -d "$root"
-  printf 'ROOT\tpresent\n'
-  find "$root" -mindepth 2 -maxdepth 2 -type f -name 'inuse.*.lock' -print |
-  while IFS= read -r path; do
-    session="${path%/*}"
-    session="${session##*/}"
-    marker="${path##*/}"
-    pid="${marker#inuse.}"
-    pid="${pid%.lock}"
-    case "$pid" in
-      ''|*[!0-9]*) printf 'INVALID\t%s\t%s\n' "$session" "$marker"; continue ;;
-    esac
-    if [ -d "/proc/$pid" ]; then state=live; else state=stale; fi
-    printf 'LOCK\t%s\t%s\t%s\n' "$session" "$pid" "$state"
-  done
-fi
-scan=ok
-for proc in /proc/[0-9]*; do
-  pid="${proc##*/}"
-  [ "$pid" = "$$" ] && continue
-  [ "$pid" = "$PPID" ] && continue
-  if [ ! -r "$proc/cmdline" ]; then
-    [ -d "$proc" ] && scan=partial
-    continue
-  fi
-  command=$(tr '\000' ' ' < "$proc/cmdline") || {
-    [ -d "$proc" ] && scan=partial
-    continue
-  }
-  case "$command" in
-    *copilot*|*Copilot*|*--acp*) printf 'PROCESS\t%s\n' "$pid" ;;
-  esac
-done
-printf 'PROCESS_SCAN\t%s\n' "$scan"
-""".strip()
+    script = build_probe_script()
     try:
         result = _docker(
             [
@@ -157,104 +110,7 @@ printf 'PROCESS_SCAN\t%s\n' "$scan"
         )
     except RuntimeError as exc:
         return SessionLiveness("unknown", [], [], str(exc))
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        return SessionLiveness(
-            "unknown",
-            [],
-            [],
-            detail or "session-state probe failed",
-        )
-    lines = result.stdout.splitlines()
-    if not lines or lines[0] not in {"ROOT\tabsent", "ROOT\tpresent"}:
-        return SessionLiveness(
-            "unknown",
-            [],
-            [],
-            "session-state probe returned an invalid header",
-        )
-    active = []
-    stale = []
-    processes = []
-    scan_state = None
-    for line in lines[1:]:
-        if line.startswith("PROCESS\t"):
-            pid = line.split("\t", 1)[1]
-            if not pid.isdigit():
-                return SessionLiveness(
-                    "unknown",
-                    active,
-                    stale,
-                    "process backstop returned an invalid pid",
-                    lines[0].split("\t", 1)[1],
-                )
-            processes.append(pid)
-            continue
-        if line.startswith("PROCESS_SCAN\t"):
-            scan_state = line.split("\t", 1)[1]
-            if scan_state not in {"ok", "partial"}:
-                return SessionLiveness(
-                    "unknown",
-                    active,
-                    stale,
-                    "process backstop returned invalid status",
-                    lines[0].split("\t", 1)[1],
-                )
-            continue
-        match = _LOCK_LINE_RE.fullmatch(line)
-        if not match:
-            return SessionLiveness(
-                "unknown",
-                active,
-                stale,
-                "session-state probe returned an invalid marker",
-                lines[0].split("\t", 1)[1],
-            )
-        session_id, _pid, marker_state = match.groups()
-        try:
-            session_id = str(uuid.UUID(session_id))
-        except ValueError:
-            return SessionLiveness(
-                "unknown",
-                active,
-                stale,
-                "session-state probe found a non-UUID session marker",
-                lines[0].split("\t", 1)[1],
-            )
-        if marker_state == "live":
-            active.append(session_id)
-        else:
-            stale.append(session_id)
-    session_state = lines[0].split("\t", 1)[1]
-    if active:
-        return SessionLiveness(
-            "active",
-            sorted(set(active)),
-            sorted(set(stale)),
-            session_state=session_state,
-        )
-    if processes:
-        return SessionLiveness(
-            "unknown",
-            [],
-            sorted(set(stale)),
-            "Copilot-like process has no matching live session marker",
-            session_state,
-        )
-    if scan_state != "ok":
-        return SessionLiveness(
-            "unknown",
-            [],
-            sorted(set(stale)),
-            "process backstop was incomplete",
-            session_state,
-        )
-    return SessionLiveness(
-        "idle",
-        [],
-        sorted(set(stale)),
-        session_state=session_state,
-    )
+    return parse_probe_output(result.returncode, result.stdout, result.stderr)
 
 
 def destroy_restricted_member(
@@ -265,15 +121,29 @@ def destroy_restricted_member(
     operation: str,
     force_remove: bool,
     force_abandon: bool,
+    migrating: bool = False,
     timeout: float = 120.0,
 ) -> DestructiveResult:
-    """Rescue and remove one restricted member only after confirmed idleness."""
+    """Rescue and remove one restricted member only after confirmed idleness.
+
+    ``migrating`` additionally admits a member whose OWN discovered profile
+    is ``restricted`` even though ``fleet`` (the CURRENT containers.yaml
+    config) is no longer restricted -- e.g. a live ``restricted``-built
+    member being recreated under a relaxed-to-``trusted`` fleet entry. The
+    member still carries the restricted-only tmpfs session-liveness markers
+    and evidence this function exists to protect, so the rescue/liveness
+    pipeline below still applies in full; only the "does it still match the
+    CURRENT fleet's restricted policy" conformance check is skipped (that
+    check assumes the container is staying restricted, which during a
+    deliberate migration it is not).
+    """
     return _restricted_member_action(
         config,
         fleet,
         info,
         operation=operation,
         force_abandon=force_abandon,
+        migrating=migrating,
         action=lambda current, action_timeout: remove_container(
             current.container_id,
             force=force_remove,
@@ -313,6 +183,97 @@ def stop_restricted_member(
     )
 
 
+def rescue_capture_restricted_member(
+    config: ContainersConfig,
+    fleet: FleetConfig,
+    info: DockerContainerInfo,
+    *,
+    timeout: float = 60.0,
+) -> DestructiveResult:
+    """Rescue-capture one restricted member's session evidence, non-destructively.
+
+    Reuses the exact same admission/idleness gating as ``destroy_restricted_member``
+    and ``stop_restricted_member`` (never runs against a live/unknown session), but
+    performs no stop or remove afterward -- the container keeps running untouched.
+    """
+    return _restricted_member_action(
+        config,
+        fleet,
+        info,
+        operation="rescue-capture",
+        force_abandon=False,
+        action=None,
+        confirm=None,
+        action_timeout=timeout,
+        success_status="captured",
+    )
+
+
+def destroy_drifted_restricted_members(
+    config: ContainersConfig,
+    fleet: FleetConfig,
+    fleet_name: str,
+    members: list[DockerContainerInfo],
+    *,
+    operation: str,
+    force_abandon: bool,
+):
+    """Recreate each member whose discovered profile has drifted off its (now
+    non-restricted) fleet's current configuration.
+
+    Most members here are restricted-observed (the common migration case),
+    routed through the full restricted rescue/liveness pipeline via
+    ``destroy_restricted_member(..., migrating=True)`` -- never a
+    lightweight lease-only path. An unlabeled legacy member (discovered
+    ``security_profile == "unknown"``) has no supported migration path and
+    is deferred rather than passed to a helper that only accepts restricted
+    members. Independent per member (one bad apple never blocks the rest).
+    Returns a ``fleet.FleetOperationResult`` with
+    ``removed``/``deferred``/``rescues``/``telemetry_abandoned`` populated
+    (other fields left at their defaults).
+    """
+    from .fleet import FleetOperationResult
+
+    result = FleetOperationResult()
+    for member in members:
+        if getattr(member, "fleet", None) and member.fleet != fleet_name:
+            result.deferred[member.name] = (
+                f"container fleet label {member.fleet!r} conflicts with "
+                f"requested fleet {fleet_name!r}"
+            )
+            continue
+        if member.security_profile != RESTRICTED_PROFILE:
+            result.deferred[member.name] = (
+                f"discovered security profile {member.security_profile!r} "
+                "has no supported migration path; recreate it manually"
+            )
+            continue
+        decision = None
+        try:
+            decision = destroy_restricted_member(
+                config,
+                fleet,
+                member,
+                operation=operation,
+                force_remove=True,
+                force_abandon=force_abandon,
+                migrating=True,
+            )
+        except (RescueError, RuntimeError) as exc:
+            result.deferred[member.name] = str(exc)
+            continue
+        if decision.status == "removed":
+            result.removed.append(member.name)
+            if decision.rescue:
+                result.rescues[member.name] = decision.rescue
+            if decision.telemetry_abandoned:
+                result.telemetry_abandoned.append(member.name)
+        else:
+            result.deferred[member.name] = decision.reason or "replacement deferred"
+    return result
+
+
+
 def _restricted_member_action(
     config: ContainersConfig,
     fleet: FleetConfig,
@@ -320,13 +281,17 @@ def _restricted_member_action(
     *,
     operation: str,
     force_abandon: bool,
-    action: Callable[[DockerContainerInfo, float], None],
-    confirm: Callable[[DockerContainerInfo], bool],
+    action: Callable[[DockerContainerInfo, float], None] | None,
+    confirm: Callable[[DockerContainerInfo], bool] | None,
     action_timeout: float,
     success_status: str,
+    migrating: bool = False,
 ) -> DestructiveResult:
-    if not fleet.restricted:
-        raise RuntimeError("restricted destructive lifecycle requires a restricted fleet")
+    if not fleet.restricted and not (migrating and info.security_profile == RESTRICTED_PROFILE):
+        raise RuntimeError(
+            "restricted destructive lifecycle requires a restricted fleet, or "
+            "migrating=True with a restricted-observed member"
+        )
     user = fleet.exec_user or config.exec_user
     rescue_timeout = config.rescue.operation_timeout_seconds
     deadline = time.monotonic() + rescue_timeout
@@ -362,6 +327,12 @@ def _restricted_member_action(
                     "container identity changed before lifecycle check",
                 )
             if current.state == "paused":
+                if action is None:
+                    return DestructiveResult(
+                        info.name,
+                        "deferred",
+                        "container is paused; capture-only never unpauses it",
+                    )
                 try:
                     unpause_container(current.container_id)
                 except RuntimeError as exc:
@@ -392,6 +363,17 @@ def _restricted_member_action(
                 )
 
             inspected = inspect_container(current.container_id)
+            if migrating:
+                # Probing/rescue run `docker exec` inside the OLD
+                # container; the CURRENT fleet's exec_user may not exist
+                # there if it changed with the migration. Use the
+                # container's own recorded UID (Docker accepts a numeric
+                # `-u`) instead of today's config.
+                migrated_uid = (
+                    (inspected.get("Config") or {}).get("Labels") or {}
+                ).get(SECURITY_UID_LABEL)
+                if migrated_uid:
+                    user = migrated_uid
             try:
                 generation = container_generation(inspected)
             except RescueError as exc:
@@ -406,11 +388,23 @@ def _restricted_member_action(
                 workspace_folder=fleet.workspace_folder or config.workspace_folder,
                 exec_user=user,
                 inspected=inspected,
+                migrating=migrating,
+            )
+            # The provisioned-image-ID check is a FIXED invariant during a
+            # migration (the container's own image genuinely hasn't
+            # changed), so it must NOT be tolerated there -- only the
+            # ordinary restricted-recreate-on-image-rebuild case (where the
+            # fleet's image was deliberately rebuilt) allows this drift.
+            _image_id_drift = "container image ID differs from provisioned image ID"
+            allowed_drift = (
+                _ALLOWED_REPLACEMENT_DRIFT - {_image_id_drift}
+                if migrating
+                else _ALLOWED_REPLACEMENT_DRIFT
             )
             unsafe_policy_errors = [
                 error
                 for error in policy_errors
-                if error not in _ALLOWED_REPLACEMENT_DRIFT
+                if error not in allowed_drift
             ]
             if unsafe_policy_errors:
                 return DestructiveResult(
@@ -421,6 +415,12 @@ def _restricted_member_action(
                 )
 
             if not current.is_running:
+                if action is None:
+                    return DestructiveResult(
+                        info.name,
+                        "deferred",
+                        "container is not running; nothing to capture",
+                    )
                 existing_rescue = verified_capture_for_instance(
                     info.name,
                     info.container_id,
@@ -536,6 +536,7 @@ def _restricted_member_action(
                     container_instance=info.container_id,
                     user=user,
                     deadline=deadline,
+                    migrating=migrating,
                 )
             except (RescueError, OSError) as exc:
                 if not force_abandon:
@@ -616,15 +617,16 @@ def _restricted_member_action(
                 if rescue_pin is not None:
                     verify_pinned_capture(rescue_pin)
                 _verify_generation(latest.container_id, generation)
-                _perform_action(
-                    info.name,
-                    hold.token,
-                    hold.expires_at,
-                    latest,
-                    action=action,
-                    confirm=confirm,
-                    action_timeout=action_timeout,
-                )
+                if action is not None:
+                    _perform_action(
+                        info.name,
+                        hold.token,
+                        hold.expires_at,
+                        latest,
+                        action=action,
+                        confirm=confirm,
+                        action_timeout=action_timeout,
+                    )
                 return DestructiveResult(
                     info.name,
                     success_status,

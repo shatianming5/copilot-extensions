@@ -56,6 +56,14 @@ robust across `copilot` versions and records the CLI surface + full logs it saw.
 - A `gh` login (or a `COPILOT_GITHUB_TOKEN`/PAT) for a **Copilot-entitled**
   account — injected automatically so no in-container login is needed.
 
+Tier-P scenarios whose manifest explicitly declares `auth.copilot: "none"`
+use the unauthenticated base image without looking up or injecting host
+credentials. The Agent Machines installation-cell scenario keeps build and
+hashing fixtures on the disposable machine's native temporary filesystem;
+reports and the cross-stage state record remain in the runner-owned results
+directory. It covers release, derived-only repair, and state-preserving
+uninstall in addition to install, explicit update, rollback, and isolation.
+
 > **Setting this up on a new machine?** Follow **[`SETUP.md`](SETUP.md)** — a
 > step-by-step to install Docker (per OS), verify it, build the image, wire auth,
 > and smoke-test the rig end-to-end. The notes below are the quick reference;
@@ -71,6 +79,23 @@ robust across `copilot` versions and records the CLI surface + full logs it saw.
 > build-time convenience to install a *given* prereq, not part of what's tested,
 > and is not inherited into the operator's runtime environment.
 
+> **Reproducing a network-blocked machine from an unrestricted dev box.**
+> `-BlockPublicFeeds` (`--block-public-feeds` on `run.sh`, or
+> `$env:CR_BLOCK_PUBLIC_FEEDS=1`) null-routes `pypi.org`,
+> `files.pythonhosted.org`, `registry.npmjs.org`, and `download.pytorch.org` at
+> the container network layer (Docker `--add-host`), regardless of what the
+> HOST machine can actually reach. This lets a fully-connected dev box exercise
+> the same "public feed genuinely unreachable" condition a governed machine
+> (e.g. private-downstream-repo's `owner_user-book2`) already produces naturally, catching a
+> hardcoded public-feed straggler before it ever reaches that machine. Combine
+> with `-UvIndex`/`--uv-index` (a real substitute feed) to prove installs still
+> succeed under the block; omit it to confirm the existing `toolchain-uv` jam
+> detection (present in most scenarios) fires on the resulting failure. Linux
+> arm only (`-Os linux`, the default) -- `run.ps1` errors if combined with
+> `-Os windows`, which uses a different container networking model and does
+> not consume this flag.
+> (the downstream feed-neutral-build-config effort, Phase 3.)
+
 ## Usage
 
 ```powershell
@@ -82,8 +107,11 @@ robust across `copilot` versions and records the CLI surface + full logs it saw.
 ./run.ps1 -Image base -NameSuffix agc    # a SECOND concurrent base clean-room (container cr-base-agc) -- won't clobber another agent's cr-base
 ./run.ps1 -Until 1 -Then shell           # prepare up to stage 1, then hand off to a shell
 ./run.ps1 -UvIndex https://…/pypi/simple/  # opt-in uv-index fixture (governed box)
+./run.ps1 -BlockPublicFeeds -UvIndex https://…  # reproduce a network-blocked machine from an unrestricted dev box
 ./run.ps1 -Mode bridge-register          # expose the box as an agent-bridge agent
+./run.ps1 -Scenario context-handoff-eval -Mode eval  # handoff speed/fidelity/lifecycle witness
 ./run.ps1 -Image pristine -Mode down     # remove the container
+./run.ps1 -Mode prune                    # remove EVERY clean-room container this rig created
 ```
 
 ```bash
@@ -94,9 +122,12 @@ robust across `copilot` versions and records the CLI surface + full logs it saw.
 ./run.sh --image base --name-suffix agc   # a SECOND concurrent base clean-room (container cr-base-agc)
 ./run.sh --until 1 --then shell run
 ./run.sh --uv-index https://…/pypi/simple/ run
+./run.sh --block-public-feeds --uv-index https://… run   # reproduce a network-blocked machine from an unrestricted dev box
 ./run.sh --scenario agent-vault-eval eval        # Tier-E agent-driven eval (mirrors run.ps1 -Mode eval)
+./run.sh --scenario context-handoff-eval eval    # handoff speed/fidelity/lifecycle witness
 ./run.sh bridge-register
 ./run.sh --image pristine down
+./run.sh prune                            # remove EVERY clean-room container this rig created
 ```
 
 ## Scenarios & the scenario contract
@@ -187,19 +218,23 @@ check — proving the substrate generalises without an internal dependency.
 | [`agent-containers-solo`](scenarios/agent-containers-solo/) | P | **agent-containers without an agent-worktrees base** — the knowledge-overlay `state-root` shell-out falls open when the base is absent; read verbs (leases / relay-profile / namespace-target-repo) answer rather than crash. |
 | [`agent-ssh-solo`](scenarios/agent-ssh-solo/) | P | **agent-ssh standalone** (a profile emitter/verifier that owns the transport-provider contract): installs with no sibling, provisions, versioned binstub, and read verbs (emit-profile / mesh-status / verify --help / explore --help) answer. |
 | [`agent-machines-solo`](scenarios/agent-machines-solo/) | P | **agent-machines standalone** reconciler: provisions, versioned binstub, read verbs (discover / plan / validate --json) answer, and `restore` (default dry-run) **refuses cleanly** on validator errors instead of crashing on absent config. |
+| [`agent-machines-installation-cells`](scenarios/agent-machines-installation-cells/) | P | **Agent Machines dual-cell lifecycle:** two independent sources carrying the same core identity install and run in separate cells; one updates and rolls back without changing its peer; requested-only/invalid/foreign/maintenance/orphaned evidence fails closed; unrelated and payload-only identities are rejected. Linux and Windows arms keep all state disposable. |
 | [`agent-logger-solo`](scenarios/agent-logger-solo/) | P | **agent-logger standalone**: provisions, versioned binstub, read verbs (config / organization / chronicle status / session-sync status) answer, and `session-sync run --dry-run` reports would-push only (no push/prune). |
 | [`agent-mcp-solo`](scenarios/agent-mcp-solo/) | P | **agent-mcp — the standalone MCP-wrapper exemplar** (no agent-bridge import, no resolver): provisions, versioned binstub, `validate` schema-checks a local stdio bridge and returns a clean error for a missing bridge. *(Green in a Docker smoke run.)* |
 | [`agent-dispatch-solo`](scenarios/agent-dispatch-solo/) | P | **agent-dispatch standalone** task-queue/coordinator: provisions, binstub `--version` matches package + manifest (not the `0.0.0` fallback), and read verbs (health / inbox / installer status) answer on an empty queue rather than crash. |
 | [`agent-index-solo`](scenarios/agent-index-solo/) | P | **agent-index standalone** retrieval service: provisions the **service** runtime **without** requiring the heavy embedding engine; read verbs (status / engine status / role / --version) answer and the read-only agent-mcp bridge + direct MCP tools register. |
+| [`agent-index-installation-cells`](scenarios/agent-index-installation-cells/) | P | **Agent Index dual-cell service lifecycle:** two independent sources carrying the same identity provision isolated runtimes and ownership-attested OS-assigned endpoints; one updates, rolls back, and recovers passive/flipped/draining/committed cutover crashes only through installer/cell-runtime management while its peer stays unchanged; every transition converges to one owned PID; ordinary payload deploy/recovery and foreign/cross-cell control fail closed; cleanup retires every current, passive, and demoted PID; no legacy command, service, task, or state footprint is created. Linux and Windows arms keep all state disposable. Full mode is acceptance; smoke is diagnostic. |
 | [`agent-vault-solo`](scenarios/agent-vault-solo/) | P | **agent-vault standalone** secret store: provisions, versioned binstub + the `vault-askpass` SUDO_ASKPASS helper, and read verbs (vault list / which / cache-status / ping) report cleanly with **no `.kdbx` configured** (no crash, no hard KeePassXC dependency). |
-| [`agent-bridge-cutover`](scenarios/agent-bridge-cutover/) | P | **Graceful daemon cutover — agent-bridge (the reference adopter):** a version cutover never kills in-flight work — routing-flip-retire (stand a new daemon up beside the old, flip `active.json`, retire the old), drain-gate (turn boundary), breadcrumb-recover (heal an aborted cutover). Stdlib-only probe, verifiable off-Docker. |
+| [`agent-remote-driver-solo`](scenarios/agent-remote-driver-solo/) | P | **agent-remote-driver standalone** launch-time baseline-drivability extension: installs solo (no agent-worktrees/agent-bridge), a real live `copilot` session writes its discovery descriptor, the loopback HTTP surface (`/health`, `/events` SSE, `/send`) answers with the descriptor's bearer token, `bin/list-sessions.mjs --json` lists the live session, and the descriptor is removed again on clean exit. |
+| [`agent-bridge-cutover`](scenarios/agent-bridge-cutover/) | P | **Graceful daemon cutover — agent-bridge (the reference adopter):** a version cutover never kills in-flight work — routing-flip-retire (stand a new daemon up beside the old, flip `active.json`, retire the old), drain-gate (turn boundary), breadcrumb-recover (heal an aborted cutover), abrupt-kill-recovery (a genuinely-dead process's synthetically-labeled session-host claim doesn't wedge a fresh generation's own real startup recovery behind it -- the dead-PID recovery primitive, not interruption of a daemon-owned claim; see the check's own docstring). Stdlib-only probe, verifiable off-Docker. Opt-in phase 4 (`CR_LIVE_TURN_DRILL=1`, Docker-only, real AI credits, [`fixtures/live_turn_probe.py`](scenarios/agent-bridge-cutover/fixtures/live_turn_probe.py)): a genuinely live Copilot/ACP turn, driven through a real local `agent-bridge create --target-dir` Session-Host session, survives `deploy`'s cutover with zero observed disruption while the daemon's generation actually changes underneath it (`agent-bridge-unified-zdd-cutover` Phase 6 -- closes Phase 5's deferred live-turn Plan item; not a routine CI gate). |
 | [`agent-bridge-concurrent-relay`](scenarios/agent-bridge-concurrent-relay/) | P | **Credential-relay bind resilience — agent-bridge:** under port contention (the classic racing-daemon-from-a-concurrent-reinstall case), the relay still comes up and publishes the port it bound — dynamic-default-bind (port 0 → OS-assigned ephemeral) and live-occupant-ephemeral-fallback (a live occupant holds a pinned port → the relay falls back to an ephemeral port, never left silently unbound). Stdlib-only probe driving the real `credential_relay` server, verifiable off-Docker. |
 | [`agent-bridge-concurrent-daemon`](scenarios/agent-bridge-concurrent-daemon/) | P | **Single-instance daemon guard — agent-bridge:** a second daemon racing the first (the concurrent-reinstall case) is REFUSED before it can bind a colliding port — duplicate-refused (a second acquire raises `AlreadyRunningError` naming the holder pid), dead-holder-reclaimed (a killed holder's lock is freed by the OS, no stale wedge), passive-coexist-by-port (active/passive coexist on one config dir by port). The prevention half of the relay scenario's recovery. Stdlib-only probe driving the real `agent_bridge.singleton` guard with cross-process holders, verifiable off-Docker. |
 | [`agent-bridge-concurrent-flip`](scenarios/agent-bridge-concurrent-flip/) | P | **Version-slot flip coherence — agent-bridge:** while installers race to flip the active runtime version (several sessions firing the sessionStart reinstall at once), a reader always resolves a valid existing slot — flip-storm-coherent-resolution (thousands of reads under two racing flippers, never None/never a missing path, both versions seen) and marker-never-torn (`current-version` never half-written; `os.replace` atomicity). Third leg of the concurrent-update triad (relay recovers · duplicate refused · flip stays coherent). Stdlib-only probe driving the real `versioned_runtime` manager with cross-process flippers, verifiable off-Docker. |
 | [`agent-dispatch-cutover`](scenarios/agent-dispatch-cutover/) | P | **Graceful daemon cutover — agent-dispatch** (correct-install-flows, dotfiles#1393): a queued task survives; a claimed+started **held task** survives and the worker re-adopts via the durable queue DB; an **aborted cutover** is healed (undrain); a **wedged daemon** is stood-up-beside and retired. Stdlib-only probe. |
 | [`agent-index-cutover`](scenarios/agent-index-cutover/) | P | **Graceful daemon cutover — agent-index** (service + durable engine): the swappable versioned service cuts over without disturbing the durable, warm embedding engine/model on its own lifecycle. Stdlib-only probe. |
 | [`agent-vault-cutover`](scenarios/agent-vault-cutover/) | P | **Cutover witness — agent-vault** (#609): proves the client-side rendezvous **cutover fallback ladder** (override → live file → legacy) deterministically, and reports the **daemon-side** active/passive zdd cutover as a forward-looking gap (INFO — vault has not yet vendored `zdd`). Stays green today; its phase-3 battery lights up once vault adopts the connection-owner contract. |
-| [`context-injection-eval`](scenarios/context-injection-eval/) | P + E | **Session-context completeness witness:** a supported local marketplace installs the unpublished authority, two synthetic canary producers, and a restart-safe idempotent side-effect-only hook. Tier P proves authority-first, producer-first, concurrent, session, and CWD permutations; Tier E uses fresh agent-bridge sessions to prove the model received every canary without reading fixtures. Run variant A with two sessions and variant B with one; evidence is counts-only. |
+| [`progressive-context-disclosure-baseline`](scenarios/progressive-context-disclosure-baseline/) | P | **Frozen progressive-disclosure baseline and renderer gate:** inventories every suite-owned context contributor, validates the representative synthetic owner/task corpus and contained guide locators, preserves deterministic full-inline and concise-kernel hashes, renders every F0-F4 × seven-reference × four-emphasis Phase 2 flat/index task cell, and rejects content-bearing evidence before behavioral comparison. |
+| [`progressive-context-disclosure-eval`](scenarios/progressive-context-disclosure-eval/) | E | **One progressive-disclosure calibration cell:** packages the frozen fixture plus a minimal current contributor-inventory snapshot into a self-contained generated scenario, materializes fresh random 192-bit guide canaries, readable repository/payload guides, and a synthetic session-start plugin outside that read-only mount; drives the declared task through ACP; records eager loading separately; and writes schema-valid zero-turn `INVALID` evidence for setup or transport jams. |
 | [`installation-mode-governance`](scenarios/installation-mode-governance/) | P | **Windows installation-governance proof:** runs the real PowerShell 5.1 resolver in a disposable Windows container and verifies policy precedence, activation-required legacy pinning, migration-required behavior, sticky active namespaced roots, orphaned-transfer refusal, maintenance blocking, and read-only evaluation. |
 | [`partner-harness-setup`](scenarios/partner-harness-setup/) | P | **Downstream partner-harness setup gate:** given a partner harness tree (mounted `CR_PARTNER_PATH` or cloned `CR_PARTNER_REPO`), assert the vendored plugin **drop is structurally coherent** (plugins parse + are marketplace-listed + ship installers; setup entrypoint + golden-path doc present), the partner's **read-only `setup check` runs without crashing**, and the partner's **OWN setup/update test suite passes**. Name-free via `CR_PARTNER_*`. A consuming gate is a downstream vendored-plugin sync — *never publish a drop that breaks the partner's setup flow.* |
 
@@ -262,7 +297,7 @@ agent-bridge send cleanroom-base "install agent-codespaces and report PASS/FAIL"
 ```
 
 The agent is a `command`-type provider agent whose transport is
-`docker exec -i cr-<image> bash -lc "copilot --acp --stdio --allow-all-tools"`.
+`docker exec -i cr-<image> bash -lc "copilot --acp --stdio --allow-all --experimental"`.
 The in-container Copilot authenticates via the injected `COPILOT_GITHUB_TOKEN`,
 so no token is embedded in the spawn command. Registration is TTL-scoped (1h)
 against the live daemon's provider API.
@@ -286,7 +321,12 @@ named container (`cr-<image>`), so you can run the automated scenario (all
 stages, or `-Until <n>` to stop early) and then `-Mode shell` / `-Then shell`
 into the *same* box to run the real interactive `copilot` — Copilot CLI does not
 fully enable every feature in `-p`/ACP, so the rig automates what it can and
-hands off for the rest. The container stays up until `-Mode down`.
+hands off for the rest. The container stays up until `-Mode down` -- by design,
+so you can come back and inspect it. Forgetting `down` for a concurrent
+`-NameSuffix` run, an ad-hoc debugging box, or an eval leaves debris; run
+`-Mode prune` (`./run.sh prune` / `./run.ps1 -Mode prune`) to sweep up **every**
+clean-room container this rig has created on the box, not just the
+currently-selected one.
 
 **Auth is automatic.** By default the runner grabs a Copilot token from your host
 `gh` and injects it into the container as `COPILOT_GITHUB_TOKEN`, so there is
@@ -343,7 +383,9 @@ Override via `run.ps1` params or `CR_*` env (see the `scenarios/generic-single-p
 header): `CR_MARKETPLACE_REPO` (a GitHub `owner/repo`, or a container-local
 marketplace directory mounted with `-HarnessMount` for uncommitted-worktree
 validation), `CR_MARKETPLACE_NAME`, `CR_PRIMARY_PLUGIN`,
-`CR_EXPECT_DEPS`, `CR_UV_INDEX` (opt-in uv-index fixture), `CR_UNTIL` (stop after
+`CR_EXPECT_DEPS`, `CR_UV_INDEX` (opt-in uv-index fixture),
+`CR_BLOCK_PUBLIC_FEEDS` (null-route public feeds at the container network
+layer), `CR_UNTIL` (stop after
 stage N). The scenario name + stage list live in `manifest.json`.
 
 ## Files
@@ -358,7 +400,7 @@ stage N). The scenario name + stage list live in `manifest.json`.
 | `scenarios/<name>/manifest.json` | Scenario descriptor: image variant, prereqs, auth, expected artifacts, ordered stages. |
 | `scenarios/<name>/scenario.sh` | In-container driver + assertions for one scenario (bind-mounted at run, so edits need no rebuild). Sources the lib; honors `CR_UNTIL`. |
 | `scenarios/generic-single-plugin/` | The reference scenario (today's Layer-0 install check). |
-| `run.ps1` / `run.sh` | Host wrappers: build · one-time auth+commit · run (`-Scenario`) · **eval** (Tier-E agent-driven; `-Mode eval` / `eval`) · **shell** (interactive handoff) · **bridge-register/unregister** (drive over agent-bridge) · down; `-Image base\|pristine`, `-UvIndex`. |
+| `run.ps1` / `run.sh` | Host wrappers: build · one-time auth+commit · run (`-Scenario`) · **eval** (Tier-E agent-driven; `-Mode eval` / `eval`) · **shell** (interactive handoff) · **bridge-register/unregister** (drive over agent-bridge) · down · **prune** (bulk-remove every clean-room container on the box); `-Image base\|pristine`, `-UvIndex`, `-BlockPublicFeeds`. |
 | `bridge_register.py` | Stdlib-only helper: register/unregister the container as an agent-bridge `command` agent via the provider API (no copilot-extensions imports). |
 
 ## Scope / non-goals

@@ -51,12 +51,13 @@ Define the fleet in `containers.yaml`, then:
 ```
 
 Containers are kept warm (stopped, not destroyed). `down` stops them, `start`
-restarts them, `rm` removes them.
+restarts them, `rm` removes them, and `rescue-capture` non-destructively copies
+idle restricted-fleet session evidence for publication without stopping members.
 
 ## Configuration (`containers.yaml`)
 
 Looked up from `$AGENT_CONTAINERS_CONFIG`, `./containers.yaml`,
-`~/.agent-containers/containers.yaml`, then (only when agent-worktrees is present
+`~/.agent-containers/containers.yaml`, then (only when agent-worktrees is present <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 and the current harness is bound to external state) a knowledge-overlay
 `containers.yaml`. Copy the starter example,
 [`references/containers.yaml`](references/containers.yaml), and adapt. A fleet
@@ -97,7 +98,7 @@ credential relay, no host worktree mount, read-only rootfs, size-bounded tmpfs
 workspace/home/scratch, dropped capabilities, no privilege escalation,
 CPU/memory/PID ceilings, and an explicit network. It is image-only and requires
 an explicit per-fleet `acp_command`; there is no implicit
-`--allow-all-tools` fallback. `fleet --json` reports the inspected effective
+`--allow-all --experimental` fallback. `fleet --json` reports the inspected effective
 posture. Stopping the container clears its restricted writable state; extract or
 push work before release.
 
@@ -112,6 +113,14 @@ Only containers with an exact fleet entry may be dispatched. Inventory may
 discover other devcontainers, but they never inherit global credential or launch
 defaults. Restricted venues are re-inspected before start/exec; a stale image or
 weakened Docker posture is refused.
+
+For an `image:`-backed **trusted** fleet that needs real, host-backed
+persistence and/or a working `systemd --user` (for its own maintenance
+timers), opt into `host_workspace_path`/`host_home_path`+`home_folder` and
+`systemd_capable: true` -- see the plugin `README.md`'s "Host-backed
+persistence and systemd for trusted, image-backed fleets" section for the
+full shape and the launch mechanics. Both are rejected on a `restricted`
+fleet.
 
 Use `environment` only for explicit **non-secret** model/harness settings.
 Credential-shaped names are refused at config load and again if an image
@@ -159,12 +168,12 @@ cleanup drift.
 <agent-bridge catalog argv[0]> send container:myrepo-1 "run the unit tests in packages/foo"
 ```
 
-The provider manifest in `~/.agent-bridge/providers.d/agent-containers.json`
+The provider manifest in `~/.agent-bridge/providers.d/agent-containers.json` <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 lets agent-bridge discover `container:` without importing this package into the
 bridge venv. The resolver launches the `exec --stdio <name>` action through its registered
 management entry point, which
 then reaches a trusted container through OpenSSH and runs
-`copilot --acp --stdio --allow-all-tools`, staging the host `gh auth token`
+`copilot --acp --stdio --allow-all --experimental`, staging the host `gh auth token`
 through stdin so the token is not persisted in bridge state, argv, or logs.
 That SSH process also carries the credential relay over an explicit loopback
 reverse forward (`-R 127.0.0.1:<container-port>:127.0.0.1:<live-host-port>`).
@@ -174,6 +183,47 @@ for a trusted fleet that intentionally needs no host credential path.
 
 Those are the **trusted-profile** defaults. A restricted fleet launches only its
 explicit `acp_command` and forwards neither host credential path.
+
+## Detached CLI-mode sessions
+
+For an observable, steerable Copilot CLI session that survives the launcher
+without taking over the caller's terminal, use a trusted container:
+
+```bash
+<catalog argv[0]> copilot <container-name> --detach --seed-file task.md
+# -> JSON with session_id, scope_id, venue, and status/observe/nudge/attach/stop commands
+<catalog argv[0]> copilot <container-name> --stop
+```
+
+`--detach` refuses restricted fleets, provisions the container's bridge
+registration credentials, starts a small host-side forward keeper for the
+bridge and credential-relay reverse forwards, launches the container's own
+worktree `embody` verb (JSON mode) in its workspace, and waits for the
+session to register with the host bridge before reporting success. Repeating
+`--copilot-arg ARG` passes extra Copilot CLI flags to the session. A new
+session starts on the caller's own model, reasoning effort, and context tier
+(from `~/.copilot/settings.json`; an explicit `--copilot-arg=--model=...` wins,
+`AGENT_CODESPACES_MODEL_PROPAGATE=0` opts out). `--stop`
+kills and verifies the venue tmux session, releases that session's keeper
+hold, stops the shared per-container keeper only when no other session still
+holds it, and deregisters the exact live-session row. `--ttl-seconds` applies
+to attached mode only; do not combine it with `--detach` or `--stop`.
+
+`--ref-file PATH` (repeatable; a file or a folder, up to 256 MiB per call)
+copies an operator file (a HAR, a log, a transcript) into the container at
+`~/.agent-bridge/refs/<batch>/`, outside the checkout, over the SSH channel's <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
+stdin, and tells the worker the exact paths: in the seed for a new session, or
+as a message when the same `--detach` rejoins a running one. The handle reports
+`ref_files` and `refs_delivered` (`seed`/`message`/`failed`). The orchestrator
+passes only the host path and never reads the file itself.
+
+The fleet image must carry Copilot CLI, the agent-bridge plugin, tmux, sshd,
+and the container's own worktree manager with the workspace already adopted
+as a project (the launch fails with "Could not resolve a project" otherwise).
+With `forward_gh_token` on (the default), the host `gh auth token` is staged
+as `GH_TOKEN` through the same stdin-only launch file as the relay values, so
+the container's Copilot starts signed in; the launch fails early if the host
+has no token rather than starting a signed-out session.
 
 For a named restricted OpenSSH target:
 
@@ -201,7 +251,7 @@ To expose the target as a project-scoped, read-only Worktree Picker source:
 ```
 
 This writes a provider-owned descriptor under
-`~/.agent-worktrees/sources/agent-containers.json`. The Picker validates the
+`~/.agent-worktrees/sources/agent-containers.json`. The Picker validates the <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 descriptor, re-resolves live instance/lease/readiness/trust metadata through
 the provider command, and reads worktrees, recent messages, and sessions
 through the descriptor's isolated absolute provider-owned connection command. The
@@ -230,9 +280,9 @@ util-linux `script` and `setsid` helpers in the restricted image.
   inspection and cleanup. Leases are advisory and TTL-reclaimed.
 - `<catalog argv[0]> namespace-list` — bridge-facing provider CLI health. If
   bridge dispatch cannot see containers, check that the provider manifest exists
-  under `~/.agent-bridge/providers.d/` and points at the absolute binstub.
+  under `~/.agent-bridge/providers.d/` and points at the absolute binstub. <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 - `<catalog argv[0]> config-migrate` — migrate/stamp only the machine-local
-  `~/.agent-containers/containers.yaml`; repo/cwd configs are never rewritten.
+  `~/.agent-containers/containers.yaml`; repo/cwd configs are never rewritten. <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 
 There is no `doctor` action today.
 
@@ -243,4 +293,4 @@ There is no `doctor` action today.
   never mount a shared git worktree (branch-exclusivity + dangling-gitdir hazard).
 - Discovery recognises fleet members by the `agent-containers.fleet` label, a
   `devcontainer.local_folder` label, or a configured image-name prefix.
-- Runtime state (leases) lives in `~/.agent-containers/leases.json`.
+- Runtime state (leases) lives in `~/.agent-containers/leases.json`. <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->

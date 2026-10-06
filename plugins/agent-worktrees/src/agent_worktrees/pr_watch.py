@@ -25,6 +25,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 from . import pr_contract as pc
+from .pr_occupancy import occupancy_from_readiness
 from .providers import ProviderError, account_token_for_slug, get_provider
 
 
@@ -41,6 +42,11 @@ def decorate_events(
     hold_labels: tuple[str, ...] = (),
     wip_title_prefixes: tuple[str, ...] = (),
     approval_required: bool = True,
+    allow_stale_approval: bool = False,
+    stale_approval_head_sha: str = "",
+    stale_approval_head_observed_at: str = "",
+    review_blocking: bool = True,
+    dismiss_stale_reviews: bool | None = None,
 ) -> dict:
     """Wrap the raw transition list into the final result payload.
 
@@ -53,7 +59,20 @@ def decorate_events(
     consent* (add the auto-merge label) rather than assuming the PR will merge on
     its own. The consent vocabulary is a multi-machine system binding passed in by the CLI
     (``automerge_label`` etc.); with none configured the block degrades to a
-    verdict/merge-state readout with no action.
+    verdict/merge-state readout with no action. ``review_blocking`` (default
+    ``True``) forwards to :func:`pr_contract.merge_readiness` -- ``False``
+    reports a bare comment as the ``"COMMENTED"`` verdict for a repo whose
+    reviewer cannot render a binding one.
+
+    A ``pr-self-merge`` repo's raw ``eligible``/``reason`` pair here reflects
+    only the human-approval gate, which can read as a hard block even when
+    the acting identity actually holds a live Maintainer-bypass right on that
+    gate (ThomasMichon/copilot-extensions#3638). This function has no
+    provider/token access to resolve that bypass note itself -- the caller
+    (``pr_cli.py``'s ``wait`` dispatch) resolves it with a single live read
+    *after* :func:`run_wait` returns (never before a potentially long/
+    unbounded wait, which could report since-revoked authorization as
+    current fact) and merges it into the returned payload directly.
     """
     payload = {
         "repo": repo,
@@ -68,12 +87,19 @@ def decorate_events(
         "base_ref": snap.base_ref,
         "cursor": pc.Baseline.from_snapshot(snap).to_cursor(),
     }
-    payload["merge"] = pc.merge_readiness(
-        snap,
-        automerge_label=automerge_label,
-        hold_labels=hold_labels,
-        wip_title_prefixes=wip_title_prefixes,
-        approval_required=approval_required,
+    payload["merge"] = occupancy_from_readiness(
+        pc.merge_readiness(
+            snap,
+            automerge_label=automerge_label,
+            hold_labels=hold_labels,
+            wip_title_prefixes=wip_title_prefixes,
+            approval_required=approval_required,
+            allow_stale_approval=allow_stale_approval,
+            stale_approval_head_sha=stale_approval_head_sha,
+            stale_approval_head_observed_at=stale_approval_head_observed_at,
+            review_blocking=review_blocking,
+            dismiss_stale_reviews=dismiss_stale_reviews,
+        )
     )
     return payload
 
@@ -91,6 +117,11 @@ def run_wait(
     hold_labels: tuple[str, ...] = (),
     wip_title_prefixes: tuple[str, ...] = (),
     approval_required: bool = True,
+    allow_stale_approval: bool = False,
+    stale_approval_head_sha: str = "",
+    stale_approval_head_observed_at: str = "",
+    review_blocking: bool = True,
+    dismiss_stale_reviews: bool | None = None,
     now: Callable[[], float] | None = None,
     sleep: Callable[[float], None] | None = None,
     on_poll: Callable[[pc.PRSnapshot], None] | None = None,
@@ -107,9 +138,14 @@ def run_wait(
     bad token / wrong repo fails fast instead of hanging the full timeout.
 
     The consent binding (``automerge_label`` / ``hold_labels`` /
-    ``wip_title_prefixes`` / ``approval_required``) is forwarded to
+    ``wip_title_prefixes`` / ``approval_required`` /
+    ``allow_stale_approval`` / ``review_blocking``) is forwarded to
     :func:`decorate_events` so the fired payload's ``merge`` block reports
     whether the caller must still grant merge consent.
+
+    This function has no provider/token access, so it never resolves a
+    self-merge-bypass note itself -- see :func:`decorate_events`'s docstring
+    for where/why that happens instead.
     """
     import time as _time
 
@@ -123,6 +159,11 @@ def run_wait(
             hold_labels=hold_labels,
             wip_title_prefixes=wip_title_prefixes,
             approval_required=approval_required,
+            allow_stale_approval=allow_stale_approval,
+            stale_approval_head_sha=stale_approval_head_sha,
+            stale_approval_head_observed_at=stale_approval_head_observed_at,
+            review_blocking=review_blocking,
+            dismiss_stale_reviews=dismiss_stale_reviews,
         )
 
     deadline = now() + timeout if timeout > 0 else None
@@ -147,12 +188,20 @@ def run_wait(
                 # / already-closed PR fires immediately (pre-existing reviews and
                 # not-yet-computed mergeability do NOT fire; only terminal does).
                 first_base = replace(
-                    pc.Baseline.from_snapshot(snap), merged=False, closed=False
+                    pc.Baseline.from_snapshot(
+                        snap, dismiss_stale_reviews=dismiss_stale_reviews,
+                    ),
+                    merged=False, closed=False,
                 )
-                events = pc.compute_events(first_base, snap, until)
+                events = pc.compute_events(
+                    first_base, snap, until,
+                    dismiss_stale_reviews=dismiss_stale_reviews,
+                )
                 if events:
                     return WaitResult(True, _decorate(events, snap))
-                base = pc.Baseline.from_snapshot(snap)
+                base = pc.Baseline.from_snapshot(
+                    snap, dismiss_stale_reviews=dismiss_stale_reviews,
+                )
             else:
                 # Lazily complete a not-yet-known mergeable baseline: the provider
                 # may compute the flag asynchronously (and a --since re-arm starts
@@ -165,12 +214,27 @@ def run_wait(
                 # without firing -- only a later regression is a transition.
                 if base.checks_state == "" and snap.checks_state:
                     base = replace(base, checks_state=snap.checks_state)
+                # A re-run resets the terminal-outcome reference: once checks go
+                # back to "pending" (a fresh run in flight), the NEXT terminal
+                # result -- success or failure -- is a genuinely new outcome and
+                # must fire even if it lands on the same state a stale baseline
+                # already held (success -> pending -> success is a real
+                # completion a self-merge-eligible wait cares about, not a
+                # no-op; a static baseline that never tracked the intervening
+                # "pending" would otherwise suppress it indefinitely).
+                if snap.checks_state == "pending" and base.checks_state != "pending":
+                    base = replace(base, checks_state="pending")
                 if base.approved is None:
                     base = replace(base, approved=(
                         pc.effective_verdict(
-                            snap.reviews, snap.head_sha, snap.author) == "approved"
+                            snap.reviews, snap.head_sha, snap.author,
+                            dismiss_stale_reviews=dismiss_stale_reviews,
+                        ) == "APPROVED"
                     ))
-                events = pc.compute_events(base, snap, until)
+                events = pc.compute_events(
+                    base, snap, until,
+                    dismiss_stale_reviews=dismiss_stale_reviews,
+                )
                 if events:
                     return WaitResult(True, _decorate(events, snap))
 

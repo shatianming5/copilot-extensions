@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import related, state_root
+from . import pr_config, related, state_root
 
 
 MAX_TOPOLOGY_BYTES = 1_250
@@ -22,21 +22,28 @@ def _clean(value: object, fallback: str = "-") -> str:
     return text or fallback
 
 
-def _bounded_prefix(prefix: str, required_suffix: str) -> str:
-    suffix = (
-        "\n[agent-worktrees context truncated]\n"
-        f"{required_suffix}"
-    )
+def _bounded_prefix(prefix: str) -> str:
+    suffix = "\n[agent-worktrees context truncated]"
     budget = MAX_TOPOLOGY_BYTES - len(suffix.encode("utf-8"))
     encoded = prefix.encode("utf-8")
     kept = encoded[: max(0, budget)].decode("utf-8", errors="ignore").rstrip()
     return kept + suffix
 
 
-def _related_summary(config: Any, cwd: str) -> tuple[str, str]:
+def _related_summary(
+    config: Any,
+    cwd: str,
+    *,
+    plugin_related_anchors: list[str] | None = None,
+) -> tuple[str, str]:
     anchors = state_root.config_source_anchors(config, cwd=cwd)
+    plugin_anchors = (
+        related.installed_plugin_related_anchors()
+        if plugin_related_anchors is None
+        else plugin_related_anchors
+    )
     topology = related.read_related_grafted(
-        [*related.installed_plugin_related_anchors(), *[item.anchor for item in anchors]]
+        [*plugin_anchors, *[item.anchor for item in anchors]]
     )
     primary = _clean(topology.primary)
     entries = sorted(
@@ -70,6 +77,29 @@ def _related_summary(config: Any, cwd: str) -> tuple[str, str]:
     return primary, "; ".join(rendered)
 
 
+def _pr_summary(config: Any) -> str:
+    """Render this repo's resolved PR-conduct facts (profile + key knobs).
+
+    Static/local-only (no network), matching the rest of this module's
+    session-start budget discipline. Role-aware overlays (``pr.roles``) are
+    resolved from the *caller's* live permission at PR-creation time
+    elsewhere, not here -- this line reports the repo's base configuration.
+    """
+    try:
+        repo = config.default_repo
+        flow = pr_config._pr_flow_profile(repo)
+    except Exception:
+        return ""
+    prc = repo.pr
+    return (
+        "PR: "
+        f"profile={_clean(flow.profile, 'unknown')}; "
+        f"enabled={'true' if prc.enabled else 'false'}; "
+        f"required={'true' if prc.required else 'false'}; "
+        f"merge_actor={_clean(prc.merge_actor, 'none')}."
+    )
+
+
 def render_registry_context(
     config: Any,
     record: Any,
@@ -77,18 +107,31 @@ def render_registry_context(
     cwd: str,
     pane_id: str | None = None,
     mux_session: str | None = None,
+    plugin_related_anchors: list[str] | None = None,
 ) -> str:
-    """Render current checkout, state pairing, and bounded related topology."""
+    """Render current checkout, state pairing, PR conduct, and bounded related topology."""
 
     resolved_state = state_root.resolve_state_root(config, cwd=cwd)
     pair = state_root.resolve_pair(config, cwd=cwd)
+    current_kind = _clean(
+        getattr(pair.current, "kind", "") if pair.current else "",
+        "worktree",
+    )
+    checkout_writable = (
+        bool(getattr(record, "worktree_path", cwd))
+        and current_kind == "worktree"
+        and _clean(getattr(record, "status", ""), "unknown")
+        in {"active", "ready"}
+    )
     checkout = (
         "Checkout: "
         f"repo={_clean(getattr(record, 'repo', ''))}; "
         f"id={_clean(getattr(record, 'worktree_id', ''))}; "
         f"role={_clean(getattr(record, 'pair_role', ''), 'unpaired')}; "
-        f"kind={_clean(getattr(record, 'pair_kind', ''), 'worktree')}; "
+        f"kind={current_kind}; "
         f"status={_clean(getattr(record, 'status', ''), 'unknown')}; "
+        f"writable={'true' if checkout_writable else 'false'}; "
+        "locus=local; delegate=none; "
         f"path={_clean(getattr(record, 'worktree_path', cwd))}."
     )
     if mux_session or pane_id:
@@ -105,11 +148,25 @@ def render_registry_context(
     )
     if pair.paired and pair.sibling and not pair.error:
         sibling = pair.sibling
+        writable = (
+            _clean(sibling.role) == "knowledge"
+            and bool(sibling.path)
+            and _clean(sibling.kind, "worktree") == "worktree"
+            and _clean(sibling.status, "unknown") in {"active", "ready"}
+        )
+        pair_label = (
+            "KnowledgePair"
+            if _clean(sibling.role) == "knowledge"
+            else "Pair"
+        )
         pairing = (
-            " Pair: "
+            f" {pair_label}: "
             f"role={_clean(sibling.role)}; "
+            f"id={_clean(sibling.worktree_id)}; "
             f"kind={_clean(sibling.kind)}; "
             f"status={_clean(sibling.status, 'unknown')}; "
+            f"writable={'true' if writable else 'false'}; "
+            "locus=local; delegate=none; "
             f"path={_clean(sibling.path)}."
         )
     else:
@@ -120,23 +177,32 @@ def render_registry_context(
     state += pairing
 
     try:
-        primary, entries = _related_summary(config, cwd)
+        primary, entries = _related_summary(
+            config,
+            cwd,
+            plugin_related_anchors=plugin_related_anchors,
+        )
     except Exception:
         primary, entries = "-", ""
     related_line = f"Related: primary={primary}"
     if entries:
         related_line += f"; important={entries}"
     related_line += "."
-    fresh = (
-        "Fresh queries: `agent-worktrees state-root --pair --json`; "
-        "`agent-worktrees related list`; "
-        "`agent-worktrees related resolve <name>`."
-    )
 
-    required = "\n".join((checkout, state, fresh))
-    candidate = "\n".join((checkout, state, related_line, fresh))
+    pr_line = _pr_summary(config)
+
+    required = "\n".join((checkout, state))
+    lines = [checkout, state]
+    if pr_line:
+        lines.append(pr_line)
+    lines.append(related_line)
+    candidate = "\n".join(lines)
     if len(candidate.encode("utf-8")) <= MAX_TOPOLOGY_BYTES:
         return candidate
+    if pr_line:
+        candidate_no_related = "\n".join((checkout, state, pr_line))
+        if len(candidate_no_related.encode("utf-8")) <= MAX_TOPOLOGY_BYTES:
+            return candidate_no_related
     if len(required.encode("utf-8")) <= MAX_TOPOLOGY_BYTES:
         return required
-    return _bounded_prefix("\n".join((checkout, state)), fresh)
+    return _bounded_prefix("\n".join((checkout, state)))

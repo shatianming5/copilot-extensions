@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from agent_worktrees import output
+from agent_worktrees import session_tracking_cli
 from agent_worktrees import tracking
 from agent_worktrees.tracking import (
     HeadTransition,
@@ -206,6 +208,64 @@ class TestTransitions:
         with pytest.raises(SessionLifecycleError):
             link_succession(rec, "ghost", "old")
 
+    def test_link_succession_concluded_predecessor_activates_successor(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        """Downstream regression (a private repository's report): the ``predecessor_state="concluded"``
+        branch (a predecessor with no real history, e.g. a manual repair) must
+        activate the successor exactly like the default ``"handed-off"``
+        branch does -- otherwise the freshly-written head transition is
+        immediately self-invalidating (``resolved_head_session`` stays None
+        because the "successor" was never actually marked eligible)."""
+        rec = _rec(tmp_tracking_dir, sessions=[
+            SessionEntry("old", "t"), SessionEntry("new", "t"),
+        ])
+        rec.head_session = "old"
+        save_record(rec)
+        link_succession(rec, "old", "new", predecessor_state="concluded")
+        r = load_record(rec.yaml_path)
+        old, new = r.session_entry("old"), r.session_entry("new")
+        assert old.state == "concluded" and old.successor == "new"
+        assert new.predecessor == "old" and new.state == "active"
+        assert r.resolved_head_session == "new"
+
+    def test_link_succession_concluded_cancels_yielded_successors_own_handoff(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        """Downstream regression (a private repository's report): a successor that is itself
+        ``"yielded"`` (it opened its own handoff intent, never linked) is not
+        terminal, so it still passes the terminal-successor guard above and
+        gets activated -- but the pending handoff that made it yielded must
+        not survive becoming head here, or an active head would still
+        report one pending."""
+        rec = _rec(tmp_tracking_dir, sessions=[
+            SessionEntry("old", "t"), SessionEntry("new", "t"),
+        ])
+        tracking.open_handoff(rec, "new", "tok")
+        assert rec.session_entry("new").state == "yielded"
+        link_succession(rec, "old", "new", predecessor_state="concluded")
+        r = load_record(rec.yaml_path)
+        assert r.session_entry("new").state == "active"
+        assert r.handoffs[0].state == "cancelled"
+        assert r.resolved_head_session == "new"
+
+    def test_link_succession_concluded_rejects_terminal_successor(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        """Downstream regression (a private repository's report): the ``else`` branch must mirror
+        ``link_handoff``'s terminal-successor guard -- never resurrect an
+        explicitly ``"handed-off"``/``"concluded"`` successor and hand it
+        head just because a manual-repair caller named it."""
+        rec = _rec(tmp_tracking_dir, sessions=[
+            SessionEntry("old", "t"),
+            SessionEntry("new", "t", state="concluded"),
+        ])
+        with pytest.raises(SessionLifecycleError):
+            link_succession(rec, "old", "new", predecessor_state="concluded")
+        r = load_record(rec.yaml_path)
+        assert r.session_entry("new").state == "concluded"
+        assert r.session_entry("old").successor is None
+
     def test_save_false_batches(self, tmp_tracking_dir: Path, monkeypatch_config):
         rec = _rec(tmp_tracking_dir, sessions=[
             SessionEntry("s1", "t"), SessionEntry("s2", "t"),
@@ -261,6 +321,59 @@ class TestRegisterSessionHeadInit:
 
 
 class TestExactHandoffLedger:
+    def test_started_candidate_does_not_take_over_until_acknowledged(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        _rec(tmp_tracking_dir)
+        tracking.register_session("wt-1", "old")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        tracking.open_handoff(rec, "old", "task-123")
+        tracking.register_session(
+            "wt-1", "new", candidate_token="task-123",
+        )
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        tracking.associate_handoff_candidate(rec, "task-123", "new")
+
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        handoff = rec.handoffs[0]
+        assert handoff.candidate == "new"
+        assert handoff.state == "pending"
+        # "old" yielded the moment it opened the handoff -- head is vacant,
+        # not still "old"; the
+        # candidate association alone does not hand head to "new" either.
+        assert rec.resolved_head_session is None
+        assert rec.session_entry("old").state == "yielded"
+
+        tracking.register_session(
+            "wt-1", "new", source="bind", handoff_token="task-123"
+        )
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        assert rec.handoffs[0].state == "linked"
+        assert rec.resolved_head_session == "new"
+        assert rec.session_entry("old").state == "handed-off"
+
+    def test_candidate_token_rejects_a_different_successor(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        _rec(tmp_tracking_dir)
+        tracking.register_session("wt-1", "old")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        tracking.open_handoff(rec, "old", "task-123")
+        tracking.register_session(
+            "wt-1", "candidate", candidate_token="task-123",
+        )
+        tracking.register_session(
+            "wt-1", "other", candidate_token="task-123",
+        )
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        tracking.associate_handoff_candidate(
+            rec, "task-123", "candidate"
+        )
+        with pytest.raises(SessionLifecycleError, match="associated with candidate"):
+            tracking.register_session(
+                "wt-1", "other", source="bind", handoff_token="task-123"
+            )
+
     def test_exact_handoff_token_completes_link(
         self, tmp_tracking_dir: Path, monkeypatch_config
     ):
@@ -338,6 +451,70 @@ class TestExactHandoffLedger:
         assert rec.resolved_head_session == "new"
         assert rec.replayed_head_transition.reason == "rebind"
 
+    def test_yielded_session_can_reclaim_its_own_head_via_bind(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        """Downstream regression (a private repository's report): a session whose own handoff intent
+        was never formally linked to a successor ("yielded" -- itself a
+        normal, expected state) must be able to reclaim its own head by
+        rebinding itself, with no supported CLI path required beforehand."""
+        _rec(tmp_tracking_dir)
+        tracking.register_session("wt-1", "old")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        tracking.open_handoff(rec, "old", "tok")
+        assert rec.session_entry("old").state == "yielded"
+        assert rec.resolved_head_session is None
+        tracking.register_session("wt-1", "old", source="bind")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        assert rec.session_entry("old").state == "active"
+        assert rec.resolved_head_session == "old"
+        assert rec.handoffs[0].state == "cancelled"
+        assert rec.replayed_head_transition.reason == "rebind"
+
+    def test_yielded_session_cannot_be_reclaimed_by_a_different_session(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        """The self-reclaim fix must stay scoped to the yielded session
+        reclaiming itself -- an unrelated session registering must not flip
+        someone else's yielded entry back to active."""
+        _rec(tmp_tracking_dir)
+        tracking.register_session("wt-1", "old")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        tracking.open_handoff(rec, "old", "tok")
+        tracking.register_session("wt-1", "other", source="bind")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        assert rec.session_entry("old").state == "yielded"
+        assert rec.resolved_head_session == "other"
+
+    def test_older_yielded_session_cannot_steal_head_from_newer_yielded_lineage(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        """Downstream regression (a private repository's report): mirrors `cancel_handoff`'s
+        `predecessor_is_latest_head` guard. `resolved_head_session` hides
+        EVERY yielded session, so without checking the raw latest head
+        transition, an older yielded session could rebind and silently steal
+        head back from a genuinely newer yielded lineage: old yields, new
+        claims head and later yields its own handoff too (both now read as
+        "no head"), but old must NOT be allowed to reclaim in that case."""
+        _rec(tmp_tracking_dir)
+        tracking.register_session("wt-1", "old")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        tracking.open_handoff(rec, "old", "tok-old")
+        # "new" claims head (the next session to register is free to, per
+        # `resolved_head_session`'s own docstring).
+        tracking.register_session("wt-1", "new")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        assert rec.resolved_head_session == "new"
+        # "new" now yields its own handoff -- the lineage has moved on.
+        tracking.open_handoff(rec, "new", "tok-new")
+        assert rec.resolved_head_session is None
+        # "old" must not be able to reclaim: it is no longer the latest head.
+        tracking.register_session("wt-1", "old", source="bind")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        assert rec.session_entry("old").state == "yielded"
+        assert rec.session_entry("new").state == "yielded"
+        assert rec.resolved_head_session is None
+
     def test_token_selects_one_of_multiple_pending_handoffs(
         self, tmp_tracking_dir: Path, monkeypatch_config
     ):
@@ -358,6 +535,57 @@ class TestExactHandoffLedger:
         assert [handoff.state for handoff in rec.handoffs] == [
             "linked", "pending"
         ]
+
+    def test_live_cutover_defaults_false_and_round_trips_through_save_and_load(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        """A handoff opened without ``live_cutover=True`` (the safe default --
+        recorded for lineage/tracking only) must never silently become
+        spawn-eligible, including across a save/reload cycle. One opened
+        WITH it must round-trip that fact durably (see
+        ``status_monitor_runtime._monitor_pending_handoff_request``, which
+        gates the resident monitor's automatic spawn+retire on exactly this
+        field)."""
+        _rec(tmp_tracking_dir)
+        tracking.register_session("wt-1", "old")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        tracking.open_handoff(rec, "old", "token-manual")
+        assert rec.handoffs[0].live_cutover is False
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        assert rec.handoffs[0].live_cutover is False
+
+        tracking.register_session("wt-1", "new2")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        tracking.open_handoff(rec, "new2", "token-armed", live_cutover=True)
+        assert rec.handoffs[1].live_cutover is True
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        assert rec.handoffs[1].live_cutover is True
+
+    def test_open_handoff_retry_upgrades_live_cutover_but_never_downgrades(
+        self, tmp_tracking_dir: Path, monkeypatch_config
+    ):
+        """A handoff first recorded under manual-only (live_cutover=False)
+        and later retried with --force / mode:auto for the SAME token must
+        have its existing entry armed (Copilot review finding on PR #4493:
+        the idempotent-return-existing branch previously ignored a
+        newly-passed live_cutover=True entirely, permanently stranding the
+        handoff as un-armed). A later unarmed retry must never downgrade an
+        already-armed entry back to False."""
+        _rec(tmp_tracking_dir)
+        tracking.register_session("wt-1", "old")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        tracking.open_handoff(rec, "old", "token-retry")
+        assert rec.handoffs[0].live_cutover is False
+
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        tracking.open_handoff(rec, "old", "token-retry", live_cutover=True)
+        assert rec.handoffs[0].live_cutover is True
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        assert rec.handoffs[0].live_cutover is True
+
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        tracking.open_handoff(rec, "old", "token-retry", live_cutover=False)
+        assert rec.handoffs[0].live_cutover is True
 
     def test_linked_token_is_idempotent_for_same_successor(
         self, tmp_tracking_dir: Path, monkeypatch_config
@@ -526,7 +754,7 @@ class TestHeadSessionCommand:
         from agent_worktrees import __main__ as m
 
         captured: dict = {}
-        monkeypatch.setattr(m, "_json_output", lambda data: captured.update(data))
+        monkeypatch.setattr(output, "_json_output", lambda data: captured.update(data))
         args = argparse.Namespace(worktree_id=worktree_id, json=True)
         rc = m.cmd_head_session(args)
         captured["_rc"] = rc
@@ -611,18 +839,14 @@ class TestFindTrackingFileAcrossProjects:
     def test_exact_match_found_via_registry_dir(
         self, tmp_path: Path, monkeypatch
     ):
-        from agent_worktrees import __main__ as m
-
         proj = tmp_path / ".proj-a" / "worktrees"
         proj.mkdir(parents=True)
         _rec(proj)  # writes proj/wt-1.yaml
         # No active-project fast path; resolution must come from the registry dir.
-        monkeypatch.setattr(m, "_all_tracking_dirs", lambda: [proj])
-        assert m._find_tracking_file("wt-1") == proj / "wt-1.yaml"
+        monkeypatch.setattr(session_tracking_cli, "_all_tracking_dirs", lambda: [proj])
+        assert session_tracking_cli._find_tracking_file("wt-1") == proj / "wt-1.yaml"
 
     def test_unique_suffix_match(self, tmp_path: Path, monkeypatch):
-        from agent_worktrees import __main__ as m
-
         proj = tmp_path / ".proj-a" / "worktrees"
         proj.mkdir(parents=True)
         rec = WorktreeRecord(
@@ -632,12 +856,10 @@ class TestFindTrackingFileAcrossProjects:
             title=None, status="active", completed_at=None, sessions=[],
         )
         save_record(rec, proj / f"{rec.worktree_id}.yaml")
-        monkeypatch.setattr(m, "_all_tracking_dirs", lambda: [proj])
-        assert m._find_tracking_file("abcd") == proj / f"{rec.worktree_id}.yaml"
+        monkeypatch.setattr(session_tracking_cli, "_all_tracking_dirs", lambda: [proj])
+        assert session_tracking_cli._find_tracking_file("abcd") == proj / f"{rec.worktree_id}.yaml"
 
     def test_ambiguous_suffix_fails_open(self, tmp_path: Path, monkeypatch):
-        from agent_worktrees import __main__ as m
-
         a = tmp_path / ".proj-a" / "worktrees"
         b = tmp_path / ".proj-b" / "worktrees"
         for d, wid in ((a, "aaa-dup"), (b, "bbb-dup")):
@@ -649,15 +871,13 @@ class TestFindTrackingFileAcrossProjects:
                 status="active", completed_at=None, sessions=[],
             )
             save_record(rec, d / f"{wid}.yaml")
-        monkeypatch.setattr(m, "_all_tracking_dirs", lambda: [a, b])
+        monkeypatch.setattr(session_tracking_cli, "_all_tracking_dirs", lambda: [a, b])
         # Two records end in "dup" -> ambiguous -> None (never guess).
-        assert m._find_tracking_file("dup") is None
+        assert session_tracking_cli._find_tracking_file("dup") is None
 
     def test_path_traversal_rejected(self, monkeypatch):
-        from agent_worktrees import __main__ as m
-
         # A traversal/glob id never touches the filesystem.
-        assert m._find_tracking_file("../etc/passwd") is None
+        assert session_tracking_cli._find_tracking_file("../etc/passwd") is None
 
 
 class TestConcludeAndLinkCommands:
@@ -668,12 +888,10 @@ class TestConcludeAndLinkCommands:
 
     @staticmethod
     def _run(monkeypatch, tracking_dir: Path, fn_name: str, **ns) -> dict:
-        from agent_worktrees import __main__ as m
-
         captured: dict = {}
-        monkeypatch.setattr(m, "_all_tracking_dirs", lambda: [tracking_dir])
-        monkeypatch.setattr(m, "_json_output", lambda data: captured.update(data))
-        rc = getattr(m, fn_name)(argparse.Namespace(json=True, **ns))
+        monkeypatch.setattr(session_tracking_cli, "_all_tracking_dirs", lambda: [tracking_dir])
+        monkeypatch.setattr(output, "_json_output", lambda data: captured.update(data))
+        rc = getattr(session_tracking_cli, fn_name)(argparse.Namespace(json=True, **ns))
         captured["_rc"] = rc
         return captured
 
@@ -747,6 +965,29 @@ class TestConcludeAndLinkCommands:
         )
         assert out["_rc"] != 0
 
+    def test_conclude_session_ambiguous_write_outcome_is_reported_not_swallowed(
+        self, tmp_tracking_dir: Path, monkeypatch
+    ):
+        """agent-worktrees-authoritative-daemon Phase 3: a write whose
+        daemon request was sent and then failed is genuinely ambiguous --
+        the command must surface `AmbiguousWriteOutcome` as a reported
+        failure, never silently retry or swallow it."""
+        from agent_worktrees import tracking_write
+
+        _rec(tmp_tracking_dir, sessions=[SessionEntry("solo", "t")])
+
+        def _raise(*_args, **_kwargs):
+            raise tracking_write.AmbiguousWriteOutcome("request sent, no response")
+
+        monkeypatch.setattr(tracking_write, "dispatch", _raise)
+        out = self._run(
+            monkeypatch, tmp_tracking_dir, "cmd_conclude_session",
+            worktree_id="wt-1", session_id="solo", state="handed-off",
+        )
+        assert out["_rc"] != 0
+        # Refused before any mutation -- the record must be untouched.
+        assert load_record(tmp_tracking_dir / "wt-1.yaml").session_entry("solo").state == "active"
+
 
 class TestListSessionsEnvelopeHead:
     """``list-sessions --worktree`` puts the asserted head on the envelope so a
@@ -772,7 +1013,7 @@ class TestListSessionsEnvelopeHead:
             lambda record: [{"id": s.session_id} for s in record.sessions],
         )
         captured: dict = {}
-        monkeypatch.setattr(m, "_json_output", lambda data: captured.update(data))
+        monkeypatch.setattr(output, "_json_output", lambda data: captured.update(data))
         rc = m.cmd_list_sessions(argparse.Namespace(worktree_id="wt-1", json=True))
         assert rc == 0
         assert captured["head_session"] == "s1"
@@ -787,7 +1028,7 @@ class TestListSessionsEnvelopeHead:
         _rec(tmp_tracking_dir, sessions=[SessionEntry("s1", "t")])
         monkeypatch.setattr(S, "list_worktree_sessions", lambda record: [])
         captured: dict = {}
-        monkeypatch.setattr(m, "_json_output", lambda data: captured.update(data))
+        monkeypatch.setattr(output, "_json_output", lambda data: captured.update(data))
         rc = m.cmd_list_sessions(argparse.Namespace(worktree_id=None, json=True))
         assert rc == 0
         # Per-session is_head covers the all-worktrees case; the envelope head is
@@ -797,7 +1038,6 @@ class TestListSessionsEnvelopeHead:
     def test_all_projects_carries_resolved_provenance(
         self, tmp_path: Path, monkeypatch
     ):
-        from agent_worktrees import __main__ as m
         from agent_worktrees import sessions as S
 
         project_a = tmp_path / "project-a"
@@ -839,16 +1079,16 @@ class TestListSessionsEnvelopeHead:
         )
         save_record(first, project_a / "wt-a.yaml")
         save_record(second, project_b / "wt-b.yaml")
-        monkeypatch.setattr(m, "_all_tracking_dirs", lambda: [project_a, project_b])
+        monkeypatch.setattr(session_tracking_cli, "_all_tracking_dirs", lambda: [project_a, project_b])
         monkeypatch.setattr(
             S,
             "list_worktree_sessions",
             lambda record: [{"id": entry.session_id} for entry in record.sessions],
         )
         captured: dict = {}
-        monkeypatch.setattr(m, "_json_output", lambda data: captured.update(data))
+        monkeypatch.setattr(output, "_json_output", lambda data: captured.update(data))
 
-        rc = m.cmd_list_sessions(argparse.Namespace(
+        rc = session_tracking_cli.cmd_list_sessions(argparse.Namespace(
             worktree_id=None,
             all_projects=True,
             json=True,
@@ -873,7 +1113,6 @@ class TestListSessionsEnvelopeHead:
     def test_conflicting_duplicate_session_provenance_is_unknown(
         self, tmp_path: Path, monkeypatch
     ):
-        from agent_worktrees import __main__ as m
         from agent_worktrees import sessions as S
 
         project_a = tmp_path / "project-a"
@@ -901,16 +1140,16 @@ class TestListSessionsEnvelopeHead:
                 kind=kind,
             )
             save_record(record, project / f"{worktree_id}.yaml")
-        monkeypatch.setattr(m, "_all_tracking_dirs", lambda: [project_a, project_b])
+        monkeypatch.setattr(session_tracking_cli, "_all_tracking_dirs", lambda: [project_a, project_b])
         monkeypatch.setattr(
             S,
             "list_worktree_sessions",
             lambda record: [{"id": entry.session_id} for entry in record.sessions],
         )
         captured: dict = {}
-        monkeypatch.setattr(m, "_json_output", lambda data: captured.update(data))
+        monkeypatch.setattr(output, "_json_output", lambda data: captured.update(data))
 
-        rc = m.cmd_list_sessions(argparse.Namespace(
+        rc = session_tracking_cli.cmd_list_sessions(argparse.Namespace(
             worktree_id=None,
             all_projects=True,
             json=True,
@@ -921,3 +1160,121 @@ class TestListSessionsEnvelopeHead:
         assert captured["sessions"][0]["interface"] == "unknown"
         assert captured["sessions"][0]["origin"] == "unknown"
         assert captured["sessions"][0]["provenance_conflict"] is True
+
+
+class TestDeadHeadReclaim:
+    """A head whose Copilot is gone never blocks the session running here."""
+
+    @staticmethod
+    def _dead(monkeypatch, *dead: str) -> None:
+        from agent_worktrees import tracking_session_registration_write as w
+
+        monkeypatch.setattr(w, "head_is_provably_dead", lambda sid: sid in dead)
+
+    def test_a_resumed_session_takes_over_a_dead_head(
+        self, tmp_tracking_dir: Path, monkeypatch_config, monkeypatch
+    ):
+        _rec(tmp_tracking_dir)
+        tracking.register_session("wt-1", "old")
+        tracking.register_session("wt-1", "new")
+        assert load_record(tmp_tracking_dir / "wt-1.yaml").resolved_head_session == "old"
+        self._dead(monkeypatch, "old")
+        tracking.register_session("wt-1", "new")  # its resume's sessionStart
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        assert rec.resolved_head_session == "new"
+        assert rec.replayed_head_transition.reason == "reclaim"
+
+    def test_a_live_head_is_never_displaced(
+        self, tmp_tracking_dir: Path, monkeypatch_config, monkeypatch
+    ):
+        _rec(tmp_tracking_dir)
+        tracking.register_session("wt-1", "old")
+        tracking.register_session("wt-1", "new")
+        self._dead(monkeypatch)  # nothing is dead
+        tracking.register_session("wt-1", "new")
+        tracking.register_session("wt-1", "new", source="bind")
+        assert load_record(tmp_tracking_dir / "wt-1.yaml").resolved_head_session == "old"
+
+    def test_a_new_session_claims_a_dead_head(
+        self, tmp_tracking_dir: Path, monkeypatch_config, monkeypatch
+    ):
+        _rec(tmp_tracking_dir)
+        tracking.register_session("wt-1", "old")
+        self._dead(monkeypatch, "old")
+        tracking.register_session("wt-1", "fresh")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        assert rec.resolved_head_session == "fresh"
+        assert rec.replayed_head_transition.reason == "reclaim"
+
+    def test_bind_revives_a_handed_off_session_over_a_dead_head(
+        self, tmp_tracking_dir: Path, monkeypatch_config, monkeypatch
+    ):
+        """The operator resumes an earlier orchestrator after a wrong
+        successor took the head and then died: the explicit bind wins."""
+        _rec(tmp_tracking_dir)
+        tracking.register_session("wt-1", "orchestrator")
+        tracking.register_session("wt-1", "stray")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        link_succession(rec, "orchestrator", "stray")
+        self._dead(monkeypatch, "stray")
+        tracking.register_session("wt-1", "orchestrator", source="bind")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        assert rec.resolved_head_session == "orchestrator"
+        assert rec.session_entry("orchestrator").state == "active"
+
+    def test_a_resumed_handed_off_orchestrator_reclaims_at_session_start(
+        self, tmp_tracking_dir: Path, monkeypatch_config, monkeypatch
+    ):
+        """No explicit bind needed: the original orchestrator's own resume
+        (its sessionStart registration) takes back a dead successor's head."""
+        _rec(tmp_tracking_dir)
+        tracking.register_session("wt-1", "orchestrator")
+        tracking.register_session("wt-1", "stray")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        link_succession(rec, "orchestrator", "stray")
+        self._dead(monkeypatch, "stray")
+        tracking.register_session("wt-1", "orchestrator")
+        rec = load_record(tmp_tracking_dir / "wt-1.yaml")
+        assert rec.resolved_head_session == "orchestrator"
+        assert rec.replayed_head_transition.reason == "reclaim"
+
+    @pytest.mark.parametrize("states, expected", [
+        ([False], "dead"),  # its process is provably gone (or the PID was reused)
+        ([], "dead"),  # no lock left at all
+        ([True], "live"),
+        ([None], "unknown"),  # access denied / no process probe on this platform
+        ([False, None], "unknown"),
+        ([False, True], "live"),
+    ])
+    def test_session_liveness_only_says_dead_on_proof(self, tmp_path, monkeypatch, states, expected):
+        from agent_worktrees import session_liveness as sl
+        from agent_worktrees import sessions
+        from agent_worktrees.tracking_session_registration_write import head_is_provably_dead
+
+        monkeypatch.setattr(sessions, "_session_state_dir", lambda: tmp_path)
+        (tmp_path / "s1").mkdir()
+        answers = {}
+        for i, state in enumerate(states):
+            pid = 1000 + i
+            (tmp_path / "s1" / f"inuse.{pid}.lock").write_text("")
+            answers[pid] = state
+        monkeypatch.setattr(sl, "copilot_pid_state", lambda pid: answers[pid])
+        assert sl.session_liveness("s1") == expected
+        assert head_is_provably_dead("s1") is (expected == "dead")
+        assert sl.session_liveness("elsewhere") == "unknown"  # not on this machine
+        assert sl.session_liveness(None) == "unknown"
+
+    def test_an_unreadable_session_directory_is_unknown_never_dead(self, tmp_path, monkeypatch):
+        from agent_worktrees import session_liveness as sl
+        from agent_worktrees import sessions
+        from agent_worktrees.tracking_session_registration_write import head_is_provably_dead
+
+        monkeypatch.setattr(sessions, "_session_state_dir", lambda: tmp_path)
+        (tmp_path / "s1").mkdir()
+
+        def _denied(path):
+            raise PermissionError(13, "Access is denied", str(path))
+
+        monkeypatch.setattr(sl.os, "scandir", _denied)
+        assert sl.session_liveness("s1") == "unknown"
+        assert head_is_provably_dead("s1") is False

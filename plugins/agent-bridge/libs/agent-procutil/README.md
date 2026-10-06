@@ -43,11 +43,43 @@ ownership. Runtime code with an additional in-process survival step can use
 instead of using `DETACHED_PROCESS`, so console-subsystem grandchildren do not
 allocate a visible console.
 
+A child that must not outlive the process that spawned it is spawned inside a
+kill-on-close Windows Job Object:
+
+```python
+proc, job = await spawn_in_kill_on_close_job(
+    *cmd, stdout=asyncio.subprocess.PIPE, **no_window_kwargs(),
+)  # job: JobHandle | None
+```
+
+On Windows the child is created suspended, assigned to the job, and only then
+resumed, so it can neither run nor start descendants outside the job while the
+job is armed. Keep the returned `JobHandle` referenced for as long as the child
+should live: when it is closed (explicitly, or when the owning process exits for
+any reason) Windows terminates every process still in the job. It is
+best-effort: `job` is `None` off Windows or when the job can't be armed (the
+child still runs). In that degraded case ordinary cleanup still applies, but a
+hard-killed owner can orphan the child. Do not use it for children meant to
+outlive their launcher (detached daemons, keepers).
+
 ## Vendoring
 
-This lib is **vendored per plugin** at `plugins/<plugin>/libs/agent-procutil`
-(a marketplace-installed plugin can only reference libs inside its own dir via
-`[tool.uv.sources] agent-procutil = { path = "libs/agent-procutil" }`). Every
-copy's `src/` tree must stay **byte-identical** and declare the **same version**
-— enforced by `tools/check-vendored-libs-sync.py`. A source change to one copy
-MUST be propagated to all, with a version bump.
+**In dev**, most consumers' `pyproject.toml` reference this library through
+a `uv`-editable canonical pointer (`vendor-pointer-generalization` effort,
+Phase 1) --
+`agent-procutil = { path = "../../libs/agent-procutil", editable = true }` --
+so those consumers resolve to this one source tree with nothing to keep in
+sync. At least one consumer (`agent-worktrees`) ships a real local copy in
+dev too, per its own self-contained build-surface requirement for its
+status-monitor cutover feature.
+
+**At release**, `tools/materialize_main.py` rewrites every remaining
+`uv`-editable pointer into a real, promoted copy at
+`<consumer>/libs/agent-procutil/` for that consumer -- `plugins/<plugin>/libs/
+agent-procutil/` for an ordinary plugin, or a top-level, out-of-plugin
+consumer's own root (e.g. `worktree-manager/libs/agent-procutil/`) for a
+standalone consumer -- non-editable, so a published consumer installs a
+self-contained source tree with no cross-plugin `path` reference.
+`tools/sync-vendored-libs.py --check` verifies every materialized copy's
+`src/` tree and version stay byte-identical to this canonical one and to
+each other.

@@ -36,9 +36,33 @@ command with:
 agent-worktrees reconcile-binstubs --transfer <project>
 ```
 
+For isolated Python registry and project-launcher operations, `AGENT_HOME`
+relocates the legacy registries, `.local/bin` launchers, and
+`.agent-worktrees/binstub-receipts` ledger together without changing `HOME` or
+`USERPROFILE` for Git/SSH credentials. A validated installation context still
+selects its own registry root; cells sharing one harness home still arbitrate
+the same launchers and ownership ledger. This does not isolate the native
+installers or Windows Terminal profile refresh performed by `register`; use
+`register-project-entry` for registry and project-launcher publication only.
+
 The plugin installs via the Copilot CLI marketplace. The runtime installs
 via init/install scripts (or first-use provisioning from the global binstub)
 and provides the `agent-worktrees` CLI and per-project binstubs.
+
+## Same-Machine AHP Sessions
+
+Same-machine Agent Host Protocol (AHP) session ownership now lives in the
+standalone **Worktree Manager**, not in agent-worktrees. Agent-worktrees keeps
+only the provider-neutral `execution-leg` record and the finalize/cleanup
+barriers that refuse a live or unknown externally owned session.
+
+The Worktree Manager Picker is the only path that can establish a **new** AHP
+session. A bare/direct `agent-worktrees` launch can still resume an **existing**
+persisted AHP execution leg and hard-bind Copilot to that session, but if no
+active AHP leg already exists it falls back to an ordinary direct/mux launch
+and warns that new AHP sessions must be created through Worktree Manager.
+See the [Configuration Reference](docs/config-reference.md#same-machine-ahp-sessions)
+and [CLI Reference](docs/cli-reference.md#session-lifecycle).
 
 ## Balanced Profile Assignment
 
@@ -102,14 +126,29 @@ See the [CLI Reference](docs/cli-reference.md#status-bar-segment-tmux--psmux)
 for the full state table and flags.
 
 On Linux/WSL the bar is applied **per tmux session** by the launcher --
-agent-worktrees does not deploy, overwrite, or delete your global
-`~/.tmux.conf`. Server-global tuning that can't be session-scoped (keystroke
-passthrough, `escape-time`) is an **opt-in** `apply-mux-keybinds.sh` you run
-yourself; it persists a clearly-marked managed block in `~/.tmux.conf` (so it
-survives restarts) and applies to any running server. (Windows/psmux works the
-same way: per-session `session-options.ps1` + opt-in `apply-mux-keybinds.ps1`;
-agent-worktrees no longer owns `~/.psmux.conf`.) See the CLI Reference's
-*Per-session, not global* note for details.
+neither agent-worktrees nor Worktree Manager deploys, overwrites, or deletes
+your global `~/.tmux.conf`. Server-global tuning that can't be session-scoped
+(keystroke passthrough, `escape-time`) is an **opt-in** `apply-mux-keybinds.sh`
+you run yourself; it persists a clearly-marked managed block in `~/.tmux.conf`
+(so it survives restarts) and applies to any running server. (Windows/psmux
+works the same way: per-session `session-options.ps1` + opt-in
+`apply-mux-keybinds.ps1`; neither system owns `~/.psmux.conf`.) See the CLI
+Reference's *Per-session, not global* note for details.
+
+## PR Attribution & Codenames
+
+Every worktree is assigned a random, public-safe **codename** at creation,
+and `create-pr` embeds it in a hidden PR marker by default
+(codename-attribution-by-default) -- a public repo can't publish raw
+machine/worktree/session identifiers, but a codename gives the PR's author,
+or any maintainer who didn't write it, a way to trace a stalled or
+unfamiliar PR back to its source worktree: `resolve --codename <name>` or
+`embody --codename <name>`, resolved locally first and then via an automated
+cross-machine SSH scan that fails closed on a remote match (reports the
+machine, never launches remotely). See the
+[Architecture doc's PR Attribution & Codenames section](docs/architecture.md#pr-attribution--codenames)
+for the mechanism and threat-model tradeoff, and the `worktree` skill's
+`references/pr-attribution.md` for the consumer-facing how-to.
 
 ## Getting Started
 
@@ -126,7 +165,8 @@ the skills below for in-session guidance.
 | [The Worktree Picker](docs/picker.md) | The interactive launcher — screen anatomy, navigation, resume/create/clean/sync, launch-time freshness |
 | [Multiplexed Sessions](docs/mux.md) | Why sessions run in tmux/psmux — persistence, detach/rejoin, and muxed-vs-programmatic launch |
 | [Worktree Lifecycle & Change Management](docs/worktree-lifecycle.md) | The full landing flow — states, direct-push and PR mode, held/follow-up and serial-vs-parallel PRs |
-| [Architecture](docs/architecture.md) | Plugin/runtime layers, installed layout, session lifecycle |
+| [Cross-Repo Setup](docs/cross-repo-project-setup.md) | Which of repo class, agent exposure, and project registration to set for a given cross-repo need — decision table + traps (e.g. `expose_agent` without `--repo-dir` is a no-op; registering a `reference` repo silently reclassifies it to `worktree`) |
+| [Architecture](docs/architecture.md) | Plugin/runtime layers, installed layout, session lifecycle, PR attribution & codenames |
 | [CLI Reference](docs/cli-reference.md) | Commands, installer actions, config format |
 
 ## Validation

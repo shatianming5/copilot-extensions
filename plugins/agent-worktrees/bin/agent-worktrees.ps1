@@ -1,4 +1,31 @@
 $env:PYTHONUTF8 = '1'
+# Sanitize inherited Python runtime variables before dispatching to the
+# resolved, architecture-correct runtime-slot interpreter (#2411). A stray
+# mismatched-architecture PYTHONHOME/PYTHONPATH -- set at Windows User scope,
+# inherited from a parent shell, or leaked from an unrelated venv activation
+# -- otherwise survives into every dispatch below and can crash the resolved
+# interpreter (e.g. an x64 PYTHONHOME under an ARM64 python.exe fails
+# `import socket` with "DLL load failed"). This is the same sanitization
+# class #2359 applied to Worktree Manager's own engine-launch subprocesses,
+# applied here at the binstub entry point so it protects every direct
+# invocation, not only Manager-spawned children. Clearing these here is safe
+# regardless of downstream provisioning path: this script never itself
+# imports Python modules, and the resolved interpreter's own site/venv
+# machinery re-establishes whatever of these it legitimately needs.
+#
+# AGENT_RT_ROOT is included here too (#3220): unlike every other plugin's
+# binstub, which sets this variable itself immediately before dot-sourcing
+# the shared resolver, `resolve-runtime.ps1`'s local `_awr` fallback here
+# honors an *inherited* AGENT_RT_ROOT as an override. A value leaked from
+# another plugin's debugging session (Windows User/Machine scope, or baked
+# into a long-lived parent process' environment) then silently hijacks this
+# resolver into a different plugin's venv, failing with an opaque
+# "No module named agent_worktrees". Clearing it here restores this
+# binstub's own default (`~/.agent-worktrees`) every time, matching the
+# canonical per-invocation-scoping contract every other plugin follows.
+foreach ($_pyEnvVar in @('PYTHONHOME', 'PYTHONPATH', 'PYTHONEXECUTABLE', 'VIRTUAL_ENV', 'UV_INTERNAL__PYTHONHOME', '__PYVENV_LAUNCHER__', 'AGENT_RT_ROOT')) {
+    Remove-Item "Env:\$_pyEnvVar" -ErrorAction SilentlyContinue
+}
 # Resolve the runtime slot python SOLELY via the junction-free `current-version`
 # marker and launch it directly. The `.venv` junction is retired (marker model,
 # #581/#1085/#1106): nothing traverses/parses a reparse point (blocked under
@@ -26,6 +53,20 @@ $_inst = if ($_snap) { Join-Path $_snap 'scripts\install.ps1' } else { '' }
 if (-not ($_inst -and (Test-Path -LiteralPath $_inst))) {
     $_inst = Get-ChildItem (Join-Path $env:USERPROFILE '.copilot\installed-plugins') -Recurse -Filter 'install.ps1' -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -match '[\\/]agent-worktrees[\\/]scripts[\\/]install\.ps1$' } |
+        Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not ($_inst -and (Test-Path -LiteralPath $_inst))) {
+    # A `copilot plugin install <repo>:<path>` direct (non-marketplace)
+    # install has no nested `agent-worktrees\` segment: it lands at
+    # `installed-plugins\_direct\<owner>--<repo>--<subpath-with-dashes>\`,
+    # which the marketplace-shaped match above never matches. Anchored on
+    # the directory name *ending* in `-agent-worktrees` (the subpath's own
+    # final segment, always `agent-worktrees` for this plugin) rather than
+    # matching the substring anywhere, so an unrelated direct-installed
+    # plugin whose name merely contains "agent-worktrees" elsewhere can
+    # never be selected.
+    $_inst = Get-ChildItem (Join-Path $env:USERPROFILE '.copilot\installed-plugins\_direct') -Recurse -Filter 'install.ps1' -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '[\\/]_direct[\\/][^\\/]*-agent-worktrees[\\/]scripts[\\/]install\.ps1$' } |
         Select-Object -First 1 -ExpandProperty FullName
 }
 if (-not ($_inst -and (Test-Path -LiteralPath $_inst))) { [Console]::Error.WriteLine('[agent-worktrees] cannot self-provision: installer not found. Re-enable the plugin, then retry.'); exit 127 }

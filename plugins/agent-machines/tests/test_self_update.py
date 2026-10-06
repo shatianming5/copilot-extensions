@@ -1,0 +1,1921 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from agent_machines import __main__ as cli
+from agent_machines import (
+    self_update,
+    self_update_dtssh,
+    self_update_lock,
+    self_update_state,
+    self_update_tasks,
+    self_update_types,
+)
+from agent_machines.manifest import ManifestError, load_package
+from agent_machines.reconcile import plan
+from agent_machines.resources import resolve_resources
+
+from ._helpers import base_package, write_package
+
+
+def _pkg(
+    tmp_path: Path,
+    name: str,
+    resources: list[dict],
+    *,
+    authority: int | None = None,
+) -> object:
+    data = base_package(
+        name=name,
+        schema_version=4,
+        gate=["box-1"],
+        manage={},
+        resources=resources,
+    )
+    if authority is not None:
+        data["authority"] = authority
+    path = write_package(tmp_path / name.replace("/", "_"), "pkg.yaml", data)
+    return load_package(path, source_repo=name.split("/")[0])
+
+
+class _FakeMutex:
+    def __init__(self, outcome: str):
+        self.outcome = outcome
+        self.released = False
+        self.closed = False
+
+    def try_acquire(self) -> str:
+        return self.outcome
+
+    def release(self) -> None:
+        self.released = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _task_snapshot(
+    tier: str,
+    *,
+    present: bool,
+    matching: bool = True,
+    enabled: bool | None = True,
+):
+    return self_update.ScheduledTaskSnapshot(
+        task_name=self_update.TIER_SPECS[tier].task_name,
+        present=present,
+        enabled=enabled,
+        logon_type="Interactive" if present else None,
+        description=self_update.task_description(tier) if present else None,
+        execute="conhost.exe" if present else None,
+        arguments=self_update.task_action_arguments(tier),
+        working_directory=self_update.task_working_directory(),
+        matching=matching,
+    )
+
+
+def test_manifest_accepts_self_update_resource_and_rejects_bad_tier(tmp_path):
+    package = _pkg(
+        tmp_path,
+        "acme/watchdog",
+        [{"type": "self-update", "tier": "watchdog"}],
+    )
+    assert package.resources[0]["tier"] == "watchdog"
+    with pytest.raises(ManifestError, match="self-update tier"):
+        _pkg(
+            tmp_path,
+            "acme/invalid",
+            [{"type": "self-update", "tier": "weekly"}],
+        )
+
+
+def test_self_update_resource_selects_highest_authority_and_equal_highest_conflicts(
+    tmp_path,
+):
+    disabled = _pkg(
+        tmp_path,
+        "acme/disabled",
+        [{"type": "self-update", "tier": "watchdog", "state": "absent"}],
+        authority=0,
+    )
+    enabled = _pkg(
+        tmp_path,
+        "acme/enabled",
+        [{"type": "self-update", "tier": "watchdog", "state": "present"}],
+        authority=10,
+    )
+    resolved, findings = resolve_resources([disabled, enabled], "box-1", "windows")
+    watchdog = next(resource for resource in resolved if resource.type == "self-update")
+    assert watchdog.desired["state"] == "present"
+    assert any(finding.code == "authority-supersession" for finding in findings)
+    equal = _pkg(
+        tmp_path,
+        "acme/equal",
+        [{"type": "self-update", "tier": "watchdog", "state": "absent"}],
+        authority=10,
+    )
+    _, equal_findings = resolve_resources([equal, enabled], "box-1", "windows")
+    assert any(finding.code == "resource-conflict" for finding in equal_findings)
+
+
+def test_run_noops_when_tier_not_opted_in():
+    result = self_update.run_tier("watchdog", opted_in=False)
+    assert result.ok is True
+    assert result.status == "noop"
+    assert result.detail == "tier 'watchdog' is not opted in"
+
+
+def test_lock_refuses_live_owner_without_double_drive(tmp_path, monkeypatch):
+    started = datetime(2026, 1, 1, tzinfo=UTC)
+    self_update.lock_path("watchdog", tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    self_update.lock_path("watchdog", tmp_path).write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "tier": "watchdog",
+                "pid": 4321,
+                "started_at": started.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(self_update_lock, "_WindowsMutex", lambda _name: _FakeMutex("timeout"))
+    monkeypatch.setattr(self_update_state, "_WindowsMutex", lambda _name: _FakeMutex("timeout"))
+    monkeypatch.setattr(self_update.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "win32")
+    lock = self_update.TierLock(tier="watchdog", home=tmp_path)
+    acquired, detail = lock.acquire()
+    assert acquired is False
+    assert "already active" in detail
+    assert lock.snapshot is not None
+    assert lock.snapshot.pid == 4321
+
+
+def test_lock_reclaims_dead_owner_only_after_stale_window(tmp_path, monkeypatch):
+    started = datetime(2026, 1, 1, tzinfo=UTC)
+    path = self_update.lock_path("watchdog", tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "tier": "watchdog",
+                "pid": 4321,
+                "started_at": started.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(self_update_lock, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    monkeypatch.setattr(self_update_state, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    monkeypatch.setattr(self_update.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "win32")
+    lock = self_update.TierLock(
+        tier="watchdog",
+        home=tmp_path,
+        pid=9999,
+        now=lambda: started + timedelta(minutes=11),
+        pid_alive=lambda _pid: False,
+    )
+    acquired, detail = lock.acquire()
+    assert acquired is True
+    assert detail == "acquired"
+    assert lock.reclaimed is True
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["pid"] == 9999
+    lock.release()
+
+
+def test_lock_refuses_recent_dead_owner(tmp_path, monkeypatch):
+    started = datetime(2026, 1, 1, tzinfo=UTC)
+    path = self_update.lock_path("watchdog", tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "tier": "watchdog",
+                "pid": 4321,
+                "started_at": started.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(self_update_lock, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    monkeypatch.setattr(self_update_state, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    monkeypatch.setattr(self_update.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "win32")
+    lock = self_update.TierLock(
+        tier="watchdog",
+        home=tmp_path,
+        pid=9999,
+        now=lambda: started + timedelta(minutes=9),
+        pid_alive=lambda _pid: False,
+    )
+    acquired, detail = lock.acquire()
+    assert acquired is False
+    assert "stale window has not elapsed" in detail
+    assert lock.snapshot is not None
+    assert json.loads(path.read_text(encoding="utf-8"))["pid"] == 4321
+
+
+def test_tier_lock_acquires_and_releases_on_posix(tmp_path):
+    """Regression: TierLock.acquire() used to unconditionally refuse with
+    'self-update locking is supported only on Windows' on any non-Windows
+    platform, so `agent-machines self-update run` could never actually
+    execute a tier there -- opting in and registering the scheduled timer
+    (see the systemd --user support above) still hit this wall every time
+    the timer fired. Exercises the real (non-mocked) POSIX flock()-based
+    path -- this test only runs meaningfully on a POSIX host."""
+    if sys.platform == "win32":
+        pytest.skip("POSIX-only lock path")
+    lock = self_update.TierLock(tier="watchdog", home=tmp_path)
+    acquired, detail = lock.acquire()
+    assert acquired is True
+    assert detail == "acquired"
+    assert self_update.lock_path("watchdog", tmp_path).exists()
+    lock.release()
+    assert not self_update.lock_path("watchdog", tmp_path).exists()
+
+
+def test_tier_lock_refuses_concurrent_holder_on_posix(tmp_path):
+    if sys.platform == "win32":
+        pytest.skip("POSIX-only lock path")
+    first = self_update.TierLock(tier="sweep", home=tmp_path, pid=111)
+    acquired_first, _ = first.acquire()
+    assert acquired_first is True
+
+    second = self_update.TierLock(tier="sweep", home=tmp_path, pid=222, pid_alive=lambda _p: True)
+    acquired_second, detail = second.acquire()
+    assert acquired_second is False
+    assert "already active" in detail
+
+    first.release()
+    third = self_update.TierLock(tier="sweep", home=tmp_path, pid=333)
+    acquired_third, _ = third.acquire()
+    assert acquired_third is True
+    third.release()
+
+
+def test_watchdog_starts_launcher_when_missing(monkeypatch):
+    config = self_update.DtsshConfig(
+        config_path=Path("config.json"),
+        install_root=Path("install"),
+        launcher_path=Path(r"C:\agent-ssh-dtssh\dtssh-host-launcher.ps1"),
+        alias="box-1",
+        port=2222,
+    )
+    state = {"running": False}
+
+    def process_lister():
+        return (
+            []
+            if not state["running"]
+            else [{"ProcessId": 321, "CommandLine": str(config.launcher_path)}]
+        )
+
+    def starter(_config):
+        state["running"] = True
+        return True
+
+    monkeypatch.setattr(self_update_dtssh, "load_dtssh_config", lambda local_app_data=None: config)
+    steps = self_update.ensure_watchdog(
+        process_lister=process_lister,
+        launcher_starter=starter,
+        sleeper=lambda _seconds: None,
+        now=iter([0.0, 0.0]).__next__,
+    )
+    assert steps[0].status == "changed"
+    assert "started dtssh host launcher" in steps[0].detail
+
+
+def test_default_launcher_starter_does_not_pass_creationflags_to_conhost(monkeypatch, tmp_path):
+    # Regression: CREATE_NO_WINDOW applied to conhost.exe --headless itself
+    # (rather than to the ordinary child it hosts) breaks its own console
+    # allocation -- conhost then exits immediately without ever starting the
+    # pwsh launcher, so the watchdog silently times out forever. conhost's
+    # own `--headless` flag already keeps a window from appearing, so no
+    # extra Popen creationflags belong on this specific spawn.
+    monkeypatch.setattr(self_update.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_dtssh, "shutil_which", lambda _name: r"C:\pwsh\pwsh.exe")
+    monkeypatch.setattr(Path, "is_file", lambda self: True)
+    captured: dict = {}
+
+    class _FakePopen:
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(self_update_dtssh.subprocess, "Popen", _FakePopen)
+    config = self_update.DtsshConfig(
+        config_path=tmp_path / "config.json",
+        install_root=tmp_path,
+        launcher_path=tmp_path / "dtssh-host-launcher.ps1",
+        alias="box-1",
+        port=2222,
+    )
+    result = self_update.default_launcher_starter(config)
+    assert result is True
+    assert "creationflags" not in captured["kwargs"]
+    assert captured["argv"][1] == "--headless"
+
+
+def test_refresh_dtssh_mesh_skips_when_agent_ssh_missing(monkeypatch):
+    monkeypatch.setattr(self_update_dtssh.shutil, "which", lambda _name: None)
+    step = self_update.refresh_dtssh_mesh(runner=lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("must not run without agent-ssh")
+    ))
+    assert step.status == "skipped"
+    assert "agent-ssh is not installed" in step.detail
+
+
+def test_refresh_dtssh_mesh_skips_when_no_machines_yaml(monkeypatch):
+    monkeypatch.setattr(self_update_dtssh.shutil, "which", lambda _name: "agent-ssh")
+
+    def runner(argv, *, cwd=None, timeout=0):
+        payload = json.dumps(
+            {"ok": True, "machines_yaml": None, "detail": "no machines.yaml found", "aliases": []}
+        )
+        return self_update.CommandResult(list(argv), 0, payload, "")
+
+    step = self_update.refresh_dtssh_mesh(runner=runner)
+    assert step.status == "skipped"
+    assert "no machines.yaml" in step.detail
+
+
+def test_refresh_dtssh_mesh_ok_when_mesh_reachable(monkeypatch):
+    monkeypatch.setattr(self_update_dtssh.shutil, "which", lambda _name: "agent-ssh")
+
+    def runner(argv, *, cwd=None, timeout=0):
+        payload = json.dumps(
+            {
+                "ok": True,
+                "machines_yaml": "machines.yaml",
+                "detail": "refreshed the dtssh mesh; all 2 known alias(es) reachable",
+                "aliases": [
+                    {"alias": "host-a", "reachable": True, "detail": "reachable"},
+                    {"alias": "host-b", "reachable": True, "detail": "reachable"},
+                ],
+            }
+        )
+        return self_update.CommandResult(list(argv), 0, payload, "")
+
+    step = self_update.refresh_dtssh_mesh(runner=runner)
+    assert step.status == "ok"
+    assert "all 2 known alias(es) reachable" in step.detail
+
+
+def test_refresh_dtssh_mesh_error_when_alias_unreachable(monkeypatch):
+    monkeypatch.setattr(self_update_dtssh.shutil, "which", lambda _name: "agent-ssh")
+
+    def runner(argv, *, cwd=None, timeout=0):
+        payload = json.dumps(
+            {
+                "ok": False,
+                "machines_yaml": "machines.yaml",
+                "detail": "refreshed the dtssh mesh; unreachable: host-b",
+                "aliases": [
+                    {"alias": "host-a", "reachable": True, "detail": "reachable"},
+                    {"alias": "host-b", "reachable": False, "detail": "unreachable after refresh"},
+                ],
+            }
+        )
+        return self_update.CommandResult(list(argv), 1, payload, "")
+
+    step = self_update.refresh_dtssh_mesh(runner=runner)
+    assert step.status == "error"
+    assert "host-b" in step.detail
+
+
+def test_refresh_dtssh_mesh_uses_same_cell_agent_ssh_prefix(monkeypatch, tmp_path):
+    cell = tmp_path / "marketplaces" / "test-cell"
+    root = cell / "plugins" / "agent-machines"
+    root.mkdir(parents=True)
+    (cell / "plugins" / "agent-ssh").mkdir()
+    own = {"cellRoot": str(cell), "pluginRoot": str(root)}
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", str(root / "install.json"))
+    monkeypatch.setenv("AGENT_RT_ROOT", str(root))
+    monkeypatch.setattr(self_update_dtssh._peer_launch, "validate_owner", lambda *args: own)
+    monkeypatch.setattr(
+        self_update_dtssh.shutil, "which", lambda _: pytest.fail("ambient PATH selected"),
+    )
+    expected_prefix = self_update_dtssh._peer_launch.launch_prefix(
+        "agent-machines", Path(own["pluginRoot"]),
+        str(Path(own["pluginRoot"]) / "install.json"), "agent-ssh",
+    )
+    calls = []
+
+    def runner(argv, *, cwd=None, timeout=0):
+        calls.append(list(argv))
+        payload = json.dumps(
+            {"ok": True, "machines_yaml": None, "detail": "no mesh", "aliases": []}
+        )
+        return self_update.CommandResult(list(argv), 0, payload, "")
+
+    step = self_update.refresh_dtssh_mesh(runner=runner)
+    assert step.status == "skipped"
+    assert calls[0][:len(expected_prefix)] == expected_prefix
+    assert calls[0][len(expected_prefix):] == ["refresh-mesh", "--json"]
+
+
+def test_refresh_dtssh_mesh_skips_without_same_cell_agent_ssh(monkeypatch, tmp_path):
+    cell = tmp_path / "marketplaces" / "test-cell"
+    root = cell / "plugins" / "agent-machines"
+    root.mkdir(parents=True)
+    own = {"cellRoot": str(cell), "pluginRoot": str(root)}
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", str(root / "install.json"))
+    monkeypatch.setenv("AGENT_RT_ROOT", str(root))
+    monkeypatch.setattr(self_update_dtssh._peer_launch, "validate_owner", lambda *args: own)
+    monkeypatch.setattr(
+        self_update_dtssh.shutil, "which", lambda _: pytest.fail("ambient PATH selected"),
+    )
+
+    step = self_update.refresh_dtssh_mesh(
+        runner=lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not run without a same-cell agent-ssh")
+        )
+    )
+    assert step.status == "skipped"
+    assert "agent-ssh is not installed" in step.detail
+
+
+def test_refresh_dtssh_mesh_propagates_context_refusal(monkeypatch, tmp_path):
+    root = tmp_path / "marketplaces" / "test-cell" / "plugins" / "agent-machines"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", str(root / "install.json"))
+    monkeypatch.setenv("AGENT_RT_ROOT", str(root))
+
+    def refuse(*_args):
+        raise ValueError("malformed receipt")
+
+    monkeypatch.setattr(self_update_dtssh._peer_launch, "validate_owner", refuse)
+
+    with pytest.raises(self_update_dtssh._peer_launch.ContextRefused):
+        self_update.refresh_dtssh_mesh(
+            runner=lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("must not run on a refused context")
+            )
+        )
+
+
+def test_ensure_dtssh_host_healthy_skips_when_agent_ssh_missing(monkeypatch):
+    monkeypatch.setattr(self_update_dtssh.shutil, "which", lambda _name: None)
+    step = self_update.ensure_dtssh_host_healthy(
+        runner=lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not run without agent-ssh")
+        )
+    )
+    assert step.status == "skipped"
+    assert "agent-ssh is not installed" in step.detail
+
+
+def test_ensure_dtssh_host_healthy_skips_when_config_missing(monkeypatch):
+    monkeypatch.setattr(self_update_dtssh.shutil, "which", lambda _name: "agent-ssh")
+
+    def raise_config(local_app_data=None):
+        raise RuntimeError("dtssh companion config is unreadable: not found")
+
+    monkeypatch.setattr(self_update_dtssh, "load_dtssh_config", raise_config)
+    step = self_update.ensure_dtssh_host_healthy(
+        runner=lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not run without a resolvable dtssh config")
+        )
+    )
+    assert step.status == "skipped"
+    assert "unreadable" in step.detail
+
+
+def test_ensure_dtssh_host_healthy_ok_when_already_healthy(monkeypatch, tmp_path):
+    monkeypatch.setattr(self_update_dtssh.shutil, "which", lambda _name: "agent-ssh")
+    config = self_update.DtsshConfig(
+        config_path=tmp_path / "config.json",
+        install_root=tmp_path,
+        launcher_path=tmp_path / "dtssh-host-launcher.ps1",
+        alias="box-1",
+        port=2222,
+    )
+    monkeypatch.setattr(self_update_dtssh, "load_dtssh_config", lambda local_app_data=None: config)
+    calls = []
+
+    def runner(argv, *, cwd=None, timeout=0):
+        calls.append(list(argv))
+        payload = json.dumps({"ok": True, "healthy": True, "would_change": False})
+        return self_update.CommandResult(list(argv), 0, payload, "")
+
+    step = self_update.ensure_dtssh_host_healthy(runner=runner)
+    assert step.status == "ok"
+    assert "healthy" in step.detail
+    # Only the status probe ran -- no apply for an already-healthy host.
+    assert len(calls) == 1
+    assert "--apply" not in calls[0]
+    assert calls[0][-1] == "--json"
+    assert calls[0][-3:-1] == ["--port", "2222"]
+    assert calls[0][-5:-3] == ["--alias", "box-1"]
+
+
+def test_ensure_dtssh_host_healthy_reports_error_without_apply_when_blocked(monkeypatch, tmp_path):
+    monkeypatch.setattr(self_update_dtssh.shutil, "which", lambda _name: "agent-ssh")
+    config = self_update.DtsshConfig(
+        config_path=tmp_path / "config.json",
+        install_root=tmp_path,
+        launcher_path=tmp_path / "dtssh-host-launcher.ps1",
+        alias="box-1",
+        port=2222,
+    )
+    monkeypatch.setattr(self_update_dtssh, "load_dtssh_config", lambda local_app_data=None: config)
+    calls = []
+
+    def runner(argv, *, cwd=None, timeout=0):
+        calls.append(list(argv))
+        payload = json.dumps(
+            {
+                "ok": False,
+                "healthy": False,
+                "would_change": False,
+                "blocked": "authentication",
+                "error": "cannot inspect Dev Tunnel login",
+            }
+        )
+        return self_update.CommandResult(list(argv), 1, payload, "")
+
+    step = self_update.ensure_dtssh_host_healthy(runner=runner)
+    assert step.status == "error"
+    assert "Dev Tunnel login" in step.detail
+    # would_change was false -- must not attempt a no-op apply.
+    assert len(calls) == 1
+
+
+def test_ensure_dtssh_host_healthy_applies_when_unhealthy_and_repairs(monkeypatch, tmp_path):
+    monkeypatch.setattr(self_update_dtssh.shutil, "which", lambda _name: "agent-ssh")
+    config = self_update.DtsshConfig(
+        config_path=tmp_path / "config.json",
+        install_root=tmp_path,
+        launcher_path=tmp_path / "dtssh-host-launcher.ps1",
+        alias="box-1",
+        port=2222,
+    )
+    monkeypatch.setattr(self_update_dtssh, "load_dtssh_config", lambda local_app_data=None: config)
+    calls = []
+
+    def runner(argv, *, cwd=None, timeout=0):
+        calls.append(list(argv))
+        if "--apply" in argv:
+            payload = json.dumps(
+                {
+                    "ok": True,
+                    "healthy": True,
+                    "would_change": False,
+                    "applied": True,
+                    "stdout": "dtssh: dtssh 0.2.2\nsshd serving: 127.0.0.1:2222 (SSH banner OK)\n",
+                }
+            )
+            return self_update.CommandResult(list(argv), 0, payload, "")
+        payload = json.dumps(
+            {
+                "ok": True,
+                "healthy": False,
+                "would_change": True,
+                "stdout": "WARNING: sshd NOT serving on :2222 -- no SSH banner\n",
+            }
+        )
+        return self_update.CommandResult(list(argv), 0, payload, "")
+
+    step = self_update.ensure_dtssh_host_healthy(runner=runner)
+    assert step.status == "changed"
+    assert "banner OK" in step.detail
+    assert len(calls) == 2
+    assert "--apply" in calls[1]
+    assert calls[1][:-2] == calls[0][:-1]  # same base argv, minus each call's trailing flag(s)
+
+
+def test_ensure_dtssh_host_healthy_apply_still_unhealthy_is_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(self_update_dtssh.shutil, "which", lambda _name: "agent-ssh")
+    config = self_update.DtsshConfig(
+        config_path=tmp_path / "config.json",
+        install_root=tmp_path,
+        launcher_path=tmp_path / "dtssh-host-launcher.ps1",
+        alias="box-1",
+        port=2222,
+    )
+    monkeypatch.setattr(self_update_dtssh, "load_dtssh_config", lambda local_app_data=None: config)
+
+    def runner(argv, *, cwd=None, timeout=0):
+        if "--apply" in argv:
+            payload = json.dumps(
+                {
+                    "ok": False,
+                    "healthy": False,
+                    "applied": False,
+                    "error": "dtssh host remains unhealthy after installation",
+                }
+            )
+            return self_update.CommandResult(list(argv), 1, payload, "")
+        payload = json.dumps({"ok": True, "healthy": False, "would_change": True})
+        return self_update.CommandResult(list(argv), 0, payload, "")
+
+    step = self_update.ensure_dtssh_host_healthy(runner=runner)
+    assert step.status == "error"
+    assert "remains unhealthy" in step.detail
+
+
+def test_ensure_dtssh_host_healthy_verification_required_is_changed_not_error(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(self_update_dtssh.shutil, "which", lambda _name: "agent-ssh")
+    config = self_update.DtsshConfig(
+        config_path=tmp_path / "config.json",
+        install_root=tmp_path,
+        launcher_path=tmp_path / "dtssh-host-launcher.ps1",
+        alias="box-1",
+        port=2222,
+    )
+    monkeypatch.setattr(self_update_dtssh, "load_dtssh_config", lambda local_app_data=None: config)
+
+    def runner(argv, *, cwd=None, timeout=0):
+        if "--apply" in argv:
+            payload = json.dumps(
+                {
+                    "ok": True,
+                    "healthy": False,
+                    "applied": False,
+                    "detached": True,
+                    "verification_required": True,
+                }
+            )
+            return self_update.CommandResult(list(argv), 0, payload, "")
+        payload = json.dumps({"ok": True, "healthy": False, "would_change": True})
+        return self_update.CommandResult(list(argv), 0, payload, "")
+
+    step = self_update.ensure_dtssh_host_healthy(runner=runner)
+    assert step.status == "changed"
+    assert "verification pending" in step.detail
+
+
+def test_run_tier_watchdog_appends_host_health_step_before_mesh_refresh(monkeypatch, tmp_path):
+    monkeypatch.setattr(self_update.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_lock, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    monkeypatch.setattr(self_update_state, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    config = self_update.DtsshConfig(
+        config_path=tmp_path / "config.json",
+        install_root=tmp_path,
+        launcher_path=tmp_path / "dtssh-host-launcher.ps1",
+        alias="box-1",
+        port=2222,
+    )
+    monkeypatch.setattr(self_update_dtssh, "load_dtssh_config", lambda local_app_data=None: config)
+    monkeypatch.setattr(
+        self_update_dtssh,
+        "watchdog_running",
+        lambda _config, process_lister=None: True,
+    )
+    order = []
+
+    def host_healer():
+        order.append("host-health")
+        return self_update.StepResult("dtssh-host-health", "changed", "repaired the dtssh host")
+
+    def mesh_refresher():
+        order.append("mesh-refresh")
+        return self_update.StepResult("dtssh-mesh-refresh", "ok", "refreshed the dtssh mesh")
+
+    result = self_update.run_tier(
+        "watchdog",
+        opted_in=True,
+        mesh_refresher=mesh_refresher,
+        host_healer=host_healer,
+        home=tmp_path,
+    )
+    assert result.status == "ok"
+    assert order == ["host-health", "mesh-refresh"]
+    assert [step.name for step in result.steps] == [
+        "dtssh-launcher",
+        "dtssh-host-health",
+        "dtssh-mesh-refresh",
+    ]
+
+
+def test_run_tier_watchdog_fails_when_host_health_errors_and_skips_mesh_refresh(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(self_update.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_lock, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    monkeypatch.setattr(self_update_state, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    config = self_update.DtsshConfig(
+        config_path=tmp_path / "config.json",
+        install_root=tmp_path,
+        launcher_path=tmp_path / "dtssh-host-launcher.ps1",
+        alias="box-1",
+        port=2222,
+    )
+    monkeypatch.setattr(self_update_dtssh, "load_dtssh_config", lambda local_app_data=None: config)
+    monkeypatch.setattr(
+        self_update_dtssh,
+        "watchdog_running",
+        lambda _config, process_lister=None: True,
+    )
+
+    def host_healer():
+        return self_update.StepResult(
+            "dtssh-host-health", "error", "dtssh host remains unhealthy after apply"
+        )
+
+    mesh_calls = []
+
+    def mesh_refresher():
+        mesh_calls.append(True)
+        return self_update.StepResult("dtssh-mesh-refresh", "ok", "refreshed the dtssh mesh")
+
+    result = self_update.run_tier(
+        "watchdog",
+        opted_in=True,
+        mesh_refresher=mesh_refresher,
+        host_healer=host_healer,
+        home=tmp_path,
+    )
+    assert result.status == "error"
+    assert "remains unhealthy" in result.detail
+    assert mesh_calls == []
+    assert result.steps[-1].name == "dtssh-host-health"
+
+
+def test_run_tier_watchdog_appends_mesh_refresh_step(monkeypatch, tmp_path):
+    monkeypatch.setattr(self_update.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_lock, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    monkeypatch.setattr(self_update_state, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    config = self_update.DtsshConfig(
+        config_path=tmp_path / "config.json",
+        install_root=tmp_path,
+        launcher_path=tmp_path / "dtssh-host-launcher.ps1",
+        alias="box-1",
+        port=2222,
+    )
+    monkeypatch.setattr(self_update_dtssh, "load_dtssh_config", lambda local_app_data=None: config)
+    monkeypatch.setattr(
+        self_update_dtssh,
+        "watchdog_running",
+        lambda _config, process_lister=None: True,
+    )
+
+    calls = []
+
+    def mesh_refresher():
+        calls.append(True)
+        return self_update.StepResult("dtssh-mesh-refresh", "ok", "refreshed the dtssh mesh")
+
+    result = self_update.run_tier(
+        "watchdog",
+        opted_in=True,
+        mesh_refresher=mesh_refresher,
+        host_healer=lambda: self_update.StepResult("dtssh-host-health", "ok", "healthy"),
+        home=tmp_path,
+    )
+    assert result.status == "ok"
+    assert calls == [True]
+    assert result.steps[-1].name == "dtssh-mesh-refresh"
+    assert result.steps[-1].status == "ok"
+
+
+def test_run_tier_watchdog_fails_when_mesh_refresh_errors(monkeypatch, tmp_path):
+    monkeypatch.setattr(self_update.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_lock, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    monkeypatch.setattr(self_update_state, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    config = self_update.DtsshConfig(
+        config_path=tmp_path / "config.json",
+        install_root=tmp_path,
+        launcher_path=tmp_path / "dtssh-host-launcher.ps1",
+        alias="box-1",
+        port=2222,
+    )
+    monkeypatch.setattr(self_update_dtssh, "load_dtssh_config", lambda local_app_data=None: config)
+    monkeypatch.setattr(
+        self_update_dtssh,
+        "watchdog_running",
+        lambda _config, process_lister=None: True,
+    )
+
+    def mesh_refresher():
+        return self_update.StepResult(
+            "dtssh-mesh-refresh", "error", "unreachable: host-b"
+        )
+
+    result = self_update.run_tier(
+        "watchdog",
+        opted_in=True,
+        mesh_refresher=mesh_refresher,
+        host_healer=lambda: self_update.StepResult("dtssh-host-health", "ok", "healthy"),
+        home=tmp_path,
+    )
+    assert result.status == "error"
+    assert "unreachable: host-b" in result.detail
+    assert result.steps[-1].status == "error"
+
+
+def test_run_tier_converts_unexpected_exception_into_error_result_and_releases_lock(
+    monkeypatch, tmp_path
+):
+    """Safety net: every *anticipated* failure path already returns its own
+    error `RunResult`. This covers everything else -- a bug in a step, an
+    unexpected `OSError`, ... -- which previously propagated straight out of
+    `run_tier`, crashing the whole `self-update run` CLI invocation with a
+    raw traceback instead of a clean, structured error result. `last_attempt`
+    was already durably recorded before this (written before any step runs);
+    what's new is that the caller gets a normal `RunResult` back instead of
+    an unhandled exception, and the lock is still released."""
+    monkeypatch.setattr(self_update.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "win32")
+    created_mutexes: list[_FakeMutex] = []
+
+    def _make_mutex(_name):
+        mutex = _FakeMutex("acquired")
+        created_mutexes.append(mutex)
+        return mutex
+
+    monkeypatch.setattr(self_update_lock, "_WindowsMutex", _make_mutex)
+    monkeypatch.setattr(self_update_state, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(self_update, "ensure_watchdog", boom)
+
+    result = self_update.run_tier("watchdog", opted_in=True, home=tmp_path)
+
+    assert result.status == "error"
+    assert "boom" in result.detail
+    assert result.attempted_at is not None
+    # The mutex `run_tier` actually acquired must have been released/closed,
+    # and its JSON lock record removed -- not merely "some later acquisition
+    # succeeds", which a leftover record owned by the same PID would also
+    # allow even if the original mutex were never released.
+    assert len(created_mutexes) == 1
+    assert created_mutexes[0].released is True
+    assert created_mutexes[0].closed is True
+    assert not self_update_lock.lock_path("watchdog", tmp_path).exists()
+
+
+def test_fast_forward_repo_skips_dirty_and_diverged(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def dirty_runner(argv, *, cwd=None, timeout=0):
+        if argv[:3] == ["git", "rev-parse", "--is-bare-repository"]:
+            return self_update.CommandResult(list(argv), 0, "false\n", "")
+        if argv[:2] == ["git", "status"]:
+            return self_update.CommandResult(list(argv), 0, " M tracked.txt\n", "")
+        raise AssertionError(argv)
+
+    dirty = self_update.fast_forward_repo(repo, runner=dirty_runner)
+    assert dirty.status == "skipped"
+    assert "dirty" in dirty.detail
+
+    def diverged_runner(argv, *, cwd=None, timeout=0):
+        mapping = {
+            ("git", "rev-parse", "--is-bare-repository"): self_update.CommandResult(
+                list(argv), 0, "false\n", ""
+            ),
+            ("git", "status"): self_update.CommandResult(list(argv), 0, "", ""),
+            ("git", "rev-parse"): self_update.CommandResult(list(argv), 0, "origin/main\n", ""),
+            ("git", "fetch"): self_update.CommandResult(list(argv), 0, "", ""),
+            ("git", "rev-list"): self_update.CommandResult(list(argv), 0, "1\t2\n", ""),
+        }
+        for prefix, result in mapping.items():
+            if tuple(argv[: len(prefix)]) == prefix:
+                return result
+        raise AssertionError(argv)
+
+    diverged = self_update.fast_forward_repo(repo, runner=diverged_runner)
+    assert diverged.status == "skipped"
+    assert "diverged" in diverged.detail
+
+
+SCRATCH_REF = "refs/agent-machines/self-update-fetch/main"
+
+
+def test_fast_forward_repo_bare_anchor_fast_forwards_branch_ref(tmp_path):
+    repo = tmp_path / "bare-repo"
+    repo.mkdir()
+    calls: list[list[str]] = []
+
+    def bare_runner(argv, *, cwd=None, timeout=0):
+        calls.append(list(argv))
+        mapping = {
+            ("git", "rev-parse", "--is-bare-repository"): self_update.CommandResult(
+                list(argv), 0, "true\n", ""
+            ),
+            ("git", "symbolic-ref"): self_update.CommandResult(list(argv), 0, "main\n", ""),
+            ("git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"): (
+                self_update.CommandResult(list(argv), 0, "origin/main\n", "")
+            ),
+            ("git", "rev-parse", "--verify", "HEAD"): self_update.CommandResult(
+                list(argv), 0, "aaaa000\n", ""
+            ),
+            ("git", "fetch"): self_update.CommandResult(list(argv), 0, "", ""),
+            ("git", "rev-parse", "--verify", SCRATCH_REF): self_update.CommandResult(
+                list(argv), 0, "bbbb111\n", ""
+            ),
+            ("git", "rev-list"): self_update.CommandResult(list(argv), 0, "0\t1\n", ""),
+            ("git", "merge-base", "--is-ancestor"): self_update.CommandResult(
+                list(argv), 0, "", ""
+            ),
+            ("git", "update-ref", "-d"): self_update.CommandResult(list(argv), 0, "", ""),
+            ("git", "update-ref"): self_update.CommandResult(list(argv), 0, "", ""),
+        }
+        for prefix, result in mapping.items():
+            if tuple(argv[: len(prefix)]) == prefix:
+                return result
+        raise AssertionError(argv)
+
+    result = self_update.fast_forward_repo(repo, runner=bare_runner)
+    assert result.status == "changed"
+    assert "bare" in result.detail
+    expected_fetch = [
+        "git", "fetch", "--quiet", "--no-tags", "origin", f"+refs/heads/main:{SCRATCH_REF}",
+    ]
+    assert expected_fetch in calls
+    assert ["git", "merge-base", "--is-ancestor", "aaaa000", "bbbb111"] in calls
+    assert ["git", "update-ref", "refs/heads/main", "bbbb111", "aaaa000"] in calls
+    assert ["git", "update-ref", "-d", SCRATCH_REF] in calls
+
+
+def test_fast_forward_repo_bare_anchor_skips_detached_head(tmp_path):
+    repo = tmp_path / "bare-repo"
+    repo.mkdir()
+
+    def bare_runner(argv, *, cwd=None, timeout=0):
+        mapping = {
+            ("git", "rev-parse", "--is-bare-repository"): self_update.CommandResult(
+                list(argv), 0, "true\n", ""
+            ),
+            ("git", "symbolic-ref"): self_update.CommandResult(
+                list(argv), 128, "", "not a symbolic ref"
+            ),
+        }
+        for prefix, result in mapping.items():
+            if tuple(argv[: len(prefix)]) == prefix:
+                return result
+        raise AssertionError(argv)
+
+    result = self_update.fast_forward_repo(repo, runner=bare_runner)
+    assert result.status == "skipped"
+    assert "detached" in result.detail
+
+
+def test_fast_forward_repo_bare_anchor_reports_error_when_ref_lock_fails(tmp_path):
+    repo = tmp_path / "bare-repo"
+    repo.mkdir()
+
+    def bare_runner(argv, *, cwd=None, timeout=0):
+        mapping = {
+            ("git", "rev-parse", "--is-bare-repository"): self_update.CommandResult(
+                list(argv), 0, "true\n", ""
+            ),
+            ("git", "symbolic-ref"): self_update.CommandResult(list(argv), 0, "main\n", ""),
+            ("git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"): (
+                self_update.CommandResult(list(argv), 0, "origin/main\n", "")
+            ),
+            ("git", "rev-parse", "--verify", "HEAD"): self_update.CommandResult(
+                list(argv), 0, "aaaa000\n", ""
+            ),
+            ("git", "fetch"): self_update.CommandResult(list(argv), 0, "", ""),
+            ("git", "rev-parse", "--verify", SCRATCH_REF): self_update.CommandResult(
+                list(argv), 0, "bbbb111\n", ""
+            ),
+            ("git", "rev-list"): self_update.CommandResult(list(argv), 0, "0\t1\n", ""),
+            ("git", "merge-base", "--is-ancestor"): self_update.CommandResult(
+                list(argv), 0, "", ""
+            ),
+            ("git", "update-ref", "-d"): self_update.CommandResult(list(argv), 0, "", ""),
+            # Something else locked/moved the ref concurrently: the
+            # compare-and-swap write itself fails.
+            ("git", "update-ref"): self_update.CommandResult(
+                list(argv), 128, "", "fatal: cannot lock ref: is at cccc222 but expected aaaa000"
+            ),
+        }
+        for prefix, result in mapping.items():
+            if tuple(argv[: len(prefix)]) == prefix:
+                return result
+        raise AssertionError(argv)
+
+    result = self_update.fast_forward_repo(repo, runner=bare_runner)
+    assert result.status == "error"
+    assert "lock ref" in result.detail
+
+
+def test_fast_forward_repo_bare_anchor_skips_when_upstream_diverges_during_update(tmp_path):
+    repo = tmp_path / "bare-repo"
+    repo.mkdir()
+
+    def bare_runner(argv, *, cwd=None, timeout=0):
+        mapping = {
+            ("git", "rev-parse", "--is-bare-repository"): self_update.CommandResult(
+                list(argv), 0, "true\n", ""
+            ),
+            ("git", "symbolic-ref"): self_update.CommandResult(list(argv), 0, "main\n", ""),
+            ("git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"): (
+                self_update.CommandResult(list(argv), 0, "origin/main\n", "")
+            ),
+            ("git", "rev-parse", "--verify", "HEAD"): self_update.CommandResult(
+                list(argv), 0, "aaaa000\n", ""
+            ),
+            ("git", "fetch"): self_update.CommandResult(list(argv), 0, "", ""),
+            ("git", "rev-parse", "--verify", SCRATCH_REF): self_update.CommandResult(
+                list(argv), 0, "cccc222\n", ""
+            ),
+            ("git", "rev-list"): self_update.CommandResult(list(argv), 0, "0\t1\n", ""),
+            # A hostile/mirror fetch refspec somehow still produced a
+            # divergent scratch ref: the local ancestry re-check catches it.
+            ("git", "merge-base", "--is-ancestor"): self_update.CommandResult(
+                list(argv), 1, "", ""
+            ),
+            ("git", "update-ref", "-d"): self_update.CommandResult(list(argv), 0, "", ""),
+        }
+        for prefix, result in mapping.items():
+            if tuple(argv[: len(prefix)]) == prefix:
+                return result
+        raise AssertionError(argv)
+
+    result = self_update.fast_forward_repo(repo, runner=bare_runner)
+    assert result.status == "skipped"
+    assert "non-fast-forward" in result.detail
+
+
+def test_fast_forward_repo_bare_anchor_already_up_to_date(tmp_path):
+    repo = tmp_path / "bare-repo"
+    repo.mkdir()
+    calls: list[list[str]] = []
+
+    def bare_runner(argv, *, cwd=None, timeout=0):
+        calls.append(list(argv))
+        mapping = {
+            ("git", "rev-parse", "--is-bare-repository"): self_update.CommandResult(
+                list(argv), 0, "true\n", ""
+            ),
+            ("git", "symbolic-ref"): self_update.CommandResult(list(argv), 0, "main\n", ""),
+            ("git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"): (
+                self_update.CommandResult(list(argv), 0, "origin/main\n", "")
+            ),
+            ("git", "rev-parse", "--verify", "HEAD"): self_update.CommandResult(
+                list(argv), 0, "aaaa000\n", ""
+            ),
+            ("git", "fetch"): self_update.CommandResult(list(argv), 0, "", ""),
+            ("git", "rev-parse", "--verify", SCRATCH_REF): self_update.CommandResult(
+                list(argv), 0, "aaaa000\n", ""
+            ),
+            ("git", "rev-list"): self_update.CommandResult(list(argv), 0, "0\t0\n", ""),
+            ("git", "update-ref", "-d"): self_update.CommandResult(list(argv), 0, "", ""),
+        }
+        for prefix, result in mapping.items():
+            if tuple(argv[: len(prefix)]) == prefix:
+                return result
+        raise AssertionError(argv)
+
+    result = self_update.fast_forward_repo(repo, runner=bare_runner)
+    assert result.status == "ok"
+    assert "up to date" in result.detail
+    assert ["git", "update-ref", "-d", SCRATCH_REF] in calls
+
+
+
+def test_live_session_deferral_reason_reports_busy_worktree():
+    reason = self_update.live_session_deferral_reason(
+        worktree_lister=lambda: [
+            {
+                "id": "wt-1",
+                "title": "busy worktree",
+                "live_rest": "busy",
+                "reciprocal_relation": {"binding": {"state": "bound-here"}},
+            }
+        ]
+    )
+    assert reason == "live session is active in worktree busy worktree"
+
+
+def test_sweep_continues_despite_unrelated_live_session_and_uses_repo_update_and_binstub_restore(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(self_update.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_lock, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    monkeypatch.setattr(self_update_state, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    repo = type("Repo", (), {"path": tmp_path / "repo"})
+    repo.path.mkdir()
+
+    def runner(argv, *, cwd=None, timeout=0):
+        if argv[:2] == ["git", "status"]:
+            if cwd == repo.path:
+                return self_update.CommandResult(list(argv), 0, " M tracked.txt\n", "")
+            return self_update.CommandResult(list(argv), 0, "", "")
+        mapping = {
+            ("git", "rev-parse"): self_update.CommandResult(list(argv), 0, "origin/main\n", ""),
+            ("git", "fetch"): self_update.CommandResult(list(argv), 0, "", ""),
+            ("git", "rev-list"): self_update.CommandResult(list(argv), 0, "0\t0\n", ""),
+            ("agent-worktrees", "-p"): self_update.CommandResult(list(argv), 0, "", ""),
+            ("agent-machines", "restore"): self_update.CommandResult(list(argv), 0, "", ""),
+        }
+        for prefix, result in mapping.items():
+            if tuple(argv[: len(prefix)]) == prefix:
+                return result
+        raise AssertionError(argv)
+
+    result = self_update.run_tier(
+        "sweep",
+        opted_in=True,
+        discovered_repos=[repo],
+        runner=runner,
+        worktree_lister=lambda: [
+            {
+                "id": "wt-1",
+                "title": "busy worktree",
+                "live_rest": "busy",
+                "reciprocal_relation": {"binding": {"state": "bound-here"}},
+            }
+        ],
+        home=tmp_path,
+    )
+    assert result.status == "ok"
+    assert result.steps[0].name == "git-pull"
+    assert result.steps[0].status == "skipped"
+    assert "dirty" in result.steps[0].detail
+    update_step = next(step for step in result.steps if step.name == "update:copilot-extensions")
+    assert update_step.command == [
+        "agent-worktrees",
+        "-p",
+        "copilot-extensions",
+        "update",
+        "--no-manager",
+    ]
+    restore_step = next(step for step in result.steps if step.name == "restore")
+    assert (restore_step.command or [None])[0] == "agent-machines"
+    assert "--maintenance-safe" in (restore_step.command or [])
+
+
+def test_plan_includes_self_update_observed_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    self_update.write_status(
+        tmp_path,
+        "watchdog",
+        attempt="2026-09-14T09:00:00+00:00",
+        success="2026-09-14T09:05:00+00:00",
+    )
+    package = _pkg(
+        tmp_path,
+        "acme/watchdog",
+        [{"type": "self-update", "tier": "watchdog"}],
+    )
+    current = plan([package], "box-1", "windows")
+    resource = next(item for item in current.resources if item["type"] == "self-update")
+    assert resource["observed"] == {
+        "last_attempt": "2026-09-14T09:00:00+00:00",
+        "last_success": "2026-09-14T09:05:00+00:00",
+    }
+    assert "last-attempt=2026-09-14T09:00:00+00:00" in resource["summary"]
+
+
+def test_cli_self_update_run_emits_json(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "_resolve_machine_identity",
+        lambda args: type(
+            "Identity",
+            (),
+            {"canonical": "box-1", "accepted": ("box-1",), "warnings": [], "raw": "box-1"},
+        )(),
+    )
+    monkeypatch.setattr(cli, "_emit_identity_warnings", lambda identity: None)
+    monkeypatch.setattr(cli, "_self_update_packages", lambda machine, accepted_machines=None: [])
+    monkeypatch.setattr(
+        cli._reconcile, "resolve_union", lambda packages, machine, accepted_machines=None: []
+    )
+    monkeypatch.setattr(cli._validator, "validate", lambda resolved, machine, plat=None: [])
+    monkeypatch.setattr(
+        cli._resources, "resolve_resources", lambda resolved, machine, plat: ([], [])
+    )
+    monkeypatch.setattr(cli._discover, "discover", lambda machine, accepted_machines=None: [])
+    monkeypatch.setattr(
+        cli._self_update,
+        "run_tier",
+        lambda tier, **kwargs: self_update.RunResult(
+            tier=tier,
+            status="noop",
+            opted_in=False,
+            detail="tier 'watchdog' is not opted in",
+        ),
+    )
+    rc = cli.main(["self-update", "run", "--tier", "watchdog", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["tier"] == "watchdog"
+    assert payload["status"] == "noop"
+
+
+def test_reconcile_task_registers_new_opt_in(monkeypatch, tmp_path):
+    monkeypatch.setattr(self_update.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_lock, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    monkeypatch.setattr(self_update_state, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    state = {"present": False}
+
+    def query(tier, *, machine=None, runner=None, resolve_binary=None, home=None):
+        return _task_snapshot(tier, present=state["present"])
+
+    def register(tier, *, machine=None, runner=None, resolve_binary=None, home=None):
+        state["present"] = True
+        return self_update.CommandResult(["pwsh"], 0, "", "")
+
+    monkeypatch.setattr(self_update_tasks, "query_scheduled_task", query)
+    monkeypatch.setattr(self_update_tasks, "register_scheduled_task", register)
+    result = self_update.reconcile_scheduled_task("watchdog", desired_present=True, home=tmp_path)
+    assert result.status == "changed"
+    assert result.changed is True
+    assert result.snapshot is not None and result.snapshot.present is True
+
+
+def test_register_scheduled_task_hourly_uses_native_repetition_parameters():
+    """Regression: mutating $trigger.Repetition.Interval post-hoc does not
+    persist through Register-ScheduledTask (Get-ScheduledTask reads back an
+    empty Repetition on the live CIM object), so the hourly watchdog task
+    registers but never matches its own expected definition. Repetition must
+    be supplied via New-ScheduledTaskTrigger's own -RepetitionInterval /
+    -RepetitionDuration parameters instead."""
+    captured: dict[str, list[str]] = {}
+
+    def fake_runner(argv, *, timeout=300):
+        captured["argv"] = argv
+        return self_update.CommandResult(argv, 0, "", "")
+
+    self_update_tasks.register_scheduled_task(
+        "watchdog",
+        runner=fake_runner,
+        resolve_binary=lambda name: f"/usr/bin/{name}",
+        home=Path("/home/operator"),
+    )
+    script = captured["argv"][-1]
+    assert "-RepetitionInterval (New-TimeSpan -Hours 1)" in script
+    assert "-RepetitionDuration (New-TimeSpan -Days 3650)" in script
+    assert "$trigger.Repetition.Interval" not in script
+    assert "$trigger.Repetition.Duration" not in script
+    assert str(Path("/home/operator/.local/bin/agent-machines")) in script
+    assert "-m agent_machines" not in script
+
+
+def test_register_scheduled_task_daily_has_no_repetition_parameters():
+    captured: dict[str, list[str]] = {}
+
+    def fake_runner(argv, *, timeout=300):
+        captured["argv"] = argv
+        return self_update.CommandResult(argv, 0, "", "")
+
+    self_update_tasks.register_scheduled_task(
+        "sweep",
+        runner=fake_runner,
+        resolve_binary=lambda name: f"/usr/bin/{name}",
+        home=Path("/home/operator"),
+    )
+    script = captured["argv"][-1]
+    assert "-Daily -At '3:00AM' -DaysInterval 1" in script
+    assert "-RepetitionInterval" not in script
+
+
+def test_task_action_arguments_uses_stable_binstub_path(monkeypatch):
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "win32")
+    args = self_update_tasks.task_action_arguments(
+        "watchdog", machine="box-1", home=Path(r"C:\Users\operator")
+    )
+    assert args.startswith("--headless cmd.exe /c ")
+    assert r"C:\Users\operator\.local\bin\agent-machines.cmd" in args
+    assert "self-update run --tier watchdog --machine box-1" in args
+    assert r"C:\\Users\\operator" not in args
+    assert "-m agent_machines" not in args
+
+
+def test_task_definition_matches_its_own_generated_arguments(monkeypatch):
+    # Regression: the "/" -> "\\" path normalization applied to the whole
+    # arguments string for the binstub-path check also corrupted cmd.exe's
+    # own literal "/c" flag into "\c", making a freshly-registered task with
+    # the current (post-versioned-path-fix) `cmd.exe /c <binstub>` command
+    # shape never match its own expected definition -- perpetual, spurious
+    # drift on every real machine (dotfiles maintenance-worker report).
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "win32")
+    home = Path(r"C:\Users\operator")
+    snapshot = self_update_tasks.ScheduledTaskSnapshot(
+        task_name=self_update_state.TIER_SPECS["sweep"].task_name,
+        present=True,
+        enabled=True,
+        state="Ready",
+        logon_type="Interactive",
+        description=self_update_tasks.task_description("sweep"),
+        execute="conhost.exe",
+        arguments=self_update_tasks.task_action_arguments(
+            "sweep", machine="box-1", home=home
+        ),
+        working_directory=self_update_tasks.task_working_directory(home),
+        trigger_kind="daily",
+        trigger_value=1,
+    )
+    assert self_update_tasks.task_definition_matches(
+        snapshot, "sweep", machine="box-1", home=home
+    )
+
+
+def test_reconcile_task_defers_to_elevated_install_when_registration_is_denied(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(self_update.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_lock, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    monkeypatch.setattr(self_update_state, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    monkeypatch.setattr(
+        self_update_tasks,
+        "query_scheduled_task",
+        lambda tier, **kwargs: _task_snapshot(tier, present=False, matching=False),
+    )
+    monkeypatch.setattr(
+        self_update_tasks,
+        "register_scheduled_task",
+        lambda tier, **kwargs: self_update.CommandResult(["pwsh"], 1, "", "Access is denied."),
+    )
+    result = self_update.reconcile_scheduled_task("watchdog", desired_present=True, home=tmp_path)
+    assert result.status == "deferred"
+    assert result.ok is False
+    assert result.commands == [["agent-machines", "self-update", "install", "--tier", "watchdog"]]
+    assert "run once from an elevated PowerShell" in result.detail
+
+
+def test_reconcile_task_removes_opted_out_task_without_retry_prompt(monkeypatch, tmp_path):
+    monkeypatch.setattr(self_update.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "win32")
+    monkeypatch.setattr(self_update_lock, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    monkeypatch.setattr(self_update_state, "_WindowsMutex", lambda _name: _FakeMutex("acquired"))
+    monkeypatch.setattr(
+        self_update_tasks,
+        "query_scheduled_task",
+        lambda tier, **kwargs: _task_snapshot(tier, present=True, matching=True, enabled=True),
+    )
+    calls: list[str] = []
+
+    def unregister(tier, *, runner=None, resolve_binary=None, machine=None):
+        calls.append(tier)
+        return self_update.CommandResult(["pwsh"], 0, "", "")
+
+    monkeypatch.setattr(self_update_tasks, "unregister_scheduled_task", unregister)
+    result = self_update.reconcile_scheduled_task("sweep", desired_present=False, home=tmp_path)
+    assert result.status == "changed"
+    assert result.changed is True
+    assert calls == ["sweep"]
+    assert "elevated PowerShell" not in result.detail
+
+
+def test_default_command_runner_resolves_pathext_shim(monkeypatch):
+    """Regression: on Windows, a bare command name that resolves to a
+    `.cmd`/`.bat` shim (e.g. the `agent-worktrees` binstub) raises
+    FileNotFoundError under subprocess.run(shell=False), because CreateProcess
+    does not apply PATHEXT resolution the way cmd.exe does. Found while
+    dogfooding the sweep tier's `agent-worktrees reconcile-plugins` call on a
+    real Windows machine -- it failed with WinError 2 even though
+    `agent-worktrees` was genuinely on PATH."""
+    captured: dict[str, list[str]] = {}
+
+    def fake_which(name):
+        return (
+            f"C:\\Users\\operator\\.local\\bin\\{name}.cmd"
+            if name == "agent-worktrees"
+            else None
+        )
+
+    class _Proc:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return "", ""
+
+    def fake_spawn(argv, **kwargs):
+        captured["argv"] = argv
+        return _Proc(), None
+
+    monkeypatch.setattr(self_update_types.shutil, "which", fake_which)
+    monkeypatch.setattr(self_update_types, "spawn_sync_in_kill_on_close_job", fake_spawn)
+    result = self_update.default_command_runner(["agent-worktrees", "-p", "dotfiles", "list"])
+    assert captured["argv"][0] == "C:\\Users\\operator\\.local\\bin\\agent-worktrees.cmd"
+    # The reported CommandResult.argv still shows the original logical argv
+    # (not the resolved absolute path) so status/log output stays readable.
+    assert result.argv[0] == "agent-worktrees"
+
+
+def test_default_command_runner_leaves_unresolvable_argv0_unchanged(monkeypatch):
+    def fake_which(name):
+        return None
+
+    captured: dict[str, list[str]] = {}
+
+    class _Proc:
+        returncode = 1
+
+        def communicate(self, timeout=None):
+            return "", "not found"
+
+    def fake_spawn(argv, **kwargs):
+        captured["argv"] = argv
+        return _Proc(), None
+
+    monkeypatch.setattr(self_update_types.shutil, "which", fake_which)
+    monkeypatch.setattr(self_update_types, "spawn_sync_in_kill_on_close_job", fake_spawn)
+    self_update.default_command_runner(["totally-unknown-binary"])
+    assert captured["argv"] == ["totally-unknown-binary"]
+
+
+def test_default_command_runner_tree_kills_job_on_timeout(monkeypatch):
+    """A hung child (and any grandchildren it spawned) must be torn down as a
+    whole Job, not just the immediate process -- a plain `kill()` on the
+    immediate child alone can leave a surviving grandchild holding the stdout
+    pipe open, which hangs `communicate()` forever even past the timeout
+    (observed in practice as a sweep tick left alive-but-stuck for over a day
+    on a real machine)."""
+    closed = {"job": False}
+
+    class _FakeJob:
+        def close(self):
+            closed["job"] = True
+
+    class _Proc:
+        returncode = None
+        killed = False
+
+        def communicate(self, timeout=None):
+            if not closed["job"]:
+                raise subprocess.TimeoutExpired(cmd="slow", timeout=timeout)
+            return "partial", ""
+
+        def kill(self):
+            self.killed = True
+
+    proc = _Proc()
+
+    def fake_spawn(argv, **kwargs):
+        return proc, _FakeJob()
+
+    monkeypatch.setattr(self_update_types.shutil, "which", lambda name: None)
+    monkeypatch.setattr(self_update_types, "spawn_sync_in_kill_on_close_job", fake_spawn)
+    result = self_update.default_command_runner(["slow-command"], timeout=5)
+
+    assert closed["job"] is True
+    assert not proc.killed  # the Job close subsumes a plain kill() when one was assigned
+    assert result.returncode == self_update_types.TIMEOUT_RETURNCODE
+    assert "timed out after 5s" in result.stderr
+    assert result.stdout == "partial"
+
+
+def test_default_command_runner_falls_back_to_kill_without_job(monkeypatch):
+    """Off-Windows (or if Job assignment itself failed), there is no Job to
+    close -- fall back to a plain `kill()` so the immediate child is still
+    reaped rather than left running forever."""
+
+    class _Proc:
+        returncode = None
+        killed = False
+
+        def communicate(self, timeout=None):
+            if not self.killed:
+                raise subprocess.TimeoutExpired(cmd="slow", timeout=timeout)
+            return "", ""
+
+        def kill(self):
+            self.killed = True
+
+    proc = _Proc()
+
+    def fake_spawn(argv, **kwargs):
+        return proc, None
+
+    monkeypatch.setattr(self_update_types.shutil, "which", lambda name: None)
+    monkeypatch.setattr(self_update_types, "spawn_sync_in_kill_on_close_job", fake_spawn)
+    result = self_update.default_command_runner(["slow-command"], timeout=5)
+
+    assert proc.killed is True
+    assert result.returncode == self_update_types.TIMEOUT_RETURNCODE
+
+
+def test_default_command_runner_preserves_partial_output_when_drain_also_times_out(
+    monkeypatch,
+):
+    """A surviving descendant can keep holding the pipes open even after the
+    tree-kill (or plain `kill()`) above, so the bounded second `communicate()`
+    can itself raise `TimeoutExpired` -- this is the one case that actually
+    guarantees a hung command can never re-hang the caller. `TimeoutExpired`
+    still carries whatever output was collected before it fired; that must be
+    returned, not silently discarded as empty strings."""
+    closed = {"job": False}
+
+    class _FakeJob:
+        def close(self):
+            closed["job"] = True
+
+    class _Proc:
+        returncode = None
+
+        def communicate(self, timeout=None):
+            if not closed["job"]:
+                raise subprocess.TimeoutExpired(cmd="slow", timeout=timeout)
+            # The bounded drain call itself times out too (a grandchild still
+            # holds the pipe), but TimeoutExpired carries whatever the OS
+            # already delivered before it fired.
+            raise subprocess.TimeoutExpired(
+                cmd="slow", timeout=timeout, output="collected-stdout", stderr="collected-stderr"
+            )
+
+        def kill(self):
+            pass
+
+    def fake_spawn(argv, **kwargs):
+        return _Proc(), _FakeJob()
+
+    monkeypatch.setattr(self_update_types.shutil, "which", lambda name: None)
+    monkeypatch.setattr(self_update_types, "spawn_sync_in_kill_on_close_job", fake_spawn)
+    result = self_update.default_command_runner(["slow-command"], timeout=5)
+
+    assert closed["job"] is True
+    assert result.returncode == self_update_types.TIMEOUT_RETURNCODE
+    assert "collected-stdout" in result.stdout
+    assert "collected-stderr" in result.stderr
+    assert "timed out after 5s" in result.stderr
+
+
+
+
+
+def test_cli_self_update_install_skips_non_opted_in_tier_without_registration(monkeypatch, capsys):
+    resource = type("Resource", (), {"desired": {"state": "absent"}})()
+    monkeypatch.setattr(
+        cli,
+        "_resolve_self_update_resources",
+        lambda args: (None, "box-1", {"watchdog": resource}),
+    )
+
+    def fail(*args, **kwargs):
+        raise AssertionError("install should not be attempted for opted-out tiers")
+
+    monkeypatch.setattr(cli._self_update, "reconcile_scheduled_task", fail)
+    rc = cli.main(["self-update", "install", "--tier", "watchdog", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["tiers"][0]["status"] == "skipped"
+    assert "not opted in" in payload["tiers"][0]["detail"]
+
+
+def test_cli_self_update_status_emits_json(monkeypatch, capsys):
+    resource = type("Resource", (), {"desired": {"state": "present"}})()
+    monkeypatch.setattr(
+        cli,
+        "_resolve_self_update_resources",
+        lambda args: (None, "box-1", {"watchdog": resource}),
+    )
+    monkeypatch.setattr(
+        cli._self_update,
+        "scheduled_task_status",
+        lambda tier, opted_in, machine=None: self_update.ScheduledTaskStatus(
+            tier=tier,
+            opted_in=opted_in,
+            task_name=self_update.TIER_SPECS[tier].task_name,
+            registered=True,
+            enabled=True,
+            matching=True,
+            state="Ready",
+            detail="Scheduled Task is registered",
+            last_attempt="2026-09-14T09:00:00+00:00",
+            last_success="2026-09-14T09:05:00+00:00",
+        ),
+    )
+    rc = cli.main(["self-update", "status", "--tier", "watchdog", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["tiers"][0]["registered"] is True
+    assert payload["tiers"][0]["opted_in"] is True
+
+
+# --- Linux/WSL: per-user systemd timer scheduling --------------------------
+#
+# Companion to the Windows Scheduled Task tests above: on Linux/WSL,
+# `agent-machines self-update` used to unconditionally report "Scheduled
+# Tasks are supported only on Windows" with no fallback -- opting a
+# Linux/WSL machine in to the `watchdog`/`sweep` tiers silently did nothing,
+# so the self-correcting drift check the tiers exist to provide never ran
+# there. These tests cover the `systemctl --user` timer equivalent that
+# closes that gap.
+
+
+def _fake_command_result(argv, returncode=0, stdout="", stderr=""):
+    return self_update.CommandResult(list(argv), returncode, stdout, stderr)
+
+
+def test_render_linux_timer_unit_hourly_vs_daily():
+    hourly = self_update_tasks.render_linux_timer_unit("watchdog")
+    assert "OnBootSec=5min" in hourly
+    assert "OnUnitActiveSec=1h" in hourly
+    assert "OnCalendar" not in hourly
+
+    daily = self_update_tasks.render_linux_timer_unit("sweep")
+    assert "OnCalendar=*-*-* 03:00:00" in daily
+    assert "OnUnitActiveSec" not in daily
+
+    for unit in (hourly, daily):
+        assert "WantedBy=timers.target" in unit
+        assert "Persistent=true" in unit
+
+
+def test_render_linux_service_unit_includes_machine_and_workdir(tmp_path):
+    # `task_binstub_path()` (which this renderer calls) intentionally keys
+    # its `.cmd`-suffix/Windows-path-style behavior off `sys.platform`, not
+    # an explicit rendering target -- it's shared with the real Windows
+    # Scheduled Task path, which needs exactly that host-reflecting
+    # behavior. On a native Windows test run this produces a real,
+    # Windows-flavored path, which this Linux-unit-text assertion was never
+    # written to expect (it assumes a POSIX host, matching how this whole
+    # systemd family is gated by `linux_systemd_user_available()` and thus
+    # only ever meaningfully exercised on Linux/WSL in practice). Skip on
+    # native Windows rather than asserting a POSIX-only rendering contract
+    # the host cannot satisfy.
+    if sys.platform == "win32":
+        pytest.skip("Linux systemd unit rendering assumes a POSIX host")
+    unit = self_update_tasks.render_linux_service_unit(
+        "sweep", machine="box-1", home=tmp_path
+    )
+    assert "Type=oneshot" in unit
+    expected = (
+        f"ExecStart={tmp_path}/.local/bin/agent-machines "
+        "self-update run --tier sweep --machine box-1"
+    )
+    assert expected in unit
+    assert "-m agent_machines" not in unit
+    assert f"WorkingDirectory={self_update_tasks.task_working_directory(tmp_path)}" in unit
+
+
+def test_render_linux_service_unit_sets_path_environment_for_local_bin(tmp_path):
+    """Regression: systemd --user's own manager environment carries a
+    minimal PATH with no `~/.local/bin`, so a bare-name subprocess call to
+    a facility binstub (agent-worktrees, agent-ssh, ...) inside the sweep
+    failed with FileNotFoundError for days before being noticed -- the
+    scheduled service ran, but every subprocess it launched failed
+    immediately. The rendered unit must set an explicit PATH that puts
+    `~/.local/bin` first."""
+    if sys.platform == "win32":
+        pytest.skip("Linux systemd unit rendering assumes a POSIX host")
+    unit = self_update_tasks.render_linux_service_unit(
+        "sweep", machine="box-1", home=tmp_path
+    )
+    assert f"Environment=PATH={tmp_path}/.local/bin:" in unit
+
+
+def test_render_linux_service_unit_quotes_path_for_home_with_whitespace(tmp_path):
+    """A home directory containing whitespace (e.g. '/home/Build User') must
+    not split the Environment=PATH= assignment into invalid tokens -- caught
+    in PR review; systemd's Environment= parser is shell-like, same as
+    ExecStart='s, which _systemd_quote already handles."""
+    if sys.platform == "win32":
+        pytest.skip("Linux systemd unit rendering assumes a POSIX host")
+    spacey_home = tmp_path / "Build User"
+    unit = self_update_tasks.render_linux_service_unit(
+        "sweep", machine="box-1", home=spacey_home
+    )
+    assert f'Environment="PATH={spacey_home}/.local/bin:' in unit
+
+
+def test_linux_systemd_user_available_false_without_binary():
+    available = self_update_tasks.linux_systemd_user_available(
+        resolve_binary=lambda _name: None,
+        runner=lambda *a, **k: _fake_command_result(["systemctl"]),
+    )
+    assert available is False
+
+
+def test_linux_systemd_user_available_true_when_running():
+    available = self_update_tasks.linux_systemd_user_available(
+        resolve_binary=lambda _name: "/usr/bin/systemctl",
+        runner=lambda argv, **k: _fake_command_result(argv, 0, "running\n"),
+    )
+    assert available is True
+
+
+def test_linux_systemd_user_available_false_when_offline():
+    """Regression: `systemctl --user is-system-running` can exit non-zero
+    with a non-empty state like 'offline' -- the manager process exists but
+    isn't usable yet, so treating any non-empty stdout as "available" let
+    the subsequent is-enabled/registration calls fail with a raw error
+    instead of the documented graceful 'skipped' result."""
+    available = self_update_tasks.linux_systemd_user_available(
+        resolve_binary=lambda _name: "/usr/bin/systemctl",
+        runner=lambda argv, **k: _fake_command_result(argv, 1, "offline\n"),
+    )
+    assert available is False
+
+
+def test_linux_exec_start_quotes_executable_with_spaces():
+    """Regression: systemd's `ExecStart=` splits the command line similarly
+    to a shell, so an unquoted executable path containing whitespace (a real
+    possibility for `sys.executable`) silently becomes multiple arguments and
+    the unit fails to start."""
+    exec_start = self_update_tasks._systemd_quote("/opt/Program Files/python3")
+    assert exec_start == '"/opt/Program Files/python3"'
+    plain = self_update_tasks._systemd_quote("/usr/bin/python3")
+    assert plain == "/usr/bin/python3"
+
+
+def test_reconcile_scheduled_task_skips_non_linux_posix_platform(monkeypatch, tmp_path):
+    """Regression: dispatching every non-Windows platform (including macOS)
+    into the Linux systemd path attempted to write/query systemd units
+    wherever a `systemctl` binary happened to be present, instead of leaving
+    genuinely unsupported platforms at the existing skipped result."""
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "darwin")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        self_update_tasks,
+        "linux_systemd_user_available",
+        lambda **kwargs: calls.append("probed"),
+    )
+    result = self_update.reconcile_scheduled_task(
+        "watchdog",
+        desired_present=True,
+        runner=lambda *a, **k: _fake_command_result(["systemctl"]),
+        home=tmp_path,
+    )
+    assert result.status == "skipped"
+    assert calls == []
+    assert "darwin" in result.detail
+
+
+def test_query_systemd_timer_absent_when_units_missing(tmp_path):
+    snapshot = self_update_tasks.query_systemd_timer(
+        "watchdog",
+        runner=lambda *a, **k: _fake_command_result(["systemctl"]),
+        resolve_binary=lambda name: f"/usr/bin/{name}",
+        home=tmp_path,
+    )
+    assert snapshot.present is False
+
+
+def test_query_systemd_timer_matches_after_register(tmp_path):
+    # Same POSIX-host assumption as test_render_linux_service_unit_...
+    # above -- `task_binstub_path()`'s Windows-flavored rendering makes the
+    # embedded exec path and this test's expected string diverge on a
+    # native Windows run.
+    if sys.platform == "win32":
+        pytest.skip("Linux systemd unit rendering assumes a POSIX host")
+
+    def runner(argv, **kwargs):
+        if "is-enabled" in argv:
+            return _fake_command_result(argv, 0, "enabled\n")
+        if "is-active" in argv:
+            return _fake_command_result(argv, 0, "active\n")
+        return _fake_command_result(argv, 0)
+
+    registered = self_update_tasks.register_systemd_timer(
+        "watchdog",
+        machine="box-1",
+        runner=runner,
+        resolve_binary=lambda name: f"/usr/bin/{name}",
+        home=tmp_path,
+    )
+    assert registered.returncode == 0
+    assert self_update_tasks._linux_service_unit_path("watchdog", tmp_path).exists()
+    assert self_update_tasks._linux_timer_unit_path("watchdog", tmp_path).exists()
+
+    snapshot = self_update_tasks.query_systemd_timer(
+        "watchdog",
+        machine="box-1",
+        runner=runner,
+        resolve_binary=lambda name: f"/usr/bin/{name}",
+        home=tmp_path,
+    )
+    assert snapshot.present is True
+    assert snapshot.enabled is True
+    assert snapshot.state == "active"
+    assert snapshot.matching is True
+    assert snapshot.execute == str(tmp_path / ".local" / "bin" / "agent-machines")
+    assert snapshot.arguments == "self-update run --tier watchdog --machine box-1"
+
+
+def test_query_systemd_timer_not_matching_when_unit_content_drifted(tmp_path):
+    def runner(argv, **kwargs):
+        if "is-enabled" in argv:
+            return _fake_command_result(argv, 0, "enabled\n")
+        if "is-active" in argv:
+            return _fake_command_result(argv, 0, "active\n")
+        return _fake_command_result(argv, 0)
+
+    self_update_tasks.register_systemd_timer(
+        "sweep",
+        runner=runner,
+        resolve_binary=lambda name: f"/usr/bin/{name}",
+        home=tmp_path,
+    )
+    # Simulate hand-edited/stale drift in the installed unit.
+    self_update_tasks._linux_service_unit_path("sweep", tmp_path).write_text(
+        "[Unit]\nDescription=stale\n", encoding="utf-8"
+    )
+    snapshot = self_update_tasks.query_systemd_timer(
+        "sweep",
+        runner=runner,
+        resolve_binary=lambda name: f"/usr/bin/{name}",
+        home=tmp_path,
+    )
+    assert snapshot.present is True
+    assert snapshot.matching is False
+
+
+def test_unregister_systemd_timer_removes_units_and_disables(tmp_path):
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        return _fake_command_result(argv, 0)
+
+    self_update_tasks.register_systemd_timer(
+        "watchdog", runner=runner, resolve_binary=lambda name: f"/usr/bin/{name}", home=tmp_path
+    )
+    removed = self_update_tasks.unregister_systemd_timer(
+        "watchdog", runner=runner, resolve_binary=lambda name: f"/usr/bin/{name}", home=tmp_path
+    )
+    assert removed.returncode == 0
+    assert not self_update_tasks._linux_service_unit_path("watchdog", tmp_path).exists()
+    assert not self_update_tasks._linux_timer_unit_path("watchdog", tmp_path).exists()
+    assert any("disable" in call for call in calls)
+
+
+def test_reconcile_scheduled_task_registers_on_linux_when_systemd_available(monkeypatch, tmp_path):
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "linux")
+    monkeypatch.setattr(
+        self_update_tasks,
+        "linux_systemd_user_available",
+        lambda **kwargs: True,
+    )
+
+    def runner(argv, **kwargs):
+        if "is-enabled" in argv:
+            return _fake_command_result(argv, 0, "enabled\n")
+        if "is-active" in argv:
+            return _fake_command_result(argv, 0, "active\n")
+        return _fake_command_result(argv, 0)
+
+    result = self_update.reconcile_scheduled_task(
+        "sweep", desired_present=True, runner=runner, home=tmp_path
+    )
+    assert result.status == "changed"
+    assert result.changed is True
+    assert result.snapshot is not None and result.snapshot.matching is True
+
+
+def test_reconcile_scheduled_task_skips_when_no_systemd_user_manager(monkeypatch, tmp_path):
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "linux")
+    monkeypatch.setattr(
+        self_update_tasks,
+        "linux_systemd_user_available",
+        lambda **kwargs: False,
+    )
+    result = self_update.reconcile_scheduled_task(
+        "watchdog",
+        desired_present=True,
+        runner=lambda *a, **k: _fake_command_result(["systemctl"]),
+        home=tmp_path,
+    )
+    assert result.status == "skipped"
+    assert result.changed is False
+    assert "systemd --user" in result.detail
+
+
+def test_scheduled_task_status_reports_linux_timer(monkeypatch, tmp_path):
+    # `scheduled_task_status()`'s public wrapper hardcodes
+    # `resolve_binary=shutil_which` (not test-injectable), so this test can
+    # only pass where a REAL `systemctl` binary is resolvable on PATH --
+    # genuine Linux/WSL with systemd, never native Windows. Mocking
+    # `sys.platform` alone cannot substitute for that real dependency.
+    if sys.platform == "win32":
+        pytest.skip("requires a real systemctl binary on PATH (Linux/WSL only)")
+    monkeypatch.setattr(self_update_tasks.sys, "platform", "linux")
+
+    def runner(argv, **kwargs):
+        if "is-system-running" in argv:
+            return _fake_command_result(argv, 0, "running\n")
+        if "is-enabled" in argv:
+            return _fake_command_result(argv, 0, "enabled\n")
+        if "is-active" in argv:
+            return _fake_command_result(argv, 0, "active\n")
+        return _fake_command_result(argv, 0)
+
+    self_update_tasks.register_systemd_timer(
+        "watchdog", runner=runner, resolve_binary=lambda name: f"/usr/bin/{name}", home=tmp_path
+    )
+    status = self_update.scheduled_task_status(
+        "watchdog", opted_in=True, runner=runner, home=tmp_path
+    )
+    assert status.registered is True
+    assert status.matching is True
+    assert status.detail == "systemd --user timer is registered"

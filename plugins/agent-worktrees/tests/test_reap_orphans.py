@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_worktrees import __main__ as cli
-from agent_worktrees import tracking
+from agent_worktrees import tracking, worktree_identity
 
 
 def _rec(wt_id, *, status="active", path="/tmp/wt", kind="session"):
@@ -34,8 +34,18 @@ def _rec(wt_id, *, status="active", path="/tmp/wt", kind="session"):
     )
 
 
-def _run(sessions_map, records, *, dry_run=False, only_id=None,
-         activity=None, now=None):
+def _run(
+    sessions_map,
+    records,
+    *,
+    dry_run=False,
+    only_id=None,
+    worktree_ids=None,
+    include_manager_owned=False,
+    activity=None,
+    now=None,
+    manager_owned_sessions=None,
+):
     """Invoke the reaper with patched mux + tracking, capturing killed ids.
 
     ``activity`` maps session_name -> last-activity epoch (defaults every session
@@ -56,10 +66,23 @@ def _run(sessions_map, records, *, dry_run=False, only_id=None,
          patch("agent_worktrees.sessions._mux_session_activity",
                return_value=act), \
          patch("agent_worktrees.sessions.kill_tmux_session", side_effect=_kill), \
+         patch(
+             "agent_worktrees.managed_mux_registry.live_mapping_for_session",
+             side_effect=lambda name: (
+                 {"mux_session": name}
+                 if name in (manager_owned_sessions or set())
+                 else None
+             ),
+         ), \
          patch("agent_worktrees.tracking.list_records", return_value=records), \
          patch("agent_worktrees.config.tracking_dir", return_value=Path("/tmp")):
         result = cli.reap_orphan_mux_sessions(
-            dry_run=dry_run, only_id=only_id, now=now)
+            dry_run=dry_run,
+            only_id=only_id,
+            worktree_ids=worktree_ids,
+            include_manager_owned=include_manager_owned,
+            now=now,
+        )
     return result, killed
 
 
@@ -110,6 +133,27 @@ class TestReapOrphans:
         result, killed = _run({"wt-brg": 0}, [rec])
         assert killed == []
         assert {"id": "brg", "reason": "bridge"} in result["skipped"]
+
+    def test_manager_owned_session_is_spared_for_manager_lane(self, tmp_path):
+        rec = _rec("mgr", status="finalized", path=str(tmp_path))
+        result, killed = _run(
+            {"wt-mgr": 0},
+            [rec],
+            manager_owned_sessions={"wt-mgr"},
+        )
+        assert killed == []
+        assert {"id": "mgr", "reason": "manager-owned"} in result["skipped"]
+
+    def test_manager_owned_session_can_be_reaped_when_explicitly_enabled(self, tmp_path):
+        rec = _rec("mgr", status="finalized", path=str(tmp_path))
+        result, killed = _run(
+            {"wt-mgr": 0},
+            [rec],
+            include_manager_owned=True,
+            manager_owned_sessions={"wt-mgr"},
+        )
+        assert killed == ["mgr"]
+        assert result["reaped"] == ["mgr"]
 
     def test_non_wt_sessions_ignored(self):
         result, killed = _run({"misc": 0, "scratch": 0}, [])
@@ -170,6 +214,19 @@ class TestReapOrphans:
         result, killed = _run({"wt-fin": 0}, [rec], only_id="nope")
         assert killed == []
         assert result["reaped"] == [] and result["skipped"] == []
+
+    def test_worktree_ids_filter_targets_multiple_specific_orphans(self, tmp_path):
+        recs = [
+            _rec("fin", status="finalized", path=str(tmp_path)),
+            _rec("fin2", status="finalized", path=str(tmp_path)),
+        ]
+        result, killed = _run(
+            {"wt-fin": 0, "wt-fin2": 0},
+            recs,
+            worktree_ids={"fin2"},
+        )
+        assert killed == ["fin2"]
+        assert result["reaped"] == ["fin2"]
 
     # ── #713 idle gate: never reap a busy (recently-active) session ───────────
 
@@ -304,7 +361,7 @@ def test_post_exit_sweeps_orphans_when_finalized(tmp_path, monkeypatch):
                         lambda: calls.__setitem__("sweep", calls["sweep"] + 1))
     monkeypatch.setattr(cli.cfg, "load_config", lambda *a, **k: object())
     monkeypatch.setattr(cli, "_infer_worktree_id", lambda wid, config: "wt-x")
-    monkeypatch.setattr(cli, "_resolve_worktree_id", lambda wid: "wt-x")
+    monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda wid: "wt-x")
     monkeypatch.setattr(cli.cfg, "tracking_dir", lambda: tmp_path)
     (tmp_path / "wt-x.yaml").write_text("")   # record exists
     monkeypatch.setattr(cli.tracking, "load_record",
@@ -321,7 +378,7 @@ def test_post_exit_sweeps_orphans_when_no_record(tmp_path, monkeypatch):
                         lambda: calls.__setitem__("sweep", calls["sweep"] + 1))
     monkeypatch.setattr(cli.cfg, "load_config", lambda *a, **k: object())
     monkeypatch.setattr(cli, "_infer_worktree_id", lambda wid, config: "wt-x")
-    monkeypatch.setattr(cli, "_resolve_worktree_id", lambda wid: "wt-x")
+    monkeypatch.setattr(worktree_identity, "_resolve_worktree_id", lambda wid: "wt-x")
     monkeypatch.setattr(cli.cfg, "tracking_dir", lambda: tmp_path)   # no yaml -> missing
 
     assert cli.cmd_post_exit(_post_exit_args()) == 0
@@ -330,28 +387,62 @@ def test_post_exit_sweeps_orphans_when_no_record(tmp_path, monkeypatch):
 
 # ── #1069 managed (system/bridge) leak GC: sweep_managed_worktrees ────────────
 
-def _managed_sweep(records, *, dry_run=True, mux=None, activity=None, now=None):
+def _managed_sweep(
+    records,
+    *,
+    dry_run=True,
+    mux=None,
+    activity=None,
+    now=None,
+    session_scans=None,
+):
     """Invoke ``sweep_managed_worktrees`` with the fleet's I/O fully patched.
 
     Dry-run by default (no git/FS side effects). Records with a non-existent
     ``worktree_path`` resolve their git-state from ``status`` (finalized ->
     'completed'), so no real git call is needed.
     """
+    import tempfile
     import types
-    repo = types.SimpleNamespace(anchor="/tmp/anchor", remote="origin",
-                                 default_branch="main")
-    config = types.SimpleNamespace(default_repo=repo, repo_name="repo")
-    with patch("agent_worktrees.config.load_config", return_value=config), \
-         patch("agent_worktrees.config.tracking_dir", return_value=Path("/tmp")), \
-         patch("agent_worktrees.tracking.list_records", return_value=records), \
-         patch("agent_worktrees.sessions._list_mux_sessions",
-               return_value=(mux or {})), \
-         patch("agent_worktrees.sessions._mux_session_activity",
-               return_value=(activity or {})), \
-         patch("agent_worktrees.sessions.scan_sessions_fast",
-               return_value=types.SimpleNamespace(active_sessions={})), \
-         patch("agent_worktrees.__main__._build_active_paths", return_value=set()):
-        return cli.sweep_managed_worktrees(dry_run=dry_run, now=now)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        tracking_dir = root / "tracking"
+        tracking_dir.mkdir()
+        for record in records:
+            tracking.save_record(
+                record,
+                tracking_dir / f"{record.worktree_id}.yaml",
+            )
+        repo = types.SimpleNamespace(
+            anchor=str(root / "anchor"),
+            worktree_root=str(root / "worktrees"),
+            remote="origin",
+            default_branch="main",
+        )
+        config = types.SimpleNamespace(
+            default_repo=repo,
+            repo_name="repo",
+            repos={"owner/repo": repo},
+        )
+        scans = list(session_scans or [{}])
+        scan_index = 0
+
+        def _scan(_records):
+            nonlocal scan_index
+            value = scans[min(scan_index, len(scans) - 1)]
+            scan_index += 1
+            return types.SimpleNamespace(active_sessions=value)
+
+        with patch("agent_worktrees.config.load_config", return_value=config), \
+             patch("agent_worktrees.config.tracking_dir", return_value=tracking_dir), \
+             patch("agent_worktrees.tracking.list_records", return_value=records), \
+             patch("agent_worktrees.sessions._list_mux_sessions",
+                   return_value=(mux or {})), \
+             patch("agent_worktrees.sessions._mux_session_activity",
+                   return_value=(activity or {})), \
+             patch("agent_worktrees.sessions.scan_sessions_fast", side_effect=_scan), \
+             patch("agent_worktrees.__main__._build_active_paths", return_value=set()):
+            return cli.sweep_managed_worktrees(dry_run=dry_run, now=now)
 
 
 def _mgd(wt_id, *, kind="bridge", status="finalized", follow_up=False):
@@ -388,3 +479,164 @@ def test_managed_sweep_ignores_non_managed_records():
     # A plain session record is not managed -> never in the managed sweep.
     report = _managed_sweep([_rec("sess", status="finalized", kind="session")])
     assert report == {"removed": [], "skipped": []}
+
+
+def test_managed_sweep_retains_record_when_removal_fails():
+    with patch(
+        "agent_worktrees.__main__._remove_managed_worktree",
+        return_value=(False, ["worktree remove failed"]),
+    ):
+        report = _managed_sweep(
+            [_mgd("retry", kind="bridge")],
+            dry_run=False,
+        )
+
+    assert report["removed"] == []
+    assert report["skipped"] == [
+        {"id": "retry", "reason": "worktree remove failed"}
+    ]
+
+
+def test_managed_sweep_rechecks_live_session_before_removal():
+    rec = _mgd("resumed", kind="bridge")
+    with patch(
+        "agent_worktrees.__main__._remove_managed_worktree",
+        side_effect=AssertionError("live worktree must not be removed"),
+    ):
+        report = _managed_sweep(
+            [rec],
+            dry_run=False,
+            session_scans=[
+                {},
+                {rec.worktree_path: ["new-session"]},
+            ],
+        )
+
+    assert report["removed"] == []
+    assert report["skipped"] == [
+        {"id": "resumed", "reason": "recheck-live-session"}
+    ]
+
+
+def test_managed_sweep_reaps_owner_ref_worktree_when_owner_is_provably_dead():
+    """issue #4556: an inbound ``owner_ref`` must not unconditionally block
+    the gc recheck -- only a still-live-or-unconfirmed-dead owner should."""
+    rec = _mgd("owned", kind="bridge", status="active")
+    rec.owner_ref = "m/owner/repo/dead-owner#sess"
+    with patch(
+        "agent_worktrees.claimant.resolve_claimant_alive", return_value=False,
+    ), patch("agent_worktrees.__main__._remove_managed_worktree",
+             return_value=(True, [])):
+        report = _managed_sweep([rec], dry_run=False)
+
+    assert report["skipped"] == []
+    assert [x["id"] for x in report["removed"]] == ["owned"]
+
+
+def test_managed_sweep_spares_owner_ref_worktree_when_owner_is_alive():
+    rec = _mgd("owned-live", kind="bridge", status="active")
+    rec.owner_ref = "m/owner/repo/live-owner#sess"
+    with patch(
+        "agent_worktrees.claimant.resolve_claimant_alive", return_value=True,
+    ), patch(
+        "agent_worktrees.__main__._remove_managed_worktree",
+        side_effect=AssertionError("owner-live worktree must not be removed"),
+    ):
+        report = _managed_sweep([rec], dry_run=False)
+
+    assert report["removed"] == []
+    assert report["skipped"] == [
+        {"id": "owned-live", "reason": "owner-ref-blocked"}
+    ]
+
+
+def test_managed_sweep_dry_run_reflects_owner_liveness_gate():
+    """issue-#4594-review: dry-run must report the SAME verdict as a real
+    run for an owner-liveness block -- not "would remove" only to have the
+    real run refuse it moments later."""
+    rec = _mgd("owned-live-dry", kind="bridge", status="active")
+    rec.owner_ref = "m/owner/repo/live-owner#sess"
+    with patch("agent_worktrees.claimant.resolve_claimant_alive", return_value=True):
+        report = _managed_sweep([rec], dry_run=True)
+
+    assert report["removed"] == []
+    assert report["skipped"] == [
+        {"id": "owned-live-dry", "reason": "owner-ref-blocked"}
+    ]
+
+
+def test_managed_sweep_owner_liveness_rechecked_locally_bounded_under_lock():
+    """issue-#4594-review (round 2): a cached liveness verdict can go stale
+    across the lock-acquisition window (the owner could resume without this
+    child's own owner_ref changing), so the locked recheck must re-resolve
+    fresh -- but bounded to a local-only check (``allow_remote=False``) so it
+    still never performs a slow cross-machine SSH probe while holding a lock."""
+    rec = _mgd("owned-dead-recheck", kind="bridge", status="active")
+    rec.owner_ref = "m/owner/repo/dead-owner#sess"
+    calls = []
+
+    def _probe(ref, **kwargs):
+        calls.append((ref, kwargs.get("allow_remote", True)))
+        return False
+
+    with patch("agent_worktrees.claimant.resolve_claimant_alive", side_effect=_probe), \
+         patch("agent_worktrees.__main__._remove_managed_worktree", return_value=(True, [])):
+        report = _managed_sweep([rec], dry_run=False)
+
+    assert report["skipped"] == []
+    assert [x["id"] for x in report["removed"]] == ["owned-dead-recheck"]
+    # pass-1 (before any lock) allows a remote probe; the locked recheck is
+    # bounded to local-only.
+    assert calls == [
+        ("m/owner/repo/dead-owner#sess", True),
+        ("m/owner/repo/dead-owner#sess", False),
+    ]
+
+
+def test_managed_sweep_owner_resumed_between_probe_and_lock_is_caught():
+    """issue-#4594-review (round 2): an owner observed dead in pass-1 that
+    resumes before the lock is acquired must be caught by the fresh, locked
+    recheck -- not silently reaped on the stale pass-1 verdict."""
+    rec = _mgd("owned-resumed", kind="bridge", status="active")
+    rec.owner_ref = "m/owner/repo/resumed-owner#sess"
+    calls = []
+
+    def _probe(ref, **kwargs):
+        calls.append(ref)
+        # First call (pass-1, before the lock): dead. Second call (the
+        # locked recheck): the owner has since resumed.
+        return len(calls) > 1
+
+    with patch("agent_worktrees.claimant.resolve_claimant_alive", side_effect=_probe), \
+         patch(
+             "agent_worktrees.__main__._remove_managed_worktree",
+             side_effect=AssertionError("must not remove a resumed owner's resource"),
+         ):
+        report = _managed_sweep([rec], dry_run=False)
+
+    assert report["removed"] == []
+    assert report["skipped"] == [
+        {"id": "owned-resumed", "reason": "recheck-record-changed"}
+    ]
+
+
+def test_managed_sweep_missing_checkout_does_not_fake_owner_content_merged():
+    """issue-#4594-review: a missing checkout with status "complete" must
+    NOT count as owner-confirmed-merged content -- git_state is synthesized
+    from status alone in that case, never actually inspected. A live owner
+    must still block removal."""
+    rec = _mgd("owned-missing-checkout", kind="bridge", status="complete")
+    rec.owner_ref = "m/owner/repo/live-owner#sess"
+    assert not Path(rec.worktree_path).exists()
+    with patch(
+        "agent_worktrees.claimant.resolve_claimant_alive", return_value=True,
+    ), patch(
+        "agent_worktrees.__main__._remove_managed_worktree",
+        side_effect=AssertionError("owner-live worktree must not be removed"),
+    ):
+        report = _managed_sweep([rec], dry_run=False)
+
+    assert report["removed"] == []
+    assert report["skipped"] == [
+        {"id": "owned-missing-checkout", "reason": "owner-ref-blocked"}
+    ]

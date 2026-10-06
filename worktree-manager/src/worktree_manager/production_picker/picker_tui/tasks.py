@@ -6,6 +6,17 @@ This module runs those commands -- always as a subprocess against the
 contributing plugin's CLI on ``PATH``, never a cross-venv Python import -- so
 the picker stays decoupled from the plugin's runtime.
 
+That decoupling has to cover the child's *environment* too: the picker itself
+is one plugin's own process (agent-worktrees), so its environment can carry
+agent-worktrees-scoped identity vars (``COPILOT_PLUGIN_ROOT``,
+``COPILOT_EXTENSIONS_CONTEXT``, and friends). A pivot's ``list``/action
+command is almost always a *different* plugin's CLI (e.g. ``agent-dispatch``);
+inheriting those vars unchanged makes that CLI's own installation-context
+self-check see a foreign plugin root and reject the invocation outright (a
+"payload context mismatch" that has nothing to do with the actual command).
+Every subprocess this module spawns therefore runs under
+:func:`_child_process_env`, never the picker's raw ``os.environ``.
+
 :class:`RegisteredPivotRuntime` keeps the picker responsive: the ``list``
 command runs on a daemon thread and the result is cached per machine, so the
 render loop only ever reads a snapshot. Everything degrades gracefully -- a
@@ -21,6 +32,7 @@ import shutil
 import signal
 import subprocess
 import threading
+import time
 from collections.abc import Mapping, Sequence
 
 from agent_procutil import no_window_flags
@@ -30,6 +42,83 @@ from .pivots import RegisteredPivot, format_template, parse_list_payload
 #: Hard cap on how long a pivot's ``list``/action command may run.
 LIST_TIMEOUT = 20.0
 ACTION_TIMEOUT = 30.0
+#: Hard cap for a ``create_action`` field's ``options_command`` -- this runs
+#: synchronously (off-thread, see `_run_bg`) right before a modal opens, so it
+#: is bounded tighter than a full action's own timeout: a slow/hung vocabulary
+#: source should degrade to the field's "Other…" free-text fallback promptly,
+#: not stall opening the dialog.
+OPTIONS_COMMAND_TIMEOUT = 5.0
+
+#: Phase 0 (render-perf follow-up, #4762, 2026-10-01):
+#: a held ``subscribe`` stream's producer can exit (crash, or a plain EOF with
+#: no ``done``/``error`` frame) without that ever being distinguished from a
+#: genuinely-still-live channel -- ``repoll()`` used to no-op unconditionally
+#: whenever ``pivot.subscribe`` was set, trusting the channel was still open
+#: forever. These bound the reconnect policy: how many times
+#: :meth:`RegisteredPivotRuntime._run_list_stream` re-spawns a dropped
+#: ``subscribe`` channel before giving up and falling back to ordinary
+#: one-shot repolling, and the backoff between attempts.
+SUBSCRIBE_MAX_RECONNECT_ATTEMPTS = 5
+SUBSCRIBE_RECONNECT_BACKOFF_SECS = 2.0
+
+#: Plugin-identity env vars that must never leak from the picker's own process
+#: into a *different* plugin's CLI. Mirrors ``reconcile._RUNTIME_ENV_UNSET``
+#: (the installer's own "clean child environment" list) -- kept as an
+#: independent, dependency-light copy here so this hot-path module doesn't pull
+#: in ``reconcile``'s (and its ``yaml``) import weight just for one tuple.
+_CHILD_ENV_UNSET = (
+    "COPILOT_EXTENSIONS_CONTEXT",
+    "COPILOT_PLUGIN_INSTALL_STAGED",
+    "COPILOT_PLUGIN_ROOT",
+    "COPILOT_PLUGIN_STAGED_FROM",
+    "PYTHONPATH",
+)
+
+
+def _child_process_env() -> dict[str, str]:
+    """A copy of the current environment with this plugin's own identity vars
+    removed, safe to hand to *any other* plugin's CLI. See the module
+    docstring for why this matters -- without it, a pivot action can fail with
+    a spurious cross-plugin "payload context mismatch"."""
+    env = dict(os.environ)
+    for key in _CHILD_ENV_UNSET:
+        env.pop(key, None)
+    return env
+
+
+def resolve_dynamic_options(argv: Sequence[str]) -> list[str]:
+    """Run a ``create_action`` field's ``options_command`` and return its
+    JSON array of strings, or ``[]`` on ANY failure (not found, non-zero exit,
+    timeout, malformed/non-array output) -- this is a soft, best-effort
+    enrichment: a field that declares ``options_command`` always has
+    ``allow_other`` auto-forced true by
+    :func:`pivot_create_action.parse_create_action`, so an empty result still
+    leaves the field answerable via its "Other…" free-text fallback rather
+    than ever blocking the create dialog from opening. Never raises."""
+    argv = list(argv)
+    if not argv:
+        return []
+    resolved = shutil.which(argv[0])
+    if resolved:
+        argv = [resolved, *argv[1:]]
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=OPTIONS_COMMAND_TIMEOUT,
+            check=False, env=_child_process_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(proc.stdout or "[]")
+    except ValueError:
+        return []
+    if not isinstance(data, list) or any(not isinstance(item, str) for item in data):
+        return []
+    return data
+
+
 #: Overall watchdog for a one-shot (non-``subscribe``) streaming ``list``: a
 #: stalled producer is killed after this many seconds, but rows already received
 #: are kept. A ``subscribe`` (held/live) stream has no overall deadline.
@@ -104,6 +193,50 @@ def _is_stream_unsupported(stderr: str) -> bool:
     return "unrecognized arguments" in s and "--stream" in s
 
 
+def prewarm_optional_modules() -> None:
+    """Import the modules a registered pivot's first switch/render needs,
+    synchronously in the caller's own thread.
+
+    ``engine.PickerScreen._machine_key_map`` lazily imports ``data_ssh`` (and,
+    transitively, its own ``roster``/``provider_sources``/``source_identity``)
+    on first use, so a picker with no registered pivots never pays that cost.
+    But that meant the *first* switch onto a registered pivot (e.g. Tasks)
+    paid a real, synchronous multi-module import on the render/key-handling
+    thread -- profiling a real tab-switch keypress showed it accounting for
+    roughly 40% of the total switch latency, exactly the momentary freeze
+    reported against this pivot (see the Tasks-pane-UX-overhaul effort's own
+    bug entry). A pure import has no side effects, so warming it here makes
+    that cost disappear from the keypress entirely instead of relocating it.
+
+    Also imports ``pivots`` (profiled at ~0.6s cold, non-trivial):
+    ``_setup_live_pivots()``'s own registry scan imports it moments later on
+    this same thread, but the FIRST render-thread call that needs it --
+    ``_wt_submenu_verbs()``'s cross-plugin action loop, reached the instant
+    the operator opens ANY worktree row's Actions menu -- can race ahead of
+    that scan now that the picker paints (and accepts keys) immediately.
+    Warming it here, ahead of that scan, closes the same class of gap
+    ``self.src.LOCAL`` had (#picker-menu-open-latency) instead of leaving
+    another render-thread caller to pay for it first.
+
+    Call this directly from a thread that is *already* off the UI thread
+    (e.g. ``engine.py``'s ``_setup_live_pivots``) so the import reliably
+    finishes before pivots are installed/activated -- spawning ANOTHER
+    background thread here instead would only shrink the freeze window
+    rather than close it: CPython's per-module import lock would still make
+    a render-thread caller block on the same import if a keypress landed
+    mid-warm-up. A caller reachable from the UI thread (the shared non-live
+    setup/reload path) must wrap this call in its own worker thread itself
+    instead."""
+    try:
+        from . import data_ssh  # noqa: F401
+    except Exception:
+        pass
+    try:
+        from . import pivots  # noqa: F401
+    except Exception:
+        pass
+
+
 def _stream_entry(obj: Mapping) -> dict:
     """Extract the entry dict from a streaming ``row``/``delta`` frame.
 
@@ -150,6 +283,15 @@ class RegisteredPivotRuntime:
         self._procs: list[subprocess.Popen] = []
         self._procs_lock = threading.Lock()
         self._closed = threading.Event()
+        # Phase 0: whether a ``subscribe`` pivot's held channel is CURRENTLY
+        # believed live for a given machine -- distinct from ``pivot.subscribe``
+        # (the manifest's static declaration), which never reflects whether the
+        # channel actually dropped. ``repoll()`` only skips a machine while this
+        # is True; a dropped/exhausted channel clears it so normal repolling
+        # resumes. ``_subscribe_retries`` counts consecutive reconnect attempts
+        # since the last successful ``ready`` frame, reset on success.
+        self._subscribe_live: dict[object, bool] = {}
+        self._subscribe_retries: dict[object, int] = {}
 
     # -- listing -------------------------------------------------------------
 
@@ -210,12 +352,25 @@ class RegisteredPivotRuntime:
         Tasks pivot pick up tasks/cards created by *another* session (e.g. a
         claimer posting a steer card) without a manual reload or a restart.
 
-        No-op only for a ``subscribe`` pivot -- its held child channel is already
-        live (it applies deltas in place), so a forced refetch would spawn a
-        redundant second channel. A one-shot ``stream`` pivot (streams once then
-        exits) is NOT already-live, so it is repolled like any other -- the
-        streaming runner re-runs and swaps rows in via :meth:`_finish`."""
-        if self._closed.is_set() or self.pivot.subscribe:
+        No-op only while a ``subscribe`` pivot's channel is CURRENTLY believed
+        live (``_subscribe_live``) -- its held child channel applies deltas in
+        place, so a forced refetch would spawn a redundant second channel. Once
+        that channel has dropped and exhausted its own reconnect attempts (Phase
+        0, #4762), ``_subscribe_live`` clears and this
+        resumes normal one-shot repolling -- a ``subscribe`` pivot's manifest
+        declaration alone no longer freezes it forever. A one-shot ``stream``
+        pivot (streams once then exits) is NOT already-live, so it is repolled
+        like any other -- the streaming runner re-runs and swaps rows in via
+        :meth:`_finish`."""
+        if self._closed.is_set():
+            return
+        # Default to "treat as live" (no-op) when a subscribe pivot hasn't
+        # recorded anything yet -- e.g. repoll() called before its first
+        # ensure() -- matching the manifest's own declared intent until a
+        # fetch has actually run and proven otherwise. Only an EXPLICIT
+        # ``False`` (recorded by a genuinely exhausted reconnect budget, Phase
+        # 0) clears this no-op.
+        if self.pivot.subscribe and self._subscribe_live.get(machine, True):
             return
         with self._lock:
             if machine in self._inflight:
@@ -249,6 +404,7 @@ class RegisteredPivotRuntime:
             stdin=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace",
             bufsize=1,
+            env=_child_process_env(),
         )
         if os.name == "posix":
             kwargs["start_new_session"] = True
@@ -311,17 +467,38 @@ class RegisteredPivotRuntime:
 
         Falls back to the one-shot :meth:`_exec_list` when the provider's
         argparse rejects ``--stream`` (an older CLI) or emits a plain JSON array
-        with no envelope, so ``stream: true`` is always safe to declare."""
-        argv = _resolve_argv((*self.pivot.list_cmd, "--stream"), ctx)
+        with no envelope, so ``stream: true`` is always safe to declare.
+
+        For a ``subscribe`` pivot, any termination of this stream -- an
+        explicit ``error`` frame, a plain EOF with no ``done``/``error`` (the
+        gap Phase 0, #4762, closes), or even an
+        unexpected ``done`` -- is treated as the held channel dropping, not as
+        a normal finish: :meth:`_handle_subscribe_drop` decides whether to
+        reconnect (bounded retries + backoff, keeping current rows visible) or
+        demote the pivot back to ordinary repolling."""
+        if self.pivot.subscribe:
+            self._subscribe_live[machine] = True
+        # The whole point of `subscribe` is a held channel receiving live
+        # deltas -- without `--subscribe` on argv, the provider runs its
+        # one-shot envelope and exits immediately, and every "termination"
+        # (a totally normal exit, not a drop) falls through to
+        # `_handle_subscribe_drop`'s reconnect path: the pivot ends up
+        # re-spawning the CLI on every backoff tick instead of ever holding
+        # one process open (#4840 review).
+        stream_flags = ("--stream", "--subscribe") if self.pivot.subscribe else ("--stream",)
+        argv = _resolve_argv((*self.pivot.list_cmd, *stream_flags), ctx)
         if not argv:
+            self._subscribe_live[machine] = False
             self._finish(machine, ("error", [], "empty list command"), {})
             return
         try:
             proc = self._spawn_stream(argv)
         except FileNotFoundError:
+            self._subscribe_live[machine] = False
             self._finish(machine, ("error", [], f"{argv[0]} not found on PATH"), {})
             return
         except Exception as exc:
+            self._subscribe_live[machine] = False
             self._finish(machine, ("error", [], str(exc)[:200]), {})
             return
 
@@ -394,6 +571,20 @@ class RegisteredPivotRuntime:
                 elif typ == "done":
                     saw_envelope = True
                     done = True
+                    if not ready:
+                        # A held `subscribe` channel keeps running past `done`
+                        # (it's not EOF) -- an empty initial board must still
+                        # publish now, or the pivot stays `loading` forever
+                        # waiting for a `row` that may never come (#4840
+                        # review). A non-empty board already published via
+                        # `row`/`delta` above. Deliberately does NOT set
+                        # `ready` -- that flag also drives `had_rows` for the
+                        # subscribe-reconnect retry budget (`_handle_
+                        # subscribe_drop`), which must still treat an
+                        # always-empty channel as never having delivered a
+                        # real row, so it exhausts normally rather than
+                        # reconnecting forever.
+                        publish()
                 elif typ == "error":
                     saw_envelope = True
                     err_frame = str(obj.get("message") or obj.get("error") or "stream error")
@@ -415,25 +606,86 @@ class RegisteredPivotRuntime:
             self._untrack(proc)
 
         if err_frame:
-            self._finish(machine, ("error", [], err_frame[:200]), {})
+            self._handle_subscribe_drop(
+                machine, ctx, ("error", [], err_frame[:200]), {}, had_rows=ready
+            )
             return
         if ready or done:
             # Fully or partially resolved (empty roster included) -- keep rows.
-            self._finish(
-                machine,
+            self._handle_subscribe_drop(
+                machine, ctx,
                 ("ready", [by_id[i] for i in order], ""),
-                dict(summary),
+                dict(summary), had_rows=ready,
             )
             return
         # No envelope was spoken. Fall back to the one-shot list: an old CLI
         # rejects ``--stream`` (argparse), or the provider emitted a plain array.
+        # A permanent demotion (the CLI doesn't understand --stream at all), not
+        # a transient drop -- never worth a subscribe reconnect attempt.
         if _is_stream_unsupported(stderr) or not saw_envelope:
+            self._subscribe_live[machine] = False
             state, rows, err, one_summary = self._exec_list(ctx)
             self._finish(machine, (state, rows, err), one_summary)
             return
         detail = (stderr or "").strip().splitlines()
         msg = detail[-1] if detail else f"exit {proc.returncode}"
-        self._finish(machine, ("error", [], msg[:200]), {})
+        self._handle_subscribe_drop(
+            machine, ctx, ("error", [], msg[:200]), {}, had_rows=ready
+        )
+
+    def _handle_subscribe_drop(
+        self,
+        machine: object,
+        ctx: Mapping[str, object],
+        result: tuple[str, list, str],
+        summary: dict,
+        *,
+        had_rows: bool,
+    ) -> None:
+        """Common tail for :meth:`_run_list_stream` (Phase 0,
+        #4762, 2026-10-01): publish the terminal
+        result, then -- only for a ``subscribe`` pivot, whose channel is
+        supposed to stay open until the picker exits -- decide whether this
+        termination (an ``error`` frame, a plain EOF, or even an unexpected
+        ``done``) is a transient drop worth reconnecting, or whether the
+        reconnect budget is exhausted and the pivot should fall back to
+        ordinary repolling instead of silently freezing on stale rows forever.
+
+        A non-``subscribe`` pivot (one-shot ``stream``) just finishes
+        normally -- EOF ending its lifecycle is the designed, not an
+        exceptional, outcome."""
+        self._finish(machine, result, summary)
+        if not self.pivot.subscribe:
+            return
+        if had_rows:
+            # Having delivered at least one real row this session resets the
+            # budget -- only CONSECUTIVE drops with zero rows delivered (a
+            # bare/early ``done``, an immediate crash, a repeated ``error``
+            # with nothing ever produced) count toward exhaustion.
+            self._subscribe_retries[machine] = 0
+        attempts = self._subscribe_retries.get(machine, 0)
+        if self._closed.is_set() or attempts >= SUBSCRIBE_MAX_RECONNECT_ATTEMPTS:
+            # Exhausted (or shutting down): stop pretending this channel is
+            # live so repoll() resumes ordinary one-shot polling instead of
+            # trusting a dead subscribe forever.
+            self._subscribe_live[machine] = False
+            return
+        self._subscribe_retries[machine] = attempts + 1
+        self._subscribe_live[machine] = False  # not live during the backoff
+        # Claim in-flight NOW (not inside the backoff thread) so a concurrent
+        # ensure()/repoll() can't race a duplicate fetch while we wait.
+        with self._lock:
+            self._inflight.add(machine)
+
+        def _reconnect() -> None:
+            time.sleep(SUBSCRIBE_RECONNECT_BACKOFF_SECS)
+            if self._closed.is_set():
+                with self._lock:
+                    self._inflight.discard(machine)
+                return
+            self._run_list_stream(machine, ctx)
+
+        threading.Thread(target=_reconnect, daemon=True).start()
 
     def _finish(
         self,
@@ -455,7 +707,8 @@ class RegisteredPivotRuntime:
             return ("error", [], "empty list command", {})
         try:
             proc = subprocess.run(
-                argv, capture_output=True, text=True, timeout=LIST_TIMEOUT, check=False
+                argv, capture_output=True, text=True, timeout=LIST_TIMEOUT,
+                check=False, env=_child_process_env(),
             )
         except FileNotFoundError:
             return ("error", [], f"{argv[0]} not found on PATH", {})
@@ -498,7 +751,8 @@ class RegisteredPivotRuntime:
             return (False, "empty action command")
         try:
             proc = subprocess.run(
-                argv, capture_output=True, text=True, timeout=ACTION_TIMEOUT, check=False
+                argv, capture_output=True, text=True, timeout=ACTION_TIMEOUT,
+                check=False, env=_child_process_env(),
             )
         except FileNotFoundError:
             return (False, f"{argv[0]} not found on PATH")
@@ -636,7 +890,8 @@ def run_config_section(action, ctx: Mapping[str, object]) -> tuple[bool, str]:
         return (False, "empty config command")
     try:
         proc = subprocess.run(
-            argv, capture_output=True, text=True, timeout=ACTION_TIMEOUT, check=False
+            argv, capture_output=True, text=True, timeout=ACTION_TIMEOUT,
+            check=False, env=_child_process_env(),
         )
     except FileNotFoundError:
         return (False, f"{argv[0]} not found on PATH")
@@ -659,7 +914,8 @@ def run_worktree_action(action, ctx: Mapping[str, object]) -> tuple[bool, str]:
         return (False, "empty action command")
     try:
         proc = subprocess.run(
-            argv, capture_output=True, text=True, timeout=ACTION_TIMEOUT, check=False
+            argv, capture_output=True, text=True, timeout=ACTION_TIMEOUT,
+            check=False, env=_child_process_env(),
         )
     except FileNotFoundError:
         return (False, f"{argv[0]} not found on PATH")

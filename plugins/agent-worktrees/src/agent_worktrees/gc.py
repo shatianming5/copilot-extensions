@@ -181,21 +181,30 @@ def classify_managed_worktree(
     has_live_session: bool,
     idle_secs: float | None,
     min_idle_secs: float = MANAGED_GC_GRACE_SECS,
+    held_claims: int = 0,
 ) -> ManagedVerdict:
     """Decide whether one managed (system/bridge) worktree may be GC'd.
 
     Eligibility (all required): the worktree is **FINAL or UNUSED** (its work is
     done or never happened), has **no active process** (no live mux session, no
     attached terminal client, no live Copilot session), carries **no follow-up
-    flag**, and has been **idle past the grace window**. Anything else -- a
-    dirty/WIP tree, a live session, an attached client, a follow-up mark, or a
-    still-fresh worktree -- is spared. Pure/inspectable: takes only facts, does
-    no I/O.
+    flag and no held resource claim**, and has been **idle past the grace
+    window**. Anything else -- a dirty/WIP tree, a live session, an attached
+    client, a follow-up mark, a held claim, or a still-fresh worktree -- is
+    spared. Pure/inspectable: takes only facts, does no I/O.
+
+    ``held_claims`` defaults to 0 for callers that haven't wired the claim
+    ledger; a positive count (``active``/``at-rest`` -- see
+    ``ResourceClaim.is_live``) spares the worktree the same way ``follow_up``
+    does, since ``status == finalized`` no longer proves claim-free (finalize
+    is not terminal -- see the worktree-finality-and-obligations effort).
     """
     if kind not in MANAGED_KINDS:
         return ManagedVerdict(worktree_id, "skip", "not-managed")
     if follow_up:
         return ManagedVerdict(worktree_id, "skip", "follow-up")
+    if held_claims:
+        return ManagedVerdict(worktree_id, "skip", "held-claims")
     if attached:
         return ManagedVerdict(worktree_id, "skip", "attached")
     if has_live_mux:
@@ -203,7 +212,9 @@ def classify_managed_worktree(
     if has_live_session:
         return ManagedVerdict(worktree_id, "skip", "live-session")
 
-    is_final = status in _FINAL_STATUSES or git_state in _FINAL_STATES
+    # A terminal tracking status is necessary context, not permission to
+    # override fresh Git evidence. Dirty/ahead work always wins preservation.
+    is_final = git_state in _FINAL_STATES
     is_unused = git_state == "unused"
     if not (is_final or is_unused):
         return ManagedVerdict(worktree_id, "skip", "not-final-or-unused")
@@ -227,7 +238,7 @@ def _on_rm_error(func, path, _exc):
         raise
 
 
-def _remove_tree(d: Path) -> tuple[bool, str]:
+def remove_tree(d: Path) -> tuple[bool, str]:
     """Remove *d*, retrying once on a lock (the Windows transient-handle case)."""
     for attempt in range(2):
         try:
@@ -237,7 +248,12 @@ def _remove_tree(d: Path) -> tuple[bool, str]:
             if attempt == 0:
                 time.sleep(0.5)
                 continue
-            return False, f"locked ({type(exc).__name__}) -- skipped, retry later"
+            locked_path = exc.filename or str(d)
+            return (
+                False,
+                f"locked ({type(exc).__name__} at {locked_path})"
+                " -- skipped, retry later",
+            )
         except OSError as exc:
             return False, f"error: {exc}"
     return False, "locked -- skipped, retry later"
@@ -258,7 +274,24 @@ def sweep_orphans(
     """
     from . import git_ops
 
-    registered = git_ops.list_worktree_paths(cwd=repo.anchor)
+    roots = candidate_roots(repo)
+    try:
+        registered = git_ops.list_worktree_paths(
+            cwd=repo.anchor,
+            fail_on_error=True,
+        )
+    except RuntimeError as exc:
+        return {
+            "roots": [str(root) for root in roots],
+            "scanned": 0,
+            "removed": [],
+            "skipped": [
+                {
+                    "path": str(repo.anchor),
+                    "reason": f"worktree registration probe failed: {exc}",
+                }
+            ],
+        }
     tracked = [r.worktree_path for r in records if getattr(r, "worktree_path", None)]
     orphans = find_orphans(repo, registered, tracked)
 
@@ -270,13 +303,21 @@ def sweep_orphans(
             skipped.append({"path": verdict.path, "reason": verdict.reason})
             continue
         if dry_run:
-            removed.append({"path": verdict.path, "reason": "would remove (effectively empty)"})
+            removed.append(
+                {
+                    "path": verdict.path,
+                    "reason": (
+                        "would remove if unlocked "
+                        "(effectively empty; lock status not checked)"
+                    ),
+                }
+            )
             continue
-        ok, reason = _remove_tree(d)
+        ok, reason = remove_tree(d)
         (removed if ok else skipped).append({"path": str(d), "reason": reason})
 
     return {
-        "roots": [str(r) for r in candidate_roots(repo)],
+        "roots": [str(root) for root in roots],
         "scanned": len(orphans),
         "removed": removed,
         "skipped": skipped,
@@ -294,5 +335,6 @@ __all__ = [
     "classify_managed_worktree",
     "classify_orphan",
     "find_orphans",
+    "remove_tree",
     "sweep_orphans",
 ]

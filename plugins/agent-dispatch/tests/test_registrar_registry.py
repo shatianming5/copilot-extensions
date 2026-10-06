@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 from dropin_registry import EntryDecision, Finding, ScanAuthority, WarningTracker
-from plugin_activation import ActivationReport, ActivePlugin
+from plugin_activation import ActivationReport, ActivePlugin, ActivePluginRoot
 
 from agent_dispatch.__main__ import main
 from agent_dispatch.registrar import load_declaration
@@ -55,7 +55,7 @@ def _plugin_root(tmp_path: Path, name: str = "plugin") -> Path:
     root = tmp_path / name
     root.mkdir()
     (root / "plugin.json").write_text(
-        json.dumps({"name": name}),
+        json.dumps({"name": name, "version": "1.2.3"}),
         encoding="utf-8",
     )
     return root
@@ -75,25 +75,48 @@ def _write_declaration(
     return path
 
 
+def _write_companion(root: Path, name: str = "companion") -> Path:
+    target = root / "references/agent-dispatch/registrar"
+    target.mkdir(parents=True, exist_ok=True)
+    path = target / f"{name}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "name": name,
+                "kind": "plugin-companion",
+                "spec": {
+                    "command": ["bin/serve"],
+                    "stop_command": ["bin/stop"],
+                    "health_probe": ["bin/health"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _write_manifest(
     registry: Path,
     root: Path,
     *,
     source: str = SOURCE,
     registrar: str = "references/agent-dispatch/registrar",
+    dispatch_install_dir: str | None = None,
     filename: str = "producer.json",
 ) -> Path:
     registry.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "plugin": source,
+        "plugin_root": str(root),
+        "registrar": registrar,
+    }
+    if dispatch_install_dir is not None:
+        payload["dispatch_install_dir"] = dispatch_install_dir
     path = registry / filename
     path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "plugin": source,
-                "plugin_root": str(root),
-                "registrar": registrar,
-            }
-        ),
+        json.dumps(payload),
         encoding="utf-8",
     )
     return path
@@ -127,6 +150,16 @@ def test_parse_manifest_requires_attributed_v1_and_root_containment(tmp_path):
                 "registrar": "references/registrar",
             }
         )
+    with pytest.raises(ManifestError, match="dispatch_install_dir"):
+        parse_manifest(
+            {
+                "schema_version": 1,
+                "plugin": SOURCE,
+                "plugin_root": str(root),
+                "registrar": "references/registrar",
+                "dispatch_install_dir": "relative/path",
+            }
+        )
     for escaped in ("../outside", "/outside", r"C:\outside"):
         with pytest.raises(ManifestError, match="root-contained"):
             parse_manifest(
@@ -153,6 +186,110 @@ def test_malformed_manifest_does_not_block_valid_peer(tmp_path):
 
     assert [entry.declaration.name for entry in report.declarations] == ["valid"]
     assert any(finding.reason == "invalid-entry" for finding in report.findings)
+
+
+def test_registrar_accepts_any_authoritative_live_root(tmp_path):
+    installed = _plugin_root(tmp_path, "installed")
+    local = _plugin_root(tmp_path, "local")
+    _write_declaration(installed, "valid")
+    registry = tmp_path / "registrar.d"
+    _write_manifest(registry, installed)
+    active = ActivePlugin(
+        source=SOURCE,
+        name=SOURCE.split("@", 1)[0],
+        marketplace=SOURCE.split("@", 1)[1],
+        root=local.resolve(),
+        scopes=("global", "project:demo"),
+        roots=(
+            ActivePluginRoot(local.resolve(), ("project:demo",), "directory"),
+            ActivePluginRoot(installed.resolve(), ("global",), "installed"),
+        ),
+    )
+
+    report = scan_registrar_registry(
+        registry,
+        activation_report=ActivationReport(
+            ScanAuthority.COMPLETE,
+            {SOURCE: EntryDecision.active(active)},
+        ),
+    )
+
+    assert [entry.declaration.name for entry in report.declarations] == ["valid"]
+
+
+def test_attributed_plugin_companion_carries_authoritative_provenance(tmp_path):
+    root = _plugin_root(tmp_path)
+    declaration_path = _write_companion(root)
+    registry = tmp_path / "registrar.d"
+    _write_manifest(registry, root)
+
+    report = scan_registrar_registry(
+        registry,
+        activation_report=_activation({SOURCE: root}),
+    )
+
+    declaration = report.declarations[0].declaration
+    assert declaration.kind == "plugin-companion"
+    assert declaration.owner == SOURCE
+    assert declaration.plugin_root == str(root.resolve())
+    assert declaration.source_path == str(declaration_path.resolve())
+    assert declaration.plugin_version == "1.2.3"
+    assert declaration.activation_scopes == ("global",)
+
+
+def test_plugin_companion_runtime_generation_overrides_plugin_version(tmp_path):
+    root = _plugin_root(tmp_path)
+    declaration_path = _write_companion(root)
+    declaration_path.write_text(
+        json.dumps(
+            {
+                "name": "companion",
+                "kind": "plugin-companion",
+                "runtime_generation": "engine-v1",
+                "spec": {
+                    "command": ["bin/serve"],
+                    "health_probe": ["bin/health"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = tmp_path / "registrar.d"
+    _write_manifest(registry, root)
+
+    report = scan_registrar_registry(
+        registry,
+        activation_report=_activation({SOURCE: root}),
+    )
+
+    declaration = report.declarations[0].declaration
+    assert declaration.kind == "plugin-companion"
+    assert declaration.plugin_version == "engine-v1"
+    assert declaration.source_path == str(declaration_path.resolve())
+
+
+def test_plugin_companion_activation_uncertainty_retains_prior_only(tmp_path):
+    root = _plugin_root(tmp_path)
+    _write_companion(root)
+    registry = tmp_path / "registrar.d"
+    _write_manifest(registry, root)
+    first = scan_registrar_registry(
+        registry,
+        activation_report=_activation({SOURCE: root}),
+    )
+
+    retained = scan_registrar_registry(
+        registry,
+        previous=first.entries,
+        activation_report=_activation(authority=ScanAuthority.INDETERMINATE),
+    )
+    fresh = scan_registrar_registry(
+        registry,
+        activation_report=_activation(authority=ScanAuthority.INDETERMINATE),
+    )
+
+    assert retained.declarations == first.declarations
+    assert fresh.declarations == ()
 
 
 def test_disabled_plugin_withdraws_previous_declarations(tmp_path):
@@ -394,6 +531,80 @@ def test_indeterminate_declaration_retains_only_that_document(
     assert retained.declarations == first.declarations
     assert fresh.declarations == ()
     assert fresh.findings[0].reason == "entry-indeterminate"
+
+
+def test_indeterminate_extends_recipe_read_retains_only_that_document(
+    monkeypatch,
+    tmp_path,
+):
+    """An `extends:`-bearing declaration's recipe-file I/O failure must
+    classify the same way a direct declaration's own read failure does
+    (`entry-indeterminate`, retaining its prior entry) -- not as a
+    permanently invalid entry that withdraws an active unit on a transient
+    filesystem race."""
+    root = _plugin_root(tmp_path)
+    declaration_dir = root / "references/agent-dispatch/registrar"
+    declaration_dir.mkdir(parents=True, exist_ok=True)
+    recipe = declaration_dir / "recipe.json"
+    recipe.write_text(json.dumps({"name": "general"}), encoding="utf-8")
+    declaration = declaration_dir / "general.json"
+    declaration.write_text(
+        json.dumps({"extends": "./recipe.json"}), encoding="utf-8"
+    )
+    registry = tmp_path / "registrar.d"
+    _write_manifest(registry, root)
+    active = _activation({SOURCE: root})
+    first = scan_registrar_registry(registry, activation_report=active)
+    original_read_text = Path.read_text
+
+    def deny_recipe(path, *args, **kwargs):
+        if path == recipe:
+            raise PermissionError("temporarily denied")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", deny_recipe)
+    retained = scan_registrar_registry(
+        registry,
+        previous=first.entries,
+        activation_report=active,
+    )
+    fresh = scan_registrar_registry(registry, activation_report=active)
+
+    assert retained.declarations == first.declarations
+    assert fresh.declarations == ()
+    assert fresh.findings[0].reason == "entry-indeterminate"
+
+
+def test_extends_resolves_relative_to_the_plugin_root_not_the_registrar_dir(
+    tmp_path,
+):
+    """A plugin-contributed declaration's `extends:` ref must resolve
+    relative to the plugin root (what `_classify_declaration` threads as
+    `repo_root`), not the registrar subdirectory the declaration itself
+    happens to live under -- otherwise a recipe placed at the plugin root
+    (rather than beside the declaration) would never be found."""
+    root = _plugin_root(tmp_path)
+    (root / "recipe.json").write_text(
+        json.dumps({"name": "from-recipe", "labels": ["plugin-root-recipe"]}),
+        encoding="utf-8",
+    )
+    declaration_dir = root / "references/agent-dispatch/registrar"
+    declaration_dir.mkdir(parents=True, exist_ok=True)
+    (declaration_dir / "general.json").write_text(
+        json.dumps({"extends": "./recipe.json"}), encoding="utf-8"
+    )
+    registry = tmp_path / "registrar.d"
+    _write_manifest(registry, root)
+
+    result = scan_registrar_registry(
+        registry, activation_report=_activation({SOURCE: root})
+    )
+
+    assert not result.findings, result.findings
+    assert [item.declaration.name for item in result.declarations] == [
+        "from-recipe"
+    ]
+    assert result.declarations[0].declaration.labels == ("plugin-root-recipe",)
 
 
 def test_indeterminate_activation_retains_prior_but_never_activates_fresh(tmp_path):
@@ -1108,3 +1319,24 @@ def test_registrar_doctor_clean_report_returns_zero(tmp_path, monkeypatch, capsy
     assert rc == 0
     assert [entry["name"] for entry in payload["dropins"]["active"]] == ["general"]
     assert payload["dropins"]["findings"] == []
+
+
+def test_manifest_bound_to_another_dispatch_install_is_rejected(tmp_path, monkeypatch):
+    root = _plugin_root(tmp_path)
+    _write_declaration(root, "general")
+    dropins = tmp_path / "registrar.d"
+    manifest = _write_manifest(
+        dropins,
+        root,
+        dispatch_install_dir=str(tmp_path / "other-install"),
+    )
+    monkeypatch.setenv("AGENT_DISPATCH_INSTALL_DIR", str(tmp_path / "this-install"))
+
+    report = scan_registrar_registry(
+        dropins,
+        activation_report=_activation({SOURCE: root}),
+    )
+
+    assert report.declarations == ()
+    assert report.findings[0].entry == str(manifest)
+    assert report.findings[0].reason == "dispatch-install-mismatch"

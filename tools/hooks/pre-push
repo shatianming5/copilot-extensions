@@ -1,4 +1,9 @@
-#!/usr/bin/env bash
+#!/bin/sh
+# Re-exec under a real bash. Testing BASH_VERSION is not enough: on a BSD host
+# /bin/sh IS bash in sh mode, which sets BASH_VERSION but disables the process
+# substitution this hook uses. Gate on an explicit marker instead.
+[ -n "${COPILOT_EXTENSIONS_HOOK_BASH:-}" ] ||
+    COPILOT_EXTENSIONS_HOOK_BASH=1 exec bash "$0" "$@"
 # pre-push hook: enforce the install contract and the internal-identifier guard
 # before pushing.
 # Enable with:  git config core.hooksPath tools/hooks
@@ -22,11 +27,23 @@ if [[ ${#PY[@]} -eq 0 ]]; then
     exit 0
 fi
 # No-op unless a private denylist is configured (env / ~/.agent-codespaces).
-"${PY[@]}" "$ROOT/tools/check-no-internal-identifiers.py"
+# Scoped to origin/dev, not the script's own origin/main default: dev is this
+# repo's real contribution trunk (CONTRIBUTING.md), and dev/main have
+# diverged enough (dev-branch-release-pipeline effort) that diffing against
+# origin/main would sweep in dev's entire independent history on every push,
+# not just this push's own changes.
+COPILOT_EXTENSIONS_GUARD_BASE=origin/dev "${PY[@]}" "$ROOT/tools/check-no-internal-identifiers.py"
 "${PY[@]}" "$ROOT/tools/check-install-contract.py"
+# Shared production libraries are shipped from multiple plugin payloads; every
+# copy must remain byte-identical before the launch guard scans each one.
+"${PY[@]}" "$ROOT/tools/check-vendored-libs-sync.py"
 # Every Windows process launch must be headless: an agent-procutil-adopting
 # plugin must not hand-roll process-creation flags (windows-launch-hardening).
 "${PY[@]}" "$ROOT/tools/check-headless-launch.py"
+# The Picker's Textual UI may only marshal a background producer's result
+# back to the render thread through Inbox.post()/background.run_background()
+# -- never a raw app.call_from_thread(...) (async+batched-only invariant).
+"${PY[@]}" "$ROOT/tools/check-picker-inbox-discipline.py"
 # Guard skill loadability: frontmatter validity + the 1024-char description limit
 # the Copilot CLI enforces (over it, a skill is silently dropped at load time).
 "${PY[@]}" "$ROOT/tools/check-skills.py"
@@ -36,7 +53,67 @@ fi
 # Keep each plugin's version identical across plugin.json / pyproject.toml /
 # marketplace.json (a one-file bump wedges the Picker's update indicator).
 "${PY[@]}" "$ROOT/tools/check-version-consistency.py"
-# Require a version bump whenever a plugin's content -- or a vendored lib it
-# ships -- changes, so new code never serves under a stale version (the silent
-# stale-deploy gap, dotfiles #1025). Diffs the push against origin/main.
-exec "${PY[@]}" "$ROOT/tools/check-version-bump.py"
+# Lint any effort/vision README.md touched by this push against the canonical
+# section-set contract (efforts/README.md, visions/README.md § Local
+# conventions) -- diff-scoped vs origin/dev (this repo's real contribution
+# trunk; see the identifier-guard note above), so pre-existing debt in a doc
+# this push doesn't touch never blocks.
+"${PY[@]}" "$ROOT/tools/check-effort-vision-structure.py" --base origin/dev
+# No config/Dockerfile/install-script/CI-workflow file may hardcode a public
+# package-feed URL as the only usable endpoint (this repo runs on machines
+# whose default feed is network-blocked and replaced with an internal mirror).
+"${PY[@]}" "$ROOT/tools/check-feed-neutrality.py"
+# Freeze registered agent-bridge contracts and require a registry update when a
+# contract-sensitive source changes.
+"${PY[@]}" "$ROOT/tools/check-agent-bridge-contracts.py" --base origin/dev
+# Require a pending changefile whenever a plugin's content -- or a vendored lib
+# it ships -- changes. Dev-branch promotion consumes the changefile into the
+# real version fields; contributors no longer hand-edit versions in ordinary
+# dev PRs.
+"${PY[@]}" "$ROOT/tools/check-changefile-presence.py" --base origin/dev
+# agent-machines packages declare a CONSUMING repo's own desired machine
+# state; that content belongs exclusively in the repo that adopts the
+# pattern, never in copilot-extensions itself (this repo is public and has
+# no machine of its own to converge).
+"${PY[@]}" "$ROOT/tools/check-no-agent-machines-packages.py"
+# Every tracked, non-test source module must stay within its line-count cap
+# (or its shrink-only grandfathered ceiling, for pre-existing offenders) --
+# a componentization failure (queue.py's ~7,200 lines) had no automated guard
+# before this. See tools/check-module-size.py and CONTRIBUTING.md § Code Style.
+"${PY[@]}" "$ROOT/tools/check-module-size.py"
+# Block check-in of oversized files (a generous cap for images, a tight cap
+# for everything else, and an outright ban on source maps/raw diffs) -- the
+# guard the main-history-rewrite effort's ~300MB of accumulated
+# coverage-baseline blobs never had. See tools/check-large-files.py.
+#
+# Reads the actual refs being pushed from stdin (the standard pre-push hook
+# protocol: "<local ref> <local sha> <remote ref> <remote sha>" per line) and
+# checks each non-deletion local sha explicitly as --head, rather than
+# assuming the currently checked-out HEAD is what's being pushed -- pushing a
+# non-checked-out branch, or several refs in one invocation, would otherwise
+# send content this hook never actually inspected. (No other check in this
+# file is ref-aware yet -- each still only ever looks at HEAD/the current
+# checkout; broadening all of them is a separate, larger change.) Nothing
+# else in this script reads stdin, so this is always safe to consume last.
+# `[ -t 0 ]` falls back to plain HEAD when run manually from a terminal
+# (no real push, nothing to read from stdin).
+large_files_failed=0
+if [ -t 0 ]; then
+    "${PY[@]}" "$ROOT/tools/check-large-files.py" --base origin/dev || large_files_failed=1
+else
+    any_ref=0
+    while read -r local_ref local_sha _remote_ref _remote_sha; do
+        [[ -n "$local_ref" ]] || continue
+        any_ref=1
+        # All-zero local sha means this ref is being deleted -- nothing new
+        # to check.
+        [[ "$local_sha" =~ ^0+$ ]] && continue
+        "${PY[@]}" "$ROOT/tools/check-large-files.py" --base origin/dev --head "$local_sha" || large_files_failed=1
+    done
+    if [[ "$any_ref" -eq 0 ]]; then
+        # Stdin was empty/closed (e.g. a non-interactive test harness) --
+        # fall back to plain HEAD so the guard still runs something.
+        "${PY[@]}" "$ROOT/tools/check-large-files.py" --base origin/dev || large_files_failed=1
+    fi
+fi
+exit "$large_files_failed"

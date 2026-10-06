@@ -11,6 +11,8 @@ Console script: ``session-sync`` (see pyproject ``[project.scripts]``).
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -18,9 +20,14 @@ from pathlib import Path
 from agent_logger.config import Config, load_config
 from agent_logger.segmenter.platform import detect_machine
 from agent_logger.sync.lock import sync_lock
+from agent_logger.sync.meta import (
+    MAX_DEFERRED_FILE_SAMPLES,
+    MAX_DEFERRED_PATH_CHARS,
+)
 from agent_logger.sync.notify import post_notify
 from agent_logger.sync.origin import classify_for_sync, effective_harness, mark_all
 from agent_logger.sync.targets import build_target
+from agent_logger.sync.worktree_binding import mark_all_worktrees
 
 
 def _automation_disabled() -> bool:
@@ -32,21 +39,31 @@ def _machine(cfg: Config) -> str:
     return cfg.machine_name or detect_machine()
 
 
+def _status_text(value, default: str = "(unknown)", limit: int = 512) -> str:
+    if not isinstance(value, (str, int, float, bool)):
+        return default
+    cleaned = "".join(char for char in str(value) if char.isprintable())
+    return cleaned[:limit] or default
+
+
 def _included_sessions(source, allowlist: list[str],
                        fail_closed: bool = False,
                        effective: list[str] | None = None,
                        machine: str = "",
-                       denylist: list[str] | None = None) -> set[str] | None:
+                       denylist: list[str] | None = None,
+                       require_repo_opt_in: bool = False) -> set[str] | None:
     """Resolve the per-repo sync policy to a set of included session ids.
 
     Returns ``None`` when there is **no** filter at all (empty allowlist *and*
-    empty denylist -- sync everything). Otherwise a session is included per
-    :func:`~agent_logger.sync.origin.classify_for_sync`: denylist excludes,
-    allowlist gates (when present), and an empty allowlist with a denylist is a
-    catch-all for everything not denied. ``effective`` is the origin-derivation
-    set (allowlist + denylist + harness repos).
+    empty denylist *and* no repo opt-in gate -- sync everything). Otherwise a
+    session is included per :func:`~agent_logger.sync.origin.classify_for_sync`:
+    denylist excludes, allowlist gates (when present), an empty allowlist with
+    a denylist is a catch-all for everything not denied, and (when
+    ``require_repo_opt_in``) the matched repo must additionally carry a
+    checked-in sync opt-in. ``effective`` is the origin-derivation set
+    (allowlist + denylist + harness repos).
     """
-    if not allowlist and not denylist:
+    if not allowlist and not denylist and not require_repo_opt_in:
         return None
     ss = source / "session-state"
     if not ss.is_dir():
@@ -58,10 +75,185 @@ def _included_sessions(source, allowlist: list[str],
             continue
         include, _ = classify_for_sync(d, machine, allowlist, eff,
                                        fail_closed=fail_closed,
-                                       denylist=denylist)
+                                       denylist=denylist,
+                                       require_repo_opt_in=require_repo_opt_in)
         if include:
             included.add(d.name)
     return included
+
+
+def _all_session_ids(source: Path) -> list[str]:
+    session_state = source / "session-state"
+    if not session_state.is_dir():
+        return []
+    return sorted(d.name for d in session_state.iterdir() if d.is_dir())
+
+
+def _record_push_result(
+    tracker, snapshot: dict[str, str], result, unfiltered: bool, index_snapshot: str | None,
+) -> None:
+    """After a successful push, persist only sessions that fully transferred.
+
+    A session with at least one deferred (locked) file did NOT fully land --
+    recording its signature anyway would permanently mask the gap once the
+    file unlocks without its size/mtime changing again. Any PRIOR stored
+    signature for a deferred session is also dropped (not just withheld):
+    an unchanged-since-last-full-sync session whose only issue this pass
+    was a transiently locked file would otherwise still match its old row
+    and be skipped as "already synced" on the very next incremental check.
+    Also records *index_snapshot* (captured before this push, see
+    :meth:`~agent_logger.sync.change_tracker.ChangeTracker.snapshot_index`)
+    whenever this push was unfiltered -- never recomputed after the fact,
+    for the same before/after-the-transfer reason as session signatures.
+    If the index itself was deferred (``result.index_deferred``), any
+    stored index signature is invalidated instead, so the next run still
+    sees it as changed rather than trusting a snapshot that never actually
+    landed.
+    """
+    to_record = {
+        sid: sig for sid, sig in snapshot.items() if sid not in result.deferred_sessions
+    }
+    tracker.record_signatures(to_record)
+    if result.deferred_sessions:
+        tracker.forget(result.deferred_sessions)
+    if unfiltered:
+        if result.index_deferred:
+            tracker.invalidate_index()
+        elif index_snapshot is not None:
+            tracker.record_index_signature(index_snapshot)
+
+
+def _push_incremental(
+    cfg: Config,
+    target,
+    source: Path,
+    machine: str,
+    include: set[str] | None,
+    *,
+    force_full: bool,
+    verbose: bool,
+):
+    """Resolve the actual push(es) for one sync pass via the change tracker.
+
+    Incremental by default: only sessions whose local signature changed
+    since the last successful sync are included -- the common case does not
+    invoke the target's transport at all. Falls back to a full, segmented
+    reconciliation (bounded-size batches, so one rsync invocation never has
+    to walk the whole corpus) on a from-scratch tracker db, when
+    *force_full* is set (``run --full``), on the configured periodic
+    cadence, or when the tracker's recorded source/destination/machine
+    identity no longer matches this run (a changed target/path/machine makes
+    its stored signatures describe a different destination -- see
+    :meth:`~agent_logger.sync.change_tracker.ChangeTracker.identity_changed`).
+    Change tracking itself is opt-out (``sync.change_tracking.enabled:
+    false`` reverts to always pushing everything, exactly as before this
+    existed).
+    """
+    from agent_logger.sync.change_tracker import ChangeTracker, chunked, resolve_db_path
+    from agent_logger.sync.targets.base import PushResult
+
+    settings = cfg.sync_change_tracking
+    if not settings["enabled"]:
+        return target.push(source, machine, include)
+
+    tracker = ChangeTracker(resolve_db_path(settings["db_path"], cfg.home))
+    # The repo-scope business filter (allowlist/denylist), not a transport
+    # batching artifact -- `batch_mode` on target.push tells the target "this
+    # explicit session set is only a size-bounded slice of what would
+    # otherwise be an unfiltered push", so it still transfers the global
+    # index and defers (rather than hard-fails) a locked file, exactly like
+    # an unfiltered push would.
+    unfiltered = include is None
+    identity = f"{source}|{target.describe()}|{machine}"
+    identity_stale = tracker.identity_changed(identity)
+    do_full = (
+        force_full
+        or identity_stale
+        or tracker.should_full_sync(settings["full_sync_interval_hours"])
+    )
+    if do_full and (force_full or identity_stale):
+        # A forced pass or a changed destination identity makes every
+        # existing signature/marker untrustworthy: signatures are purely
+        # content-based, so a session unchanged since it was last sent to a
+        # DIFFERENT destination would otherwise look "already synced" here
+        # too, even though this destination never received it; and a stale
+        # "recently full-synced" marker surviving a failed forced attempt
+        # would let the next routine run skip retrying it. Clear the slate
+        # so every batch below rebuilds trustworthy state from scratch.
+        tracker.reset()
+
+    if not do_full:
+        changed = tracker.changed_sessions(source, include)
+        final_include = changed if include is None else (changed & include)
+        index_due = unfiltered and tracker.index_changed(source)
+        if not final_include and not index_due:
+            target.heartbeat(machine)
+            return PushResult(ok=True, detail="no session changes detected")
+        # Snapshot before the transfer, not after: a signature recomputed
+        # post-push could capture a live append that happened during the
+        # push but was never actually transferred, permanently masking it.
+        snapshot = tracker.snapshot(source, final_include)
+        index_snapshot = tracker.snapshot_index(source) if unfiltered else None
+        result = target.push(source, machine, final_include, batch_mode=unfiltered)
+        if result.ok:
+            _record_push_result(tracker, snapshot, result, unfiltered, index_snapshot)
+        return result
+
+    all_ids = _all_session_ids(source)
+    if include is not None:
+        all_ids = [sid for sid in all_ids if sid in include]
+
+    total_files = 0
+    total_excluded_files = 0
+    total_excluded_bytes = 0
+    excluded_roots: list[str] = []
+    measurement_complete = True
+    batch_count = 0
+    # An unfiltered reconciliation with zero session dirs still needs one
+    # push call to carry an index-only change -- otherwise `run --full`
+    # on a source with no sessions yet would push nothing at all.
+    batches = list(chunked(all_ids, settings["batch_size"])) or (
+        [[]] if unfiltered else []
+    )
+    for batch in batches:
+        batch_count += 1
+        if verbose:
+            print(f"session-sync: full sync batch {batch_count} ({len(batch)} session(s))")
+        snapshot = tracker.snapshot(source, batch)
+        index_snapshot = tracker.snapshot_index(source) if unfiltered else None
+        result = target.push(source, machine, set(batch), batch_mode=unfiltered)
+        if not result.ok:
+            return result
+        total_files += result.file_count
+        total_excluded_files += result.excluded_file_count
+        total_excluded_bytes += result.excluded_byte_count
+        excluded_roots.extend(result.excluded_roots)
+        measurement_complete = measurement_complete and result.excluded_measurement_complete
+        _record_push_result(tracker, snapshot, result, unfiltered, index_snapshot)
+
+    vanished = tracker.vanished_sessions(source)
+    if vanished:
+        tracker.forget(vanished)
+    # Identity before the completion marker: an interrupted exit here still
+    # leaves `should_full_sync` due (no fresh marker), so a later run forces
+    # another full reconciliation instead of silently trusting a signature
+    # set recorded under an identity that was never actually confirmed.
+    tracker.record_identity(identity)
+    tracker.mark_full_sync()
+
+    detail = (
+        f"full reconciliation: {len(all_ids)} session(s) in {batch_count} batch(es)"
+        if all_ids else "full reconciliation: nothing to push"
+    )
+    return PushResult(
+        ok=True,
+        detail=detail,
+        file_count=total_files,
+        excluded_file_count=total_excluded_files,
+        excluded_byte_count=total_excluded_bytes,
+        excluded_roots=tuple(excluded_roots),
+        excluded_measurement_complete=measurement_complete,
+    )
 
 
 def run_sync(
@@ -70,6 +262,7 @@ def run_sync(
     dry_run: bool = False,
     prune: bool = False,
     verbose: bool = False,
+    full: bool = False,
 ) -> int:
     """Execute one sync pass. Returns a process exit code."""
     if _automation_disabled():
@@ -81,10 +274,12 @@ def run_sync(
     target = build_target(cfg.sync_target, cfg.target_options(cfg.sync_target))
     allowlist = cfg.sync_repo_allowlist
     denylist = cfg.sync_repo_denylist
+    require_repo_opt_in = cfg.sync_require_repo_opt_in
     effective = effective_harness(allowlist, cfg.sync_harness_repos, denylist)
     include = _included_sessions(source, allowlist,
                                  cfg.sync_repo_allowlist_fail_closed,
-                                 effective, machine, denylist)
+                                 effective, machine, denylist,
+                                 require_repo_opt_in)
 
     if verbose:
         print(f"machine:   {machine}")
@@ -92,6 +287,8 @@ def run_sync(
         print(f"target:    {target.describe()}")
         if include is not None:
             scope = f"allowlist={allowlist} denylist={denylist}"
+            if require_repo_opt_in:
+                scope += " require_repo_opt_in=True"
             print(f"filter:    {scope} -> {len(include)} session(s) included")
 
     if not source.is_dir():
@@ -105,6 +302,19 @@ def run_sync(
         print(f"origin:    marked {origin_summary['marked']}/"
               f"{origin_summary['total']} session(s) {origin_summary['by_repo']}")
 
+    # session-worktree-archive-linkout Phase 3: proactively bind each session
+    # to its worktree (via the live local agent-worktrees tracking, while it's
+    # still available) rather than requiring Permanent Record to reconstruct
+    # one from the archived CWD after the fact. Must run after origin marking
+    # above -- it reads each session's just-written origin.json for its
+    # harness-project scope. A no-op (never an error) when agent-worktrees
+    # isn't installed alongside agent-logger on this machine.
+    worktree_summary = mark_all_worktrees(source, dry_run=dry_run)
+    if verbose:
+        print(f"worktree:  marked {worktree_summary['marked']}/"
+              f"{worktree_summary['total']} session(s) "
+              f"({worktree_summary['unresolved']} unresolved)")
+
     if dry_run:
         scope = "" if include is None else f", {len(include)} session(s) match"
         print(
@@ -113,7 +323,7 @@ def run_sync(
         )
         return 0
 
-    lock_file = cfg.home / "session-sync.lock"
+    lock_file = cfg.home / cfg.sync_lock_name
     with sync_lock(lock_file, timeout=cfg.sync_lock_timeout) as acquired:
         if not acquired:
             print("session-sync: another sync holds the lock; skipping", file=sys.stderr)
@@ -140,11 +350,21 @@ def run_sync(
                     file=sys.stderr,
                 )
 
-        result = target.push(source, machine, include)
+        result = _push_incremental(
+            cfg, target, source, machine, include, force_full=full, verbose=verbose
+        )
         if not result.ok:
             print(f"session-sync: push failed: {result.detail}", file=sys.stderr)
             return 1
         print(f"session-sync: ok {result.detail} ({result.file_count} files)")
+        if result.excluded_roots:
+            mib = result.excluded_byte_count / (1024 * 1024)
+            qualifier = "" if result.excluded_measurement_complete else "at least "
+            print(
+                f"session-sync: excluded {qualifier}"
+                f"{result.excluded_file_count} detritus "
+                f"file(s) in {len(result.excluded_roots)} root(s) ({mib:.1f} MiB)"
+            )
 
         if prune:
             removed = target.prune(machine, cfg.sync_retention_days)
@@ -162,23 +382,29 @@ def run_sync(
                 print(f"session-sync: archive push failed: {arc.detail}", file=sys.stderr)
 
             opts = cfg.sync_compact
-            from agent_logger.sync.compact import tracked_worktree_paths
+            from agent_logger.sync.compact import resolve_hub_tracked_paths
 
-            tracked = (
-                tracked_worktree_paths()
-                if opts["require_untracked_worktree"]
-                else None
+            tracked, unresolved = resolve_hub_tracked_paths(
+                opts["require_untracked_worktree"]
             )
-            backlog = target.compact_backlog(
-                machine, opts["min_age_days"], opts["codec"],
-                tracked_paths=tracked,
-            )
-            if backlog:
-                print(f"session-sync: compacted {backlog} hub-only session(s)")
+            if unresolved:
+                print(
+                    "session-sync: tracked-worktree protection requested but "
+                    "unresolved this pass; skipping hub compaction to avoid "
+                    "archiving an unverified live session",
+                    file=sys.stderr,
+                )
+            else:
+                backlog = target.compact_backlog(
+                    machine, opts["min_age_days"], opts["codec"],
+                    tracked_paths=tracked,
+                )
+                if backlog:
+                    print(f"session-sync: compacted {backlog} hub-only session(s)")
 
-            reclaimed = target.reconcile_hub(machine)
-            if reclaimed:
-                print(f"session-sync: reconciled {reclaimed} hub session(s)")
+                reclaimed = target.reconcile_hub(machine)
+                if reclaimed:
+                    print(f"session-sync: reconciled {reclaimed} hub session(s)")
 
         notify = cfg.sync_notify
         if notify["url"]:
@@ -234,6 +460,14 @@ def run_push(
         print(f"session-sync: push failed: {result.detail}", file=sys.stderr)
         return 1
     print(f"session-sync: ok {result.detail} ({result.file_count} files)")
+    if result.excluded_roots:
+        mib = result.excluded_byte_count / (1024 * 1024)
+        qualifier = "" if result.excluded_measurement_complete else "at least "
+        print(
+            f"session-sync: excluded {qualifier}"
+            f"{result.excluded_file_count} detritus "
+            f"file(s) in {len(result.excluded_roots)} root(s) ({mib:.1f} MiB)"
+        )
     return 0
 
 
@@ -246,9 +480,163 @@ def do_status(cfg: Config) -> int:
     print(f"retention_days: {cfg.sync_retention_days}")
     allowlist = cfg.sync_repo_allowlist
     print(f"repo_allowlist: {allowlist or '(all)'}")
+    print(f"repo_denylist:  {cfg.sync_repo_denylist or '(none)'}")
+    print(f"require_repo_opt_in: {cfg.sync_require_repo_opt_in}")
     notify = cfg.sync_notify
     print(f"notify:         {notify['url'] or '(none)'}")
+    latest = target.sync_status(machine)
+    if not latest.supported:
+        print("latest_sync:    (target does not expose status)")
+    elif latest.error:
+        print(f"latest_sync:    unreadable ({_status_text(latest.error)})")
+    elif latest.metadata is None:
+        print("latest_sync:    (none)")
+    else:
+        metadata = latest.metadata
+        print(f"latest_sync:    {_status_text(metadata.get('last_sync_utc'))}")
+        print(f"latest_status:  {_status_text(metadata.get('status'))}")
+        print(
+            "partial_streak: "
+            f"{_status_text(metadata.get('consecutive_partial_count', 0))}"
+        )
+        print(f"sessions:       {_status_text(metadata.get('session_count'))}")
+        deferred_count = metadata.get("deferred_file_count", 0)
+        print(f"deferred_files: {_status_text(deferred_count)}")
+        deferred_files = metadata.get("deferred_files")
+        if isinstance(deferred_files, list):
+            for path in deferred_files[:MAX_DEFERRED_FILE_SAMPLES]:
+                print(
+                    f"  - {_status_text(path, '(invalid)', MAX_DEFERRED_PATH_CHARS)}"
+                )
+        elif deferred_files is not None:
+            print("  - (invalid deferred_files metadata)")
+        excluded_count = metadata.get("excluded_detritus_root_count", 0)
+        excluded_files = metadata.get("excluded_detritus_file_count", 0)
+        excluded_bytes = metadata.get("excluded_detritus_byte_count", 0)
+        excluded_complete = metadata.get(
+            "excluded_detritus_measurement_complete",
+            True,
+        )
+        print(f"detritus_roots: {_status_text(excluded_count)}")
+        print(f"detritus_files: {_status_text(excluded_files)}")
+        print(f"detritus_bytes: {_status_text(excluded_bytes)}")
+        print(f"detritus_complete: {_status_text(excluded_complete)}")
+        excluded_roots = metadata.get("excluded_detritus_roots")
+        if isinstance(excluded_roots, list):
+            for path in excluded_roots[:MAX_DEFERRED_FILE_SAMPLES]:
+                print(
+                    f"  - {_status_text(path, '(invalid)', MAX_DEFERRED_PATH_CHARS)}"
+                )
+        elif excluded_roots is not None:
+            print("  - (invalid excluded_detritus_roots metadata)")
     return 0
+
+
+def do_health(
+    cfg: Config,
+    *,
+    fleet: bool,
+    machines: list[str],
+    max_age_hours: float,
+    partial_threshold: int,
+    json_output: bool,
+) -> int:
+    from agent_logger.sync.health import classify_sync_health
+
+    def fail(message: str, code: int) -> int:
+        cleaned = _status_text(message)
+        if json_output:
+            print(
+                json.dumps(
+                    {
+                        "health": "unknown" if code == 2 else "unhealthy",
+                        "error": cleaned,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(f"session-sync health: {cleaned}", file=sys.stderr)
+        return code
+
+    target = build_target(cfg.sync_target, cfg.target_options(cfg.sync_target))
+    if fleet:
+        fleet_status = target.fleet_sync_status()
+        if not fleet_status.supported:
+            return fail("target does not expose fleet status", 2)
+        if fleet_status.error:
+            return fail(f"fleet status unreadable ({fleet_status.error})", 1)
+        statuses = fleet_status.machines
+        if machines:
+            statuses = {
+                machine: (
+                    statuses[machine]
+                    if machine in statuses
+                    else target.sync_status(machine)
+                )
+                for machine in machines
+            }
+    else:
+        if len(machines) > 1:
+            return fail("--machine may be repeated only with --fleet", 2)
+        machine = machines[0] if machines else _machine(cfg)
+        latest = target.sync_status(machine)
+        if not latest.supported:
+            return fail("target does not expose status", 2)
+        statuses = {machine: latest}
+
+    results = [
+        classify_sync_health(
+            machine,
+            status,
+            max_age_hours=max_age_hours,
+            partial_threshold=partial_threshold,
+        )
+        for machine, status in sorted(statuses.items())
+    ]
+    if not results:
+        return fail("no machine metadata found", 1)
+
+    unhealthy = sum(result.health == "unhealthy" for result in results)
+    degraded = sum(result.health == "degraded" for result in results)
+    healthy = sum(result.health == "healthy" for result in results)
+    if json_output:
+        print(
+            json.dumps(
+                {
+                    "health": "unhealthy" if unhealthy else (
+                        "degraded" if degraded else "healthy"
+                    ),
+                    "max_age_hours": max_age_hours,
+                    "partial_threshold": partial_threshold,
+                    "summary": {
+                        "healthy": healthy,
+                        "degraded": degraded,
+                        "unhealthy": unhealthy,
+                    },
+                    "machines": [result.as_dict() for result in results],
+                },
+                indent=2,
+            )
+        )
+    else:
+        for result in results:
+            age = (
+                f"{result.age_hours:.1f}h"
+                if result.age_hours is not None
+                else "unknown"
+            )
+            print(
+                f"{_status_text(result.machine)}: "
+                f"{result.health} ({result.reason}); "
+                f"age={age}, "
+                f"status={_status_text(result.latest_status, 'unknown')}, "
+                f"partial_streak={result.consecutive_partial_count}"
+            )
+        print(
+            f"summary: healthy={healthy} degraded={degraded} unhealthy={unhealthy}"
+        )
+    return 1 if unhealthy else 0
 
 
 def do_doctor(cfg: Config) -> int:
@@ -270,12 +658,24 @@ def do_compact_hub(cfg: Config, *, dry_run: bool, verbose: bool) -> int:
         print("session-sync compact-hub: disabled (sync.compact.enabled=false)")
         return 0
     target = build_target(cfg.sync_target, cfg.target_options(cfg.sync_target))
-    lock_file = cfg.home / "session-sync.lock"
+    lock_file = cfg.home / cfg.sync_lock_name
     # Protect hub copies of sessions whose worktree is still tracked (the
-    # running machine authoritatively knows its own namespace).
-    from agent_logger.sync.compact import tracked_worktree_paths
+    # running machine authoritatively knows its own namespace). Hub sessions
+    # may belong to a foreign machine, so there is no on-disk existence
+    # fallback here (unlike select_compactable's live-session path): an
+    # unresolved lookup must fail closed rather than proceed as "nothing to
+    # protect" (see resolve_hub_tracked_paths).
+    from agent_logger.sync.compact import resolve_hub_tracked_paths
 
-    tracked = tracked_worktree_paths() if opts["require_untracked_worktree"] else None
+    tracked, unresolved = resolve_hub_tracked_paths(opts["require_untracked_worktree"])
+    if unresolved:
+        print(
+            "session-sync compact-hub: tracked-worktree protection requested "
+            "but unresolved this pass; skipping to avoid archiving an unverified "
+            "live session",
+            file=sys.stderr,
+        )
+        return 0
     with sync_lock(lock_file, timeout=cfg.sync_lock_timeout) as acquired:
         if not acquired:
             print(
@@ -308,6 +708,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--dry-run", action="store_true", help="show what would happen")
     p_run.add_argument("--prune", action="store_true", help="prune old sessions after sync")
     p_run.add_argument("--verbose", action="store_true", help="verbose output")
+    p_run.add_argument(
+        "--full",
+        action="store_true",
+        help="force a full, segmented reconciliation pass now (ignores the "
+        "periodic cadence and any incremental change-tracking state) -- the "
+        "operator escape hatch for local/upstream drift",
+    )
     p_run.add_argument(
         "--detach",
         action="store_true",
@@ -356,6 +763,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_rescue.add_argument("--verbose", action="store_true", help="verbose output")
 
     sub.add_parser("status", help="show resolved sync configuration")
+    p_health = sub.add_parser(
+        "health",
+        help="classify sync freshness and repeated partial results",
+    )
+    p_health.add_argument(
+        "--fleet",
+        action="store_true",
+        help="summarize every machine visible to a filesystem target",
+    )
+    p_health.add_argument(
+        "--machine",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="inspect an exact machine name (repeatable with --fleet)",
+    )
+    p_health.add_argument(
+        "--max-age-hours",
+        type=float,
+        default=12.0,
+        help="mark metadata older than this unhealthy (default: 12)",
+    )
+    p_health.add_argument(
+        "--partial-threshold",
+        type=int,
+        default=3,
+        help="mark this many consecutive partial passes unhealthy (default: 3)",
+    )
+    p_health.add_argument("--json", action="store_true", help="emit JSON")
     sub.add_parser("doctor", help="check the target is reachable/usable")
 
     p_compact = sub.add_parser(
@@ -380,16 +816,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    cfg = load_config(include_repo=False)
+    # Repo-local config now legitimately affects sync -- schema v3's
+    # sync.local_path (see agent_logger.config._load_repo_config) is the
+    # one facility-wide-constant sync destination a repo may declare. Using
+    # the default (include_repo=True) here is what actually delivers that
+    # value to the running sync engine; excluding it would silently keep
+    # every machine on whatever stale/absent machine-local sync path it had
+    # before the repo declared the correct one.
+    cfg = load_config()
 
     try:
         if args.command == "run":
             if getattr(args, "detach", False):
                 from agent_logger.sync import spawn
 
-                return spawn.spawn_detached_sync(cfg, prune=args.prune)
+                return spawn.spawn_detached_sync(
+                    cfg, prune=args.prune, full=args.full
+                )
             return run_sync(
-                cfg, dry_run=args.dry_run, prune=args.prune, verbose=args.verbose
+                cfg, dry_run=args.dry_run, prune=args.prune, verbose=args.verbose,
+                full=args.full,
             )
         if args.command == "push":
             return run_push(
@@ -408,6 +854,36 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.command == "status":
             return do_status(cfg)
+        if args.command == "health":
+            if (
+                not math.isfinite(args.max_age_hours)
+                or args.max_age_hours <= 0
+                or args.partial_threshold <= 0
+            ):
+                if args.json:
+                    print(
+                        json.dumps(
+                            {
+                                "health": "unknown",
+                                "error": "thresholds must be finite and positive",
+                            },
+                            indent=2,
+                        )
+                    )
+                else:
+                    print(
+                        "session-sync health: thresholds must be finite and positive",
+                        file=sys.stderr,
+                    )
+                return 2
+            return do_health(
+                cfg,
+                fleet=args.fleet,
+                machines=args.machine,
+                max_age_hours=args.max_age_hours,
+                partial_threshold=args.partial_threshold,
+                json_output=args.json,
+            )
         if args.command == "doctor":
             return do_doctor(cfg)
         if args.command == "compact":

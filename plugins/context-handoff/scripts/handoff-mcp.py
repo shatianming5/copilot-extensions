@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
-"""stdio MCP server giving Claude Code and Grok the extension's handoff tools.
+"""stdio MCP server exposing Copilot-compatible context-handoff tools.
 
-Copilot gets generate/save/consume/continue_handoff from the context-handoff
-extension. Hosts without it (Claude Code via .claude-plugin/plugin.json, Grok
-via the same manifest or config.toml) get the same four tools, with the same
-names and arguments, so the context-handoff skill reads the same everywhere:
-
-  generate_handoff_prompt  session facts (cwd, git state) to write the brief from
-  save_handoff_prompt      handoff-cli save: agent-dispatch task, else file store
-  consume_handoff          agent-dispatch consume (task_id) / handoff-cli consume
-  continue_handoff         handoff-cli continue: live cutover. A tmux/psmux
-                           session relaunches on the calling host through
-                           agent-worktrees; a Herdr pane cutover is Copilot-only.
+Used by Claude Code (.claude-plugin/plugin.json mcpServers) and Grok CLI (config.toml mcp_servers).
+Wraps handoff-cli.mjs plus grok-handoff.sh continue --kind grok|claude.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -27,158 +19,295 @@ ROOT = Path(
     or Path(__file__).resolve().parents[1]
 )
 CLI = ROOT / "extensions" / "context-handoff" / "handoff-cli.mjs"
-
-
-def _string(description: str) -> dict:
-    return {"type": "string", "description": description}
-
+CONTINUE = ROOT / "scripts" / "grok-handoff.sh"
 
 TOOLS = [
     {
         "name": "generate_handoff_prompt",
-        "description": "Generate session facts (cwd, branch, git status, recent "
-                       "commits) to compose a continuation handoff from.",
-        "inputSchema": {"type": "object", "properties": {
-            "summary": _string("Optional summary of what was accomplished."),
-            "next_steps": _string("Optional description of what should happen next."),
-        }},
+        "description": "Collect extension-free handoff facts (git, cwd, session) as JSON.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "save_handoff_prompt",
-        "description": "Store the composed handoff markdown (an agent-dispatch task "
-                       "when available, else a one-time file) and return the "
-                       "HANDOFF_SEED a successor starts from.",
-        "inputSchema": {"type": "object", "properties": {
-            "prompt_text": _string("The complete handoff markdown."),
-            "title": _string("Short topic."),
-            "prompt": _string("Alias of prompt_text."),
-        }},
+        "description": "Store a handoff brief without launching a successor. Returns HANDOFF_SEED and HANDOFF_TOKEN.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "markdown": {"type": "string", "description": "Handoff markdown brief"},
+                "prompt": {"type": "string"},
+            },
+            "required": ["title"],
+        },
     },
     {
         "name": "consume_handoff",
-        "description": "Consume a stored handoff exactly once: task_id for an "
-                       "agent-dispatch handoff, handoff_id or path for a file one.",
-        "inputSchema": {"type": "object", "properties": {
-            "task_id": _string("agent-dispatch task id."),
-            "handoff_id": _string("File-backed handoff id."),
-            "path": _string("Explicit file-backed handoff JSON path."),
-            "defer_complete": {"type": "boolean", "description":
-                               "Task handoffs: complete the task only when the goal is reached."},
-        }},
+        "description": "Consume a stored handoff once. Pass locator task:<id> or file:<id>.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "locator": {"type": "string"},
+                "task_id": {"type": "string"},
+                "handoff_id": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "trigger_handoff",
+        "description": "Store (if needed) and signal pickup for a saved baton. Native-goal batons should use continue_handoff instead.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "markdown": {"type": "string"},
+                "handoff_token": {"type": "string"},
+            },
+        },
     },
     {
         "name": "continue_handoff",
-        "description": "Live-cutover the current session to a successor seeded "
-                       "with the HANDOFF_SEED from save_handoff_prompt.",
-        "inputSchema": {"type": "object", "properties": {
-            "seed": _string("The exact HANDOFF_SEED."),
-        }, "required": ["seed"]},
+        "description": "Freeze the saved baton and launch a successor. Pass the exact HANDOFF_SEED from save. Claude launches --kind claude; Grok uses grok-pane.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "seed": {"type": "string"},
+                "kind": {"type": "string", "enum": ["claude", "grok"]},
+            },
+            "required": ["seed"],
+        },
+    },
+    {
+        "name": "retry_handoff_cutover",
+        "description": "Retry the existing saved handoff identity without creating another baton.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"seed": {"type": "string"}},
+        },
     },
 ]
 
 
+# Claude Code speaks newline-delimited JSON (MCP stdio spec); other hosts may
+# use Content-Length framing. Reply in whichever framing the client used.
+_LINE_MODE = False
+
+
+def _read_message() -> dict | None:
+    global _LINE_MODE
+    headers: dict[bytes, bytes] = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if not headers and line.lstrip().startswith(b"{"):
+            _LINE_MODE = True
+            return json.loads(line.decode("utf-8"))
+        if line in (b"\r\n", b"\n"):
+            if not headers:
+                continue
+            break
+        key, _, value = line.partition(b":")
+        headers[key.strip().lower()] = value.strip()
+    length = int(headers.get(b"content-length", b"0"))
+    if length <= 0:
+        return None
+    body = sys.stdin.buffer.read(length)
+    return json.loads(body.decode("utf-8"))
+
+
+def _write_message(payload: dict) -> None:
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    if _LINE_MODE:
+        sys.stdout.buffer.write(raw + b"\n")
+    else:
+        sys.stdout.buffer.write(f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii"))
+        sys.stdout.buffer.write(raw)
+    sys.stdout.buffer.flush()
+
+
+def _ok(req_id, text: str) -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {"content": [{"type": "text", "text": text}]},
+    }
+
+
+def _err(req_id, text: str) -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "content": [{"type": "text", "text": text}],
+            "isError": True,
+        },
+    }
+
+
 def _session_id() -> str:
-    """The calling host's session id (Copilot, Claude Code or Grok)."""
-    for name in ("COPILOT_AGENT_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "GROK_SESSION_ID"):
-        if os.environ.get(name):
-            return os.environ[name]
-    return ""
+    return (
+        os.environ.get("GROK_SESSION_ID")
+        or os.environ.get("COPILOT_AGENT_SESSION_ID")
+        or os.environ.get("CLAUDE_SESSION_ID")
+        or os.environ.get("CLAUDE_CODE_SESSION_ID")
+        or ""
+    )
 
 
-def _run(cmd: list[str], stdin: str | None = None) -> str:
-    """Run a command; its stdout on success, else raise with its output."""
-    proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True,
-                          timeout=90, check=False)
+def _run_cli(args: list[str], stdin: str | None = None) -> subprocess.CompletedProcess:
+    cmd = ["node", str(CLI), *args, "--json"]
+    sid = _session_id()
+    if sid and "--session-id" not in args:
+        cmd.extend(["--session-id", sid])
+    env = os.environ.copy()
+    env["PYTHONPATH"] = ""
+    return subprocess.run(
+        cmd,
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+        cwd=os.environ.get("PWD") or os.getcwd(),
+        env=env,
+    )
+
+
+def _successor_kind(explicit: str | None) -> str:
+    if explicit in ("claude", "grok"):
+        return explicit
+    if os.environ.get("CLAUDE_PLUGIN_ROOT") or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        return "claude"
+    return "grok"
+
+
+def _token_from_seed(seed: str) -> tuple[str, str]:
+    text = (seed or "").strip()
+    match = re.search(r"Recovery:\s*context-handoff\s+(file|task):([A-Za-z0-9._-]+)", text)
+    if match:
+        return match.group(1), match.group(2)
+    match = re.search(r"HANDOFF_TOKEN:\s*([A-Za-z0-9._-]+)", text)
+    if match:
+        return "file", match.group(1)
+    match = re.match(r"(file|task):([A-Za-z0-9._-]+)\s*$", text)
+    if match:
+        return match.group(1), match.group(2)
+    if re.fullmatch(r"[A-Za-z0-9._-]+", text):
+        return "file", text
+    raise ValueError("could not parse HANDOFF_TOKEN / file:<id> / task:<id> from seed")
+
+
+def _continue(seed: str, kind: str | None) -> subprocess.CompletedProcess:
+    _kind, token = _token_from_seed(seed)
+    cmd = ["bash", str(CONTINUE), "continue", "--kind", _successor_kind(kind), "--handoff-token", token]
+    sid = _session_id()
+    env = os.environ.copy()
+    env["PYTHONPATH"] = ""
+    if sid:
+        env.setdefault("GROK_SESSION_ID", sid)
+        env.setdefault("CLAUDE_SESSION_ID", sid)
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+        cwd=os.environ.get("PWD") or os.getcwd(),
+        env=env,
+    )
+
+
+def _handle_call(name: str, arguments: dict) -> str:
+    arguments = arguments or {}
+    if name == "generate_handoff_prompt":
+        proc = _run_cli(["facts"])
+    elif name == "save_handoff_prompt":
+        title = arguments.get("title") or "Continue the current work"
+        markdown = arguments.get("markdown") or arguments.get("prompt") or ""
+        if not str(markdown).strip():
+            raise ValueError("save_handoff_prompt requires markdown/prompt")
+        proc = _run_cli(["save", "--no-task", "--title", title], stdin=str(markdown))
+    elif name == "consume_handoff":
+        locator = arguments.get("locator")
+        if not locator:
+            if arguments.get("task_id"):
+                locator = f"task:{arguments['task_id']}"
+            elif arguments.get("handoff_id"):
+                locator = f"file:{arguments['handoff_id']}"
+        if not locator:
+            raise ValueError("consume_handoff requires locator, task_id, or handoff_id")
+        proc = _run_cli(["consume", "--locator", str(locator)])
+    elif name == "trigger_handoff":
+        args = ["trigger", "--no-task"]
+        if arguments.get("title"):
+            args.extend(["--title", str(arguments["title"])])
+        if arguments.get("handoff_token"):
+            args.extend(["--handoff-token", str(arguments["handoff_token"])])
+            proc = _run_cli(args)
+        else:
+            markdown = arguments.get("markdown") or arguments.get("prompt") or ""
+            if not str(markdown).strip():
+                raise ValueError("trigger_handoff requires markdown or handoff_token")
+            proc = _run_cli(args, stdin=str(markdown))
+    elif name == "continue_handoff":
+        proc = _continue(str(arguments.get("seed") or ""), arguments.get("kind"))
+    elif name == "retry_handoff_cutover":
+        seed = arguments.get("seed") or ""
+        if not seed:
+            raise ValueError("retry_handoff_cutover needs the existing seed")
+        proc = _continue(str(seed), arguments.get("kind"))
+    else:
+        raise ValueError(f"unknown tool {name}")
     text = (proc.stdout or "").strip() or (proc.stderr or "").strip() or f"exit {proc.returncode}"
     if proc.returncode != 0:
         raise RuntimeError(text)
     return text
 
 
-def _handoff_cli(args: list[str], stdin: str | None = None) -> str:
-    sid = ["--session-id", _session_id()] if _session_id() else []
-    return _run(["node", str(CLI), *args, "--json", *sid], stdin)
-
-
-def _git(*args: str) -> str:
-    try:
-        return subprocess.run(["git", *args], capture_output=True, text=True,
-                              timeout=10, check=False).stdout.strip()
-    except OSError:
-        return ""
-
-
-def call(name: str, arguments: dict) -> str:
-    """Dispatch one tools/call to the handoff CLI or agent-dispatch."""
-    if name == "generate_handoff_prompt":
-        return json.dumps({
-            "sessionId": _session_id(),
-            "cwd": os.getcwd(),
-            "branch": _git("branch", "--show-current"),
-            "status": _git("status", "--short").splitlines()[:40],
-            "recentCommits": _git("log", "--oneline", "-5").splitlines(),
-            "summary": arguments.get("summary") or "",
-            "nextSteps": arguments.get("next_steps") or "",
-            "instructions": "Compose the handoff markdown (objective, state, decisions, "
-                            "remaining work) from these facts and your own context, "
-                            "then call save_handoff_prompt with prompt_text.",
-        }, indent=2)
-    if name == "save_handoff_prompt":
-        text = str(arguments.get("prompt_text") or arguments.get("prompt") or "")
-        if not text.strip():
-            raise ValueError("save_handoff_prompt needs prompt_text")
-        # handoff-cli stores an agent-dispatch task, else a one-time file.
-        return _handoff_cli(["save", "--title",
-                             str(arguments.get("title") or "Continue the current work")], text)
-    if name == "consume_handoff":
-        if arguments.get("task_id"):
-            defer = ["--defer-complete"] if arguments.get("defer_complete") else []
-            return _run(["agent-dispatch", "consume", str(arguments["task_id"]), *defer])
-        if arguments.get("handoff_id"):
-            return _handoff_cli(["consume", "--handoff-id", str(arguments["handoff_id"])])
-        if arguments.get("path"):
-            return _handoff_cli(["consume", "--path", str(arguments["path"])])
-        raise ValueError("consume_handoff needs task_id, handoff_id or path")
-    if name == "continue_handoff":
-        if not arguments.get("seed"):
-            raise ValueError("continue_handoff needs the HANDOFF_SEED from save_handoff_prompt")
-        return _handoff_cli(["continue", "--seed", str(arguments["seed"])])
-    raise ValueError(f"unknown tool {name}")
-
-
-def _reply(req_id, result: dict) -> None:
-    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result}) + "\n")
-    sys.stdout.flush()
-
-
 def main() -> int:
-    """Serve newline-delimited JSON-RPC (MCP stdio) until stdin closes."""
     if not CLI.is_file():
         sys.stderr.write(f"handoff-mcp: missing CLI at {CLI}\n")
         return 1
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        req = json.loads(line)
-        method, req_id = req.get("method"), req.get("id")
+    while True:
+        req = _read_message()
+        if req is None:
+            return 0
+        method = req.get("method")
+        req_id = req.get("id")
         if method == "initialize":
-            _reply(req_id, {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                            "serverInfo": {"name": "context-handoff", "version": "1"}})
+            _write_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "context-handoff", "version": "0.1.1-dev16"},
+                    },
+                }
+            )
+        elif method == "notifications/initialized":
+            continue
         elif method == "tools/list":
-            _reply(req_id, {"tools": TOOLS})
+            _write_message({"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}})
         elif method == "tools/call":
             params = req.get("params") or {}
+            name = params.get("name")
+            arguments = params.get("arguments") or {}
             try:
-                text, error = call(params.get("name"), params.get("arguments") or {}), False
-            except Exception as exc:  # report to the model, keep serving
-                text, error = f"{type(exc).__name__}: {exc}", True
-            _reply(req_id, {"content": [{"type": "text", "text": text}], "isError": error})
+                _write_message(_ok(req_id, _handle_call(name, arguments)))
+            except Exception as exc:
+                _write_message(_err(req_id, f"{type(exc).__name__}: {exc}"))
         elif method == "ping":
-            _reply(req_id, {})
+            _write_message({"jsonrpc": "2.0", "id": req_id, "result": {}})
         elif req_id is not None:
-            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req_id, "error": {
-                "code": -32601, "message": f"Method not found: {method}"}}) + "\n")
-            sys.stdout.flush()
+            _write_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32601, "message": f"Method not found: {method}"},
+                }
+            )
     return 0
 
 

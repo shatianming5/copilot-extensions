@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import logging
+import logging.handlers
 import os
 import signal
 import subprocess
@@ -14,12 +14,13 @@ import threading
 import time
 from pathlib import Path
 
-from agent_procutil import detached_kwargs, windowless_python
+from agent_procutil import detached_kwargs, windowless_python, windowless_python_env
 
 from .cache import get_cache
 from .config import (
     DEFAULT_TCP_PORT,
     ENDPOINT_ENV,
+    INSTALLATION_ID_ENV,
     IS_WINDOWS,
     LOG_FILE,
     PID_FILE,
@@ -69,7 +70,7 @@ UNLOCK_REQUIRED_ACTIONS = frozenset({
     "move", "mv",
 })
 
-log = logging.getLogger("agent-vault.service")
+log = logging.getLogger("agent-vault.service")  # marketplace-isolation: allow logger-namespace
 
 
 def _within_group(entry: str, group: str | None) -> bool:
@@ -1036,7 +1037,11 @@ async def run_server(service: VaultService, tcp_port: int | None = None) -> None
     if advertised is not None:
         try:
             path = write_endpoint(
-                run_dir(), advertised[0], advertised[1], alt=advertised[2] or None
+                run_dir(),
+                advertised[0],
+                advertised[1],
+                installation_id=os.environ.get(INSTALLATION_ID_ENV),
+                alt=advertised[2] or None,
             )
             log.info("Advertised endpoint %s:%s at %s", advertised[0], advertised[1], path)
         except OSError as e:
@@ -1217,12 +1222,16 @@ def daemonize_unix() -> bool:
 
 def daemonize_windows(argv: list[str]) -> None:
     """Start a detached background process (Windows)."""
-    cmd = [windowless_python(sys.executable), *argv, "--foreground"]
+    python = sys.executable
+    cmd = [windowless_python(python), *argv, "--foreground"]
+    env = os.environ.copy()
+    env.update(windowless_python_env(python))
     subprocess.Popen(
         cmd,
         # Neutral cwd: the detached daemon must not inherit (and pin) the
         # caller's directory, which may be a worktree or the plugin payload.
         cwd=str(Path.home()),
+        env=env,
         **detached_kwargs(),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -1240,6 +1249,29 @@ def main() -> None:
                         help=f"TCP port (default: {DEFAULT_TCP_PORT})")
     parser.add_argument("--ping", action="store_true", help="Check if service is running")
     parser.add_argument("--stop", action="store_true", help="Stop running service")
+    parser.add_argument(
+        "--export-handoff", action="store_true",
+        help=(
+            "Drain-safe cutover (#743): if a daemon is running and reachable "
+            "over an owner-gated local transport, print its unlocked-state "
+            "handoff payload as one line of JSON to stdout (empty output, exit "
+            "0, when there is nothing to hand off -- never raises). Installer-"
+            "internal; piped straight into the successor's --handoff-stdin, "
+            "never written to disk."
+        ),
+    )
+    parser.add_argument(
+        "--handoff-stdin", action="store_true",
+        help=(
+            "Drain-safe cutover (#743): accept a JSON handoff payload -- via "
+            "the AGENT_VAULT_HANDOFF_JSON env var (the systemd-managed "
+            "restart path) or, failing that, stdin (the direct-invocation "
+            "path) -- and warm this generation with it before serving -- no "
+            "re-unlock. Consumed BEFORE any fork/daemonize so the warmed "
+            "state carries into the detached child via copy-on-write memory; "
+            "never touches disk, never logged."
+        ),
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     args = parser.parse_args()
 
@@ -1250,14 +1282,14 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    log.setLevel(logging.DEBUG)
+    log.setLevel(level)
 
     try:
-        fh = logging.FileHandler(str(LOG_FILE), encoding="utf-8")
-        fh.setLevel(logging.DEBUG)
+        fh = logging.handlers.RotatingFileHandler(
+            str(LOG_FILE), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        fh.setLevel(level)
         fh.setFormatter(logging.Formatter(
-            "%(asctime)s %(name)s [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"))
+            "%(asctime)s %(name)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
         logging.getLogger().addHandler(fh)
         log.debug("Log file: %s", LOG_FILE)
     except Exception as exc:
@@ -1274,6 +1306,19 @@ def main() -> None:
             sys.exit(0)
         print("Vault service not running")
         sys.exit(1)
+
+    if args.export_handoff:
+        # Never raises: no daemon, a refusal (non-owner-gated transport), or
+        # any dial failure all print nothing and exit 0 -- a silent, safe
+        # degrade to the existing re-unlock path (invariant #3). The payload
+        # is plaintext-secret-bearing, so it goes to stdout ONLY, one line,
+        # never logged.
+        from .cutover import request_handoff_from_running_daemon
+
+        payload = request_handoff_from_running_daemon()
+        if payload is not None:
+            print(json.dumps(payload))
+        sys.exit(0)
 
     if args.stop:
         resp = send_command({"action": "stop"})
@@ -1296,6 +1341,20 @@ def main() -> None:
         service.ttl_override = 0
         log.info("Persistent mode - inactivity timeout disabled")
     service.initialize()
+
+    if args.handoff_stdin:
+        # Drain-safe cutover (#743): consume + apply BEFORE any fork/daemonize,
+        # so the warmed state carries into the eventual detached child via
+        # copy-on-write memory -- never written to disk, never logged. See
+        # cutover.consume_pending_handoff for the two carriers (env var for a
+        # systemd-managed restart, stdin for a direct invocation).
+        from .cutover import apply_handoff_payload, consume_pending_handoff
+
+        payload = consume_pending_handoff(environ=os.environ, stdin=sys.stdin)
+        warmed = apply_handoff_payload(service, payload)
+        log.info(
+            "Drain-safe cutover: warmed %d vault(s) from predecessor handoff", warmed
+        )
 
     tcp_port = args.tcp_port
 

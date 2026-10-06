@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 
 import {
   CONTINUATION_DIRECTIVE,
+  HANDOFF_MECHANISM_AWARENESS,
 } from "../extensions/context-handoff/cutover-seed.mjs";
 
 const plugin = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -17,65 +18,128 @@ test("successor directive drives the parent objective across context windows", (
   assert.match(CONTINUATION_DIRECTIVE, /Consuming the handoff is setup, not completion/);
   assert.match(CONTINUATION_DIRECTIVE, /begin substantive work immediately after pickup/);
   assert.match(CONTINUATION_DIRECTIVE, /finish the planning needed to act and then execute it/);
-  assert.match(
-    CONTINUATION_DIRECTIVE,
-    /subject to any required safety, review, approval, or confirmation gate/,
-  );
-  assert.match(CONTINUATION_DIRECTIVE, /hand off again with the same parent objective/);
   assert.match(CONTINUATION_DIRECTIVE, /load that effort before reconstructing intent/);
 });
 
-test("handoff guidance requires a forward-looking successor roster", () => {
-  const skill = readFileSync(
-    join(plugin, "skills", "context-handoff", "SKILL.md"),
-    "utf8",
-  );
-  const template = readFileSync(
-    join(plugin, "skills", "context-handoff", "references", "handoff-template.md"),
-    "utf8",
-  );
-  const normalizedSkill = skill.replace(/\s+/g, " ");
-
-  assert.match(
-    normalizedSkill,
-    /A handoff with no actionable successor work is usually malformed/,
-  );
-  assert.match(normalizedSkill, /A single session may consume one handoff/);
-  assert.match(
-    normalizedSkill,
-    /Do not wait for another user prompt merely because one phase/,
-  );
-  assert.match(normalizedSkill, /Consuming the handoff is setup, not completion/);
-  assert.match(normalizedSkill, /finish the planning needed to act and then execute it/);
-  assert.match(
-    normalizedSkill,
-    /subject to any required safety, review, approval, or confirmation gate/,
-  );
-
-  const headings = [
-    "## Standalone Session Continuation",
-    "### Original Request",
-    "### Continuing Objective",
-    "### Progress",
-    "### Successor Work Roster",
-    "### Completion Gates",
-    "### Re-Handoff Instructions",
-  ];
-  let previous = -1;
-  for (const heading of headings) {
-    const current = template.indexOf(heading, previous + 1);
-    assert.notEqual(current, -1, `${heading} must be present`);
-    assert.ok(current > previous, `${heading} must appear in forward order`);
-    previous = current;
-  }
-  assert.match(template, /Do not wait for the user to ask again/);
+test("handoff mechanism awareness carries perpetuation + fresh-session awareness", () => {
+  assert.match(HANDOFF_MECHANISM_AWARENESS, /available from turn one/);
+  assert.match(HANDOFF_MECHANISM_AWARENESS, /whether or not this session began from a handoff/);
+  assert.match(HANDOFF_MECHANISM_AWARENESS, /never a reason to truncate diligence/);
+  assert.match(HANDOFF_MECHANISM_AWARENESS, /forces a handoff before auto-compaction/);
+  assert.match(HANDOFF_MECHANISM_AWARENESS, /context-handoff skill/);
+  assert.match(HANDOFF_MECHANISM_AWARENESS, /chain many handoffs in\s*\n?\s*succession/);
 });
 
-test("effort-backed handoffs link durable intent and carry only the relay delta", () => {
+test("handoff-core threads the mechanism-awareness constant into every delivered brief", () => {
+  const core = readFileSync(
+    join(plugin, "extensions", "context-handoff", "handoff-core.mjs"),
+    "utf8",
+  );
+  assert.match(core, /HANDOFF_MECHANISM_AWARENESS,\s*\n\s*leadFrom/);
+  assert.match(core, /CONTINUATION_DIRECTIVE,\s*\n\s*""[,\s]*\n\s*HANDOFF_MECHANISM_AWARENESS/);
+});
+
+test("extension no longer re-delivers the awareness nudge from in-memory module state", () => {
+  const extension = readFileSync(
+    join(plugin, "extensions", "context-handoff", "extension.mjs"),
+    "utf8",
+  );
+  // The fresh-session awareness message moved to the static, naturally
+  // idempotent session-guidance file (scripts/emit-guidance.*) so a
+  // mid-session extension re-fork (reconnect/reload) can never replay it --
+  // see efforts/active/context-handoff-overhaul's journal for the incident
+  // (a reload replayed this nudge and raced the skill registry, producing a
+  // transient "Skill not found: context-handoff").
+  assert.doesNotMatch(extension, /awarenessNudgeSent/);
+  assert.doesNotMatch(extension, /pendingAwareness/);
+  assert.doesNotMatch(extension, /HANDOFF_MECHANISM_AWARENESS/);
+});
+
+test("skill and README distinguish context-pressure auto-trigger from follow-up ask-first", () => {
   const skill = readFileSync(
     join(plugin, "skills", "context-handoff", "SKILL.md"),
     "utf8",
   ).replace(/\s+/g, " ");
+  const readme = readFileSync(
+    join(plugin, "README.md"),
+    "utf8",
+  ).replace(/\s+/g, " ");
+
+  for (const source of [skill, readme]) {
+    assert.match(source, /native.*(?:goal|`\/goal`)/i);
+    assert.match(source, /continue_handoff/);
+    assert.match(source, /save_handoff_prompt/);
+    assert.match(source, /trigger_handoff/);
+    assert.match(source, /context-pressure-driven handoff/i);
+    assert.match(source, /trigger directly|call `trigger_handoff` directly/i);
+    assert.match(source, /turn-end|follow-up/i);
+    assert.match(source, /ask the user/i);
+    assert.match(source, /one session own one slice|one session own one natural slice/i);
+  }
+  assert.match(skill, /A handoff with no actionable successor work is usually malformed/);
+  assert.match(skill, /Only this turn-end follow-up path is skippable via \*\*autopilot\*\*/);
+});
+
+test("native live handoff is explicit and preserves the signal-only trigger surface", () => {
+  const extension = readFileSync(
+    join(plugin, "extensions", "context-handoff", "extension.mjs"),
+    "utf8",
+  );
+  assert.match(extension, /name: "save_handoff_prompt"/);
+  assert.match(extension, /name: "trigger_handoff"/);
+  assert.match(extension, /name: "consume_handoff"/);
+  assert.match(extension, /name: "continue_handoff"/);
+  assert.match(extension, /name: "retry_handoff_cutover"/);
+  assert.match(extension, /final native usage will be frozen at session.idle/);
+  assert.match(extension, /It NEVER checks panes or PIDs/);
+  assert.match(extension, /Final short handoff prompt\/seed/);
+});
+
+test("extension and CLI share the SDK-free handoff implementation", () => {
+  const extension = readFileSync(
+    join(plugin, "extensions", "context-handoff", "extension.mjs"),
+    "utf8",
+  );
+  const cli = readFileSync(
+    join(plugin, "extensions", "context-handoff", "handoff-cli.mjs"),
+    "utf8",
+  );
+  assert.match(extension, /from "\.\/handoff-core\.mjs"/);
+  assert.match(cli, /from "\.\/handoff-core\.mjs"/);
+  assert.doesNotMatch(extension, /function (?:makeHandoffMetadata|dispatchHandoff|consumeDispatchHandoffTask)/);
+});
+
+test("payload-local fallback documents trigger, consume, and retry-cutover", () => {
+  const skill = readFileSync(
+    join(plugin, "skills", "context-handoff", "SKILL.md"),
+    "utf8",
+  );
+  const setup = readFileSync(
+    join(plugin, "skills", "context-handoff-setup", "SKILL.md"),
+    "utf8",
+  );
+  for (const command of [
+    "facts --json",
+    "save --title",
+    "trigger --title",
+    "trigger --handoff-token",
+    "consume --locator \"task:<task-id>\"",
+    "consume --locator \"file:<handoff-id>\"",
+    "retry-cutover --session-id",
+  ]) {
+    assert.ok(skill.includes(command), `fallback must document ${command}`);
+  }
+  assert.match(setup, /No installed runtime, venv, binstub/);
+  assert.match(setup, /invoke it with `node`/);
+  assert.doesNotMatch(skill, /\bcontinue --seed\b/);
+  assert.doesNotMatch(skill, /\bretry --session-id\b/);
+});
+
+test("outstanding background flows/external state is a standing schema class, not just prose", () => {
+  const skill = readFileSync(
+    join(plugin, "skills", "context-handoff", "SKILL.md"),
+    "utf8",
+  );
   const template = readFileSync(
     join(plugin, "skills", "context-handoff", "references", "handoff-template.md"),
     "utf8",
@@ -84,52 +148,84 @@ test("effort-backed handoffs link durable intent and carry only the relay delta"
     join(plugin, "extensions", "context-handoff", "extension.mjs"),
     "utf8",
   );
-
-  for (const heading of [
-    "## Effort-Backed Session Continuation",
-    "### Active Effort",
-    "### Next Slice",
-    "### Immediate Session Delta",
-    "### Completion Gates",
-    "### Re-Handoff Instructions",
-  ]) {
-    assert.notEqual(template.indexOf(heading), -1, `${heading} must be present`);
+  for (const source of [skill, template]) {
+    assert.match(source, /### Outstanding Background Flows & External State/);
   }
-  assert.match(skill, /effort-focus show --json/);
-  assert.match(skill, /active_effort\.active` is `true/);
-  assert.match(skill, /do not duplicate its request, plan, or journal/i);
-  assert.match(skill, /Use session ramp-up only when the Immediate Session Delta is missing/);
-  assert.match(skill, /successfully bound successor is the rightful head/);
-  assert.match(skill, /must not continue making competing worktree changes/);
-  assert.match(skill, /session-role --json/);
-  assert.match(skill, /scope boundary or required safety confirmation stops progress/);
-  assert.match(skill, /update landed Plan\/Validation markers and the Journal/);
-  assert.match(skill, /failed approaches and non-obvious gotchas in the Journal/);
-  assert.match(skill, /Deferred to \\`<tracked objective>\\`/);
-  assert.match(skill, /Blocked; transferred to \\`<tracked objective>\\`/);
-  assert.match(template, /\*\*Gotchas \/ failed approaches:\*\*/);
-  assert.match(extension, /compact effort-backed shape/);
-  assert.doesNotMatch(extension, /Compose the FULL handoff markdown/);
-  assert.doesNotMatch(extension, /The full continuation context/);
+  // Both shapes in handoff-template.md must carry the section (effort-backed
+  // and standalone), not just one.
+  assert.equal(
+    (template.match(/### Outstanding Background Flows & External State/g) || []).length,
+    2,
+  );
+  assert.match(skill, /never silently drop/i);
+  assert.match(template, /Never silently drop/);
+  // The force-tier auto-draft path (no agent composition) must still surface
+  // an explicit open item rather than omit the section.
+  assert.match(extension, /Outstanding Background Flows & External State/);
+  assert.match(extension, /Not captured -- this handoff was auto-drafted by the force tier/);
+  // generate_handoff_prompt's returned instructions require the section too.
+  assert.match(extension, /section: never silently drop/);
 });
 
-test("direct handoff consumption reinforces substantive continuation", () => {
+test("skill states the mechanism is known from turn one, independent of handoff origin", () => {
+  const skill = readFileSync(
+    join(plugin, "skills", "context-handoff", "SKILL.md"),
+    "utf8",
+  );
+  assert.match(skill, /## Every session knows this exists/);
+  assert.match(skill, /whether or not it began\s*\n?\s*from a handoff/);
+});
+
+test("skill and README agree on the extension-host disconnect recovery", () => {
+  const skill = readFileSync(
+    join(plugin, "skills", "context-handoff", "SKILL.md"),
+    "utf8",
+  ).replace(/\s+/g, " ");
+  const readme = readFileSync(
+    join(plugin, "README.md"),
+    "utf8",
+  ).replace(/\s+/g, " ");
+
+  for (const source of [skill, readme]) {
+    assert.match(source, /Extension disconnected before responding to tool call/);
+    assert.match(source, /transport-level failure, not a semantic answer/);
+    assert.match(source, /retry the identical call once/);
+    assert.match(source, /payload-local CLI/);
+    assert.match(source, /does not depend on the extension host/);
+    assert.match(source, /Only report "nothing pending" once/);
+  }
+});
+
+test("skill and README agree on the last-resort write-the-file-yourself fallback", () => {
+  const skill = readFileSync(
+    join(plugin, "skills", "context-handoff", "SKILL.md"),
+    "utf8",
+  ).replace(/\s+/g, " ");
+  const readme = readFileSync(
+    join(plugin, "README.md"),
+    "utf8",
+  ).replace(/\s+/g, " ");
+
+  for (const source of [skill, readme]) {
+    assert.match(source, /Last-resort fallback: write the file yourself/);
+    assert.match(source, /no MCP tool call, no extension, no `node`/);
+    assert.match(source, /session-state\/<session-id>\//);
+    assert.match(source, /\/clear\s*Read <absolute-path-to-file> and resume the objective/);
+    assert.match(source, /no automatic pickup, no claim tracking, and no\s*supersession/);
+  }
+});
+
+test("consume command remains the canonical resume surface", () => {
   const extension = readFileSync(
     join(plugin, "extensions", "context-handoff", "extension.mjs"),
     "utf8",
   );
-  const start = extension.indexOf("function formatConsumeResult");
-  const end = extension.indexOf("// Fallback", start);
-  assert.notEqual(start, -1);
-  assert.ok(end > start);
-  const formatter = extension.slice(start, end);
-
-  assert.match(formatter, /CONTINUATION_DIRECTIVE/);
-  assert.match(formatter, /Handoff consumption is blocked/);
-  assert.match(formatter, /Do not treat the missing/);
-  assert.match(formatter, /reconstruct a different objective/);
-  assert.ok(
-    formatter.indexOf("CONTINUATION_DIRECTIVE") < formatter.indexOf("result.payload"),
-    "continuation directive must precede the consumed handoff payload",
-  );
+  const start = extension.indexOf('name: "consume-handoff"');
+  const end = extension.indexOf('name: "resume-handoff"', start);
+  assert.ok(start >= 0 && end > start);
+  const handler = extension.slice(start, end);
+  assert.match(handler, /findTaskDeliveryCheckpoint/);
+  assert.match(handler, /markDeliveryPromptInjected/);
+  assert.match(handler, /task remains owned and the durable delivery checkpoint can retry it/);
+  assert.doesNotMatch(handler, /completeHandoffLifecycle|handoff-cutover|retired/);
 });

@@ -8,6 +8,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from .cli_mode_models import (  # noqa: F401 -- re-exported public models
+    CliModeReservationInfo,
+    CreateCliModeReservationRequest,
+    LiveSessionVenue,
+)
+from .install_paths import effective_config_dir
 from .protocol import HTTP_PROTOCOL_MIN_SUPPORTED, HTTP_PROTOCOL_VERSION
 
 # -- Platform defaults -------------------------------------------------------
@@ -43,6 +49,21 @@ class SessionStatus(str, Enum):
     ENDED = "ended"
 
 
+class AttentionReason(str, Enum):
+    """Stable reasons that may settle an attached attention wait."""
+
+    TURN_COMPLETE = "turn_complete"
+    TURN_CANCELLED = "turn_cancelled"
+    FAILED = "failed"
+    INPUT_REQUIRED = "input_required"
+    PERMISSION_REQUIRED = "permission_required"
+    UNREACHABLE = "unreachable"
+    POLICY_REQUIRED = "policy_required"
+    CONTRACT_CHANGED = "contract_changed"
+    STOPPED = "stopped"
+    ENDED = "ended"
+
+
 # -- Agent config ------------------------------------------------------------
 
 
@@ -64,13 +85,31 @@ class AgentProfile(BaseModel):
 
 
 class SessionInfo(BaseModel):
-    """Public view of a session."""
+    """Public view of a session.
+
+    ``session_id`` is agent-bridge's own internal identifier -- for a live
+    bridge-hosted session it is an ephemeral escrow id, NOT a durable
+    cross-system identity (agent-bridge prunes its own session store
+    aggressively; nothing outside this bridge instance resolves it once the
+    session ends). For a cold-store session (``at_rest=True``), ``session_id``
+    already IS the durable Copilot ACP id, so the ambiguity only exists live.
+
+    ``durable_session_id`` resolves that for every caller: use it, never
+    ``session_id`` directly, for anything outliving the current request (a
+    deep link, a dispatch-task binding, any persisted reference). It is
+    ``acp_session_id`` when known, falling back to the live escrow
+    ``session_id`` only when the CLI hasn't reported its ACP identity back
+    yet. See ``visions/plugins/agent-bridge`` §*session and event ledger* for
+    the incident this closes (agent-dispatch's ``owner_session_id`` was
+    captured from this same escrow id, breaking every downstream deep link).
+    """
 
     session_id: str
     name: str
     agent_name: str | None = None
     caller_id: str | None = None
     acp_session_id: str | None = None  # ACP-sourced session id (durable identity)
+    durable_session_id: str | None = None  # acp_session_id, or session_id if that's all there is
     target_dir: str | None = None
     target_type: Literal["local", "ssh", "command"] = "local"
     target_host: str | None = None
@@ -94,6 +133,33 @@ class SessionInfo(BaseModel):
     last_output_at: str | None = None
     last_heartbeat_at: str | None = None
     liveness: str | None = None
+    at_rest: bool = False
+
+
+class WorktreeHandoffRequest(BaseModel):
+    """External control-plane request to hand off a worktree's current session.
+
+    Used by callers that already composed the successor's exact opening turn and
+    want agent-bridge to perform only the in-place session swap. This is an
+    optional integration point, not the mechanism agent-bridge's own
+    ACP-hosted sessions depend on for auto-handoff.
+    """
+
+    session_id: str = Field(
+        min_length=1,
+        description="Current bridge or ACP session id expected to own the "
+        "worktree right now.",
+    )
+    seed_text: str = Field(
+        min_length=1,
+        description="Exact opening-turn text to submit to the successor "
+        "instead of asking the predecessor to author a continuation brief.",
+    )
+    handoff_token: str | None = Field(
+        default=None,
+        description="Opaque handoff correlation token carried on the "
+        "session_handoff event and CLI response.",
+    )
 
 
 class TurnInfo(BaseModel):
@@ -146,15 +212,6 @@ class StartSessionRequest(BaseModel):
     # supported value only for an exclusive ``venue-parity:`` caller using
     # ``force_new``; ordinary callers cannot alter the far-side ACP command.
     parity_fault: str | None = None
-    # Break-glass override for the session-lifecycle head guard (agent-fabric
-    # `single-current-session-per-worktree`). When targeting an *existing*
-    # worktree (``worktree_id`` set) whose ground-layer head is active or whose
-    # numbered handoff is pending, create is refused (409). ``reclaim=true`` is
-    # the deliberate take-over: it
-    # bypasses the head guard, mirroring the ``reclaim`` break-glass on
-    # ``POST /worktrees/{id}/resume``. Distinct from ``force_new`` (which only
-    # opts out of caller-affinity reuse, and does NOT bypass the head guard).
-    reclaim: bool = False
     # Per-session model / reasoning-effort override for THIS session only. Copilot
     # ignores the ``--model`` launch flag in ``--acp`` mode, so agent-bridge sets
     # the model per-session via ``session/set_config_option``; these fields feed
@@ -228,6 +285,13 @@ class AnswerAskUserRequest(BaseModel):
     action: str = "accept"
 
 
+class AnswerPermissionRequest(BaseModel):
+    """Resolve the currently parked permission request on a live session."""
+
+    request_id: str
+    option_id: str
+
+
 class CursorAckRequest(BaseModel):
     """Acknowledge delivery of events up to ``last_id`` for a caller.
 
@@ -238,6 +302,9 @@ class CursorAckRequest(BaseModel):
 
     caller_id: str | None = None
     last_id: int = Field(ge=0)
+    continuity_id: str | None = Field(
+        default=None, min_length=1, max_length=128
+    )
 
 
 # -- API responses -----------------------------------------------------------
@@ -369,7 +436,14 @@ class ResultIncrement(BaseModel):
 class ResultCurrentState(BaseModel):
     """Current lifecycle/attention state composed from existing owners."""
 
-    session_status: SessionStatus
+    session_status: SessionStatus | Literal[
+        "live",
+        "wedged",
+        "expired",
+        "taken-over",
+        "reserved",
+    ]
+    at_rest: bool = False
     liveness: str | None = None
     observer_only: bool = True
     retained_attention: bool = False
@@ -399,6 +473,51 @@ class DelegatedResultSnapshot(BaseModel):
     limits: ResultLimits
 
 
+class AttentionIdentity(BaseModel):
+    """Existing delegate and lineage identities observed by an attention wait."""
+
+    logical_delegate_kind: Literal["worktree", "session"]
+    logical_delegate_id: str
+    requested_ref: str
+    observed_session_id: str
+    current_session_id: str
+    successor_id: str | None = None
+
+
+class AttentionReference(BaseModel):
+    """One bounded, opaque reference associated with an attention boundary."""
+
+    kind: Literal[
+        "result",
+        "input",
+        "permission",
+        "terminal",
+        "policy",
+        "successor",
+    ]
+    ref: str
+    availability: Literal[
+        "available",
+        "resolved",
+        "withdrawn",
+        "unknown_after_restart",
+        "unavailable",
+    ] = "available"
+    value: dict[str, Any] | None = None
+
+
+class AttentionWaitResponse(BaseModel):
+    """Cursor-neutral result of evaluating selected attention boundaries."""
+
+    settled: bool
+    reason: AttentionReason | None = None
+    identity: AttentionIdentity
+    position: str | None = None
+    boundary_event_id: int | None = None
+    reference: AttentionReference | None = None
+    limitations: list[str] = Field(default_factory=list)
+
+
 class SessionListResponse(BaseModel):
     sessions: list[SessionInfo]
 
@@ -418,6 +537,8 @@ class RegisterLiveSessionRequest(BaseModel):
     pid: int | None = None
     role: str | None = None
     driven_by: str | None = None
+    venue: LiveSessionVenue | None = None
+    process_started_at: float | None = None  # with pid: one process instance; routes refuse non-finite
 
 
 class LiveSessionInfo(BaseModel):
@@ -433,15 +554,24 @@ class LiveSessionInfo(BaseModel):
     role: str | None = None
     driven_by: str | None = None
     status: str = "live"
-    #: Coarse turn-state derived from the represented event tail (Phase 7
-    #: Channel A): "running" | "idle" | None (no turn signal yet).
+    #: Coarse turn-state from the represented event tail: "running" | "idle" | None.
     turn_state: str | None = None
     last_activity_at: float | None = None
     #: Friendly liveness label computed on read: active / stalled / idle / None.
     liveness: str | None = None
     #: Operator-driven session's latest progress beat (parsed object) or None
-    #: (Phase 7 Slice 7c). The live-session analogue of a task's latest_progress.
+    #: (Phase 7 Slice 7c), the live-session analogue of a task's latest_progress.
     latest_progress: dict[str, Any] | None = None
+    #: True when this registration claimed a pending CLI-mode Session Host
+    #: reservation for its worktree (agent-bridge-cli-mode-sessions Phase 2) --
+    #: a durable, honest marker distinguishing an explicitly-allocated,
+    #: human-attended CLI-mode session from an ordinary ambient live-session
+    #: registration. Never set by the caller; the bridge derives it at
+    #: registration time from ``cli_mode_reservations``.
+    cli_mode: bool = False
+    #: Where this session lives and how to reattach, for a remote-venue
+    #: CLI-mode session (Phase 4); ``None`` for the ordinary local case.
+    venue: LiveSessionVenue | None = None
     registered_at: float
     updated_at: float
 
@@ -492,6 +622,9 @@ class LiveProgressRequest(BaseModel):
     pr: str | None = None
 
 
+LiveMessageDelivery = Literal["queue", "steer", "interrupt"]
+
+
 class SendMessageRequest(BaseModel):
     """Post a message INTO a live interactive session (Phase 2 write path)."""
 
@@ -499,6 +632,7 @@ class SendMessageRequest(BaseModel):
     body: str
     reply_to: str | None = None
     kind: str = "prompt"
+    delivery: LiveMessageDelivery = "steer"  # not "queue": see _live_message_delivery
     wait: bool = False
     wait_timeout: float = 120.0
     #: Optional freshness assertion (#2906): the session id the caller believes
@@ -538,6 +672,7 @@ class LiveMessage(BaseModel):
     body: str
     reply_to: str | None = None
     kind: str = "prompt"
+    delivery: LiveMessageDelivery = "steer"
     created_at: float
 
 
@@ -567,6 +702,9 @@ class CursorInfo(BaseModel):
     caller_id: str | None = None
     last_acked_id: int = 0
     head_id: int = 0
+    continuity_id: str | None = None
+    cursor_registered: bool = False
+    invalidation: dict[str, Any] | None = None
     """The session's current max event id (the live head). Lets a caller tell
     whether it is behind unseen history without reading the whole backlog."""
 
@@ -723,12 +861,17 @@ class TopologyProfile(BaseModel):
 
 
 class RepoBridgeConfig(BaseModel):
-    """In-repo agent-bridge config: ``<repo>/.agent-bridge/config.yaml``.
+    """In-repo agent-bridge config.
 
     A repo that a topology profile derives its roster from can carry its own
     agent-bridge settings *in the repo*, so they travel with the code to every
     machine that syncs it -- rather than being pinned in each machine's local
-    ``~/.agent-bridge/config.yaml``. Currently the multi-machine system spawn defaults
+    ``~/.agent-bridge/config.yaml``. The canonical path is
+    ``<repo>/.copilot-extensions/agent-bridge/config.yaml`` with legacy
+    ``<repo>/.agent-bridge/config.yaml`` fallback. An explicit marketplace
+    overlay can live under
+    ``<repo>/.copilot-extensions/agent-bridge/marketplaces/<marketplace-id>/config.yaml``.
+    Currently the multi-machine system spawn defaults
     (``default_copilot_args`` / ``default_env``): the repo declares the model
     target once, and every machine's derived roster inherits it on sync. Extra
     keys are ignored so the file can grow without breaking older daemons.
@@ -760,7 +903,9 @@ class ServiceConfig(BaseModel):
     # clients still fall back to default_port() when no routing table exists.
     port: int = 0
     bind: str = "127.0.0.1"
-    db_path: str = "~/.agent-bridge/sessions.db"
+    db_path: str = Field(
+        default_factory=lambda: str(effective_config_dir() / "sessions.db")
+    )
     log_level: str = "info"
     topologies: dict[str, TopologyProfile] = Field(default_factory=dict)
     context_thresholds: ContextThresholds = Field(default_factory=ContextThresholds)
@@ -770,8 +915,10 @@ class ServiceConfig(BaseModel):
     worktree_discovery_interval: float = Field(
         default=0,
         description="Seconds between periodic worktree discovery sweeps. "
-        "0 disables periodic crawling (on-demand only).",
-    )
+        "0 disables periodic crawling (on-demand only).")
+    agent_roster_cache_interval: float = Field(
+        default=12.0, ge=1.0, allow_inf_nan=False,
+        description="Agent-roster cache rescan interval (Phase 3b), seconds (floor 1.0).")
     idle_shutdown_seconds: int = Field(
         default=0,
         description="If > 0, the daemon exits after this many seconds with no "

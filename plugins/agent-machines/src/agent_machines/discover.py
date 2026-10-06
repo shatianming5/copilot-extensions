@@ -13,12 +13,17 @@ facts, so the discovery set is never state ``agent-machines`` itself manages (no
 recursion).
 
 À la carte independence: if the registry is absent (agent-worktrees not
-installed), discovery degrades to an empty set. Discovery never *requires* a
-sibling plugin.
+installed), the adopted-project source degrades to an empty set. Discovery
+never *requires* a sibling plugin -- see ``user_scoped_packages()``/
+``user_package_root()`` below for the repo-free, registry-free source
+``discover()`` always additionally scans, so a machine with no bound
+knowledge/control repo (or agent-worktrees entirely absent) can still declare
+desired state, most commonly opting into the ``self-update`` schedule.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import sys
@@ -30,12 +35,16 @@ import yaml
 
 from .manifest import ManifestError, RequirementPackage, load_package
 
-MACHINE_STATE_ROOT = ".agent-machines"
+CANONICAL_MACHINE_STATE_ROOT = Path(".copilot-extensions") / "agent-machines"
+LEGACY_MACHINE_STATE_ROOT = ".agent-machines"  # marketplace-isolation: allow legacy-compatibility
+MACHINE_STATE_ROOT = str(CANONICAL_MACHINE_STATE_ROOT)
 ALL_PACKAGES_DIR = "all"
 MACHINES_PACKAGES_DIR = "machines"
 LEGACY_MACHINE_STATE_DIR = ".github/machine-state"
+MARKETPLACE_OVERLAYS_DIR = CANONICAL_MACHINE_STATE_ROOT / "marketplaces"
 PROJECT_CONFIG_FILE = "config.yaml"
-REPO_CONFIG_FILE = Path(".agent-worktrees") / "config.yaml"
+_AWT = ".agent-worktrees"  # marketplace-isolation: allow registry
+REPO_CONFIG_FILE = Path(_AWT) / "config.yaml"
 
 
 def home() -> Path:
@@ -58,15 +67,15 @@ def current_platform() -> str:
 
 
 def registry_path(home_dir: Path | None = None) -> Path:
-    return (home_dir or home()) / ".agent-worktrees" / "repos.yaml"
+    return (home_dir or home()) / _AWT / "repos.yaml"
 
 
 def projects_path(home_dir: Path | None = None) -> Path:
-    return (home_dir or home()) / ".agent-worktrees" / "projects.yaml"
+    return (home_dir or home()) / _AWT / "projects.yaml"
 
 
 def global_config_path(home_dir: Path | None = None) -> Path:
-    return (home_dir or home()) / ".agent-worktrees" / PROJECT_CONFIG_FILE
+    return (home_dir or home()) / _AWT / PROJECT_CONFIG_FILE
 
 
 @dataclass
@@ -96,7 +105,7 @@ def resolve_repo_path(name: str, entry: dict, srcroot: dict, plat: str) -> Path 
     """Resolve a repo's checkout path on ``plat`` from its registry entry.
 
     Paths in ``repos.yaml`` may be written with a ``~`` home shorthand (e.g. a
-    WSL entry ``wsl: ~/src/aperture-labs``), so every resolved path is
+    WSL entry ``wsl: ~/src/private-downstream-repo``), so every resolved path is
     ``expanduser()``-ed. Without this, ``Path('~/src/...').is_dir()`` is False in
     :func:`discover`, the repo is silently skipped, and none of its machine-state
     packages are discovered.
@@ -168,16 +177,21 @@ def _registered_repo_entry(repos: dict, name: str) -> tuple[str, dict] | None:
 
 def _repo_requires_external_state(repo_path: Path) -> bool:
     """Return whether committed repo config activates the knowledge relationship."""
-    path = repo_path / REPO_CONFIG_FILE
-    if not path.is_file():
-        return False
-    try:
-        config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError):
-        return False
-    if not isinstance(config, dict):
-        return False
-    return bool(config.get("stateless") or config.get("requires_external_state_root"))
+    candidates = (
+        repo_path / ".copilot-extensions" / "agent-worktrees" / PROJECT_CONFIG_FILE,
+        repo_path / REPO_CONFIG_FILE,
+    )
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            return False
+        if not isinstance(config, dict):
+            return False
+        return bool(config.get("stateless") or config.get("requires_external_state_root"))
+    return False
 
 
 def adopted_project_repos(
@@ -474,10 +488,41 @@ def _yaml_files(directory: Path) -> list[Path]:
     return direct
 
 
+def _load_installation_context() -> dict[str, Any] | None:
+    raw = os.environ.get("COPILOT_EXTENSIONS_CONTEXT", "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.startswith("{"):
+            value = json.loads(raw)
+        else:
+            value = json.loads(Path(raw).expanduser().read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _installation_marketplace_id() -> str | None:
+    context = _load_installation_context()
+    if context is None:
+        return None
+    marketplace_id = context.get("marketplaceId")
+    if not isinstance(marketplace_id, str) or not marketplace_id.strip():
+        return None
+    return marketplace_id.strip()
+
+
 def _validate_canonical_root(root: Path) -> None:
     allowed_dirs = {ALL_PACKAGES_DIR, MACHINES_PACKAGES_DIR}
     for child in sorted(root.iterdir()):
         if child.is_dir() and child.name in allowed_dirs:
+            continue
+        if (
+            child.is_dir()
+            and child.name == "marketplaces"
+            and root.name == "agent-machines"
+            and root.parent.name == ".copilot-extensions"
+        ):
             continue
         if child.is_file() and child.name.casefold() == "readme.md":
             continue
@@ -488,13 +533,72 @@ def _validate_canonical_root(root: Path) -> None:
         )
 
 
-def _machine_package_dir(root: Path, machine: str) -> Path | None:
+def _selected_repo_package_root(repo_path: Path) -> tuple[Path | None, str]:
+    canonical = repo_path / MACHINE_STATE_ROOT
+    if canonical.exists():
+        return canonical, "structured"
+    legacy = repo_path / LEGACY_MACHINE_STATE_ROOT
+    if legacy.exists():
+        return legacy, "structured"
+    fallback = repo_path / LEGACY_MACHINE_STATE_DIR
+    return (fallback, "flat-legacy") if fallback.exists() else (None, "flat-legacy")
+
+
+def _marketplace_overlay_root(repo_path: Path) -> Path | None:
+    marketplace_id = _installation_marketplace_id()
+    if not marketplace_id:
+        return None
+    candidate = repo_path / MARKETPLACE_OVERLAYS_DIR / marketplace_id
+    return candidate if candidate.exists() else None
+
+
+def _structured_package_files(
+    root: Path,
+    machine: str,
+    accepted_machines: tuple[str, ...] | None = None,
+) -> list[Path]:
+    _validate_canonical_root(root)
+    files = _yaml_files(root / ALL_PACKAGES_DIR)
+    machine_dir = _machine_package_dir(root, machine, accepted_machines)
+    if machine_dir is not None:
+        files.extend(_yaml_files(machine_dir))
+    return files
+
+
+def _package_file_layers_in_repo(
+    repo_path: Path,
+    machine: str,
+    accepted_machines: tuple[str, ...] | None = None,
+) -> list[tuple[str, list[Path]]]:
+    layers: list[tuple[str, list[Path]]] = []
+    root, layout_kind = _selected_repo_package_root(repo_path)
+    if root is not None:
+        files = (
+            _structured_package_files(root, machine, accepted_machines)
+            if layout_kind == "structured"
+            else _yaml_files(root)
+        )
+        layers.append((layout_kind, files))
+    overlay = _marketplace_overlay_root(repo_path)
+    if overlay is not None:
+        layers.append(("structured", _structured_package_files(overlay, machine, accepted_machines)))
+    return layers
+
+
+def _machine_package_dir(
+    root: Path,
+    machine: str,
+    accepted_machines: tuple[str, ...] | None = None,
+) -> Path | None:
     machines_dir = root / MACHINES_PACKAGES_DIR
     if not machines_dir.is_dir():
         return None
+    accepted = {
+        name.casefold() for name in (accepted_machines or (machine,))
+    }
     matches = sorted(
         child for child in machines_dir.iterdir()
-        if child.is_dir() and child.name.casefold() == machine.casefold()
+        if child.is_dir() and child.name.casefold() in accepted
     )
     if len(matches) > 1:
         names = ", ".join(str(path) for path in matches)
@@ -504,22 +608,26 @@ def _machine_package_dir(root: Path, machine: str) -> Path | None:
     return matches[0] if matches else None
 
 
-def package_files_in_repo(repo_path: Path, machine: str) -> list[Path]:
-    """Resolve canonical package files, with a bounded legacy fallback.
+def package_files_in_repo(
+    repo_path: Path,
+    machine: str,
+    accepted_machines: tuple[str, ...] | None = None,
+) -> list[Path]:
+    """Resolve effective package files with bounded legacy fallback.
 
-    ``.agent-machines`` is authoritative whenever it exists. Adopters migrate
-    atomically; the old ``.github/machine-state`` directory is consulted only
-    when the canonical root is absent, so a moved package is never loaded twice.
+    ``.copilot-extensions/agent-machines/`` is authoritative whenever it
+    exists. Legacy ``.agent-machines/`` remains readable, and the older
+    ``.github/machine-state/`` directory is consulted only when neither newer
+    root exists. An explicit marketplace overlay under
+    ``.copilot-extensions/agent-machines/marketplaces/<marketplace-id>/`` may
+    add or replace packages on top of the selected base layer.
     """
-    root = repo_path / MACHINE_STATE_ROOT
-    if root.is_dir():
-        _validate_canonical_root(root)
-        files = _yaml_files(root / ALL_PACKAGES_DIR)
-        machine_dir = _machine_package_dir(root, machine)
-        if machine_dir is not None:
-            files.extend(_yaml_files(machine_dir))
-        return files
-    return _yaml_files(repo_path / LEGACY_MACHINE_STATE_DIR)
+    files: list[Path] = []
+    for _kind, layer_files in _package_file_layers_in_repo(
+        repo_path, machine, accepted_machines
+    ):
+        files.extend(layer_files)
+    return files
 
 
 def packages_in_repo(
@@ -527,37 +635,103 @@ def packages_in_repo(
     repo_name: str,
     machine: str,
     source_anchor: Path | None = None,
+    accepted_machines: tuple[str, ...] | None = None,
 ) -> list[RequirementPackage]:
     """Load and gate-filter the requirement packages carried by ``repo_path``."""
+    return _load_packages_from_layers(
+        _package_file_layers_in_repo(repo_path, machine, accepted_machines),
+        repo_name,
+        machine,
+        source_anchor or repo_path,
+        accepted_machines,
+    )
+
+
+def _load_packages_from_layers(
+    layers: list[tuple[str, list[Path]]],
+    repo_name: str,
+    machine: str,
+    source_anchor: Path,
+    accepted_machines: tuple[str, ...] | None = None,
+) -> list[RequirementPackage]:
     out: list[RequirementPackage] = []
-    names: dict[str, Path] = {}
-    canonical = (repo_path / MACHINE_STATE_ROOT).is_dir()
-    machine_root = repo_path / MACHINE_STATE_ROOT / MACHINES_PACKAGES_DIR
-    for pkg_file in package_files_in_repo(repo_path, machine):
-        pkg = load_package(
-            pkg_file,
-            source_repo=repo_name,
-            source_anchor=source_anchor or repo_path,
-        )
-        machine_scoped = canonical and pkg_file.parent.parent == machine_root
-        applies = pkg.applies_to(machine)
-        if machine_scoped and not applies:
-            raise ManifestError(
-                f"{pkg_file}: package gate excludes its containing machine "
-                f"directory {pkg_file.parent.name!r}; machine-scoped packages "
-                "must omit gate, use '*', or include that machine"
+    selected: dict[str, int] = {}
+    for layout_kind, layer_files in layers:
+        layer_names: dict[str, Path] = {}
+        for pkg_file in layer_files:
+            pkg = load_package(
+                pkg_file,
+                source_repo=repo_name,
+                source_anchor=source_anchor,
             )
-        if not applies:
-            continue
-        if canonical and pkg.name in names:
-            raise ManifestError(
-                f"{pkg_file}: package {pkg.name!r} duplicates {names[pkg.name]}; "
-                "files under all/ and machines/<machine>/ are independent complete "
-                "packages and must have unique package names"
+            machine_scoped = (
+                layout_kind == "structured"
+                and pkg_file.parent.parent.name == MACHINES_PACKAGES_DIR
             )
-        names[pkg.name] = pkg_file
-        out.append(pkg)
+            applies = pkg.applies_to(machine, accepted_machines)
+            if machine_scoped and not applies:
+                raise ManifestError(
+                    f"{pkg_file}: package gate excludes its containing machine "
+                    f"directory {pkg_file.parent.name!r}; machine-scoped packages "
+                    "must omit gate, use '*', or include that machine"
+                )
+            if not applies:
+                continue
+            if layout_kind == "structured" and pkg.name in layer_names:
+                raise ManifestError(
+                    f"{pkg_file}: package {pkg.name!r} duplicates {layer_names[pkg.name]}; "
+                    "files under all/ and machines/<machine>/ are independent complete "
+                    "packages and must have unique package names"
+                )
+            layer_names[pkg.name] = pkg_file
+            if layout_kind == "structured":
+                if pkg.name in selected:
+                    out[selected[pkg.name]] = pkg
+                else:
+                    selected[pkg.name] = len(out)
+                    out.append(pkg)
+            else:
+                out.append(pkg)
     return out
+
+
+#: Name reported for the synthetic, non-repo package source below (never a
+#: real adopted project, so it can't collide with one).
+USER_SCOPE_NAME = "user"
+
+
+def user_package_root(home_dir: Path | None = None) -> Path:
+    """Home-relative requirement-package root usable with **no adopted repo**.
+
+    A machine with no bound knowledge/control repo (or none reachable) still
+    needs somewhere to declare desired state -- most commonly, opting itself
+    into the ``self-update`` watchdog/sweep schedule. This root is structured
+    exactly like a repo's canonical ``.copilot-extensions/agent-machines/``
+    (``all/`` + ``machines/<machine>/``), but requires no adoption, registry,
+    or repository at all. Always scanned by :func:`discover`, alongside every
+    adopted repo's own packages -- not only as a no-repo fallback -- so it also
+    works standalone (agent-worktrees entirely absent).
+    """
+    return (home_dir or home()) / ".agent-machines" / "config"
+
+
+def user_scoped_packages(
+    machine: str,
+    accepted_machines: tuple[str, ...] | None = None,
+    home_dir: Path | None = None,
+) -> list[RequirementPackage]:
+    """Load and gate-filter requirement packages from :func:`user_package_root`.
+
+    Returns ``[]`` when the root does not exist -- this source is always
+    optional, never required.
+    """
+    root = user_package_root(home_dir)
+    if not root.is_dir():
+        return []
+    files = _structured_package_files(root, machine, accepted_machines)
+    return _load_packages_from_layers(
+        [("structured", files)], USER_SCOPE_NAME, machine, root, accepted_machines
+    )
 
 
 def discover(
@@ -565,17 +739,21 @@ def discover(
     registry: dict | None = None,
     projects: dict | None = None,
     require_enable: bool = False,
+    accepted_machines: tuple[str, ...] | None = None,
 ) -> list[DiscoveredRepo]:
     """Return the adopted projects on this machine that contribute packages.
 
     The candidate set is ``projects.yaml`` (adopted harness projects); each path
     is resolved from ``repos.yaml`` (which owns paths). A project is included when
-    it (a) carries ``.agent-machines/all/`` or
-    ``.agent-machines/machines/<machine>/`` packages that (b) gate to
-    ``machine``. Plugin-enable status is annotated; set ``require_enable`` to
-    also require the project to enable ``agent-machines``. The legacy
-    ``.github/machine-state/`` location is used only when ``.agent-machines/``
-    is absent.
+    it (a) carries canonical
+    ``.copilot-extensions/agent-machines/all/`` or
+    ``.copilot-extensions/agent-machines/machines/<machine>/`` packages that
+    (b) gate to ``machine``. Plugin-enable status is annotated; set
+    ``require_enable`` to also require the project to enable
+    ``agent-machines``. Legacy ``.agent-machines/`` and
+    ``.github/machine-state/`` locations are used only when the canonical root
+    is absent. A home-relative :func:`user_package_root` (no adopted repo
+    required) is always additionally scanned -- see its docstring.
     """
     machine = machine or current_machine()
     found: list[DiscoveredRepo] = []
@@ -588,24 +766,51 @@ def discover(
                     f"supplemental repo {name!r} required by {owners} is unavailable at {path}"
                 )
             continue
-        pkgs = packages_in_repo(path, name, machine)
+        pkgs = packages_in_repo(
+            path,
+            name,
+            machine,
+            accepted_machines=accepted_machines,
+        )
         if not pkgs:
             continue
         enabled = repo_enables_agent_machines(path)
         if require_enable and not enabled:
             continue
         found.append(DiscoveredRepo(name=name, path=path, enabled=enabled, packages=pkgs))
+    user_pkgs = user_scoped_packages(machine, accepted_machines=accepted_machines)
+    if user_pkgs:
+        # No repo settings to check enablement against -- this source has no
+        # plugin-activation concept of its own; it is inert unless the
+        # currently-running agent-machines itself already applies it.
+        found.append(
+            DiscoveredRepo(
+                name=USER_SCOPE_NAME,
+                path=user_package_root(),
+                enabled=True,
+                packages=user_pkgs,
+            )
+        )
     return found
 
 
-def _main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI glue
-    machine = current_machine()
-    repos = discover(machine)
-    print(f"machine: {machine}  platform: {current_platform()}")
+def _main(
+    argv: list[str] | None = None,
+    *,
+    machine: str | None = None,
+    accepted_machines: tuple[str, ...] | None = None,
+    raw_machine: str | None = None,
+) -> int:  # pragma: no cover - thin CLI glue
+    machine = machine or current_machine()
+    repos = discover(machine, accepted_machines=accepted_machines)
+    label = machine
+    if raw_machine and raw_machine.casefold() != machine.casefold():
+        label = f"{machine} (raw: {raw_machine})"
+    print(f"machine: {label}  platform: {current_platform()}")
     if not repos:
         print("no requirement packages discovered "
               "(no adopted projects or declared supplemental repositories carry "
-              ".agent-machines packages)")
+              ".copilot-extensions/agent-machines packages)")
         return 0
     for repo in repos:
         flag = "enabled" if repo.enabled else "not-enabled"

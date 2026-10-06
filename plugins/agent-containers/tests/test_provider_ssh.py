@@ -14,8 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_containers import __main__ as containers_cli
 from agent_containers import lease as lease_mod
+from agent_containers import lifecycle as lifecycle_mod
 from agent_containers import provider_launcher, provider_ssh
 from agent_containers.config import ContainersConfig, FleetConfig
 from agent_containers.resolver import LiveExecTarget
@@ -281,9 +281,9 @@ def test_profile_spec_can_describe_project_scoped_picker_source(monkeypatch, tmp
     monkeypatch.setattr(provider_ssh.ContainerResolver, "resolve_spec", resolve_spec)
     monkeypatch.setattr(provider_ssh, "get_lease", lambda _name: _lease())
     monkeypatch.setattr(
-        provider_ssh.shutil,
-        "which",
-        lambda name: f"/bin/{name}",
+        provider_ssh,
+        "payload_binstub",
+        lambda: Path("/payload/bin/agent-containers"),
     )
 
     result = provider_ssh.ssh_profile_spec(
@@ -331,6 +331,9 @@ def test_profile_spec_can_describe_project_scoped_picker_source(monkeypatch, tmp
     }
     assert source["capabilities"]["messages"] is True
     assert source["capabilities"]["resume"] is False
+    assert Path(result["registry"]["proxy_command_binary"]) == Path(
+        "/payload/bin/agent-containers"
+    )
 
 
 def test_provider_launcher_executes_active_isolated_runtime(monkeypatch, tmp_path):
@@ -405,7 +408,7 @@ def test_emit_profile_persists_registry_and_delegates_to_agent_ssh(
         "module": str(tmp_path / "module.yaml"),
         "registry": {
             "transport": "provider-exec",
-            "proxy_command_binary": "/bin/agent-containers",
+            "proxy_command_binary": "/payload/bin/agent-containers",
             "machines": [{"name": "restricted-worker"}],
         },
     }
@@ -449,7 +452,7 @@ def test_emit_profile_persists_registry_and_delegates_to_agent_ssh(
     )
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
     assert registry["transport"] == "provider-exec"
-    assert registry["proxy_command_binary"] == "/bin/agent-containers"
+    assert registry["proxy_command_binary"] == "/payload/bin/agent-containers"
     assert [machine["name"] for machine in registry["machines"]] == [
         "existing-worker",
         "restricted-worker",
@@ -473,7 +476,7 @@ def test_emit_profile_publishes_picker_source_after_ssh_profile(
         "module": str(tmp_path / "module.yaml"),
         "registry": {
             "transport": "provider-exec",
-            "proxy_command_binary": "/bin/agent-containers",
+            "proxy_command_binary": "/payload/bin/agent-containers",
             "machines": [{"name": "restricted-worker"}],
         },
         "worktree_source": {
@@ -485,7 +488,7 @@ def test_emit_profile_publishes_picker_source_after_ssh_profile(
             "alias": "restricted-worker",
             "shell": "bash",
             "resolve": [
-                "/bin/agent-containers",
+                "/payload/bin/agent-containers",
                 "ssh-profile",
                 "sandbox-1",
                 "--alias",
@@ -712,9 +715,7 @@ def test_release_reports_busy_provider_admission(monkeypatch, capsys):
         lambda _target: pytest.fail("blocked release must not clean registrations"),
     )
 
-    result = containers_cli._cmd_release(
-        SimpleNamespace(target="sandbox-1")
-    )
+    result = lifecycle_mod.cmd_release("sandbox-1")
 
     assert result == 75
     assert "Release blocked: active provider session" in capsys.readouterr().err
@@ -728,7 +729,7 @@ def test_emit_profile_fails_when_agent_ssh_is_unavailable(monkeypatch):
             "module": "/module.yaml",
             "registry": {
                 "transport": "provider-exec",
-                "proxy_command_binary": "/bin/agent-containers",
+                "proxy_command_binary": "/payload/bin/agent-containers",
                 "machines": [{"name": "sandbox-1"}],
             },
         },
@@ -745,11 +746,72 @@ def test_emit_profile_fails_when_agent_ssh_is_unavailable(monkeypatch):
         provider_ssh.emit_ssh_profile("sandbox-1")
 
 
+def test_emit_profile_uses_same_cell_agent_ssh_prefix(monkeypatch, tmp_path):
+    cell = tmp_path / "marketplaces" / "test-cell"
+    root = cell / "plugins" / "agent-containers"
+    root.mkdir(parents=True)
+    (cell / "plugins" / "agent-ssh").mkdir()
+    own = {"cellRoot": str(cell), "pluginRoot": str(root)}
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", str(root / "install.json"))
+    monkeypatch.setattr(provider_ssh._peer_launch, "validate_owner", lambda *args: own)
+    monkeypatch.setattr(
+        provider_ssh.shutil, "which", lambda _: pytest.fail("ambient PATH selected"),
+    )
+    registry_path = tmp_path / "profile.json"
+    monkeypatch.setattr(provider_ssh, "_profile_registry_path", lambda: registry_path)
+    monkeypatch.setattr(
+        provider_ssh,
+        "ssh_profile_spec",
+        lambda *_args: {
+            "module": str(tmp_path / "module.yaml"),
+            "registry": {
+                "transport": "provider-exec",
+                "proxy_command_binary": "/payload/bin/agent-containers",
+                "machines": [{"name": "sandbox-1"}],
+            },
+        },
+    )
+    expected_prefix = provider_ssh._peer_launch.launch_prefix(
+        "agent-containers", Path(own["pluginRoot"]),
+        str(Path(own["pluginRoot"]) / "install.json"), "agent-ssh",
+    )
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(provider_ssh.subprocess, "run", run)
+
+    assert provider_ssh.emit_ssh_profile("sandbox-1") == 0
+    assert calls[0][:len(expected_prefix)] == expected_prefix
+    assert calls[0][len(expected_prefix):] == [
+        "emit-profile", str(registry_path), "--module", str(tmp_path / "module.yaml"),
+    ]
+
+
+def test_emit_profile_refuses_without_same_cell_agent_ssh(monkeypatch, tmp_path):
+    cell = tmp_path / "marketplaces" / "test-cell"
+    root = cell / "plugins" / "agent-containers"
+    root.mkdir(parents=True)
+    own = {"cellRoot": str(cell), "pluginRoot": str(root)}
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", str(root / "install.json"))
+    monkeypatch.setattr(provider_ssh._peer_launch, "validate_owner", lambda *args: own)
+    monkeypatch.setattr(
+        provider_ssh.shutil, "which", lambda _: pytest.fail("ambient PATH selected"),
+    )
+
+    with pytest.raises(
+        provider_ssh._peer_launch.ContextRefused, match="same-cell installation",
+    ):
+        provider_ssh.emit_ssh_profile("sandbox-1")
+
+
 def test_print_profile_does_not_invalidate_published_registry(monkeypatch, tmp_path):
     registry_path = tmp_path / "provider-exec.json"
     published = {
         "transport": "provider-exec",
-        "proxy_command_binary": "/bin/agent-containers",
+        "proxy_command_binary": "/payload/bin/agent-containers",
         "machines": [{"name": "existing-worker", "hostname": "sandbox-0"}],
     }
     registry_path.write_text(json.dumps(published), encoding="utf-8")
@@ -760,7 +822,7 @@ def test_print_profile_does_not_invalidate_published_registry(monkeypatch, tmp_p
             "module": str(tmp_path / "module.yaml"),
             "registry": {
                 "transport": "provider-exec",
-                "proxy_command_binary": "/bin/agent-containers",
+                "proxy_command_binary": "/payload/bin/agent-containers",
                 "machines": [{"name": "preview-worker", "hostname": "sandbox-1"}],
             },
         },

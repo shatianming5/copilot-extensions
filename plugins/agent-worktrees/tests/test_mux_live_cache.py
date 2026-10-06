@@ -194,8 +194,11 @@ def test_reaper_does_not_clear_hint_when_kill_fails(tmp_path):
 def test_restart_copilot_clears_hint_on_graceful_stop():
     calls = []
     with patch("agent_worktrees.sessions.has_mux_session", return_value=True), \
-         patch("agent_worktrees.sessions.graceful_quit_mux_session",
-               return_value=True), \
+         patch("agent_worktrees.sessions.mux_active_pane", return_value="%1"), \
+         patch("agent_worktrees.sessions.mux_session_name", return_value="wt-aaaa"), \
+         patch("agent_worktrees.pane_lifecycle.pane_terminate", return_value={
+             "ok": True, "pane": "%1", "gone": True, "method": "graceful",
+         }), \
          patch("agent_worktrees.tracking.stamp_mux_live",
                side_effect=lambda wt, live, **kw: calls.append((wt, live))):
         res = sessions.restart_worktree_copilot("aaaa")
@@ -239,13 +242,13 @@ def test_fresh_true_hint_marks_active_without_probe():
     m_has.assert_not_called()
 
 
-def test_fresh_false_hint_is_inactive_without_probe():
+def test_fresh_false_hint_falls_back_to_probe():
     rec = _rec("aaaa", path="/tmp/a", mux_live=False, mux_live_at=_fresh())
     with patch("agent_worktrees.sessions._list_mux_sessions", return_value=None), \
-         patch("agent_worktrees.sessions.has_mux_session") as m_has:
+         patch("agent_worktrees.sessions.has_mux_session", return_value=False) as m_has:
         active = cli._build_active_paths([rec], session_ctx=_empty_ctx())
     assert active == set()
-    m_has.assert_not_called()
+    m_has.assert_called_once()
 
 
 def test_stale_hint_falls_back_to_probe():
@@ -287,7 +290,7 @@ def test_batch_available_ignores_hint():
 
 from types import SimpleNamespace  # noqa: E402
 
-from agent_worktrees.picker_tui import data_local  # noqa: E402
+from agent_worktrees.picker_support import data_local  # noqa: E402
 
 
 def _reconcile_mux(records, *, mux_present_ids, bound_ids=(), tmp_path,

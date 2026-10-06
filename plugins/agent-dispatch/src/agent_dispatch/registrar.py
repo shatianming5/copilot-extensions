@@ -50,11 +50,25 @@ _KNOWN_KEYS = frozenset(
         "evaluator",
         "owner",
         "description",
+        "runtime_generation",
+        "transition_group",
         "kind",
         "spec",
     }
 )
-_KNOWN_BODY_KEYS = frozenset({"type", "agent", "headless_labels", "cli_labels"})
+_KNOWN_BODY_KEYS = frozenset(
+    {
+        "type",
+        "agent",
+        "charter",
+        "headless_labels",
+        "cli_labels",
+        "disposable_cli_labels",
+        "idle_nudge_exempt_labels",
+        "steering_disallowed_labels",
+        "no_pair",
+    }
+)
 _KNOWN_FLEET_KEYS = frozenset({"pool", "origin", "headless"})
 _KNOWN_FILTER_KEYS = frozenset({"permit", "reject"})
 
@@ -87,12 +101,71 @@ class Body:
     Per-label overrides refine either default: ``cli_labels`` forces specific
     labels to a CLI body when the profile is headless-by-default; ``headless_labels``
     forces specific labels headless when the profile is ``embody`` (a mixed profile).
+
+    ``agent`` and ``charter`` are deliberately distinct: ``agent`` is the
+    **venue** this pool embodies onto -- a real, already-addressable
+    agent-bridge target (a machine/repo loopback identity), never a
+    stand-in invented just to carry a persona. ``charter`` is the optional
+    **behavior overlay** -- a ``.github/agents/<charter>.agent.md`` name
+    passed as Copilot's own ``--agent <charter>`` flag on the launched
+    session, scoping its tools/guidance without changing where it runs or
+    what it can access. A pool with no ``charter`` launches a plain,
+    unscoped session at its venue -- this is the case (worker pools with no
+    fixed persona) the field's optionality exists for. Whether the body is
+    headless or CLI-embodied is a separate, purely operational "mode" axis
+    (``type`` above / per-label overrides) -- it is not part of either
+    ``agent`` or ``charter`` and must never be inferred from either.
     """
 
     type: str = "headless"
     agent: str = "task-worker"
+    charter: str | None = None
     headless_labels: tuple[str, ...] = ()
     cli_labels: tuple[str, ...] = ()
+    disposable_cli_labels: tuple[str, ...] = ()
+    idle_nudge_exempt_labels: tuple[str, ...] = ()
+    """Labels exempt from the generic idle-confirm nudge (see
+    ``Supervisor.idle_nudge_exempt_labels``): a task type that owns its own
+    resume path (an in-process evaluator, or an external one driven entirely
+    through this CLI) has going idle with no new activity as its correct
+    resting state, not an unfinished turn. Confirmed live that nudging it
+    anyway can encourage the worker to reach for a resolution its own
+    charter never sanctioned."""
+    steering_disallowed_labels: tuple[str, ...] = ()
+    """Labels forbidden from posting a ``request_input`` steering card at
+    all (enforced coordinator-side, in ``TaskQueue.set_card`` -- see the
+    ``set_card`` docstring). The *default is permissive*: an undeclared
+    label may still post a card. Name a label here only for a task type
+    with no human on the other end of a steering answer -- an
+    evaluator-owned auto-reviewer (Intelligence Dampener), a batch log
+    writer, or an Adjudication Board sweep/verdict worker are the
+    confirmed real cases this closes (copilot-extensions#3731,
+    the downstream tracker)."""
+    no_pair: bool = False
+    """Skip the paired-knowledge carve for every worktree this lane
+    creates -- for a pool with no bound knowledge repo to give its workers
+    (see the reciprocal-disposal/pairing-configurability effort). Applies
+    to BOTH body types: a headless agent-bridge ACP body also pre-creates
+    (and, since #catch-22, also pairs) its own worktree via the same
+    `agent-worktrees create` path a CLI-embodied body uses. Rejected
+    together with a fleet (`--pool`) declaration by `load_declaration`
+    (fleet mode never creates a paired worktree locally, so there is
+    nothing for this flag to skip)."""
+
+    def __post_init__(self) -> None:
+        # Mirrors supervise_cli.py's own runtime guard: agent-worktrees embody
+        # has no charter-binding flag, so a charter can never reach a
+        # CLI-embodied lane. cli_labels is unconditionally CLI-incompatible
+        # (per to_supervise_args, only ever emitted for a headless-default
+        # profile); `type == "embody"` is validated against the *effective*
+        # mode in load_declaration below, since a fleet declaration can pair
+        # it with `fleet.headless: true` to mean a headless fleet lane, not
+        # CLI -- Body alone (no Fleet visibility here) can't tell those apart.
+        if self.charter and self.cli_labels:
+            raise RegistrarError(
+                "body.charter: not supported with any body.cli_labels -- "
+                "agent-worktrees embody has no charter-binding flag"
+            )
 
 
 @dataclass(frozen=True)
@@ -175,7 +248,7 @@ class ProfileDeclaration:
     max_attempts: int = 3
     label_max_attempts: Mapping[str, int] = field(default_factory=dict)
     heartbeat: bool = True
-    reactive: bool = True
+    reactive: bool = False
     reactive_interval: float = 2.0
     verify_timeout: int = 0
     body: Body = field(default_factory=Body)
@@ -184,6 +257,12 @@ class ProfileDeclaration:
     evaluator: str | None = None
     owner: str | None = None  # provenance: which system declared this
     description: str | None = None
+    runtime_generation: str | None = None
+    transition_group: str | None = None
+    plugin_root: str | None = None
+    source_path: str | None = None
+    plugin_version: str | None = None
+    activation_scopes: tuple[str, ...] = ()
 
     def to_supervise_args(self) -> list[str]:
         """Render the equivalent ``agent-dispatch supervise`` args (lossless).
@@ -239,8 +318,25 @@ class ProfileDeclaration:
             # Headless-default lane (the default): --cli-label opts a subset out to CLI.
             for label in self.body.cli_labels:
                 args += ["--cli-label", label]
+        for label in self.body.disposable_cli_labels:
+            args += ["--disposable-cli-label", label]
+        for label in self.body.idle_nudge_exempt_labels:
+            args += ["--idle-nudge-exempt-label", label]
+        # NOTE: body.steering_disallowed_labels is deliberately NOT emitted
+        # here. This method renders the *foreground* `agent-dispatch
+        # supervise` argv, whose parser never registered
+        # `--steering-disallowed-label` (only `supervise register`'s parser
+        # did -- the field is coordinator-DB-only and the running
+        # subprocess never consumes it itself; see
+        # SupervisorDaemon._publish_declared_registrations). Emitting it
+        # here would produce an unrecognized-option failure for any
+        # declaration that sets the field (caught in PR review).
+        if self.body.no_pair:
+            args.append("--no-pair")
         if self.body.type == "headless" or self.body.headless_labels or self.fleet.headless:
             args += ["--headless-agent", self.body.agent]
+        if self.body.charter:
+            args += ["--charter", self.body.charter]
         if self.evaluator:
             args += ["--evaluator", self.evaluator]
         return args
@@ -264,10 +360,27 @@ class ProfileDeclaration:
         lane spec, so it is exposed rather than kept private."""
         return self._effective_headless_labels()
 
-    def with_owner(self, owner: str) -> "ProfileDeclaration":
+    def with_owner(self, owner: str) -> ProfileDeclaration:
         """Return a copy stamped with discovery-time provenance (the pointer's owner),
         used when a declaration is discovered without an explicit ``owner``."""
         return replace(self, owner=self.owner or owner)
+
+    def with_plugin_provenance(
+        self,
+        *,
+        plugin_root: str,
+        source_path: str,
+        plugin_version: str,
+        activation_scopes: tuple[str, ...],
+    ) -> ProfileDeclaration:
+        """Attach authoritative discovery metadata to a plugin-owned declaration."""
+        return replace(
+            self,
+            plugin_root=plugin_root,
+            source_path=source_path,
+            plugin_version=plugin_version,
+            activation_scopes=activation_scopes,
+        )
 
     def effective_filters(self) -> Filters:
         """The pool filter with the ``name``/``labels``/``repos`` shorthand folded in.
@@ -290,6 +403,33 @@ class ProfileDeclaration:
     def permits(self, task_attrs: Mapping[str, object]) -> bool:
         """Does this pool (filter + shorthand) accept a task with these attributes?"""
         return self.effective_filters().permits(task_attrs)
+
+
+def filter_vocabulary(declarations: Sequence["ProfileDeclaration"]) -> dict[str, list[str]]:
+    """Aggregate every declaration's effective ``permit`` values per dimension.
+
+    Returns the known-value vocabulary (:data:`_FILTER_DIMS`) spoken by the
+    currently-active pool set -- a value an operator-authored task could
+    usefully target to be eligible for at least one active pool. Built from
+    ``effective_filters().permit`` only (the ``name``/``labels``/``repos``
+    shorthand folded in, so a pool with no explicit ``filters`` still
+    contributes its name/labels as ``task-type`` values); ``reject``-only
+    values name something to steer *away* from, not toward, so they are
+    deliberately excluded. A dimension no declaration constrains at all is
+    omitted (an empty vocabulary would otherwise render as a dropdown with no
+    options and no signal). Each dimension's values are sorted for stable,
+    diffable output.
+
+    This is a read-only, pure aggregation over already-discovered
+    declarations -- callers needing the currently active set should pass
+    ``registrar_discovery``'s own combined/trusted declarations, not
+    rediscover them here.
+    """
+    vocab: dict[str, set[str]] = {}
+    for decl in declarations:
+        for dim, values in decl.effective_filters().permit.items():
+            vocab.setdefault(dim, set()).update(values)
+    return {dim: sorted(values) for dim, values in vocab.items() if values}
 
 
 def _num(x: float) -> str:
@@ -358,11 +498,28 @@ def _load_body(data: object) -> Body:
     agent = data.get("agent", "task-worker")
     if not isinstance(agent, str) or not agent:
         raise RegistrarError(f"body.agent: expected a non-empty string, got {agent!r}")
+    charter = data.get("charter")
+    if charter is not None and (not isinstance(charter, str) or not charter):
+        raise RegistrarError(f"body.charter: expected a non-empty string, got {charter!r}")
     return Body(
         type=btype,
         agent=agent,
+        charter=charter,
         headless_labels=_as_str_tuple(data.get("headless_labels"), key="body.headless_labels"),
         cli_labels=_as_str_tuple(data.get("cli_labels"), key="body.cli_labels"),
+        disposable_cli_labels=_as_str_tuple(
+            data.get("disposable_cli_labels"),
+            key="body.disposable_cli_labels",
+        ),
+        idle_nudge_exempt_labels=_as_str_tuple(
+            data.get("idle_nudge_exempt_labels"),
+            key="body.idle_nudge_exempt_labels",
+        ),
+        steering_disallowed_labels=_as_str_tuple(
+            data.get("steering_disallowed_labels"),
+            key="body.steering_disallowed_labels",
+        ),
+        no_pair=_as_bool(data.get("no_pair", False), key="body.no_pair"),
     )
 
 
@@ -451,7 +608,9 @@ def _load_label_max_attempts(value: object) -> dict[str, int]:
     return out
 
 
-def load_declaration(data: Mapping) -> ProfileDeclaration:
+def load_declaration(
+    data: Mapping, *, allow_plugin_companion: bool = False
+) -> ProfileDeclaration:
     """Validate + normalize a decoded mapping into a :class:`ProfileDeclaration`.
 
     Raises :class:`RegistrarError` with a specific message on any problem. Pure:
@@ -486,13 +645,51 @@ def load_declaration(data: Mapping) -> ProfileDeclaration:
     if not isinstance(kind, str):
         raise RegistrarError(f"kind: expected a string, got {kind!r}")
     if kind != "supervised-lane":
-        from .registrations import RegistrationError, validate_registration
+        from .registrations import RegistrationError, RegistrationKind, validate_registration
 
-        allowed = {"name", "kind", "spec", "filters", "owner", "description"}
+        if kind == RegistrationKind.PLUGIN_COMPANION and not allow_plugin_companion:
+            raise RegistrarError(
+                "plugin-companion declarations require attributed plugin discovery"
+            )
+
+        allowed = {
+            "name",
+            "kind",
+            "spec",
+            "filters",
+            "owner",
+            "description",
+            "runtime_generation",
+            "transition_group",
+        }
         extras = sorted(set(data) - allowed)
         if extras:
             raise RegistrarError(
                 f"declaration kind {kind!r} does not accept lane fields: {extras}"
+            )
+        runtime_generation = data.get("runtime_generation")
+        if runtime_generation is not None and kind != RegistrationKind.PLUGIN_COMPANION:
+            raise RegistrarError(
+                "runtime_generation: only plugin-companion declarations may set it"
+            )
+        if runtime_generation is not None and (
+            not isinstance(runtime_generation, str)
+            or not runtime_generation
+        ):
+            raise RegistrarError(
+                "runtime_generation: plugin-companion declarations require a non-empty string"
+            )
+        transition_group = data.get("transition_group")
+        if transition_group is not None and kind != RegistrationKind.PLUGIN_COMPANION:
+            raise RegistrarError(
+                "transition_group: only plugin-companion declarations may set it"
+            )
+        if transition_group is not None and (
+            not isinstance(transition_group, str)
+            or not transition_group.strip()
+        ):
+            raise RegistrarError(
+                "transition_group: plugin-companion declarations require a non-empty string"
             )
         spec = data.get("spec")
         if not isinstance(spec, Mapping):
@@ -510,7 +707,15 @@ def load_declaration(data: Mapping) -> ProfileDeclaration:
             filters=_load_filters(data.get("filters")),
             owner=data.get("owner"),
             description=data.get("description"),
+            runtime_generation=runtime_generation,
+            transition_group=transition_group,
         )
+
+    for plugin_only_field in ("runtime_generation", "transition_group"):
+        if data.get(plugin_only_field) is not None:
+            raise RegistrarError(
+                f"{plugin_only_field}: only plugin-companion declarations may set it"
+            )
 
     legacy_concurrency = data.get("concurrency")
     process_cap = data.get(
@@ -525,6 +730,7 @@ def load_declaration(data: Mapping) -> ProfileDeclaration:
         raise RegistrarError(
             "concurrency and max_active_processes must agree when both are set"
         )
+    _as_bool(data.get("reactive", False), key="reactive")
     decl = ProfileDeclaration(
         name=name,
         kind=kind,
@@ -543,7 +749,7 @@ def load_declaration(data: Mapping) -> ProfileDeclaration:
         max_attempts=_as_int(data.get("max_attempts", 3), key="max_attempts", minimum=0),
         label_max_attempts=_load_label_max_attempts(data.get("label_max_attempts")),
         heartbeat=_as_bool(data.get("heartbeat", True), key="heartbeat"),
-        reactive=_as_bool(data.get("reactive", True), key="reactive"),
+        reactive=False,
         reactive_interval=_as_float(
             data.get("reactive_interval", 2.0), key="reactive_interval", minimum=0.1
         ),
@@ -558,6 +764,18 @@ def load_declaration(data: Mapping) -> ProfileDeclaration:
 
     # A headless local profile whose headless labels are a subset that doesn't
     # intersect the watched labels supervises nothing headless -- catch the typo.
+    if decl.body.type == "embody" and not decl.fleet.headless and decl.body.charter:
+        # Mirrors to_supervise_args's effective-mode mapping: body.type ==
+        # "embody" means CLI-embodied UNLESS a fleet declaration pairs it with
+        # fleet.headless: true (a headless fleet lane). Only the genuinely
+        # CLI-embodied case is charter-incompatible (agent-worktrees embody
+        # has no charter-binding flag) -- validated here, not in
+        # Body.__post_init__, since it needs Fleet visibility.
+        raise RegistrarError(
+            "body.charter: not supported with a CLI-embodied body "
+            "(body.type: embody without fleet.headless: true) -- "
+            "agent-worktrees embody has no charter-binding flag"
+        )
     if decl.body.headless_labels and not decl.fleet.enabled:
         stray = set(decl.body.headless_labels) - set(decl.labels)
         if stray:
@@ -574,6 +792,38 @@ def load_declaration(data: Mapping) -> ProfileDeclaration:
                 f"body.cli_labels {sorted(stray)} are not in labels "
                 f"{sorted(decl.labels)} -- a cli label must also be watched"
             )
+    if decl.body.disposable_cli_labels:
+        watched = set(decl.labels)
+        disposable = set(decl.body.disposable_cli_labels)
+        if stray := disposable - watched:
+            raise RegistrarError(
+                f"body.disposable_cli_labels {sorted(stray)} are not in labels "
+                f"{sorted(decl.labels)} -- a disposable CLI label must be watched"
+            )
+        if decl.fleet.enabled:
+            raise RegistrarError(
+                "body.disposable_cli_labels are supported only for local "
+                "worker bodies"
+            )
+    if decl.body.idle_nudge_exempt_labels:
+        stray = set(decl.body.idle_nudge_exempt_labels) - set(decl.labels)
+        if stray:
+            raise RegistrarError(
+                f"body.idle_nudge_exempt_labels {sorted(stray)} are not in labels "
+                f"{sorted(decl.labels)} -- an exempt label must also be watched"
+            )
+    if decl.body.steering_disallowed_labels:
+        stray = set(decl.body.steering_disallowed_labels) - set(decl.labels)
+        if stray:
+            raise RegistrarError(
+                f"body.steering_disallowed_labels {sorted(stray)} are not in "
+                f"labels {sorted(decl.labels)} -- a disallowed label must also "
+                "be watched"
+            )
+    if decl.body.no_pair and decl.fleet.enabled:
+        raise RegistrarError(
+            "body.no_pair is supported only for local worker bodies"
+        )
     return decl
 
 
@@ -664,7 +914,7 @@ def declaration_from_env(name: str, env: Mapping[str, str]) -> ProfileDeclaratio
         "max_attempts": _env_int(g("MAX_ATTEMPTS"), key="MAX_ATTEMPTS", default=3),
         "label_max_attempts": label_max,
         "heartbeat": not extra["no_heartbeat"],
-        "reactive": not extra["no_reactive"],
+        "reactive": False,
         "body": body,
     }
     if extra["pool"]:

@@ -4,7 +4,9 @@ Canonical, dependency-light management foundation for marketplace installation
 cells. Mutation remains explicit and non-automatic:
 
 - `installation_context.py` provides the stdlib-only management/runtime API and
-  CLI.
+  CLI composition root; its sibling `_installation_context_*.py` fragments keep
+  the canonical Python implementation componentized while the sync tool vendors
+  the same self-contained file set into every consuming plugin.
 - `installation-context.sh` plus `json-query.awk` provides a Bash bootstrap that
   does not require Python or `jq`. The Linux/WSL bootstrap requires Bash 4.4+
   plus `awk`, a SHA-256 command (`sha256sum`, `shasum`, or `openssl`), and a
@@ -27,13 +29,16 @@ namespace, install, and activation generations. The cross-runner actions do not
 otherwise migrate legacy state, launch a runtime, or wire an automatic caller.
 The Python module additionally exposes importable slot APIs. All three runners
 provide equivalent `slot-provision`, `slot-validate`, `slot-complete`,
-`slot-completion-validate`, and `slot-cutover` CLI actions. Ownership publication
+`slot-completion-validate`, `slot-cutover`, and `slot-release` CLI actions. Ownership publication
 reserves a cell-local version slot. Completion publication immutably binds that
 owned slot to strict build-completion evidence without activating it. Cutover
 uses explicit receipt-generation and current-marker compare-and-swap
 expectations to publish only cell-local runtime markers. Agent Machines and
 Agent Index expose explicit installer adapter actions for the first four
 transactions;
+the Python API additionally exposes explicit `attribute_legacy_state(...)` and
+`deactivate_installation(...)` helpers for the two-lock migration and rollback
+paths, including monotonic deactivation records under `<plugin-root>/deactivations/`.
 their normal install/bootstrap paths do not call them. The adapters bind the
 selected snapshot to their exact payload root and version. Every mutation
 requires an explicit `--context` / `-Context`; it never adopts an ambient
@@ -49,6 +54,34 @@ of Windows device basenames.
 
 All successful actions emit one JSON object. Ambiguous or mismatched evidence
 writes an actionable error to stderr and exits nonzero.
+
+### Interrupted reservations
+
+Slot provisioning first publishes `.runtime-slot-reservation.json`, with the
+ownership identity fields, schema `copilot-extensions.runtime-slot-reservation`,
+version 1, and a random non-negative signed-64-bit `generation`. Python and
+PowerShell stage it in the hidden sibling before no-replace rename; Bash writes
+it as the first final-slot entry. Successful ownership publication removes it.
+An interruption before that publication is not an owned or completed runtime.
+
+`slot-release` requires `--context`, `--durable-home`,
+`--expected-marketplace-id`, `--expected-plugin-id`, `--runtime-version`,
+`--reservation-root`, `--expected-reservation-generation`,
+`--expected-reservation-sha256`, `--expected-namespace-generation`, and
+`--expected-install-generation`. PowerShell uses the corresponding PascalCase
+parameters. The root is the exact final slot or its digest-qualified hidden
+sibling; the digest pins the caller-observed receipt bytes, not just its path.
+
+Both receipt locks cover validation and deletion. Only a directory containing
+exactly the matching reservation receipt can be released. Markerless, linked,
+foreign, replaced, malformed, non-empty, completed, current, and LKG targets
+are protected. Generation mismatch returns `status: revalidation-required`,
+`released: false`; successful deletion returns `status: ready`,
+`reason: runtime-slot-reservation-released`, `released: true`. Absent replay
+returns `runtime-slot-reservation-absent` with `released: false`: it proves only
+that nothing was deleted, never that an absent receipt was owned.
+
+### Invocation examples
 
 ```powershell
 .\installation-context.ps1 source-id `

@@ -42,6 +42,46 @@ def test_create_defaults_to_queued(q):
     assert t.attempts == 0
 
 
+def test_dead_letter_status_migration_is_idempotent(q):
+    task = q.create("legacy", repo=TEST_REPO)
+    with q._connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = 'dead_letter', owner = 'old-worker',"
+            " owner_session_id = 'old-session', lease_expires_at = 10 WHERE id = ?",
+            (task.id,),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id, ts, from_status, to_status, note)"
+            " VALUES (?, 1, 'started', 'dead_letter', 'legacy')",
+            (task.id,),
+        )
+        conn.execute(
+            "DELETE FROM queue_migrations WHERE name = ?",
+            ("2026-09-30-retire-dead-letter-status",),
+        )
+
+    migrated = TaskQueue(q.db_path)
+    result = migrated.get(task.id)
+    assert result.status == Status.ABANDONED
+    assert result.owner is None
+    assert result.owner_session_id is None
+    assert result.completed_at is not None
+    with migrated._connect() as conn:
+        event = conn.execute(
+            "SELECT from_status, to_status FROM task_events"
+            " WHERE task_id = ? AND to_status = 'abandoned'",
+            (task.id,),
+        ).fetchone()
+        assert tuple(event) == ("started", "abandoned")
+        assert conn.execute(
+            "SELECT COUNT(*) FROM queue_migrations WHERE name = ?",
+            ("2026-09-30-retire-dead-letter-status",),
+        ).fetchone()[0] == 1
+
+    reopened = TaskQueue(q.db_path)
+    assert reopened.get(task.id).status == Status.ABANDONED
+
+
 def test_full_happy_path(q):
     t = q.create("work")
     claimed = q.claim_one("w1")
@@ -57,6 +97,122 @@ def test_full_happy_path(q):
     assert done.result_ref == "pr/42"
     assert done.owner is None
     assert done.completed_by == "w1"
+
+
+def test_complete_self_attests_when_verification_is_not_required(q):
+    t = q.create("work")
+    q.claim_one("w1", task_id=t.id)
+    q.start(t.id, "w1")
+
+    done = q.complete(t.id, "w1")
+
+    assert done.status == Status.COMPLETED
+    events = q.events(t.id)
+    assert events[-2]["to_status"] == Status.SUBMITTED
+    assert events[-1]["to_status"] == Status.COMPLETED
+    assert events[-1]["note"] == "confirmed by self-attestation"
+
+
+def test_complete_requires_explicit_confirmation_when_flagged(q):
+    t = q.create("work", require_verification=True)
+    q.claim_one("w1", task_id=t.id)
+    q.start(t.id, "w1")
+
+    done = q.complete(t.id, "w1")
+
+    assert done.status == Status.SUBMITTED
+    assert q.confirm(t.id, actor="evaluator").status == Status.COMPLETED
+
+
+# -- confirm / reopen_completed (the submitted -> completed lifecycle) ------
+
+
+def test_confirm_closes_a_completed_task(q):
+    t = q.create("work", require_verification=True)
+    q.claim_one("w1")
+    q.start(t.id, "w1")
+    q.complete(t.id, "w1", result_ref="pr/1")
+    confirmed = q.confirm(t.id, actor="evaluator")
+    assert confirmed.status == Status.COMPLETED
+
+
+def test_confirm_rejects_a_non_submitted_task(q):
+    t = q.create("work")
+    with pytest.raises(TaskError):
+        q.confirm(t.id)
+
+
+def test_confirm_is_idempotent_on_replay(q):
+    t = q.create("work", require_verification=True)
+    q.claim_one("w1")
+    q.start(t.id, "w1")
+    q.complete(t.id, "w1")
+    q.confirm(t.id)
+    again = q.confirm(t.id)  # replay: already completed
+    assert again.status == Status.COMPLETED
+
+
+def test_reopen_completed_returns_to_queued_and_clears_the_claim(q):
+    t = q.create("work", require_verification=True)
+    q.claim_one("w1")
+    q.start(t.id, "w1")
+    q.complete(t.id, "w1", result_ref="pr/1")
+    reopened = q.reopen_completed(t.id, reason="not actually done")
+    assert reopened.status == Status.QUEUED
+    assert reopened.result_ref is None
+    assert reopened.completed_by is None
+    # The reopened task is claimable again, exactly like fresh queued work.
+    claimed = q.claim_one("w2")
+    assert claimed is not None
+    assert claimed.id == t.id
+
+
+def test_reopen_completed_rejects_a_non_submitted_task(q):
+    t = q.create("work")
+    with pytest.raises(TaskError):
+        q.reopen_completed(t.id)
+
+
+def test_reopen_completed_records_a_steer_atomically(q):
+    t = q.create("work", require_verification=True)
+    q.claim_one("w1")
+    q.start(t.id, "w1")
+    q.complete(t.id, "w1")
+    q.reopen_completed(
+        t.id, steer_fields={"instructions": "also fix the docs"}, sender="operator"
+    )
+    log = q.steer_log(t.id)
+    assert len(log) == 1
+    assert log[0]["fields"] == {"instructions": "also fix the docs"}
+    assert log[0]["sender"] == "operator"
+    assert log[0]["taken"] is False
+
+
+def test_confirmed_and_completed_are_both_in_concluded(q):
+    assert Status.SUBMITTED in Status.CONCLUDED
+    assert Status.COMPLETED in Status.CONCLUDED
+    assert Status.SUBMITTED not in Status.TERMINAL  # provisional, not terminal
+    assert Status.COMPLETED in Status.TERMINAL
+
+
+def test_abandon_permits_a_completed_but_unconfirmed_task(q):
+    """The Completion Review card's Abandon action."""
+    t = q.create("work", require_verification=True)
+    q.claim_one("w1")
+    q.start(t.id, "w1")
+    q.complete(t.id, "w1")
+    done = q.abandon(t.id, permitted=True, reason="not worth landing")
+    assert done.status == Status.ABANDONED
+
+
+def test_abandon_rejects_an_already_confirmed_task(q):
+    t = q.create("work", require_verification=True)
+    q.claim_one("w1")
+    q.start(t.id, "w1")
+    q.complete(t.id, "w1")
+    q.confirm(t.id)
+    with pytest.raises(TaskError):
+        q.abandon(t.id, permitted=True, reason="too late")
 
 
 def test_complete_persists_schema_neutral_structured_result(q):
@@ -218,7 +374,7 @@ def test_retry_fill_recovers_owner_from_completion_after_migration(tmp_path):
             "UPDATE tasks SET status = ?, completed_at = ?, result_ref = ?,"
             " result = NULL, completed_by = NULL, owner = NULL"
             " WHERE id = ?",
-            (Status.COMPLETED, 10, "artifact/old", task.id),
+            (Status.SUBMITTED, 10, "artifact/old", task.id),
         )
         conn.execute(
             "INSERT INTO task_events"
@@ -228,7 +384,7 @@ def test_retry_fill_recovers_owner_from_completion_after_migration(tmp_path):
                 task.id,
                 10,
                 Status.STARTED,
-                Status.COMPLETED,
+                Status.SUBMITTED,
                 "worker-1",
                 "complete",
             ),
@@ -255,8 +411,8 @@ def test_retry_fill_recovers_owner_from_completion_after_migration(tmp_path):
     assert len(events_after) == len(events_before) + 1
     assert events_after[-1] == {
         "ts": events_after[-1]["ts"],
-        "from_status": Status.COMPLETED,
-        "to_status": Status.COMPLETED,
+        "from_status": Status.SUBMITTED,
+        "to_status": Status.SUBMITTED,
         "worker": "worker-1",
         "note": "complete retry: result recorded",
     }
@@ -390,6 +546,340 @@ def test_suspend_resume_are_owner_gated_and_state_checked(q):
         q.complete(t.id, "w2")
 
 
+# -- operator hold ("Pause") -------------------------------------------------
+
+
+def test_set_hold_blocks_resume_release_and_reclaim(q):
+    t = q.create("investigate the flaky runner")
+    q.claim_one("w1", task_id=t.id)
+    q.start(t.id, "w1")
+    q.suspend(t.id, "w1", reason="waiting on an external decision")
+
+    held = q.set_hold(t.id, reason="operator paused from the picker", actor="operator")
+    assert held.hold_reason == "operator paused from the picker"
+    assert held.hold_actor == "operator"
+    assert held.hold_at is not None
+    # A hold does not itself change status -- the task is still suspended.
+    assert held.status == Status.SUSPENDED
+
+    with pytest.raises(TaskError, match="held"):
+        q.resume(t.id, "w1")
+    with pytest.raises(TaskError, match="held"):
+        q.release_suspended(t.id, "w1")
+
+    unheld = q.clear_hold(t.id, actor="operator")
+    assert unheld.hold_reason is None
+    assert unheld.hold_actor is None
+    assert unheld.hold_at is None
+    # Now the normal paths work again.
+    resumed = q.resume(t.id, "w1")
+    assert resumed.status == Status.STARTED
+
+
+def test_set_hold_on_claimed_task_blocks_start(q):
+    """PR #2913 review finding: a hold set while `claimed` must also block the
+    claimed -> started transition, not just resume/release_suspended -- a
+    worker must not be able to advance a task past an operator's durable
+    pause."""
+    t = q.create("investigate the flaky runner")
+    q.claim_one("w1", task_id=t.id)
+    q.set_hold(t.id, reason="operator paused before start", actor="operator")
+
+    with pytest.raises(TaskError, match="held"):
+        q.start(t.id, "w1")
+
+    q.clear_hold(t.id, actor="operator")
+    started = q.start(t.id, "w1")
+    assert started.status == Status.STARTED
+
+
+def test_set_hold_on_queued_task_prevents_claim(q):
+    t = q.create("queued task an operator wants held")
+    q.set_hold(t.id, reason="hold before anyone claims it", actor="operator")
+    assert q.claim_one("w1") is None
+    assert q.claim_one("w1", task_id=t.id) is None
+
+    q.clear_hold(t.id, actor="operator")
+    claimed = q.claim_one("w1", task_id=t.id)
+    assert claimed is not None
+    assert claimed.id == t.id
+
+
+def test_set_hold_requires_a_reason(q):
+    t = q.create("task")
+    with pytest.raises(TaskError, match="non-empty reason"):
+        q.set_hold(t.id, reason="   ", actor="operator")
+
+
+def test_set_hold_refuses_terminal_task(q):
+    t = q.create("task")
+    q.claim_one("w1", task_id=t.id)
+    q.start(t.id, "w1")
+    q.complete(t.id, "w1")
+    with pytest.raises(TaskError, match="completed"):
+        q.set_hold(t.id, reason="too late", actor="operator")
+
+
+def test_set_hold_is_idempotent_and_clear_hold_is_a_noop_when_unheld(q):
+    t = q.create("task")
+    first = q.set_hold(t.id, reason="first reason", actor="alice")
+    assert first.hold_reason == "first reason"
+    second = q.set_hold(t.id, reason="updated reason", actor="bob")
+    assert second.hold_reason == "updated reason"
+    assert second.hold_actor == "bob"
+
+    q.clear_hold(t.id, actor="bob")
+    # Clearing an already-unheld task is a harmless no-op, not an error.
+    again = q.clear_hold(t.id, actor="bob")
+    assert again.hold_reason is None
+
+
+# -- Phase 1 item 4: universal mutating-action fencing -----------------------
+
+
+def test_set_hold_rejects_stale_expected_status(q):
+    t = q.create("task")
+    q.claim_one("w1", task_id=t.id)
+    with pytest.raises(TaskError, match="changed; refresh and retry"):
+        q.set_hold(t.id, reason="pause", actor="op", expected_status=Status.QUEUED)
+    # the mismatch must not have applied the hold
+    assert q.get(t.id).hold_reason is None
+    # the matching status succeeds
+    held = q.set_hold(t.id, reason="pause", actor="op", expected_status=Status.CLAIMED)
+    assert held.hold_reason == "pause"
+
+
+def test_clear_hold_rejects_stale_expected_status_only_when_actually_held(q):
+    t = q.create("task")
+    q.claim_one("w1", task_id=t.id)
+    q.set_hold(t.id, reason="pause", actor="op")
+    with pytest.raises(TaskError, match="changed; refresh and retry"):
+        q.clear_hold(t.id, actor="op", expected_status=Status.QUEUED)
+    assert q.get(t.id).hold_reason == "pause"
+    cleared = q.clear_hold(t.id, actor="op", expected_status=Status.CLAIMED)
+    assert cleared.hold_reason is None
+
+    # already-unheld is a no-op regardless of a stale expected_status -- the
+    # operator's intent ("make sure it's unpaused") is already satisfied.
+    noop = q.clear_hold(t.id, actor="op", expected_status=Status.QUEUED)
+    assert noop.hold_reason is None
+
+
+# -- clear_exclude: the symmetric undo `yield --exclude`/`--exclude-self`
+# never got, so a self-exclusion permanently starves a task once set --------
+
+
+def test_clear_exclude_removes_one_token_and_leaves_others(q):
+    t = q.create("task")
+    q.claim_one("w1", task_id=t.id)
+    q.yield_task(t.id, "w1", note="blocked here", exclude="machine:m1")
+    q.claim_one("w2", task_id=t.id)
+    q.yield_task(t.id, "w2", note="blocked here too", exclude="machine:m2")
+    assert set(q.get(t.id).excludes) == {"machine:m1", "machine:m2"}
+
+    cleared = q.clear_exclude(t.id, exclude="machine:m1", actor="op")
+    assert cleared.excludes == ["machine:m2"]
+
+
+def test_clear_exclude_without_a_token_clears_everything(q):
+    t = q.create("task")
+    q.claim_one("w1", task_id=t.id)
+    q.yield_task(t.id, "w1", note="blocked", exclude="machine:m1")
+    q.claim_one("w2", task_id=t.id)
+    q.yield_task(t.id, "w2", note="blocked", exclude="machine:m2")
+
+    cleared = q.clear_exclude(t.id, actor="op")
+    assert cleared.excludes == []
+
+
+def test_clear_exclude_is_a_noop_when_nothing_is_excluded(q):
+    t = q.create("task")
+    # No excludes were ever set -- clearing must not error.
+    noop = q.clear_exclude(t.id, actor="op")
+    assert noop.excludes == []
+
+
+def test_clear_exclude_is_a_noop_for_an_unmatched_token(q):
+    t = q.create("task")
+    q.claim_one("w1", task_id=t.id)
+    q.yield_task(t.id, "w1", note="blocked", exclude="machine:m1")
+
+    noop = q.clear_exclude(t.id, exclude="machine:does-not-exist", actor="op")
+    assert noop.excludes == ["machine:m1"]
+
+
+def test_clear_exclude_rejects_stale_expected_status_only_when_actually_excluded(q):
+    t = q.create("task")
+    q.claim_one("w1", task_id=t.id)
+    q.yield_task(t.id, "w1", note="blocked", exclude="machine:m1")
+    with pytest.raises(TaskError, match="changed; refresh and retry"):
+        q.clear_exclude(t.id, actor="op", expected_status=Status.STARTED)
+    assert q.get(t.id).excludes == ["machine:m1"]
+    cleared = q.clear_exclude(t.id, actor="op", expected_status=Status.QUEUED)
+    assert cleared.excludes == []
+
+    # already-clear is a no-op regardless of a stale expected_status.
+    noop = q.clear_exclude(t.id, actor="op", expected_status=Status.STARTED)
+    assert noop.excludes == []
+
+
+def test_clear_exclude_unstrands_a_single_machine_lane(q):
+    """The motivating scenario: a task self-excluded the only machine its
+    lane permits, permanently starving it with no error, card, or
+    dead-letter signal. clear_exclude is the only way out."""
+    t = q.create("task")
+    q.claim_one("w1", task_id=t.id)
+    q.yield_task(t.id, "w1", note="blocked on this machine", exclude="machine:only-box")
+    # still excluded -- the lane's only permitted machine can't claim it
+    assert q.claim_one("w2", task_id=t.id, machine="only-box") is None
+
+    q.clear_exclude(t.id, exclude="machine:only-box", actor="op")
+    claimed = q.claim_one("w2", task_id=t.id, machine="only-box")
+    assert claimed is not None
+    assert claimed.id == t.id
+
+
+def test_abandon_rejects_stale_expected_status(q):
+    t = q.create("task")
+    q.claim_one("w1", task_id=t.id)
+    with pytest.raises(TaskError, match="changed; refresh and retry"):
+        q.abandon(t.id, permitted=True, reason="stale", expected_status=Status.QUEUED)
+    assert q.get(t.id).status == Status.CLAIMED
+    done = q.abandon(t.id, permitted=True, reason="ok", expected_status=Status.CLAIMED)
+    assert done.status == Status.ABANDONED
+
+
+def test_abandon_still_honors_expected_generation_fencing(q):
+    """expected_generation/expected_owner_session_id reuse `_transition`'s
+    existing identity fencing verbatim -- distinct from expected_status."""
+    t = q.create("continue after handoff")
+    q.claim_one("m/wt", task_id=t.id, machine="m", worktree="wt")
+    q.start(t.id, "m/wt", owner_session_id="s1")
+    q.suspend(t.id, "m/wt", reason="test")
+    q.resume(t.id, "m/wt", adopt_owner_session_id="s2")
+    gen = q.get(t.id).generation
+    with pytest.raises(TaskError, match="ownership incarnation changed"):
+        q.abandon(
+            t.id, permitted=True, reason="stale identity",
+            expected_generation=gen - 1, expected_owner_session_id="s2",
+        )
+    ok = q.abandon(
+        t.id, permitted=True, reason="fresh identity",
+        expected_generation=gen, expected_owner_session_id="s2",
+    )
+    assert ok.status == Status.ABANDONED
+
+
+def test_submit_steer_rejects_stale_expected_status(q):
+    t = q.create("task")
+    q.claim_one("w1", task_id=t.id)
+    q.start(t.id, "w1")
+    with pytest.raises(TaskError, match="changed; refresh and retry"):
+        q.submit_steer(t.id, fields={"a": 1}, expected_status=Status.SUSPENDED)
+    back = q.submit_steer(t.id, fields={"a": 1}, expected_status=Status.STARTED)
+    assert back.status == Status.STARTED
+
+
+# -- Phase 2: reset (the gentler "not like this") ----------------------------
+
+
+def test_reset_discards_embodiment_state_preserves_goal(q):
+    t = q.create(
+        "task", goal="ship the thing", done_criteria="tests pass"
+    )
+    q.claim_one("m/wt", task_id=t.id, machine="m", worktree="wt")
+    q.start(t.id, "m/wt", owner_session_id="s1")
+    q.record_progress(t.id, "m/wt", phase="impl", summary="did a thing")
+    back = q.reset(t.id, reason="wrong approach")
+    assert back.status == Status.PROPOSED
+    assert back.owner is None
+    assert back.owner_session_id is None
+    assert back.claimed_at is None
+    assert back.started_at is None
+    # durable goal/done-criteria/progress log survive a reset
+    assert back.goal == "ship the thing"
+    assert back.done_criteria == "tests pass"
+    assert len(q.progress_log(t.id)) == 1
+
+
+def test_reset_releases_active_spawn_reservation(q):
+    """PR #2913 review: resetting a task with an active spawn reservation
+    must release it -- otherwise the old attempt's session/reservation
+    stays live with no task owning it, free to keep running and race a
+    fresh attempt. Reuses the same `release_spawn` mechanism
+    `yield_task`/`release_suspended` already rely on."""
+    t = q.create("task")
+    reservation, _ = q.reserve_spawn(t.id)
+    q.record_spawn(reservation.key, session_handle="s1", worktree="wt")
+    q.claim_one("m/wt", task_id=t.id, machine="m", worktree="wt")
+    q.start(t.id, "m/wt", owner_session_id="s1")
+    assert q.latest_reservation(t.id).state == "spawned"
+
+    q.reset(t.id, reason="not like this")
+
+    released = q.latest_reservation(t.id)
+    assert released.key == reservation.key
+    assert released.state == "releasing"
+    assert released.release_requested is True
+
+
+@pytest.mark.parametrize(
+    "setup",
+    ["queued", "claimed", "started", "suspended"],
+)
+def test_reset_allowed_from_every_non_terminal_working_state(q, setup):
+    t = q.create("task")
+    if setup in ("claimed", "started", "suspended"):
+        q.claim_one("m/wt", task_id=t.id, machine="m", worktree="wt")
+    if setup in ("started", "suspended"):
+        q.start(t.id, "m/wt")
+    if setup == "suspended":
+        q.suspend(t.id, "m/wt", reason="test")
+    assert q.reset(t.id).status == Status.PROPOSED
+
+
+def test_reset_refuses_terminal_task(q):
+    t = q.create("task")
+    q.claim_one("w1", task_id=t.id)
+    q.start(t.id, "w1")
+    q.complete(t.id, "w1")
+    with pytest.raises(TaskError):
+        q.reset(t.id)
+
+
+def test_reset_refuses_held_task(q):
+    t = q.create("task")
+    q.claim_one("m/wt", task_id=t.id, machine="m", worktree="wt")
+    q.start(t.id, "m/wt")
+    q.set_hold(t.id, reason="pause", actor="op")
+    with pytest.raises(TaskError, match="held"):
+        q.reset(t.id)
+    q.clear_hold(t.id, actor="op")
+    assert q.reset(t.id).status == Status.PROPOSED
+
+
+def test_reset_rejects_stale_expected_status(q):
+    t = q.create("task")
+    q.claim_one("w1", task_id=t.id)
+    with pytest.raises(TaskError, match="changed; refresh and retry"):
+        q.reset(t.id, expected_status=Status.QUEUED)
+    assert q.reset(t.id, expected_status=Status.CLAIMED).status == Status.PROPOSED
+
+
+def test_reset_honors_expected_generation_fencing(q):
+    t = q.create("task")
+    q.claim_one("m/wt", task_id=t.id, machine="m", worktree="wt")
+    q.start(t.id, "m/wt", owner_session_id="s1")
+    q.suspend(t.id, "m/wt", reason="test")
+    q.resume(t.id, "m/wt", adopt_owner_session_id="s2")
+    gen = q.get(t.id).generation
+    with pytest.raises(TaskError, match="ownership incarnation changed"):
+        q.reset(t.id, expected_generation=gen - 1, expected_owner_session_id="s2")
+    assert q.reset(
+        t.id, expected_generation=gen, expected_owner_session_id="s2"
+    ).status == Status.PROPOSED
+
+
 def test_suspended_successor_adopts_session_and_advances_generation(q):
     t = q.create("continue after handoff")
     claimed = q.claim_one("host-a/wt-1", task_id=t.id)
@@ -488,20 +978,20 @@ def test_suspended_successor_adoption_rejects_stale_snapshot(q):
 
 
 def test_suspended_task_can_complete_without_resume(q):
-    t = q.create("wait for merge")
+    t = q.create("wait for merge", require_verification=True)
     claimed = q.claim_one("w1", task_id=t.id)
     q.start(t.id, "w1", owner_session_id="session-1")
     q.suspend(t.id, "w1", reason="waiting for merge")
 
     done = q.complete(t.id, "w1", result_ref="change/42")
 
-    assert done.status == Status.COMPLETED
+    assert done.status == Status.SUBMITTED
     assert done.result_ref == "change/42"
     assert done.owner is None
     assert done.generation == claimed.generation
     assert [event["to_status"] for event in q.events(t.id)][-2:] == [
         Status.SUSPENDED,
-        Status.COMPLETED,
+        Status.SUBMITTED,
     ]
 
 
@@ -524,7 +1014,7 @@ def test_fenced_suspended_completion_loses_concurrent_resume(q):
     assert q.get(t.id).status == Status.STARTED
 
 
-def test_release_suspended_clears_owner_and_spawn_reservation(q):
+def test_release_suspended_clears_owner_and_requests_spawn_release(q):
     t = q.create("replace me")
     reservation, _ = q.reserve_spawn(t.id)
     q.record_spawn(
@@ -542,7 +1032,10 @@ def test_release_suspended_clears_owner_and_spawn_reservation(q):
     assert released.owner is None
     assert released.owner_session_id is None
     assert released.claimed_at is None
-    assert q.get_reservation(reservation.key).state == "settled"
+    active = q.get_reservation(reservation.key)
+    assert active.state == "releasing"
+    assert active.release_requested is True
+    assert active.release_disposition == "settled"
     replacement = q.claim_one("host-b/wt-2", task_id=t.id)
     assert replacement is not None
     assert replacement.owner == "host-b/wt-2"
@@ -680,7 +1173,127 @@ def test_set_activity_rejects_unknown_value(q):
     reservation, _ = q.reserve_spawn(t.id)
     q.record_spawn(reservation.key, session_handle="local-body:s1")
     with pytest.raises(TaskError, match="invalid task activity"):
-        q.set_activity(t.id, "IDLE", reservation_key=reservation.key)
+        q.set_activity(t.id, "BUSY", reservation_key=reservation.key)
+
+
+def test_bind_owner_session_is_owner_and_generation_fenced(q):
+    task = q.create("headless")
+    claimed = q.claim_one("headless-owner", task_id=task.id)
+    assert claimed is not None
+    started = q.start(task.id, "headless-owner")
+    bound = q.bind_owner_session(
+        task.id,
+        "headless-owner",
+        "bridge-session",
+        expected_generation=started.generation,
+    )
+    assert bound.owner_session_id == "bridge-session"
+    with pytest.raises(TaskError, match="another owner session"):
+        q.bind_owner_session(
+            task.id,
+            "headless-owner",
+            "other-session",
+            expected_generation=started.generation,
+        )
+
+
+def test_attachment_history_records_bind_release_and_handoff(q):
+    """durable-attachment-history: releasing/re-embodying a task must NOT
+    discard the prior session's identity -- reproduces the private-downstream-repo
+    incident (a stuck Intelligence Dampener review released twice, each
+    release silently losing the previous session's record)."""
+    task = q.create("headless", target_worktree="wt-1", target_machine="m1")
+    q.claim_one("w1", task_id=task.id, machine="m1", worktree="wt-1")
+    q.start(task.id, "w1")
+    q.bind_owner_session(task.id, "w1", "session-a", now=1000.0)
+
+    # A plain suspend/resume of the SAME session is not a new attachment.
+    q.suspend(task.id, "w1", reason="idle", now=1010.0)
+    q.resume(task.id, "w1", now=1020.0)
+    history = q.attachment_history(task.id)
+    assert len(history) == 1
+    assert history[0].session_id == "session-a"
+    assert history[0].detached_at is None
+    assert history[0].worktree_id == "wt-1"
+    assert history[0].machine == "m1"
+
+    # Releasing for a fresh embodiment detaches session-a and, once a new
+    # session binds, records session-b as a SEPARATE, non-destructive entry.
+    q.suspend(task.id, "w1", reason="stuck", now=1030.0)
+    q.release_suspended(task.id, "w1", reason="reset for fresh embodiment", now=1040.0)
+    history = q.attachment_history(task.id)
+    assert len(history) == 1
+    assert history[0].session_id == "session-a"
+    assert history[0].detached_at == 1040.0
+    assert history[0].detach_reason == "reset for fresh embodiment"
+
+    q.claim_one("w2", task_id=task.id, machine="m1", worktree="wt-1", now=1050.0)
+    q.start(task.id, "w2", now=1050.0)
+    q.bind_owner_session(task.id, "w2", "session-b", now=1050.0)
+    history = q.attachment_history(task.id)
+    assert [h.session_id for h in history] == ["session-b", "session-a"]
+    assert history[0].detached_at is None
+    # session-a's record from the first release is preserved, not discarded.
+    assert history[1].detached_at == 1040.0
+
+    # A handoff (adopt_owner_session_id) detaches the retiring session and
+    # attaches the successor, all within resume -- no release round-trip.
+    q.suspend(task.id, "w2", reason="context exhaustion", now=1060.0)
+    q.resume(task.id, "w2", adopt_owner_session_id="session-c", now=1070.0)
+    history = q.attachment_history(task.id)
+    assert [h.session_id for h in history] == ["session-c", "session-b", "session-a"]
+    assert history[0].detached_at is None
+    assert history[1].detached_at == 1070.0
+
+
+def test_tasks_for_session_reverse_lookup(q):
+    """tasks_for_session is the reverse of attachment_history: given a session
+    id, find every task it has ever attached to. Backs the reverse-lookup CLI
+    (an arbitrary session id -> its worktree + task-assignment history)."""
+    t1 = q.create("headless", target_worktree="wt-1", target_machine="m1")
+    q.claim_one("w1", task_id=t1.id, machine="m1", worktree="wt-1")
+    q.start(t1.id, "w1")
+    q.bind_owner_session(t1.id, "w1", "session-shared", now=1000.0)
+
+    # The same session id later attaches to a second, unrelated task.
+    t2 = q.create("headless", target_worktree="wt-2", target_machine="m2")
+    q.claim_one("w2", task_id=t2.id, machine="m2", worktree="wt-2")
+    q.start(t2.id, "w2")
+    q.bind_owner_session(t2.id, "w2", "session-shared", now=2000.0)
+
+    found = q.tasks_for_session("session-shared")
+    assert [entry.task_id for entry in found] == [t2.id, t1.id]
+    assert found[0].worktree_id == "wt-2"
+    assert found[0].machine == "m2"
+    assert found[0].detached_at is None
+    assert found[1].worktree_id == "wt-1"
+    assert found[1].machine == "m1"
+
+    # A session id that never attached to anything is an empty list, not an
+    # error.
+    assert q.tasks_for_session("session-never-seen") == []
+
+
+def test_tasks_for_session_reports_worktree_for_unpinned_task(q):
+    """Regression: an UNPINNED task (no target_worktree/target_machine --
+    the common case, an untargeted claim from the general pool) must still
+    report the actual claimant's worktree/machine in the reverse lookup.
+    Real CLI callers pass worker_id as the machine/worktree composite
+    (`worker_id_for`/`_owner_from_identity`); a prior version of this code
+    read only the target pin, which is always null for an unpinned task."""
+    task = q.create("headless")  # no target_worktree/target_machine
+    q.claim_one("anomalous-potato/wt-real", task_id=task.id)
+    q.start(task.id, "anomalous-potato/wt-real")
+    q.bind_owner_session(task.id, "anomalous-potato/wt-real", "session-unpinned", now=1000.0)
+
+    found = q.tasks_for_session("session-unpinned")
+    assert len(found) == 1
+    assert found[0].machine == "anomalous-potato"
+    assert found[0].worktree_id == "wt-real"
+
+    history = q.attachment_history(task.id)
+    assert history[0].machine == "anomalous-potato"
+    assert history[0].worktree_id == "wt-real"
 
 
 def test_set_activity_cannot_restore_activity_on_suspended_task(q):
@@ -692,7 +1305,7 @@ def test_set_activity_cannot_restore_activity_on_suspended_task(q):
     q.set_activity(t.id, "ACTIVE", reservation_key=reservation.key)
     q.suspend(t.id, "w1", reason="waiting")
 
-    with pytest.raises(TaskError, match="non-null activity on suspended task"):
+    with pytest.raises(TaskError, match="active activity on suspended task"):
         q.set_activity(t.id, "STALLED", reservation_key=reservation.key)
 
     dormant = q.get(t.id)
@@ -731,6 +1344,36 @@ def test_set_activity_rejects_stale_or_wrong_reservation(q):
     assert q.get(t.id).activity_updated_at is not None
     with pytest.raises(TaskError, match="active spawned reservation"):
         q.set_activity(t.id, "ACTIVE", reservation_key=reservation.key)
+
+
+@pytest.mark.parametrize("terminal_state", [SpawnState.FAILED, SpawnState.SETTLED])
+def test_old_terminal_metadata_does_not_clear_successor_activity(q, terminal_state):
+    task = q.create("observed")
+    first, _ = q.reserve_spawn(task.id)
+    q.record_spawn(first.key, session_handle="local-body:first")
+    if terminal_state == SpawnState.FAILED:
+        q.fail_spawn(first.key)
+    else:
+        q.settle_spawn(first.key)
+    second, _ = q.reserve_spawn(task.id)
+    q.record_spawn(second.key, session_handle="local-body:second")
+    q.set_activity(task.id, "ACTIVE", reservation_key=second.key)
+
+    if terminal_state == SpawnState.FAILED:
+        q.fail_spawn(
+            first.key,
+            conclusion_state="held",
+            conclusion_detail='{"action":"preserved","reason":"cleanup-held"}',
+        )
+    else:
+        q.settle_spawn(
+            first.key,
+            conclusion_state="held",
+            conclusion_detail='{"action":"preserved","reason":"cleanup-held"}',
+        )
+
+    assert q.get(task.id).activity == "ACTIVE"
+    assert q.get_reservation(second.key).state == SpawnState.SPAWNED
 
 
 # -- progress beats ----------------------------------------------------------
@@ -1055,6 +1698,87 @@ def test_migration_adds_nullable_result_column_to_existing_db(tmp_path):
     assert {"result", "completed_by"} <= columns
 
 
+def test_migration_adds_require_verification_with_false_default(tmp_path):
+    db = tmp_path / "legacy-require-verification.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO tasks(id) VALUES ('legacy-task')")
+
+    q = RealTaskQueue(db)
+
+    assert q.get("legacy-task").require_verification is False
+    with sqlite3.connect(db) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        applied = conn.execute(
+            "SELECT COUNT(*) FROM queue_migrations "
+            "WHERE name = '2026-09-29-require-verification-flag'"
+        ).fetchone()[0]
+    assert "require_verification" in columns
+    assert applied == 1
+
+    reopened = RealTaskQueue(db)
+    assert reopened.get("legacy-task").require_verification is False
+    with sqlite3.connect(db) as conn:
+        applied_again = conn.execute(
+            "SELECT COUNT(*) FROM queue_migrations "
+            "WHERE name = '2026-09-29-require-verification-flag'"
+        ).fetchone()[0]
+    assert applied_again == 1
+
+
+def test_migration_renames_legacy_completed_and_confirmed_statuses(tmp_path):
+    db = tmp_path / "legacy-statuses.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE tasks ("
+            "id TEXT PRIMARY KEY, status TEXT, result TEXT, result_ref TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO tasks VALUES (?, ?, NULL, NULL)",
+            [("t-submitted", "completed"), ("t-completed", "confirmed")],
+        )
+        conn.execute(
+            "CREATE TABLE task_events ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,"
+            "ts REAL NOT NULL, from_status TEXT, to_status TEXT,"
+            "worker TEXT, note TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO task_events (task_id, ts, from_status, to_status, worker, note)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("t-submitted", 1, "started", "completed", "worker-1", "complete"),
+                ("t-completed", 2, "completed", "confirmed", "evaluator", "confirm"),
+            ],
+        )
+
+    q = RealTaskQueue(db)
+
+    assert q.get("t-submitted").status == Status.SUBMITTED
+    assert q.get("t-completed").status == Status.COMPLETED
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT task_id, from_status, to_status FROM task_events ORDER BY id"
+        ).fetchall()
+        applied = conn.execute(
+            "SELECT COUNT(*) FROM queue_migrations"
+            " WHERE name = '2026-09-29-status-rename-submitted-completed'"
+        ).fetchone()[0]
+    assert rows == [
+        ("t-submitted", "started", "submitted"),
+        ("t-completed", "submitted", "completed"),
+    ]
+    assert applied == 1
+
+    fresh = q.create("fresh work", repo="github.com/example/repo")
+    q.claim_one("worker-1")
+    q.start(fresh.id, "worker-1")
+    q.complete(fresh.id, "worker-1")
+
+    reopened = RealTaskQueue(db)
+    assert reopened.get(fresh.id).status == Status.COMPLETED
+
+
 def test_migration_backfills_stable_completing_owner(tmp_path):
     db = tmp_path / "legacy-completed.db"
     with sqlite3.connect(db) as conn:
@@ -1063,7 +1787,7 @@ def test_migration_backfills_stable_completing_owner(tmp_path):
             "id TEXT PRIMARY KEY, status TEXT, result TEXT, result_ref TEXT)"
         )
         conn.execute(
-            "INSERT INTO tasks VALUES ('t1', 'completed', NULL, 'artifact/1')"
+            "INSERT INTO tasks VALUES ('t1', 'submitted', NULL, 'artifact/1')"
         )
         conn.execute(
             "CREATE TABLE task_events ("
@@ -1074,7 +1798,7 @@ def test_migration_backfills_stable_completing_owner(tmp_path):
         conn.execute(
             "INSERT INTO task_events "
             "(task_id, ts, from_status, to_status, worker, note)"
-            " VALUES ('t1', 1, 'started', 'completed', 'worker-1', 'complete')"
+            " VALUES ('t1', 1, 'started', 'submitted', 'worker-1', 'complete')"
         )
 
     q = RealTaskQueue(db)
@@ -1091,7 +1815,7 @@ def test_legacy_completion_without_owner_fails_retry_fill_closed(tmp_path):
         conn.execute(
             "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT)"
         )
-        conn.execute("INSERT INTO tasks VALUES ('t1', 'completed', NULL)")
+        conn.execute("INSERT INTO tasks VALUES ('t1', 'submitted', NULL)")
 
     q = RealTaskQueue(db)
 
@@ -1105,7 +1829,7 @@ def test_legacy_completion_with_ambiguous_owners_fails_retry_fill_closed(tmp_pat
         conn.execute(
             "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT)"
         )
-        conn.execute("INSERT INTO tasks VALUES ('t1', 'completed', NULL)")
+        conn.execute("INSERT INTO tasks VALUES ('t1', 'submitted', NULL)")
         conn.execute(
             "CREATE TABLE task_events ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,"
@@ -1115,7 +1839,7 @@ def test_legacy_completion_with_ambiguous_owners_fails_retry_fill_closed(tmp_pat
         conn.executemany(
             "INSERT INTO task_events"
             " (task_id, ts, from_status, to_status, worker, note)"
-            " VALUES ('t1', ?, 'started', 'completed', ?, 'complete')",
+            " VALUES ('t1', ?, 'started', 'submitted', ?, 'complete')",
             [(1, "worker-1"), (2, "worker-2")],
         )
 
@@ -1141,7 +1865,13 @@ def test_events_record_transitions(q):
     q.start(t.id, "w1")
     q.complete(t.id, "w1")
     trail = [e["to_status"] for e in q.events(t.id)]
-    assert trail == [Status.QUEUED, Status.CLAIMED, Status.STARTED, Status.COMPLETED]
+    assert trail == [
+        Status.QUEUED,
+        Status.CLAIMED,
+        Status.STARTED,
+        Status.SUBMITTED,
+        Status.COMPLETED,
+    ]
 
 
 # -- worker identity + targeting-in-claim ------------------------------------
@@ -1268,7 +1998,7 @@ def _seed_all_states(q):
     q.claim_one("w", task_id=started_t.id)
     q.start(started_t.id, "w")
 
-    completed_t = q.create("completed one", prompt="done")
+    completed_t = q.create("completed one", prompt="done", require_verification=True)
     q.claim_one("w", task_id=completed_t.id)
     q.start(completed_t.id, "w")
     q.complete(completed_t.id, "w")
@@ -1281,7 +2011,7 @@ def _seed_all_states(q):
         Status.QUEUED: queued,
         Status.CLAIMED: claimed_t,
         Status.STARTED: started_t,
-        Status.COMPLETED: completed_t,
+        Status.SUBMITTED: completed_t,
         Status.ABANDONED: abandoned_t,
     }
 
@@ -1304,6 +2034,57 @@ def test_list_empty_status_sequence_matches_all(q):
     assert len(q.list(status=[])) == 6
 
 
+def test_list_applies_label_filter_before_limit(q):
+    matching = q.create("matching", labels=["review"], evaluator_ref="review-lifecycle")
+    for index in range(5):
+        q.create(
+            f"newer unrelated {index}",
+            labels=["other"],
+            evaluator_ref="review-lifecycle",
+        )
+    malformed = q.create(
+        "malformed legacy labels",
+        labels=["other"],
+        evaluator_ref="review-lifecycle",
+    )
+    with sqlite3.connect(q.db_path) as conn:
+        conn.execute("UPDATE tasks SET labels = '' WHERE id = ?", (malformed.id,))
+
+    assert [
+        task.id
+        for task in q.list(
+            repo=TEST_REPO,
+            status=Status.QUEUED,
+            evaluator_ref="review-lifecycle",
+            label="review",
+            limit=1,
+        )
+    ] == [matching.id]
+    assert q.list(label="rev", limit=10) == []
+
+
+def test_run_waiter_registration_and_supersession_round_trip(q):
+    t = q.create("wait")
+    q.claim_one("w1", task_id=t.id)
+    q.start(t.id, "w1", owner_session_id="session-1")
+    q.suspend(t.id, "w1", reason="waiting")
+
+    registered = q.register_run_waiter(
+        t.id,
+        pid=123,
+        host="test-host",
+        start_token="token-123",
+        resume_worktree="m/wt-1",
+        command=["sleep", "1"],
+    )
+    assert registered["generation"] == 1
+    assert q.get_active_run_waiter(t.id)["pid"] == 123
+
+    superseded = q.supersede_run_waiter(t.id, reason="event note wake")
+    assert superseded is not None
+    assert q.get_active_run_waiter(t.id) is None
+
+
 def test_sweep_spans_all_states_except_abandoned(q):
     seed = _seed_all_states(q)
     swept = {t.id for t in q.sweep()}
@@ -1314,7 +2095,7 @@ def test_sweep_spans_all_states_except_abandoned(q):
             Status.QUEUED,
             Status.CLAIMED,
             Status.STARTED,
-            Status.COMPLETED,
+            Status.SUBMITTED,
         )
     }
     assert seed[Status.ABANDONED].id not in swept

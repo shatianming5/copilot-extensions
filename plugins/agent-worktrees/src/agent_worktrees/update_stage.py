@@ -54,8 +54,6 @@ _PLUGIN_ID = "agent-worktrees@copilot-extensions"
 _FINGERPRINT_FILES = (
     "pyproject.toml",
     "plugin.json",
-    "bin/launch-session.ps1",
-    "bin/launch-session.sh",
     "scripts/install.ps1",
     "scripts/install.sh",
 )
@@ -191,10 +189,37 @@ def discover_plugin_dir(home: Path | None = None) -> tuple[Path | None, str]:
 
 
 def fingerprint(plugin_dir: Path) -> str:
-    """Hash the version/launcher/installer files to detect a real change."""
+    """Hash the version/launcher/installer files plus the actual application
+    source (#2609) to detect a real change.
+
+    The curated ``_FINGERPRINT_FILES`` list alone misses a plugin bug fix that
+    lands purely in ``.py`` source under ``src/`` (or a vendored path-
+    dependency's ``libs/*/src/``) without touching a version string or any of
+    those specific meta-files -- exactly the gap that let a merged fix sit
+    undetected on this machine: the marketplace payload had genuinely changed,
+    but every staleness check available (this fingerprint, and the deployed-
+    vs-payload version-drift check that reads ``pyproject.toml``'s version
+    string) agreed nothing needed reinstalling. Hashing the source tree too
+    closes that gap the same way :func:`install.ps1's Get-PayloadHash /
+    install.sh's _payload_hash <#2609>` already were.
+
+    Uses BLAKE2b (via ``hashlib``, no new dependency) rather than SHA-256:
+    this is a pure local change-detector, never compared against an
+    externally-supplied or attacker-controlled value, so SHA-256's
+    collision-resistance guarantee is unused overhead here -- BLAKE2b is
+    materially faster per byte on typical CPUs for the same "did this change"
+    question. Deliberately NOT mirrored into ``install.ps1``'s
+    ``Get-PayloadHash`` / ``install.sh``'s ``_payload_hash``: .NET's
+    ``System.Security.Cryptography`` has no built-in BLAKE2b (only MD5, which
+    risks tripping security scanners/policy for a change unrelated to any
+    actual security need), and POSIX ``b2sum`` isn't reliably present on
+    every platform ``sha256sum`` already is. Those two independently hash a
+    different file set for a different purpose (a persisted, cross-run
+    completion-marker comparison) and are unaffected by this choice.
+    """
     import hashlib
 
-    h = hashlib.sha256()
+    h = hashlib.blake2b()
     for rel in _FINGERPRINT_FILES:
         fp = plugin_dir / rel
         if fp.exists():
@@ -203,6 +228,26 @@ def fingerprint(plugin_dir: Path) -> str:
             except Exception:
                 h.update(b"<unreadable>")
         h.update(b"\x00")
+
+    source_roots = [plugin_dir / "src"]
+    libs_dir = plugin_dir / "libs"
+    if libs_dir.is_dir():
+        for lib in sorted(p for p in libs_dir.iterdir() if p.is_dir()):
+            candidate = lib / "src"
+            if candidate.is_dir():
+                source_roots.append(candidate)
+    for root in source_roots:
+        if not root.is_dir():
+            continue
+        for fp in sorted(root.rglob("*")):
+            if not fp.is_file() or fp.suffix in (".pyc", ".pyo") or "__pycache__" in fp.parts:
+                continue
+            h.update(str(fp.relative_to(plugin_dir)).replace("\\", "/").encode("utf-8"))
+            try:
+                h.update(fp.read_bytes())
+            except Exception:
+                h.update(b"<unreadable>")
+            h.update(b"\x00")
     return h.hexdigest()
 
 
@@ -227,6 +272,37 @@ def _run_copilot_update() -> tuple[bool, str]:
         return False, f"copilot plugin update error: {e}"
 
 
+def _resolve_before_fingerprint(prior: dict, plugin_dir: Path) -> tuple[str, str]:
+    """Reuse the previous stage's recorded AFTER-fingerprint as this run's
+    BEFORE-fingerprint when it is trustworthy, skipping one full-tree hash
+    walk (roughly half the fingerprinting cost) in the common case where
+    nothing changed between stage runs.
+
+    Safe only because of this module's own docstring's "Critical safety
+    constraint": the marketplace payload directory this hashes
+    (``~/.copilot/installed-plugins/copilot-extensions/agent-worktrees``) is
+    exclusively written by ``copilot plugin update`` -- nothing else in this
+    stage-then-join flow mutates it between runs. The prior AFTER-fingerprint
+    is trusted only when it was recorded for the SAME ``plugin_dir`` by a
+    real, non-skipped, completed run; any other prior state (first run ever,
+    a locked/no-plugin-dir skip, a different plugin_dir, or a non-marketplace
+    layout that never computed one) falls back to a fresh full-tree hash so a
+    mismatch never silently hides a real change. Returns
+    ``(fingerprint, "cached" | "computed")`` -- the source tag is carried into
+    the status file purely for diagnosability (tests/`doctor` can see which
+    path a run took), never used to change behavior.
+    """
+    if (
+        not prior.get("skipped")
+        and prior.get("stage_done")
+        and prior.get("plugin_dir") == str(plugin_dir)
+        and isinstance(prior.get("fingerprint"), str)
+        and prior["fingerprint"]
+    ):
+        return prior["fingerprint"], "cached"
+    return fingerprint(plugin_dir), "computed"
+
+
 def stage(
     *,
     status: Path | None = None,
@@ -238,8 +314,10 @@ def stage(
     Steps (all safe w.r.t. the running Picker's venv):
       1. Single-flight: acquire the lock, else record ``skipped: locked``.
       2. Discover the marketplace payload dir (else ``skipped``).
-      3. Fingerprint -> ``copilot plugin update`` -> fingerprint; the diff is
-         ``plugin_changed`` (the shell apply runs the installer iff changed).
+      3. Fingerprint (reusing the prior run's AFTER-hash when trustworthy --
+         see :func:`_resolve_before_fingerprint`) -> ``copilot plugin
+         update`` -> fingerprint; the diff is ``plugin_changed`` (the shell
+         apply runs the installer iff changed).
       4. Pre-compute the cheap ``pre-launch`` staleness plan so the join can
          skip a redundant spawn when nothing is stale.
 
@@ -247,6 +325,7 @@ def stage(
     """
     status = status or status_path()
     lock = lock or lock_path()
+    prior = read_status(status)
     result: dict = {"stage_done": False, "ts": time.time()}
 
     if not acquire_lock(lock):
@@ -269,9 +348,11 @@ def stage(
         plugin_changed = False
         copilot_output = "skipped (non-marketplace layout)"
         if layout == "marketplace":
-            before = fingerprint(plugin_dir)
+            before, before_source = _resolve_before_fingerprint(prior, plugin_dir)
             ran, copilot_output = _run_copilot_update()
             after = fingerprint(plugin_dir) if ran else before
+            result["fingerprint"] = after
+            result["before_fingerprint_source"] = before_source
             plugin_changed = ran and (before != after)
 
         # Version-drift reconcile (#2826): the fingerprint diff above only
@@ -289,22 +370,25 @@ def stage(
             from . import reconcile
 
             payload_ver = reconcile.payload_version(plugin_dir)
-            runtime_root, context_selected = reconcile._selected_runtime_root(
-                "agent-worktrees", plugin_dir, home=home
+            installer_environment, runtime_root = (
+                reconcile.runtime_installer_environment(
+                    "agent-worktrees",
+                    plugin_dir,
+                    base={},
+                    home=home,
+                )
             )
             deployed_ver = reconcile.runtime_deployed_version(
                 "agent-worktrees", root=runtime_root
             )
             result["payload_version"] = payload_ver
             result["deployed_version"] = deployed_ver
-            if context_selected:
-                result["context_runtime_root"] = str(runtime_root)
-                result["runtime_apply_blocked"] = "installation-context-read-only"
-                plugin_changed = False
-            else:
-                venv_drift = bool(
-                    payload_ver and deployed_ver and payload_ver != deployed_ver
-                )
+            result["runtime_root"] = str(runtime_root)
+            result["environment"] = installer_environment
+            result["unset_environment"] = list(reconcile._RUNTIME_ENV_UNSET)
+            venv_drift = bool(
+                payload_ver and deployed_ver and payload_ver != deployed_ver
+            )
         except ValueError as error:
             result["venv_drift_error"] = str(error)
             result["runtime_apply_blocked"] = "installation-context-invalid"
@@ -361,6 +445,7 @@ def indicator_state(
     """Picker-facing update state for the version indicator (#1430).
 
     Returns one of:
+      "paused"    -- this launch explicitly disabled updates;
       "checking"  -- a background stage is in flight (live, fresh lock, or the
                      last stage recorded ``skipped: locked`` because a peer
                      stage owns the lock);
@@ -371,6 +456,9 @@ def indicator_state(
 
     Read-only and cheap (two small files); safe to poll on the render tick.
     """
+    if os.environ.get("WORKTREE_NO_UPDATE") == "1":
+        return "paused"
+
     lk = lock or lock_path()
     try:
         if lk.exists():
@@ -394,6 +482,18 @@ def indicator_state(
 def cmd_stage_update(args) -> int:
     """CLI: run one background staging pass (launcher backgrounds this)."""
     st = getattr(args, "status", None)
+    if getattr(args, "indicator_state", False):
+        payload = {
+            "version": 1,
+            "indicator_state": indicator_state(
+                status=Path(st) if st else None,
+            ),
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload))
+        else:
+            print(payload["indicator_state"])
+        return 0
     result = stage(status=Path(st) if st else None)
     if getattr(args, "json", False):
         print(json.dumps(result))

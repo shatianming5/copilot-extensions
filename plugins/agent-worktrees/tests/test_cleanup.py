@@ -11,6 +11,8 @@ import argparse
 import json
 import types
 
+import pytest
+
 import agent_worktrees.__main__ as m
 from agent_worktrees import cleanup, tracking
 from agent_worktrees import config as cfg
@@ -84,15 +86,34 @@ def test_reclaim_codespace_dry_run_reports_intent(monkeypatch):
 
 
 def test_reclaim_codespace_apply_success(monkeypatch):
-    monkeypatch.setattr(cleanup, "_run_codespaces", lambda *a, **k: _proc(0))
+    monkeypatch.setattr(
+        cleanup, "_run_codespaces",
+        lambda *a, **k: _proc(0, stdout=json.dumps(
+            {"reclaimed": True, "detail": "deleted CodeSpace cs-x"})))
     r = cleanup.reclaim_codespace("cs-x", apply=True)
     assert r.status == "reclaimed" and "deleted" in r.detail
+
+
+def test_reclaim_codespace_uses_claim_reclaim_not_legacy_delete(monkeypatch):
+    """claim-provider-pattern effort review finding: this must invoke the
+    provider's own claim-reclaim callback (lease guard + session-recovery
+    gate), not the legacy human-facing `delete ... --force` shape."""
+    captured = {}
+
+    def _run(args, **kw):
+        captured["args"] = args
+        return _proc(0, stdout=json.dumps(
+            {"reclaimed": True, "detail": "deleted CodeSpace cs-x"}))
+    monkeypatch.setattr(cleanup, "_run_codespaces", _run)
+    cleanup.reclaim_codespace("cs-x", apply=True)
+    assert captured["args"] == [("claim-reclaim", True), ("cs-x", False), ("--apply", True)]
 
 
 def test_reclaim_codespace_404_is_already_gone(monkeypatch):
     monkeypatch.setattr(
         cleanup, "_run_codespaces",
-        lambda *a, **k: _proc(1, stderr="HTTP 404: Not Found"))
+        lambda *a, **k: _proc(0, stdout=json.dumps(
+            {"reclaimed": True, "detail": "CodeSpace cs-x already gone"})))
     r = cleanup.reclaim_codespace("cs-x", apply=True)
     assert r.status == "reclaimed" and "already gone" in r.detail
 
@@ -100,9 +121,25 @@ def test_reclaim_codespace_404_is_already_gone(monkeypatch):
 def test_reclaim_codespace_real_failure_retains(monkeypatch):
     monkeypatch.setattr(
         cleanup, "_run_codespaces",
-        lambda *a, **k: _proc(1, stderr="HTTP 500: server exploded"))
+        lambda *a, **k: _proc(0, stdout=json.dumps(
+            {"reclaimed": False, "detail": "HTTP 500: server exploded"})))
     r = cleanup.reclaim_codespace("cs-x", apply=True)
     assert r.status == "failed" and "exploded" in r.detail
+
+
+def test_reclaim_codespace_callback_exits_nonzero(monkeypatch):
+    monkeypatch.setattr(
+        cleanup, "_run_codespaces",
+        lambda *a, **k: _proc(1, stderr="unexpected crash"))
+    r = cleanup.reclaim_codespace("cs-x", apply=True)
+    assert r.status == "failed" and "crash" in r.detail
+
+
+def test_reclaim_codespace_invalid_json_fails(monkeypatch):
+    monkeypatch.setattr(
+        cleanup, "_run_codespaces", lambda *a, **k: _proc(0, stdout="not json"))
+    r = cleanup.reclaim_codespace("cs-x", apply=True)
+    assert r.status == "failed" and "invalid JSON" in r.detail
 
 
 def test_reclaim_codespace_binstub_unavailable(monkeypatch):
@@ -114,6 +151,105 @@ def test_reclaim_codespace_binstub_unavailable(monkeypatch):
 def test_reclaim_codespace_empty_name(monkeypatch):
     r = cleanup.reclaim_codespace("", apply=True)
     assert r.status == "failed"
+
+
+# ── _run_codespaces: resolves via the claim-provider registry ───────────────
+# (claim-provider-pattern effort: no more ambient `shutil.which`)
+
+def test_run_codespaces_no_provider_registered(monkeypatch):
+    from agent_worktrees import claim_providers
+    monkeypatch.setattr(claim_providers, "discover_claim_providers",
+                        lambda *a, **k: ({}, ()))
+    assert cleanup._run_codespaces([("delete", True), ("cs-x", False), ("--force", True)]) is None
+
+
+def test_run_codespaces_uses_providers_reclaim_command(monkeypatch):
+    from agent_worktrees import claim_providers
+    provider = claim_providers.ClaimProviderManifest(
+        namespace="codespace", plugin="agent-codespaces@marketplace",
+        plugin_root="/x", reclaim_command=("agent-codespaces",))
+    monkeypatch.setattr(claim_providers, "discover_claim_providers",
+                        lambda *a, **k: ({"codespace": provider}, ()))
+    captured = {}
+
+    def _run(provider, *, callback_args, legacy_command, timeout, cwd=None):
+        captured["provider"] = provider.plugin
+        captured["callback_args"] = callback_args
+        captured["legacy_command"] = legacy_command
+        return _proc(0)
+    monkeypatch.setattr(claim_providers, "_run_provider_process", _run)
+    proc = cleanup._run_codespaces([("delete", True), ("cs-x", False), ("--force", True)])
+    assert proc.returncode == 0
+    assert captured == {
+        "provider": "agent-codespaces@marketplace",
+        "callback_args": ("delete", "cs-x", "--force"),
+        "legacy_command": ("agent-codespaces", "delete", "cs-x", "--force"),
+    }
+
+
+def test_run_codespaces_refuses_unsafe_name(monkeypatch):
+    """A CodeSpace name containing a cmd.exe metacharacter must never reach
+    the resolved argv (claim-provider-pattern effort review finding)."""
+    from agent_worktrees import claim_providers
+    provider = claim_providers.ClaimProviderManifest(
+        namespace="codespace", plugin="agent-codespaces@marketplace",
+        plugin_root="/x", reclaim_command=("agent-codespaces",))
+    monkeypatch.setattr(claim_providers, "discover_claim_providers",
+                        lambda *a, **k: ({"codespace": provider}, ()))
+    called = {"n": 0}
+    monkeypatch.setattr(cleanup.subprocess, "run",
+                        lambda *a, **k: called.__setitem__("n", 1))
+    proc = cleanup._run_codespaces([("delete", True), ("cs-x&whoami", False), ("--force", True)])
+    assert proc is None
+    assert called["n"] == 0
+
+
+def test_run_codespaces_still_invokes_with_a_namespaced_cell_context(monkeypatch):
+    """Explicit-context calls must rebind through peer-launch."""
+    from agent_worktrees import claim_providers
+    provider = claim_providers.ClaimProviderManifest(
+        namespace="codespace", plugin="agent-codespaces@marketplace",
+        plugin_root="/x", reclaim_command=("agent-codespaces",))
+    monkeypatch.setattr(claim_providers, "discover_claim_providers",
+                        lambda *a, **k: ({"codespace": provider}, ()))
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", "agent-worktrees@copilot-extensions")
+    monkeypatch.setattr(claim_providers.peer_launch_adapter, "explicit_context", lambda: True)
+    captured = {}
+
+    def _run(peer, *args, **kw):
+        captured["peer"] = peer
+        captured["args"] = args
+        captured["timeout"] = kw.get("timeout")
+        return _proc(0)
+
+    monkeypatch.setattr(cleanup.subprocess, "run", lambda *a, **k: pytest.fail("legacy fallback used"))
+    monkeypatch.setattr(claim_providers.peer_launch_adapter, "run", _run)
+    proc = cleanup._run_codespaces([("delete", True), ("cs-x", False), ("--force", True)])
+    assert proc.returncode == 0
+    assert captured == {
+        "peer": "agent-codespaces",
+        "args": ("delete", "cs-x", "--force"),
+        "timeout": 660.0,
+    }
+
+
+def test_run_codespaces_refusal_does_not_fallback_to_legacy(monkeypatch):
+    from agent_worktrees import claim_providers
+
+    provider = claim_providers.ClaimProviderManifest(
+        namespace="codespace", plugin="agent-codespaces@marketplace",
+        plugin_root="/x", reclaim_command=("agent-codespaces",))
+    monkeypatch.setattr(claim_providers, "discover_claim_providers",
+                        lambda *a, **k: ({"codespace": provider}, ()))
+    monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", "explicit")
+    monkeypatch.setattr(claim_providers.peer_launch_adapter, "explicit_context", lambda: True)
+    monkeypatch.setattr(
+        claim_providers.peer_launch_adapter,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(claim_providers.peer_launch_adapter.ContextRefused("refused")),
+    )
+    monkeypatch.setattr(cleanup.subprocess, "run", lambda *a, **k: pytest.fail("legacy fallback used"))
+    assert cleanup._run_codespaces([("delete", True), ("cs-x", False), ("--force", True)]) is None
 
 
 # ── reclaim_worktree ─────────────────────────────────────────────────────────
@@ -209,7 +345,7 @@ def test_reclaim_worktree_falls_back_to_global_repo_registry(
     monkeypatch.setattr(
         cleanup.tracking, "load_orphaned_obligations_strict",
         lambda project=None: [])
-    r = cleanup.reclaim_worktree("m/dev.tmichon/child", _config(), apply=True)
+    r = cleanup.reclaim_worktree("m/dev.operator/child", _config(), apply=True)
     assert r.status == "reclaimed"
     assert seen["cwd"] == str(anchor)
 
@@ -261,7 +397,8 @@ def test_reclaim_orphan_unknown_kind_unsupported():
 
 
 def test_reclaim_orphan_codespace_dispatches(monkeypatch):
-    monkeypatch.setattr(cleanup, "_run_codespaces", lambda *a, **k: _proc(0))
+    monkeypatch.setattr(cleanup, "_run_codespaces",
+                        lambda *a, **k: _proc(0, stdout=json.dumps({"reclaimed": True})))
     entry = {"kind": "codespace", "ref": "cs-x", "machine": "m"}
     r = cleanup.reclaim_orphan(entry, _config(machine="m"), apply=True)
     assert r.status == "reclaimed"
@@ -282,7 +419,8 @@ def test_cleanup_dry_run_does_not_remove(tmp_path, monkeypatch):
     _seed_project(tmp_path, monkeypatch)
     tracking.rehome_abandoned_obligations(
         [_claim("codespace", "cs-a")], source_worktree="wt", config=_config())
-    monkeypatch.setattr(cleanup, "_run_codespaces", lambda *a, **k: _proc(0))
+    monkeypatch.setattr(cleanup, "_run_codespaces",
+                        lambda *a, **k: _proc(0, stdout=json.dumps({"reclaimed": True})))
     rows = cleanup.cleanup_orphanage(_config(), apply=False)
     assert rows[0]["status"] == "reclaimed"
     # dry-run: registry untouched.
@@ -297,8 +435,9 @@ def test_cleanup_apply_removes_only_reclaimed(tmp_path, monkeypatch):
         source_worktree="wt", config=_config())
 
     def _fake(args, **k):
-        name = args[1]
-        return _proc(0) if name == "cs-good" else _proc(1, stderr="HTTP 500")
+        name = args[1][0]
+        return (_proc(0, stdout=json.dumps({"reclaimed": True})) if name == "cs-good"
+                else _proc(1, stderr="HTTP 500"))
     monkeypatch.setattr(cleanup, "_run_codespaces", _fake)
 
     rows = cleanup.cleanup_orphanage(_config(), apply=True)
@@ -323,7 +462,8 @@ def test_cleanup_selects_exact_ref_or_source_worktree(tmp_path, monkeypatch):
     tracking.rehome_abandoned_obligations(
         [_claim("codespace", "cs-c")],
         source_worktree="owner-b", config=_config())
-    monkeypatch.setattr(cleanup, "_run_codespaces", lambda *a, **k: _proc(0))
+    monkeypatch.setattr(cleanup, "_run_codespaces",
+                        lambda *a, **k: _proc(0, stdout=json.dumps({"reclaimed": True})))
 
     by_ref = cleanup.cleanup_orphanage(
         _config(), apply=True, selectors={"cs-a"})
@@ -347,13 +487,19 @@ def test_claims_cleanup_verb_json(tmp_path, monkeypatch, capfd):
     monkeypatch.setattr(cfg, "load_config", lambda: _config())
     tracking.rehome_abandoned_obligations(
         [_claim("codespace", "cs-a")], source_worktree="wt", config=_config())
-    monkeypatch.setattr(cleanup, "_run_codespaces", lambda *a, **k: _proc(0))
+    monkeypatch.setattr(cleanup, "_run_codespaces",
+                        lambda *a, **k: _proc(0, stdout=json.dumps({"reclaimed": True})))
+    logged = []
+    monkeypatch.setattr(m.activity, "log_event", lambda *a, **k: logged.append((a, k)))
     rc = m.cmd_claims(_cleanup_args(apply=True, json_=True))
     assert rc == 0
     out = json.loads(capfd.readouterr().out)
     assert out["applied"] is True and out["reclaimed"] == 1
     assert out["results"][0]["ref"] == "cs-a"
     assert tracking.load_orphaned_obligations() == []
+    assert logged == [(("claim_reclaimed",), {
+        "worktree_id": "wt", "kind": "codespace", "ref": "cs-a",
+        "handoff_to": ""})]
 
 
 def test_claims_cleanup_verb_empty_text(tmp_path, monkeypatch, capfd):
@@ -370,7 +516,8 @@ def test_claims_cleanup_verb_passes_selectors(tmp_path, monkeypatch, capfd):
     tracking.rehome_abandoned_obligations(
         [_claim("codespace", "cs-a"), _claim("codespace", "cs-b")],
         source_worktree="owner", config=_config())
-    monkeypatch.setattr(cleanup, "_run_codespaces", lambda *a, **k: _proc(0))
+    monkeypatch.setattr(cleanup, "_run_codespaces",
+                        lambda *a, **k: _proc(0, stdout=json.dumps({"reclaimed": True})))
     rc = m.cmd_claims(_cleanup_args(
         apply=True, json_=True, selectors=["cs-a"]))
     assert rc == 0

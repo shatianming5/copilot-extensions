@@ -14,7 +14,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ENGINE_URL = "http://127.0.0.1:8421"
+DEFAULT_ENGINE_URL = "http://127.0.0.1:8421"  # marketplace-isolation: allow legacy-compatibility
 
 # Generous timeout for embedding — model loading can take 20+ seconds on
 # first call, and a full batch takes time on a slow/CPU embed path. The read
@@ -165,11 +165,13 @@ class EngineClient:
         except httpx.ConnectError:
             return {
                 "status": "unreachable",
+                "generation": None,
                 "gpu_deps_installed": False,
                 "model_loaded": False,
                 "model_name": None,
                 "device": None,
                 "cuda_available": None,
+                "python_executable": None,
                 "detail": f"Engine not reachable at {self._base_url}",
             }
 

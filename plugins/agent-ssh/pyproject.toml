@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-ssh"
-version = "0.1.0-dev65"
+version = "0.1.29-dev3"
 description = "SSH profile emitter, verifier, and transport-provider contract for the agent fabric"
 readme = "README.md"
 license = "MIT"
@@ -14,16 +14,50 @@ authors = [
 ]
 dependencies = [
     "pyyaml>=6.0.3",
+    "agent-ssh-manager",
+    "agent-venue-copilot",
+    "agent-zdd",
     "agent-procutil",
     "agent-dropin-registry",
+    "agent-remote-login-shell",
 ]
 
 [tool.uv.sources]
-# Shared Windows-headless / detached process-spawn kwargs, vendored per plugin
-# (byte-identical src across copies; see tools/check-vendored-libs-sync.py).
+# Shared Windows-headless / detached process-spawn kwargs. This is a
+# `uv`-editable canonical reference (vendor-pointer-generalization effort,
+# Phase 1 -- converted early as a prerequisite for `ssh-manager`'s own
+# conversion, which depends on it): `path` escapes this plugin's own root
+# and resolves live to `libs/agent-procutil`, so this `dev`-branch
+# checkout has nothing to keep manually in sync -- only a real
+# `main`-branch release (tools/materialize_main.py) ever gets a real
+# local copy.
 agent-procutil = { path = "libs/agent-procutil" }
 # Tri-state managed-fragment scans and bounded operational warnings.
 agent-dropin-registry = { path = "libs/dropin-registry" }
+# Shared OpenSSH process/config primitives. This is a `uv`-editable
+# canonical reference (vendor-pointer-generalization effort, Phase 1):
+# `path` escapes this plugin's own root and resolves live to
+# `libs/ssh-manager`, so this `dev`-branch checkout has nothing to keep
+# manually in sync -- only a real `main`-branch release
+# (tools/materialize_main.py) ever gets a real local copy.
+agent-ssh-manager = { path = "libs/ssh-manager" }
+# Provider-agnostic detached CLI-mode reservation/launch helpers. This is
+# a `uv`-editable canonical reference (vendor-pointer-generalization
+# effort, Phase 1): `path` escapes this plugin's own root and resolves
+# live to `libs/venue-copilot`, so this `dev`-branch checkout has nothing
+# to keep manually in sync -- only a real `main`-branch release
+# (tools/materialize_main.py) ever gets a real local copy.
+agent-venue-copilot = { path = "libs/venue-copilot" }
+# Routing-table reader used by venue-copilot for host bridge discovery.
+agent-zdd = { path = "libs/zdd" }
+# Shared POSIX login-shell command wrapping for remote SSH exec (module
+# ``remote_login_shell``, copilot-extensions#5207). This is a `uv`-editable
+# canonical reference (vendor-pointer-generalization effort, Phase 1): `path`
+# escapes this plugin's own root and resolves live to
+# `libs/remote-login-shell`, so this `dev`-branch checkout has nothing to
+# keep manually in sync -- only a real `main`-branch release
+# (tools/materialize_main.py) ever gets a real local copy.
+agent-remote-login-shell = { path = "libs/remote-login-shell" }
 
 [project.scripts]
 agent-ssh = "agent_ssh.__main__:main"

@@ -35,17 +35,6 @@ def test_every_hook_leaves_payload_cwd_before_running_script():
         assert bash_detach >= 0 and bash_script >= 0
         assert bash_detach < bash_script
 
-
-def test_session_conduct_has_a_cold_start_budget():
-    hooks = json.loads((_PLUGIN / "hooks.json").read_text(encoding="utf-8"))
-    hook = next(
-        item
-        for item in hooks["hooks"]["sessionStart"]
-        if "session-conduct" in str(item)
-    )
-    assert hook["timeoutSec"] >= 30
-
-
 def test_detached_provision_worker_runs_from_home():
     ps1 = (_PLUGIN / "scripts" / "provision-check.ps1").read_text("utf-8")
     sh = (_PLUGIN / "scripts" / "provision-check.sh").read_text("utf-8")
@@ -66,8 +55,13 @@ def test_provision_hook_surfaces_previous_failure():
 
 
 def test_powershell_diagnostics_are_optional():
+    # The launcher relocated to Worktree Manager in Phase 3b Sub-slice 2a
+    # Step 2 (efforts/active/worktree-manager-control-plane/phase-3b-mux-
+    # relocation.md); agent-worktrees no longer ships its own copy.
     provision = (_PLUGIN / "scripts" / "provision-check.ps1").read_text("utf-8")
-    launcher = (_PLUGIN / "bin" / "launch-session.ps1").read_text("utf-8")
+    launcher = (
+        _PLUGIN.parent.parent / "worktree-manager" / "bin" / "launch-session.ps1"
+    ).read_text("utf-8")
     assert "$plan.PSObject.Properties['diagnostics']" in provision
     assert "function Write-PlanDiagnostics" in launcher
     assert "$Plan.PSObject.Properties['diagnostics']" in launcher

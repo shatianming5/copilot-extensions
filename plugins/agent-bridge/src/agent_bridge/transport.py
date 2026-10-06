@@ -26,7 +26,7 @@ from agent_procutil import no_window_flags
 from ssh_manager import SSHProfileSource, get_default_manager
 
 from .connect import ConnectError, ConnectStage, ConnectTracker
-from .procgroup import safe_killpg
+from .procgroup import safe_killpg, terminate_windows_tree
 from .relay_state import get_live_relay_port
 
 log = logging.getLogger("agent-bridge")
@@ -101,6 +101,8 @@ class SpawnTarget:
     copilot_args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     project: str | None = None  # agent-worktrees project (binstub name)
+    explicit_cwd: bool = False  # caller supplied cwd; do not resolve/create a
+    #                              second checkout through the project transport
     ssh_shell: str | None = None  # remote shell (e.g. "pwsh", "bash")
     worktree_id: str | None = None  # resume a specific worktree
     caller_worktree: str | None = None  # #2178: caller worktree that requested a
@@ -127,6 +129,10 @@ class SpawnTarget:
     #                            Persisted unchanged so the bridge never invents
     #                            a parallel venue identity.
     auth_hooks: list[dict] = field(default_factory=list)  # serializable auth hook dicts
+    mcp_servers: list[dict[str, Any]] = field(default_factory=list)
+    #   Copied from the resolved AgentConfig.mcp_servers (see agent_registry.py)
+    #   at resolve time. A per-session request-level ``mcp_servers`` still
+    #   overrides this -- see routes/sessions.py's ``start_session``.
 
     def to_json(self) -> str:
         """Serialize for DB persistence."""
@@ -178,16 +184,7 @@ class AgentProcess:
             return
         pid = self.proc.pid
         if sys.platform == "win32":
-            try:
-                killer = await asyncio.create_subprocess_exec(
-                    "taskkill", "/PID", str(pid), "/T", "/F",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                async with asyncio.timeout(5):
-                    await killer.wait()
-            except (TimeoutError, OSError, ProcessLookupError):
-                pass
+            await terminate_windows_tree(self.proc)
         else:
             # POSIX: the agent spawns use start_new_session, so the child is a
             # process-group leader -- signal the whole group. Guard against
@@ -305,6 +302,20 @@ def _wrap_batch_for_windows(
     return args
 
 
+def _agent_worktrees_root() -> str:
+    """The agent-worktrees runtime root, honoring ``AGENT_RT_ROOT``.
+
+    The standard cross-plugin resolution override every plugin's own
+    ``resolve-runtime.ps1``/``resolve-runtime.sh`` honors; defaulting here too
+    keeps every consumer of the runtime root (the interpreter resolver below,
+    and the legacy ``lib/`` PYTHONPATH compatibility shim) consistent with an
+    active override instead of only the interpreter lookup respecting it.
+    """
+    return os.environ.get("AGENT_RT_ROOT") or os.path.join(
+        os.path.expanduser("~"), ".agent-worktrees"
+    )
+
+
 def _agent_worktrees_python() -> str:
     """Absolute path to the agent-worktrees runtime interpreter.
 
@@ -315,8 +326,15 @@ def _agent_worktrees_python() -> str:
     back to the newest ``versions/`` slot, then -- best-effort, for un-migrated
     hosts -- the legacy ``.venv``. Raises ``RuntimeError`` when no interpreter is
     found.
+
+    Honors ``AGENT_RT_ROOT`` as the runtime-root override (see
+    :func:`_agent_worktrees_root`), exactly as ``resolve-runtime.ps1``/
+    ``resolve-runtime.sh`` do -- the standard cross-plugin resolution signal,
+    so a machine using a non-default agent-worktrees install location resolves
+    consistently everywhere, rather than only via a hardcoded
+    ``~/.agent-worktrees`` default.
     """
-    root = os.path.join(os.path.expanduser("~"), ".agent-worktrees")
+    root = _agent_worktrees_root()
     rel = ("Scripts", "python.exe") if sys.platform == "win32" else ("bin", "python")
 
     # Preferred: the current-version marker.
@@ -371,20 +389,17 @@ async def _resolve_worktree(
     python = _agent_worktrees_python()
 
     # Clear VIRTUAL_ENV/PYTHONHOME so the bridge's own venv doesn't pollute the
-    # agent-worktrees subprocess (they may use different Python versions), and set
-    # WORKTREE_PROJECT so it resolves the right project config. The versioned
-    # runtime bundles its own site-packages, so no PYTHONPATH is needed; a legacy
-    # host that still carries ~/.agent-worktrees/lib gets it for compatibility.
+    # agent-worktrees subprocess (they may use different Python versions). The
+    # versioned runtime bundles its own site-packages, so no PYTHONPATH is needed;
+    # a legacy host that still carries ~/.agent-worktrees/lib gets it for
+    # compatibility.
     env = dict(env)
-    _aw_lib = os.path.join(os.path.expanduser("~"), ".agent-worktrees", "lib")
+    _aw_lib = os.path.join(_agent_worktrees_root(), "lib")
     if os.path.isdir(_aw_lib):
         env["PYTHONPATH"] = _aw_lib
     env["PYTHONUTF8"] = "1"
     env.pop("VIRTUAL_ENV", None)
     env.pop("PYTHONHOME", None)
-    if target.project:
-        env["WORKTREE_PROJECT"] = target.project
-
     # Pass the project as the global --project flag (before the subcommand).
     # agent-worktrees resolves the project from cwd or --project ONLY -- the
     # ambient $WORKTREE_PROJECT identity fallback was retired (cwd-resolution
@@ -392,7 +407,7 @@ async def _resolve_worktree(
     # inside the target repo, so without --project it fails "could not resolve a
     # project".
     base_args = [python, "-m", "agent_worktrees"]
-    if target.project:
+    if target.project and not target.explicit_cwd:
         base_args += ["--project", target.project]
     base_args += ["resolve", "--json", "--no-resume"]
     creating_new = not target.worktree_id
@@ -491,10 +506,11 @@ class RemoteProjectNotProvisioned(RuntimeError):
 
     Distinguishes an **unprovisioned project** (the remote ``<project>``
     worktree binstub does not exist on the target -- so the resolve command is
-    a shell "command not found") from a *generic* resolve failure. The former
-    must fail loud (#757): degrading to a direct ``--new`` launch there only
-    produces a misleading ``LAUNCH_ACP: Connection closed`` downstream, whereas
-    a generic failure can still legitimately fall back.
+    a shell "command not found") from a *generic* resolve failure. Every
+    resolve failure -- unprovisioned project or otherwise -- fails loud:
+    degrading to a direct ``--new`` launch in an unmanaged cwd only produces a
+    misleading ``LAUNCH_ACP: Connection closed`` (or ACP handshake timeout)
+    downstream, whichever kind of resolve failure caused it.
     """
 
 
@@ -557,8 +573,8 @@ async def _resolve_worktree_remote(
     in case a remote shell prepends banner noise.
 
     Returns the parsed plan dict. Raises ``RuntimeError`` on failure; the
-    caller treats failure as non-fatal (falls back to a direct ``--new``
-    launch).
+    caller fails the whole connect attempt rather than falling back to a
+    direct ``--new`` launch in an unmanaged cwd.
     """
     if not target.project:
         raise RuntimeError("remote resolve requires target.project")
@@ -691,7 +707,7 @@ async def resolve_local_launch(
     env.pop("PYTHONHOME", None)
     env.update(target.env)
 
-    if target.project:
+    if target.project and not target.explicit_cwd:
         # Stage 6: create/resume the worktree. Failures propagate (no retry).
         with tracker.stage(ConnectStage.WORKTREE, f"project={target.project}"):
             plan = await _resolve_worktree(target, env)
@@ -714,8 +730,8 @@ async def resolve_local_launch(
         # Merge plan environment into the process env
         env.update(plan_env)
 
-        # Append ACP protocol args + any extra copilot args
-        args = cmd + ["--acp", "--stdio"] + target.copilot_args
+        # --no-auto-update pins the child to the installed build (no silent CLI updates).
+        args = cmd + ["--acp", "--stdio", "--no-auto-update"] + target.copilot_args
         log.info(
             "Resolved copilot launch from worktree plan: %s (cwd=%s, worktree=%s)",
             " ".join(args), work_dir, worktree_id,
@@ -724,7 +740,7 @@ async def resolve_local_launch(
         if not target.cwd:
             raise ValueError("Local agent without 'project' requires 'cwd'")
         copilot = target.copilot_path or _find_copilot()
-        args = [copilot, "--acp", "--stdio"] + target.copilot_args
+        args = [copilot, "--acp", "--stdio", "--no-auto-update"] + target.copilot_args
         work_dir = target.cwd
         log.info("Resolved local agent launch: %s (cwd=%s)", " ".join(args), work_dir)
 
@@ -799,7 +815,7 @@ def _build_remote_cmd(target: SpawnTarget, session_id: str = "") -> str:
     copilot = target.copilot_path or "copilot"
     breadcrumb = _breadcrumb_prelude(session_id)
 
-    if target.project:
+    if target.project and not target.explicit_cwd:
         # ``--json`` marks the launch as non-interactive: it forces the
         # binstub's ``resolve`` step to skip the TTY picker and resolve the
         # worktree deterministically (by ``--worktree-id`` or ``--new``).
@@ -812,12 +828,12 @@ def _build_remote_cmd(target: SpawnTarget, session_id: str = "") -> str:
             binstub_args = [
                 target.project, "--json", "--worktree-id", target.worktree_id,
                 "--no-mux", "--no-update", "--no-resume",
-                "--", "--acp", "--stdio",
+                "--", "--acp", "--stdio", "--no-auto-update",
             ]
         else:
             binstub_args = [
                 target.project, "--json", "--new", "--no-mux", "--no-update",
-                "--", "--acp", "--stdio",
+                "--", "--acp", "--stdio", "--no-auto-update",
             ]
         if target.copilot_args:
             binstub_args.extend(target.copilot_args)
@@ -886,7 +902,7 @@ def _build_remote_cmd(target: SpawnTarget, session_id: str = "") -> str:
     if target.env:
         for k, v in target.env.items():
             parts.append(f"export {k}={shlex.quote(v)}")
-    copilot_cmd = f"exec {shlex.quote(copilot)} --acp --stdio"
+    copilot_cmd = f"exec {shlex.quote(copilot)} --acp --stdio --no-auto-update"
     if target.copilot_args:
         copilot_cmd += " " + " ".join(shlex.quote(a) for a in target.copilot_args)
     parts.append(copilot_cmd)
@@ -1076,43 +1092,53 @@ async def spawn_ssh(
     # bridge's session<->worktree linkage (managed/live state, duplicate NF
     # cards). ``resolve --new`` creates the worktree; _build_remote_cmd then
     # takes its resume branch (--worktree-id) so the binstub launches into the
-    # just-created worktree (no second worktree). If resolve fails, keep the
-    # legacy direct --new launch path but surface the failure as a connection
-    # checkpoint and probe the target for an existing cwd so ACP validation does
-    # not fail on a templated, non-existent home directory.
-    if target.project and (not target.worktree_id or not target.cwd):
+    # just-created worktree (no second worktree).
+    #
+    # A resolve failure, or a resolve that returns an incomplete plan (missing
+    # either ``worktree_id`` or ``work_dir``), fails the whole connect attempt
+    # (see below) instead of degrading to a direct launch in an unmanaged,
+    # non-worktree directory -- a degraded launch there just fails a second
+    # time with an unrelated-looking error (an immediate "Connection closed",
+    # or an ACP handshake timeout), hiding the real stage-6 cause. The plan's
+    # ``worktree_id``/``work_dir`` are authoritative over any pre-populated
+    # ``target.cwd`` (e.g. a static ``cwd:`` carried from agent config): a
+    # stale or unrelated configured cwd must never silently substitute for the
+    # just-resolved worktree checkout.
+    if (
+        target.project
+        and not target.explicit_cwd
+        and (not target.worktree_id or not target.cwd)
+    ):
         tracker.started(ConnectStage.WORKTREE, f"resolve project={target.project}")
         try:
             plan = await _resolve_worktree_remote(manager, target)
             launch = plan.get("launch", plan)
             wt_id = launch.get("worktree_id")
             work_dir = launch.get("work_dir")
-            if wt_id:
-                target.worktree_id = wt_id
-            if work_dir and not target.cwd:
-                target.cwd = work_dir
-            if not target.cwd:
-                fallback = await _resolve_remote_existing_cwd(manager, target)
-                if fallback:
-                    target.cwd = fallback
-                    log.warning(
-                        "Remote worktree resolve for %s returned no cwd; "
-                        "using verified fallback cwd=%s",
-                        target.host, fallback,
-                    )
+            if not wt_id or not work_dir:
+                msg = (
+                    f"remote worktree resolve for {target.host} succeeded but "
+                    f"returned an incomplete plan (worktree_id={wt_id!r}, "
+                    f"work_dir={work_dir!r})"
+                )
+                tracker.failed(ConnectStage.WORKTREE, msg, retryable=False)
+                raise ConnectError(ConnectStage.WORKTREE, msg, retryable=False)
+            target.worktree_id = wt_id
+            target.cwd = work_dir
             log.info(
                 "Bound remote worktree for %s: id=%s cwd=%s",
                 target.host, wt_id, target.cwd,
             )
             tracker.reached(
                 ConnectStage.WORKTREE,
-                f"worktree={target.worktree_id or '(unbound)'} cwd={target.cwd or '(none)'}",
+                f"worktree={target.worktree_id} cwd={target.cwd}",
             )
         except RemoteProjectNotProvisioned as exc:
-            # Fail loud, do NOT degrade (#757). Degrading to a direct --new
-            # launch when the project isn't provisioned only surfaces later as a
-            # misleading `LAUNCH_ACP: Connection closed`, hiding the real cause.
-            # Raise a clear, staged error naming the project + host instead.
+            # Fail loud, do NOT degrade. Degrading to a direct --new launch
+            # when the project isn't provisioned only surfaces later as a
+            # misleading `LAUNCH_ACP: Connection closed`, hiding the real
+            # cause. Raise a clear, staged error naming the project + host
+            # instead.
             msg = (
                 f"{exc}. Provision {target.project!r} on {target.host!r}, or "
                 f"dispatch from a context whose project is provisioned there "
@@ -1123,24 +1149,24 @@ async def spawn_ssh(
             raise ConnectError(
                 ConnectStage.WORKTREE, msg, retryable=False, cause=exc,
             ) from exc
-        except Exception as exc:  # noqa: BLE001 -- non-fatal, see above
-            detail = (
-                f"remote worktree resolve failed for {target.host}: {exc}; "
-                "falling back to direct launch"
-            )
-            log.warning("%s", detail)
-            if not target.cwd:
-                fallback = await _resolve_remote_existing_cwd(manager, target)
-                if fallback:
-                    target.cwd = fallback
-                    detail += f" with verified cwd={fallback}"
-                    log.warning(
-                        "Using verified remote fallback cwd for %s: %s",
-                        target.host, fallback,
-                    )
-                else:
-                    detail += "; no verified cwd available"
-            tracker.failed(ConnectStage.WORKTREE, detail, retryable=False)
+        except ConnectError:
+            # Already staged + tagged above (the incomplete-plan case);
+            # propagate as-is instead of letting the generic handler below
+            # re-wrap it.
+            raise
+        except Exception as exc:  # noqa: BLE001 -- staged + re-raised below
+            # Fail loud here too, uniformly, rather than narrowly scoped to
+            # "unprovisioned project" only. A generic resolve failure must not
+            # launch ACP directly in a bare, unmanaged cwd -- that degraded
+            # launch never actually recovers; it just fails a second time
+            # with an unrelated-looking error (an immediate "Connection
+            # closed", or an ACP handshake timeout), hiding the real stage-6
+            # cause.
+            msg = f"remote worktree resolve failed for {target.host}: {exc}"
+            tracker.failed(ConnectStage.WORKTREE, msg, retryable=False)
+            raise ConnectError(
+                ConnectStage.WORKTREE, msg, retryable=False, cause=exc,
+            ) from exc
 
     # Stages 5-7 happen remotely inside the binstub; the device breadcrumb
     # (in the remote command) is the on-device proof of arrival.
@@ -1169,18 +1195,33 @@ async def spawn(
     return await spawn_local(target, tracker=tracker, session_id=session_id)
 
 
+_AGENT_CONTAINERS_PROVIDER = "agent-containers"
+
+
+def _is_agent_containers_target(target: SpawnTarget) -> bool:
+    """Whether ``target`` is an ``agent-containers``-backed command target.
+
+    Trusted fleets carry ``target.container`` metadata directly; restricted
+    fleets reach ``spawn_raw`` the same way but deliberately omit it,
+    identifying themselves only via ``venue.provider`` instead -- so both
+    must be checked (``agent_containers.resolver.ContainerResolver
+    .resolve_spec``, the ``if not restricted:`` branch around ``spec
+    ["container"]``).
+    """
+    if target.container is not None:
+        return True
+    venue = target.venue if isinstance(target.venue, dict) else {}
+    return venue.get("provider") == _AGENT_CONTAINERS_PROVIDER
+
+
 async def spawn_raw(
     target: SpawnTarget,
     *,
     tracker: ConnectTracker | None = None,
     session_id: str = "",
 ) -> AgentProcess:
-    """Spawn an ACP agent via a raw command.
-
-    Used for provider agents that handle their own transport (e.g.
-    agent-codespaces wraps SSH connection and copilot launch internally).
-    The command is expected to speak ACP protocol on stdin/stdout.
-    """
+    """Spawn an ACP agent via a raw command (provider agents that handle
+    their own transport, e.g. agent-codespaces wraps SSH + copilot launch)."""
     if not target.spawn_command:
         raise ValueError("Command target requires spawn_command")
 
@@ -1213,6 +1254,15 @@ async def spawn_raw(
     env.update(target.env)
 
     spawn_command = _reresolve_stale_interpreter(list(target.spawn_command))
+    if _is_agent_containers_target(target) and target.copilot_args:
+        # Forwarded via env, not trailing argv: on Windows the wrapper is
+        # often a `.cmd` shim that `_wrap_batch_for_windows` below routes
+        # through `cmd.exe`, which reparses metacharacters in argv but
+        # passes the environment block through untouched -- so this is the
+        # only reparsing-safe channel regardless of which binstub a given
+        # install resolves to. `agent-containers exec`'s own CLI reads this
+        # var (see AGENT_CONTAINERS_EXEC_COPILOT_ARGS in its resolver.py).
+        env["AGENT_CONTAINERS_EXEC_COPILOT_ARGS"] = json.dumps(target.copilot_args)
     args = _wrap_batch_for_windows(spawn_command, env)
     log.info("Spawning command agent: %s", " ".join(args))
 

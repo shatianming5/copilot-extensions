@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import time
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote
 
-from ..pr_contract import Comment, CommentThread, PRSnapshot, Review, ThreadsResult
+from ..pr_contract import Comment, CommentThread, PRDiff, PRSnapshot, Review, ThreadsResult
 from .base import ProviderError, PRScope, PullResult, run_cli
 
 # HTTP statuses (plus the synthetic 0 = curl-level failure) worth retrying when
@@ -37,10 +39,44 @@ def _is_transient(status: int) -> bool:
     return status in _TRANSIENT_LABEL_HTTP or status >= 500
 
 
+#: Gitea's ``permissions`` object on ``GET /repos/{owner}/{repo}`` is
+#: admin/push/pull booleans for the *authenticated* identity. Highest-to-lowest
+#: so one true bit wins; ``push`` is Gitea's name for write access, matching
+#: ``actor_merge_authority``'s ``"write"`` token.
+_GITEA_PERMISSION_PRIORITY = ("admin", "push", "pull")
+_GITEA_PERMISSION_TOKEN = {"admin": "admin", "push": "write", "pull": "read"}
+
+
+def _gitea_viewer_permission(permissions: object) -> str:
+    """Normalize Gitea's ``permissions`` object to a merge-authority token.
+
+    Returns ``""`` when missing/malformed or every bit is false (an
+    authenticated read of a visible repo always has at least ``pull`` true, so
+    all-false means the field wasn't populated -- unknown, not a confident
+    "none"). A bit must be the actual boolean ``True`` -- a malformed payload
+    with e.g. ``"push": "false"`` (a truthy string) must never normalize to
+    write access.
+    """
+    if not isinstance(permissions, dict):
+        return ""
+    for bit in _GITEA_PERMISSION_PRIORITY:
+        if permissions.get(bit) is True:
+            return _GITEA_PERMISSION_TOKEN[bit]
+    return ""
+
+
 class GiteaProvider:
     """Open + query pull requests on a Gitea instance via curl."""
 
     name = "gitea"
+
+    # find_pull_by_head's state=all pagination bound (#2146 healing): caps the
+    # worst case (a very old/prolific repo with no match) rather than paging
+    # forever.
+    _HEAD_SEARCH_MAX_PAGES = 20
+
+    def authority_endpoint(self, api_base: str = "") -> str:
+        return (api_base or "").rstrip("/")
 
     def _api(self, api_base: str, path: str) -> str:
         base = (api_base or "").rstrip("/")
@@ -406,6 +442,73 @@ class GiteaProvider:
             base_ref=str((data.get("base") or {}).get("ref", "")),
         )
 
+    def observe_head(
+        self, repo: str, number: int, *, api_base: str = "", token: str | None = None
+    ) -> PullResult:
+        """Read the exact head and the Gitea server's HTTP ``Date`` together."""
+        if not token:
+            raise ProviderError("Gitea provider needs a token to observe a PR head.")
+        url = self._api(api_base, f"/repos/{repo}/pulls/{number}")
+        proc = run_cli([
+            "curl", "-sS", "-X", "GET", url,
+            "-H", f"Authorization: token {token}",
+            "-H", "Accept: application/json",
+            "-w", "\n%header{date}\n%{http_code}",
+        ])
+        if proc.returncode != 0:
+            raise ProviderError(
+                f"curl failed observing Gitea PR #{number}: "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        parts = proc.stdout.rsplit("\n", 2)
+        if len(parts) != 3:
+            raise ProviderError(f"Gitea PR #{number} observation was malformed.")
+        body, date_header, status_text = parts
+        try:
+            status = int(status_text.strip())
+        except ValueError as exc:
+            raise ProviderError(
+                f"Gitea PR #{number} observation had no HTTP status."
+            ) from exc
+        if status != 200:
+            raise ProviderError(f"Gitea PR #{number} lookup failed (HTTP {status}).")
+        try:
+            data = json.loads(body)
+            observed_at = parsedate_to_datetime(date_header.strip()).isoformat()
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ProviderError(
+                f"Gitea PR #{number} observation lacked valid server evidence."
+            ) from exc
+        return PullResult(
+            number=int(data.get("number", number)),
+            head_sha=str((data.get("head") or {}).get("sha", "")),
+            observed_at=observed_at,
+        )
+
+    def publish_source_marker(
+        self,
+        repo: str,
+        number: int,
+        marker: str,
+        *,
+        api_base: str = "",
+        token: str | None = None,
+    ) -> str:
+        if not token:
+            return "Gitea provider needs a token to publish source attribution."
+        status, response = self._curl(
+            "POST",
+            self._api(api_base, f"/repos/{repo}/issues/{number}/comments"),
+            token,
+            payload={"body": marker},
+        )
+        if status not in (200, 201):
+            return (
+                f"Gitea PR #{number} source comment failed (HTTP {status}): "
+                f"{response.strip()[:300]}"
+            )
+        return ""
+
     def head_contained_in_base(
         self, repo: str, base: str, head_sha: str, *, api_base: str = "",
         token: str | None = None,
@@ -439,6 +542,17 @@ class GiteaProvider:
         commits = data.get("commits")
         if isinstance(commits, list):
             return len(commits) == 0
+        return None
+
+    def ensure_fork(
+        self, repo: str, *, api_base: str = "", token: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Not implemented: fork-mode publishing is GitHub-only today."""
+        _ = (repo, api_base, token)
+        return None
+
+    def resolve_fork_owner(self, *, api_base: str = "", token: str | None = None) -> str | None:
+        """Not implemented: fork-mode publishing is GitHub-only today."""
         return None
 
     def get_snapshot(
@@ -481,6 +595,7 @@ class GiteaProvider:
             merged=bool(pr.get("merged", False)),
             head_sha=str((pr.get("head") or {}).get("sha", "")),
             base_ref=str((pr.get("base") or {}).get("ref", "")),
+            updated_at=str(pr.get("updated_at", "") or ""),
             reviews=self._all_review_objs(repo, number, api_base, token),
             author=str((pr.get("user") or {}).get("login", "")),
             mergeable=mergeable_raw if isinstance(mergeable_raw, bool) else None,
@@ -648,6 +763,69 @@ class GiteaProvider:
             page += 1
         return tuple(numbers)
 
+    def find_pull_by_head(
+        self, repo: str, head: str, *, api_base: str = "", token: str | None = None
+    ) -> PullResult | None:
+        """Resolve a PR by its head branch name across every state (paginated).
+
+        fleet-flows Phase 2 (#2146): heals a tracked record whose active PR has
+        no ``number``. Gitea's list endpoint has no head-branch filter, so this
+        paginates ``state=all`` and matches ``head.ref`` client-side -- bounded
+        by ``_HEAD_SEARCH_MAX_PAGES`` so a very old/prolific repo can't spin
+        forever. Returns the newest match (Gitea sorts newest-first by
+        default), or ``None`` when nothing matches.
+        """
+        if not token:
+            raise ProviderError("Gitea provider needs a token to find a PR by head.")
+        page_size = 50
+        for page in range(1, self._HEAD_SEARCH_MAX_PAGES + 1):
+            status, body = self._curl_with_retry(
+                "GET",
+                self._api(api_base,
+                          f"/repos/{repo}/pulls?state=all&limit={page_size}&page={page}"),
+                token,
+            )
+            if status != 200:
+                raise ProviderError(
+                    f"Gitea PR search by head failed (HTTP {status}) on page "
+                    f"{page} for {repo}",
+                    transient=_is_transient(status),
+                )
+            try:
+                batch = json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise ProviderError(f"Gitea returned non-JSON PR list: {exc}") from exc
+            if not isinstance(batch, list) or not batch:
+                break
+            for p in batch:
+                if not isinstance(p, dict):
+                    continue
+                if (p.get("head") or {}).get("ref") == head:
+                    merged = bool(p.get("merged"))
+                    state = str(p.get("state", "")) or "open"
+                    if merged:
+                        state = "merged"
+                    return PullResult(
+                        url=str(p.get("html_url", "")),
+                        number=int(p["number"]),
+                        state=state,
+                        merged=merged,
+                        head_sha=str((p.get("head") or {}).get("sha", "")),
+                        base_ref=str((p.get("base") or {}).get("ref", "")),
+                    )
+            if len(batch) < page_size:
+                break
+        return None
+
+    def request_review(
+        self, repo: str, number: int, *, reviewer: str = "", api_base: str = "",
+        token: str | None = None,
+    ):
+        """Not implemented: Gitea has no automated PR-reviewer bot to nudge today."""
+        from .base import _unsupported_review_request
+        _ = (repo, number, api_base, token)
+        return _unsupported_review_request(self.name, reviewer)
+
     def request_auto_complete(
         self, repo: str, number: int, *, api_base: str = "", token: str | None = None,
         automerge_label: str = "", squash: bool = True,
@@ -668,29 +846,125 @@ class GiteaProvider:
     def merge_pull(
         self, repo: str, number: int, *, squash: bool = True, admin: bool = False,
         api_base: str = "", token: str | None = None,
+        delete_source_branch: bool = True, expected_head_sha: str = "",
     ) -> str:
         """Not implemented: direct merge (pr-merge --now) is GitHub-only today."""
         from .base import _unsupported_merge
-        _ = (repo, number, squash, admin, api_base, token)
+        _ = (repo, number, squash, admin, api_base, token, delete_source_branch,
+             expected_head_sha)
         return _unsupported_merge(self.name)
+
+    def close_pull(
+        self, repo: str, number: int, *, api_base: str = "", token: str | None = None,
+        comment: str = "",
+    ) -> str:
+        """Not implemented: pr-abandon is GitHub-only today (Gitea's PR PATCH
+        endpoint supports ``state: closed``, a straightforward future add)."""
+        from .base import _unsupported_close
+        _ = (repo, number, api_base, token, comment)
+        return _unsupported_close(self.name)
 
     def enable_auto_merge(
         self, repo: str, number: int, *, squash: bool = True,
         api_base: str = "", token: str | None = None,
+        delete_source_branch: bool = True, expected_head_sha: str = "",
     ) -> str:
         """Not implemented: native auto-merge here is GitHub-only today."""
         from .base import _unsupported_auto_merge
-        _ = (repo, number, squash, api_base, token)
+        _ = (repo, number, squash, api_base, token, delete_source_branch,
+             expected_head_sha)
         return _unsupported_auto_merge(self.name)
 
     def get_repo_policy(
         self, repo: str, *, default_branch: str = "", api_base: str = "",
         token: str | None = None,
     ):
-        """Not implemented: adopt-time settings research is GitHub-only today."""
-        from .base import _unsupported_repo_policy
-        _ = (repo, default_branch, api_base, token)
-        return _unsupported_repo_policy(self.name)
+        """Read Gitea repo settings + the caller's own permissions into a
+        ``RepoPolicy``.
+
+        One read: ``GET /repos/{repo}`` returns both the repo's merge-method
+        settings and a ``permissions`` object (``admin``/``push``/``pull``
+        booleans) for the **authenticated identity** -- whoever's token this
+        is, not a config value. Required-reviews / required-status-checks
+        detail is not read here (Gitea's protection API needs admin rights the
+        acting token may not hold); those fields stay ``None``.
+
+        A second, best-effort read -- ``GET
+        /repos/{repo}/branch_protections/{default_branch}`` -- fills in
+        ``dismiss_stale_reviews`` from Gitea's ``dismiss_stale_approvals``
+        setting (copilot-extensions#2060; read access suffices, so this
+        works for the lower-privilege collaborator token too). A 404 (no
+        protection rule) means nothing dismisses -> ``False``; any other
+        failure leaves the field ``None`` (unknown) rather than guessing.
+
+        Never raises: a failed primary read yields
+        ``RepoPolicy(supported=False, error=...)``.
+        """
+        from ..pr_contract import RepoPolicy
+
+        if not token:
+            return RepoPolicy(
+                supported=False,
+                error="Gitea provider needs a token to read repo settings.",
+            )
+        try:
+            status, body = self._curl(
+                "GET", self._api(api_base, f"/repos/{repo}"), token,
+            )
+        except ProviderError as exc:
+            return RepoPolicy(supported=False, error=str(exc))
+        if status != 200:
+            return RepoPolicy(
+                supported=False,
+                error=f"gitea repos/{repo} GET returned HTTP {status}",
+            )
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as exc:
+            return RepoPolicy(supported=False, error=f"non-JSON repo payload: {exc}")
+        if not isinstance(data, dict):
+            return RepoPolicy(supported=False, error="unexpected repo payload shape")
+
+        def _b(key):
+            v = data.get(key)
+            return bool(v) if isinstance(v, bool) else None
+
+        dismiss_stale_reviews: bool | None = None
+        if default_branch:
+            try:
+                pstatus, pbody = self._curl(
+                    "GET",
+                    self._api(
+                        api_base,
+                        f"/repos/{repo}/branch_protections/"
+                        f"{quote(default_branch, safe='')}",
+                    ),
+                    token,
+                )
+            except ProviderError:
+                pstatus, pbody = 0, ""
+            if pstatus == 404:
+                dismiss_stale_reviews = False  # no rule -> nothing dismisses
+            elif pstatus == 200:
+                try:
+                    prot = json.loads(pbody)
+                except json.JSONDecodeError:
+                    prot = None
+                if isinstance(prot, dict):
+                    dsa = prot.get("dismiss_stale_approvals")
+                    if isinstance(dsa, bool):
+                        dismiss_stale_reviews = dsa
+            # else (403/5xx/unreachable): leave None (unknown).
+
+        return RepoPolicy(
+            supported=True,
+            allow_squash=_b("allow_squash_merge"),
+            allow_merge_commit=_b("allow_merge_commits"),
+            allow_rebase=_b("allow_rebase"),
+            delete_branch_on_merge=_b("default_delete_branch_after_merge"),
+            dismiss_stale_reviews=dismiss_stale_reviews,
+            viewer_permission=_gitea_viewer_permission(data.get("permissions")),
+        )
 
     def get_comment_threads(
         self, repo: str, number: int, *, api_base: str = "", token: str | None = None
@@ -768,15 +1042,83 @@ class GiteaProvider:
         self, repo: str, number: int, *, api_base: str = "", token: str | None = None,
         thread_ids: tuple[int, ...] = (),
     ) -> str:
-        """Gitea exposes no programmatic conversation-resolve on its PR API.
-
-        The irritating gap: resolving a review conversation on Gitea is a UI-only
-        action (no stable REST endpoint), so this reports that rather than
-        pretending to resolve. Reading threads (:meth:`get_comment_threads`)
-        works; resolution is manual on Gitea.
-        """
+        """Gitea has no programmatic conversation-resolve API (UI-only);
+        reports that. Reading threads (:meth:`get_comment_threads`) works."""
         _ = (repo, number, api_base, token, thread_ids)
         return (
             "gitea: resolving review conversations is not exposed by the Gitea "
             "REST API (resolve them in the web UI)."
         )
+
+    def get_diff(
+        self, repo: str, number: int, *, api_base: str = "", token: str | None = None
+    ) -> PRDiff:
+        """Return the PR's current unified diff via Gitea's ``.diff`` endpoint."""
+        if not token:
+            return PRDiff(
+                supported=False,
+                error="Gitea provider needs a token to read a PR diff.",
+            )
+        try:
+            status, body = self._curl(
+                "GET", self._api(api_base, f"/repos/{repo}/pulls/{number}.diff"), token,
+            )
+        except ProviderError as exc:
+            return PRDiff(supported=True, error=str(exc))
+        if status != 200:
+            return PRDiff(
+                supported=True, error=f"gitea diff GET returned HTTP {status}"
+            )
+        return PRDiff(diff=body)
+
+    def post_comment(
+        self, repo: str, number: int, body: str, *, api_base: str = "",
+        token: str | None = None,
+    ) -> str:
+        """Post a general PR comment via Gitea's issue-comments endpoint."""
+        if not token:
+            return "Gitea provider needs a token to post a comment."
+        status, response = self._curl(
+            "POST",
+            self._api(api_base, f"/repos/{repo}/issues/{number}/comments"),
+            token,
+            payload={"body": body},
+        )
+        if status not in (200, 201):
+            return (
+                f"Gitea PR #{number} comment failed (HTTP {status}): "
+                f"{response.strip()[:300]}"
+            )
+        return ""
+
+    _REVIEW_EVENT_MAP = {
+        "APPROVED": "APPROVED",
+        "CHANGES_REQUESTED": "REQUEST_CHANGES",
+        "COMMENTED": "COMMENT",
+    }
+
+    def submit_review(
+        self, repo: str, number: int, *, event: str, body: str = "",
+        api_base: str = "", token: str | None = None,
+    ) -> str:
+        """Publish a review verdict via Gitea's pulls-reviews endpoint."""
+        if not token:
+            return "Gitea provider needs a token to submit a review."
+        gitea_event = self._REVIEW_EVENT_MAP.get(event.upper())
+        if gitea_event is None:
+            return (
+                f"gitea: unknown review event {event!r} (expected one of "
+                f"{tuple(self._REVIEW_EVENT_MAP)})."
+            )
+        status, response = self._curl(
+            "POST",
+            self._api(api_base, f"/repos/{repo}/pulls/{number}/reviews"),
+            token,
+            payload={"event": gitea_event, "body": body},
+        )
+        if status not in (200, 201):
+            return (
+                f"Gitea PR #{number} review failed (HTTP {status}): "
+                f"{response.strip()[:300]}"
+            )
+        return ""

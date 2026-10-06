@@ -24,8 +24,9 @@ from dropin_registry import (
     ScanSnapshot,
     scan_directory,
 )
-from plugin_activation import ActivationReport, resolve_active_plugins
+from plugin_activation import ActivationReport, ActivePlugin, resolve_active_plugins
 
+from .install_paths import install_dir, normalized_path
 from .registrar import ProfileDeclaration, RegistrarError
 from .registrar_discovery import RegistrarIndeterminateError, read_declaration_file
 
@@ -40,7 +41,7 @@ def registrar_dropins_dir() -> Path:
     override = os.environ.get(REGISTRAR_DROPINS_DIR_ENV)
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".agent-dispatch" / "registrar.d"
+    return install_dir() / "registrar.d"
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class RegistrarManifest:
     plugin: str
     plugin_root: str
     registrar: str
+    dispatch_install_dir: str | None = None
     source_path: str = ""
     schema_version: int = 1
 
@@ -137,10 +139,20 @@ def parse_manifest(data: object, *, source_path: str = "") -> RegistrarManifest:
     ):
         raise ManifestError("`registrar` must be a root-contained relative path")
 
+    dispatch_install_dir = data.get("dispatch_install_dir")
+    if dispatch_install_dir is not None:
+        if not isinstance(dispatch_install_dir, str) or not dispatch_install_dir.strip():
+            raise ManifestError("`dispatch_install_dir` must be a non-empty absolute path")
+        if not Path(dispatch_install_dir).expanduser().is_absolute():
+            raise ManifestError("`dispatch_install_dir` must be absolute on the current platform")
+
     return RegistrarManifest(
         plugin=plugin.strip(),
         plugin_root=plugin_root.strip(),
         registrar=registrar,
+        dispatch_install_dir=(
+            dispatch_install_dir.strip() if isinstance(dispatch_install_dir, str) else None
+        ),
         source_path=source_path,
     )
 
@@ -321,9 +333,13 @@ def _classify_declaration(
     path: Path,
     *,
     manifest: RegistrarManifest,
+    plugin_root: Path,
+    active_plugin: ActivePlugin | None,
 ) -> EntryDecision[PluginDeclaration]:
     try:
-        declaration = read_declaration_file(path)
+        declaration = read_declaration_file(
+            path, allow_plugin_companion=True, repo_root=plugin_root
+        )
     except RegistrarIndeterminateError as exc:
         return EntryDecision.indeterminate(
             _finding(
@@ -355,6 +371,82 @@ def _classify_declaration(
         )
     if not declaration.owner:
         declaration = declaration.with_owner(manifest.plugin)
+    if declaration.kind == "plugin-companion":
+        if active_plugin is None:
+            return EntryDecision.indeterminate(
+                _finding(
+                    path,
+                    "entry-indeterminate",
+                    status="indeterminate",
+                    owner=manifest.plugin,
+                    detail="plugin activation could not be confirmed",
+                )
+            )
+        try:
+            plugin_data = json.loads(
+                (plugin_root / "plugin.json").read_text(encoding="utf-8-sig")
+            )
+            if not isinstance(plugin_data, dict):
+                raise ValueError("plugin.json must contain an object")
+            plugin_version = (
+                declaration.runtime_generation or plugin_data.get("version")
+            )
+        except OSError as exc:
+            return EntryDecision.indeterminate(
+                _finding(
+                    path,
+                    "entry-indeterminate",
+                    status="indeterminate",
+                    owner=manifest.plugin,
+                    detail=f"plugin companion version could not be read: {exc}",
+                )
+            )
+        except (UnicodeDecodeError, ValueError) as exc:
+            return EntryDecision.inactive(
+                _finding(
+                    path,
+                    "invalid-entry",
+                    owner=manifest.plugin,
+                    detail=f"plugin companion version could not be read: {exc}",
+                )
+            )
+        if not isinstance(plugin_version, str) or not plugin_version:
+            return EntryDecision.inactive(
+                _finding(
+                    path,
+                    "invalid-entry",
+                    owner=manifest.plugin,
+                    detail=(
+                        "plugin companion requires plugin.json version or an explicit "
+                        "runtime_generation"
+                    ),
+                )
+            )
+        scopes = tuple(
+            sorted(
+                {
+                    scope
+                    for live_root in active_plugin.live_roots
+                    if live_root.root.resolve() == plugin_root
+                    for scope in live_root.scopes
+                }
+            )
+        )
+        if not scopes:
+            return EntryDecision.inactive(
+                _finding(
+                    path,
+                    "identity-mismatch",
+                    owner=manifest.plugin,
+                    detail="plugin companion root has no authoritative activation scopes",
+                )
+            )
+        declaration = declaration.with_plugin_provenance(
+            plugin_root=str(plugin_root),
+            source_path=str(path.resolve()),
+            plugin_version=plugin_version,
+            activation_scopes=scopes,
+        )
     return EntryDecision.active(
         PluginDeclaration(
             declaration=declaration,
@@ -382,6 +474,7 @@ def _manifest_identity_matches(
         previous.manifest.plugin == manifest.plugin
         and previous.manifest.plugin_root == current_root
         and previous.manifest.registrar == manifest.registrar
+        and previous.manifest.dispatch_install_dir == manifest.dispatch_install_dir
     )
 
 
@@ -395,6 +488,7 @@ def _candidate(
             plugin=manifest.plugin,
             plugin_root=str(plugin_root),
             registrar=manifest.registrar,
+            dispatch_install_dir=manifest.dispatch_install_dir,
             source_path=manifest.source_path,
         ),
         declaration_entries=dict(declaration_entries),
@@ -466,6 +560,18 @@ def _classify_manifest(
         return _inactive(path, "invalid-entry", detail=str(exc))
 
     observed_sources.add(manifest.plugin)
+    if (
+        manifest.dispatch_install_dir is not None
+        and normalized_path(Path(manifest.dispatch_install_dir))
+        != normalized_path(install_dir())
+    ):
+        return _inactive(
+            path,
+            "dispatch-install-mismatch",
+            target=manifest.dispatch_install_dir,
+            owner=manifest.plugin,
+            detail="manifest targets a different agent-dispatch installation",
+        )
     activation = activation_source()
     activation_decision = activation.decisions.get(manifest.plugin)
     if activation.authority is not ScanAuthority.INDETERMINATE:
@@ -536,11 +642,15 @@ def _classify_manifest(
             )
         return target_error
     assert registrar_target is not None
+    active_plugin = activation_decision.value if activation_decision is not None else None
 
     declaration_snapshot = scan_directory(
         registrar_target,
         lambda declaration_path: _classify_declaration(
-            declaration_path, manifest=manifest
+            declaration_path,
+            manifest=manifest,
+            plugin_root=plugin_root,
+            active_plugin=active_plugin,
         ),
         registry=REGISTRY_NAME,
         suffixes=_DECL_SUFFIXES,
@@ -632,7 +742,10 @@ def _classify_manifest(
             ),
             *declaration_snapshot.findings,
         )
-    if plugin_root != activation_decision.value.root:
+    live_roots = {
+        selected.root for selected in activation_decision.value.live_roots
+    }
+    if plugin_root not in live_roots:
         return EntryDecision.inactive(
             _finding(
                 path,
@@ -640,8 +753,8 @@ def _classify_manifest(
                 target=manifest.plugin_root,
                 owner=manifest.plugin,
                 detail=(
-                    "manifest plugin_root differs from active plugin root "
-                    f"{activation_decision.value.root}"
+                    "manifest plugin_root differs from authoritative live plugin roots "
+                    + ", ".join(str(root) for root in sorted(live_roots))
                 ),
             ),
             *declaration_snapshot.findings,
@@ -768,13 +881,17 @@ def _retention_rejection(
             owner=candidate.manifest.plugin,
             detail=cause.detail,
         )
-    if Path(candidate.manifest.plugin_root) != decision.value.root:
+    live_roots = {selected.root for selected in decision.value.live_roots}
+    if Path(candidate.manifest.plugin_root) not in live_roots:
         return _finding(
             entry,
             "identity-mismatch",
             target=candidate.manifest.plugin_root,
             owner=candidate.manifest.plugin,
-            detail=f"active plugin root is now {decision.value.root}",
+            detail=(
+                "active plugin roots are now "
+                + ", ".join(str(root) for root in sorted(live_roots))
+            ),
         )
     return None
 

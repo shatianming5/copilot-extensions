@@ -2,32 +2,54 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+from . import _knowledge_overlay
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 0
 RUN_DIR_ENV = "AGENT_INDEX_RUN_DIR"
-ENDPOINT_ENV = "AGENT_INDEX_ENDPOINT"
+STATE_DIR_ENV = "AGENT_INDEX_STATE_DIR"
+LOG_DIR_ENV = "AGENT_INDEX_LOG_DIR"
+CACHE_DIR_ENV = "AGENT_INDEX_CACHE_DIR"
+CONFIG_ROOT_ENV = "AGENT_INDEX_CONFIG_ROOT"
+ROUTING_DIR_ENV = "AGENT_INDEX_ROUTING_DIR"
+ENDPOINT_ENV = "AGENT_INDEX_ENDPOINT"  # marketplace-isolation: allow env-var-name-declaration
 HOME_ENV = "AGENT_INDEX_HOME"
 ROLE_ENV = "AGENT_INDEX_ROLE"
 CONFIG_ENV = "AGENT_INDEX_CONFIG"
+EFFECTIVE_CONFIG_ENV = "AGENT_INDEX_EFFECTIVE_CONFIG"
+CONFIG_DATA_ENV = "AGENT_INDEX_CONFIG_DATA_B64"
 MACHINE_ENV = "AGENT_INDEX_MACHINE"
 REPO_ENV = "AGENT_INDEX_REPO"
+SERVER_VENV_PYTHON_ENV = "AGENT_INDEX_SERVER_VENV_PYTHON"
 VALID_ROLES = ("host", "client")
 UNCONFIGURED_ROLE = "unconfigured"
-REPO_CONFIG_RELPATH = ".agent-index/config.yaml"
+CONFIG_FILENAME = "config.yaml"
+SHAREABLE_CONFIG_DIR = Path(".agent-index")  # marketplace-isolation: allow legacy-compatibility
+OVERLAY_CONFIG_DIR = Path(".copilot-extensions") / "agent-index"
+REPO_CONFIG_RELPATH = str(SHAREABLE_CONFIG_DIR / CONFIG_FILENAME)
+LEGACY_REPO_CONFIG_RELPATH = str(OVERLAY_CONFIG_DIR / CONFIG_FILENAME)
+MARKETPLACE_OVERLAYS_DIR = OVERLAY_CONFIG_DIR / "marketplaces"
+INSTALLATION_CONTEXT_ENV = "COPILOT_EXTENSIONS_CONTEXT"
 
 
 def install_dir() -> Path:
     """Runtime root for agent-index."""
-    return Path(os.environ.get(HOME_ENV) or (Path.home() / ".agent-index"))
+    return Path(os.environ.get(HOME_ENV) or (Path.home() / SHAREABLE_CONFIG_DIR))
 
 
 def data_dir() -> Path:
     """Durable data directory for index state and task queues."""
-    return install_dir() / "data"
+    override = os.environ.get("AGENT_INDEX_DATA_DIR") or os.environ.get(
+        STATE_DIR_ENV
+    )
+    return Path(override).expanduser() if override else install_dir() / "data"
 
 
 def run_dir() -> Path:
@@ -35,9 +57,52 @@ def run_dir() -> Path:
     return Path(os.environ.get(RUN_DIR_ENV) or (install_dir() / "run"))
 
 
+def server_venv_python() -> Path | None:
+    """Resolve the sibling SERVER venv's interpreter, if one is provisioned.
+
+    agent-index-server-venv-split moves the FastAPI/uvicorn/pydantic HTTP
+    service shell (the ``[server]`` extra) into its own per-version sibling
+    venv, distinct from the client/orchestrator venv this process normally
+    runs in -- so the server's own heavy deps never load into a pure client
+    install. Until the installer actually provisions that sibling venv
+    (still a separate Plan item), this returns ``None`` for every existing
+    layout today, and callers fall back to running the server in-process
+    exactly as before -- this resolver is inert scaffolding, not a behavior
+    change on its own.
+
+    Resolution order:
+      1. ``AGENT_INDEX_SERVER_VENV_PYTHON`` -- an explicit interpreter path
+         override, honored unconditionally (test/dev convenience, or an
+         unconventional layout).
+      2. The convention: a ``server`` subdirectory of whichever venv root
+         owns the currently-running interpreter (the directory containing
+         the ``Scripts``/``bin`` folder), using the same shape as the
+         current interpreter. Deliberately does **not** assume that root is
+         named ``.venv`` -- a real installed runtime is pinned directly to
+         ``versions/<version>/Scripts`` (or ``versions/<version>/bin``) via
+         marker-only activation (``Invoke-VersionedActivate``'s own
+         ``--no-link``); there is no ``.venv``-named directory anywhere in
+         a deployed process's own path. A plain local dev venv (``uv venv
+         .venv``) has its ``Scripts``/``bin`` directly under ``.venv``
+         too, so the same ``<venv-root>/server/...`` convention resolves
+         correctly there as well, without a separate case.
+    """
+    override = os.environ.get(SERVER_VENV_PYTHON_ENV)
+    if override:
+        candidate = Path(override).expanduser()
+        return candidate if candidate.is_file() else None
+
+    current = Path(sys.executable).resolve()
+    venv_bin = current.parent
+    venv_root = venv_bin.parent
+    candidate = venv_root / "server" / venv_bin.name / current.name
+    return candidate if candidate.is_file() else None
+
+
 def routing_dir() -> Path:
     """Stable zdd routing-table directory shared by all installed versions."""
-    return install_dir()
+    override = os.environ.get(ROUTING_DIR_ENV)
+    return Path(override).expanduser() if override else install_dir()
 
 
 def config_path() -> Path:
@@ -50,6 +115,9 @@ def config_path() -> Path:
     override = os.environ.get(CONFIG_ENV)
     if override:
         return Path(override).expanduser()
+    config_root = os.environ.get(CONFIG_ROOT_ENV)
+    if config_root:
+        return Path(config_root).expanduser() / "config.yaml"
     return install_dir() / "config.yaml"
 
 
@@ -66,6 +134,220 @@ def _load_yaml(path: Path) -> dict:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _load_inline_config() -> dict | None:
+    encoded = os.environ.get(CONFIG_DATA_ENV)
+    if not encoded:
+        return None
+    try:
+        value = json.loads(
+            base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8")
+        )
+    except (ValueError, UnicodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _deep_merge_dicts(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _merge_sources_by_precedence(high: list, low: list) -> list:
+    """Merge ``corpus.sources`` as the one deliberate list-merge exception.
+
+    The surrounding config follows the same precedence model documented for the
+    other ``.agent-*`` configs (see ``docs/configuration.md`` and the
+    agent-worktrees config reference): machine-local overrides win over the
+    knowledge overlay, which wins over the in-repo base, with ordinary list
+    values replaced wholesale by the higher-precedence layer.
+
+    ``corpus.sources`` is the narrow exception: it behaves like a set of
+    independent declarations, so higher-precedence layers come first and lower
+    layers contribute only source names that have not already been claimed.
+    """
+    merged = list(high)
+    seen = {
+        item["name"].casefold()
+        for item in merged
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    for item in low:
+        if isinstance(item, dict) and isinstance(item.get("name"), str):
+            folded = item["name"].casefold()
+            if folded in seen:
+                continue
+            seen.add(folded)
+        merged.append(item)
+    return merged
+
+
+def _merge_repo_config_dicts(base: dict, override: dict) -> dict:
+    """Merge one lower-precedence layer with one higher-precedence layer."""
+    merged = _deep_merge_dicts(base, override)
+    if "indexers" in override and "indexer" not in override:
+        merged.pop("indexer", None)
+        merged["indexers"] = override["indexers"]
+    if "indexer" in override and "indexers" not in override:
+        merged.pop("indexers", None)
+        merged["indexer"] = override["indexer"]
+    base_corpus = base.get("corpus")
+    override_corpus = override.get("corpus")
+    if (
+        isinstance(base_corpus, dict)
+        and isinstance(override_corpus, dict)
+        and isinstance(base_corpus.get("sources"), list)
+        and isinstance(override_corpus.get("sources"), list)
+    ):
+        corpus = dict(merged.get("corpus") or {})
+        corpus["sources"] = _merge_sources_by_precedence(
+            override_corpus["sources"], base_corpus["sources"]
+        )
+        merged["corpus"] = corpus
+    return merged
+
+
+def _load_installation_context() -> dict | None:
+    raw = os.environ.get(INSTALLATION_CONTEXT_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.startswith("{"):
+            value = json.loads(raw)
+        else:
+            value = json.loads(Path(raw).expanduser().read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _installation_marketplace_id() -> str | None:
+    context = _load_installation_context()
+    if context is None:
+        return None
+    marketplace_id = context.get("marketplaceId")
+    if not isinstance(marketplace_id, str) or not marketplace_id.strip():
+        return None
+    return marketplace_id.strip()
+
+
+def _requires_external(root: Path) -> tuple[str, bool]:
+    return _knowledge_overlay.requires_external(root)
+
+
+def _external_state_root(root: Path) -> tuple[str, Path | None]:
+    return _knowledge_overlay.external_state_root(
+        root,
+        load_installation_context=_load_installation_context,
+        agent_worktrees_home=_agent_worktrees_home,
+    )
+
+
+def _knowledge_root_for_repo(root: Path) -> Path | None:
+    policy_state, requires_external = _requires_external(root)
+    if policy_state != "ready" or not requires_external:
+        return None
+    state, knowledge_root = _external_state_root(root)
+    if state == "ready":
+        return knowledge_root
+    return None
+
+
+def _repo_base_config_path(root: Path) -> Path | None:
+    for candidate in (
+        root / REPO_CONFIG_RELPATH,
+        root / LEGACY_REPO_CONFIG_RELPATH,
+    ):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _repo_local_overlay_path(root: Path) -> Path | None:
+    base = root / REPO_CONFIG_RELPATH
+    overlay = root / LEGACY_REPO_CONFIG_RELPATH
+    if base.exists() and overlay.exists():
+        return overlay
+    return None
+
+
+def _repo_marketplace_overlay_path(root: Path) -> Path | None:
+    marketplace_id = _installation_marketplace_id()
+    if not marketplace_id:
+        return None
+    candidate = root / MARKETPLACE_OVERLAYS_DIR / marketplace_id / CONFIG_FILENAME
+    return candidate if candidate.exists() else None
+
+
+def _repo_config_layers(root: Path) -> list[Path]:
+    layers: list[Path] = []
+    base = _repo_base_config_path(root)
+    if base is not None:
+        layers.append(base)
+    knowledge_root = _knowledge_root_for_repo(root)
+    if knowledge_root is not None:
+        knowledge = knowledge_root / REPO_CONFIG_RELPATH
+        if knowledge.exists():
+            layers.append(knowledge)
+    overlay = _repo_local_overlay_path(root)
+    if overlay is not None:
+        layers.append(overlay)
+    overlay = _repo_marketplace_overlay_path(root)
+    if overlay is not None:
+        layers.append(overlay)
+    return layers
+
+
+def _repo_root_for_effective_config_path(path: Path) -> Path | None:
+    normalized = path.expanduser()
+    parts = normalized.parts
+    if len(parts) >= 3 and parts[-3:] == (
+        ".copilot-extensions",
+        "agent-index",
+        CONFIG_FILENAME,
+    ):
+        return normalized.parents[2]
+    _tail = (".agent-index", CONFIG_FILENAME)  # marketplace-isolation: allow legacy-compatibility
+    if len(parts) >= 2 and parts[-2:] == _tail:
+        return normalized.parents[1]
+    return None
+
+
+def _load_effective_config_path(path: Path) -> dict:
+    repo_root = _repo_root_for_effective_config_path(path)
+    if repo_root is None:
+        return _load_yaml(path)
+    merged: dict = {}
+    for layer in _repo_config_layers(repo_root):
+        loaded = _load_yaml(layer)
+        if isinstance(loaded, dict):
+            merged = _merge_repo_config_dicts(merged, loaded)
+    return merged
+
+
+def _load_effective_repo_config(root: Path | None) -> dict:
+    if CONFIG_DATA_ENV in os.environ:
+        return _load_inline_config() or {}
+    effective = os.environ.get(EFFECTIVE_CONFIG_ENV)
+    if effective:
+        return _load_effective_config_path(Path(effective).expanduser())
+    if root is None:
+        return {}
+    layers = _repo_config_layers(root)
+    if not layers:
+        return {}
+    merged: dict = {}
+    for layer in layers:
+        loaded = _load_yaml(layer)
+        if isinstance(loaded, dict):
+            merged = _merge_repo_config_dicts(merged, loaded)
+    return merged
 
 
 def _read_config_role(path: Path) -> str | None:
@@ -129,8 +411,13 @@ def repo_root(explicit: str | None = None) -> Path | None:
 
 
 def repo_config_path(root: Path) -> Path:
-    """The repo-committed adoption config: ``<repo>/.agent-index/config.yaml``."""
-    return root / REPO_CONFIG_RELPATH
+    """The repo-local writable overlay path used by setup/adoption flows."""
+    return root / LEGACY_REPO_CONFIG_RELPATH
+
+
+def repo_has_config(root: Path) -> bool:
+    """Whether the repo carries a base config or any recognized overlay."""
+    return bool(_repo_config_layers(root))
 
 
 def read_indexer(root: Path | None) -> dict | None:
@@ -141,14 +428,16 @@ def read_indexer(root: Path | None) -> dict | None:
     or, for a plural ``indexers:`` deployment, the **primary** (first) indexer.
     Callers that need the full ordered set use :func:`read_indexers`.
     """
-    if root is None:
+    if root is None and not (
+        os.environ.get(EFFECTIVE_CONFIG_ENV) or os.environ.get(CONFIG_DATA_ENV)
+    ):
         return None
-    data = _load_yaml(repo_config_path(root))
-    ind = data.get("indexer")
-    if isinstance(ind, dict) and ind.get("machine"):
-        return ind
+    data = _load_effective_repo_config(root)
     plural = read_indexers(root)
-    return plural[0] if plural else None
+    if plural:
+        return plural[0]
+    ind = data.get("indexer")
+    return ind if isinstance(ind, dict) and ind.get("machine") else None
 
 
 def read_indexers(root: Path | None) -> list[dict]:
@@ -166,9 +455,11 @@ def read_indexers(root: Path | None) -> list[dict]:
     Malformed entries (no ``machine``) are dropped defensively. Returns ``[]`` when
     neither key is set.
     """
-    if root is None:
+    if root is None and not (
+        os.environ.get(EFFECTIVE_CONFIG_ENV) or os.environ.get(CONFIG_DATA_ENV)
+    ):
         return []
-    data = _load_yaml(repo_config_path(root))
+    data = _load_effective_repo_config(root)
     items = data.get("indexers")
     if isinstance(items, list):
         out = [it for it in items if isinstance(it, dict) and it.get("machine")]
@@ -182,7 +473,7 @@ def read_indexers(root: Path | None) -> list[dict]:
 
 def read_corpus_sources() -> list[dict]:
     """Return the effective ``corpus.sources`` — a **virtual config grafted** from
-    every adopted local project's own ``.agent-index/config.yaml``.
+    every adopted local project's own repo config.
 
     Read **dynamically** (no caching) so edits are picked up on the next reindex
     without a service restart (each reindex runs in a fresh worker process). The
@@ -192,8 +483,12 @@ def read_corpus_sources() -> list[dict]:
        registry (``~/.agent-worktrees/projects.yaml`` — the set of repos that have
        a project binstub), resolving each to its checkout path via
        ``repos.yaml``.
-    2. Read each project's committed ``<repo>/.agent-index/config.yaml`` and graft
-       its ``corpus.sources`` into one list, deduped by source ``name`` (first
+    2. Read each project's effective layered repo config using the established
+       ``.agent-*`` precedence model: checked-in ``<repo>/.agent-index/
+       config.yaml`` in-repo defaults, then the repo-local machine overlay
+       ``<repo>/.copilot-extensions/agent-index/config.yaml``, plus the
+       marketplace overlay when present. Then graft its
+       ``corpus.sources`` into one list, deduped by source ``name`` (first
        contributor wins). The originating project's checkout path is attached as
        ``_repo_path`` so a ``git`` source resolves without a second lookup.
     3. Also graft the **machine-local** config's own ``corpus.sources``
@@ -201,13 +496,21 @@ def read_corpus_sources() -> list[dict]:
        sources.
 
     Each element is a mapping like
-    ``{name, type?, repo?, auth?: {account}, trust_domain?}``, plus internal keys
-    ``_repo_path`` (the contributing project's checkout) and ``_contributed_by``
-    (its project name). Malformed entries are dropped defensively. Returns ``[]``
+    ``{name, type?, repo?, auth?: {account}, trust_domain?, ref?}``, plus
+    internal keys ``_repo_path`` (the contributing project's checkout) and
+    ``_contributed_by`` (its project name). ``ref`` (``git:`` sources only)
+    overrides which branch/revision to index -- e.g. ``origin/dev`` for a repo
+    whose integration branch isn't its default branch -- instead of the
+    connector's own default (the remote's ``HEAD``, i.e. its default branch).
+    ``auth.account`` on a ``git:`` source also authenticates that source's
+    fetch step (resolved the same way as a ``github:`` source's token), so the
+    checkout is actively pulled forward as the remote branch moves rather than
+    depending on the ambient `gh`-backed git credential helper's currently
+    active account. Malformed entries are dropped defensively. Returns ``[]``
     when nothing is declared anywhere.
     """
-    def _sources_of(path: Path) -> list[dict]:
-        corpus = _load_yaml(path).get("corpus")
+    def _sources_of_data(data: dict) -> list[dict]:
+        corpus = data.get("corpus")
         if not isinstance(corpus, dict):
             return []
         srcs = corpus.get("sources")
@@ -215,11 +518,22 @@ def read_corpus_sources() -> list[dict]:
             return []
         return [s for s in srcs if isinstance(s, dict) and s.get("name")]
 
+    def _sources_of(path: Path) -> list[dict]:
+        return _sources_of_data(_load_yaml(path))
+
     graft: dict[str, dict] = {}
+
+    effective_root = repo_root()
+    for spec in _sources_of_data(_load_effective_repo_config(effective_root)):
+        spec = dict(spec)
+        if effective_root is not None:
+            spec.setdefault("_repo_path", str(effective_root))
+        spec.setdefault("_contributed_by", "effective-config")
+        graft.setdefault(str(spec["name"]), spec)
 
     # (1)+(2) adopted projects, each self-declaring its index targets
     for name, root in _local_project_roots().items():
-        for spec in _sources_of(repo_config_path(root)):
+        for spec in _sources_of_data(_load_effective_repo_config(root)):
             spec = dict(spec)
             spec.setdefault("_repo_path", str(root))
             spec.setdefault("_contributed_by", name)
@@ -235,7 +549,8 @@ def read_corpus_sources() -> list[dict]:
 def _agent_worktrees_home() -> Path:
     """The sibling agent-worktrees registry dir (``~/.agent-worktrees``)."""
     env = os.environ.get("AGENT_WORKTREES_HOME")
-    return Path(env).expanduser() if env else (Path.home() / ".agent-worktrees")
+    _awt = ".agent-worktrees"  # marketplace-isolation: allow registry
+    return Path(env).expanduser() if env else (Path.home() / _awt)
 
 
 def _registry_platform_key() -> str:
@@ -330,10 +645,10 @@ def machine_device() -> str | None:
 def write_indexer_designation(
     root: Path, machine: str, *, ssh: str | None = None, endpoint: str | None = None
 ) -> Path:
-    """Record the shared indexer designation into ``<repo>/.agent-index/config.yaml``
-    (merging existing keys). Returns the repo config path."""
+    """Record the repo-local indexer designation into the writable overlay."""
     path = repo_config_path(root)
-    data = _load_yaml(path)
+    source = path if path.exists() else None
+    data = _load_yaml(source) if source is not None else {}
     ind: dict = {"machine": machine}
     if ssh:
         ind["ssh"] = ssh
@@ -345,14 +660,10 @@ def write_indexer_designation(
 
 
 def write_indexers_designation(root: Path, indexers: list[dict]) -> Path:
-    """Record an **ordered** multi-indexer designation (``indexers:`` list, primary
-    first) into ``<repo>/.agent-index/config.yaml`` (merging other keys). Each entry
-    is normalized to ``{machine, ssh?, endpoint?}``; entries without a ``machine`` are
-    dropped. The singular ``indexer:`` key is removed so the plural list is the single
-    source of truth. Returns the repo config path
-    (vision §adoption-designates-ordered-indexers)."""
+    """Record ordered multi-indexer designations into the writable overlay."""
     path = repo_config_path(root)
-    data = _load_yaml(path)
+    source = path if path.exists() else None
+    data = _load_yaml(source) if source is not None else {}
     norm: list[dict] = []
     for it in indexers:
         if not isinstance(it, dict):
@@ -519,7 +830,7 @@ def client_url() -> str | None:
     ``status``/``stop`` probe a dead static port and report the running service as
     down (#1349)."""
     root = repo_root()
-    indexers = read_indexers(root) if root is not None else []
+    indexers = read_indexers(root)
     if indexers:
         me = machine_id().strip().lower()
         role = (

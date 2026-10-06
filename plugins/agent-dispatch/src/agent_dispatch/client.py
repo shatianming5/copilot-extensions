@@ -7,12 +7,19 @@ snapshots) so callers stay decoupled from the server-side dataclasses.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Sequence
-from typing import Any, Callable
+from collections.abc import Callable, Sequence
+from typing import Any
 
 import httpx
-
-
+from .client_completion_review import CompletionReviewMixin
+from .client_events import EventStreamClientMixin
+from .client_exclude import ClearExcludeClientMixin
+from .client_registrations import RegistrationClientMixin
+from .client_spawn_reservations import SpawnReservationClientMixin
+from .client_spawn_terminal import SpawnTerminalClientMixin
+from .client_suspend import SuspendClientMixin
+from .client_verification import VerificationClientMixin
+from .client_worktree_status import WorktreeStatusClientMixin
 class DispatchError(RuntimeError):
     """A non-2xx response from the coordinator (carries status + detail)."""
 
@@ -39,7 +46,7 @@ class DispatchUpgradeRequired(DispatchError):
         super().__init__(426, detail)
 
 
-class DispatchClient:
+class DispatchClient(RegistrationClientMixin, WorktreeStatusClientMixin, CompletionReviewMixin, SuspendClientMixin, VerificationClientMixin, ClearExcludeClientMixin, SpawnTerminalClientMixin, SpawnReservationClientMixin, EventStreamClientMixin):
     """A synchronous client for one coordinator base URL."""
 
     def __init__(
@@ -53,14 +60,28 @@ class DispatchClient:
         tunnel: Any = None,
     ):
         headers = {"Authorization": f"Bearer {token}"} if token else {}
+        verify = not base_url.lower().startswith("http://")
         self._http = httpx.Client(
-            base_url=base_url.rstrip("/"), headers=headers, timeout=timeout, transport=transport
+            base_url=base_url.rstrip("/"),
+            headers=headers,
+            timeout=timeout,
+            transport=transport,
+            verify=verify,
         )
         self._control_token = control_token
         # An optional owned resource (e.g. an SSH failover port-forward) closed
         # together with the HTTP client, so the transport lives exactly as long
         # as the client that rides it.
         self._tunnel = tunnel
+
+    @property
+    def base_url(self) -> str:
+        """The coordinator base URL this client is actually bound to --
+        never re-resolved. Lets a second request path (e.g. a plain
+        ``urllib`` fetch beside this client's SSE connection) target the
+        same coordinator generation instead of independently re-resolving
+        ``active.json``, which could observe a cutover mid-way."""
+        return str(self._http.base_url).rstrip("/")
 
     def close(self) -> None:
         self._http.close()
@@ -109,6 +130,29 @@ class DispatchClient:
     def progress_log(self, task_id: str) -> list[dict]:
         """The accumulated append-only progress log for a task (oldest first)."""
         return self._unwrap(self._http.get(f"/tasks/{task_id}/progress-log"))
+
+    def attachments(self, task_id: str) -> list[dict]:
+        """A task's durable attachment history, newest first -- every session
+        that has ever attached, distinct from its current owner session."""
+        return self._unwrap(self._http.get(f"/tasks/{task_id}/attachments"))
+
+    def tasks_for_session(self, session_id: str) -> list[dict]:
+        """The reverse lookup: every task ``session_id`` has ever attached to
+        on this host's coordinator, newest first. Empty, not an error, when
+        the session id never attached to a task here.
+
+        Unlike a task id (always an internally-generated hex string),
+        ``session_id`` is an externally-sourced value (an agent-bridge escrow
+        id or a durable ACP UUID) -- URL-encode it before interpolating into
+        the path so a value containing a reserved character (``?``, ``#``)
+        can't be mis-parsed as query/fragment syntax. A literal ``/`` in the
+        id is a separate, ASGI-level limitation (the server decodes ``%2F``
+        back to ``/`` before route matching) that percent-encoding here
+        cannot fix -- expected to never occur for a real session id.
+        """
+        from urllib.parse import quote
+
+        return self._unwrap(self._http.get(f"/sessions/{quote(session_id, safe='')}/tasks"))
 
     def payload(self, task_id: str) -> dict:
         return self._unwrap(self._http.get(f"/tasks/{task_id}/payload"))
@@ -216,20 +260,17 @@ class DispatchClient:
 
     def yield_task(
         self, task_id: str, worker_id: str, *, note: str | None = None,
-        exclude: str | None = None,
+        exclude: str | None = None, release_spawn: bool = True,
     ) -> dict:
         return self._unwrap(
             self._http.post(
                 f"/tasks/{task_id}/yield",
-                json={"worker_id": worker_id, "note": note, "exclude": exclude},
-            )
-        )
-
-    def suspend(self, task_id: str, worker_id: str, *, reason: str) -> dict:
-        return self._unwrap(
-            self._http.post(
-                f"/tasks/{task_id}/suspend",
-                json={"worker_id": worker_id, "reason": reason},
+                json={
+                    "worker_id": worker_id,
+                    "note": note,
+                    "exclude": exclude,
+                    "release_spawn": release_spawn,
+                },
             )
         )
 
@@ -241,9 +282,21 @@ class DispatchClient:
         wake: bool = True,
         message: str | None = None,
         adopt_session: bool = False,
+        adopt_owner_session_id: str | None = None,
+        reuse_session: bool = False,
         expected_owner_session_id: str | None = None,
         expected_generation: int | None = None,
     ) -> dict:
+        """Resume a suspended task under ``worker_id``.
+
+        ``adopt_session`` resolves and adopts the CALLER's own currently-live
+        session for ``worker_id`` (a handoff successor resuming into itself).
+        ``adopt_owner_session_id`` instead adopts an explicitly-named session
+        id, known to the caller ahead of time (e.g.
+        :mod:`agent_dispatch.interactive_embody`'s transaction, which resumes
+        a task into a session it just launched but is not itself running
+        inside of) -- mutually exclusive with ``adopt_session``.
+        """
         return self._unwrap(
             self._http.post(
                 f"/tasks/{task_id}/resume",
@@ -252,6 +305,8 @@ class DispatchClient:
                     "wake": wake,
                     "message": message,
                     "adopt_session": adopt_session,
+                    "adopt_owner_session_id": adopt_owner_session_id,
+                    "reuse_session": reuse_session,
                     "expected_owner_session_id": expected_owner_session_id,
                     "expected_generation": expected_generation,
                 },
@@ -317,11 +372,77 @@ class DispatchClient:
         worker_id: str | None = None,
         permitted: bool = False,
         reason: str | None = None,
+        expected_status: str | None = None,
+        expected_generation: int | None = None,
+        expected_owner_session_id: str | None = None,
     ) -> dict:
         return self._unwrap(
             self._http.post(
                 f"/tasks/{task_id}/abandon",
-                json={"worker_id": worker_id, "permitted": permitted, "reason": reason},
+                json={
+                    "worker_id": worker_id,
+                    "permitted": permitted,
+                    "reason": reason,
+                    "expected_status": expected_status,
+                    "expected_generation": expected_generation,
+                    "expected_owner_session_id": expected_owner_session_id,
+                },
+            )
+        )
+
+    def set_hold(
+        self,
+        task_id: str,
+        *,
+        reason: str,
+        actor: str,
+        expected_status: str | None = None,
+    ) -> dict:
+        """Set the Phase 1 durable, operator-owned hold -- the "Pause" primitive
+        (:meth:`agent_dispatch.queue.TaskQueue.set_hold`)."""
+        return self._unwrap(
+            self._http.post(
+                f"/tasks/{task_id}/hold",
+                json={"reason": reason, "actor": actor, "expected_status": expected_status},
+            )
+        )
+
+    def clear_hold(
+        self,
+        task_id: str,
+        *,
+        actor: str | None = None,
+        expected_status: str | None = None,
+    ) -> dict:
+        """Clear a hold set by :meth:`set_hold` -- the "Unpause" primitive."""
+        return self._unwrap(
+            self._http.post(
+                f"/tasks/{task_id}/unhold",
+                json={"actor": actor, "expected_status": expected_status},
+            )
+        )
+
+    def reset(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        expected_status: str | None = None,
+        expected_generation: int | None = None,
+        expected_owner_session_id: str | None = None,
+    ) -> dict:
+        """Phase 2's gentler "not like this" -- reset a task back to
+        ``proposed`` for a fresh attempt (:meth:`agent_dispatch.queue
+        .TaskQueue.reset`)."""
+        return self._unwrap(
+            self._http.post(
+                f"/tasks/{task_id}/reset",
+                json={
+                    "reason": reason,
+                    "expected_status": expected_status,
+                    "expected_generation": expected_generation,
+                    "expected_owner_session_id": expected_owner_session_id,
+                },
             )
         )
 
@@ -337,6 +458,25 @@ class DispatchClient:
             self._http.post(
                 f"/tasks/{task_id}/activity",
                 json={"activity": activity, "reservation_key": reservation_key},
+            )
+        )
+
+    def bind_owner_session(
+        self,
+        task_id: str,
+        worker_id: str,
+        owner_session_id: str,
+        *,
+        expected_generation: int | None = None,
+    ) -> dict:
+        return self._unwrap(
+            self._http.post(
+                f"/tasks/{task_id}/owner-session",
+                json={
+                    "worker_id": worker_id,
+                    "owner_session_id": owner_session_id,
+                    "expected_generation": expected_generation,
+                },
             )
         )
 
@@ -377,6 +517,21 @@ class DispatchClient:
             )
         )
 
+    def save_card_draft(self, task_id: str, *, fields: dict) -> dict:
+        """Persist an operator's not-yet-submitted draft answer. Never touches
+        ``awaiting_steer``/status -- the task stays blocked exactly as before,
+        durably visible from any surface/machine via ``get``/``card show``."""
+        return self._unwrap(
+            self._http.post(
+                f"/tasks/{task_id}/card-draft",
+                json={"fields": fields},
+            )
+        )
+
+    def clear_card_draft(self, task_id: str) -> dict:
+        """Clear a task's saved draft. Never touches ``awaiting_steer``/status."""
+        return self._unwrap(self._http.delete(f"/tasks/{task_id}/card-draft"))
+
     def steer(
         self,
         task_id: str,
@@ -385,6 +540,7 @@ class DispatchClient:
         sender: str | None = None,
         wake: bool = True,
         message: str | None = None,
+        expected_status: str | None = None,
     ) -> dict:
         """Submit an answer and ask the coordinator to resume the task owner."""
         return self._unwrap(
@@ -395,6 +551,7 @@ class DispatchClient:
                     "sender": sender,
                     "wake": wake,
                     "message": message,
+                    "expected_status": expected_status,
                 },
             )
         )
@@ -521,17 +678,30 @@ class DispatchClient:
 
     # -- spawn reservations --------------------------------------------------
 
-    def reserve_spawn(self, task_id: str, *, reserved_by: str | None = None) -> dict:
+    def reserve_spawn(
+        self, task_id: str, *, reserved_by: str | None = None,
+        allow_suspended_reembodiment: bool = False,
+    ) -> dict:
         """Atomically reserve the right to spawn an embody worker for a task.
 
         Returns ``{"reserved": bool, "reservation": {...}}``. When ``reserved``
         is ``False`` an active reservation already exists and the caller must
         **not** spawn.
+
+        ``allow_suspended_reembodiment`` additionally accepts a ``suspended``
+        task (interactive re-embodiment's own case -- see
+        :meth:`agent_dispatch.queue.TaskQueue.reserve_spawn`'s docstring);
+        every other caller leaves this ``False`` (the default, ordinary
+        queued-and-unowned gate).
         """
         return self._unwrap(
             self._http.post(
                 "/spawn-reservations",
-                json={"task_id": task_id, "reserved_by": reserved_by},
+                json={
+                    "task_id": task_id,
+                    "reserved_by": reserved_by,
+                    "allow_suspended_reembodiment": allow_suspended_reembodiment,
+                },
             )
         )
 
@@ -549,19 +719,188 @@ class DispatchClient:
             )
         )
 
-    def fail_spawn(self, key: str, *, detail: str | None = None) -> dict:
+    def record_routing_assignment(self, key: str, assignment: dict[str, Any]) -> dict:
+        """Attach one immutable routing decision to a spawn reservation."""
         return self._unwrap(
-            self._http.post(f"/spawn-reservations/{key}/fail", json={"detail": detail})
+            self._http.post(
+                f"/spawn-reservations/{key}/routing-assignment",
+                json=assignment,
+            )
         )
 
-    def record_cold(self, key: str) -> dict:
+    def transition_routing_assignment(
+        self,
+        assignment_id: str,
+        *,
+        event_type: str,
+        actor_role: str,
+        terminal_disposition: str | None = None,
+        reason_code: str | None = None,
+        worker_session_ref: str | None = None,
+    ) -> dict:
         return self._unwrap(
-            self._http.post(f"/spawn-reservations/{key}/cold")
+            self._http.post(
+                f"/routing-assignments/{assignment_id}/transition",
+                json={
+                    "event_type": event_type,
+                    "actor_role": actor_role,
+                    "terminal_disposition": terminal_disposition,
+                    "reason_code": reason_code,
+                    "worker_session_ref": worker_session_ref,
+                },
+            )
         )
 
-    def settle_spawn(self, key: str, *, detail: str | None = None) -> dict:
+    def record_routing_billing_ref(
+        self,
+        assignment_id: str,
+        *,
+        event_id: str,
+        provider: str,
+        provider_billing_event_ref: str,
+        actor_role: str,
+        occurred_at: float | None = None,
+    ) -> dict:
         return self._unwrap(
-            self._http.post(f"/spawn-reservations/{key}/settle", json={"detail": detail})
+            self._http.post(
+                f"/routing-assignments/{assignment_id}/billing-ref",
+                json={
+                    "event_id": event_id,
+                    "provider": provider,
+                    "provider_billing_event_ref": provider_billing_event_ref,
+                    "actor_role": actor_role,
+                    "occurred_at": occurred_at,
+                },
+            )
+        )
+
+    def routing_assignment(self, assignment_id: str) -> dict:
+        return self._unwrap(self._http.get(f"/routing-assignments/{assignment_id}"))
+
+    def routing_assignments(
+        self,
+        *,
+        task_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        params = {"limit": limit}
+        if task_id is not None:
+            params["task_id"] = task_id
+        return self._unwrap(self._http.get("/routing-assignments", params=params))
+
+    def routing_assignment_events(self, assignment_id: str) -> list[dict]:
+        return self._unwrap(
+            self._http.get(f"/routing-assignments/{assignment_id}/events")
+        )
+
+    def record_spawn_worktree(
+        self,
+        key: str,
+        worktree: str,
+        *,
+        ownership: str = "unknown",
+        creating_host: str | None = None,
+        driver: str | None = None,
+    ) -> dict:
+        """Record the reserved worktree before launching the worker session."""
+        return self._unwrap(
+            self._http.post(
+                f"/spawn-reservations/{key}/worktree",
+                json={
+                    "worktree": worktree,
+                    "ownership": ownership,
+                    "creating_host": creating_host,
+                    "driver": driver,
+                },
+            )
+        )
+
+    def defer_spawn(self, key: str, *, detail: str | None = None) -> dict:
+        return self._unwrap(
+            self._http.post(f"/spawn-reservations/{key}/defer", json={"detail": detail})
+        )
+
+    def request_spawn_release(
+        self, key: str, *, detail: str | None = None,
+        disposition: str = "failed", session_handle: str | None = None,
+        worktree: str | None = None,
+    ) -> dict:
+        payload = {"detail": detail, "disposition": disposition}
+        if session_handle is not None:
+            payload["session_handle"] = session_handle
+        if worktree is not None:
+            payload["worktree"] = worktree
+        return self._unwrap(
+            self._http.post(f"/spawn-reservations/{key}/release", json=payload)
+        )
+
+    def retire_spawn(
+        self,
+        key: str,
+        *,
+        exact_absence: bool,
+        detail: str | None = None,
+        conclusion_state: str | None = None,
+        conclusion_detail: str | None = None,
+    ) -> dict:
+        return self._unwrap(
+            self._http.post(
+                f"/spawn-reservations/{key}/retire",
+                json={
+                    "exact_absence": exact_absence,
+                    "detail": detail,
+                    "conclusion_state": conclusion_state,
+                    "conclusion_detail": conclusion_detail,
+                },
+            )
+        )
+
+    def record_cold(self, key: str, *, release_exclusive: bool = False) -> dict:
+        return self._unwrap(
+            self._http.post(
+                f"/spawn-reservations/{key}/cold",
+                json={"release_exclusive": release_exclusive},
+            )
+        )
+
+    def record_spawn_conclusion(
+        self,
+        key: str,
+        *,
+        conclusion_state: str,
+        conclusion_detail: str,
+        detail: str | None = None,
+        claim_token: str | None = None,
+    ) -> dict:
+        return self._unwrap(
+            self._http.post(
+                f"/spawn-reservations/{key}/conclusion",
+                json={
+                    "conclusion_state": conclusion_state,
+                    "conclusion_detail": conclusion_detail,
+                    "detail": detail,
+                    "claim_token": claim_token,
+                },
+            )
+        )
+
+    def claim_spawn_conclusion_retry(self, key: str) -> dict:
+        return self._unwrap(
+            self._http.post(
+                f"/spawn-reservations/{key}/conclusion/claim",
+            )
+        )
+
+    def validate_spawn_conclusion_claim(
+        self,
+        key: str,
+        claim_token: str,
+    ) -> dict:
+        return self._unwrap(
+            self._http.post(
+                f"/spawn-reservations/{key}/conclusion/validate",
+                json={"claim_token": claim_token},
+            )
         )
 
     def rearm_spawn(
@@ -582,32 +921,6 @@ class DispatchClient:
                 },
             )
         )
-
-    def list_reservations(
-        self,
-        *,
-        task_id: str | None = None,
-        state: str | None = None,
-        repo: str | None = None,
-        label: str | None = None,
-        resume_requested: bool | None = None,
-        limit: int = 200,
-    ) -> list[dict]:
-        params: dict[str, Any] = {"limit": limit}
-        if task_id is not None:
-            params["task_id"] = task_id
-        if state is not None:
-            params["state"] = state
-        if repo is not None:
-            params["repo"] = repo
-        if label is not None:
-            params["label"] = label
-        if resume_requested is not None:
-            params["resume_requested"] = resume_requested
-        return self._unwrap(self._http.get("/spawn-reservations", params=params))
-
-    def get_reservation(self, key: str) -> dict:
-        return self._unwrap(self._http.get(f"/spawn-reservations/{key}"))
 
     # -- schedule registry + job-leases -------------------------------------
 
@@ -660,63 +973,71 @@ class DispatchClient:
     def get_schedule_lease(self, scope: str) -> dict | None:
         return self._unwrap(self._http.get(f"/schedule-leases/{scope}"))
 
-    # -- supervisor registrations -------------------------------------------
+    # -- external producer resource reservations ----------------------------
 
-    def register_registration(
+    def acquire_resource_reservation(
         self,
-        kind: str,
-        spec: dict,
+        key: str,
+        owner: str,
         *,
-        reg_id: str | None = None,
-        machine: str | None = None,
-        env: str = "default",
+        ttl: float,
+        token: str | None = None,
     ) -> dict:
-        body = {
-            "kind": kind,
-            "spec": spec,
-            "id": reg_id,
-            "machine": machine,
-            "env": env,
+        body: dict[str, object] = {
+            "key": key,
+            "owner": owner,
+            "ttl": ttl,
         }
-        return self._unwrap(self._http.post("/registrations", json=body))
-
-    def list_registrations(
-        self,
-        *,
-        kind: str | None = None,
-        machine: str | None = None,
-        env: str | None = None,
-        include_paused: bool = True,
-    ) -> list[dict]:
-        params: dict[str, object] = {"include_paused": include_paused}
-        if kind is not None:
-            params["kind"] = kind
-        if machine is not None:
-            params["machine"] = machine
-        if env is not None:
-            params["env"] = env
-        return self._unwrap(self._http.get("/registrations", params=params))
-
-    def get_registration(self, rid: str) -> dict:
-        return self._unwrap(self._http.get(f"/registrations/{rid}"))
-
-    def remove_registration(self, rid: str) -> dict:
-        return self._unwrap(self._http.delete(f"/registrations/{rid}"))
-
-    def set_registration_status(self, rid: str, status: str) -> dict:
+        if token is not None:
+            body["token"] = token
         return self._unwrap(
-            self._http.post(f"/registrations/{rid}/status", json={"status": status})
+            self._http.post(
+                "/resource-reservations/acquire",
+                json=body,
+            )
         )
 
-    def stream_events(self) -> Iterator[dict]:
-        """Yield task events from the coordinator's SSE stream (blocking)."""
-        with self._http.stream("GET", "/events") as resp:
-            if resp.status_code >= 400:
-                resp.read()
-                raise DispatchError(resp.status_code, resp.text)
-            for line in resp.iter_lines():
-                if line.startswith("data:"):
-                    yield json.loads(line[len("data:") :].strip())
+    def bind_resource_reservation(
+        self, key: str, owner: str, token: str, task_id: str
+    ) -> dict:
+        return self._unwrap(
+            self._http.post(
+                "/resource-reservations/bind",
+                json={
+                    "key": key,
+                    "owner": owner,
+                    "token": token,
+                    "task_id": task_id,
+                },
+            )
+        )
+
+    def release_resource_reservation(
+        self, key: str, owner: str, token: str
+    ) -> dict:
+        return self._unwrap(
+            self._http.post(
+                "/resource-reservations/release",
+                json={"key": key, "owner": owner, "token": token},
+            )
+        )
+
+    def list_resource_reservations(
+        self,
+        *,
+        owner_prefix: str | None = None,
+        task_id: str | None = None,
+    ) -> list[dict]:
+        params: dict[str, str] = {}
+        if owner_prefix is not None:
+            params["owner_prefix"] = owner_prefix
+        if task_id is not None:
+            params["task_id"] = task_id
+        return self._unwrap(
+            self._http.get("/resource-reservations", params=params)
+        )
+
+    # -- supervisor registrations (RegistrationClientMixin) -----------------
 
 
 class ResolvingDispatchClient:

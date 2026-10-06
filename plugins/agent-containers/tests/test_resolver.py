@@ -11,15 +11,18 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
+from pathlib import Path
 
 import pytest
 from ssh_manager import SSHConfig
 
 from agent_containers.resolver import (
+    AGENT_CONTAINERS_EXEC_COPILOT_ARGS_ENV,
     ContainerResolver,
     build_restricted_spawn_command,
     build_spawn_command,
     build_wrapper_command,
+    resolve_extra_copilot_args,
 )
 
 
@@ -79,14 +82,22 @@ def test_build_wrapper_command():
     # no docker / token details leak into the wrapper command
     assert "docker" not in cmd
     assert "GH_TOKEN" not in cmd
+    assert Path(cmd[0]).name in {"agent-containers", "agent-containers.cmd"}
 
 
-def test_build_wrapper_command_uses_module_not_binstub():
-    """Spawn via ``python -m agent_containers``, never the .cmd binstub, so
-    agent-bridge does not route the spawn through cmd.exe and mangle args."""
+def test_build_wrapper_command_uses_payload_local_shim(monkeypatch, tmp_path):
+    from agent_containers import resolver as r
+
+    shim = tmp_path / "payload" / "bin" / (
+        "agent-containers.cmd" if sys.platform == "win32" else "agent-containers"
+    )
+    shim.parent.mkdir(parents=True)
+    shim.write_text("", encoding="utf-8")
+    monkeypatch.setattr(r, "payload_command_argv", lambda: [str(shim)])
+
     cmd = build_wrapper_command("myrepo-1")
-    assert cmd[1:3] == ["-m", "agent_containers"]
-    assert not cmd[0].lower().endswith((".cmd", ".bat"))
+
+    assert cmd == [str(shim), "exec", "--stdio", "myrepo-1"]
 
 
 def _stub_agent_bridge(monkeypatch):
@@ -233,6 +244,11 @@ def test_resolve_spec_exposes_trusted_session_host_transport(monkeypatch):
     monkeypatch.setattr(r, "get_lease", lambda name: None)
     monkeypatch.setattr(
         r,
+        "payload_command_argv",
+        lambda: ["/payload/bin/agent-containers"],
+    )
+    monkeypatch.setattr(
+        r,
         "prepare_ssh_config",
         lambda name, user: SSHConfig(
             host_alias=f"agent-container-{name}",
@@ -250,7 +266,7 @@ def test_resolve_spec_exposes_trusted_session_host_transport(monkeypatch):
     assert transport["security_profile"] == "trusted"
     assert transport["acp_command"] == "copilot --acp --stdio"
     assert transport["ssh"]["host_alias"] == "agent-container-myrepo-1"
-    assert transport["provider_command"][1:3] == ["-m", "agent_containers"]
+    assert transport["provider_command"] == ["/payload/bin/agent-containers"]
     assert spec["venue"]["target_id"] == "container:myrepo-1"
     assert spec["venue"]["transport"] == "ssh"
     assert spec["venue"]["capabilities"]["session_host"] is True
@@ -548,3 +564,27 @@ def test_ensure_ready_rejects_profile_mismatch(monkeypatch):
 
     with pytest.raises(RuntimeError, match="does not match its fleet"):
         asyncio.run(ContainerResolver().ensure_ready("trusted-1"))
+
+
+def test_resolve_extra_copilot_args_prefers_env_over_cli(monkeypatch):
+    monkeypatch.setenv(
+        AGENT_CONTAINERS_EXEC_COPILOT_ARGS_ENV,
+        '["--agent", "env-charter"]',
+    )
+    assert resolve_extra_copilot_args(["--agent", "cli-charter"]) == [
+        "--agent", "env-charter",
+    ]
+
+
+def test_resolve_extra_copilot_args_falls_back_to_cli_without_env(monkeypatch):
+    monkeypatch.delenv(AGENT_CONTAINERS_EXEC_COPILOT_ARGS_ENV, raising=False)
+    assert resolve_extra_copilot_args(["--agent", "cli-charter"]) == [
+        "--agent", "cli-charter",
+    ]
+    assert resolve_extra_copilot_args(None) is None
+
+
+def test_resolve_extra_copilot_args_rejects_malformed_env(monkeypatch):
+    monkeypatch.setenv(AGENT_CONTAINERS_EXEC_COPILOT_ARGS_ENV, '{"not": "a list"}')
+    with pytest.raises(ValueError):
+        resolve_extra_copilot_args(None)

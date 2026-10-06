@@ -4,7 +4,7 @@ Subcommands:
   ssh <name>            SSH into a CodeSpace (interactive or --stdio)
   list                  List active CodeSpaces
   config adopt          Register current repo for config
-  config init           Scaffold .agent-codespaces/config.yaml (+ auto-adopt)
+  config init           Scaffold .copilot-extensions/agent-codespaces/config.yaml (+ auto-adopt)
   config show           Show resolved config
   config validate       Validate config
   delete <name>         Delete a CodeSpace (recovers sessions first)
@@ -21,36 +21,42 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import logging
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from . import capture_cli
+from . import claim_provider_cli
 from . import pool as pool_mod
 from . import relay_launch
 from .codespace_config import CodespaceSource
+from .worktrees import ContextRefused, validate_context
 from .config import (
-    ADOPTED_REPOS_FILE,
     CANONICAL_CONFIG_REL,
-    CONFIG_DIR_NAME,
     CONFIG_FILE_IN_DIR,
     CONFIG_FILENAME,
+    LEGACY_CONFIG_DIR_NAME,
     NO_SUPPLEMENTAL_CONFIG_ADVISORY,
     RUNTIME_DIR,
     AdoptedRepo,
+    adoption_storage_path,
+    adoption_storage_summary,
     load_adopted_repos,
     load_merged_config,
     repo_config_path,
     repo_has_config,
     save_adopted_repos,
-    scan_config_dropin_registry,
+    scan_config_providers,
     validate_config,
 )
 from .connect import (
@@ -67,6 +73,7 @@ from .lifecycle import (
     wait_for_available,
 )
 from .sessions import sync_codespace_sessions
+from ._ssh_retry import exec_with_retry
 
 log = logging.getLogger("agent-codespaces")
 
@@ -81,6 +88,22 @@ _SSH_BOOT_TIMEOUT = float(os.environ.get("AGENT_CODESPACES_BOOT_TIMEOUT", "180")
 # use by another live process (see ssh_manager.TargetBusyError). Distinct from
 # generic failures (1) and the --remote-cmd timeout (124) so callers can react.
 _BUSY_EXIT = 75
+_COORDINATION_EXIT = 78
+
+
+def _context_admitted(
+    command: Callable[[argparse.Namespace], int],
+) -> Callable[[argparse.Namespace], int]:
+    @functools.wraps(command)
+    def run(args: argparse.Namespace) -> int:
+        try:
+            validate_context()
+            return command(args)
+        except ContextRefused as error:
+            print(f"[BLOCKED] CodeSpace installation context refused: {error}", file=sys.stderr)
+            return _COORDINATION_EXIT
+
+    return run
 
 # Exit code when the host cannot mint an ADO REST bearer and enforcement is on
 # (credentials.enforce_ado_rest_login) -- the connect aborts cleanly rather than
@@ -97,7 +120,8 @@ _ADO_AUTH_EXIT = 77
 # particular self-reports a missing/mis-authed gh, so it never balks.
 _GH_REQUIRED_COMMANDS = frozenset({
     "ssh", "list", "delete", "finalize", "stop", "verify",
-    "create", "prune", "wait", "pool", "allocate",
+    "create", "prune", "wait", "pool", "allocate", "copilot",
+    "sync-sessions",
 })
 
 
@@ -181,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--project", "-p", dest="project", default=None, metavar="REPO",
         help="Resolve as if the cwd were inside REPO's checkout: repo-root "
-             "discovery (e.g. .agent-codespaces/config.yaml) targets REPO "
+             "discovery (e.g. .copilot-extensions/agent-codespaces/config.yaml) targets REPO "
              "instead of the "
              "actual cwd. Injected by the `<repo> <slug>` router (e.g. `<repo> "
              "codespaces …`). A harmless no-op for verbs that take an explicit "
@@ -289,6 +313,10 @@ def main(argv: list[str] | None = None) -> int:
              "another worktree's control.",
     )
 
+    # --- copilot (agent-bridge-cli-mode-sessions Phase 4: venue launch) ---
+    from .copilot_venue import add_copilot_subparser
+    add_copilot_subparser(sub)
+
     # --- list ---
     list_parser = sub.add_parser("list", help="List active CodeSpaces")
     list_parser.add_argument(
@@ -306,11 +334,11 @@ def main(argv: list[str] | None = None) -> int:
     config_sub.add_parser(
         "migrate",
         help="Relocate a legacy repo-root codespaces.yaml to "
-             ".agent-codespaces/config.yaml",
+             ".copilot-extensions/agent-codespaces/config.yaml",
     )
     config_init_p = config_sub.add_parser(
         "init",
-        help="Scaffold .agent-codespaces/config.yaml in the current repo "
+        help="Scaffold .copilot-extensions/agent-codespaces/config.yaml in the current repo "
              "(supplementary-only; most repos need none)",
     )
     config_init_p.add_argument(
@@ -319,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     config_init_p.add_argument(
         "--force", action="store_true",
-        help="Overwrite an existing .agent-codespaces/config.yaml",
+        help="Overwrite an existing .copilot-extensions/agent-codespaces/config.yaml",
     )
     config_init_p.add_argument(
         "--adopt", action="store_true",
@@ -337,6 +365,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Skip the pre-delete Copilot session recovery",
     )
 
+    claim_provider_cli.add_claim_provider_parsers(sub)
+    capture_cli.add_capture_parser(sub)
     # --- finalize ---
     finalize_parser = sub.add_parser(
         "finalize",
@@ -493,7 +523,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     release_p.add_argument("target", help="CodeSpace name or effort name")
 
-    sub.add_parser("leases", help="Show active CodeSpace leases")
+    leases_p = sub.add_parser("leases", help="Show active CodeSpace leases")
+    leases_p.add_argument(
+        "--owner", dest="owner", default=None,
+        help="Only show leases/claims owned by this worktree/effort",
+    )
+    leases_p.add_argument(
+        "--json", dest="json_output", action="store_true",
+        help="Emit machine-readable JSON instead of the human table",
+    )
 
     # --- claim / release-claim (#897: exclusive, worktree-keyed control) ------
     # The process-to-process seam the agent-bridge daemon shells out to (it
@@ -526,11 +564,22 @@ def main(argv: list[str] | None = None) -> int:
         "release-claim",
         help="Release this worktree's exclusive claim on a CodeSpace (#897)",
     )
-    release_claim_p.add_argument("codespace", help="CodeSpace name")
+    release_claim_p.add_argument(
+        "codespace", nargs="?", default=None,
+        help="CodeSpace name (omit with --all to release every claim the "
+             "owner holds)",
+    )
     release_claim_p.add_argument(
         "--owner", dest="owner", default=None,
         help="Owning worktree (defaults to the calling worktree). Only releases "
              "if the claim is owned by this worktree.",
+    )
+    release_claim_p.add_argument(
+        "--all", dest="release_all", action="store_true",
+        help="Release EVERY CodeSpace claim held by the owner, not just one "
+             "named CodeSpace -- the safety-net form used by "
+             "`agent-worktrees finalize` so a worktree never leaves a stray "
+             "claim behind, even if it forgot which CodeSpace(s) it held.",
     )
 
     # --- pool (finite, budget-bounded pool view: disposition + budget) ---
@@ -622,13 +671,16 @@ def main(argv: list[str] | None = None) -> int:
     # Runs the reconcile loop that owns + self-heals each CodeSpace's credential
     # relay per machine, independent of any one agent-bridge dispatch, so a caller
     # disconnect / bridge restart no longer drops the relay mid-task
-    # (dotfiles#1320/#1333). Config-gated (default off) + additive: nothing starts
-    # it by default. Making the ssh/dispatch paths defer to it is a later
-    # increment; this entrypoint makes the daemon runnable + live-validatable.
+    # (dotfiles#1320/#1333). Config-gated (default ON) + on-demand: a tenant
+    # starts it itself if it isn't already running (ensure_owner_running), and
+    # the daemon exits on its own after being idle (no held CodeSpace) for
+    # connection_owner.idle_shutdown_after -- it is never assumed to be a
+    # permanently-resident background service.
     owner_p = sub.add_parser(
         "owner",
         help="Run the persistent Connection Owner relay daemon "
-             "(config-gated: connection_owner.enabled; default off)",
+             "(config-gated: connection_owner.enabled; default on; idles out "
+             "on its own when nothing needs it)",
     )
     owner_p.add_argument(
         "--force", action="store_true",
@@ -643,10 +695,18 @@ def main(argv: list[str] | None = None) -> int:
         help="override the reconcile interval in seconds (default: config or 15)",
     )
     owner_p.add_argument(
+        "--idle-shutdown-after", dest="idle_shutdown_after", type=float,
+        default=None,
+        help="override the idle-shutdown window in seconds (default: config or "
+             "300); pass a non-positive value to disable idle shutdown "
+             "(run until stopped)",
+    )
+    owner_p.add_argument(
         "--status", action="store_true",
         help="print the resolved connection_owner config as JSON "
-             "(enabled/reconcile_interval) and exit; install/update uses this to "
-             "gate service provisioning (does not start the daemon)",
+             "(enabled/reconcile_interval/idle_shutdown_after) and exit; "
+             "install/update uses this to gate service provisioning (does not "
+             "start the daemon)",
     )
 
     # --- status ---
@@ -660,11 +720,49 @@ def main(argv: list[str] | None = None) -> int:
     doctor_parser = sub.add_parser(
         "doctor",
         help="Check gh auth and config.d registry hygiene; print remedies and "
-             "exit non-zero when either has findings (#980)",
+             "exit non-zero when either has findings (#980). Given a "
+             "CodeSpace <name>, pivots instead to that venue's own "
+             "readiness (see `check`), optionally remediating with --fix.",
+    )
+    doctor_parser.add_argument(
+        "name", nargs="?", default=None,
+        help="CodeSpace name -- pivots to per-venue readiness/remediation "
+             "instead of host-side gh-auth/config.d hygiene",
     )
     doctor_parser.add_argument(
         "--json", dest="json_output", action="store_true",
         help="Output exhaustive gh-auth and config.d diagnostics as JSON",
+    )
+    doctor_parser.add_argument(
+        "--fix", action="store_true",
+        help="With a CodeSpace <name>: apply the two safely-idempotent "
+             "remediations this command knows (install tmux; provision/"
+             "refresh agent-worktrees). Read-only (report-only) without "
+             "this flag. Has no effect on the host-side (no-name) mode.",
+    )
+    doctor_parser.add_argument(
+        "--timeout", type=float, default=240.0,
+        help="Seconds to wait for the venue probe/remediation round trip "
+             "(default: 240)",
+    )
+
+    # --- check (agent-bridge-cli-mode-sessions Phase 4: venue preflight) ---
+    check_parser = sub.add_parser(
+        "check",
+        help="Read-only venue toolchain readiness probe for the CLI-mode "
+             "`copilot` verb's own preflight: copilot/tmux presence and "
+             "agent-worktrees install state (absent/lean/full). Never "
+             "mutates the venue -- follow up with `doctor <name> --fix` to "
+             "remediate.",
+    )
+    check_parser.add_argument("name", help="CodeSpace name")
+    check_parser.add_argument(
+        "--json", dest="json_output", action="store_true",
+        help="Output the readiness report as JSON",
+    )
+    check_parser.add_argument(
+        "--timeout", type=float, default=30.0,
+        help="Seconds to wait for the probe round trip (default: 30)",
     )
 
     # --- version ---
@@ -755,7 +853,42 @@ def main(argv: list[str] | None = None) -> int:
         help="Migrate machine-local config schema (adopted-repos.yaml); idempotent",
     )
 
+    # --- dev-release / dev-status (mutable-dev-slot, #3376 Phase 2) ---
+    # `dev-claim`/`slot`/`activate` stay installer-time only (they need this
+    # worktree's own checkout to build the editable slot); a *release* must
+    # work even when the operator is no longer standing in a source checkout
+    # (e.g. reacting to an `agent-worktrees finalize` warning) -- see
+    # docs/patterns/mutable-dev-slot.md "Runtime accessibility". Both verbs
+    # shell out to the versioned_runtime.py copy staged at RUNTIME_DIR by the
+    # installer (option 1 in that doc), never import it directly.
+    dev_release_p = sub.add_parser(
+        "dev-release",
+        help="Release the mutable `dev` version slot and restore the machine's "
+        "real deployment (current-version -> whatever was active before "
+        "dev mode was claimed).",
+    )
+    dev_release_p.add_argument(
+        "--owner", default=None,
+        help="Claimant ref to release as (defaults to `agent-worktrees get "
+        "worktree-dir`, else this repo checkout's root).",
+    )
+    dev_release_p.add_argument(
+        "--force", action="store_true",
+        help="Release even if the claim is held by a different owner.",
+    )
+    sub.add_parser(
+        "dev-status",
+        help="Print the current `dev` slot claim (or null) as JSON.",
+    )
+
     args = parser.parse_args(argv)
+
+    try:
+        if args.command and args.command not in {"doctor", "status", "version", "installer-readiness", "dev-release", "dev-status"}:
+            validate_context()
+    except ContextRefused as error:
+        print(f"[BLOCKED] CodeSpace installation context refused: {error}", file=sys.stderr)
+        return _COORDINATION_EXIT
 
     # --remote-cmd-file: the internal bridge-dispatch path passes the ACP launch
     # payload as a file PATH (a clean argv token) rather than a --remote-cmd
@@ -777,8 +910,12 @@ def main(argv: list[str] | None = None) -> int:
     # the cwd; on a name/CodeSpace-addressed verb an *explicit* --project bounces
     # (fail loud, #1080) while a router-injected one stays a silent no-op.
     # Best-effort otherwise: an unresolvable project warns but never blocks.
-    if _guard_project_scope(parser, args):
-        _chdir_to_project(args.project)
+    try:
+        if _guard_project_scope(parser, args):
+            _chdir_to_project(args.project)
+    except ContextRefused as error:
+        print(f"[BLOCKED] CodeSpace installation context refused: {error}", file=sys.stderr)
+        return _COORDINATION_EXIT
 
     if not args.command:
         parser.print_help()
@@ -792,8 +929,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
+        if getattr(args, "func", None) is not None:
+            return args.func(args)
         if args.command == "ssh":
             return _cmd_ssh(args)
+        if args.command == "copilot":
+            from .copilot_venue import cmd_copilot
+
+            return cmd_copilot(args, interactive_ssh=_interactive_ssh, ssh_session=_ssh_session)
         if args.command == "list":
             return _cmd_list(args)
         if args.command == "config":
@@ -821,7 +964,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "release":
             return _cmd_release(args)
         if args.command == "leases":
-            return _cmd_leases()
+            return _cmd_leases(args)
         if args.command == "claim":
             return _cmd_claim(args)
         if args.command == "release-claim":
@@ -837,7 +980,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "installer-readiness":
             return _cmd_installer_readiness()
         if args.command == "doctor":
+            if getattr(args, "name", None):
+                from .venue_check_cli import cmd_doctor_venue
+
+                return asyncio.run(cmd_doctor_venue(args))
             return _cmd_doctor(json_output=args.json_output)
+        if args.command == "check":
+            from .venue_check_cli import cmd_check
+
+            return asyncio.run(cmd_check(args))
         if args.command == "version":
             return _cmd_version()
         if args.command == "acp-model-flags":
@@ -859,7 +1010,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "config-migrate":
             return _cmd_config_migrate()
         if args.command == "owner":
-            return _cmd_owner(args)
+            from .owner_cli import cmd_owner
+            return cmd_owner(args)
+        if args.command == "dev-release":
+            return _cmd_dev_release(args)
+        if args.command == "dev-status":
+            return _cmd_dev_status()
+    except ContextRefused as error:
+        print(f"[BLOCKED] CodeSpace installation context refused: {error}", file=sys.stderr)
+        return _COORDINATION_EXIT
     except RuntimeError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
@@ -971,7 +1130,7 @@ async def _preflight_copilot_platform(manager, name: str) -> None:  # noqa: ANN0
     from .platform_preflight import ensure_copilot_platform
 
     async def _run(cmd: str) -> tuple[int, str]:
-        result = await manager.exec_command(name, cmd, timeout=240)
+        result = await exec_with_retry(manager, name, cmd, timeout=240)
         return result.exit_code, (result.stdout or "") + (result.stderr or "")
 
     try:
@@ -988,93 +1147,87 @@ async def _preflight_copilot_platform(manager, name: str) -> None:  # noqa: ANN0
         )
 
 
+@_context_admitted
 def _cmd_ssh(args: argparse.Namespace) -> int:
     """SSH into a CodeSpace using ssh-manager."""
+    return _ssh_session(args)
+
+
+def _ssh_session(
+    args: argparse.Namespace,
+    *,
+    remote_cmd_builder: Callable[[list[str]], str] | None = None,
+    result_sink: Callable[[Any], int] | None = None,
+    settle_on_disconnect: bool = True,
+) -> int:
+    """The body of ``agent-codespaces ssh``: claim, lock, full venue prep, run.
+
+    In-process callers that need the full dispatch-grade preparation for a
+    non-``--stdio`` remote command (the detached ``copilot --detach`` launch)
+    pass keyword hooks instead of widening the CLI surface:
+
+    * ``remote_cmd_builder(plugin_dirs) -> str`` supplies the remote command
+      after provisioning, receiving the staged CodeSpace-scoped plugin dirs
+      (which it folds in itself); it also opts the command out of the
+      minimal "diagnostic ``--remote-cmd``" provisioning path;
+    * ``result_sink(result) -> int`` receives the exec result instead of it
+      being printed;
+    * ``settle_on_disconnect=False`` keeps the borrowing worktree's claim
+      obligation active at disconnect (the launched work keeps running).
+    """
     from ssh_manager import ConnectionManager, TargetBusyError, TargetLock
 
+    from .gh_account import credential_account_for_codespace
     from .lifecycle import account_for_codespace
+    from .worktrees import ContextRefused
 
     source = CodespaceSource(args.name, account=account_for_codespace(args.name))
+    github_account = None if getattr(args, "no_relay", False) else credential_account_for_codespace(args.name)
     config = load_merged_config()
     from .relay_launch import effective_relay_port
     relay_port = effective_relay_port(config)
 
     # Reusing a box (an explicit ssh connect) clears any prune-lifecycle marker
     # -- it is active work again, not a recovered/prunable reclaim candidate.
-    _clear_status_quietly(args.name)
-    # Exclusive, worktree-keyed claim (#897). A CodeSpace is fronted by exactly
-    # one agent-bridge Session Host, so only one worktree may control it at a
-    # time. Resolve the owning worktree -- an explicit ``--effort`` (used by a
-    # dispatched ``ssh`` whose cwd is the daemon's, not the caller's worktree),
-    # else the calling worktree via agent-worktrees -- then acquire the claim,
-    # sweeping existing claims and BOUNCING a live different owner (unless
-    # ``--force``). A claim held by a gone/finalized worktree is auto-released and
-    # taken over. Degrade-safe: when no worktree resolves (not a worktree,
-    # agent-worktrees absent), we skip claiming and connect exactly as before.
-    from .lease import (
-        ClaimConflict,
-        active_worktree_ids,
-        claim,
-        resolve_owner_worktree,
-    )
+    # Exclusive, worktree-keyed claim (#897), enforced through the single
+    # shared choke point every connect path must go through
+    # (`lease.claim_for_connect` -- see its docstring for why this must never
+    # be duplicated/bypassed per-verb again).
+    from .lease import ClaimConflict, CoordinationRejected, claim_for_connect
 
-    # Escape hatch: an operator (or a unit test) can disable exclusive-control
-    # enforcement entirely. --force remains the per-call takeover.
-    if os.environ.get("AGENT_CODESPACES_DISABLE_CLAIM"):
-        claim_owner = None
-    else:
-        claim_owner = resolve_owner_worktree(
-            explicit=getattr(args, "effort", None),
+    fence_holder_ref = None
+    try:
+        fence_holder_ref = claim_for_connect(
+            args.name,
+            force=getattr(args, "force_claim", False),
+            effort=getattr(args, "effort", None),
             session_id=getattr(args, "session_id", None),
         )
-    # Resolve the qualified holder ClaimRef once, for BOTH the cross-machine L2
-    # claim (below) and the cross-harness in-CodeSpace fence (in _run). It is the
-    # marker's holder identity even when L1/L2 claiming is disabled, so hoist it
-    # out of the claim block. Degrade-safe: None when not in a worktree.
-    from . import coordination
-    fence_holder_ref = coordination.owner_ref(
-        session_id=getattr(args, "session_id", None),
-    )
-    if claim_owner:
-        holder_ref = fence_holder_ref
-        try:
-            claim(
-                args.name, claim_owner,
-                force=getattr(args, "force_claim", False),
-                active=active_worktree_ids(),
-                holder_ref=holder_ref,
-            )
-        except ClaimConflict as exc:
-            print(
-                f"[BUSY] {exc}\n"
-                f"       A CodeSpace is fronted by a single bridge, so a second "
-                f"worktree cannot drive it concurrently. Options:\n"
-                f"       - let the owner finish, or dispatch to a different "
-                f"CodeSpace; or\n"
-                f"       - take over with --force-claim (evicts the current "
-                f"owner's claim -- its in-flight work may be disrupted).",
-                file=sys.stderr,
-            )
-            return _BUSY_EXIT
-        except RuntimeError as exc:
-            # Never let a claim-bookkeeping error block a connect.
-            print(f"[WARN] CodeSpace claim skipped: {exc}", file=sys.stderr)
+    except ClaimConflict as exc:
+        print(
+            f"[BUSY] {exc}\n"
+            f"       A CodeSpace is fronted by a single bridge, so a second "
+            f"worktree cannot drive it concurrently. Options:\n"
+            f"       - let the owner finish, or dispatch to a different "
+            f"CodeSpace; or\n"
+            f"       - take over with --force-claim (evicts the current "
+            f"owner's claim -- its in-flight work may be disrupted).",
+            file=sys.stderr,
+        )
+        return _BUSY_EXIT
+    except (CoordinationRejected, ContextRefused) as exc:
+        print(
+            f"[BLOCKED] CodeSpace claim requires durable coordination: {exc}",
+            file=sys.stderr,
+        )
+        return _COORDINATION_EXIT
+    except RuntimeError as exc:
+        # Never let a claim-bookkeeping error block a connect.
+        print(f"[WARN] CodeSpace claim skipped: {exc}", file=sys.stderr)
 
-        # Journal the CodeSpace as an outbound obligation on the BORROWING
-        # worktree so its finalize gate holds it accountable
-        # (resource-obligation-settlement Ph3b-wiring/2). Best-effort +
-        # degrade-safe: resolves the owner by its qualified holder-ref (not the
-        # caller's cwd -- a dispatched ssh runs in the daemon's cwd). Settled to
-        # at-rest on a clean disconnect (below). A missing holder-ref / binstub /
-        # cross-machine owner is a silent no-op. Journaled for any claimed
-        # connect (a clean disconnect immediately settles it to at-rest, so an
-        # ephemeral probe leaves only harmless at-rest provenance).
-        if fence_holder_ref:
-            if coordination.journal_obligation(args.name, fence_holder_ref):
-                log.info(
-                    "Journaled CodeSpace %s as an obligation on %s",
-                    args.name, fence_holder_ref,
-                )
+    # Reusing a box clears any prune-lifecycle marker only after coordination
+    # has allowed the operation to proceed.
+    _clear_status_quietly(args.name)
 
     # Credential relay state. The relay reverse-forward now has its own
     # supervised ``ssh -N -R`` channel, so it is not piggybacked on the
@@ -1109,33 +1262,35 @@ def _cmd_ssh(args: argparse.Namespace) -> int:
         # (it also serves network-reachable containers), so the codespace path
         # must present its own secret for the official azure-auth-helper scope
         # broker. Minted/persisted host-side; injected over SSH as LC_* so it
-        # survives the login shell into the relay client.
-        from .relay_token import token_for
-
-        relay_token = token_for(args.name)
+        # survives the login shell into the relay client. Minted WITH the
+        # configured Azure scope: an unscoped token records no resources and
+        # the broker then denies every get-azure-token.
+        relay_token = relay_launch.scoped_relay_token(args.name, config)
 
     # Launch prelude: always scrub injected PATs (#160/#77); add the relay
-    # exports only when the relay is in use. Built here (after the token mint)
-    # so the PAT scrub can NEVER be clobbered by the relay exports.
+    # exports only when the relay is in use, after the token mint.
     relay_env = _build_relay_env(
         relay_port,
         relay_token,
         use_relay=not args.no_relay,
         ado_host=getattr(config.credentials, "ado_host", None),
+        github_account=github_account,
         feed_token_env=getattr(config.credentials, "feed_token_env", None),
+        identity_env=getattr(config.credentials, "identity_env", None),
     )
 
     manager = ConnectionManager()
     relay_forward = None
 
-    # Connection Owner defer (dotfiles#1345): when the Owner daemon is live and
-    # enabled, this one-off ssh becomes a non-owning tenant -- it places a hold so
-    # the Owner keeps this CodeSpace's relay up and does NOT stand up its own -R
-    # (which would collide, #561). Default-off + fail-safe: if the feature is off,
-    # no daemon is live, or the hold fails, we own the relay exactly as before.
-    # The decision here is side-effect-free; the hold itself is placed only AFTER
-    # the target lock is acquired (below), so a busy-target rejection can't leak a
-    # hold that would linger until its TTL.
+    # Connection Owner defer (dotfiles#1345): when enabled, this one-off ssh
+    # becomes a non-owning tenant -- it places a hold so the Owner keeps this
+    # CodeSpace's relay up and does NOT stand up its own -R (which would
+    # collide, #561). Default-on + fail-safe: `should_defer_to_owner` spins the
+    # daemon up on-demand if it isn't already live; if the feature is off or
+    # spin-up genuinely fails, we own the relay exactly as before. The decision
+    # here is side-effect-free; the hold itself is placed only AFTER the target
+    # lock is acquired (below), so a busy-target rejection can't leak a hold
+    # that would linger until its TTL.
     from . import connection_owner as _owner
     owner_tenant = f"ssh:{os.getpid()}"
     defer_to_owner = _owner.should_defer_to_owner(config, no_relay=args.no_relay)
@@ -1144,7 +1299,9 @@ def _cmd_ssh(args: argparse.Namespace) -> int:
     # any --stage-plugin payloads are staged -- so their on-CodeSpace
     # --plugin-dir paths can be folded into the copilot invocation. See
     # _finalize_remote_cmd below.
-    diagnostic_remote_cmd = bool(args.remote_cmd and not args.stdio)
+    diagnostic_remote_cmd = bool(
+        args.remote_cmd and not args.stdio and remote_cmd_builder is None
+    )
     minimal_provision = bool(getattr(args, "no_provision", False) or diagnostic_remote_cmd)
     overall_timeout = getattr(args, "connect_timeout", None)
     if overall_timeout is None and diagnostic_remote_cmd:
@@ -1159,8 +1316,17 @@ def _cmd_ssh(args: argparse.Namespace) -> int:
         """Wrap args.remote_cmd in a login shell (see _build_launch_command).
 
         Folds ``--plugin-dir`` args in ONLY for the ``--stdio`` copilot launch,
-        never for a plain diagnostic ``--remote-cmd`` (issue #152).
+        never for a plain diagnostic ``--remote-cmd`` (issue #152). A
+        ``remote_cmd_builder`` receives the dirs and folds them in itself.
         """
+        if remote_cmd_builder is not None:
+            return _build_launch_command(
+                remote_cmd_builder(plugin_dirs),
+                [],
+                is_stdio=False,
+                relay_env=relay_env,
+                breadcrumb=breadcrumb_prelude(args.name),
+            )
         return _build_launch_command(
             args.remote_cmd,
             plugin_dirs,
@@ -1273,8 +1439,12 @@ def _cmd_ssh(args: argparse.Namespace) -> int:
             # connect) and syncs it forward on reconnect. Needs the relay up for
             # git auth.
             if not args.no_relay:
-                await _provision_dotfiles(manager, args.name, config)
-                await _provision_harness(manager, args.name, config)
+                await _provision_dotfiles(
+                    manager, args.name, config, relay_env=relay_env,
+                )
+                await _provision_harness(
+                    manager, args.name, config, relay_env=relay_env,
+                )
 
             # Register CodeSpace-scoped plugins (the CodeSpace-scoped axis) via
             # BOTH lanes: (1) the CodeSpace user settings so they load for
@@ -1291,7 +1461,8 @@ def _cmd_ssh(args: argparse.Namespace) -> int:
                 )
 
             # Run repo-declared provision hooks (by-convention extras from the
-            # adopted repo's .agent-codespaces/config.yaml). Best-effort, idempotent.
+            # adopted repo's .copilot-extensions/agent-codespaces/config.yaml).
+            # Best-effort, idempotent.
             await _provision_repo_hooks(
                 manager, args.name, config, getattr(args, "repo", None),
             )
@@ -1306,7 +1477,9 @@ def _cmd_ssh(args: argparse.Namespace) -> int:
             from .auth_preflight import AdoRestAuthError
 
             try:
-                await _verify_remote_auth(manager, args.name, config)
+                await _verify_remote_auth(
+                    manager, args.name, config, github_account=github_account,
+                )
             except AdoRestAuthError as exc:
                 print(f"[ERROR] {exc}", file=sys.stderr)
                 await manager.disconnect(args.name)
@@ -1360,9 +1533,20 @@ def _cmd_ssh(args: argparse.Namespace) -> int:
                 args.name, remote_cmd, timeout=args.timeout
             )
             tracker.reached(ConnectStage.LAUNCH_ACP)
+            if result_sink is not None:
+                return result_sink(result)
             return _emit_remote_cmd_result(result, args.timeout)
 
-        # Interactive SSH -- fall through to gh codespace ssh
+        # Interactive SSH -- fall through to gh codespace ssh. ssh drops the
+        # local LC_* relay env, so publish the port map (token + account) now.
+        if not args.no_relay:
+            publish = relay_launch.build_relay_portmap_publish(
+                relay_port, relay_token, github_account=github_account,
+                ado_host=getattr(config.credentials, "ado_host", None))
+            try:
+                await exec_with_retry(manager, args.name, publish, timeout=20)
+            except Exception as exc:  # noqa: BLE001 -- best-effort, like warm-up
+                log.debug("Relay port-map publish on %s failed: %s", args.name, exc)
         await manager.disconnect(args.name)
         return _interactive_ssh(
             args.name,
@@ -1428,7 +1612,7 @@ def _cmd_ssh(args: argparse.Namespace) -> int:
             # read-only cleanliness probe can execute. Best-effort + degrade-safe:
             # un-probeable / dirty / no holder-ref -> the obligation stays active
             # (never settled blind).
-            if fence_holder_ref:
+            if fence_holder_ref and settle_on_disconnect:
                 await _settle_codespace_on_disconnect(
                     manager, args.name, fence_holder_ref,
                 )
@@ -1544,8 +1728,8 @@ async def _stage_plugins(
         dest = dest_dir(source)
         try:
             command, payload_b64 = build_stage_command(payload, dest)
-            result = await manager.exec_command(
-                name, command, timeout=60.0, input_bytes=payload_b64
+            result = await exec_with_retry(
+                manager, name, command, timeout=60.0, input_bytes=payload_b64
             )
             if result.exit_code == 0:
                 dirs.append(dest)
@@ -1598,8 +1782,8 @@ async def _check_cross_harness_fence(
         return True
 
     try:
-        read = await manager.exec_command(
-            name, fence.read_marker_command(), timeout=30.0,
+        read = await exec_with_retry(
+            manager, name, fence.read_marker_command(), timeout=30.0,
         )
         text = read.stdout if read.exit_code == 0 else ""
     except Exception as exc:
@@ -1634,8 +1818,8 @@ async def _check_cross_harness_fence(
         harness=local_harness, holder=holder_ref or "", written_at=time.time(),
     )
     try:
-        await manager.exec_command(
-            name, fence.write_marker_command(our), timeout=30.0,
+        await exec_with_retry(
+            manager, name, fence.write_marker_command(our), timeout=30.0,
         )
     except Exception as exc:
         log.warning("Cross-harness fence write on %s failed: %s", name, exc)
@@ -1651,10 +1835,13 @@ async def _provision_relay_helpers(manager, name: str) -> None:
     but never raises, since the SSH command itself should still proceed.
     """
     from .codespace_assets import build_provision_command
+    from .config import load_merged_config
 
     try:
-        command = build_provision_command()
-        result = await manager.exec_command(name, command, timeout=30.0)
+        cfg = load_merged_config(include_cwd=False)
+        ado_host = getattr(cfg.credentials, "ado_host", None)
+        command = build_provision_command(ado_host=ado_host)
+        result = await exec_with_retry(manager, name, command, timeout=30.0)
         if result.exit_code == 0:
             log.debug("Relay helpers provisioned on %s", name)
         else:
@@ -1666,7 +1853,9 @@ async def _provision_relay_helpers(manager, name: str) -> None:
         log.warning("Relay helper provisioning on %s failed: %s", name, exc)
 
 
-async def _provision_dotfiles(manager, name: str, config) -> None:
+async def _provision_dotfiles(
+    manager, name: str, config, *, relay_env: str = "",
+) -> None:
     """Ensure the configured dotfiles repo is present + current on a CodeSpace.
 
     Universal bootstrap for every CodeSpace when ``defaults.dotfiles_repo`` is
@@ -1688,6 +1877,8 @@ async def _provision_dotfiles(manager, name: str, config) -> None:
         command = build_dotfiles_command(
             config.dotfiles_repo, effective_relay_port(config),
         )
+        if relay_env:
+            command = relay_env + command
         # Run under a LOGIN shell: the dotfiles clone authenticates to GitHub via
         # the CodeSpace's own credential helper (gitcredential_github.sh), which
         # needs the platform env (GITHUB_TOKEN, profile.d) that only a login
@@ -1696,7 +1887,7 @@ async def _provision_dotfiles(manager, name: str, config) -> None:
         # path wrap their commands.
         login_command = f"bash -l -c {shlex.quote(command)}"
         # Clone + install.sh can run long on a first connect; be generous.
-        result = await manager.exec_command(name, login_command, timeout=900.0)
+        result = await exec_with_retry(manager, name, login_command, timeout=900.0, attempts=2)
         if result.exit_code == 0:
             log.debug("Dotfiles provisioned on %s", name)
         else:
@@ -1708,7 +1899,9 @@ async def _provision_dotfiles(manager, name: str, config) -> None:
         log.warning("Dotfiles provisioning on %s failed: %s", name, exc)
 
 
-async def _provision_harness(manager, name: str, config) -> None:
+async def _provision_harness(
+    manager, name: str, config, *, relay_env: str = "",
+) -> None:
     """Ensure the configured control-plane *harness* checkout is present +
     current on a venue at ``/workspaces/<basename(harness_repo)>``.
 
@@ -1731,11 +1924,13 @@ async def _provision_harness(manager, name: str, config) -> None:
         command = build_harness_command(
             config.harness_repo, effective_relay_port(config),
         )
+        if relay_env:
+            command = relay_env + command
         # Login shell, same rationale as the dotfiles clone: the harness clone
         # authenticates to GitHub via the CodeSpace's own credential helper,
         # which needs the platform env only a login shell loads.
         login_command = f"bash -l -c {shlex.quote(command)}"
-        result = await manager.exec_command(name, login_command, timeout=900.0)
+        result = await exec_with_retry(manager, name, login_command, timeout=900.0, attempts=2)
         if result.exit_code == 0:
             log.debug("Harness provisioned on %s", name)
         else:
@@ -1756,7 +1951,7 @@ async def _register_codespace_plugins(
     - **user settings (interactive lane):** resolves the harness's
       ``codespacePlugins`` for this CodeSpace's workspace repo -- both those
       swept from installed harness plugins AND the operator-declared
-      ``.agent-codespaces/config.yaml`` ``codespace_plugins`` list
+      ``.copilot-extensions/agent-codespaces/config.yaml`` ``codespace_plugins`` list
       (:func:`codespace_plugins.resolve_codespace_plugins`) -- and writes them
       into the CodeSpace's user ``~/.copilot/settings.json`` + pre-installs the
       payloads (see :mod:`codespace_register`). Honored by interactive /
@@ -1776,8 +1971,8 @@ async def _register_codespace_plugins(
     related-repo lane uses); only the remote-marketplace specs go through the
     register + pre-install lane.
 
-    Best-effort and idempotent: logs a warning on failure but never raises, and
-    returns ``[]`` when there is nothing to register.
+    Best-effort and idempotent for ordinary failures; explicit installation
+    refusals propagate. Returns ``[]`` when there is nothing to register.
     """
     from .codespace_plugins import (
         parse_operator_plugins,
@@ -1789,6 +1984,7 @@ async def _register_codespace_plugins(
     from .config import repo_copilot_settings
 
     try:
+        validate_context()
         # The dispatch path doesn't pass --repo, so resolve the CodeSpace's
         # workspace repo ourselves (needed to apply repo-scoped codespacePlugins
         # entries; global entries apply regardless). A single `gh` lookup, only
@@ -1805,7 +2001,7 @@ async def _register_codespace_plugins(
         enabled_names = plugin_names_from_enabled(repo_settings.get("enabledPlugins"))
         marketplaces = repo_settings.get("extraKnownMarketplaces") or {}
 
-        # Merge the operator-declared globals (.agent-codespaces/config.yaml
+        # Merge the operator-declared globals (.copilot-extensions/agent-codespaces/config.yaml
         # `codespace_plugins`)
         # with the set swept from installed harness plugins.
         operator_specs = parse_operator_plugins(
@@ -1835,7 +2031,7 @@ async def _register_codespace_plugins(
             wrapped = f"bash -l -c {shlex.quote(command)}"
             # Settings merge is quick; the pre-install (`copilot plugin install`)
             # clones the marketplace over the relay, so allow a generous window.
-            result = await manager.exec_command(name, wrapped, timeout=240.0)
+            result = await exec_with_retry(manager, name, wrapped, timeout=240.0)
             if result.exit_code == 0:
                 log.info(
                     "Registered %d CodeSpace-scoped plugin(s) on %s: %s",
@@ -1869,12 +2065,16 @@ async def _register_codespace_plugins(
             dirs += staged
 
         return dirs
+    except ContextRefused:
+        raise
     except Exception as exc:
         log.warning("CodeSpace plugin registration on %s failed: %s", name, exc)
     return []
 
 
-async def _verify_remote_auth(manager, name: str, config) -> None:
+async def _verify_remote_auth(
+    manager, name: str, config, *, github_account: str | None = None,
+) -> None:
     """Verify host-side auth for the CodeSpace's git remote domains.
 
     Lists the git remotes of both the workspace/product checkout and the
@@ -1890,11 +2090,13 @@ async def _verify_remote_auth(manager, name: str, config) -> None:
     cannot mint the bearer and ``enforce_ado_rest_login`` is on -- the caller
     catches it to abort the connect cleanly.
     """
+    from credential_relay.sources.git_credential import GitCredentialSource
+
     from .auth_preflight import host_from_url, verify_remote_auth
 
     async def _run_remote(cmd: str) -> str:
         wrapped = f"bash -l -c {shlex.quote(cmd)}"
-        result = await manager.exec_command(name, wrapped, timeout=30.0)
+        result = await exec_with_retry(manager, name, wrapped, timeout=30.0)
         return result.stdout or ""
 
     # Guarantee the dotfiles repo's host is checked even if its checkout isn't
@@ -1907,7 +2109,9 @@ async def _verify_remote_auth(manager, name: str, config) -> None:
 
     try:
         hosts, missing = await verify_remote_auth(
-            _run_remote, extra_hosts=extra_hosts,
+            _run_remote,
+            extra_hosts=extra_hosts,
+            source=GitCredentialSource(github_username=github_account),
         )
     except Exception as exc:
         log.debug("Remote auth verification on %s failed: %s", name, exc)
@@ -2019,27 +2223,25 @@ async def _warm_remote_auth_cache(
     hosts plus the ADO REST/feed bare-token helpers. Failures are debug-only and
     never block the connect.
     """
-    from .auth_preflight import REMOTE_LIST_COMMAND, host_from_url, parse_remote_hosts
+    from . import auth_preflight as auth
 
     async def _run_remote(cmd: str, *, command_timeout: float) -> str:
         wrapped = f"bash -l -c {shlex.quote(cmd)}"
-        result = await manager.exec_command(name, wrapped, timeout=command_timeout)
+        result = await exec_with_retry(manager, name, wrapped, timeout=command_timeout)
         if getattr(result, "exit_code", 1) != 0:
             return ""
         return getattr(result, "stdout", "") or ""
 
     hosts: list[str] = []
     try:
-        remote_output = await _run_remote(REMOTE_LIST_COMMAND, command_timeout=10.0)
-        hosts.extend(parse_remote_hosts(remote_output))
+        remote_output = await _run_remote(auth.REMOTE_LIST_COMMAND, command_timeout=10.0)
+        hosts.extend(auth.parse_remote_hosts(remote_output))
     except Exception as exc:
         log.debug("Auth-cache warm-up remote host discovery on %s failed: %s", name, exc)
-
     if config.dotfiles_repo:
-        dotfiles_host = host_from_url(f"https://github.com/{config.dotfiles_repo}")
+        dotfiles_host = auth.host_from_url(f"https://github.com/{config.dotfiles_repo}")
         if dotfiles_host:
             hosts.append(dotfiles_host)
-
     deduped_hosts = list(dict.fromkeys(h for h in hosts if h))
     commands = ["set +e"]
     for host in deduped_hosts:
@@ -2049,7 +2251,9 @@ async def _warm_remote_auth_cache(
             "| ado-auth-helper get >/dev/null 2>/dev/null || true"
         )
     commands.extend([
-        "azure-auth-helper get-access-token >/dev/null 2>/dev/null || true",
+        "ado-auth-helper get-access-token "
+        f"--resource {shlex.quote(auth.ADO_REST_RESOURCE)} "
+        ">/dev/null 2>/dev/null || true",
         "ado-auth-helper get-access-token >/dev/null 2>/dev/null || true",
     ])
     command = relay_env + " " + "; ".join(commands)
@@ -2065,13 +2269,15 @@ async def _warm_remote_auth_cache(
 
 
 def _lookup_codespace_repo(name: str) -> str | None:
-    """Best-effort lookup of a CodeSpace's repository (owner/name)."""
+    """Look up a repository, preserving explicit installation refusals."""
     try:
         from .lifecycle import list_codespaces
 
         for cs in list_codespaces():
             if cs.name == name:
                 return cs.repository
+    except ContextRefused:
+        raise
     except Exception as exc:
         log.debug("Could not resolve repo for %s: %s", name, exc)
     return None
@@ -2088,11 +2294,13 @@ async def _provision_repo_hooks(
     The repo is taken from ``--repo`` when provided (hot path) and only
     looked up when per-repo hooks actually exist. When
     ``include_on_create`` is set, ``on_create`` commands run too (used
-    once during ``agent-codespaces create``). Best-effort and idempotent.
+    once during ``agent-codespaces create``). Best-effort and idempotent for
+    ordinary failures; explicit installation refusals propagate.
     """
     from .provision import build_provision_command
 
     try:
+        validate_context()
         # Only pay for a repo lookup when per-repo hooks are declared.
         if repo is None and any(rc.provision for rc in config.repos.values()):
             repo = _lookup_codespace_repo(name)
@@ -2107,7 +2315,7 @@ async def _provision_repo_hooks(
         # on_create hooks (e.g. install scripts) can run long; give them
         # a generous timeout. on_connect-only hooks stay snappy.
         timeout = 900.0 if include_on_create else 30.0
-        result = await manager.exec_command(name, command, timeout=timeout)
+        result = await exec_with_retry(manager, name, command, timeout=timeout)
         if result.exit_code == 0:
             log.debug("Repo provision hooks applied on %s", name)
         else:
@@ -2115,6 +2323,8 @@ async def _provision_repo_hooks(
                 "Repo provision hooks on %s exited %s: %s",
                 name, result.exit_code, result.stderr.strip(),
             )
+    except ContextRefused:
+        raise
     except Exception as exc:
         log.warning("Repo provision hooks on %s failed: %s", name, exc)
 
@@ -2234,8 +2444,15 @@ def _interactive_ssh(
     port_forwards: list[str],
     relay_port: int | None = None,
     relay_token: str | None = None,
+    remote_command: str | None = None,
 ) -> int:
-    """Fall back to ``gh codespace ssh`` for interactive sessions."""
+    """Fall back to ``gh codespace ssh`` for interactive sessions.
+
+    ``remote_command``, appended after any ``-R`` forwards, is passed straight
+    through by ``gh codespace ssh -- <ssh-args>`` to the underlying ``ssh`` --
+    used by the venue `copilot` verb to run `agent-worktrees copilot` inside
+    the CodeSpace over this same channel.
+    """
     import subprocess as sp
 
     from . import gh_account, lifecycle
@@ -2246,6 +2463,7 @@ def _interactive_ssh(
     account = lifecycle.account_for_codespace(codespace_name)
     env = gh_account.env_for_account(account) if account else None
     if relay_port is not None:
+        github_account = gh_account.credential_account_for_codespace(codespace_name)
         env = {
             **(env if env is not None else os.environ),
             "LC_GIT_CREDENTIAL_RELAY": str(relay_port),
@@ -2253,11 +2471,37 @@ def _interactive_ssh(
         }
         if relay_token:
             env["LC_GIT_CREDENTIAL_RELAY_TOKEN"] = relay_token
+        if github_account:
+            env["LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT"] = github_account
+            if remote_command:
+                # ssh drops local LC_* vars; carry the (non-secret) account in
+                # the command so the remote auth helpers inherit it.
+                remote_command = (
+                    f"export LC_GIT_CREDENTIAL_RELAY_GITHUB_ACCOUNT={shlex.quote(github_account)}; "
+                    + remote_command
+                )
 
     args = ["gh", "codespace", "ssh", "-c", codespace_name]
+    if port_forwards or remote_command:
+        args.append("--")
+    # A remote_command needs a real pty: without one, ssh never allocates a
+    # remote tty when given a command, so `agent-worktrees copilot`'s own
+    # `sys.stdin.isatty()` guard on the FAR side always fails -- the venue
+    # `copilot` verb documents itself (this module's docstring, and the CLI
+    # help text in `copilot_venue.add_copilot_subparser`) as "SSHes -t in",
+    # but nothing here ever added the flag, so the documented contract was
+    # never actually implemented (confirmed live, agent-bridge-cli-mode-
+    # sessions Phase 4 validation against a real downstream CodeSpace: the
+    # remote `agent-worktrees copilot` immediately refused with "needs a
+    # controlling terminal to attach to"). An ordinary port-forward-only /
+    # no-command interactive shell is unaffected -- `gh codespace ssh`
+    # already allocates a pty for that case on its own.
+    if remote_command:
+        args.append("-t")
     for fwd in port_forwards:
-        # Split "-R port:host:port" into SSH option
-        args.extend(["--", fwd])
+        args.extend(["-R", fwd])
+    if remote_command:
+        args.append(remote_command)
 
     return sp.call(args, env=env)
 
@@ -2378,26 +2622,33 @@ def _chdir_to_project(project: str) -> bool:
     runs. Returns True iff the cwd was changed."""
     import shutil
     import subprocess as sp
+    from . import worktrees
 
+    worktrees.validate_context()
     name = (project or "").strip()
     if not name:
         return False
     # Resolve the binstub via PATHEXT (on Windows it is a .cmd/.ps1, not a bare
     # executable, so a plain ["agent-worktrees", ...] argv fails with WinError 2).
-    exe = shutil.which("agent-worktrees")
-    if not exe:
-        print(f"WARNING: --project {name}: agent-worktrees not found on PATH; "
-              f"using current directory", file=sys.stderr)
-        return False
-    try:
-        result = sp.run(
-            [exe, "repos", "find", name],
-            capture_output=True, text=True, timeout=15,
-        )
-    except Exception as exc:  # pragma: no cover - environment-dependent
-        print(f"WARNING: --project {name}: could not resolve checkout ({exc}); "
-              f"using current directory", file=sys.stderr)
-        return False
+    if worktrees.explicit_context():
+        result = worktrees.run("repos", "find", name, timeout=15)
+        if result is None:
+            return False
+    else:
+        exe = shutil.which("agent-worktrees")  # marketplace-isolation: allow no-context legacy project lookup; explicit context uses worktrees.run
+        if not exe:
+            print(f"WARNING: --project {name}: agent-worktrees not found on PATH; "
+                  f"using current directory", file=sys.stderr)
+            return False
+        try:
+            result = sp.run(
+                [exe, "repos", "find", name],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception as exc:  # pragma: no cover - environment-dependent
+            print(f"WARNING: --project {name}: could not resolve checkout ({exc}); "
+                  f"using current directory", file=sys.stderr)
+            return False
     path = (result.stdout or "").strip().splitlines()
     checkout = path[0].strip() if path else ""
     if result.returncode != 0 or not checkout or not Path(checkout).is_dir():
@@ -2491,6 +2742,8 @@ def _discover_workspace_folder(codespaces: list[dict], repository: str) -> str |
     """
     import subprocess as sp
 
+    from agent_procutil import no_window_kwargs
+
     from . import gh_account
 
     available = [
@@ -2510,6 +2763,7 @@ def _discover_workspace_folder(codespaces: list[dict], repository: str) -> str |
                 text=True,
                 timeout=45,
                 env=env,
+                **no_window_kwargs(),
             )
         except (FileNotFoundError, sp.TimeoutExpired):
             return None
@@ -2576,7 +2830,7 @@ def _derive_codespaces_defaults(
 
 
 def _render_codespaces_yaml(defaults: dict | None) -> str:
-    """Render a ``.agent-codespaces/config.yaml``.
+    """Render a ``.copilot-extensions/agent-codespaces/config.yaml``.
 
     The file is **supplementary-only**: it carries just the CodeSpace-specific
     bits convention can't derive. A repo that matches convention (machine
@@ -2585,7 +2839,7 @@ def _render_codespaces_yaml(defaults: dict | None) -> str:
     keeps every block commented unless a discovered CodeSpace supplies a value.
     """
     header = (
-        "# .agent-codespaces/config.yaml -- SUPPLEMENTARY CodeSpace config.\n"
+        "# .copilot-extensions/agent-codespaces/config.yaml -- SUPPLEMENTARY CodeSpace config.\n"
         "#\n"
         "# Most repos need NO file here. agent-codespaces derives by convention:\n"
         "#   * machine_type=largePremiumLinux, location=EastUs\n"
@@ -2644,26 +2898,9 @@ def _render_codespaces_yaml(defaults: dict | None) -> str:
 
 
 def _parse_gh_account_scopes(status_text: str) -> dict[str, set[str]]:
-    """Parse ``gh auth status`` into ``{login: {scopes}}``.
+    from .auth_preflight import parse_gh_account_scopes
 
-    ``gh auth status`` prints a block per authenticated account; each carries a
-    ``Token scopes: 'a', 'b', ...`` line. We attribute each scopes line to the
-    most recent ``account <login>`` seen so a per-account scope check is
-    possible (multi-account #247/#190).
-    """
-    import re
-
-    accounts: dict[str, set[str]] = {}
-    current: str | None = None
-    for line in status_text.splitlines():
-        m = re.search(r"account\s+([A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?)", line)
-        if m:
-            current = m.group(1)
-            accounts.setdefault(current, set())
-        if current and "token scopes" in line.lower():
-            scopes = set(re.findall(r"'([^']+)'", line))
-            accounts[current] |= scopes
-    return accounts
+    return parse_gh_account_scopes(status_text)
 
 
 def _gh_auth_status() -> tuple[int, str]:
@@ -2689,52 +2926,10 @@ def _gh_auth_status() -> tuple[int, str]:
 
 
 def _gh_auth_preflight() -> list[str]:
-    """Check gh auth + codespace scope. Returns a list of guidance messages
-    (empty if all good).
+    """Check gh auth + codespace scope only for CodeSpace-serving accounts."""
+    from .auth_preflight import gh_auth_preflight
 
-    Beyond the ambient account, verifies every account in the agent-worktrees
-    ``account_map`` is logged in with the ``codespace`` scope, surfacing the
-    per-account remedy (its ``accounts.yaml`` login flow when recorded) so a
-    cross-account list/ssh doesn't fail with a misleading 403/404 (#247/#190).
-    """
-    from . import gh_account
-
-    msgs: list[str] = []
-    rc, combined = _gh_auth_status()
-    if rc == -1:
-        return ["gh CLI not found -- install from https://cli.github.com/ "
-                "then run: gh auth login"]
-    if rc == -2:
-        return ["gh auth status timed out -- check your network / gh install."]
-
-    if rc != 0 or "not logged" in combined.lower():
-        msgs.append("gh is not authenticated -- run: gh auth login")
-        return msgs
-
-    # gh prints "Token scopes: 'gist', 'repo', ..." -- the codespace scope is
-    # required for `gh codespace` operations.
-    if "codespace" not in combined.lower():
-        msgs.append(
-            "gh token is missing the 'codespace' scope (needed for CodeSpace "
-            "operations) -- run: gh auth refresh -h github.com -s codespace"
-        )
-
-    # Per-account check for every account the account_map routes to.
-    per_account = _parse_gh_account_scopes(combined)
-    lowered = {login.casefold(): scopes for login, scopes in per_account.items()}
-    for login in gh_account.mapped_accounts():
-        scopes = lowered.get(login.casefold())
-        if scopes is None:
-            remedy = _account_login_remedy(login)
-            msgs.append(
-                f"mapped gh account '{login}' is not logged in -- {remedy}"
-            )
-        elif "codespace" not in {s.casefold() for s in scopes}:
-            msgs.append(
-                f"mapped gh account '{login}' is missing the 'codespace' scope "
-                f"-- run: gh auth refresh -h github.com -u {login} -s codespace"
-            )
-    return msgs
+    return gh_auth_preflight(_gh_auth_status, _account_login_remedy)
 
 
 def _ambient_codespace_scope() -> tuple[bool, str]:
@@ -2790,34 +2985,59 @@ def _require_codespace_scope(op: str) -> int | None:
 
 
 def _cmd_doctor(*, json_output: bool = False) -> int:
-    """Check gh auth and exhaustively report config.d registry hygiene.
-
-    Read-only and available even without ``gh``. Exit behavior remains nonzero
-    for auth failures and now also reports stale/invalid config.d entries.
-    """
+    """Check gh auth, relay credential readiness, and provider hygiene."""
     auth_findings = _gh_auth_preflight()
-    config_report = scan_config_dropin_registry()
-    has_findings = bool(auth_findings or config_report.findings)
+    from .auth_preflight import emit_github_credential_doctor, run_github_credential_doctor_checks
+
+    github_credentials = run_github_credential_doctor_checks()
+    # Summary entry (back-compat): the first failing account's result, else the first.
+    github_credential = next((c for c in github_credentials if not c.ok), github_credentials[0])
+    provider_reports = scan_config_providers()
+    has_findings = bool(auth_findings or provider_reports.findings or not github_credential.ok)
 
     if json_output:
-        print(json.dumps({
-            "gh": {
-               "ok": not auth_findings,
-               "findings": auth_findings,
-            },
-            "config_d": config_report.to_dict(),
-        }, indent=2, sort_keys=True))
+        print(json.dumps({"gh": {"ok": not auth_findings, "findings": auth_findings},
+                          "github_credential": github_credential.to_dict(),
+                          "github_credentials": [c.to_dict() for c in github_credentials],
+                          "plugin_manifests": provider_reports.active_plugins.to_dict(),
+                          "config_d": provider_reports.config_d.to_dict()},
+                         indent=2, sort_keys=True))
         return 1 if has_findings else 0
 
     if not auth_findings:
-        print("[OK] gh is authenticated with the 'codespace' scope "
-              "(ambient + all mapped accounts).")
+        print("[OK] gh is authenticated with the 'codespace' scope (CodeSpace-serving accounts).")
     else:
-        print("[gh] CodeSpace auth issue(s) -- `gh codespace` ops will fail until "
-              "resolved:", file=sys.stderr)
+        print("[gh] CodeSpace auth issue(s) -- `gh codespace` ops will fail until resolved:", file=sys.stderr)
         for finding in auth_findings:
             print(f"  - {finding}", file=sys.stderr)
 
+    for credential in github_credentials:
+        emit_github_credential_doctor(credential)
+
+    plugin_report = provider_reports.active_plugins
+    print(f"[plugin-manifests] authority: {plugin_report.authority.value}")
+    if plugin_report.active_configs:
+        print("[plugin-manifests] active declarations:")
+        for contribution in plugin_report.active_configs:
+            print(
+                f"  - {contribution.owner}: {contribution.entry} -> "
+                f"{contribution.target}"
+            )
+    if not plugin_report.findings:
+        print("[OK] active plugin config declarations have no findings.")
+    else:
+        print("[plugin-manifests] declaration finding(s):", file=sys.stderr)
+        for finding in plugin_report.findings:
+            target = f" target={finding.target}" if finding.target else ""
+            detail = f" ({finding.detail})" if finding.detail else ""
+            print(
+                f"  - {finding.owner}: {finding.entry}: "
+                f"{finding.reason}{target}{detail}\n"
+                f"    Remedy: {finding.remedy}",
+                file=sys.stderr,
+            )
+
+    config_report = provider_reports.config_d
     print(f"[config.d] authority: {config_report.authority.value}")
     if config_report.active_configs:
         print("[config.d] active entries:")
@@ -2843,18 +3063,25 @@ def _cmd_doctor(*, json_output: bool = False) -> int:
 
 def _account_login_remedy(login: str) -> str:
     """Return the recorded login flow for ``login``, or a sane default."""
+    from . import worktrees
+
     try:
-        import shutil
-        aw = shutil.which("agent-worktrees")
-        if aw:
+        if worktrees.explicit_context():
+            r = worktrees.run("accounts", "show", login, "--json", timeout=10)
+        else:
+            import shutil
             import subprocess as sp
+            aw = shutil.which("agent-worktrees")  # marketplace-isolation: allow no-context legacy account lookup; explicit context uses worktrees.run
             r = sp.run([aw, "accounts", "show", login, "--json"],
-                       capture_output=True, text=True, timeout=10)
+                       capture_output=True, text=True, timeout=10) if aw else None
+        if r is not None:
             if r.returncode == 0:
                 data = json.loads(r.stdout or "{}")
                 flow = (data.get("login_flow") or "").strip()
                 if flow:
                     return f"run: {flow}"
+    except worktrees.ContextRefused:
+        raise
     except Exception:
         pass
     return f"run: gh auth login -h github.com (account {login})"
@@ -2863,18 +3090,20 @@ def _account_login_remedy(login: str) -> str:
 def _config_init(
     *, from_codespace: str | None, force: bool, also_adopt: bool
 ) -> int:
-    """Scaffold ``.agent-codespaces/config.yaml``, deriving from existing CodeSpaces.
+    """Scaffold ``.copilot-extensions/agent-codespaces/config.yaml``, deriving from existing CodeSpaces.
 
     Most repos need no file at all -- the scaffold is supplementary-only. Writing
     it also auto-adopts the repo (so the detached daemon picks it up); pass a
     repo that matches convention and you can simply skip this entirely.
     """
     repo_root = _resolve_repo_root()
-    canonical = repo_root / CONFIG_DIR_NAME / CONFIG_FILE_IN_DIR
+    canonical = repo_root / CANONICAL_CONFIG_REL
+    legacy_dir = repo_root / LEGACY_CONFIG_DIR_NAME / CONFIG_FILE_IN_DIR
     legacy = repo_root / CONFIG_FILENAME
 
-    if legacy.exists() and not canonical.exists():
-        print(f"A legacy {CONFIG_FILENAME} exists at {legacy}.")
+    if (legacy.exists() or legacy_dir.exists()) and not canonical.exists():
+        legacy_path = legacy if legacy.exists() else legacy_dir
+        print(f"A legacy config exists at {legacy_path}.")
         print(f"Run `agent-codespaces config migrate` to move it to "
               f"{CANONICAL_CONFIG_REL}.")
         return 0
@@ -2952,42 +3181,50 @@ def _config_adopt() -> int:
         path=repo_root,
         adopted_at=datetime.now(tz=timezone.utc).isoformat(),
     ))
-    save_adopted_repos(repos)
+    try:
+        save_adopted_repos(repos)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     print(f"Adopted: {repo_root}")
     print(f"Config:   {repo_config_path(repo_root)}")
-    print(f"Manifest: {ADOPTED_REPOS_FILE}")
+    print(f"Manifest: {adoption_storage_path(repo_root)}")
     return 0
 
 
 def _config_migrate_file() -> int:
     """Relocate a legacy repo-root ``codespaces.yaml`` to the canonical location.
 
-    Moves ``<repo>/codespaces.yaml`` -> ``<repo>/.agent-codespaces/config.yaml``
-    (idempotent). Content is copied verbatim; adoption is unaffected (the manifest
-    tracks the repo root, not the file). A no-op when the repo already uses the
-    canonical location or carries no config.
+    Moves ``<repo>/codespaces.yaml`` or ``<repo>/.agent-codespaces/config.yaml``
+    to ``<repo>/.copilot-extensions/agent-codespaces/config.yaml`` (idempotent).
+    Content is copied verbatim; adoption is unaffected (machine-local adoption
+    keys by repo identity, not by the committed file path). A no-op when the
+    repo already uses the canonical location or carries no config.
     """
     repo_root = _resolve_repo_root()
-    canonical = repo_root / CONFIG_DIR_NAME / CONFIG_FILE_IN_DIR
+    canonical = repo_root / CANONICAL_CONFIG_REL
+    legacy_dir = repo_root / LEGACY_CONFIG_DIR_NAME / CONFIG_FILE_IN_DIR
     legacy = repo_root / CONFIG_FILENAME
 
     if canonical.exists():
-        if legacy.exists():
-            print(f"Both {CANONICAL_CONFIG_REL} and legacy {CONFIG_FILENAME} "
-                  f"exist. The canonical file wins; remove {legacy} when ready.")
+        if legacy.exists() or legacy_dir.exists():
+            legacy_path = legacy if legacy.exists() else legacy_dir
+            print(f"Both {CANONICAL_CONFIG_REL} and legacy config {legacy_path} "
+                  f"exist. The canonical file wins; remove {legacy_path} when ready.")
             return 0
         print(f"Already migrated: {canonical}")
         return 0
 
-    if not legacy.exists():
+    source = legacy_dir if legacy_dir.exists() else legacy
+    if not source.exists():
         print(f"No legacy {CONFIG_FILENAME} to migrate in {repo_root} "
               "(nothing to do).")
         return 0
 
     canonical.parent.mkdir(parents=True, exist_ok=True)
-    canonical.write_text(legacy.read_text(encoding="utf-8"), encoding="utf-8")
-    legacy.unlink()
-    print(f"Migrated {legacy}")
+    canonical.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    source.unlink()
+    print(f"Migrated {source}")
     print(f"      -> {canonical}")
     print("Commit the move; adoption is unchanged (the manifest tracks the repo "
           "root, not the file).")
@@ -3055,16 +3292,25 @@ def _cmd_delete(args: argparse.Namespace) -> int:
     """Delete a CodeSpace, recovering its Copilot sessions first (unless
     --no-sync). The recovery is best-effort: a failure warns but does not block
     deletion (use `finalize` for a sync-gated delete)."""
-    if not getattr(args, "no_sync", False):
-        res = sync_codespace_sessions(args.name, verbose=args.verbose)
-        if res.get("ok"):
-            print(f"[OK] Recovered {res.get('session_count', 0)} session(s) "
-                  f"before delete: {res.get('detail', '')}")
-        else:
-            print(f"[WARN] Pre-delete session recovery failed (continuing): "
-                  f"{res.get('detail')}", file=sys.stderr)
-    delete_codespace(args.name, force=args.force)
-    print(f"Deleted: {args.name}")
+    from ssh_manager import TargetBusyError
+
+    from .lifecycle_lock import lifecycle_lock
+
+    try:
+        with lifecycle_lock(args.name) as lock:
+            if not getattr(args, "no_sync", False):
+                res = sync_codespace_sessions(args.name, verbose=args.verbose, lock=lock)
+                if res.get("ok"):
+                    print(f"[OK] Recovered {res.get('session_count', 0)} session(s) "
+                          f"before delete: {res.get('detail', '')}")
+                else:
+                    print(f"[WARN] Pre-delete session recovery failed (continuing): "
+                          f"{res.get('detail')}", file=sys.stderr)
+            delete_codespace(args.name, force=args.force)
+            print(f"Deleted: {args.name}")
+    except TargetBusyError as busy:
+        print(f"[BUSY] {busy}", file=sys.stderr)
+        return 1
     _release_lease_quietly(args.name)
     return 0
 
@@ -3131,6 +3377,9 @@ def _cmd_finalize(args: argparse.Namespace) -> int:
     delete is additionally gated on the cleanliness beacon (off-box safety) unless
     ``--force`` (venue-pool Phase 3).
     """
+    from ssh_manager import TargetBusyError
+
+    from .lifecycle_lock import lifecycle_lock
     from .status import STATE_RECOVERED, set_status
 
     # venue-pool Phase 3: gate the destructive delete on off-box safety BEFORE any
@@ -3142,58 +3391,63 @@ def _cmd_finalize(args: argparse.Namespace) -> int:
             print(f"[blocked] {block}", file=sys.stderr)
             return 2
 
-    # Preserving path may skip booting a Shutdown box; the destructive --delete
-    # path must recover first (booting if needed) before the box is gone.
-    res = sync_codespace_sessions(
-        args.name, timeout=args.timeout, verbose=args.verbose,
-        skip_if_shutdown=not args.delete,
-    )
-    if res.get("ok"):
-        if res.get("skipped"):
-            print(f"[OK] {args.name}: {res.get('detail', '')}")
-        else:
-            print(f"[OK] Recovered {res.get('session_count', 0)} session(s) from "
-                  f"{args.name}: {res.get('detail', '')}")
-    else:
-        print(f"[WARN] Session recovery for {args.name} failed: "
-              f"{res.get('detail')}", file=sys.stderr)
-        if args.delete and not args.force:
-            print("Refusing to delete after a failed recovery. Diagnose and "
-                  "resolve the error above (often a still-booting CodeSpace or "
-                  "an SSH/relay issue), then re-run finalize so the sessions "
-                  "are captured. If the CodeSpace is genuinely unbootable (never "
-                  "reaches SSH), its session-state is unrecoverable -- retire it "
-                  "with `agent-codespaces finalize <name> --delete --force` (or "
-                  "`delete <name> --force --no-sync`) to skip recovery.",
-                  file=sys.stderr)
-            return 1
-
-    if args.delete:
-        delete_codespace(args.name, force=args.force)
-        print(f"Deleted: {args.name}")
-        _release_lease_quietly(args.name)
-        _clear_status_quietly(args.name)
-        return 0 if res.get("ok") else 1
-
-    # Default preserve path: stop (idempotent) then mark recovered.
     try:
-        stopped = stop_codespace(args.name)
-        print(f"Stopped: {args.name} (preserved -- boots on next connect)"
-              if stopped else f"Already stopped: {args.name}")
-    except RuntimeError as exc:
-        print(f"[WARN] Could not stop {args.name} (continuing): {exc}",
-              file=sys.stderr)
+        with lifecycle_lock(args.name) as lock:
+            # Preserving path may skip booting a Shutdown box; the destructive --delete
+            # path must recover first (booting if needed) before the box is gone.
+            res = sync_codespace_sessions(
+                args.name, timeout=args.timeout, verbose=args.verbose,
+                skip_if_shutdown=not args.delete, lock=lock,
+            )
+            if res.get("ok"):
+                if res.get("skipped"):
+                    print(f"[OK] {args.name}: {res.get('detail', '')}")
+                else:
+                    print(f"[OK] Recovered {res.get('session_count', 0)} session(s) from "
+                          f"{args.name}: {res.get('detail', '')}")
+            else:
+                print(f"[WARN] Session recovery for {args.name} failed: "
+                      f"{res.get('detail')}", file=sys.stderr)
+                if args.delete and not args.force:
+                    print("Refusing to delete after a failed recovery. Diagnose and "
+                          "resolve the error above (often a still-booting CodeSpace or "
+                          "an SSH/relay issue), then re-run finalize so the sessions "
+                          "are captured. If the CodeSpace is genuinely unbootable (never "
+                          "reaches SSH), its session-state is unrecoverable -- retire it "
+                          "with `agent-codespaces finalize <name> --delete --force` (or "
+                          "`delete <name> --force --no-sync`) to skip recovery.",
+                          file=sys.stderr)
+                    return 1
 
-    if res.get("ok"):
-        set_status(args.name, STATE_RECOVERED, reason="finalized")
-        print(f"[OK] {args.name} marked 'recovered' -- preserved & reusable; "
-              f"eligible for prune once its PR merges (reuse clears the mark)")
-        _release_lease_quietly(args.name)
-        return 0
+            if args.delete:
+                delete_codespace(args.name, force=args.force)
+                print(f"Deleted: {args.name}")
+                _release_lease_quietly(args.name)
+                _clear_status_quietly(args.name)
+                return 0 if res.get("ok") else 1
 
-    print(f"[WARN] Not marking {args.name} 'recovered' (recovery failed; the box "
-          f"is preserved, so retry `finalize {args.name}` later)", file=sys.stderr)
-    return 1
+            # Default preserve path: stop (idempotent) then mark recovered.
+            try:
+                stopped = stop_codespace(args.name)
+                print(f"Stopped: {args.name} (preserved -- boots on next connect)"
+                      if stopped else f"Already stopped: {args.name}")
+            except RuntimeError as exc:
+                print(f"[WARN] Could not stop {args.name} (continuing): {exc}",
+                      file=sys.stderr)
+
+            if res.get("ok"):
+                set_status(args.name, STATE_RECOVERED, reason="finalized")
+                print(f"[OK] {args.name} marked 'recovered' -- preserved & reusable; "
+                      f"eligible for prune once its PR merges (reuse clears the mark)")
+                _release_lease_quietly(args.name)
+                return 0
+
+            print(f"[WARN] Not marking {args.name} 'recovered' (recovery failed; the box "
+                  f"is preserved, so retry `finalize {args.name}` later)", file=sys.stderr)
+            return 1
+    except TargetBusyError as busy:
+        print(f"[BUSY] {busy}", file=sys.stderr)
+        return 1
 
 
 def _cmd_finalize_progress(args: argparse.Namespace) -> int:
@@ -3231,54 +3485,64 @@ def _cmd_finalize_progress(args: argparse.Namespace) -> int:
             if block is not None:
                 emit({"type": "error", "message": block})
                 return 2
-        emit({"type": "progress", "pct": 5.0,
-              "msg": f"Recovering Copilot sessions from {name}\u2026"})
-        res = sync_codespace_sessions(
-            name, timeout=args.timeout, verbose=args.verbose,
-            skip_if_shutdown=not args.delete,
-        )
-        if res.get("ok"):
-            if res.get("skipped"):
-                emit({"type": "progress", "pct": 45.0, "msg": res.get("detail", "")})
-            else:
-                emit({"type": "progress", "pct": 45.0,
-                      "msg": f"Recovered {res.get('session_count', 0)} session(s)"})
-        else:
-            if args.delete and not args.force:
-                emit({"type": "error",
-                      "message": f"Session recovery failed ({res.get('detail')}). "
-                                 "Not deleting -- diagnose first, or re-run with "
-                                 "--force to retire an unrecoverable box."})
-                return 1
-            emit({"type": "progress", "pct": 45.0,
-                  "msg": f"Recovery failed ({res.get('detail')}); continuing"})
 
-        if args.delete:
-            emit({"type": "progress", "pct": 70.0, "msg": f"Deleting {name}\u2026"})
-            delete_codespace(name, force=args.force)
-            _release_lease_quietly(name)
-            _clear_status_quietly(name)
-            emit({"type": "done",
-                  "message": f"Recycled {name} (recovered + deleted)"})
-            return 0 if res.get("ok") else 1
+        from ssh_manager import TargetBusyError
 
-        # Preserve path: stop (idempotent) then mark recovered.
-        emit({"type": "progress", "pct": 70.0,
-              "msg": f"Stopping {name} (preserving)\u2026"})
+        from .lifecycle_lock import lifecycle_lock
+
         try:
-            stop_codespace(name)
-        except RuntimeError as exc:
-            emit({"type": "progress", "pct": 80.0,
-                  "msg": f"stop warning: {exc}"})
-        if res.get("ok"):
-            set_status(name, STATE_RECOVERED, reason="finalized")
-            _release_lease_quietly(name)
-            emit({"type": "done",
-                  "message": f"{name} finalized -- preserved & reusable"})
-            return 0
-        emit({"type": "error",
-              "message": f"Recovery failed; {name} preserved -- retry later"})
-        return 1
+            with lifecycle_lock(name) as lock:
+                emit({"type": "progress", "pct": 5.0,
+                      "msg": f"Recovering Copilot sessions from {name}\u2026"})
+                res = sync_codespace_sessions(
+                    name, timeout=args.timeout, verbose=args.verbose,
+                    skip_if_shutdown=not args.delete, lock=lock,
+                )
+                if res.get("ok"):
+                    if res.get("skipped"):
+                        emit({"type": "progress", "pct": 45.0, "msg": res.get("detail", "")})
+                    else:
+                        emit({"type": "progress", "pct": 45.0,
+                              "msg": f"Recovered {res.get('session_count', 0)} session(s)"})
+                else:
+                    if args.delete and not args.force:
+                        emit({"type": "error",
+                              "message": f"Session recovery failed ({res.get('detail')}). "
+                                         "Not deleting -- diagnose first, or re-run with "
+                                         "--force to retire an unrecoverable box."})
+                        return 1
+                    emit({"type": "progress", "pct": 45.0,
+                          "msg": f"Recovery failed ({res.get('detail')}); continuing"})
+
+                if args.delete:
+                    emit({"type": "progress", "pct": 70.0, "msg": f"Deleting {name}\u2026"})
+                    delete_codespace(name, force=args.force)
+                    _release_lease_quietly(name)
+                    _clear_status_quietly(name)
+                    emit({"type": "done",
+                          "message": f"Recycled {name} (recovered + deleted)"})
+                    return 0 if res.get("ok") else 1
+
+                # Preserve path: stop (idempotent) then mark recovered.
+                emit({"type": "progress", "pct": 70.0,
+                      "msg": f"Stopping {name} (preserving)\u2026"})
+                try:
+                    stop_codespace(name)
+                except RuntimeError as exc:
+                    emit({"type": "progress", "pct": 80.0,
+                          "msg": f"stop warning: {exc}"})
+                if res.get("ok"):
+                    set_status(name, STATE_RECOVERED, reason="finalized")
+                    _release_lease_quietly(name)
+                    emit({"type": "done",
+                          "message": f"{name} finalized -- preserved & reusable"})
+                    return 0
+                emit({"type": "error",
+                      "message": f"Recovery failed; {name} preserved -- retry later"})
+                return 1
+        except TargetBusyError as busy:
+            emit({"type": "error", "message": str(busy)})
+            return 1
     except Exception as exc:  # never crash the modal reader
         emit({"type": "error", "message": str(exc)[:200]})
         return 1
@@ -3361,29 +3625,38 @@ def _cmd_stop(args: argparse.Namespace) -> int:
     -- it is the plain pause primitive; ``finalize`` is the mark-eligible "done"
     transition.
     """
-    if not getattr(args, "no_sync", False):
-        res = sync_codespace_sessions(
-            args.name, timeout=args.timeout, verbose=args.verbose,
-            skip_if_shutdown=True,
-        )
-        if res.get("ok"):
-            detail = res.get("detail", "")
-            if res.get("skipped"):
-                print(f"[OK] {args.name}: {detail}")
-            else:
-                print(f"[OK] Recovered {res.get('session_count', 0)} session(s) "
-                      f"before stop: {detail}")
-        else:
-            print(f"[WARN] Pre-stop session recovery failed (continuing -- the "
-                  f"CodeSpace is preserved, so sessions can be recovered "
-                  f"later): {res.get('detail')}", file=sys.stderr)
+    from ssh_manager import TargetBusyError
 
-    stopped = stop_codespace(args.name)
-    if stopped:
-        print(f"Stopped: {args.name} (preserved -- boots on next connect)")
-    else:
-        print(f"Already stopped: {args.name}")
-    return 0
+    from .lifecycle_lock import lifecycle_lock
+
+    try:
+        with lifecycle_lock(args.name) as lock:
+            if not getattr(args, "no_sync", False):
+                res = sync_codespace_sessions(
+                    args.name, timeout=args.timeout, verbose=args.verbose,
+                    skip_if_shutdown=True, lock=lock,
+                )
+                if res.get("ok"):
+                    detail = res.get("detail", "")
+                    if res.get("skipped"):
+                        print(f"[OK] {args.name}: {detail}")
+                    else:
+                        print(f"[OK] Recovered {res.get('session_count', 0)} session(s) "
+                              f"before stop: {detail}")
+                else:
+                    print(f"[WARN] Pre-stop session recovery failed (continuing -- the "
+                          f"CodeSpace is preserved, so sessions can be recovered "
+                          f"later): {res.get('detail')}", file=sys.stderr)
+
+            stopped = stop_codespace(args.name)
+            if stopped:
+                print(f"Stopped: {args.name} (preserved -- boots on next connect)")
+            else:
+                print(f"Already stopped: {args.name}")
+        return 0
+    except TargetBusyError as busy:
+        print(f"[BUSY] {busy}", file=sys.stderr)
+        return 1
 
 
 def _release_lease_quietly(codespace: str) -> None:
@@ -3482,16 +3755,25 @@ def _cmd_prune(args: argparse.Namespace) -> int:
             continue
 
         print(f"Pruning {name} ({rec.reason or 'prunable'})...")
-        # Destructive path: recover even a Shutdown box (boot if needed) first.
-        res = sync_codespace_sessions(name, skip_if_shutdown=False)
-        if not (res.get("ok") or res.get("skipped")):
-            print(f"[WARN] Final recovery failed for {name}; skipping delete "
-                  f"(diagnose): {res.get('detail')}", file=sys.stderr)
-            continue
+        from ssh_manager import TargetBusyError
+
+        from .lifecycle_lock import lifecycle_lock
+
         try:
-            delete_codespace(name, force=False)
-        except RuntimeError as exc:
-            print(f"[WARN] Delete failed for {name}: {exc}", file=sys.stderr)
+            with lifecycle_lock(name) as lock:
+                # Destructive path: recover even a Shutdown box (boot if needed) first.
+                res = sync_codespace_sessions(name, skip_if_shutdown=False, lock=lock)
+                if not (res.get("ok") or res.get("skipped")):
+                    print(f"[WARN] Final recovery failed for {name}; skipping delete "
+                          f"(diagnose): {res.get('detail')}", file=sys.stderr)
+                    continue
+                try:
+                    delete_codespace(name, force=False)
+                except RuntimeError as exc:
+                    print(f"[WARN] Delete failed for {name}: {exc}", file=sys.stderr)
+                    continue
+        except TargetBusyError as busy:
+            print(f"[WARN] {name} busy, skipping this pass: {busy}", file=sys.stderr)
             continue
         clear_status(name)
         _release_lease_quietly(name)
@@ -3534,12 +3816,20 @@ def _reclaim_for_quota(err: str) -> str | None:
     if total_limit:
         for rec in sorted(list_by_state(STATE_PRUNABLE), key=lambda s: s.state_at):
             name = rec.codespace
-            res = sync_codespace_sessions(name, skip_if_shutdown=False)
-            if not (res.get("ok") or res.get("skipped")):
-                continue
+            from ssh_manager import TargetBusyError
+
+            from .lifecycle_lock import lifecycle_lock
+
             try:
-                delete_codespace(name, force=False)
-            except RuntimeError:
+                with lifecycle_lock(name) as lock:
+                    res = sync_codespace_sessions(name, skip_if_shutdown=False, lock=lock)
+                    if not (res.get("ok") or res.get("skipped")):
+                        continue
+                    try:
+                        delete_codespace(name, force=False)
+                    except RuntimeError:
+                        continue
+            except TargetBusyError:
                 continue
             clear_status(name)
             _release_lease_quietly(name)
@@ -3585,24 +3875,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
 
     config = load_merged_config()
 
-    # Phase 2 (#708): reuse-before-create + budget-not-exceeded. Consult the pool
-    # planner before spending an account slot -- prefer reusing a suitable idle
-    # box, and refuse to over-provision past the core budget. Degrade-safe: any
-    # planner failure falls through to a plain create (never wedge a legit
-    # create). ``--force-create`` skips the guard entirely.
+    # Phase 2b (#708): resume this workstream's own claimed box, never a
+    # stranger's idle one; degrade-safe. ``--force-create`` skips this.
     if not getattr(args, "force_create", False):
         try:
+            from .driving_worktrees import resolve_current_workstream_box
             _members, _budget = pool_mod.build_pool()
             decision = pool_mod.plan_allocation(
                 _members, _budget, repo=args.repo,
                 new_cores=_intended_cores(config, args.repo),
-            )
+                workstream_box=resolve_current_workstream_box(_members, args.repo))
         except Exception:
             decision = None
         if decision is not None and decision.action == pool_mod.ALLOC_REUSE:
             print(f"[reuse] {decision.reason}")
             print(
-                f"A suitable idle CodeSpace already exists -- reuse "
+                f"This workstream already has a CodeSpace -- reuse "
                 f"'{decision.codespace}' (ssh/borrow) instead of creating a new "
                 f"box, or pass --force-create to create anyway.",
                 file=sys.stderr,
@@ -3770,11 +4058,37 @@ def _hold_is_self(owner: str | None, l2_holder: str | None,
     return False
 
 
-def _cmd_leases() -> int:
-    """Show active CodeSpace leases (advisory borrows and #897 claims)."""
+def _cmd_leases(args: argparse.Namespace | None = None) -> int:
+    """Show active CodeSpace leases (advisory borrows and #897 claims).
+
+    ``--owner`` filters to one worktree/effort's own leases/claims; ``--json``
+    emits a machine-readable list instead of the human table -- the read-only
+    query surface a caller (e.g. ``agent-worktrees finalize``'s claim-warning
+    step) uses to discover exactly which CodeSpaces a worktree still has
+    claimed, WITHOUT releasing anything itself.
+    """
     from .lease import list_leases
 
     leases = list_leases()
+    owner_filter = getattr(args, "owner", None) if args is not None else None
+    if owner_filter:
+        leases = [
+            lease for lease in leases
+            if (lease.worktree or lease.effort) == owner_filter
+        ]
+    json_output = bool(getattr(args, "json_output", False)) if args is not None else False
+    if json_output:
+        print(json.dumps([
+            {
+                "codespace": lease.codespace,
+                "owner": lease.worktree or lease.effort,
+                "kind": "claim" if lease.worktree else "borrow",
+                "host": lease.host,
+                "pid": lease.pid,
+            }
+            for lease in leases
+        ]))
+        return 0
     if not leases:
         print("No active leases.")
         return 0
@@ -3801,6 +4115,7 @@ def _cmd_leases() -> int:
     return 0
 
 
+@_context_admitted
 def _cmd_claim(args: argparse.Namespace) -> int:
     """Acquire an exclusive worktree-keyed claim on a CodeSpace (#897).
 
@@ -3812,53 +4127,80 @@ def _cmd_claim(args: argparse.Namespace) -> int:
     """
     from .lease import (
         ClaimConflict,
+        CoordinationRejected,
         active_worktree_ids,
         claim,
         resolve_owner_worktree,
     )
 
-    # Escape hatch parity with the ``ssh`` direct path: an operator (or a unit
-    # test) can disable exclusive-control enforcement entirely. Honored here too
-    # so the daemon's shelled ``claim`` is a no-op success when the daemon runs
-    # with claiming disabled.
+    from . import coordination
+
+    holder_ref = coordination.owner_ref(
+        explicit=getattr(args, "holder_ref", None),
+        session_id=getattr(args, "session_id", None),
+    )
+    readiness = coordination.preflight(holder_ref) if holder_ref else None
+
+    # This escape hatch disables the local exclusive claim, not authorization
+    # for an owner-associated operation. The preflight above still applies.
     if os.environ.get("AGENT_CODESPACES_DISABLE_CLAIM"):
+        if readiness and readiness.rejected:
+            print(
+                "[BLOCKED] CodeSpace operation requires durable coordination: "
+                f"{readiness.code}: {readiness.detail}",
+                file=sys.stderr,
+            )
+            return _COORDINATION_EXIT
         print("[OK] Claim disabled (AGENT_CODESPACES_DISABLE_CLAIM); skipped.")
         return 0
 
     owner = resolve_owner_worktree(explicit=getattr(args, "owner", None))
     if not owner:
+        if readiness and readiness.rejected:
+            print(
+                "[BLOCKED] CodeSpace operation requires durable coordination: "
+                f"{readiness.code}: {readiness.detail}",
+                file=sys.stderr,
+            )
+            return _COORDINATION_EXIT
         print(
             "[WARN] No owning worktree resolved (not in a worktree and no "
             "--owner given); claim skipped.",
             file=sys.stderr,
         )
         return 0
-    from . import coordination
-    # Cross-machine holder identity: an explicit --holder-ref (a dispatched
-    # caller, e.g. the bridge daemon, passes the original caller's qualified
-    # ClaimRef), else resolved from the calling worktree. None -> L2 skipped
-    # (degrade-safe, L1-only).
-    holder_ref = coordination.owner_ref(
-        explicit=getattr(args, "holder_ref", None),
-        session_id=getattr(args, "session_id", None),
-    )
     try:
         lease = claim(
             args.codespace, owner,
             force=getattr(args, "force_claim", False),
             active=active_worktree_ids(),
             holder_ref=holder_ref,
+            preflight_result=readiness,
         )
     except ClaimConflict as exc:
         print(f"[BUSY] {exc} Use --force-claim to take over.", file=sys.stderr)
         return _BUSY_EXIT
+    except CoordinationRejected as exc:
+        print(
+            f"[BLOCKED] CodeSpace claim requires durable coordination: {exc}",
+            file=sys.stderr,
+        )
+        return _COORDINATION_EXIT
     print(f"[OK] Claimed {lease.codespace} for {owner}")
     return 0
 
 
+@_context_admitted
 def _cmd_release_claim(args: argparse.Namespace) -> int:
-    """Release this worktree's exclusive claim on a CodeSpace (#897)."""
-    from .lease import release_claim, resolve_owner_worktree
+    """Release this worktree's exclusive claim on a CodeSpace (#897), or --all
+    of them -- the safety-net bulk form (worst-case backstop invoked by
+    `agent-worktrees finalize`) so a worktree that forgot exactly which
+    CodeSpace(s) it claimed still releases every one it actually holds,
+    rather than leaking a claim past the worktree's own lifetime. Better to
+    over-release (idempotent no-op on an already-clear claim) than under-
+    release and leave a stale claim blocking a legitimate future dispatch.
+    """
+    from .lease import release_claim, release_worktree_claims, resolve_owner_worktree
 
     if os.environ.get("AGENT_CODESPACES_DISABLE_CLAIM"):
         print("[OK] Claim disabled (AGENT_CODESPACES_DISABLE_CLAIM); skipped.")
@@ -3868,6 +4210,22 @@ def _cmd_release_claim(args: argparse.Namespace) -> int:
         print("[WARN] No owning worktree resolved; nothing to release.",
               file=sys.stderr)
         return 0
+    if getattr(args, "release_all", False):
+        released = release_worktree_claims(owner)
+        if released:
+            print(
+                f"[OK] Released {len(released)} claim(s) owned by {owner}: "
+                f"{', '.join(released)}"
+            )
+        else:
+            print(f"No claims owned by {owner}.")
+        return 0
+    if not args.codespace:
+        print(
+            "[FAIL] Either a CodeSpace name or --all is required.",
+            file=sys.stderr,
+        )
+        return 2
     if release_claim(args.codespace, owner):
         print(f"[OK] Released claim on {args.codespace} (owner {owner})")
     else:
@@ -3971,13 +4329,10 @@ _ALLOC_PRESSURE_EXIT = 4
 
 def _cmd_allocate(args: argparse.Namespace) -> int:
     """Resolve a venue request for ``repo`` to a reuse/create/recycle/pressure
-    decision (Phase 2 / #708) -- the reuse-before-create, budget-bounded planner.
-
-    Advisory + read-only: it *decides* (which box to reuse, whether to create,
-    which stale box to recycle, or that the pool is full), the caller acts. Exit
-    ``0`` for an actionable decision; ``_ALLOC_PRESSURE_EXIT`` (4) for pressure so
-    a scripted gate can branch.
-    """
+    decision (Phase 2b / #708): resume this workstream's own box, create
+    fresh, recycle stale, or pressure. Advisory + read-only; caller acts.
+    Exit 0 for an actionable decision, ``_ALLOC_PRESSURE_EXIT`` (4) for
+    pressure (a scripted gate can branch on it)."""
     config = load_merged_config()
     new_cores = (
         args.new_cores if args.new_cores is not None
@@ -3991,9 +4346,14 @@ def _cmd_allocate(args: argparse.Namespace) -> int:
     members, budget = pool_mod.build_pool(
         budget_cores=budget_cores, stale_after=stale_after,
     )
+    try:
+        from .driving_worktrees import resolve_current_workstream_box
+        workstream_box = resolve_current_workstream_box(members, args.repo)
+    except Exception:
+        workstream_box = None
     decision = pool_mod.plan_allocation(
         members, budget, repo=args.repo, new_cores=new_cores,
-    )
+        workstream_box=workstream_box)
     if args.json_output:
         print(json.dumps(decision.to_dict()))
     else:
@@ -4159,7 +4519,7 @@ def _cmd_status() -> int:
     """Show service status overview."""
     print("=== agent-codespaces status ===")
     print(f"Runtime dir: {RUNTIME_DIR}")
-    print(f"Adopted repos: {ADOPTED_REPOS_FILE}")
+    print(f"Adopted repos: {adoption_storage_summary()}")
 
     repos = load_adopted_repos()
     print(f"Adopted repo count: {len(repos)}")
@@ -4190,20 +4550,43 @@ def _cmd_status() -> int:
 
 def _cmd_installer_readiness() -> int:
     """Report runtime/config readiness without requiring a live CodeSpace."""
-    from .installer_readiness import emit, evaluate
+    from .installer_readiness import emit, evaluate, should_check_gh_auth
 
-    auth_findings = _gh_auth_preflight()
-    config_report = scan_config_dropin_registry()
-    merged = load_merged_config()
+    provider_reports = scan_config_providers()
+    merged = load_merged_config(provider_reports=provider_reports)
+    authoritative_owners = {
+        contribution.owner
+        for contribution in provider_reports.active_plugins.active_configs
+        if contribution.owner
+    }
+
+    def render_finding(finding) -> str:
+        return (
+            f"{finding.owner or finding.entry}: {finding.entry}: "
+            f"{finding.reason}; target: {finding.target or 'none'}; "
+            f"remedy: {finding.remedy}"
+        )
+
     registry_findings = [
-        f"{finding.entry}: {finding.reason}; remedy: {finding.remedy}"
-        for finding in config_report.findings
+        render_finding(finding)
+        for finding in provider_reports.active_plugins.findings
+    ]
+    registry_findings.extend(
+        render_finding(finding)
+        for finding in provider_reports.config_d.findings
+        if finding.owner not in authoritative_owners
+    )
+    registry_advisories = [
+        render_finding(finding)
+        for finding in provider_reports.config_d.findings
+        if finding.owner in authoritative_owners
     ]
     configured = bool(
         load_adopted_repos()
-        or config_report.active_configs
+        or provider_reports.active_configs
         or merged.source_paths
     )
+    auth_findings = _gh_auth_preflight() if should_check_gh_auth(configured=configured) else []
     config_issues = validate_config(merged)
     config_issues = [
         issue
@@ -4214,6 +4597,7 @@ def _cmd_installer_readiness() -> int:
         evaluate(
             auth_findings=auth_findings,
             registry_findings=registry_findings,
+            registry_advisories=registry_advisories,
             config_issues=config_issues,
             configured=configured,
         )
@@ -4260,8 +4644,11 @@ def _cmd_provision_command() -> int:
     Prints the idempotent bash command to stdout.
     """
     from .codespace_assets import build_provision_command
+    from .config import load_merged_config
 
-    print(build_provision_command())
+    cfg = load_merged_config(include_cwd=False)
+    ado_host = getattr(cfg.credentials, "ado_host", None)
+    print(build_provision_command(ado_host=ado_host))
     return 0
 
 
@@ -4298,10 +4685,10 @@ _NS_BAD_STATE_EXIT = 4
 
 
 def _cmd_namespace_list() -> int:
-    """Print a JSON list of `codespace:` namespace agent specs (#892 Inc 3)."""
-    from .resolver import CodespaceResolver
+    """Print `codespace:` agent specs; never raises (see resolver.list_specs_tolerant)."""
+    from .resolver import list_specs_tolerant
 
-    specs = asyncio.run(CodespaceResolver().list_specs())
+    specs = asyncio.run(list_specs_tolerant())
     print(json.dumps(specs))
     return 0
 
@@ -4370,7 +4757,8 @@ def _cmd_config_migrate() -> int:
     """Migrate machine-local config schema (adopted-repos.yaml) in place.
 
     Idempotent + atomic; machine-local only (never touches the repo-committed
-    ``.agent-codespaces/config.yaml`` -- that is an adopt concern). Safe no-op
+    ``.copilot-extensions/agent-codespaces/config.yaml`` -- that is an adopt
+    concern). Safe no-op
     when the vendored ``config_migrate`` library is absent. Invoked once from the
     installer's install/update flow.
     """
@@ -4384,83 +4772,106 @@ def _cmd_config_migrate() -> int:
     return 0
 
 
-def _cmd_owner(args: argparse.Namespace) -> int:
-    """Run the Connection Owner relay reconcile daemon (config-gated; default off).
-
-    The Owner is the single, persistent per-machine owner of each CodeSpace's
-    credential relay, independent of any one agent-bridge dispatch -- so a caller
-    disconnect / bridge restart no longer drops the relay mid-task
-    (dotfiles#1320/#1333). Additive + opt-in: it refuses to run unless
-    ``connection_owner.enabled`` is set (or ``--force`` for validation), so nothing
-    starts it by default. Making the ssh/dispatch paths defer to it is a later
-    increment; this entrypoint makes the daemon runnable + live-validatable.
-
-    ``--once`` reconciles a single cycle and exits (validation): with no holds it
-    is a safe no-op that exercises the wiring without touching a real CodeSpace.
-
-    ``--status`` prints the resolved ``connection_owner`` config as JSON
-    (``enabled`` / ``reconcile_interval``) and exits without starting anything --
-    the install/update scripts call it to decide whether to provision the
-    per-machine Owner service (config-gated cutover; default off -> inert).
+def _resolve_dev_slot_owner() -> str:
+    """Same resolution the installer's `dev` verb uses (mutable-dev-slot.md):
+    the calling worktree's checkout path via `agent-worktrees get
+    worktree-dir`, falling back to this package's own installed source
+    directory when that CLI is unavailable.
     """
-    import asyncio
+    agent_worktrees = shutil.which("agent-worktrees")  # marketplace-isolation: allow dev-slot owner resolution falls back when unavailable
+    if agent_worktrees:
+        try:
+            proc = subprocess.run(
+                [agent_worktrees, "get", "worktree-dir"],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            out = proc.stdout.strip()
+            if proc.returncode == 0 and out:
+                return out
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return str(Path(__file__).resolve().parent.parent.parent)
 
-    from .config import load_merged_config
-    from .connection_owner import (
-        ConnectionOwner,
-        list_holds,
-        make_supervised_relay_factory,
-        run_owner_daemon,
-    )
 
-    cfg = load_merged_config(include_cwd=False)
-    co = getattr(cfg, "connection_owner", None)
-    enabled = bool(co and co.enabled)
+def _versioned_runtime_helper_path() -> Path | None:
+    """The versioned_runtime.py copy the installer stages at RUNTIME_DIR
+    (mutable-dev-slot.md "Runtime accessibility", option 1) -- present once
+    any install/update/dev has run. ``None`` if it has never been staged.
+    """
+    candidate = RUNTIME_DIR / "versioned_runtime.py"
+    return candidate if candidate.is_file() else None
 
-    if getattr(args, "status", False):
-        import json
 
-        interval = float(co.reconcile_interval) if co else 15.0
-        print(json.dumps({"enabled": enabled, "reconcile_interval": interval}))
-        return 0
-
-    if not enabled and not args.force:
-        print(
-            "connection-owner is disabled (set connection_owner.enabled: true, or "
-            "pass --force to validate); not starting.",
-            file=sys.stderr,
-        )
-        return 0
-
-    interval = (
-        args.interval
-        if args.interval is not None
-        else (float(co.reconcile_interval) if co else 15.0)
-    )
-    if interval <= 0:
+def _run_versioned_runtime(*args: str, json_output: bool = False) -> subprocess.CompletedProcess[str]:
+    """Shell out to the staged versioned_runtime.py. ``--root``/``--link-name``
+    and (if requested) ``--json`` are GLOBAL flags on that tool's own parser
+    and must precede the subcommand token, so they are assembled here rather
+    than left to each caller to order correctly.
+    """
+    helper = _versioned_runtime_helper_path()
+    if helper is None:
         raise RuntimeError(
-            f"connection-owner reconcile interval must be > 0 (got {interval}); "
-            "check --interval / connection_owner.reconcile_interval."
+            "versioned_runtime.py has not been staged yet -- run "
+            "`agent-codespaces` install/update at least once first"
         )
-    factory = make_supervised_relay_factory(cfg)
-    owner = ConnectionOwner(factory)
+    cmd = [sys.executable, str(helper), "--root", str(RUNTIME_DIR), "--link-name", ".venv"]
+    if json_output:
+        cmd.append("--json")
+    cmd.extend(args)
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
-    if args.once:
-        asyncio.run(owner.reconcile())
-        held = sorted(h.codespace for h in list_holds())
-        active = sorted(owner.active_codespaces())
-        print(f"connection-owner: reconciled once; held={held}; active={active}")
-        return 0
 
-    print(
-        f"connection-owner: starting reconcile daemon (interval={interval}s; "
-        "Ctrl-C to stop)...",
-        file=sys.stderr,
-    )
+def _cmd_dev_release(args: argparse.Namespace) -> int:
+    """Release the mutable `dev` version slot (mutable-dev-slot.md).
+
+    Restores `current-version` to whatever was active before dev mode was
+    claimed. Reachable from the DEPLOYED CLI (no source checkout required) --
+    the whole point of staging versioned_runtime.py at RUNTIME_DIR.
+    """
+    owner = args.owner or _resolve_dev_slot_owner()
+    release_args = ["dev-release", "--owner", owner]
+    if args.force:
+        release_args.append("--force")
     try:
-        asyncio.run(run_owner_daemon(owner, interval=interval))
-    except KeyboardInterrupt:
-        pass
+        result = _run_versioned_runtime(*release_args, json_output=True)
+    except RuntimeError as exc:
+        print(f"dev-release: {exc}", file=sys.stderr)
+        return 1
+    if result.returncode == 2:
+        print(result.stderr.strip() or result.stdout.strip(), file=sys.stderr)
+        print("Pass --force to release a claim held by a different owner.", file=sys.stderr)
+        return 2
+    if result.returncode != 0:
+        print(result.stderr.strip() or result.stdout.strip(), file=sys.stderr)
+        return 1
+    record = json.loads(result.stdout) if result.stdout.strip() else None
+    if not record:
+        print("dev-release: no dev-slot claim was held (nothing to release)")
+        return 0
+    previous_version = record.get("previous_version")
+    if not previous_version:
+        print("dev-release: released the claim, but no previous_version was "
+              "recorded to restore -- current-version left untouched")
+        return 0
+    activate = _run_versioned_runtime("activate", previous_version, "--no-link")
+    if activate.returncode != 0:
+        print(activate.stderr.strip() or activate.stdout.strip(), file=sys.stderr)
+        return 1
+    print(f"dev-release: released; current-version -> {previous_version}")
+    return 0
+
+
+def _cmd_dev_status() -> int:
+    """Print the current `dev` slot claim (or ``null``) as JSON."""
+    try:
+        result = _run_versioned_runtime("dev-status", json_output=True)
+    except RuntimeError as exc:
+        print(f"dev-status: {exc}", file=sys.stderr)
+        return 1
+    if result.returncode != 0:
+        print(result.stderr.strip() or result.stdout.strip(), file=sys.stderr)
+        return 1
+    print(result.stdout.strip() or "null")
     return 0
 
 

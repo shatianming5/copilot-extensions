@@ -23,6 +23,7 @@ from agent_bridge.agent_registry import (
     NamespaceAgentInfo,
     NamespaceResolver,
 )
+from agent_bridge.agent_registry_namespace import NamespaceListIncomplete
 from agent_bridge.transport import SpawnTarget
 
 
@@ -75,6 +76,43 @@ async def test_list_uses_cli():
 
 
 @pytest.mark.asyncio
+async def test_list_threads_timeout_into_subprocess_run():
+    # Reliability: AgentResolver.list_agents_async's per-resolver bound must
+    # actually kill a wedged provider process, not merely abandon the await
+    # (asyncio.wait_for alone cannot stop a subprocess.run already running in
+    # a worker thread via asyncio.to_thread -- see agent_registry.py's
+    # _NAMESPACE_LIST_RESOLVER_TIMEOUT_ENV docstring). Confirm the ``timeout``
+    # kwarg to ``list()`` reaches ``subprocess.run`` verbatim, so its own
+    # timeout enforcement (which kills the child process) is what bounds it.
+    fb = _Fallback()
+    payload = json.dumps([{"name": "cs-a", "state": "available"}])
+    with patch("shutil.which", _which), patch(
+        "subprocess.run", return_value=_cp(0, payload)
+    ) as mock_run:
+        await CliNamespaceResolver("codespace", "agent-codespaces", fb).list(
+            timeout=3.5
+        )
+    assert mock_run.call_args.kwargs["timeout"] == 3.5
+
+
+@pytest.mark.asyncio
+async def test_list_timeout_expired_degrades_like_other_subprocess_failures():
+    # subprocess.run(timeout=...) raises TimeoutExpired after already killing
+    # the child process (stdlib guarantee) -- CliNamespaceResolver must treat
+    # that exactly like any other subprocess failure (fall back, not raise).
+    fb = _Fallback()
+    with patch("shutil.which", _which), patch(
+        "subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd=["agent-codespaces"], timeout=3.5),
+    ):
+        agents = await CliNamespaceResolver(
+            "codespace", "agent-codespaces", fb
+        ).list(timeout=3.5)
+    assert [a.name for a in agents] == ["fallback-cs"]
+    assert fb.calls == ["list"]
+
+
+@pytest.mark.asyncio
 async def test_list_falls_back_on_unparseable():
     fb = _Fallback()
     with patch("shutil.which", _which), patch("subprocess.run", return_value=_cp(0, "not json")):
@@ -122,20 +160,20 @@ async def test_resolve_carries_venue_metadata():
     fb = _Fallback()
 
     container = {
-        "name": "odsp-web-1",
-        "workspace_folder": "/workspaces/odsp-web",
+        "name": "sample-web-1",
+        "workspace_folder": "/workspaces/sample-web",
         "security_profile": "trusted",
-        "ssh": {"host_alias": "agent-container-odsp-web-1"},
+        "ssh": {"host_alias": "agent-container-sample-web-1"},
         "provider_command": ["python", "-m", "agent_containers"],
     }
     venue = {
         "schema_version": 1,
         "provider": "agent-containers",
         "kind": "container",
-        "target_id": "container:odsp-web-1",
+        "target_id": "container:sample-web-1",
         "scope": "provider-instance",
         "instance_id": "instance-123",
-        "workspace_folder": "/workspaces/odsp-web",
+        "workspace_folder": "/workspaces/sample-web",
         "security_profile": "trusted",
         "ready": True,
         "posture_verified": False,
@@ -144,9 +182,9 @@ async def test_resolve_carries_venue_metadata():
     def _run(argv, **_kw):
         return _cp(0, json.dumps({
             "type": "command",
-            "spawn_command": ["c", "exec", "--stdio", "odsp-web-1"],
+            "spawn_command": ["c", "exec", "--stdio", "sample-web-1"],
             "user": "vscode",
-            "workspace_folder": "/workspaces/odsp-web",
+            "workspace_folder": "/workspaces/sample-web",
             "security_profile": "trusted",
             "container": container,
             "venue": venue,
@@ -154,7 +192,7 @@ async def test_resolve_carries_venue_metadata():
 
     with patch("shutil.which", _which), patch("subprocess.run", side_effect=_run):
         t = await CliNamespaceResolver("container", "agent-containers", fb).resolve(
-            "odsp-web-1",
+            "sample-web-1",
         )
     assert t.venue == venue
     assert t.container == container
@@ -361,6 +399,103 @@ async def test_resolve_venue_none_when_absent():
 
 
 @pytest.mark.asyncio
+async def test_resolve_worktree_type_delegates_transport_to_bridge():
+    """A provider (e.g. agent-dispatch's `dispatch:` namespace, #3389) names
+    *which* worktree to resume rather than building a raw spawn_command --
+    agent-bridge's own worktree transport resolution builds the rest."""
+    fb = _Fallback()
+
+    def _run(argv, **_kw):
+        return _cp(0, json.dumps({
+            "type": "worktree",
+            "worktree_id": "wt-42",
+            "venue": {"provider": "agent-dispatch", "target_id": "task-1"},
+        }))
+
+    with patch("shutil.which", _which), patch("subprocess.run", side_effect=_run):
+        t = await CliNamespaceResolver("dispatch", "agent-dispatch", fb).resolve(
+            "task-1",
+        )
+    assert t.type == "local"
+    assert t.worktree_id == "wt-42"
+    assert t.spawn_command is None
+    assert t.venue == {"provider": "agent-dispatch", "target_id": "task-1"}
+    assert "resolve" not in fb.calls
+
+
+@pytest.mark.asyncio
+async def test_resolve_worktree_type_with_host_becomes_ssh_target():
+    fb = _Fallback()
+
+    def _run(argv, **_kw):
+        return _cp(0, json.dumps({
+            "type": "worktree", "worktree_id": "wt-7", "host": "ember",
+        }))
+
+    with patch("shutil.which", _which), patch("subprocess.run", side_effect=_run):
+        t = await CliNamespaceResolver("dispatch", "agent-dispatch", fb).resolve(
+            "task-2",
+        )
+    assert t.type == "ssh"
+    assert t.host == "ember"
+    assert t.worktree_id == "wt-7"
+
+
+@pytest.mark.asyncio
+async def test_resolve_session_type_carries_venue_unspawnable():
+    """A provider with no spawnable target at all (e.g. agent-dispatch's
+    `dispatch:` namespace resolving a completed headless task, #3389
+    extension) -- only a durable session reference for read-only
+    resolve-by-any-origin-reference lookup, never a worktree/spawn_command."""
+    fb = _Fallback()
+
+    def _run(argv, **_kw):
+        return _cp(0, json.dumps({
+            "type": "session",
+            "venue": {
+                "provider": "agent-dispatch",
+                "target_id": "task-9",
+                "task": {"status": "completed", "owner_session_id": "s-1"},
+                "attachments": [],
+            },
+        }))
+
+    with patch("shutil.which", _which), patch("subprocess.run", side_effect=_run):
+        t = await CliNamespaceResolver("dispatch", "agent-dispatch", fb).resolve(
+            "task-9",
+        )
+    assert t.type == "session"
+    assert t.worktree_id is None
+    assert t.spawn_command is None
+    assert t.venue["task"]["owner_session_id"] == "s-1"
+    assert "resolve" not in fb.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"type": "worktree"}, "invalid worktree_id"),
+        ({"type": "worktree", "worktree_id": ""}, "invalid worktree_id"),
+        ({"type": "worktree", "worktree_id": "  "}, "invalid worktree_id"),
+        ({"type": "worktree", "worktree_id": "wt-1", "host": ""}, "invalid host"),
+    ],
+)
+async def test_resolve_worktree_type_rejects_invalid_shape(payload, message):
+    fb = _Fallback()
+
+    def _run(argv, **_kw):
+        return _cp(0, json.dumps(payload))
+
+    with patch("shutil.which", _which), patch("subprocess.run", side_effect=_run):
+        with pytest.raises(RuntimeError, match=message):
+            await CliNamespaceResolver("dispatch", "agent-dispatch", fb).resolve(
+                "task-1",
+            )
+    assert "resolve" not in fb.calls
+
+
+@pytest.mark.asyncio
 async def test_resolve_not_found_maps_to_keyerror():
     fb = _Fallback()
     with patch("shutil.which", _which), patch("subprocess.run", return_value=_cp(3, "", "no such cs")):
@@ -432,6 +567,60 @@ async def test_no_fallback_resolve_still_raises_when_cli_absent():
             await r.ensure_ready("cs-a")
 
 
+# --- list(): genuine provider failure (vs. legitimate absence) -----------
+#
+# A found binstub whose namespace-list genuinely
+# fails (timeout, non-zero exit, unparseable output) with no in-process
+# fallback must NOT degrade to [] like the "not installed" case above --
+# that would let AgentResolver.list_agents_async() treat a partial/failed
+# scan as an authoritative empty roster and silently drop real agents from
+# a --subscribe diff with no ``removed`` frame at all.
+
+@pytest.mark.asyncio
+async def test_no_fallback_list_raises_incomplete_on_timeout():
+    r = CliNamespaceResolver("codespace", "agent-codespaces", fallback=None)
+    with patch("shutil.which", _which), patch(
+        "subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd=["agent-codespaces"], timeout=3.5),
+    ):
+        with pytest.raises(NamespaceListIncomplete):
+            await r.list(timeout=3.5)
+
+
+@pytest.mark.asyncio
+async def test_no_fallback_list_raises_incomplete_on_nonzero_exit():
+    r = CliNamespaceResolver("codespace", "agent-codespaces", fallback=None)
+    with patch("shutil.which", _which), patch(
+        "subprocess.run", return_value=_cp(1, "", "boom")
+    ):
+        with pytest.raises(NamespaceListIncomplete):
+            await r.list()
+
+
+@pytest.mark.asyncio
+async def test_no_fallback_list_raises_incomplete_on_unparseable_output():
+    r = CliNamespaceResolver("codespace", "agent-codespaces", fallback=None)
+    with patch("shutil.which", _which), patch(
+        "subprocess.run", return_value=_cp(0, "not json")
+    ):
+        with pytest.raises(NamespaceListIncomplete):
+            await r.list()
+
+
+@pytest.mark.asyncio
+async def test_with_fallback_list_still_falls_back_on_genuine_failure():
+    # A fallback resolver, when present, still covers a genuine failure --
+    # only the no-fallback case must raise instead of silently degrading.
+    fb = _Fallback()
+    r = CliNamespaceResolver("codespace", "agent-codespaces", fallback=fb)
+    with patch("shutil.which", _which), patch(
+        "subprocess.run", return_value=_cp(1, "", "boom")
+    ):
+        agents = await r.list()
+    assert [a.name for a in agents] == ["fallback-cs"]
+    assert fb.calls == ["list"]
+
+
 # --- restricted (container) variant + signature-aware fallback (#892 Inc 3b) ---
 
 import inspect  # noqa: E402
@@ -494,3 +683,129 @@ async def test_signature_aware_fallback_drops_unsupported_kwargs():
         )
     assert t.spawn_command == ["fb"]
     assert fb.calls == ["resolve"]
+
+
+# --- list() caching (perf hardening: namespace-list is a slow, often
+# network-bound subprocess -- e.g. agent-codespaces enumerating CodeSpaces
+# across mapped GitHub accounts measured 4-10s in production) ---------------
+
+@pytest.mark.asyncio
+async def test_list_is_cached_within_ttl():
+    fb = _Fallback()
+    payload = json.dumps([{"name": "cs-a", "state": "available"}])
+    calls = 0
+
+    def _run(_argv, **_kw):
+        nonlocal calls
+        calls += 1
+        return _cp(0, payload)
+
+    resolver = CliNamespaceResolver("codespace", "agent-codespaces", fb)
+    with patch("shutil.which", _which), patch("subprocess.run", side_effect=_run):
+        first = await resolver.list()
+        second = await resolver.list()
+    assert [a.name for a in first] == ["cs-a"]
+    assert second == first
+    assert calls == 1  # second call served from the in-memory cache
+
+
+@pytest.mark.asyncio
+async def test_list_cache_disabled_via_env(monkeypatch):
+    monkeypatch.setenv("AGENT_BRIDGE_NAMESPACE_LIST_TTL", "0")
+    fb = _Fallback()
+    payload = json.dumps([{"name": "cs-a", "state": "available"}])
+    calls = 0
+
+    def _run(_argv, **_kw):
+        nonlocal calls
+        calls += 1
+        return _cp(0, payload)
+
+    resolver = CliNamespaceResolver("codespace", "agent-codespaces", fb)
+    with patch("shutil.which", _which), patch("subprocess.run", side_effect=_run):
+        await resolver.list()
+        await resolver.list()
+    assert calls == 2  # TTL=0 (off) re-queries every call
+
+
+@pytest.mark.asyncio
+async def test_list_cache_expires_after_ttl(monkeypatch):
+    monkeypatch.setenv("AGENT_BRIDGE_NAMESPACE_LIST_TTL", "5")
+    fb = _Fallback()
+    payload = json.dumps([{"name": "cs-a", "state": "available"}])
+    calls = 0
+
+    def _run(_argv, **_kw):
+        nonlocal calls
+        calls += 1
+        return _cp(0, payload)
+
+    fake_now = [1000.0]
+    resolver = CliNamespaceResolver("codespace", "agent-codespaces", fb)
+    with (
+        patch("shutil.which", _which),
+        patch("subprocess.run", side_effect=_run),
+        patch("time.monotonic", side_effect=lambda: fake_now[0]),
+    ):
+        await resolver.list()
+        fake_now[0] += 6  # past the 5s TTL
+        await resolver.list()
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_invalidate_list_cache_forces_requery():
+    fb = _Fallback()
+    payload = json.dumps([{"name": "cs-a", "state": "available"}])
+    calls = 0
+
+    def _run(_argv, **_kw):
+        nonlocal calls
+        calls += 1
+        return _cp(0, payload)
+
+    resolver = CliNamespaceResolver("codespace", "agent-codespaces", fb)
+    with patch("shutil.which", _which), patch("subprocess.run", side_effect=_run):
+        await resolver.list()
+        resolver.invalidate_list_cache()
+        await resolver.list()
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_successful_resolve_invalidates_list_cache():
+    fb = _Fallback()
+    list_payload = json.dumps([{"name": "cs-a", "state": "available"}])
+    resolve_payload = json.dumps(
+        {"type": "command", "spawn_command": ["ssh", "x"], "user": "me"}
+    )
+
+    def _run(argv, **_kw):
+        if argv[1] == "namespace-list":
+            return _cp(0, list_payload)
+        return _cp(0, resolve_payload)
+
+    resolver = CliNamespaceResolver("codespace", "agent-codespaces", fb)
+    with patch("shutil.which", _which), patch("subprocess.run", side_effect=_run):
+        await resolver.list()
+        assert resolver._list_cache is not None
+        await resolver.resolve("cs-a")
+        assert resolver._list_cache is None  # invalidated by the successful resolve
+
+
+@pytest.mark.asyncio
+async def test_successful_ensure_ready_invalidates_list_cache():
+    fb = _Fallback()
+    list_payload = json.dumps([{"name": "cs-a", "state": "available"}])
+
+    def _run(argv, **_kw):
+        if argv[1] == "namespace-list":
+            return _cp(0, list_payload)
+        return _cp(0)
+
+    resolver = CliNamespaceResolver("codespace", "agent-codespaces", fb)
+    with patch("shutil.which", _which), patch("subprocess.run", side_effect=_run):
+        await resolver.list()
+        assert resolver._list_cache is not None
+        await resolver.ensure_ready("cs-a")
+        assert resolver._list_cache is None

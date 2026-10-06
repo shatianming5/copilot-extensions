@@ -22,12 +22,24 @@ def _without_plugin_root() -> dict[str, str]:
             if key != "COPILOT_PLUGIN_ROOT"}
 
 
-def test_hook_manifest_points_to_payload_scripts() -> None:
-    hooks = json.loads((PLUGIN / "hooks.json").read_text(encoding="utf-8"))
-    entries = hooks["hooks"]["sessionStart"]
-    assert len(entries) == 1
-    assert "COPILOT_PLUGIN_ROOT" in entries[0]["powershell"]
-    assert "COPILOT_PLUGIN_ROOT" in entries[0]["bash"]
+def test_manifest_uses_static_projection_for_context_without_a_session_hook() -> None:
+    """No sessionStart/additionalContext-composition hook -- that path is
+    intentionally deferred to native host composition (see README). A
+    preToolUse guardrail (the @copilot-mention guard) has no such
+    composition hazard and is registered via ``hooks.json`` instead."""
+    manifest = json.loads((PLUGIN / "plugin.json").read_text(encoding="utf-8"))
+    assert "sessionContext" not in manifest
+    assert not (PLUGIN / "session-context.json").exists()
+    assert manifest.get("hooks") == "hooks.json"
+    declared = json.loads((PLUGIN / "hooks.json").read_text(encoding="utf-8"))
+    assert "sessionStart" not in declared.get("hooks", {})
+    assert "preToolUse" in declared.get("hooks", {})
+    declaration = json.loads(
+        (PLUGIN / "instruction-projections.json").read_text(encoding="utf-8")
+    )
+    assert declaration["projections"][0]["template"] == (
+        "instructions/contribution-boundary.instructions.md"
+    )
 
 
 def test_bash_hook_has_interpreter_and_json_fallbacks() -> None:
@@ -92,21 +104,6 @@ def test_powershell_hook_falls_back_to_script_location() -> None:
     )
 
 
-@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh unavailable")
-def test_powershell_manifest_fails_open_without_root(tmp_path: Path) -> None:
-    hooks = json.loads((PLUGIN / "hooks.json").read_text(encoding="utf-8"))
-    command = hooks["hooks"]["sessionStart"][0]["powershell"]
-    result = subprocess.run(
-        ["pwsh", "-NoProfile", "-Command", command],
-        check=True,
-        capture_output=True,
-        text=True,
-        cwd=tmp_path,
-        env=_without_plugin_root(),
-    )
-    assert result.stdout.strip() == "{}"
-
-
 @pytest.mark.skipif(os.name == "nt" or shutil.which("bash") is None,
                     reason="POSIX bash payload test")
 def test_bash_hook_emits_existing_guide() -> None:
@@ -122,19 +119,3 @@ def test_bash_hook_emits_existing_guide() -> None:
     assert str(GUIDE) in payload["additionalContext"]
     assert "organization-neutral" in payload["additionalContext"]
     assert len(payload["additionalContext"].encode("utf-8")) <= 448
-
-
-@pytest.mark.skipif(os.name == "nt" or shutil.which("bash") is None,
-                    reason="POSIX bash payload test")
-def test_bash_manifest_fails_open_without_root(tmp_path: Path) -> None:
-    hooks = json.loads((PLUGIN / "hooks.json").read_text(encoding="utf-8"))
-    command = hooks["hooks"]["sessionStart"][0]["bash"]
-    result = subprocess.run(
-        ["bash", "-c", command],
-        check=True,
-        capture_output=True,
-        text=True,
-        cwd=tmp_path,
-        env=_without_plugin_root(),
-    )
-    assert result.stdout.strip() == "{}"

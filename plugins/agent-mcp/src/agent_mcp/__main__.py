@@ -10,10 +10,34 @@ Subcommands:
                                 serve session-host and pump stdio<->socket, with a
                                 direct-bridge fallback (the #744 multiplexer child).
   validate <name|FILE>          Parse + schema-check a bridge config (no run).
+  diagnose <name|FILE>          Staged connectivity check: config -> auth ->
+                                transport -> handshake -> catalog. Reports
+                                exactly which layer failed instead of one
+                                opaque top-level error.
   status                        Show prerequisites and available bridges.
+  clean-tool-cache               Detect/purge stale-schema entries in the
+                                persisted MCP tool-snapshot cache (the runtime
+                                only age-expires entries itself, never
+                                schema-mismatched ones).
+  mcp-health                     Sweep the CLI's own process logs for known
+                                MCP-lifecycle warning signals and snapshot
+                                the tool-cache staleness ratio. Read-only;
+                                meant for periodic health tracking.
   call <bridge> <tool> [args]   One-shot: invoke one upstream tool, print result.
+  source-digest <bridge>        Print the keyed effective source fingerprint.
   materialize <bridge>          Project the upstream catalog into a CLI stub fleet.
-  serve                         Resident warmth daemon: keep upstreams warm over a socket.
+                                Consults a reachable resident ``serve`` daemon
+                                first (it opens/reuses the bridge session as
+                                needed, avoiding a redundant fresh upstream
+                                spawn); ``--no-serve`` always spawns cold.
+  serve                         Resident warmth daemon: keep upstreams warm over a
+                                socket. ``--passive``/``--control-port`` are
+                                internal seams `cutover` uses to spawn a new
+                                generation beside a live one.
+  cutover                       Zero-downtime replace the resident `serve` daemon:
+                                spawn the installed version beside the running
+                                one, health-gate it, flip the client-facing
+                                handle, drain the old generation, retire it.
 
 Heavy imports (the bridge tree: config, credential injectors, decorators,
 transports, the upstream client, the serve daemon) are deferred into each command
@@ -26,6 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -80,6 +105,20 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     print(f"OK: {where} -- {cfg.server.type} -> "
           f"{cfg.server.launch_desc} (auth: {auth_desc})")
     return 0
+
+
+def _cmd_diagnose(args: argparse.Namespace) -> int:
+    import asyncio
+
+    from .diagnose import diagnose
+
+    printer = (lambda _line: None) if args.json else print
+    report = asyncio.run(
+        diagnose(args.name, list_tools=not args.no_tools, printer=printer)
+    )
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    return 0 if report.ok else 1
 
 
 def _cmd_status(_args: argparse.Namespace) -> int:
@@ -146,6 +185,127 @@ def _cmd_installer_readiness(_args: argparse.Namespace) -> int:
             candidates.append((normalize_bridge_name(path.name), path))
     candidates.extend(discover_plugin_bridge_candidates())
     return emit(evaluate(candidates))
+
+
+# ---------------------------------------------------------------------------
+# clean-tool-cache -- purge stale-schema MCP tool-snapshot cache entries
+# ---------------------------------------------------------------------------
+
+def _cmd_clean_tool_cache(args: argparse.Namespace) -> int:
+    from . import tool_cache_maintenance as tcm
+
+    cache_dir = tcm.resolve_cache_dir(args.cache_dir)
+    if cache_dir is None or not cache_dir.is_dir():
+        result = {
+            "cache_dir": str(cache_dir) if cache_dir else None,
+            "found": False,
+            "total_entries": 0,
+            "stale_entries": 0,
+            "stale_bytes": 0,
+            "deleted": 0,
+            "applied": args.apply,
+        }
+        if args.json:
+            print(json.dumps(result))
+        else:
+            print(
+                f"No MCP tool-cache directory found"
+                f"{f' at {cache_dir}' if cache_dir else ''} -- nothing to do "
+                f"(expected on a fresh install, or a machine that has never "
+                f"run an MCP-equipped session)."
+            )
+        return 2
+
+    scanned = tcm.scan(cache_dir)
+    stale = scanned.stale_entries
+    deleted = 0
+    delete_errors: list[str] = []
+    if args.apply:
+        for e in stale:
+            try:
+                e.path.unlink()
+                deleted += 1
+            except OSError as error:
+                delete_errors.append(f"{e.path}: {error}")
+
+    if not args.quiet and not args.json:
+        print(f"MCP tool cache: {cache_dir}")
+        print(f"  {len(scanned.entries)} entr{'y' if len(scanned.entries) == 1 else 'ies'} total")
+        for version, count in sorted(scanned.version_counts.items(), key=lambda kv: -kv[1]):
+            marker = " (current)" if version == scanned.current_version else " (STALE)"
+            print(f"    schemaVersion {version}: {count}{marker}")
+        unparseable = [e for e in scanned.entries if e.parse_error]
+        if unparseable:
+            print(f"    unparseable/malformed: {len(unparseable)} (STALE)")
+        stale_bytes = sum(e.size for e in stale)
+        print(f"  {len(stale)} stale entr{'y' if len(stale) == 1 else 'ies'} ({stale_bytes:,} bytes)")
+        if args.apply:
+            print(f"  Deleted {deleted} of {len(stale)} stale entries")
+            for error in delete_errors:
+                print(f"  \u2717 Failed to delete {error}")
+        elif stale:
+            print("  Dry run -- pass --apply to actually delete these entries")
+
+    if args.json:
+        print(json.dumps({
+            "cache_dir": str(cache_dir),
+            "found": True,
+            "total_entries": len(scanned.entries),
+            "current_schema_version": scanned.current_version,
+            "schema_version_counts": dict(scanned.version_counts),
+            "stale_entries": len(stale),
+            "stale_bytes": sum(e.size for e in stale),
+            "deleted": deleted,
+            "delete_errors": delete_errors,
+            "applied": args.apply,
+        }))
+
+    if delete_errors:
+        return 1
+    if stale and not args.apply:
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# mcp-health -- sweep the CLI's own logs for known MCP-lifecycle signals
+# ---------------------------------------------------------------------------
+
+def _cmd_mcp_health(args: argparse.Namespace) -> int:
+    from . import mcp_health
+
+    report = mcp_health.health_report(
+        log_dir_override=args.log_dir,
+        cache_dir_override=args.cache_dir,
+        since_hours=None if args.since_hours <= 0 else args.since_hours,
+    )
+
+    if not args.quiet and not args.json:
+        sweep = report["log_sweep"]
+        if sweep.get("found") is False:
+            print(f"No Copilot log directory found at {sweep.get('log_dir')} -- nothing to sweep.")
+        else:
+            window = f"last {args.since_hours}h" if args.since_hours > 0 else "all available history"
+            print(f"MCP log sweep: {sweep['log_dir']} ({window})")
+            print(f"  {sweep['files_scanned']} file(s), {sweep['lines_scanned']:,} line(s) scanned")
+            for name, count in sweep["signal_counts"].items():
+                marker = "" if count == 0 else "  <-- "
+                print(f"    {name}: {count}{marker}")
+                if count and name in sweep["first_seen"]:
+                    print(f"        first: {sweep['first_seen'][name]}  last: {sweep['last_seen'][name]}")
+        cache = report["tool_cache"]
+        if cache.get("found"):
+            print(f"Tool cache: {cache['cache_dir']}")
+            print(f"  {cache['total_entries']} entries, {cache['stale_entries']} stale "
+                  f"({cache['stale_ratio']:.1%}, {cache['stale_bytes']:,} bytes) -- "
+                  f"current schema {cache['current_schema_version']}")
+        else:
+            print(f"No tool cache directory found at {cache.get('cache_dir')}.")
+
+    if args.json:
+        print(json.dumps(report))
+
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +471,61 @@ async def _run_materialize(cfg) -> list[dict]:
         return await sess.list_tools()
 
 
+def _try_serve_materialize(bridge_ref: str, *, no_serve: bool) -> list[dict] | None:
+    """Attempt to fetch the upstream tool catalog via a running ``agent-mcp
+    serve`` daemon instead of spawning a fresh upstream process.
+
+    Mirrors ``_try_serve_call``'s fast-path/fallback shape: returns the tool
+    list (bridge ``tools:`` filter already applied, identical to what the
+    cold ``OneShotSession.list_tools()`` path returns) when a warm daemon
+    served the request, or ``None`` when no daemon is available so the
+    caller falls back to the cold spawn. A daemon-reported error also
+    returns ``None`` (not raised) -- materialize's cold path re-derives and
+    reports the same failure with its own error handling, so surfacing it
+    twice would be redundant and the fallback path is always safe to
+    attempt.
+
+    This is the fix for a reproduced failure mode: on a host running many
+    concurrent Copilot CLI sessions, an upstream spawned via a package-runner
+    shim (e.g. ``bunx``/``npx``) can share a single per-user, per-package
+    temp workspace across every concurrent invocation. A fresh materialize
+    that always spawns cold contends with every other concurrent spawn for
+    that bridge on the same workspace, and can stall for minutes with no
+    daemon-warmth fast path to avoid it. Consulting a resident ``serve``
+    daemon first means a fleet host that already keeps a bridge warm never
+    pays that cost again for materialize.
+    """
+    from . import ipc
+    socket = None if no_serve else ipc.serve_socket_if_available()
+    if socket is None:
+        return None
+    ref = bridge_ref
+    try:
+        p = Path(bridge_ref)
+        if p.exists():
+            ref = str(p.resolve())
+    except OSError:
+        pass
+    import asyncio
+    try:
+        resp = asyncio.run(ipc.list_tools_via_socket(socket, ref))
+    except OSError:
+        return None  # socket vanished/refused -> fall back to cold path
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        # A malformed/skewed daemon could return non-dict JSON in principle;
+        # never let request_via_socket's raw parsed value hit resp.get()
+        # unguarded, only to crash instead of falling back to the cold path.
+        return None  # let the cold path re-derive and report the failure
+    tools = resp.get("tools")
+    if not isinstance(tools, list):
+        # Malformed/corrupted daemon reply (missing field, version skew, a
+        # future protocol change) -- never hand plan_tools() a non-list, and
+        # never treat this as the upstream's real (empty) catalog. Fall back
+        # to the cold path, which re-derives the catalog independently.
+        return None
+    return tools
+
+
 def _cmd_materialize(args: argparse.Namespace) -> int:
     import asyncio
 
@@ -323,11 +538,18 @@ def _cmd_materialize(args: argparse.Namespace) -> int:
     except ConfigError as exc:
         print(f"agent-mcp: {exc}", file=sys.stderr)
         return 1
-    try:
-        tools = asyncio.run(_run_materialize(cfg))
-    except UpstreamError as exc:
-        print(f"agent-mcp materialize: {exc}", file=sys.stderr)
-        return 1
+
+    # Fast path: a reachable serve daemon can service this without spawning a
+    # redundant fresh upstream process -- it opens/reuses the bridge's warm
+    # session as needed, not only when one already exists. Falls through to
+    # the cold spawn when no daemon is reachable or it reports an error.
+    tools = _try_serve_materialize(args.name, no_serve=args.no_serve)
+    if tools is None:
+        try:
+            tools = asyncio.run(_run_materialize(cfg))
+        except UpstreamError as exc:
+            print(f"agent-mcp materialize: {exc}", file=sys.stderr)
+            return 1
 
     plan = _materialize.plan_tools(tools)
     if not plan:
@@ -343,12 +565,27 @@ def _cmd_materialize(args: argparse.Namespace) -> int:
     _materialize.write_farm(
         server_dir, plan, server=server, bridge_ref=bridge_ref,
         version=__version__, windows=args.windows,
+        source_digest=_materialize.bridge_source_digest(cfg),
     )
     if not args.quiet:
         print(f"materialized {len(plan)} tool(s) -> {server_dir}")
         print(f"  bin/  ({len(plan)} stub(s)) -- add to PATH to invoke by name")
         print(f"  doc/  ({len(plan)} sidecar(s))")
         print("  index.md, manifest.json")
+    return 0
+
+
+def _cmd_source_digest(args: argparse.Namespace) -> int:
+    from . import materialize as _materialize
+    from .config import ConfigError, load_config
+
+    try:
+        cfg = load_config(args.name)
+        digest = _materialize.bridge_source_digest(cfg)
+    except (ConfigError, OSError, ValueError) as exc:
+        print(f"agent-mcp source-digest: {exc}", file=sys.stderr)
+        return 1
+    print(digest)
     return 0
 
 
@@ -359,17 +596,86 @@ def _cmd_materialize(args: argparse.Namespace) -> int:
 def _cmd_serve(args: argparse.Namespace) -> int:
     import asyncio
 
-    from . import ipc
+    from . import __version__, ipc
     from . import serve as _serve
+
+    if args.passive and not args.socket:
+        # --passive is an internal cutover seam, never a user-facing entry
+        # point. Without an explicit generation-specific --socket it would
+        # default to the SAME fixed client-facing handle a real active
+        # daemon binds -- and since --passive also skips the single-instance
+        # lease, it would unlink/bind over that live handle (a POSIX symlink
+        # or socket file) with nothing to stop it, causing an avoidable
+        # outage. Fail fast rather than let that happen silently.
+        print("agent-mcp serve: --passive requires an explicit --socket "
+              "(a generation-specific path) -- refusing to default to the "
+              "fixed client-facing handle", file=sys.stderr)
+        return 2
+
     socket_path = args.socket or str(ipc.default_socket_path())
-    server = _serve.Server(socket_path, idle_timeout=args.idle_timeout)
-    print(f"agent-mcp serve: listening on {socket_path} "
+    # Resolve BEFORE the chdir below, in case a caller ever passes a relative
+    # --socket -- it must still mean "relative to the caller's cwd", not to
+    # the daemon's own (about to change) cwd.
+    socket_path = str(Path(socket_path).resolve())
+    control_token = os.environ.get("AGENT_MCP_CONTROL_TOKEN") or None
+
+    # Pin the resident daemon's CWD to the stable AGENT_MCP_HOME directory
+    # before doing anything else. This process runs for a very long time
+    # (days), and every relative-path subprocess it spawns on a caller's
+    # behalf (a bridge's `auth.command`, a CLI tool invocation, ...) resolves
+    # against ITS cwd, not the caller's -- so whatever transient directory
+    # happened to be current when `serve`/`cutover` launched it (a worktree
+    # later finalized, an install-time backup dir later cleaned up, ...)
+    # becomes a ticking time bomb: once that directory is removed, every
+    # relative-path subprocess this daemon spawns fails with ENOENT, silently,
+    # for the rest of its (long) life -- confirmed live (private-downstream-repo, the
+    # daemon's cwd resolved to a deleted `~/.copilot/.agent-mcp.bak-*`
+    # install-backup directory, breaking auth-token minting for every bridge
+    # that had not already cached a token, across every session on the host).
+    # AGENT_MCP_HOME already always exists (ipc/sockio's own socket lives
+    # there) and is never a directory anything else deletes.
+    home_dir = ipc.default_home_dir()
+    home_dir.mkdir(parents=True, exist_ok=True)
+    os.chdir(home_dir)
+
+    server = _serve.Server(
+        socket_path, idle_timeout=args.idle_timeout,
+        passive=args.passive, control_port=args.control_port,
+        control_token=control_token, version=__version__,
+    )
+    mode = "passive (cutover-spawned)" if args.passive else "active"
+    print(f"agent-mcp serve: listening on {socket_path} [{mode}] "
           f"(idle-timeout {args.idle_timeout:g}s; Ctrl-C to stop)", file=sys.stderr)
     try:
         asyncio.run(server.serve_forever())
     except KeyboardInterrupt:
         print("agent-mcp serve: stopped", file=sys.stderr)
     return 0
+
+
+def _cmd_cutover(args: argparse.Namespace) -> int:
+    """``cutover`` -- zero-downtime replace the resident ``serve`` daemon.
+
+    See docs/patterns/graceful-daemon-cutover.md and agent_mcp.cutover's module
+    docstring for the full design; this is a thin CLI dispatch.
+    """
+    from . import cutover as _cutover
+    result = _cutover.run_cutover(
+        health_timeout=args.health_timeout, drain_timeout=args.drain_timeout,
+        force=args.force, require_live_daemon=args.require_live,
+    )
+    if args.json:
+        print(json.dumps(result))
+        return 0 if result.get("ok") else 1
+    if result.get("skipped"):
+        print(f"agent-mcp cutover: skipped ({result['skipped']})")
+        return 0
+    if result.get("ok"):
+        print(f"agent-mcp cutover: committed -> {result.get('data_socket')}")
+        return 0
+    print(f"agent-mcp cutover: {result.get('error') or 'failed'}", file=sys.stderr)
+    return 1
+
 
 
 class _LazyVersionAction(argparse.Action):
@@ -392,6 +698,8 @@ class _LazyVersionAction(argparse.Action):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    _h = "bridge name under ~/"
+    _h += ".agent-mcp/bridges/"  # marketplace-isolation: allow deployed-runtime-diagnostics
     parser = argparse.ArgumentParser(prog="agent-mcp", description=__doc__)
     parser.add_argument("--version", action=_LazyVersionAction)
     parser.add_argument("--log-level", default="info",
@@ -401,7 +709,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bridge = sub.add_parser(
         "bridge", help="run the stdio MCP bridge (multiplexed by default; "
                        "AGENT_MCP_NO_MULTIPLEX for the classic in-process bridge)")
-    p_bridge.add_argument("name", nargs="?", help="bridge name under ~/.agent-mcp/bridges/")
+    p_bridge.add_argument("name", nargs="?", help=_h)
     p_bridge.add_argument("--config", help="explicit path to a bridge config file")
     p_bridge.set_defaults(func=_cmd_bridge)
 
@@ -409,7 +717,7 @@ def build_parser() -> argparse.ArgumentParser:
         "forward", help="thin per-session forwarder: attach to a resident serve "
                         "session-host and pump stdio<->socket (direct-bridge fallback)")
     p_forward.add_argument("name", nargs="?",
-                           help="bridge name under ~/.agent-mcp/bridges/")
+                           help=_h)
     p_forward.add_argument("--config", help="explicit path to a bridge config file")
     p_forward.add_argument("--socket", help="serve socket handle to attach "
                                             "(default: $AGENT_MCP_HOME/serve.sock)")
@@ -419,6 +727,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_validate.add_argument("name", help="bridge name or path to a config file")
     p_validate.set_defaults(func=_cmd_validate)
 
+    p_diagnose = sub.add_parser(
+        "diagnose",
+        help="staged connectivity check for one bridge: config -> auth -> "
+             "transport -> handshake -> catalog, reporting exactly which "
+             "layer failed",
+    )
+    p_diagnose.add_argument("name", help="bridge name or path to a config file")
+    p_diagnose.add_argument("--no-tools", action="store_true",
+                            help="stop after a successful handshake -- skip tools/list")
+    p_diagnose.add_argument("--json", action="store_true",
+                            help="emit a JSON report instead of the staged text progress")
+    p_diagnose.set_defaults(func=_cmd_diagnose)
+
     p_status = sub.add_parser("status", help="show prerequisites and bridges")
     p_status.set_defaults(func=_cmd_status)
 
@@ -427,6 +748,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="emit the plugin-owned installer/readiness contract state as JSON",
     )
     p_readiness.set_defaults(func=_cmd_installer_readiness)
+
+    p_clean_cache = sub.add_parser(
+        "clean-tool-cache",
+        help="detect/purge stale-schema entries in the persisted MCP "
+             "tool-snapshot cache (the runtime itself only age-expires "
+             "entries, never schema-mismatched ones)",
+    )
+    p_clean_cache.add_argument("--apply", action="store_true",
+                               help="actually delete stale entries (default: report only)")
+    p_clean_cache.add_argument("--cache-dir",
+                               help="override the auto-detected mcp-tools cache directory")
+    p_clean_cache.add_argument("--json", action="store_true",
+                               help="emit a JSON summary instead of text")
+    p_clean_cache.add_argument("--quiet", action="store_true",
+                               help="suppress per-file detail (summary only)")
+    p_clean_cache.set_defaults(func=_cmd_clean_tool_cache)
+
+    p_health = sub.add_parser(
+        "mcp-health",
+        help="sweep the CLI's own process logs for known MCP-lifecycle "
+             "warning signals (stale cache rejects, hydration timeouts, "
+             "stuck-pending snapshots, explicit failed-retry counts) and "
+             "snapshot the tool-cache staleness ratio -- read-only, meant "
+             "to be run periodically to track MCP reliability over time",
+    )
+    p_health.add_argument("--since-hours", type=float, default=24.0,
+                          help="only count log lines newer than this many hours ago "
+                               "(0 or negative = scan all available log history, "
+                               "default: 24)")
+    p_health.add_argument("--log-dir",
+                          help="override the auto-detected Copilot CLI log directory")
+    p_health.add_argument("--cache-dir",
+                          help="override the auto-detected mcp-tools cache directory")
+    p_health.add_argument("--json", action="store_true",
+                          help="emit a JSON report instead of text")
+    p_health.add_argument("--quiet", action="store_true",
+                          help="suppress the text report (use with --json)")
+    p_health.set_defaults(func=_cmd_mcp_health)
 
     p_call = sub.add_parser(
         "call", help="one-shot: invoke a single upstream tool and print its result")
@@ -444,6 +803,13 @@ def build_parser() -> argparse.ArgumentParser:
                              "the stateless one-shot path directly")
     p_call.set_defaults(func=_cmd_call)
 
+    p_digest = sub.add_parser(
+        "source-digest",
+        help="print the machine-keyed effective bridge source fingerprint",
+    )
+    p_digest.add_argument("name", help="bridge name or path to a config file")
+    p_digest.set_defaults(func=_cmd_source_digest)
+
     p_serve = sub.add_parser(
         "serve", help="run the resident warmth daemon (keeps upstreams warm)")
     p_serve.add_argument("--socket", help="unix socket path "
@@ -451,7 +817,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--idle-timeout", type=float, default=300.0,
                          help="evict a warm session unused this many seconds "
                               "(default: 300)")
+    p_serve.add_argument("--passive", action="store_true",
+                         help="cutover-spawned: bind --socket without taking "
+                              "the home-wide single-instance lease or "
+                              "touching the fixed client-facing handle "
+                              "(internal seam for `agent-mcp cutover`)")
+    p_serve.add_argument("--control-port", type=int, default=None,
+                         help="bind the lifecycle control listener on this "
+                              "exact port instead of an OS-assigned one "
+                              "(internal seam for `agent-mcp cutover`)")
     p_serve.set_defaults(func=_cmd_serve)
+
+    p_cutover = sub.add_parser(
+        "cutover",
+        help="zero-downtime replace the resident 'serve' daemon (spawn the "
+             "installed version beside the running one, health-gate, flip "
+             "the client-facing handle, drain, retire)")
+    p_cutover.add_argument("--health-timeout", type=float, default=60.0,
+                           help="seconds to wait for the new generation to "
+                                "answer a control-channel ping (default: 60)")
+    p_cutover.add_argument("--drain-timeout", type=float, default=300.0,
+                           help="seconds to wait for the old generation to "
+                                "reach 0 attached sessions before retiring "
+                                "it (default: 300)")
+    p_cutover.add_argument("--force", action="store_true",
+                           help="retire the old generation even if it never "
+                                "finished draining (attached sessions are "
+                                "cut off; only after the timeout)")
+    p_cutover.add_argument("--require-live", action="store_true",
+                           help="installer-safe mode: never start a resident "
+                                "daemon that wasn't already running, and skip "
+                                "as a no-op if one is already on this exact "
+                                "version -- only cuts over a live daemon that "
+                                "is genuinely on a different version. Safe to "
+                                "call unconditionally on every activation")
+    p_cutover.add_argument("--json", action="store_true",
+                           help="print the result as JSON")
+    p_cutover.set_defaults(func=_cmd_cutover)
 
     p_mat = sub.add_parser(
         "materialize", help="project an upstream MCP catalog into a CLI stub fleet")
@@ -462,6 +864,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_mat.add_argument("--windows", action="store_true",
                        help="emit the Windows .ps1/.cmd shim farm instead of symlinks")
     p_mat.add_argument("--quiet", action="store_true", help="suppress the summary")
+    p_mat.add_argument("--no-serve", action="store_true",
+                       help="bypass a running 'agent-mcp serve' daemon and always "
+                            "spawn the upstream cold to enumerate its catalog")
     p_mat.set_defaults(func=_cmd_materialize)
 
     return parser
@@ -474,5 +879,19 @@ def main(argv: list[str] | None = None) -> int:
     return args.func(args)
 
 
+def console_entry() -> None:
+    """Entry point for both the ``python -m agent_mcp`` guard below and the
+    installed ``agent-mcp`` console script (`pyproject.toml`'s
+    ``[project.scripts]``) -- the generated script wrapper calls this
+    directly, bypassing the ``__main__`` guard, so routing both through here
+    is required for the shutdown-crash workaround to cover the installed
+    command too (including ``agent-mcp bridge --config ...``, the MCP-server
+    subprocess Copilot CLI itself spawns and communicates with over stdio).
+    """
+    from ._shutdown_exit import run_and_exit
+
+    run_and_exit(main)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    console_entry()

@@ -38,10 +38,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .config import home_dir
 from .coredelegation import delegate
 
 #: Explicit endpoint override for a wired core (a ``"<transport>:<address>"`` spec).
-CORE_ENDPOINT_ENV = "AGENT_VAULT_CORE_ENDPOINT"
+CORE_ENDPOINT_ENV = "AGENT_VAULT_CORE_ENDPOINT"  # marketplace-isolation: allow env-var-name-declaration
 #: Optional bearer token attached to each delegated request.
 CORE_TOKEN_ENV = "AGENT_VAULT_CORE_TOKEN"  # noqa: S105 -- an env var name, not a secret
 #: Upper bound (seconds) on a single delegated-core round-trip, overridable.
@@ -68,7 +69,7 @@ def core_runtime_dir() -> Path:
     override = os.environ.get("AGENT_VAULT_CORE_RUN_DIR")
     if override:
         return Path(override)
-    return Path.home() / ".agent-vault" / "core"
+    return home_dir() / "core"
 
 
 def _core_timeout(requested: float | None) -> float:

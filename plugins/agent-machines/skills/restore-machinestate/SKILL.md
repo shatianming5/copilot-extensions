@@ -5,7 +5,9 @@ description: >
   requirement packages via the agent-machines engine -- Copilot settings first,
   then repo-local modules. Use this skill to inspect or apply machine state:
   discover which packages apply, plan the change, validate for conflicts, and
-  restore.
+  restore. This is an apply-only workflow for desired state that is already
+  declared; requests to add, change, or standardize configuration across
+  machines belong to agent-machines-setup instead.
   Trigger phrases include:
   - 'restore machine state'
   - 'restore-machinestate'
@@ -13,14 +15,15 @@ description: >
   - 'apply my machine config'
   - 'what requirement packages apply here'
   - 'validate machine state'
-  - 'agent-machines'
+  - 'apply declared agent-machines state'
 ---
 
 # restore-machinestate
 
 The agent-machines runtime converges the current machine to desired state declared in
-**requirement packages** carried by adopted repos under `.agent-machines/all/`
-and `.agent-machines/machines/<machine>/`.
+**requirement packages** carried by adopted repos under
+`.copilot-extensions/agent-machines/all/` and
+`.copilot-extensions/agent-machines/machines/<machine>/`.
 Restore is **machine-scoped**: it reconciles the union of every discovered
 package, not one anchor repo. The CLI itself is standalone; if the project
 registries are absent, discovery returns no packages instead of
@@ -47,8 +50,8 @@ unavailable, surface that failure rather than improvising an install.
    <catalog argv[0]> discover
    ```
    Lists the registered repos that carry gated requirement packages for this
-   machine. The candidate set is `~/.agent-worktrees/projects.yaml`; paths are
-   resolved from `~/.agent-worktrees/repos.yaml` when present.
+   machine. The candidate set is `~/.agent-worktrees/projects.yaml`; paths are <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
+   resolved from `~/.agent-worktrees/repos.yaml` when present. <!-- marketplace-isolation: allow deployed-runtime-diagnostics -->
 
 3. **Plan** (read-only) -- the managed surfaces and a content drift key:
    ```
@@ -73,6 +76,12 @@ unavailable, surface that failure rather than improvising an install.
    surfaces/modules so you review and apply section by section. Surfaces back up
    before writing; a module runs in a dry-run only if it declares `dry_run_args`.
    Restore refuses to run (dry-run or apply) while the validator reports errors.
+
+For maintenance queued because the machine was unreachable, use the companion
+`performing-machine-maintenance` skill. It resolves the explicit user-repository
+queue, claims one item, treats issue prose as advisory, and wraps this
+doctor/plan/validate/restore sequence with revision checks, safety confirmations,
+verification, and evidence-based closure.
 
 ## Dispositions
 

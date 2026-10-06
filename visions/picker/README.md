@@ -5,7 +5,7 @@
   worktree-backed agents of a project.
 - **Scope:** leaf (concrete component; child of the agent-fabric vision)
 - **Status:** Active
-- **Last revised:** 2026-08-26
+- **Last revised:** 2026-09-25
 - **Home:** delivered by the **Installer & Configurator** (the optional worktree-
   and agent-control-plane) — see [installer](../installer/README.md). It is an
   **optional** surface: the plugins provide the in-session tools agents use and
@@ -34,10 +34,10 @@ wrong machine, only to back out. The Picker earns its place by making the
 *decision* cheap even though the *action* is not.
 
 It is also the fabric's **coherent context anchor**. An operator drowning in
-near-identical terminal sessions must be able to glance at the Picker (and the
-multiplexer that wraps it) and know, unambiguously, **which project, which
-machine, and which versions** this surface represents. Confusing one terminal
-session for another is a class of error the Picker exists to abolish.
+near-identical sessions must be able to glance at the Picker and the selected
+session-host surface and know, unambiguously, **which project, which machine,
+which provider, and which versions** this surface represents. Confusing one
+execution context for another is a class of error the Picker exists to abolish.
 
 Finally, the Picker is the fabric's **unified presentation surface**. It is
 delivered by the **Configurator** — the optional worktree/agent control-plane
@@ -81,13 +81,13 @@ prerequisite for the plugins or their agents to function.
   consequential or multi-step. Browsing and acting are visibly different kinds of
   thing.
 - **The context header.** The always-present statement of *where you are*:
-  project, machine/venue, and the versions of the surfaces in play — coordinated
-  with the multiplexer wrapper so the two never disagree about the current
-  context.
+  project, machine/venue, selected session-host provider, and the versions of
+  the surfaces in play — coordinated with the active host so the two never
+  disagree about the current context.
 - **The launch handoff.** The informed transition out of the Picker into a
   worktree's Copilot session: it states plainly *which* worktree, on *which*
-  machine/environment, is about to be entered, and that a session will be spun
-  up.
+  machine/environment and through which provider, is about to be entered, and
+  that a session will be created or resumed.
 - **The programmatic substrate.** Everything the Picker shows is obtainable from
   the underlying CLI's machine-readable (`--json`) verbs. The Picker is a faithful
   *renderer* of that data, not a separate source of truth.
@@ -124,9 +124,58 @@ an afterthought.
 
 ### explicit-launch-target
 Whenever the Picker is about to kick an agent off into a worktree, it makes the
-**target unambiguous**: which worktree, on which machine and environment, and the
-fact that a session will be created or resumed. The operator never launches
-unsure of where the agent will land.
+**target unambiguous**: which worktree, on which machine and environment, which
+session-host provider owns the interaction, and whether a session will be
+created or resumed. The operator never launches unsure of where or how the
+agent will run.
+
+### detachable-launch-into-a-new-window
+Opening, resuming, or creating a worktree session does not have to consume the
+Picker's own window. The operator can choose to launch the target **detached
+into a new terminal window**, leaving the Picker itself running and ready to
+launch the next one — so recovering a whole fleet after a lost multiplexer
+server means stepping down the list and opening each into its own window,
+never closing and reopening the Picker per worktree.
+
+### worktree-search-and-filter
+A lightweight, keyboard-summoned search narrows the worktree list by substring
+match across every identifying facet an operator actually recognizes a
+worktree by — its short id, codename, title, current activity, and claim set —
+so a large fleet stays navigable by typing a fragment instead of scanning
+every row by age. Clearing the filter and returning to full keyboard
+navigation of the list are both a single, obvious keystroke away.
+
+### fleet-recovery-relaunch
+When the underlying session-host process itself dies or is replaced — a
+terminal multiplexer server, say — every execution leg it hosted is lost
+together, not one worktree's session quietly ending on its own. The **provider
+that owns that host** is the only party that can honestly know this happened:
+it publishes a bounded, attributable observation naming its own host instance as
+ended and listing the execution legs it was hosting
+(`§Concepts/provider-observation-ingestion` /
+`§Behaviors/observation-loss-degrades-honestly` on the agent-worktrees vision).
+That observation stays honest even across the provider's own full restart — not
+only a graceful one — because the provider keeps a **durable liveness snapshot**
+of what it was hosting, independent of any one process's memory
+(`§Concepts/Durable liveness snapshot` /
+`§Features/recoverable-across-full-restart` on the session-hosting vision); the
+Picker never needs to distinguish
+"the host process died" from "the whole machine restarted," since both surface
+through the identical provider-published signal. The Picker never infers
+correlated loss itself from worktree-side staleness alone — that would cross
+the render-derive-not-own boundary and requires guessing at causation the
+durable worktree record was never meant to carry. It
+only **renders** that provider-supplied signal and offers a single, explicit
+**bulk-resume** action gated on it: reopen every named worktree's current head,
+in one confirmed gesture, instead of making the operator resume each one by
+hand. This extends the ordinary single-worktree resume the Picker already
+performs — a batched invocation of it, never a new resume mechanism. Worktrees
+resuming near-simultaneously **without** such a provider-published host-loss
+observation (the operator closing several terminals deliberately, say) is not
+this pattern. The Picker offers the bulk action only on the explicit
+provider-published signal, never on its own inference, so genuine correlated
+host loss is never confused with ordinary independent resumes, and the bulk
+action is never presented as a routine choice.
 
 ### consequential-vs-browsing-clarity
 The Picker visibly distinguishes **browsing** (free, reversible, no side effects)
@@ -135,10 +184,10 @@ state). Consequential actions read as consequential; navigation and inspection
 never masquerade as them.
 
 ### coherent-context
-The Picker, together with the multiplexer that wraps it, coherently represents
-the current context — project, target machine/venue, and the app/plugin versions
-in play — so an operator with many similar terminal sessions open can always tell
-*which one this is* and *what it targets*.
+The Picker and the active session host coherently represent the current context
+— project, target machine/venue, provider, and app/plugin versions — so an
+operator with many similar sessions can always tell *which one this is*, *what
+it targets*, and *which surface owns it*.
 
 ### at-a-glance-multi-machine
 The fleet across **all** the fabric's machines is legible from a single Picker,
@@ -261,6 +310,35 @@ step" contract applied at both levels: onboarding for a missing provider,
 provider-owned guidance for missing resources. The Picker never presents a
 promise it cannot source; it presents the path to earning it.
 
+### responsive-by-budget
+Keyboard-first navigation (`§keyboard-first-navigation`) is a promise, not just
+an input mapping — the Manager commits to concrete latency budgets so that
+promise holds under real fleet load, not only on an idle demo machine:
+
+- **A keypress is acknowledged in well under 100ms.** Navigation, selection,
+  and typing into an open input never wait on a network/subprocess round trip
+  — the render/input loop (one asyncio event loop, per
+  `§auditable-testable-rendering`) is never blocked by I/O. Any data a
+  keystroke's visible feedback does not strictly need yet is fetched off that
+  loop and painted in when it arrives, not before.
+- **The Manager boots to its first interactive frame in well under 2s.**
+  Startup cost scales with what's installed, not with fleet size or a cold
+  provider's own startup cost (`§graceful-capability-scaling`'s scaling
+  promise applies to boot latency too, not only to feature surface).
+- **An action menu opens in well under 1s.** Opening a row's action menu
+  reflects cached/derived state immediately; an authoritative recheck may
+  follow asynchronously but never gates the menu's appearance.
+
+These are budgets, not aspirations: a change that is merely "not slower than
+before" can still violate them. A synchronous CLI/subprocess round trip
+reachable from the render tick or a key/menu handler is a budget violation by
+construction, regardless of how infrequently it runs — see
+`§live-not-snapshot` and `§render-derive-not-own` for why the data *source*
+matters here too, not only the thread it runs on: a slow one-shot CLI call
+moved off-thread still risks painting stale data persistently if nothing
+replaces it with a live channel. Tracked by the
+`picker-performance-and-responsiveness` effort.
+
 ### renderable-and-assertable-headless
 The Picker can be instantiated **headlessly** — no live terminal, no human, no
 real fleet — fed a known context (its `--json`-shaped inputs), driven to a target
@@ -277,9 +355,9 @@ regression is something a test can catch before an operator does.
 - **Not the editor or the agent session.** The Picker is the front door and the
   fleet console; it **hands off** to the Copilot session and does not replace the
   operator's interactive working surface once inside a worktree.
-- **Not the multiplexer.** The Picker *coordinates context with* the mux wrapper
-  but is a distinct surface with a distinct job; it does not own session
-  multiplexing.
+- **Not a session host.** The Picker selects and invokes compatible providers,
+  then reflects their identity and status. It does not own terminal
+  multiplexing, Copilot processes, ACP sessions, SDK runtimes, or App windows.
 - **Not in-process with the engine — it sits *on top of* the CLI.** The Picker runs
   as a **separate process** that reaches each layer's engine **only by invoking its
   machine-readable (`--json`) CLI verbs**, never by importing it in-process. All the
@@ -318,6 +396,22 @@ regression is something a test can catch before an operator does.
   Configurator** is the optional worktree/agent control-plane that **delivers and
   keeps this Picker current** (out-of-band, self-updating). The Picker is an
   optional surface of that app; the plugins are self-sufficient without it.
+- Execution-host sibling: [session-hosting](../session-hosting/README.md) — the
+  provider-neutral launch/join/resume/cutover boundary the Picker drives but
+  does not implement.
+- Sibling: [venue-pivots-ux](../venue-pivots-ux/README.md) — overhauling the
+  already-registered Codespaces and Containers pivots for presentation
+  consistency and information fidelity (Containers brought to Codespaces'
+  columnar/action fidelity, a dropped Codespaces subtitle wired back in, a
+  new agent-bridge live-session join, Open/New-venue flows, and the inverse
+  worktree-row view of the remote workers a worktree supervises), the same
+  kind of pivot-specific overhaul `plugins/agent-dispatch/tasks-pane-ux` did
+  for Tasks.
+- Performance budgets tracked by:
+  `efforts/active/picker-performance-and-responsiveness` (the numeric budgets
+  in `§responsive-by-budget` above) and
+  `efforts/active/pivot-streaming-transport` (the live-channel work
+  `§live-not-snapshot` and `§responsive-by-budget` both depend on).
 - CodeSpaces-pivot data owner: [agent-codespaces](../plugins/agent-codespaces/README.md)
   — the Picker's **CodeSpaces** pivot renders that venue's pool membership,
   per-venue state (in-use / idle / clean / stale), allocation, and budget
@@ -399,3 +493,46 @@ regression is something a test can catch before an operator does.
   through the same contract as every other operational pivot, rather than
   remaining a privileged Manager implementation. The Manager retains only the
   generic shell, interaction primitives, and provider-free onboarding floor.
+- **2026-09-04** — Generalized launch and context coherence from one
+  multiplexer-backed terminal to a selected session-host provider. The Picker
+  remains the provider-neutral decision and presentation surface; CLI/mux, ACP,
+  SDK, App, and third-party hosts own their own execution mechanics.
+- **2026-09-18** — Added §Features/*fleet-recovery-relaunch*: a bulk-resume
+  action for when a session-host provider loses many worktrees' execution legs
+  at once (the host process itself died or was replaced), rather than one
+  worktree's session ending on its own. Prompted by a real facility incident —
+  an operator's terminal multiplexer was lost machine-wide, taking down eight
+  concurrently active worktree sessions at once, and every one of them had to
+  be resumed by hand because no bulk recovery affordance existed. Deliberately
+  scoped as a batched invocation of the existing single-worktree resume, gated
+  on the owning session-host provider itself publishing an explicit host-loss
+  observation — never on the Picker inferring correlation from worktree-side
+  staleness, which would cross the render-derive-not-own boundary (refined
+  after initial review flagged that gap). Not offered for ordinary, unrelated
+  single-session endings that merely land near each other in time.
+- **2026-09-18** — Cross-linked *fleet-recovery-relaunch* to the
+  session-hosting vision's new *Durable liveness snapshot* /
+  *recoverable-across-full-restart*: a direct operator follow-up observed that
+  the provider-published host-loss observation this feature depends on is only
+  honest if the provider can still name what it was hosting after its own
+  restart — which requires the provider to persist that record durably, not
+  just detect loss while some part of it happens to still be running. That
+  guarantee now lives on session-hosting, generalizing recovery from "the mux
+  process died" to "the machine it ran on rebooted entirely."
+- **2026-10-04** — Added `§Behaviors/responsive-by-budget`: concrete numeric
+  latency budgets (keypress <~100ms, boot <~2s, action-menu-open <~1s) for
+  what `keyboard-first-navigation` and `live-not-snapshot` already promised
+  qualitatively. Prompted by a live operator incident (py-spy + process-census
+  diagnosis on a loaded machine) that traced a near-total UI freeze to a
+  single, previously-undetected regression: the render-tick's update-indicator
+  poll (`production_picker/picker_tui/engine_runtime.py`'s
+  `_poll_update_state`) called a ~2-2.5s synchronous CLI subprocess round trip
+  directly on Textual's render/input thread, roughly twice a second — so the
+  loop was blocked almost continuously despite Phase 3c of
+  `worktree-manager-control-plane` already having moved every *other* known
+  blocking call off that thread. Budgets, not just "move the one bug off-
+  thread," because a regression of this exact shape (a synchronous call
+  quietly reappearing on the hot path) is otherwise invisible until an
+  operator notices the freeze — tracked going forward by the
+  `picker-performance-and-responsiveness` effort, which closed that specific
+  regression as its first phase and owns measuring/holding the budgets here.

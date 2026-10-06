@@ -62,6 +62,20 @@ class TestLiveMessageQueue:
         assert pending[0]["kind"] == "prompt"
         assert pending[1]["kind"] == "status-check"
 
+    def test_enqueue_carries_delivery_default_queue(self, tmp_db: Database) -> None:
+        now = time.time()
+        tmp_db.enqueue_live_message("s", "alice", "do it", now)  # default
+        tmp_db.enqueue_live_message("s", "bob", "now", now, delivery="interrupt")
+        pending = tmp_db.list_pending_live_messages("s")
+        assert pending[0]["delivery"] == "queue"
+        assert pending[1]["delivery"] == "interrupt"
+
+    def test_enqueue_rejects_unknown_delivery(self, tmp_db: Database) -> None:
+        with pytest.raises(ValueError, match="unsupported live-message delivery"):
+            tmp_db.enqueue_live_message(
+                "s", "alice", "do it", time.time(), delivery="fast"
+            )
+
     def test_ack_empty_ids_is_noop(self, tmp_db: Database) -> None:
         assert tmp_db.ack_live_messages("s", [], now=time.time()) == 0
 
@@ -150,6 +164,69 @@ def test_migration_v8_to_v9_adds_kind(tmp_path: Path) -> None:
         db.close()
 
 
+def test_migration_v21_to_v22_adds_delivery(tmp_path: Path) -> None:
+    """A pre-v22 database bumps to v22 with live_messages.delivery."""
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);"
+        "INSERT INTO schema_version (version) VALUES (21);"
+        "CREATE TABLE live_messages ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,"
+        " sender TEXT NOT NULL, body TEXT NOT NULL, reply_to TEXT,"
+        " kind TEXT NOT NULL DEFAULT 'prompt', idempotency_key TEXT,"
+        " created_at REAL NOT NULL, delivered_at REAL);"
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(db_path)
+    try:
+        ver = db.execute_read("SELECT version FROM schema_version")[0]["version"]
+        assert ver == SCHEMA_VERSION
+        db.execute_write(
+            "INSERT INTO live_messages (session_id, sender, body, created_at) "
+            "VALUES ('s', 'old', 'legacy', ?)", (time.time(),)
+        )
+        mid = db.enqueue_live_message(
+            "s", "alice", "now", time.time(), delivery="interrupt"
+        )
+        assert mid > 0
+        pending = db.list_pending_live_messages("s")
+        assert pending[0]["delivery"] == "queue"
+        assert pending[1]["delivery"] == "interrupt"
+    finally:
+        db.close()
+
+
+def test_migration_v22_to_v23_adds_the_control_handshake(tmp_path: Path) -> None:
+    """A v22 database bumps to v23 with live_messages.claimed_at/outcome."""
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);"
+        "INSERT INTO schema_version (version) VALUES (22);"
+        "CREATE TABLE live_messages ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,"
+        " sender TEXT NOT NULL, body TEXT NOT NULL, reply_to TEXT,"
+        " kind TEXT NOT NULL DEFAULT 'prompt', delivery TEXT NOT NULL DEFAULT 'queue',"
+        " idempotency_key TEXT, created_at REAL NOT NULL, delivered_at REAL);"
+        "INSERT INTO live_messages (session_id, sender, body, kind, created_at)"
+        " VALUES ('s', 'op', 'plan', 'control:set-mode', 1.0);"
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(db_path)
+    try:
+        ver = db.execute_read("SELECT version FROM schema_version")[0]["version"]
+        assert ver == SCHEMA_VERSION
+        assert db.live_control_state("s", 1) == {"claimed_at": None, "outcome": None}
+        assert [r["id"] for r in db.claim_live_controls("s", time.time(), 1e12)] == [1]
+    finally:
+        db.close()
+
+
 # -- Route layer ------------------------------------------------------------
 
 
@@ -207,6 +284,33 @@ def test_message_roundtrip_poll_and_ack(client: TestClient) -> None:
     ).json()["acked"] == 0
 
 
+def test_ack_marks_delivered_message_as_running_turn(
+    client: TestClient, tmp_db: Database
+) -> None:
+    _register(client)
+    # Seed the state observed before a peer steers an idle session.
+    tmp_db.update_live_turn_state(
+        "cli-1", turn_state="idle", last_activity_at=time.time()
+    )
+    assert client.get("/api/v1/live-sessions/cli-1").json()["turn_state"] == "idle"
+
+    sent = client.post(
+        "/api/v1/live-sessions/cli-1/messages",
+        json={"sender": "peer", "body": "continue", "delivery": "steer"},
+    )
+    assert sent.status_code == 200, sent.text
+    mid = sent.json()["message_id"]
+
+    acked = client.post(
+        "/api/v1/live-sessions/cli-1/messages/ack", json={"ids": [mid]}
+    )
+    assert acked.status_code == 200, acked.text
+    assert acked.json()["acked"] == 1
+    info = client.get("/api/v1/live-sessions/cli-1").json()
+    assert info["turn_state"] == "running"
+    assert info["liveness"] == "active"
+
+
 def test_message_post_is_idempotent_with_producer_key(
     client: TestClient,
 ) -> None:
@@ -256,6 +360,33 @@ def test_message_post_rejects_idempotency_key_reuse_for_different_request(
     assert "already bound" in conflict.json()["detail"]
 
 
+def test_message_post_idempotency_key_compares_delivery(
+    client: TestClient,
+) -> None:
+    _register(client)
+    first = client.post(
+        "/api/v1/live-sessions/cli-1/messages",
+        json={
+            "sender": "worker",
+            "body": "resume",
+            "delivery": "queue",
+            "idempotency_key": "wake:task-1:2:1",
+        },
+    )
+    conflict = client.post(
+        "/api/v1/live-sessions/cli-1/messages",
+        json={
+            "sender": "worker",
+            "body": "resume",
+            "delivery": "steer",
+            "idempotency_key": "wake:task-1:2:1",
+        },
+    )
+    assert first.status_code == 200
+    assert conflict.status_code == 409
+    assert "already bound" in conflict.json()["detail"]
+
+
 def test_poll_and_ack_require_registration(client: TestClient) -> None:
     assert client.get("/api/v1/live-sessions/ghost/messages").status_code == 404
     assert client.post(
@@ -284,6 +415,35 @@ def test_message_carries_kind_over_route(client: TestClient) -> None:
     )
     listed = client.get("/api/v1/live-sessions/cli-1/messages").json()["messages"]
     assert listed[0]["kind"] == "status-check"
+
+
+def test_message_carries_delivery_over_route(client: TestClient) -> None:
+    _register(client)
+    client.post(
+        "/api/v1/live-sessions/cli-1/messages",
+        json={"sender": "peer", "body": "now", "delivery": "interrupt"},
+    )
+    listed = client.get("/api/v1/live-sessions/cli-1/messages").json()["messages"]
+    assert listed[0]["delivery"] == "interrupt"
+
+
+def test_message_delivery_defaults_to_steer_over_route(client: TestClient) -> None:
+    _register(client)
+    client.post(
+        "/api/v1/live-sessions/cli-1/messages",
+        json={"sender": "peer", "body": "do the thing"},
+    )
+    listed = client.get("/api/v1/live-sessions/cli-1/messages").json()["messages"]
+    assert listed[0]["delivery"] == "steer"
+
+
+def test_message_rejects_unknown_delivery_over_route(client: TestClient) -> None:
+    _register(client)
+    r = client.post(
+        "/api/v1/live-sessions/cli-1/messages",
+        json={"sender": "peer", "body": "do it", "delivery": "fast"},
+    )
+    assert r.status_code == 422
 
 
 def test_message_kind_defaults_to_prompt_over_route(client: TestClient) -> None:
@@ -394,3 +554,187 @@ def test_post_fresh_registration_still_delivers(client: TestClient) -> None:
     )
     assert r.status_code == 200
     assert r.json()["message_id"] > 0
+
+
+# -- Session controls (mode changes) ---------------------------------------
+
+
+def _control(db: Database, mode: str = "autopilot", *, now: float | None = None) -> int:
+    cid, reason = db.enqueue_live_message_if_fresh(
+        "cli-1", sender="op", body=mode, now=now or time.time(), kind="control:set-mode")
+    assert reason is None and cid is not None
+    return cid
+
+
+def _outcome(db: Database, cid: int) -> str | None:
+    return (db.live_control_state("cli-1", cid) or {}).get("outcome")
+
+
+def test_an_untaken_mode_change_is_withdrawn_and_never_applies(client: TestClient, monkeypatch) -> None:
+    _register(client)
+    monkeypatch.setattr(live_sessions, "MODE_POLL_SECONDS", 0.01)
+    r = client.post("/api/v1/live-sessions/cli-1/mode", json={"mode": "autopilot", "wait_timeout": 1})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert (out["applied"], out["state"], out["mode"]) == (False, "withdrawn", "autopilot")
+    assert "predate" in out["detail"]
+    # Withdrawn: a later poll never hands it out, and it's never a message.
+    assert client.get("/api/v1/live-sessions/cli-1/controls").json()["messages"] == []
+    assert client.get("/api/v1/live-sessions/cli-1/messages").json()["messages"] == []
+
+
+def test_controls_are_claimed_once_and_apart_from_messages(tmp_db: Database, client: TestClient) -> None:
+    _register(client)
+    client.post("/api/v1/live-sessions/cli-1/messages", json={"sender": "a", "body": "hi"})
+    cid = _control(tmp_db)
+    msgs = client.get("/api/v1/live-sessions/cli-1/messages").json()["messages"]
+    ctrls = client.get("/api/v1/live-sessions/cli-1/controls").json()["messages"]
+    assert [m["body"] for m in msgs] == ["hi"]  # an older extension never sees a control
+    assert [(c["id"], c["kind"], c["body"]) for c in ctrls] == [(cid, "control:set-mode", "autopilot")]
+    assert client.get("/api/v1/live-sessions/cli-1/controls").json()["messages"] == []  # claimed
+    # Claimed: its requester's timeout can no longer withdraw it.
+    assert not tmp_db.withdraw_live_control("cli-1", cid, time.time())
+    acked = client.post("/api/v1/live-sessions/cli-1/controls/ack", json={"ids": [cid]}).json()
+    assert acked["acked"] == 1 and _outcome(tmp_db, cid) == "applied"
+    # A control ack doesn't mark the session busy (a mode change starts no turn).
+    assert (tmp_db.get_live_session("cli-1") or {}).get("turn_state") != "running"
+
+
+def test_message_and_control_acks_never_cross(tmp_db: Database, client: TestClient) -> None:
+    _register(client)
+    mid = client.post("/api/v1/live-sessions/cli-1/messages",
+                      json={"sender": "a", "body": "hi"}).json()["message_id"]
+    cid = _control(tmp_db)
+    client.get("/api/v1/live-sessions/cli-1/controls")
+    assert client.post("/api/v1/live-sessions/cli-1/messages/ack", json={"ids": [cid]}).json()["acked"] == 0
+    assert _outcome(tmp_db, cid) is None
+    assert client.post("/api/v1/live-sessions/cli-1/controls/ack", json={"ids": [mid]}).json()["acked"] == 0
+    assert [m["id"] for m in client.get("/api/v1/live-sessions/cli-1/messages").json()["messages"]] == [mid]
+
+
+def test_an_unclaimed_control_cant_be_acked(tmp_db: Database, client: TestClient) -> None:
+    _register(client)
+    cid = _control(tmp_db)
+    assert client.post("/api/v1/live-sessions/cli-1/controls/ack", json={"ids": [cid]}).json()["acked"] == 0
+    assert tmp_db.withdraw_live_control("cli-1", cid, time.time())
+
+
+def test_a_control_whose_requester_is_gone_expires_unapplied(tmp_db: Database, client: TestClient) -> None:
+    _register(client)
+    old = _control(tmp_db, now=time.time() - live_sessions.CONTROL_MAX_AGE_SECONDS - 5)
+    fresh = _control(tmp_db, "plan")
+    ctrls = client.get("/api/v1/live-sessions/cli-1/controls").json()["messages"]
+    assert [c["id"] for c in ctrls] == [fresh]
+    assert _outcome(tmp_db, old) == "expired"
+
+
+def _claim_then(tmp_db: Database, applied: bool | None):
+    """Stand in for an extension that claims the control, then reports."""
+    real = tmp_db.withdraw_live_control
+
+    def withdraw(sid, cid, now):
+        tmp_db.claim_live_controls(sid, now, 3600)
+        if applied is not None:
+            tmp_db.ack_live_messages(sid, [cid], now, controls=True,
+                                     outcome="applied" if applied else "rejected")
+        return real(sid, cid, now)
+    return withdraw
+
+
+@pytest.mark.parametrize("applied, state", [(True, "applied"), (False, "rejected"), (None, "in_flight")])
+def test_a_claimed_control_reports_its_real_outcome(
+    client: TestClient, tmp_db: Database, monkeypatch, applied, state
+) -> None:
+    _register(client)
+    monkeypatch.setattr(live_sessions, "MODE_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(live_sessions, "CLAIMED_CONTROL_GRACE_SECONDS", 0.05)
+    # The extension claims it right as the requester's wait ends.
+    monkeypatch.setattr(tmp_db, "withdraw_live_control", _claim_then(tmp_db, applied))
+    out = client.post("/api/v1/live-sessions/cli-1/mode", json={"mode": "plan", "wait_timeout": 1}).json()
+    assert (out["applied"], out["state"]) == (applied, state)
+
+
+def test_an_applied_mode_change_reports_applied(client: TestClient, tmp_db: Database, monkeypatch) -> None:
+    _register(client)
+    monkeypatch.setattr(tmp_db, "live_control_state", lambda sid, cid: {"outcome": "applied"})
+    r = client.post("/api/v1/live-sessions/cli-1/mode", json={"mode": "interactive"})
+    assert (r.json()["applied"], r.json()["state"]) == (True, "applied")
+
+
+def test_mode_changes_are_validated_and_controls_reserved(client: TestClient) -> None:
+    _register(client)
+    assert client.post("/api/v1/live-sessions/cli-1/mode", json={"mode": "yolo"}).status_code == 422
+    assert client.post("/api/v1/live-sessions/ghost/mode", json={"mode": "plan"}).status_code == 404
+    r = client.post("/api/v1/live-sessions/cli-1/messages",
+                    json={"sender": "a", "body": "autopilot", "kind": "control:set-mode"})
+    assert r.status_code == 400
+
+
+# -- a session-id change (resume) keeps one handle, log and control path -----
+
+
+def _rollover_client(tmp_db: Database):
+    from agent_bridge.live_representation import LiveEventStore
+
+    app = FastAPI()
+    app.state.db = tmp_db
+    app.state.live_event_store = LiveEventStore()
+    app.include_router(live_sessions.router)
+    tmp_db.create_cli_mode_reservation("wt-R", now=time.time())
+    c = TestClient(app)
+    assert c.post("/api/v1/live-sessions", json={
+        "session_id": "placeholder", "worktree_id": "wt-R", "machine": "host-1", "pid": 4242}).status_code == 200
+    return c, app.state.live_event_store
+
+
+def _say(c: TestClient, sid: str, text: str, eid: str) -> None:
+    r = c.post(f"/api/v1/live-sessions/{sid}/events", json={"events": [
+        {"type": "assistant.message", "data": {"content": text}, "id": eid}]})
+    assert r.status_code == 200, r.text
+    assert r.json()["session_id"] == "resumed" or sid == "placeholder"
+
+
+def test_one_represented_log_spans_a_session_id_change(tmp_db: Database) -> None:
+    c, store = _rollover_client(tmp_db)
+    _say(c, "placeholder", "before", "e1")
+    waited_on = store.get("placeholder")  # what a waited send / open stream holds
+    assert c.post("/api/v1/live-sessions", json={
+        "session_id": "resumed", "worktree_id": "wt-R", "machine": "host-1", "pid": 4242}).status_code == 200
+    _say(c, "resumed", "reply", "e2")
+    _say(c, "placeholder", "late, via the old handle", "e3")
+    assert store.get("resumed") is waited_on and store.get("placeholder") is waited_on
+    texts = [e.data.get("text") for e in waited_on.get_events(0)]
+    assert "reply" in str(texts) and "late, via the old handle" in str(texts)
+    assert tmp_db.get_live_session_exact("placeholder") is None
+
+
+@pytest.mark.parametrize("applied", [True, False])
+def test_a_mode_change_follows_a_session_id_change_while_waiting(
+    tmp_db: Database, monkeypatch, applied: bool
+) -> None:
+    c, _store = _rollover_client(tmp_db)
+    monkeypatch.setattr(live_sessions, "MODE_POLL_SECONDS", 0.01)
+    real = tmp_db.live_control_state
+    state = {"rolled": False}
+
+    def control_state(sid, cid):
+        if not state["rolled"]:
+            state["rolled"] = True
+            assert tmp_db.register_live_session(
+                "resumed", machine="host-1", cwd=None, worktree_id="wt-R", repo=None,
+                branch=None, pid=4242, role=None, now=time.time()) == "live"
+            if applied:
+                tmp_db.claim_live_controls("resumed", time.time(), 3600)
+                tmp_db.ack_live_messages("resumed", [cid], time.time(), controls=True,
+                                         outcome="applied")
+        return real(sid, cid)
+
+    monkeypatch.setattr(tmp_db, "live_control_state", control_state)
+    out = c.post("/api/v1/live-sessions/placeholder/mode",
+                 json={"mode": "plan", "wait_timeout": 1}).json()
+    if applied:
+        assert (out["state"], out["session_id"]) == ("applied", "resumed")
+    else:
+        # Withdrawn under the new id, so it can never apply later.
+        assert out["state"] == "withdrawn"
+        assert c.get("/api/v1/live-sessions/resumed/controls").json()["messages"] == []

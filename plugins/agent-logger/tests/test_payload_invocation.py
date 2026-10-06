@@ -34,19 +34,48 @@ def test_payload_manifest_covers_every_runtime_command() -> None:
         (PLUGIN / "payload-invocation.json").read_text(encoding="utf-8")
     )
 
+    assert manifest["version"] == 2
     assert manifest["plugin"] == "agent-logger"
+    assert manifest["legacyRuntimeRoot"] == ".agent-logger"
+    assert manifest["installationContext"] == "required"
+    assert manifest["payloadRootEnv"] == "AGENT_LOGGER_PAYLOAD_ROOT"
+    assert manifest["payloadDispatcher"] == {
+        "posix": "scripts/runtime-gate.sh",
+        "windows": "scripts/runtime-gate.ps1",
+    }
     assert {command["command"] for command in manifest["commands"]} == EXPECTED_COMMANDS
+
+    posix = (PLUGIN / "bin" / "collate-session").read_text(encoding="utf-8")
+    powershell = (PLUGIN / "bin" / "collate-session.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "runtime-gate.sh" in posix
+    assert "payload-dir" not in posix
+    assert 'COPILOT_EXTENSIONS_PAYLOAD_MODULE="agent_logger.segmenter.collate"' in posix
+    assert r"runtime-gate.ps1" in powershell
+    assert "payload-dir" not in powershell
+    assert (
+        "$env:COPILOT_EXTENSIONS_PAYLOAD_MODULE = 'agent_logger.segmenter.collate'"
+        in powershell
+    )
 
 
 def test_session_start_emits_payload_catalog_after_bootstrap() -> None:
     hooks = json.loads((PLUGIN / "hooks.json").read_text(encoding="utf-8"))
     session_hooks = hooks["hooks"]["sessionStart"]
+    expected_order = [
+        "bootstrap-check",
+        "register-cold-store-provider",
+        "write-session-guidance",
+    ]
 
-    assert len(session_hooks) == 2
-    for shell in ("bash", "powershell"):
-        assert "bootstrap-check" in session_hooks[0][shell]
-        assert "emit-command-catalog" in session_hooks[1][shell]
-        for hook in session_hooks:
+    assert len(session_hooks) == 3
+    assert [
+        next(name for name in expected_order if name in hook["bash"])
+        for hook in session_hooks
+    ] == expected_order
+    for hook in session_hooks:
+        for shell in ("bash", "powershell"):
             assert "COPILOT_PLUGIN_ROOT" in hook[shell]
             assert "'{}'" in hook[shell]
 

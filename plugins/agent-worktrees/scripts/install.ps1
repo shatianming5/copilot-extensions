@@ -19,14 +19,22 @@
     Lifecycle action to perform.
 
 .PARAMETER ProjectName
-    Project name (e.g. 'my-project'). Defaults to: WORKTREE_PROJECT env var,
-    then inferred from existing config, then basename of CWD repo.
+    Project name (e.g. 'my-project'). Defaults to an existing config matching
+    the basename of the current directory.
+
+.PARAMETER InstallDir
+    Exact runtime installation root. Structured context callers must supply the
+    root selected by the installation-context resolver.
 
 .PARAMETER RemoveConfig
     On uninstall: also delete project config and worktree session metadata.
 
 .PARAMETER Force
     Overwrite config without drift confirmation.
+
+.PARAMETER ZeroDowntime
+    Deprecated no-op. Update now auto-detects and cuts over a live
+    status-monitor whenever possible.
 #>
 [CmdletBinding()]
 param(
@@ -36,12 +44,335 @@ param(
 
     [string]$ProjectName,
 
+    [string]$InstallDir,
     [switch]$RemoveConfig,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$ZeroDowntime
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+function ConvertTo-NativeArgument {
+    param([AllowEmptyString()][string]$Value)
+
+    if ($null -eq $Value) { $Value = '' }
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+
+    $builder = [Text.StringBuilder]::new()
+    [void]$builder.Append('"')
+    $backslashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') {
+            $backslashes += 1
+            continue
+        }
+        if ($character -eq '"') {
+            [void]$builder.Append(('\' * (($backslashes * 2) + 1)))
+            [void]$builder.Append('"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes) {
+            [void]$builder.Append(('\' * $backslashes))
+            $backslashes = 0
+        }
+        [void]$builder.Append($character)
+    }
+    if ($backslashes) {
+        [void]$builder.Append(('\' * ($backslashes * 2)))
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+# === install-contract:test-persistent-environment -- keep byte-identical across installers ===
+function Get-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    return [Environment]::GetEnvironmentVariable($Name, $effectiveTarget)
+}
+
+function Set-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [AllowNull()][string]$Value,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    [Environment]::SetEnvironmentVariable($Name, $Value, $effectiveTarget)
+}
+# === end install-contract:test-persistent-environment ===
+
+$InstallDirSpecified = [bool]$InstallDir
+if ($InstallDir) {
+    $InstallDir = [IO.Path]::GetFullPath($InstallDir)
+    $PSBoundParameters['InstallDir'] = $InstallDir
+} else {
+    $InstallDir = Join-Path $env:USERPROFILE '.agent-worktrees'
+}
+$ContextualInstall = [bool]$env:COPILOT_EXTENSIONS_CONTEXT
+if ($ContextualInstall) {
+    if ($Action -notin @('install', 'update', 'status')) {
+        Write-Error "Structured installation context does not support action '$Action'."
+        exit 1
+    }
+    if (-not $InstallDirSpecified) {
+        Write-Error 'Structured installation context requires -InstallDir.'
+        exit 1
+    }
+    $contextPath = [IO.Path]::GetFullPath($env:COPILOT_EXTENSIONS_CONTEXT)
+    if (-not (Test-Path -LiteralPath $contextPath -PathType Leaf)) {
+        Write-Error 'Structured installation context is unavailable.'
+        exit 1
+    }
+    $contextPayload = if ($env:COPILOT_PLUGIN_STAGED_FROM) {
+        [IO.Path]::GetFullPath($env:COPILOT_PLUGIN_STAGED_FROM)
+    } else {
+        (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+    }
+    $contextHelper = Join-Path $PSScriptRoot 'installation-context\installation-context.ps1'
+    if (-not (Test-Path -LiteralPath $contextHelper -PathType Leaf)) {
+        Write-Error 'Installation-context validator is unavailable.'
+        exit 1
+    }
+    $contextDurableHome = $contextPath
+    1..5 | ForEach-Object {
+        $contextDurableHome = Split-Path -Parent $contextDurableHome
+    }
+    $hostExe = (Get-Process -Id $PID).Path
+    $validatedJson = & $hostExe -NoProfile -ExecutionPolicy Bypass -File $contextHelper validate `
+        -Context $contextPath `
+        -DurableHome $contextDurableHome `
+        -ExpectedPluginId 'agent-worktrees' `
+        -ExpectedPayloadRoot $contextPayload
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    try {
+        $validatedContext = $validatedJson | ConvertFrom-Json
+        $validatedRoot = (Resolve-Path -LiteralPath (
+            [IO.Path]::GetFullPath([string]$validatedContext.pluginRoot)
+        )).Path
+        $InstallDir = (Resolve-Path -LiteralPath $InstallDir).Path
+    } catch {
+        Write-Error 'Installation-context validator returned invalid output.'
+        exit 1
+    }
+    if ($validatedRoot -ne $InstallDir) {
+        Write-Error '-InstallDir does not match validated installation context.'
+        exit 1
+    }
+    $contextStatusArgs = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $contextHelper,
+        'status',
+        '-PayloadRoot', $contextPayload,
+        '-PluginId', 'agent-worktrees',
+        '-LegacyRoot', (Join-Path $env:USERPROFILE '.agent-worktrees'),
+        '-Context', $contextPath,
+        '-DurableHome', $contextDurableHome
+    )
+    $contextStatusJson = @(& $hostExe @contextStatusArgs)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error 'Installation governance could not be resolved.'
+        exit 1
+    }
+    try {
+        $contextStatus = ($contextStatusJson -join "`n") | ConvertFrom-Json
+    } catch {
+        Write-Error 'Installation governance returned invalid output.'
+        exit 1
+    }
+    if (
+        [string]$contextStatus.actualMode -cne 'namespaced' -or
+        (
+            (
+                [string]$contextStatus.status -cne 'ready' -or
+                [string]$contextStatus.reason -cne 'namespaced-active'
+            ) -and
+            [string]$contextStatus.status -cne 'deactivation-required'
+        ) -or
+        [string]$contextStatus.runtimeRoot -cne $InstallDir -or
+        [string]$contextStatus.context -cne $contextPath
+    ) {
+        Write-Error 'Installation governance does not authorize this context runtime.'
+        exit 1
+    }
+    $contextActivationGeneration = [string]$contextStatus.activationGeneration
+    $contextNamespaceGeneration = [string]$validatedContext.namespaceGeneration
+    $contextInstallGeneration = [string]$validatedContext.generation
+    if ([string]$contextStatus.installGeneration -cne $contextInstallGeneration) {
+        Write-Error 'Installation receipt generation does not match governance.'
+        exit 1
+    }
+
+    function Test-ContextGovernanceUnchanged {
+        $currentJson = @(& $hostExe @contextStatusArgs)
+        if ($LASTEXITCODE -ne 0) { return $false }
+        try {
+            $current = ($currentJson -join "`n") | ConvertFrom-Json
+        } catch {
+            return $false
+        }
+        $currentValidationJson = & $hostExe -NoProfile -ExecutionPolicy Bypass `
+            -File $contextHelper validate `
+            -Context $contextPath `
+            -DurableHome $contextDurableHome `
+            -ExpectedPluginId 'agent-worktrees' `
+            -ExpectedPayloadRoot $contextPayload
+        if ($LASTEXITCODE -ne 0) { return $false }
+        try {
+            $currentValidated = $currentValidationJson | ConvertFrom-Json
+        } catch {
+            return $false
+        }
+        return (
+            [string]$current.status -ceq [string]$contextStatus.status -and
+            [string]$current.reason -ceq [string]$contextStatus.reason -and
+            [string]$current.actualMode -ceq 'namespaced' -and
+            [string]$current.runtimeRoot -ceq $InstallDir -and
+            [string]$current.context -ceq $contextPath -and
+            [string]$current.activationGeneration -ceq $contextActivationGeneration -and
+            [string]$current.installGeneration -ceq $contextInstallGeneration -and
+            [string]$currentValidated.namespaceGeneration -ceq
+                $contextNamespaceGeneration -and
+            [string]$currentValidated.generation -ceq $contextInstallGeneration
+        )
+    }
+
+    # The standard self-stage block is byte-identical across plugins and uses
+    # the legacy root. Context cell paths are already deep enough to exceed the
+    # Windows legacy path limit once a copied payload and vendored build tree
+    # are nested below them, so use one shallow temp staging root instead.
+    # Mark the child staged so the standard block remains inert.
+    if (-not $env:COPILOT_PLUGIN_INSTALL_STAGED) {
+        try {
+            Set-Location -LiteralPath $env:USERPROFILE
+            [System.IO.Directory]::SetCurrentDirectory($env:USERPROFILE)
+        } catch {}
+        $contextStageRoot = Join-Path (
+            Join-Path ([IO.Path]::GetTempPath()) 'copilot-extensions-install'
+        ) 'agent-worktrees'
+        $contextStage = Join-Path $contextStageRoot (
+            (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfff') + "-$PID"
+        )
+        New-Item -ItemType Directory -Force -Path $contextStage | Out-Null
+        Copy-Item -LiteralPath $contextPayload -Destination $contextStage -Recurse -Force
+        $contextStagedPayload = Join-Path $contextStage (Split-Path -Leaf $contextPayload)
+        $contextStagedEntry = Join-Path (
+            Join-Path $contextStagedPayload 'scripts'
+        ) (Split-Path -Leaf $PSCommandPath)
+        Get-ChildItem $contextStageRoot -Directory -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $contextStage } |
+            ForEach-Object {
+                $ownerPid = 0
+                if ($_.Name -match '-(\d+)$') {
+                    [void][int]::TryParse($Matches[1], [ref]$ownerPid)
+                }
+                $ownerAlive = $false
+                if ($ownerPid -gt 0) {
+                    $ownerAlive = [bool](
+                        Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+                    )
+                }
+                if (-not $ownerAlive) {
+                    try {
+                        Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+                    } catch {}
+                }
+            }
+        $contextForward = @()
+        foreach ($key in $PSBoundParameters.Keys) {
+            $value = $PSBoundParameters[$key]
+            if ($value -is [System.Management.Automation.SwitchParameter]) {
+                if ($value.IsPresent) { $contextForward += "-$key" }
+            } else {
+                $contextForward += "-$key"
+                $contextForward += [string]$value
+            }
+        }
+        $env:COPILOT_PLUGIN_INSTALL_STAGED = 'context-install'
+        $env:COPILOT_PLUGIN_STAGED_FROM = $contextPayload
+        $contextDeadline = 480
+        $contextDeadlineRaw = $env:AGENT_WORKTREES_INSTALL_DEADLINE_SEC
+        if (-not $contextDeadlineRaw) {
+            $contextDeadlineRaw = $env:COPILOT_PLUGIN_INSTALL_DEADLINE_SEC
+        }
+        if ($contextDeadlineRaw) {
+            $parsedContextDeadline = 0
+            $parsedContextDeadlineOk = [int]::TryParse(
+                [string]$contextDeadlineRaw,
+                [ref]$parsedContextDeadline
+            )
+            if ($parsedContextDeadlineOk) {
+                $contextDeadline = $parsedContextDeadline
+            }
+        }
+        $contextArguments = @(
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            $contextStagedEntry
+        ) + $contextForward
+        $contextStart = [Diagnostics.ProcessStartInfo]::new()
+        $contextStart.FileName = $hostExe
+        if ($contextStart.PSObject.Properties.Name -contains 'ArgumentList') {
+            foreach ($argument in $contextArguments) {
+                [void]$contextStart.ArgumentList.Add([string]$argument)
+            }
+        } else {
+            $contextStart.Arguments = (($contextArguments | ForEach-Object {
+                ConvertTo-NativeArgument ([string]$_)
+            }) -join ' ')
+        }
+        $contextStart.WorkingDirectory = $contextStagedPayload
+        $contextStart.UseShellExecute = $false
+        $contextStart.CreateNoWindow = $true
+        $contextChild = [Diagnostics.Process]::Start($contextStart)
+        if (-not $contextChild) {
+            Write-Error 'Context installer child could not be started.'
+            exit 1
+        }
+        if (
+            $contextDeadline -gt 0 -and
+            -not $contextChild.WaitForExit($contextDeadline * 1000)
+        ) {
+            try {
+                & taskkill.exe /PID $contextChild.Id /T /F 2>&1 | Out-Null
+            } catch {}
+            try {
+                Stop-Process -Id $contextChild.Id -Force -ErrorAction SilentlyContinue
+            } catch {}
+            try {
+                Add-Content -LiteralPath (
+                    Join-Path $InstallDir 'reconcile.err.log'
+                ) -Value (
+                    (
+                        "[{0}] WATCHDOG-KILL agent-worktrees context install " +
+                        "exceeded {1}s deadline (child pid {2}); killed tree. " +
+                        "Stage: {3}"
+                    ) -f
+                    ((Get-Date).ToUniversalTime().ToString('s') + 'Z'),
+                    $contextDeadline,
+                    $contextChild.Id,
+                    $contextStage
+                )
+            } catch {}
+            $contextExitCode = 124
+        } else {
+            if ($contextDeadline -le 0) {
+                $contextChild.WaitForExit()
+            }
+            $contextExitCode = $contextChild.ExitCode
+        }
+        Remove-Item -LiteralPath $contextStage -Recurse -Force -ErrorAction SilentlyContinue
+        exit $contextExitCode
+    }
+}
 
 # === install-contract:v4 self-stage -- keep byte-identical across plugins ===
 # dotfiles #935: a plugin installer reads its own payload (src/, libs/,
@@ -215,7 +546,6 @@ if (-not $env:UV_HTTP_TIMEOUT) { $env:UV_HTTP_TIMEOUT = '60' }
 # -- Metadata -------------------------------------------------------------
 
 $ServiceName     = 'Worktree Manager'
-$InstallDir      = Join-Path $env:USERPROFILE '.agent-worktrees'
 $BinDir          = Join-Path $InstallDir 'bin'
 $LocalBin        = Join-Path $env:USERPROFILE '.local\bin'
 $ScriptDir       = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -237,24 +567,34 @@ $LegacyBinstubs = @(
 # RepoDir: detect from existing config, then CWD.
 $RepoDir = $null
 
-# Infer project name: explicit parameter > env var > existing config > basename of CWD repo
-if (-not $ProjectName) { $ProjectName = $env:WORKTREE_PROJECT }
+# Infer project name: explicit parameter > existing config matching CWD
 if (-not $ProjectName) {
-    # Try to infer from existing config directories (find any .{name}/config.yaml)
+    # Try to infer from existing config directories (find any .{name}/config.yaml).
+    # Never infer the reserved runtime name itself: ~/.agent-worktrees/config.yaml
+    # is the TOOL's OWN runtime config (always present once installed), not a
+    # user-created project -- inferring it whenever the CWD happens to be a
+    # directory literally named `agent-worktrees` (e.g. this plugin's own
+    # checkout/payload dir) is a guaranteed false positive, not something to
+    # warn about on every routine invocation. Skip inference for it entirely so
+    # the noisy warning below is reserved for a genuine explicit -ProjectName
+    # mistake.
     if ((Get-Location).Path -match '[\\/]([^\\/]+)$') {
         $cwdName = $Matches[1]
-        $candidateConf = Join-Path $env:USERPROFILE ".$cwdName\config.yaml"
-        if (Test-Path $candidateConf) { $ProjectName = $cwdName }
+        if ($cwdName -ne 'agent-worktrees') {
+            $candidateConf = Join-Path $env:USERPROFILE ".$cwdName\config.yaml"
+            if (Test-Path $candidateConf) { $ProjectName = $cwdName }
+        }
     }
 }
 # Don't auto-adopt the CWD repo -- project association is explicit.
 # Runtime installs fine without a project name.
 # Reserved-name guard: `agent-worktrees` is the runtime's own global command
 # (the project-agnostic shim from bin/agent-worktrees.{ps1,cmd}, deployed by
-# Deploy-GlobalBinstub), never a per-project launcher. If inference or an
-# explicit -ProjectName resolves to it (e.g. the installer run from a dir
-# literally named `agent-worktrees`), a project deploy would overwrite the
-# global shims with self-`--project` binstubs. Never treat it as a project.
+# Deploy-GlobalBinstub), never a per-project launcher. Auto-inference above
+# already never resolves to it, so reaching here means an EXPLICIT
+# -ProjectName agent-worktrees was passed -- a genuine mistake worth warning
+# about, since a project deploy would overwrite the global shims with
+# self-`--project` binstubs. Never treat it as a project.
 if ($ProjectName -eq 'agent-worktrees') {
     Write-ServiceWarn "Ignoring reserved runtime name 'agent-worktrees' as a project (global command is owned by the tool binstub)"
     $ProjectName = $null
@@ -332,16 +672,134 @@ function Invoke-VersionedActivate {
     $vr = Join-Path $PSScriptRoot 'versioned_runtime.py'
     $py = if (Test-Path $VenvPython) { $VenvPython } else { $LinkPython }
     if (-not (Test-Path $py)) { return $true }
+    # A bare `import agent_worktrees` is NOT a sufficient health check: the
+    # `agent_worktrees` directory merely EXISTING makes it importable as a
+    # PEP 420 namespace package even when it holds zero `.py` files (e.g. an
+    # interrupted/partial `uv pip install` that never actually placed the
+    # package). That false pass let a broken slot get marked complete and
+    # activated with no working CLI. Importing the `__main__` submodule
+    # instead forces Python to resolve a real `__main__.py` and walk its full
+    # transitive import chain (config, project_state, the internal `libs/*`
+    # packages, etc.), so a partial install that dropped any of those pieces
+    # fails the gate here instead of silently activating.
+    #
+    # `import agent_worktrees.__main__` alone only exercises __main__'s EAGER
+    # imports -- the CLI defers ~35 submodules behind `_LAZY_DISPATCH_TABLE`/
+    # `_load_full_command_surface()`, so a slot missing one of those would
+    # still pass and only fail on its first real invocation. Call
+    # `_load_full_command_surface()` too so the completion marker means the
+    # complete CLI is importable, not just its entry point.
+    #
+    # Run with `-I` (isolated mode: ignores PYTHONPATH/other PYTHON* env vars
+    # AND excludes the working directory / script dir from sys.path) so a
+    # stale checkout's `src` dir or another on-disk `agent_worktrees` copy
+    # can't satisfy the import while $VenvPython points at the partial slot
+    # under test -- the explicit PYTHONPATH clear below is kept as
+    # defense-in-depth (matches the isolation already used by
+    # Register-ProjectEntry and the package-stamping probe below).
     $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    & $VenvPython -c 'import agent_worktrees' 2>$null
+    $prevHealthPP = $env:PYTHONPATH
+    $env:PYTHONPATH = $null
+    $healthOut = & $VenvPython -I -c 'import agent_worktrees.__main__ as m; m._load_full_command_surface()' 2>&1
     $slotOk = ($LASTEXITCODE -eq 0)
+    $env:PYTHONPATH = $prevHealthPP
     $ErrorActionPreference = $prevEAP
     if (-not $slotOk) {
         Write-ServiceErr "Fresh runtime slot failed its health gate (versions/$SrcVersion) -- not activating"
+        if ($healthOut) { Write-ServiceErr "  $healthOut" }
+        # This slot may already carry a completion marker from an OLDER,
+        # less-strict installer run (dotfiles #7561): Test-SlotAlreadyComplete
+        # trusts a valid marker + matching payload hash and skips reinstalling,
+        # so without this the same stale-but-broken slot would keep failing
+        # this gate forever on every future run. Remove just the marker file
+        # (never the slot's other files -- safe even if this happens to be the
+        # CURRENTLY ACTIVE slot, since a JSON marker is never held open by a
+        # running interpreter the way its own module files can be) so a future
+        # run stops trusting it and either rebuilds it fresh or falls back to
+        # last-known-good (resolve_python's tiered fallback in
+        # versioned_runtime.py already treats a markerless slot as unhealthy).
+        # Filename matches versioned_runtime.py's own COMPLETE_MARKER constant.
+        $staleMarker = Join-Path $VenvDir '.install-complete.json'
+        if (Test-Path $staleMarker) {
+            Remove-Item $staleMarker -Force -ErrorAction SilentlyContinue
+            Write-ServiceChanged "Invalidated stale completion marker (versions/$SrcVersion)"
+        }
         return $false
     }
+    # Determine the just-superseded slot by calling the CANONICAL resolver
+    # (resolve-runtime.ps1) directly, rather than reimplementing its tiered
+    # marker/last-known-good/newest-slot validity logic here (review finding,
+    # round 5): `current`/reading last-known-good as raw strings only checks
+    # for EMPTINESS, not whether the resolver actually considers that slot
+    # valid/complete -- a nonempty but incomplete marker or last-known-good
+    # value makes the resolver reject it and fall through to a further tier,
+    # while this heuristic would have stopped at the first nonempty value and
+    # protected the WRONG (or no) slot. Calling the resolver directly is
+    # authoritative by construction: it IS the exact code path a real
+    # resolve()/launch would use, so whatever slot it returns here is exactly
+    # what a plan resolved moments earlier would have pinned.
+    #
+    # MUST run BEFORE Invoke-VersionedMarkComplete (review finding, round 6):
+    # marking $SrcVersion complete makes IT a valid tier-3 candidate too: if
+    # both the marker and last-known-good are invalid at this exact moment,
+    # a resolve AFTER mark-complete could have the newest-slot scan pick the
+    # brand-new $SrcVersion itself (its own version number sorts newest)
+    # instead of the actually-previously-pinned older slot, leaving that real
+    # $prev undetected and unprotected.
+    $prev = $null
+    try {
+        $savedRtRoot = $env:AGENT_RT_ROOT
+        $env:AGENT_RT_ROOT = $InstallDir
+        $resolverSrc = Join-Path $ScriptDir 'resolve-runtime.ps1'
+        if (Test-Path -LiteralPath $resolverSrc) {
+            . $resolverSrc
+            if ($AwPy) {
+                # $AwPy = .../versions/<ver>/{Scripts/python.exe,bin/python};
+                # the version is two directory levels up from the interpreter.
+                $prev = Split-Path -Leaf (Split-Path -Parent (Split-Path -Parent $AwPy))
+            }
+        }
+    } catch {
+        Write-ServiceWarn "Could not resolve pre-activation runtime slot: $($_.Exception.Message)"
+    } finally {
+        $env:AGENT_RT_ROOT = $savedRtRoot
+    }
     Invoke-VersionedMarkComplete
-    $prev = (& $py $vr --root $InstallDir --link-name '.venv' current 2>$null); $prev = ("$prev").Trim()
+    # Touch the just-superseded slot's mtime IMMEDIATELY after resolving it,
+    # BEFORE activate() runs (review finding on #4451): installs run
+    # concurrently by design, so a delay here (activate + status-monitor-
+    # restart + last-known-good write all used to run first) leaves a window
+    # where a CONCURRENT installer can activate the NEXT generation and run
+    # its own gc -- which protects only ITS OWN $prev (the version we are
+    # about to activate, not the one before it) -- reaping this $prev before
+    # this invocation's own touch/gc ever runs. Touching as early as possible
+    # minimizes that exposure window. `gc`'s --min-age-days floor measures a
+    # slot's age from its directory mtime (~= install time, versioned_runtime
+    # .py's _slot_age_days), NOT from when it stopped being current. Without
+    # this touch, a slot installed more than --min-age-days ago (the common
+    # case -- most versions live for days between releases) gets ZERO
+    # protection from the floor the moment it's superseded. Resetting $prev's
+    # mtime here makes the floor measure what it needs to: time-since-
+    # superseded, so a plan resolved against it moments before this
+    # activation survives the immediately-following gc.
+    if ($prev) {
+        try {
+            $prevSlot = Join-Path (Join-Path $InstallDir 'versions') $prev
+            if (Test-Path -LiteralPath $prevSlot) {
+                (Get-Item -LiteralPath $prevSlot).LastWriteTime = Get-Date
+            }
+        } catch {
+            Write-ServiceWarn "Could not touch superseded slot mtime ($prevSlot): $($_.Exception.Message)"
+        }
+    }
+    $monitorWasLive = $false
+    if (-not $ContextualInstall) {
+        $prevHealthPP = $env:PYTHONPATH
+        $env:PYTHONPATH = $null
+        & $VenvPython -c 'from agent_worktrees.status_monitor_cutover import monitor_live_now as _f; raise SystemExit(0 if _f() else 1)' > $null 2>&1
+        $monitorWasLive = ($LASTEXITCODE -eq 0)
+        $env:PYTHONPATH = $prevHealthPP
+    }
     & $py $vr --root $InstallDir --link-name '.venv' activate $SrcVersion --no-link 2>&1 |
         ForEach-Object { Write-ServiceChanged $_ }
     if ($LASTEXITCODE -ne 0) {
@@ -349,16 +807,23 @@ function Invoke-VersionedActivate {
         return $false
     }
     Write-ServiceOk "Runtime version $SrcVersion active (marker -> versions/$SrcVersion)"
-    # Consolidated-status-daemon Phase 1 (#1696): the cutover just superseded any
-    # running status-monitor, which self-retires but only RESPAWNS on the next
-    # session start -- leaving live sessions' status bars frozen until then. Reap
-    # the superseded monitor + spawn the current one now (from the NEW slot's
-    # python), so every live session's bar is re-served with no session restart.
-    # Best-effort, never fatal.
-    try {
-        & $LinkPython -m agent_worktrees status-monitor-restart 2>&1 |
-            ForEach-Object { Write-ServiceChanged "monitor: $_" }
-    } catch {}
+    # Graceful status-monitor cutover: now that the new slot is active, ask the
+    # newly-activated runtime to cut over a live resident monitor in-process
+    # (or, for a pre-cutover daemon with no routed control endpoint yet, fall
+    # back once to the legacy restart path). Best-effort, never fatal.
+    if (-not $ContextualInstall) {
+        try {
+            $prevHelperPP = $env:PYTHONPATH
+            $env:PYTHONPATH = $null
+            $env:AGENT_WORKTREES_MONITOR_WAS_LIVE = if ($monitorWasLive) { '1' } else { '0' }
+            & $LinkPython -c 'from agent_worktrees.status_monitor_cutover import installer_after_update as _f; raise SystemExit(_f())' 2>&1 |
+                ForEach-Object { Write-ServiceChanged "monitor: $_" }
+        } catch {}
+        finally {
+            $env:PYTHONPATH = $prevHelperPP
+            Remove-Item Env:AGENT_WORKTREES_MONITOR_WAS_LIVE -ErrorAction SilentlyContinue
+        }
+    }
     # #742: record the just-activated version as `last-known-good` so a future
     # marker-absent resolution (resolve-runtime.ps1 tier 2) prefers it over a
     # newest-slot guess. Atomic (temp + rename); best-effort, never fatal.
@@ -370,7 +835,15 @@ function Invoke-VersionedActivate {
         try { Remove-Item -LiteralPath $lkgTmp -Force -ErrorAction SilentlyContinue } catch {}
     }
     $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    $gcArgs = @($vr, '--root', $InstallDir, '--link-name', '.venv', 'gc', '--protect-pids')
+    # --min-age-days is a recency floor protecting a STORED (not-running)
+    # path-pinned reference -- launch-session.ps1/.sh's `resolve` bakes the
+    # runtime interpreter's path into a plan BEFORE this activation runs; if
+    # that plan hasn't launched its pane yet, its baked path names a slot that
+    # is neither `current` nor `--keep`-protected nor attributable to a live
+    # process (the resolving process already exited). 0.05 days (~72min)
+    # matches agent-mcp's init.ps1 precedent for the same class of not-yet-live
+    # reference. See #4432 for the concrete failure this closes.
+    $gcArgs = @($vr, '--root', $InstallDir, '--link-name', '.venv', 'gc', '--protect-pids', '--min-age-days', '0.05')
     if ($prev) { $gcArgs += @('--keep', $prev) }
     & $LinkPython @gcArgs 2>&1 | ForEach-Object { Write-ServiceChanged "gc: $_" }
     $ErrorActionPreference = $prevEAP
@@ -628,9 +1101,61 @@ function Get-ApplicationPath {
         foreach ($command in $commands) {
             $source = [string]$command.Source
             if (-not $source -or $source -match 'WindowsApps') { continue }
+            $wingetTarget = Resolve-WinGetPackageExecutable -Source $source
+            if ($wingetTarget) { return $wingetTarget }
             if (Test-Path -LiteralPath $source -PathType Leaf) { return $source }
         }
     }
+    return $null
+}
+
+function Resolve-WinGetPackageExecutable {
+    <# WinGet's Links directory can contain a reparse shim that PowerShell
+       cannot invoke while native output is redirected. Resolve that link to
+       the ordinary package binary before capture. #>
+    param([Parameter(Mandatory)][string]$Source)
+    if (-not $env:LOCALAPPDATA) { return $null }
+    $linksRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links'
+    $sourceParent = Split-Path -Parent $Source
+    if (-not $sourceParent -or -not [string]::Equals(
+        [IO.Path]::GetFullPath($sourceParent).TrimEnd('\'),
+        [IO.Path]::GetFullPath($linksRoot).TrimEnd('\'),
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        return $null
+    }
+    $link = Get-Item -LiteralPath $Source -Force -ErrorAction SilentlyContinue
+    if (-not $link -or
+        -not ($link.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        return $null
+    }
+    $packagesRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+    if (-not (Test-Path -LiteralPath $packagesRoot -PathType Container)) {
+        return $null
+    }
+    $leaf = Split-Path -Leaf $Source
+    $enumeration = @{
+        LiteralPath = $packagesRoot
+        Recurse = $true
+        File = $true
+        ErrorAction = 'SilentlyContinue'
+    }
+    if (-not [Management.Automation.WildcardPattern]::ContainsWildcardCharacters(
+        $leaf
+    )) {
+        $enumeration.Filter = $leaf
+    }
+    $matches = @(Get-ChildItem @enumeration |
+        Where-Object {
+            [string]::Equals(
+                $_.Name,
+                $leaf,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -and $_.Length -gt 0 -and
+            -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)
+        } |
+        Select-Object -First 2)
+    if ($matches.Count -eq 1) { return [string]$matches[0].FullName }
     return $null
 }
 
@@ -721,8 +1246,19 @@ function Get-BootstrapPython {
 }
 
 function Get-PayloadHash {
-    <# Cheap payload fingerprint for the completion marker (#935): sha256 of
-       pyproject.toml + the vendored-lib version set. Never throws -> '' on error. #>
+    <# Payload fingerprint for the completion marker (#935, hardened #2609):
+       sha256 of pyproject.toml + the vendored-lib manifests + every actual
+       source file under src/ (this plugin's own package) and libs/*/src/
+       (its vendored path-dependencies). #2609: hashing only the manifests
+       missed any content change that didn't also bump the version string or
+       touch a dependency list -- exactly a plugin bug fix landing in .py
+       source with no pyproject.toml edit -- so `update`/`update --force`
+       reported "already at latest" and left the venv silently stale even
+       though the marketplace payload had genuinely changed. Deterministic
+       (sorted relative paths) and content-based (not size/mtime, which a
+       checkout/clone can rewrite without changing bytes). Never throws -> ''
+       on error, which Test-SlotAlreadyComplete already treats as "unknown,
+       force a rebuild" -- so a hashing failure fails toward correctness. #>
     try {
         $parts = @()
         $pp = Join-Path $PluginDir 'pyproject.toml'
@@ -731,6 +1267,23 @@ function Get-PayloadHash {
         if (Test-Path $libs) {
             Get-ChildItem $libs -Recurse -Filter 'pyproject.toml' -ErrorAction SilentlyContinue |
                 Sort-Object FullName | ForEach-Object { $parts += (Get-Content $_.FullName -Raw) }
+        }
+        $sourceRoots = @(Join-Path $PluginDir 'src')
+        if (Test-Path $libs) {
+            Get-ChildItem $libs -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                $candidate = Join-Path $_.FullName 'src'
+                if (Test-Path $candidate) { $sourceRoots += $candidate }
+            }
+        }
+        foreach ($root in $sourceRoots) {
+            if (-not (Test-Path $root)) { continue }
+            Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -notin @('.pyc', '.pyo') -and $_.Name -ne '__pycache__' } |
+                Sort-Object FullName | ForEach-Object {
+                    $rel = $_.FullName.Substring($PluginDir.ToString().Length).Replace('\', '/')
+                    $parts += $rel
+                    $parts += (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue)
+                }
         }
         $joined = [string]::Join("`n", $parts)
         $sha = [System.Security.Cryptography.SHA256]::Create()
@@ -743,13 +1296,21 @@ function Invoke-VersionedSlotClean {
     <# Toss an INCOMPLETE prior slot before building so we never `uv venv
        --allow-existing` over a corpse (#935); the current/active slot is never
        tossed (link-name derived from $LinkDir so the guard works per plugin).
-       No-op in legacy mode. #>
-    if (-not $VersionedRuntime) { return }
+       No-op ($true -- nothing to clean) in legacy mode.
+
+       Returns $true iff the slot is confirmed clean (or cleaning was a no-op);
+       $false when the underlying `slot --clean-incomplete` call failed (e.g.
+       "incomplete runtime slot is still in use") -- callers must not build a
+       signed-Python venv straight into a slot this reports dirty (#2413): a
+       still-populated $VenvDir predictably fails `--copies` and silently
+       downgrades to an unsigned uv-built interpreter. #>
+    if (-not $VersionedRuntime) { return $true }
     $vr = Join-Path $PSScriptRoot 'versioned_runtime.py'
     $py = Get-BootstrapPython
-    if (-not $py) { return }
+    if (-not $py) { return $true }
     & $py $vr --root $InstallDir --link-name (Split-Path -Leaf $LinkDir) slot $SrcVersion --clean-incomplete 2>&1 |
         ForEach-Object { Write-Host "  ...    $_" }
+    return ($LASTEXITCODE -eq 0)
 }
 
 function Invoke-VersionedMarkComplete {
@@ -765,6 +1326,34 @@ function Invoke-VersionedMarkComplete {
     $ph = Get-PayloadHash
     if ($ph) { $mcArgs += @('--payload-hash', $ph) }
     & $py @mcArgs 2>&1 | ForEach-Object { Write-Host "  ...    $_" }
+}
+
+function Test-SlotAlreadyComplete {
+    <# "Create forward, never touch an already-activated slot" gate (#2174):
+       an already-completed slot whose content hash still matches the current
+       payload must be a true no-op -- Deploy-Venv/Deploy-Package must never
+       reinstall into it. Without this, `update` unconditionally reinstalled
+       into $VenvDir on every invocation, including the CURRENTLY ACTIVE, live
+       slot (current-version / last-known-good already point at it, and a
+       long-lived process such as the status-monitor daemon or a foreground
+       `pr-watch wait` may be running out of it) -- an in-place reinstall then
+       collides with Windows file locks on the running interpreter's open
+       module files. Returns $true only when the exact target version's slot
+       is present, healthy (has a valid completion marker), and its recorded
+       payload hash matches the CURRENT source tree -- i.e. nothing to do.
+       No-op ($false, forcing the normal build path) in legacy mode or when
+       the bootstrap python / versioned_runtime.py helper is unavailable, so a
+       missing prerequisite never silently skips a real build. #>
+    if (-not $VersionedRuntime) { return $false }
+    $vr = Join-Path $PSScriptRoot 'versioned_runtime.py'
+    $py = Get-BootstrapPython
+    if (-not $py) { return $false }
+    $payloadHash = Get-PayloadHash
+    if (-not $payloadHash) { return $false }
+    $icArgs = @($vr, '--root', $InstallDir, '--link-name', (Split-Path -Leaf $LinkDir),
+                'is-complete', $SrcVersion, '--expect-hash', $payloadHash)
+    $result = Invoke-NativeCapture { & $py @icArgs }
+    return ($result.ExitCode -eq 0)
 }
 # === end install-contract:v4 marker/toss helpers ===
 
@@ -844,20 +1433,42 @@ function Write-V3Manifest {
         $g = Get-GitInfo -Path (Split-Path -Parent (Split-Path -Parent $pluginPath))
         $commit = $g.commit; $branch = $g.branch; $dirty = $g.dirty
     }
+    # Content fingerprint (#2174): a `marketplace` deploy never has a git
+    # `commit` to compare against (it isn't a git checkout the launcher's
+    # repo_dir can `git log`), so the staleness check falls back to comparing
+    # this fingerprint against a fresh one of the current payload dir. Reuse
+    # the canonical Python implementation (`update_stage.fingerprint`) via the
+    # just-deployed venv rather than reimplementing the hash in PowerShell, so
+    # the two sides can never drift apart. Best-effort: a failure here must
+    # never fail the deploy -- the staleness check already treats a missing
+    # fingerprint as "unknown" and behaves exactly as it did before this field
+    # existed.
+    $payloadFingerprint = $null
+    if (Test-Path $VenvPython) {
+        try {
+            $normPluginPath = ($pluginPath -replace '\\', '/')
+            $pyCode = "from agent_worktrees.update_stage import fingerprint; from pathlib import Path; print(fingerprint(Path(r'$normPluginPath')))"
+            $fpResult = Invoke-NativeCapture { & $VenvPython -c $pyCode }
+            if ($fpResult.ExitCode -eq 0 -and $fpResult.Output.Trim()) {
+                $payloadFingerprint = $fpResult.Output.Trim()
+            }
+        } catch {}
+    }
     $manifest = [ordered]@{
         schema_version = 3
         service        = 'agent-worktrees'
         deployed_at    = (Get-Date -Format 'o')
         deployed_by    = "$($env:COMPUTERNAME.ToLower())-windows"
         source         = [ordered]@{
-            kind    = $kind
-            path    = ($pluginPath -replace '\\', '/')
-            repo    = 'copilot-extensions'
-            plugin  = 'agent-worktrees'
-            version = $ver
-            commit  = $commit
-            branch  = $branch
-            dirty   = $dirty
+            kind                = $kind
+            path                = ($pluginPath -replace '\\', '/')
+            repo                = 'copilot-extensions'
+            plugin              = 'agent-worktrees'
+            version             = $ver
+            commit              = $commit
+            branch              = $branch
+            dirty               = $dirty
+            payload_fingerprint = $payloadFingerprint
         }
         venv           = ($LinkDir -replace '\\', '/')
         runtime        = 'python'
@@ -873,13 +1484,44 @@ function Write-V3Manifest {
     Write-ServiceOk "Deploy manifest written (source: $kind)"
 }
 
+function Test-UvConfiguredIndex {
+    if ($env:UV_CONFIG_FILE) {
+        $configPaths = @($env:UV_CONFIG_FILE)
+    } else {
+        $configPaths = @()
+        if ($env:APPDATA) {
+            $configPaths += Join-Path $env:APPDATA 'uv\uv.toml'
+        }
+        if ($env:PROGRAMDATA) {
+            $configPaths += Join-Path $env:PROGRAMDATA 'uv\uv.toml'
+        }
+    }
+    foreach ($configPath in $configPaths) {
+        if (-not $configPath -or -not (Test-Path -LiteralPath $configPath)) { continue }
+        $inIndex = $false
+        foreach ($line in Get-Content -LiteralPath $configPath) {
+            $value = ($line -replace '\s+#.*$', '').Trim()
+            if ($value -match '^index-url\s*=') { return $true }
+            if ($value -match '^\[\[index\]\]$') {
+                $inIndex = $true
+                continue
+            }
+            if ($value -match '^\[') { $inIndex = $false }
+            if ($inIndex -and $value -match '^default\s*=\s*true$') {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
 function Ensure-UvIndex {
     <# Bridge the governed pip index-url to uv. uv does not read pip.conf, so a
        governed feed (where public PyPI is blocked) must be exported as
        UV_DEFAULT_INDEX or uv resolves against public PyPI and fails. No-op when
-       already set or when pip has no configured index. Mirrors install.sh's
-       `_ensure_uv_index`. #>
-    if ($env:UV_DEFAULT_INDEX -or $env:UV_INDEX_URL) { return }
+       uv already has an environment or file-configured index, or when pip has no
+       configured index. Mirrors install.sh's `_ensure_uv_index`. #>
+    if ($env:UV_DEFAULT_INDEX -or $env:UV_INDEX_URL -or (Test-UvConfiguredIndex)) { return }
     $idx = ''
     if (Get-Command pip -CommandType Application -ErrorAction SilentlyContinue) {
         $result = Invoke-NativeCapture { & pip config get global.index-url }
@@ -1044,7 +1686,8 @@ function Invoke-VenvPackageInstall {
         [Parameter(Mandatory)][string]$PkgDir
     )
 
-    $uvAvailable = [bool](Get-Command uv -ErrorAction SilentlyContinue)
+    $uvPath = Get-ApplicationPath -Name @('uv')
+    $uvAvailable = [bool]$uvPath
     $out = ''
     $rc = 0
 
@@ -1053,8 +1696,9 @@ function Invoke-VenvPackageInstall {
     try {
         if ($uvAvailable) {
             Ensure-UvIndex
+            # Install-contract: resolved-path equivalent of `uv pip install`.
             $result = Invoke-NativeCapture {
-                & uv pip install --python $VenvPython `
+                & $uvPath pip install --python $VenvPython `
                     --reinstall-package $PkgName "$PkgDir" --quiet
             }
             $out = $result.Output
@@ -1153,9 +1797,17 @@ function Deploy-Package {
 
     # Vendored config-schema-migration lib (agent-config-migrate / module
     # config_migrate). Install it first so the package dependency resolves from
-    # the local path on every deploy. It lives inside the plugin folder, so the
-    # path is identical in the git-checkout and marketplace layouts.
+    # the local path on every deploy. Plugin-vendored (marketplace/release
+    # layout) or, when absent, the monorepo's own canonical `libs/config-migrate`
+    # (git-checkout/dev layout, where this is a `uv`-editable canonical
+    # reference with no per-plugin copy -- vendor-pointer-generalization
+    # effort, Phase 1). Needed even when `uv` is available, since the
+    # `Invoke-VenvPackageInstall` fallback to bare `python -m pip` (used when
+    # `uv` is absent) does not honor `[tool.uv.sources]` at all.
     $cfgMigrateDir = Join-Path $PluginDir 'libs\config-migrate'
+    if (-not (Test-Path (Join-Path $cfgMigrateDir 'pyproject.toml'))) {
+        $cfgMigrateDir = Join-Path $PluginDir '..\..\libs\config-migrate'
+    }
     if (Test-Path (Join-Path $cfgMigrateDir 'pyproject.toml')) {
         $libRes = Invoke-VenvPackageInstall -VenvPython $VenvPython -PkgName 'agent-config-migrate' -PkgDir $cfgMigrateDir
         if ($libRes.ExitCode -ne 0) {
@@ -1167,15 +1819,90 @@ function Deploy-Package {
     }
 
     # Vendored plugin-resolution lib (agent-plugin-resolve / module
-    # plugin_resolve). Like config-migrate, install it first so the package's
-    # dependency is satisfied from the local path: the venv build prefers
-    # `python -m pip`, which does NOT honor pyproject's [tool.uv.sources] path,
-    # so the dep must already be present when the main package installs.
+    # plugin_resolve). Plugin-vendored (marketplace/release layout) or, when
+    # absent, the monorepo's own canonical `libs/plugin-resolve` (git-checkout/
+    # dev layout, uv-editable canonical reference -- vendor-pointer-
+    # generalization effort, Phase 1). Needed even when `uv` is available,
+    # since the `Invoke-VenvPackageInstall` fallback to bare `python -m pip`
+    # (used when `uv` is absent) does not honor `[tool.uv.sources]` at all.
     $pluginResolveDir = Join-Path $PluginDir 'libs\plugin-resolve'
+    if (-not (Test-Path (Join-Path $pluginResolveDir 'pyproject.toml'))) {
+        $pluginResolveDir = Join-Path $PluginDir '..\..\libs\plugin-resolve'
+    }
     if (Test-Path (Join-Path $pluginResolveDir 'pyproject.toml')) {
         $libRes = Invoke-VenvPackageInstall -VenvPython $VenvPython -PkgName 'agent-plugin-resolve' -PkgDir $pluginResolveDir
         if ($libRes.ExitCode -ne 0) {
             Write-ServiceErr "plugin-resolve library install failed (exit $($libRes.ExitCode))"
+            if ($libRes.Output.Trim()) { Write-ServiceErr ("install: " + $libRes.Output.Trim()) }
+            $ErrorActionPreference = $prevEAP
+            return $false
+        }
+    }
+
+    # Vendored plugin contribution registry lib (agent-dropin-registry /
+    # module dropin_registry). Same dev/release-layout fallback as
+    # config-migrate/plugin-resolve above (vendor-pointer-generalization
+    # effort, Phase 1).
+    $dropinRegistryDir = Join-Path $PluginDir 'libs\dropin-registry'
+    if (-not (Test-Path (Join-Path $dropinRegistryDir 'pyproject.toml'))) {
+        $dropinRegistryDir = Join-Path $PluginDir '..\..\libs\dropin-registry'
+    }
+    if (Test-Path (Join-Path $dropinRegistryDir 'pyproject.toml')) {
+        $libRes = Invoke-VenvPackageInstall -VenvPython $VenvPython -PkgName 'agent-dropin-registry' -PkgDir $dropinRegistryDir
+        if ($libRes.ExitCode -ne 0) {
+            Write-ServiceErr "dropin-registry library install failed (exit $($libRes.ExitCode))"
+            if ($libRes.Output.Trim()) { Write-ServiceErr ("install: " + $libRes.Output.Trim()) }
+            $ErrorActionPreference = $prevEAP
+            return $false
+        }
+    }
+
+    # Vendored plugin activation/inventory lib (agent-plugin-activation /
+    # module plugin_activation). Installed AFTER dropin-registry and
+    # plugin-resolve above: it imports both at module load time, so its own
+    # install step must come after theirs (mirrors agent-logger's own
+    # install-order guard). Same dev/release-layout fallback (vendor-pointer-
+    # generalization effort, Phase 1).
+    $pluginActivationDir = Join-Path $PluginDir 'libs\plugin-activation'
+    if (-not (Test-Path (Join-Path $pluginActivationDir 'pyproject.toml'))) {
+        $pluginActivationDir = Join-Path $PluginDir '..\..\libs\plugin-activation'
+    }
+    if (Test-Path (Join-Path $pluginActivationDir 'pyproject.toml')) {
+        $libRes = Invoke-VenvPackageInstall -VenvPython $VenvPython -PkgName 'agent-plugin-activation' -PkgDir $pluginActivationDir
+        if ($libRes.ExitCode -ne 0) {
+            Write-ServiceErr "plugin-activation library install failed (exit $($libRes.ExitCode))"
+            if ($libRes.Output.Trim()) { Write-ServiceErr ("install: " + $libRes.Output.Trim()) }
+            $ErrorActionPreference = $prevEAP
+            return $false
+        }
+    }
+
+    # Vendored zero-downtime cutover lib (agent-zdd / module zdd). Install it
+    # before the main package so the bare `python -m pip` fallback path (used
+    # when `uv` is absent and therefore ignoring `[tool.uv.sources]`) never
+    # tries to resolve this unpublished dependency from the package index.
+    $zddDir = Join-Path $PluginDir 'libs\zdd'
+    if (Test-Path (Join-Path $zddDir 'pyproject.toml')) {
+        $libRes = Invoke-VenvPackageInstall -VenvPython $VenvPython -PkgName 'agent-zdd' -PkgDir $zddDir
+        if ($libRes.ExitCode -ne 0) {
+            Write-ServiceErr "zdd library install failed (exit $($libRes.ExitCode))"
+            if ($libRes.Output.Trim()) { Write-ServiceErr ("install: " + $libRes.Output.Trim()) }
+            $ErrorActionPreference = $prevEAP
+            return $false
+        }
+    }
+
+    # Vendored remote-login-shell lib (agent-remote-login-shell / module
+    # remote_login_shell, copilot-extensions#5207). Same dev/release-layout
+    # fallback as dropin-registry above.
+    $remoteLoginShellDir = Join-Path $PluginDir 'libs\remote-login-shell'
+    if (-not (Test-Path (Join-Path $remoteLoginShellDir 'pyproject.toml'))) {
+        $remoteLoginShellDir = Join-Path $PluginDir '..\..\libs\remote-login-shell'
+    }
+    if (Test-Path (Join-Path $remoteLoginShellDir 'pyproject.toml')) {
+        $libRes = Invoke-VenvPackageInstall -VenvPython $VenvPython -PkgName 'agent-remote-login-shell' -PkgDir $remoteLoginShellDir
+        if ($libRes.ExitCode -ne 0) {
+            Write-ServiceErr "remote-login-shell library install failed (exit $($libRes.ExitCode))"
             if ($libRes.Output.Trim()) { Write-ServiceErr ("install: " + $libRes.Output.Trim()) }
             $ErrorActionPreference = $prevEAP
             return $false
@@ -1311,6 +2038,40 @@ function Get-SignedBasePython {
     return $null
 }
 
+function Invoke-UvVenvWithRetry {
+    <#
+    Create a venv via `uv` at $VenvDir, retrying a bounded number of times
+    past the transient Windows file-handle race ("Access is denied" /
+    "failed to persist temporary file" while uv renames the freshly-written
+    python.exe into place -- typically AV/EDR real-time scanning briefly
+    holding the file open), mirroring the signed-Python slot-clean retry in
+    Deploy-Venv above. Only that transient-signature failure is retried; any
+    other failure (e.g. uv missing/misconfigured) surfaces immediately
+    without burning the retry budget. Returns the final Invoke-NativeCapture
+    result (success or the last failure).
+    #>
+    param([Parameter(Mandatory)][string]$VenvDir)
+
+    $transientPattern = 'Access is denied|failed to persist temporary file'
+    $uvResult = $null
+    for ($i = 0; $i -lt 3; $i++) {
+        $args_ = @('venv', $VenvDir, '--python', '3.11', '--allow-existing')
+        $uvResult = Invoke-NativeCapture { & uv @args_ }
+        if ($uvResult.ExitCode -ne 0) {
+            # Fallback: try without version constraint
+            $args_ = @('venv', $VenvDir, '--allow-existing')
+            $uvResult = Invoke-NativeCapture { & uv @args_ }
+        }
+        if ($uvResult.ExitCode -eq 0) { break }
+        if ($uvResult.Output -notmatch $transientPattern) { break }
+        if ($i -lt 2) {
+            Write-ServiceWarn "uv venv creation hit a transient file-lock error -- retrying (attempt $($i + 2) of 3)..."
+            Start-Sleep -Milliseconds 750
+        }
+    }
+    return $uvResult
+}
+
 function Deploy-Venv {
     <# Create venv and install pyyaml via uv. #>
 
@@ -1332,10 +2093,22 @@ function Deploy-Venv {
     # (the signed python.exe is embedded in the venv); fall back to uv when no
     # signed Python is present (fine on machines without Smart App Control).
     if (-not (Test-Path $VenvPython)) {
-        Invoke-VersionedSlotClean
+        $slotClean = Invoke-VersionedSlotClean
+        if (-not $slotClean) {
+            # "Still in use" is typically a transient Windows file-handle race
+            # (a just-exited process hasn't released the slot yet) -- retry
+            # briefly rather than immediately falling through to a doomed
+            # signed-Python `--copies` attempt against the still-dirty
+            # $VenvDir, which would otherwise silently downgrade to an
+            # unsigned uv-built interpreter (#2413).
+            for ($i = 0; $i -lt 3 -and -not $slotClean; $i++) {
+                Start-Sleep -Milliseconds 750
+                $slotClean = Invoke-VersionedSlotClean
+            }
+        }
         $signedBase = Get-SignedBasePython
         $created = $false
-        if ($signedBase) {
+        if ($signedBase -and $slotClean) {
             $result = Invoke-NativeCapture {
                 & $signedBase -m venv --copies $VenvDir
             }
@@ -1349,6 +2122,12 @@ function Deploy-Venv {
         if (-not $created) {
             if (-not $signedBase) {
                 Write-ServiceWarn "No signed system Python found -- using uv (unsigned). On Smart App Control machines, install python.org Python 3.11+ and re-run update."
+            } elseif (-not $slotClean) {
+                # Loud, not a soft warning: a signed Python IS available, but
+                # the stale slot couldn't be cleared, so this venv is being
+                # built UNSIGNED instead. Silently downgrading the SAC
+                # guarantee here is the exact failure mode of #2413.
+                Write-ServiceErr "Runtime slot still in use after retries -- building an UNSIGNED uv Python venv instead of the signed system Python. Smart App Control compatibility is NOT guaranteed for $VenvDir; re-run update once the prior process has exited."
             }
             # Run uv from a trusted CWD (SystemDrive root), never the profile
             # mount -- launching the WinGet uv.exe reparse shim with the profile
@@ -1357,13 +2136,7 @@ function Deploy-Venv {
             $prevLoc = Get-Location
             Set-Location "$env:SystemDrive\"
             try {
-                $args_ = @('venv', $VenvDir, '--python', '3.11', '--allow-existing')
-                $uvResult = Invoke-NativeCapture { & uv @args_ }
-                if ($uvResult.ExitCode -ne 0) {
-                    # Fallback: try without version constraint
-                    $args_ = @('venv', $VenvDir, '--allow-existing')
-                    $uvResult = Invoke-NativeCapture { & uv @args_ }
-                }
+                $uvResult = Invoke-UvVenvWithRetry -VenvDir $VenvDir
             } finally {
                 Set-Location $prevLoc
             }
@@ -1400,33 +2173,19 @@ prompt = .venv
 }
 
 function Deploy-Wrappers {
-    <# Copy the static launch wrappers and bootstrap scripts to ~/.agent-worktrees/bin/. #>
+    <# Copy bootstrap scripts to ~/.agent-worktrees/bin/. The interactive
+       mux launch-session/pane-wrapper scripts are no longer deployed here:
+       Phase 3b Sub-slice 2a Step 2 (efforts/active/worktree-manager-control-
+       plane/phase-3b-mux-relocation.md) completed the cutover to the
+       relocated Worktree Manager copy as the one true implementation;
+       agent-worktrees' own cmd_launch resolves that install live (or the
+       direct, non-mux fallback) instead of an in-plugin copy. #>
     Ensure-InstallDir $BinDir
-
-    foreach ($wrapper in @('launch-session.cmd', 'launch-session.ps1')) {
-        $src = Join-Path $PluginDir "bin\$wrapper"
-        $dst = Join-Path $BinDir $wrapper
-        if (-not (Test-Path $src)) {
-            Write-ServiceErr "Wrapper source not found: $src"
-            return $false
-        }
-        Copy-Item $src $dst -Force
-        Write-ServiceOk "Wrapper: $wrapper"
-    }
-
-    # Deploy the pane wrapper (records the pane_exited exit code inside psmux
-    # panes + shows a crash diagnostic). Optional -- mirrors install.sh's
-    # pane-wrapper.sh handling; absence just falls back to the verbatim command.
-    $paneSrc = Join-Path $PluginDir "bin\pane-wrapper.ps1"
-    if (Test-Path $paneSrc) {
-        Copy-Item $paneSrc (Join-Path $BinDir 'pane-wrapper.ps1') -Force
-        Write-ServiceOk "Wrapper: pane-wrapper.ps1"
-    }
 
     if (-not (Deploy-RuntimeResolvers)) { return $false }
 
-    # Deploy hook scripts: sessionStart (session-conduct + session-machine + bootstrap-check + project-hooks + register-nudge + register/deregister-session + anchor-hygiene-check + marketplace-overrides + provision-check) + preToolUse guards (statelessness_guard + cross_repo_guard + anchor_write_guard) + postToolUse nudges (nudge_status + bind-nudge)
-    foreach ($script in @('session-conduct.ps1', 'session-conduct.sh', 'session-machine.ps1', 'session-machine.sh', 'bootstrap-check.ps1', 'bootstrap-check.sh', 'project-hooks.ps1', 'project-hooks.sh', 'register-nudge.ps1', 'register-nudge.sh', 'register-session.ps1', 'register-session.sh', 'deregister-session.ps1', 'deregister-session.sh', 'anchor-hygiene-check.ps1', 'anchor-hygiene-check.sh', 'marketplace-overrides.ps1', 'marketplace-overrides.sh', 'provision-check.ps1', 'provision-check.sh', 'statelessness_guard.py', 'cross_repo_guard.py', 'anchor_write_guard.py', 'nudge_status.py', 'bind-nudge.sh', 'bind-nudge.ps1')) {
+    # Deploy hook scripts, including the consolidated pre/post client and its fallback modules.
+    foreach ($script in @('session-conduct.ps1', 'session-conduct.sh', 'session-machine.ps1', 'session-machine.sh', 'bootstrap-check.ps1', 'bootstrap-check.sh', 'bootstrap-killswitch-guard.ps1', 'bootstrap-killswitch-guard.sh', 'project-hooks.ps1', 'project-hooks.sh', 'register-nudge.ps1', 'register-nudge.sh', 'register-session.ps1', 'register-session.sh', 'deregister-session.ps1', 'deregister-session.sh', 'anchor-hygiene-check.ps1', 'anchor-hygiene-check.sh', 'provision-check.ps1', 'provision-check.sh', 'statelessness_guard.py', 'cross_repo_guard.py', 'anchor_write_guard.py', 'pr_supersede_guard.py', 'registry_root.py', 'nudge_status.py', 'bind_nudge.py', 'hook_client.py', 'bind-nudge.sh', 'bind-nudge.ps1')) {
         $src = Join-Path $ScriptDir $script
         $dst = Join-Path $BinDir $script
         if (Test-Path $src) {
@@ -1449,20 +2208,23 @@ function Deploy-Wrappers {
         }
     }
 
-    # Deploy default setup scripts to ~/.agent-worktrees/scripts/ (used when a
-    # repo lacks its own tools/setup/setup.ps1). The agent-bridge launch plan
-    # invokes ~/.agent-worktrees/scripts/default-setup.ps1, so these MUST be
-    # deployed here to keep the install flow and that launch instruction in
-    # sync -- otherwise spawning a worktree agent fails at LAUNCH_ACP because
-    # the setup script is missing. Mirrors installer.py deploy_wrappers().
+    # Deploy normalized setup and optional machine-settings reconciliation.
+    # Mirrors installer.py deploy_wrappers().
     $ScriptsDir = Join-Path $InstallDir 'scripts'
     Ensure-InstallDir $ScriptsDir
-    foreach ($setup in @('default-setup.ps1', 'default-setup.sh')) {
+    foreach ($setup in @(
+        'default-setup.ps1',
+        'default-setup.sh',
+        'launch-command.ps1',
+        'launch-command.sh',
+        'reconcile-machine-settings.ps1',
+        'reconcile-machine-settings.sh'
+    )) {
         $src = Join-Path $ScriptDir $setup
         $dst = Join-Path $ScriptsDir $setup
         if (Test-Path $src) {
             Copy-Item $src $dst -Force
-            Write-ServiceOk "Default setup: $setup"
+            Write-ServiceOk "Session script: $setup"
         }
     }
 
@@ -1493,8 +2255,7 @@ function Deploy-RuntimeResolvers {
 
 function Deploy-Binstub {
     <# Generate the project-specific binstub in ~/.local/bin/.
-       Routes through the Python CLI for subcommand dispatch.
-       Falls back to launch-session.cmd if the venv is missing. #>
+       Every path routes through this payload's attributable command. #>
     Ensure-InstallDir $LocalBin
 
     # Reserved-name guard (belt-and-suspenders with the ProjectName resolution
@@ -1506,54 +2267,30 @@ function Deploy-Binstub {
         return
     }
 
+    $payloadCmd = Join-Path $PluginDir 'bin\payload\agent-worktrees.cmd'
+    $payloadPs1 = Join-Path $PluginDir 'bin\payload\agent-worktrees.ps1'
     $content = @"
 @echo off
+rem agent-worktrees project binstub
 set "PYTHONUTF8=1"
-rem Context resolves from CWD / --project (git-like); the binstub names its
-rem project via --project, not an ambient env var.
-where pwsh >nul 2>&1
-if %ERRORLEVEL%==0 (
-  pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0$ProjectName.ps1" %*
-) else (
-  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0$ProjectName.ps1" %*
-)
+set "AGENT_WORKTREES_LAUNCH_ID=$ProjectName-%RANDOM%-%RANDOM%"
+call "$payloadCmd" --project $ProjectName %*
 exit /b %ERRORLEVEL%
 "@
     $dst = Join-Path $LocalBin "$ProjectName.cmd"
     Set-Content -Path $dst -Value $content -NoNewline
 
-    # Primary .ps1 (PowerShell prefers it over the .cmd in the same dir; @args
-    # forwards argv verbatim so quoting/&&/|/;/! survive). The .cmd above stays
-    # as a fallback for cmd.exe, `cmd /c` Windows Terminal profiles, and ssh
-    # launchers. Both route through the signed venv python via -m, falling back
-    # to launch-session when the venv is missing (recovery).
+    # Primary .ps1 (PowerShell prefers it over .cmd); both pin the payload.
     $ps1Content = (@'
+# agent-worktrees project binstub
 $env:PYTHONUTF8 = '1'
-# Context resolves from CWD / --project (git-like). This .ps1 runs in-process in
-# the caller's session, so it names its project via --project (not an ambient
-# env var), leaving the live session env untouched. Recovery (venv missing)
-# passes the project to launch-session via a scoped, restored WORKTREE_PROJECT.
-# Resolve the runtime slot python via the junction-free current-version marker
-# (the .venv junction is retired -- #637/#1085/#1106).
-$_root = Join-Path $env:USERPROFILE '.agent-worktrees'
-$AwPy = $null
-$_resolver = Join-Path $_root 'bin\resolve-runtime.ps1'
-if (Test-Path -LiteralPath $_resolver -PathType Leaf) { . $_resolver }
-$_py = $AwPy
-if (Test-Path $_py) {
-    & $_py -m agent_worktrees --project '%%PROJECT%%' @args
-    exit $LASTEXITCODE
-}
-$_savedProj = $env:WORKTREE_PROJECT
-$env:WORKTREE_PROJECT = '%%PROJECT%%'
-try {
-    & "$env:USERPROFILE\.agent-worktrees\bin\launch-session.cmd" @args
-    $_rc = $LASTEXITCODE
-} finally {
-    if ($null -eq $_savedProj) { Remove-Item Env:WORKTREE_PROJECT -ErrorAction SilentlyContinue } else { $env:WORKTREE_PROJECT = $_savedProj }
-}
-exit $_rc
-'@).Replace('%%PROJECT%%', $ProjectName)
+$env:AGENT_WORKTREES_LAUNCH_ID = '%%PROJECT%%-' + [guid]::NewGuid().ToString('N')
+& '%%PAYLOAD%%' --project '%%PROJECT%%' @args
+exit $LASTEXITCODE
+'@).Replace('%%PROJECT%%', $ProjectName).Replace(
+        '%%PAYLOAD%%',
+        $payloadPs1.Replace("'", "''")
+    )
     $ps1Dst = Join-Path $LocalBin "$ProjectName.ps1"
     [System.IO.File]::WriteAllText($ps1Dst, $ps1Content, (New-Object System.Text.UTF8Encoding($false)))
     Write-ServiceOk "Binstub: $ps1Dst (+ .cmd fallback)"
@@ -1666,7 +2403,6 @@ repos:
     # worktree_root defaults to $worktreeRoot -- a sibling
     # <anchor>.worktrees dir, matching Copilot CLI's /worktree layout.
     # Uncomment and set an absolute path to override.
-    default_branch: master
     remote: origin
 
 # terminal_profiles -- this machine's terminal-profile column (the Picker's
@@ -1680,22 +2416,14 @@ terminal_profiles:
 }
 
 function Deploy-TerminalScripts {
-    <# Deploy the per-session psmux options + opt-in keybind scripts to BIN_DIR.
-       agent-worktrees no longer owns ~/.psmux.conf: the launcher stamps the
-       status bar + behaviors per-session from session-options.ps1, and
-       apply-mux-keybinds.ps1 is an opt-in server-global tuning script the user
-       (or a restore flow) may run. Mirrors install.sh deploy_terminal_scripts. #>
+    <# Deploy the psmux-path helper + relinquish the legacy global psmux
+       config. The per-session options/opt-in keybind scripts
+       (session-options.ps1, apply-mux-keybinds.ps1, psmux-passthrough.conf)
+       were relocated to Worktree Manager in Phase 3b Sub-slice 2a Step 2
+       (efforts/active/worktree-manager-control-plane/phase-3b-mux-relocation.md)
+       along with the launch-session.ps1 they configure; agent-worktrees no
+       longer deploys its own copies. Mirrors install.sh deploy_terminal_scripts. #>
     Ensure-InstallDir $BinDir
-    $srcDir = Join-Path $PluginDir 'terminal'
-    foreach ($script in @('session-options.ps1', 'apply-mux-keybinds.ps1', 'psmux-passthrough.conf')) {
-        $src = Join-Path $srcDir $script
-        if (-not (Test-Path $src)) {
-            Write-ServiceWarn "terminal script not found at $src"
-            continue
-        }
-        Copy-Item $src (Join-Path $BinDir $script) -Force
-        Write-ServiceOk "Terminal script: $script"
-    }
     $psmuxPathHelper = Join-Path $PluginDir 'scripts\psmux-path.ps1'
     if (Test-Path -LiteralPath $psmuxPathHelper) {
         Copy-Item $psmuxPathHelper (Join-Path $BinDir 'psmux-path.ps1') -Force
@@ -1728,12 +2456,10 @@ function Ensure-PsmuxSshSafe {
        piped/NoProfile pwsh. (Same reparse-shim wall the WinGet uv.exe install
        hits.)
 
-       Fix: select the newest REAL binary at or above the 3.3.8 compatibility
-       floor, remove
+       Fix: select the newest compatible REAL binary, remove
        every stale marlocarlo.psmux package directory from User and process
        PATH, and put that directory first. This does not mutate the package or
        its server, so it remains safe while existing sessions are live. #>
-    $minimumVersion = '3.3.8'
     $packageRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
     $helper = Join-Path $PSScriptRoot 'psmux-path.ps1'
     if (-not (Test-Path -LiteralPath $helper)) {
@@ -1742,18 +2468,18 @@ function Ensure-PsmuxSshSafe {
     }
     . $helper
     $selected = Find-AwCompatiblePsmuxPackageBinary `
-        -PackageRoot $packageRoot -MinimumVersion $minimumVersion
+        -PackageRoot $packageRoot
     if (-not $selected) {
-        Write-ServiceWarn "psmux: no WinGet package binary meets minimum version $minimumVersion; User PATH was not changed"
+        Write-ServiceWarn "psmux: no compatible WinGet package binary was found; User PATH was not changed"
         return
     }
 
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $userPath = Get-CopilotPersistentEnvironmentVariable -Name 'Path' -Target 'User'
     if (-not $userPath) { $userPath = '' }
     $repair = Repair-AwPsmuxPath -SelectedDirectory $selected.Directory `
         -UserPath $userPath -ProcessPath $env:Path -PackageRoot $packageRoot
     if ($repair.UserChanged) {
-        [Environment]::SetEnvironmentVariable('Path', $repair.UserPath, 'User')
+        Set-CopilotPersistentEnvironmentVariable -Name 'Path' -Value $repair.UserPath -Target 'User'
         Write-ServiceChanged "psmux: selected compatible $($selected.Version) package binary and removed stale package dirs from User PATH (SSH-safe): $($selected.Directory)"
     }
     $env:Path = $repair.ProcessPath
@@ -1781,7 +2507,8 @@ function Ensure-PsmuxSshSafe {
             '$out = (& $cmd.Source --help 2>&1 | Select-Object -First 1) | Out-String; ' +
             '$pattern = "(?<![0-9.])" + [regex]::Escape($env:AW_PSMUX_EXPECTED_VERSION) + "(?![0-9.])"; ' +
             'if ($out -notmatch $pattern) { exit 1 }'
-        & pwsh.exe -NoLogo -NoProfile -NonInteractive -Command $verify
+        $encodedVerify = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($verify))
+        & pwsh.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encodedVerify
         if ($LASTEXITCODE -ne 0) {
             throw "psmux PATH repair failed NoProfile/SSH-style verification for version $($selected.Version)"
         }
@@ -1805,8 +2532,7 @@ function Resolve-AwPsmuxBin {
        if (Test-Path -LiteralPath $helper) {
            . $helper
            $desired = Find-AwCompatiblePsmuxPackageBinary `
-               -PackageRoot (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages') `
-               -MinimumVersion '3.3.8'
+               -PackageRoot (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages')
            if ($desired) { return $desired.Path }
        }
        $src = $Cmd.Source
@@ -1823,20 +2549,21 @@ function Resolve-AwPsmuxBin {
 }
 
 function Ensure-Psmux {
-    <# Ensure the psmux compatibility floor (3.3.8). Missing or older versions
-       are installed/upgraded to the floor; newer versions are accepted. The
+    <# Ensure a compatible psmux version. Versions 3.3.5 and 3.3.7+ are
+       accepted; 3.3.6 is blocked. Missing or incompatible versions are
+       installed/upgraded to the preferred version. The
        installer deliberately does not own the machine's winget pin -- an
        adopting machine-state package may pin an exact validated version.
        Replacement happens only when no live sessions exist, because refreshing
        the portable package
        tears down the running psmux server and every attached session. #>
-    $minimumVersion = '3.3.8'
+    $installVersion = '3.3.8'
     if (-not (Get-Command psmux -ErrorAction SilentlyContinue)) {
-        Write-Host "  Installing psmux $minimumVersion (terminal multiplexer)..."
-        & winget install --id marlocarlo.psmux --version $minimumVersion --exact `
+        Write-Host "  Installing psmux $installVersion (terminal multiplexer)..."
+        & winget install --id marlocarlo.psmux --version $installVersion --exact `
             --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0) {
-            Write-ServiceOk "psmux $minimumVersion installed"
+            Write-ServiceOk "psmux $installVersion installed"
         } else {
             Write-ServiceWarn "psmux install failed - sessions will launch without multiplexing"
         }
@@ -1844,41 +2571,41 @@ function Ensure-Psmux {
         return
     }
     $muxBin = Resolve-AwPsmuxBin (Get-Command psmux -ErrorAction SilentlyContinue)
-    $psmuxVer = (& $muxBin --help 2>&1 | Select-Object -First 1) -replace '.*psmux v([0-9.]+).*', '$1'
-    try { $belowMinimum = ([version]$psmuxVer -lt [version]$minimumVersion) }
-    catch { $belowMinimum = $true }
-    if ($belowMinimum) {
-        $helper = Join-Path $PSScriptRoot 'psmux-path.ps1'
-        if (Test-Path -LiteralPath $helper) {
-            . $helper
-            $sessionState = Get-AwPsmuxSessionState -Path $muxBin
-        } else {
-            $sessionState = [pscustomobject]@{ Known = $false; Sessions = @() }
-        }
+    $helper = Join-Path $PSScriptRoot 'psmux-path.ps1'
+    if (-not (Test-Path -LiteralPath $helper)) {
+        Write-ServiceWarn "psmux compatibility cannot be validated because the helper is missing -- not replacing it"
+        return
+    }
+    . $helper
+    if (-not (Get-Command Get-AwPsmuxBinaryVersion -ErrorAction SilentlyContinue) -or
+        -not (Get-Command Test-AwPsmuxVersionCompatible -ErrorAction SilentlyContinue)) {
+        Write-ServiceWarn "psmux compatibility cannot be validated because the helper is unavailable -- not replacing it"
+        return
+    }
+    $psmuxVer = Get-AwPsmuxBinaryVersion -Path $muxBin
+    $psmuxDisplay = if ($psmuxVer) { $psmuxVer } else { '<unknown>' }
+    $compatible = Test-AwPsmuxVersionCompatible -Version $psmuxVer
+    if (-not $compatible) {
+        $sessionState = Get-AwPsmuxSessionState -Path $muxBin
         if (-not $sessionState.Known) {
-            Write-ServiceWarn "psmux $psmuxVer is below minimum $minimumVersion, but live-session state could not be determined -- not replacing it. Re-run 'update' after confirming all psmux sessions are closed."
+            Write-ServiceWarn "psmux $psmuxDisplay is incompatible, but live-session state could not be determined -- not replacing it. Re-run 'update' after confirming all psmux sessions are closed."
         } elseif ($sessionState.Sessions.Count -gt 0) {
-            Write-ServiceWarn "psmux $psmuxVer is below minimum $minimumVersion. $($sessionState.Sessions.Count) live session(s) present -- not replacing it now (that would kill them). Close all worktree sessions and re-run 'update' to upgrade."
+            Write-ServiceWarn "psmux $psmuxDisplay is incompatible. $($sessionState.Sessions.Count) live session(s) present -- not replacing it now (that would kill them). Close all worktree sessions and re-run 'update' to upgrade."
         } else {
-            Write-ServiceChanged "psmux $psmuxVer is below minimum $minimumVersion -- refreshing the portable package"
-            & winget install --id marlocarlo.psmux --version $minimumVersion --exact `
+            Write-ServiceChanged "psmux $psmuxDisplay is incompatible -- refreshing the portable package"
+            & winget install --id marlocarlo.psmux --version $installVersion --exact `
                 --uninstall-previous --force --accept-source-agreements `
                 --accept-package-agreements 2>&1 | Out-Null
-            if (Test-Path -LiteralPath $helper) {
-                $selected = Find-AwCompatiblePsmuxPackageBinary `
-                    -PackageRoot (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages') `
-                    -MinimumVersion $minimumVersion
-            } else {
-                $selected = $null
-            }
+            $selected = Find-AwCompatiblePsmuxPackageBinary `
+                -PackageRoot (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages')
             if ($selected) {
                 Write-ServiceOk "psmux upgraded to compatible version $($selected.Version)"
             } else {
-                Write-ServiceWarn "psmux refresh attempted but no installed binary meets minimum $minimumVersion"
+                Write-ServiceWarn "psmux refresh attempted but no compatible installed binary was found"
             }
         }
     } else {
-        Write-ServiceOk "psmux available ($psmuxVer; minimum $minimumVersion)"
+        Write-ServiceOk "psmux available ($psmuxDisplay; compatible)"
     }
     Ensure-PsmuxSshSafe
 }
@@ -2159,17 +2886,21 @@ function Deploy-WslBinstub {
         return $false
     }
 
-    # Generate thin launcher with helpful error when not yet installed
+    # Generate thin launcher with helpful error when not yet installed. Routes
+    # through the WSL-side `agent-worktrees` tool binstub (deployed by its own
+    # install.sh's deploy_tool_binstub at $HOME/.local/bin/agent-worktrees) via
+    # `--project`, exactly like every other modern project binstub -- NOT the
+    # shared launch-session.sh script, which was retired from agent-worktrees
+    # in the phase-3b relocation (worktree-manager-control-plane/phase-3b-mux-
+    # relocation.md) and hasn't been deployed at its old install path since.
     $binstubScript = @"
 #!/usr/bin/env bash
+# agent-worktrees project binstub
 # Thin binstub for $ProjectName - deployed by agent-worktrees (Windows)
 # Requires agent-worktrees to be installed in WSL via the copilot-extensions plugin.
-# This thin launcher only starts a session (no CLI dispatch), so it passes the
-# project to launch-session via WORKTREE_PROJECT.
-export WORKTREE_PROJECT="$ProjectName"
-_launcher="`$HOME/.agent-worktrees/bin/launch-session.sh"
+_launcher="`$HOME/.local/bin/agent-worktrees"
 if [[ -x "`$_launcher" ]]; then
-    exec "`$_launcher" "`$@"
+    exec "`$_launcher" --project "$ProjectName" "`$@"
 else
     echo "agent-worktrees is not installed in WSL." >&2
     echo "To set up:" >&2
@@ -2214,73 +2945,106 @@ fi
     }
 }
 
-function Deploy-Shortcuts {
-    <# Deploy Windows Terminal fragment (with remote SSH profiles) and create .lnk shortcuts.
-       Handles WT state cleanup so new/changed profiles appear correctly on next WT launch. #>
+function Test-WorktreeManagerVersionAtLeast {
+    <# Compare a captured ``--version`` output string against a minimum
+       (major, minor, patch, dev) tuple -- mirrors agent_worktrees' own
+       Python ``_probe_worktree_manager_version``/``_WORKTREE_MANAGER_MIN_
+       PICKER_VERSION`` comparison so both sides of the health-check use the
+       same semantics (a release build, with no ``-devN`` suffix, always
+       compares as newer than any dev build of the same major.minor.patch). #>
+    param([string]$VersionText, [int[]]$Minimum)
+    if ($VersionText -notmatch '(\d+)\.(\d+)\.(\d+)(?:-dev(\d+))?') { return $false }
+    $dev = if ($Matches[4]) { [int]$Matches[4] } else { 1000000 }
+    $parts = @([int]$Matches[1], [int]$Matches[2], [int]$Matches[3], $dev)
+    for ($i = 0; $i -lt 4; $i++) {
+        if ($parts[$i] -gt $Minimum[$i]) { return $true }
+        if ($parts[$i] -lt $Minimum[$i]) { return $false }
+    }
+    return $true
+}
+
+# The lowest worktree-manager version that has terminal-fragment --deploy /
+# profiles apply --mirror (Phase 3e Step 5a, 0.1.0-dev75).
+$script:WorktreeManagerDeployMinVersion = @(0, 1, 0, 75)
+
+function Get-UsableWorktreeManagerBin {
+    <# Resolve the Worktree Manager binstub on PATH, but only if it is
+       actually invocable AND new enough to support the deploy mechanism
+       (mirrors agent_worktrees' own Python ``_usable_worktree_manager()``
+       PATH + ``--version`` health-check + minimum-version guard) -- a
+       stale, broken, or too-old binstub falls back to the local
+       implementation instead of silently failing or erroring on an
+       unrecognized flag. #>
+    $cmd = Get-Command worktree-manager -ErrorAction SilentlyContinue
+    if (-not $cmd) { return $null }
+    try {
+        $verOut = & $cmd.Source --version 2>&1
+    } catch {
+        return $null
+    }
+    if ($LASTEXITCODE -ne 0) { return $null }
+    if (-not (Test-WorktreeManagerVersionAtLeast -VersionText ($verOut -join ' ') -Minimum $script:WorktreeManagerDeployMinVersion)) {
+        return $null
+    }
+    return $cmd.Source
+}
+
+function Deploy-TerminalFragmentViaWorktreeManager {
+    <# Phase 3e Step 5b (copilot-extensions#3390): deploy the Windows Terminal
+       fragment through the relocated ``worktree_manager.terminal_fragment
+       .deploy_fragment`` mechanism when a usable Worktree Manager install is
+       on PATH. Returns ``$true`` only when the deploy actually ran and
+       succeeded (exit 0) -- callers fall back to the local implementation on
+       ``$false``, the same present-or-fallback shape as the interactive mux
+       launch's own Worktree-Manager check (Phase 3b Sub-slice 2a). #>
+    param([string]$Machine, [string]$ProjectName)
+
+    $wmBin = Get-UsableWorktreeManagerBin
+    if (-not $wmBin) { return $false }
+
+    & $wmBin terminal-fragment $ProjectName --machine $Machine --deploy --live 2>&1 |
+        ForEach-Object { Write-ServiceChanged "terminal-fragment: $_" }
+    if ($LASTEXITCODE -ne 0) {
+        Write-ServiceWarn "Worktree Manager terminal-fragment --deploy failed (exit $LASTEXITCODE) -- falling back to the local implementation"
+        return $false
+    }
+    Write-ServiceOk "Windows Terminal profiles deployed via Worktree Manager"
+    return $true
+}
+
+function Deploy-TerminalFragmentLocally {
+    <# Phase 3e Step 6 (copilot-extensions#3390): Terminal Fragment generation
+       is no longer owned by agent-worktrees at all -- ``agent_worktrees``'s
+       own ``terminal-fragment``/``profiles`` verbs (the only thing this
+       function used to shell out to) were retired in Step 6; see
+       ``visions/plugins/agent-worktrees``'s *Not a Terminal Fragment owner*
+       Non-Goal. There is no local (non-Worktree-Manager) implementation left
+       to fall back to -- degrade loudly instead of attempting a command that
+       no longer exists. Always returns ``$false`` (matching the historical
+       ``Deploy-Shortcuts`` behaviour of skipping shortcut creation when the
+       fragment can't be deployed), so this machine's WT profiles/shortcuts
+       simply go stale until a usable Worktree Manager install is present. #>
     param([string]$Machine)
 
-    # Deploy WT fragment - use a shared fragment directory for all projects
-    $fragmentDir = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\Fragments\AgentWorktrees'
-    if (-not (Test-Path $fragmentDir)) {
-        New-Item -ItemType Directory -Path $fragmentDir -Force | Out-Null
+    Write-ServiceWarn "Worktree Manager is required to deploy Windows Terminal profiles (agent-worktrees no longer owns Terminal Fragments -- see visions/plugins/agent-worktrees's 'Not a Terminal Fragment owner' Non-Goal). Install or repair Worktree Manager, then re-run 'refresh-profiles'."
+    return $false
+}
+
+function Deploy-Shortcuts {
+    <# Deploy Windows Terminal fragment (with remote SSH profiles) and create .lnk shortcuts.
+       Handles WT state cleanup so new/changed profiles appear correctly on next WT launch.
+
+       Phase 3e Step 5b (copilot-extensions#3390): prefers the relocated
+       Worktree Manager deploy mechanism when a usable install is on PATH,
+       falling back to the local implementation otherwise -- the same
+       present-or-fallback shape Phase 3b's mux launch repoint used. #>
+    param([string]$Machine)
+
+    $deployed = Deploy-TerminalFragmentViaWorktreeManager -Machine $Machine -ProjectName $ProjectName
+    if (-not $deployed) {
+        $deployed = Deploy-TerminalFragmentLocally -Machine $Machine
     }
-
-    # Collect GUIDs from existing fragment BEFORE any overwrites.
-    # We need these to compute stale GUIDs for state cleanup later.
-    $oldFragGuids = @()
-    $fragmentDst = Join-Path $fragmentDir 'agent-worktrees.json'
-    if (Test-Path $fragmentDst) {
-        try {
-            $oldFrag = Get-Content $fragmentDst -Raw | ConvertFrom-Json
-            $oldFragGuids += @($oldFrag.profiles | ForEach-Object { $_.guid.ToLower() })
-        } catch { }
-    }
-    $oldFragGuids = @($oldFragGuids | Sort-Object -Unique)
-
-    # Generate the fragment from the Python single-source-of-truth generator.
-    # First normalize any legacy display-name selections to canonical machine
-    # keys (idempotent), then capture the fragment JSON (stdout is pure JSON).
-    & $VenvPython -m agent_worktrees terminal-fragment --machine $Machine --migrate-selections 2>&1 |
-        ForEach-Object { Write-ServiceChanged "profiles: $_" }
-    $fragment = & $VenvPython -m agent_worktrees terminal-fragment --machine $Machine
-    if ($LASTEXITCODE -ne 0 -or -not $fragment) {
-        Write-ServiceErr "Fragment generation failed (agent_worktrees terminal-fragment exited $LASTEXITCODE)"
-        return
-    }
-    $newFragObj = $fragment | ConvertFrom-Json
-    $newFragGuids = @($newFragObj.profiles | ForEach-Object { $_.guid.ToLower() })
-
-    # Detect changed profiles: same GUID but different content (e.g. renamed
-    # machine, changed SSH alias).  These need WT rediscovery even though the
-    # GUID didn't change.
-    $changedGuids = @()
-    if ($oldFragGuids.Count -gt 0) {
-        $commonGuids = @($oldFragGuids | Where-Object { $_ -in $newFragGuids })
-        foreach ($g in $commonGuids) {
-            $oldP = $oldFrag.profiles | Where-Object { $_.guid.ToLower() -eq $g }
-            $newP = $newFragObj.profiles | Where-Object { $_.guid.ToLower() -eq $g }
-            if ($oldP -and $newP) {
-                $oldCmd  = if ($oldP.PSObject.Properties['commandline']) { $oldP.commandline } else { '' }
-                $newCmd  = if ($newP.PSObject.Properties['commandline']) { $newP.commandline } else { '' }
-                $oldName = if ($oldP.PSObject.Properties['name']) { $oldP.name } else { '' }
-                $newName = if ($newP.PSObject.Properties['name']) { $newP.name } else { '' }
-                if ($oldCmd -ne $newCmd -or $oldName -ne $newName) {
-                    $changedGuids += $g
-                }
-            }
-        }
-        if ($changedGuids.Count -gt 0) {
-            Write-ServiceChanged "$($changedGuids.Count) profile(s) changed content -- will force WT rediscovery"
-        }
-    }
-
-    # Clean WT state BEFORE writing the new fragment to avoid a race where
-    # WT reads the new fragment while stale GUIDs are still in state.json.
-    Sync-TerminalState -OldFragmentGuids $oldFragGuids -NewFragmentGuids $newFragGuids -ChangedGuids $changedGuids
-
-    # Write the new fragment
-    $fragment | Set-Content $fragmentDst -Encoding UTF8
-    Write-ServiceOk "Windows Terminal profiles deployed (fragment with all registered projects)"
+    if (-not $deployed) { return }
 
     # Create .lnk shortcuts for each registered project
     $shell = New-Object -ComObject WScript.Shell
@@ -2672,8 +3436,12 @@ switch ($Action) {
         Ensure-UvIndex
         foreach ($dir in @($InstallDir, $BinDir, $LocalBin)) { Ensure-InstallDir $dir }
         if (-not (Deploy-RuntimeResolvers)) { exit 1 }
-        if (-not (Deploy-Venv)) { exit 1 }
-        if (-not (Deploy-Package)) { exit 1 }
+        if (Test-SlotAlreadyComplete) {
+            Write-ServiceSkipped "Slot $SrcVersion already complete and unchanged -- skipping venv/package (re)install"
+        } else {
+            if (-not (Deploy-Venv)) { exit 1 }
+            if (-not (Deploy-Package)) { exit 1 }
+        }
         if (-not (Invoke-VersionedActivate)) { exit 1 }
         Deploy-GlobalBinstub
         Write-V3Manifest
@@ -2700,23 +3468,44 @@ switch ($Action) {
             exit 1
         }
 
-        # Optional: psmux terminal multiplexer for session persistence. Pinned
-        # to 3.3.8, which includes the post-3.3.6 attach and Ctrl+C fixes.
+        # Optional: psmux terminal multiplexer for session persistence. New
+        # installs use 3.3.8; existing compatible versions remain supported.
         # See Ensure-Psmux (shared with 'update' so existing boxes self-heal).
-        Ensure-Psmux
+        if (-not $ContextualInstall) {
+            Ensure-Psmux
+        }
 
-        # Create directory structure (runtime dirs always; project dirs only if adopting)
-        $runtimeDirs = @($InstallDir, $BinDir, $LocalBin)
-        if ($HasProject) { $runtimeDirs += @($ProjectDir, $WorktreesDir) }
+        # Structured contexts may mutate only their installation-local paths.
+        $runtimeDirs = if ($ContextualInstall) {
+            @($InstallDir, $BinDir)
+        } else {
+            @($InstallDir, $BinDir, $LocalBin)
+        }
+        if ($HasProject -and -not $ContextualInstall) {
+            $runtimeDirs += @($ProjectDir, $WorktreesDir)
+        }
         foreach ($dir in $runtimeDirs) {
             Ensure-InstallDir $dir
         }
 
         # -- Shared runtime (venv first: package install targets the venv) --
-        if (-not (Deploy-Venv)) { exit 1 }
-        if (-not (Deploy-Package)) { exit 1 }
-        if (-not (Invoke-VersionedActivate)) { exit 1 }
+        if (Test-SlotAlreadyComplete) {
+            Write-ServiceSkipped "Slot $SrcVersion already complete and unchanged -- skipping venv/package (re)install"
+        } else {
+            if (-not (Deploy-Venv)) { exit 1 }
+            if (-not (Deploy-Package)) { exit 1 }
+        }
         if (-not (Deploy-Wrappers)) { exit 1 }
+        if ($ContextualInstall -and -not (Test-ContextGovernanceUnchanged)) {
+            Write-ServiceErr 'Installation governance changed before runtime cutover'
+            exit 1
+        }
+        if (-not (Invoke-VersionedActivate)) { exit 1 }
+        if ($ContextualInstall) {
+            Write-V3Manifest
+            Write-ServiceOk "Context runtime installed at $InstallDir"
+            exit 0
+        }
         Deploy-CopilotPlugin
         Deploy-GlobalBinstub
         Ensure-CopilotExperimental
@@ -2827,7 +3616,10 @@ switch ($Action) {
             Write-ServiceChanged "Removed package: $LibDir"
         }
 
-        # Remove wrappers
+        # Remove wrappers (legacy cleanup: earlier versions deployed the
+        # in-plugin mux launch scripts here; they are no longer deployed by
+        # this installer, but a stale copy from a pre-cutover version is
+        # still cleaned up on uninstall).
         foreach ($wrapper in @('launch-session.cmd', 'launch-session.ps1', 'pane-wrapper.ps1')) {
             $path = Join-Path $BinDir $wrapper
             if (Test-Path $path) { Remove-Item $path -Force }
@@ -2886,14 +3678,16 @@ switch ($Action) {
         }
         $ErrorActionPreference = $prevEAP
 
-        # Wrapper
-        foreach ($wrapper in @('launch-session.cmd', 'launch-session.ps1')) {
-            $wrapperPath = Join-Path $BinDir $wrapper
-            if (Test-Path $wrapperPath) {
-                Write-ServiceOk "$wrapper deployed"
-            } else {
-                Write-ServiceErr "$wrapper missing"
-            }
+        # Interactive mux launch (relocated to Worktree Manager since Phase
+        # 3b Sub-slice 2a Step 2; no in-plugin wrapper is deployed anymore).
+        # A lightweight presence check only -- the real health-gated
+        # resolution (version probe, current-version marker) lives in
+        # cmd_launch's own `_usable_worktree_manager_launcher_dir`.
+        $wmRoot = if ($env:WORKTREE_MANAGER_ROOT) { $env:WORKTREE_MANAGER_ROOT } else { Join-Path $env:USERPROFILE '.worktree-manager' }
+        if (Test-Path (Join-Path $wmRoot 'current-version')) {
+            Write-ServiceOk "Interactive launch: Worktree Manager found at $wmRoot"
+        } else {
+            Write-ServiceSkipped "Interactive launch: no Worktree Manager found; direct non-mux fallback"
         }
 
         # Binstub (.ps1 primary, .cmd fallback)
@@ -2963,12 +3757,14 @@ switch ($Action) {
             } catch { }
         }
 
-        # Terminal scripts (per-session psmux options + opt-in keybinds)
-        $sessOpts = Join-Path $BinDir 'session-options.ps1'
-        if (Test-Path $sessOpts) {
-            Write-ServiceOk "terminal scripts at $BinDir (session-options.ps1)"
+        # psmux-path.ps1 (the only terminal script agent-worktrees still
+        # deploys itself; the per-session options/keybind scripts relocated
+        # to Worktree Manager -- see the "Interactive launch" check above).
+        $psmuxPathDeployed = Join-Path $BinDir 'psmux-path.ps1'
+        if (Test-Path $psmuxPathDeployed) {
+            Write-ServiceOk "terminal script at $BinDir (psmux-path.ps1)"
         } else {
-            Write-ServiceWarn "terminal scripts missing - run 'update' to deploy"
+            Write-ServiceWarn "psmux-path.ps1 missing - run 'update' to deploy"
         }
 
         # Active worktree sessions
@@ -3033,16 +3829,43 @@ switch ($Action) {
     'update' {
         Write-ServiceHeader "Updating $ServiceName"
 
+        if ($ContextualInstall) {
+            if (-not (Ensure-Uv)) { exit 1 }
+            Ensure-UvIndex
+            foreach ($dir in @($InstallDir, $BinDir)) {
+                Ensure-InstallDir $dir
+            }
+            if (Test-SlotAlreadyComplete) {
+                Write-ServiceSkipped "Slot $SrcVersion already complete and unchanged -- skipping venv/package (re)install"
+            } else {
+                if (-not (Deploy-Venv)) { exit 1 }
+                if (-not (Deploy-Package)) { exit 1 }
+            }
+            if (-not (Deploy-Wrappers)) { exit 1 }
+            if (-not (Test-ContextGovernanceUnchanged)) {
+                Write-ServiceErr 'Installation governance changed before runtime cutover'
+                exit 1
+            }
+            if (-not (Invoke-VersionedActivate)) { exit 1 }
+            Write-V3Manifest
+            Write-ServiceOk "Context runtime updated at $InstallDir"
+            exit 0
+        }
+
         if (-not (Test-Path $BinDir)) {
             Write-ServiceErr "Not installed - run 'install' first"
             exit 1
         }
 
         # -- Shared runtime (venv first: package install targets the venv) --
-        if (-not (Deploy-Venv)) { exit 1 }
-        if (-not (Deploy-Package)) { exit 1 }
-        if (-not (Invoke-VersionedActivate)) { exit 1 }
+        if (Test-SlotAlreadyComplete) {
+            Write-ServiceSkipped "Slot $SrcVersion already complete and unchanged -- skipping venv/package (re)install"
+        } else {
+            if (-not (Deploy-Venv)) { exit 1 }
+            if (-not (Deploy-Package)) { exit 1 }
+        }
         if (-not (Deploy-Wrappers)) { exit 1 }
+        if (-not (Invoke-VersionedActivate)) { exit 1 }
         Deploy-CopilotPlugin
         Deploy-GlobalBinstub
         Ensure-CopilotExperimental

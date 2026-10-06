@@ -6,11 +6,13 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from agent_worktrees import related
+from agent_worktrees import output
 from agent_worktrees.related import Locus, RelatedConfig, RelatedEntry
 
 # ---------------------------------------------------------------------------
@@ -18,25 +20,31 @@ from agent_worktrees.related import Locus, RelatedConfig, RelatedEntry
 # ---------------------------------------------------------------------------
 
 def test_path_helpers(tmp_path: Path):
-    assert related.related_dir(tmp_path) == tmp_path / ".agent-worktrees"
-    assert related.related_path(tmp_path) == tmp_path / ".agent-worktrees" / "related.yaml"
-    assert related.docs_dir(tmp_path) == tmp_path / ".agent-worktrees" / "related"
+    assert related.related_dir(tmp_path) == (
+        tmp_path / ".copilot-extensions" / "agent-worktrees"
+    )
+    assert related.related_path(tmp_path) == (
+        tmp_path / ".copilot-extensions" / "agent-worktrees" / "related.yaml"
+    )
+    assert related.docs_dir(tmp_path) == (
+        tmp_path / ".copilot-extensions" / "agent-worktrees" / "related"
+    )
     assert related.default_doc_rel("example-web") == "related/example-web.md"
 
 
 def test_doc_abs_path_default_and_explicit(tmp_path: Path):
     # default for a bare name
     assert related.doc_abs_path(tmp_path, "foo") == (
-        tmp_path / ".agent-worktrees" / "related" / "foo.md"
+        tmp_path / ".copilot-extensions" / "agent-worktrees" / "related" / "foo.md"
     )
     # explicit doc on the entry wins
     e = RelatedEntry(name="foo", doc="related/custom.md")
     assert related.doc_abs_path(tmp_path, e) == (
-        tmp_path / ".agent-worktrees" / "related" / "custom.md"
+        tmp_path / ".copilot-extensions" / "agent-worktrees" / "related" / "custom.md"
     )
     # entry without doc falls back to the default
     assert related.doc_abs_path(tmp_path, RelatedEntry(name="bar")) == (
-        tmp_path / ".agent-worktrees" / "related" / "bar.md"
+        tmp_path / ".copilot-extensions" / "agent-worktrees" / "related" / "bar.md"
     )
 
 
@@ -48,8 +56,17 @@ def test_doc_abs_path_honors_origin_anchor(tmp_path: Path):
     e = RelatedEntry(name="example-web", doc="related/example-web.md",
                      origin_anchor=str(knowledge))
     assert related.doc_abs_path(base, e) == (
-        knowledge / ".agent-worktrees" / "related" / "example-web.md"
+        knowledge / ".copilot-extensions" / "agent-worktrees" / "related" / "example-web.md"
     )
+
+
+def test_plugin_anchor_path_helpers_keep_legacy_layout(tmp_path: Path):
+    plugin = tmp_path / "plugin"
+    plugin.mkdir()
+    (plugin / "plugin.json").write_text('{"name":"example"}', encoding="utf-8")
+    assert related.related_dir(plugin) == plugin / ".agent-worktrees"
+    assert related.related_path(plugin) == plugin / ".agent-worktrees" / "related.yaml"
+    assert related.docs_dir(plugin) == plugin / ".agent-worktrees" / "related"
 
 
 # ---------------------------------------------------------------------------
@@ -131,17 +148,28 @@ def test_grafted_list_role_filter(tmp_path: Path):
 # Installed-plugin config-graft: plugins contribute related entries by install
 # ---------------------------------------------------------------------------
 
-def _make_installed_plugin(root: Path, marketplace: str, name: str,
-                           cfg: RelatedConfig, *, manifest: str = "plugin.json"):
+def _make_installed_plugin(
+    root: Path,
+    marketplace: str,
+    name: str,
+    cfg: RelatedConfig,
+    *,
+    manifest: str = "plugin.json",
+    manifest_name: str | None = None,
+):
     """Create a fake installed plugin under root/<marketplace>/<name>/."""
     plugin_dir = root / marketplace / name
     plugin_dir.mkdir(parents=True, exist_ok=True)
     if manifest == "plugin.json":
-        (plugin_dir / "plugin.json").write_text("{}", encoding="utf-8")
+        _write_json(
+            plugin_dir / "plugin.json",
+            {"name": manifest_name or name},
+        )
     elif manifest == ".claude-plugin":
-        (plugin_dir / ".claude-plugin").mkdir(exist_ok=True)
-        (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
-            "{}", encoding="utf-8")
+        _write_json(
+            plugin_dir / ".claude-plugin" / "plugin.json",
+            {"name": manifest_name or name},
+        )
     # else: no manifest (negative case)
     _write_related(plugin_dir, cfg)
     return plugin_dir
@@ -184,7 +212,13 @@ def _register_project(home: Path, name: str, repo: Path) -> None:
         ["git", "-C", str(repo), "remote", "add", "origin", remote],
         check=True,
     )
-    platform_key = "windows" if os.name == "nt" else "linux"
+    platform_key = (
+        "windows"
+        if os.name == "nt"
+        else "wsl"
+        if os.environ.get("WSL_DISTRO_NAME")
+        else "linux"
+    )
     _write_json(
         home / ".agent-worktrees" / "projects.yaml",
         {"projects": {name: {"config_dir": f"~/.{name}"}}},
@@ -304,9 +338,14 @@ def test_plugin_related_anchors_use_effective_active_local_plugins(
         },
     )
 
-    assert related.installed_plugin_related_anchors(home=tmp_path) == [
-        str(enabled)
-    ]
+    anchors = related.installed_plugin_related_anchors(home=tmp_path)
+    assert anchors == [str(enabled)]
+    entry = related.get_related_grafted(anchors, "enabled")
+    assert entry is not None
+    assert related.entry_provenance(entry) == {
+        "layer": "plugin",
+        "plugin": "enabled-harness",
+    }
     assert str(disabled) not in related.installed_plugin_related_anchors(
         home=tmp_path
     )
@@ -378,6 +417,51 @@ def test_plugin_related_anchors_include_adopted_project_local_marketplace(
     ]
 
 
+def test_plugin_related_anchors_include_mixed_live_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv(related.INSTALLED_PLUGINS_ENV, raising=False)
+    installed = _make_installed_plugin(
+        tmp_path / ".copilot" / "installed-plugins",
+        "local",
+        "example-harness",
+        RelatedConfig(
+            related={"installed": RelatedEntry(name="installed", role="tooling")}
+        ),
+    ).resolve()
+    _write_json(installed / "plugin.json", {"name": "example-harness"})
+    repo = tmp_path / "control-harness"
+    _register_project(tmp_path, "control-harness", repo)
+    local = _make_local_marketplace_plugin(
+        repo,
+        "local",
+        "example-harness",
+        RelatedConfig(
+            related={"local": RelatedEntry(name="local", role="tooling")}
+        ),
+    )
+    _write_json(
+        tmp_path / ".copilot" / "settings.json",
+        {"enabledPlugins": {"example-harness@local": True}},
+    )
+    _write_json(
+        repo / ".github" / "copilot" / "settings.json",
+        {
+            "extraKnownMarketplaces": {
+                "local": {
+                    "source": {"source": "directory", "path": "./.ai"}
+                }
+            },
+            "enabledPlugins": {"example-harness@local": True},
+        },
+    )
+
+    assert related.installed_plugin_related_anchors(home=tmp_path) == sorted(
+        [str(installed), str(local)],
+        key=os.path.normcase,
+    )
+
+
 def test_plugin_related_anchors_fail_closed_on_indeterminate_settings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
@@ -432,16 +516,66 @@ def test_grafted_plugin_is_lowest_precedence_and_primary_ignored(
                                  summary="from knowledge")}))
 
     # anchor order as _related_config_source_anchors builds it: plugin, base, knowledge
-    merged = related.read_related_grafted([str(plugin), base, knowledge])
+    merged = related.read_related_grafted([
+        str(plugin),
+        related.config_contribution_anchor(base, "harness"),
+        related.config_contribution_anchor(knowledge, "knowledge"),
+    ])
 
     # union: plugin-only entry survives; collision resolves to knowledge
     assert set(merged.related) == {"example-web", "vessel"}
     assert merged.related["example-web"].summary == "from knowledge"   # user overrides plugin
     assert merged.related["example-web"].origin_anchor == str(knowledge)
+    assert related.entry_provenance(merged.related["example-web"]) == {
+        "layer": "knowledge",
+    }
     # plugin-only entry is contributed purely by being installed
     assert merged.related["vessel"].origin_anchor == str(plugin)
+    assert related.entry_provenance(merged.related["vessel"]) == {
+        "layer": "plugin",
+        "plugin": "example-web-harness",
+    }
     # a plugin's primary is NEVER adopted; the base primary stands
     assert merged.primary == "base-primary"
+
+
+def test_cli_config_sources_preserve_harness_and_knowledge_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    from agent_worktrees import related_cli as cli
+    from agent_worktrees.state_root import ConfigSource
+
+    harness = tmp_path / "harness"
+    knowledge = tmp_path / "knowledge"
+    _write_related(harness, RelatedConfig(related={
+        "from-harness": RelatedEntry(name="from-harness"),
+    }))
+    _write_related(knowledge, RelatedConfig(related={
+        "from-knowledge": RelatedEntry(name="from-knowledge"),
+    }))
+    monkeypatch.setattr(cli.cfg, "load_config", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        cli.state_root_mod,
+        "config_source_anchors",
+        lambda *_args, **_kwargs: [
+            ConfigSource(anchor=str(harness), origin="harness"),
+            ConfigSource(anchor=str(knowledge), origin="knowledge"),
+        ],
+    )
+    monkeypatch.setattr(
+        related, "installed_plugin_related_anchors", lambda: []
+    )
+
+    merged = related.read_related_grafted(
+        cli._related_config_source_anchors(str(harness))
+    )
+
+    assert related.entry_provenance(merged.related["from-harness"]) == {
+        "layer": "harness",
+    }
+    assert related.entry_provenance(merged.related["from-knowledge"]) == {
+        "layer": "knowledge",
+    }
 
 
 def test_grafted_plugin_only_entry_resolves_when_no_user_config(
@@ -458,6 +592,128 @@ def test_grafted_plugin_only_entry_resolves_when_no_user_config(
     # merely installing the plugin makes example-web resolvable
     e = related.get_related_grafted([str(plugin), base], "example-web")
     assert e is not None and e.delegate == "agent-codespaces"
+
+
+@pytest.mark.parametrize("manifest", ["plugin.json", ".claude-plugin"])
+def test_plugin_provenance_prefers_declared_manifest_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manifest: str,
+):
+    root = tmp_path / "installed-plugins"
+    plugin = _make_installed_plugin(
+        root,
+        "example-marketplace",
+        "cached-payload-1.2.3",
+        RelatedConfig(related={
+            "example-web": RelatedEntry(name="example-web", role="product")
+        }),
+        manifest=manifest,
+        manifest_name="example-web-harness",
+    )
+    monkeypatch.setenv(related.INSTALLED_PLUGINS_ENV, str(root))
+
+    entry = related.get_related_grafted([str(plugin)], "example-web")
+
+    assert entry is not None
+    assert related.entry_provenance(entry) == {
+        "layer": "plugin",
+        "plugin": "example-web-harness",
+    }
+
+
+@pytest.mark.parametrize("manifest_content", ["{not json", "{}"])
+def test_plugin_provenance_is_unknown_without_declared_manifest_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    manifest_content: str,
+):
+    root = tmp_path / "installed-plugins"
+    plugin = _make_installed_plugin(
+        root,
+        "example-marketplace",
+        "unverified-cache-directory",
+        RelatedConfig(related={
+            "example-web": RelatedEntry(name="example-web", role="product")
+        }),
+    )
+    (plugin / "plugin.json").write_text(manifest_content, encoding="utf-8")
+    monkeypatch.setenv(related.INSTALLED_PLUGINS_ENV, str(root))
+
+    entry = related.get_related_grafted([str(plugin)], "example-web")
+
+    assert entry is not None
+    assert related.entry_provenance(entry) == {
+        "layer": "plugin",
+        "plugin": "unknown",
+    }
+
+
+def test_related_show_reports_plugin_provenance_without_local_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd,
+):
+    from agent_worktrees.__main__ import cmd_related_dispatch as run
+
+    root = tmp_path / "installed-plugins"
+    plugin = _make_installed_plugin(
+        root, "example-marketplace", "example-web-harness",
+        RelatedConfig(related={
+            "example-web": RelatedEntry(name="example-web", role="product")
+        }),
+    )
+    monkeypatch.setenv(related.INSTALLED_PLUGINS_ENV, str(root))
+    base = tmp_path / "harness"
+    _write_related(base, RelatedConfig())
+
+    assert run([
+        "show", "example-web", "--repo", str(base), "--json",
+    ]) == 0
+    rendered = capfd.readouterr().out
+    payload = json.loads(rendered)
+    assert payload["provenance"] == {
+        "layer": "plugin",
+        "plugin": "example-web-harness",
+    }
+    assert str(plugin) not in rendered
+
+    assert run(["show", "example-web", "--repo", str(base)]) == 0
+    rendered = capfd.readouterr().out
+    assert "provenance: plugin (example-web-harness)" in rendered
+    assert "doc:      related/example-web.md" in rendered
+    assert str(plugin) not in rendered
+
+
+def test_related_show_sanitizes_absolute_plugin_doc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd,
+):
+    from agent_worktrees.__main__ import cmd_related_dispatch as run
+
+    root = tmp_path / "installed-plugins"
+    leaked_doc = r"C:\Users\operator\.copilot\installed-plugins\README.md"
+    _make_installed_plugin(
+        root,
+        "example-marketplace",
+        "example-web-harness",
+        RelatedConfig(related={
+            "example-web": RelatedEntry(
+                name="example-web",
+                role="product",
+                doc=leaked_doc,
+            )
+        }),
+    )
+    monkeypatch.setenv(related.INSTALLED_PLUGINS_ENV, str(root))
+    base = tmp_path / "harness"
+    _write_related(base, RelatedConfig())
+
+    assert run([
+        "show", "example-web", "--repo", str(base), "--json",
+    ]) == 0
+    payload = json.loads(capfd.readouterr().out)
+    assert payload["doc"] == "related/example-web.md"
+
+    assert run(["show", "example-web", "--repo", str(base)]) == 0
+    rendered = capfd.readouterr().out
+    assert "doc:      related/example-web.md" in rendered
+    assert leaked_doc not in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +761,46 @@ def test_read_non_mapping_returns_empty(tmp_path: Path):
     p.parent.mkdir(parents=True)
     p.write_text("- just\n- a\n- list\n", encoding="utf-8")
     assert related.read_related(tmp_path) == RelatedConfig()
+
+
+def test_read_legacy_related_fallback(tmp_path: Path):
+    legacy = tmp_path / ".agent-worktrees" / "related.yaml"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("related:\n  legacy:\n    role: tooling\n", encoding="utf-8")
+    cfg = related.read_related(tmp_path)
+    assert cfg.related["legacy"].role == "tooling"
+    assert cfg.related["legacy"].doc_root == str(legacy.parent)
+
+
+def test_marketplace_overlay_overrides_related_entry(tmp_path: Path, monkeypatch):
+    base = related.related_path(tmp_path)
+    base.parent.mkdir(parents=True)
+    base.write_text(
+        "primary: base\nrelated:\n  example:\n    role: tooling\n    summary: base\n",
+        encoding="utf-8",
+    )
+    overlay = (
+        tmp_path
+        / ".copilot-extensions"
+        / "agent-worktrees"
+        / "marketplaces"
+        / "mp-test"
+        / "related.yaml"
+    )
+    overlay.parent.mkdir(parents=True)
+    overlay.write_text(
+        "primary: overlay\nrelated:\n  example:\n    role: product\n  extra:\n    role: docs\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "COPILOT_EXTENSIONS_CONTEXT",
+        json.dumps({"marketplaceId": "mp-test"}),
+    )
+    cfg = related.read_related(tmp_path)
+    assert cfg.primary == "overlay"
+    assert cfg.related["example"].role == "product"
+    assert cfg.related["extra"].role == "docs"
+    assert cfg.related["example"].doc_root == str(overlay.parent)
 
 
 # ---------------------------------------------------------------------------
@@ -1095,7 +1391,7 @@ def test_plugins_roundtrip(tmp_path: Path):
 
 
 def test_plugins_parse_shorthand_dedup_and_invalid(tmp_path: Path):
-    (tmp_path / ".agent-worktrees").mkdir()
+    related.related_path(tmp_path).parent.mkdir(parents=True)
     related.related_path(tmp_path).write_text(
         "related:\n"
         "  x:\n"
@@ -1136,8 +1432,8 @@ def test_no_plugins_emits_nothing(tmp_path: Path):
 
 def test_pr_roundtrip(tmp_path: Path):
     cfg = RelatedConfig(related={
-        "spark-transpile": RelatedEntry(
-            name="spark-transpile",
+        "example-transpile": RelatedEntry(
+            name="example-transpile",
             role="tooling",
             pr={
                 "enabled": True,
@@ -1151,7 +1447,7 @@ def test_pr_roundtrip(tmp_path: Path):
         ),
     })
     related.write_related(tmp_path, cfg)
-    got = related.read_related(tmp_path).related["spark-transpile"]
+    got = related.read_related(tmp_path).related["example-transpile"]
     assert got.pr == {
         "enabled": True,
         "required": True,
@@ -1164,7 +1460,7 @@ def test_pr_roundtrip(tmp_path: Path):
 
 
 def test_pr_parse_nonmapping_is_empty(tmp_path: Path):
-    (tmp_path / ".agent-worktrees").mkdir()
+    related.related_path(tmp_path).parent.mkdir(parents=True)
     related.related_path(tmp_path).write_text(
         "related:\n"
         "  x:\n"
@@ -1255,7 +1551,7 @@ def test_find_control_plane_anchor_none_when_undeclared(tmp_path: Path, monkeypa
 
 
 def test_related_lookup_anchors_falls_back_to_control_plane(monkeypatch):
-    from agent_worktrees import __main__ as cli
+    from agent_worktrees import related_cli as cli
     monkeypatch.setattr(cli, "_related_config_source_anchors", lambda base: [base])
     monkeypatch.setattr(
         related, "get_related_grafted",
@@ -1269,7 +1565,7 @@ def test_related_lookup_anchors_falls_back_to_control_plane(monkeypatch):
 
 
 def test_related_lookup_anchors_local_hit_skips_fallback(monkeypatch):
-    from agent_worktrees import __main__ as cli
+    from agent_worktrees import related_cli as cli
     monkeypatch.setattr(cli, "_related_config_source_anchors", lambda base: [base])
     monkeypatch.setattr(related, "get_related_grafted",
                         lambda anchors, name: object())
@@ -1283,7 +1579,7 @@ def test_related_lookup_anchors_local_hit_skips_fallback(monkeypatch):
 
 
 def test_related_lookup_anchors_respects_explicit_repo(monkeypatch):
-    from agent_worktrees import __main__ as cli
+    from agent_worktrees import related_cli as cli
     monkeypatch.setattr(cli, "_related_config_source_anchors", lambda base: [base])
     calls = {"cp": 0}
 
@@ -1443,6 +1739,7 @@ def test_normalize_ownership_drops_unknown():
     assert related.normalize_ownership("  internal ") == "internal"
     assert related.normalize_ownership("public") == ""   # not in VALID_OWNERSHIP
     assert related.normalize_ownership(None) == ""
+    assert related.normalize_ownership(123) == ""  # non-string: never raises
 
 
 def test_read_drops_bogus_ownership(tmp_path: Path):
@@ -1599,7 +1896,7 @@ def test_cli_owners_is_global_via_control_plane(tmp_path: Path, monkeypatch):
     """`related owners` reads the CONTROL-PLANE index regardless of cwd (so an
     ambient consumer gets the owned set from anywhere), never raising the
     cwd-anchor guard."""
-    from agent_worktrees import __main__ as cli
+    from agent_worktrees import related_cli as cli
     cp = tmp_path / "control-plane"; cp.mkdir()
     _patch_registry(monkeypatch, {
         "mine": "https://github.com/me/mine.git",
@@ -1611,14 +1908,370 @@ def test_cli_owners_is_global_via_control_plane(tmp_path: Path, monkeypatch):
     }))
     monkeypatch.setattr(related, "find_control_plane_anchor", lambda: str(cp))
     # No --repo, and _related_anchor would not resolve a project here: the
-    # control-plane path must still answer.
+    # control-plane path must still answer. _related_anchor is self-owned
+    # by related_cli (patch there); _json_output lives in output.py now
+    # (patch there too -- see docs/patterns/compatibility-root-decoupling.md).
     monkeypatch.setattr(cli, "_related_anchor", lambda rest: None)
     captured: dict = {}
-    monkeypatch.setattr(cli, "_json_output", lambda payload: captured.update(payload))
+    monkeypatch.setattr(output, "_json_output", lambda payload: captured.update(payload))
     rc = cli.cmd_related_dispatch(["owners", "--json"])
     assert rc == 0
     assert captured["source"] == "control-plane"
     assert [t["name"] for t in captured["owned"]] == ["mine"]
+
+
+# ---------------------------------------------------------------------------
+# Audience + AI-attribution override: schema round-trip, normalization,
+# resolved disclosure policy
+# ---------------------------------------------------------------------------
+
+def test_audience_roundtrips(tmp_path: Path):
+    cfg = RelatedConfig(related={
+        "pub": RelatedEntry(name="pub", audience="public"),
+        "priv": RelatedEntry(
+            name="priv", audience="private",
+            ai_attribution={"disclose_on_open": False, "disclose_on_reply": True},
+        ),
+    })
+    related.write_related(tmp_path, cfg)
+    got = related.read_related(tmp_path)
+    assert got.related["pub"].audience == "public"
+    assert got.related["priv"].audience == "private"
+    assert got.related["priv"].ai_attribution == {
+        "disclose_on_open": False, "disclose_on_reply": True,
+    }
+    # Emitted YAML is valid + carries the fields.
+    data = yaml.safe_load(related.related_path(tmp_path).read_text(encoding="utf-8"))
+    assert data["related"]["pub"]["audience"] == "public"
+    assert data["related"]["priv"]["ai_attribution"]["disclose_on_open"] is False
+    assert data["related"]["priv"]["ai_attribution"]["disclose_on_reply"] is True
+
+
+def test_normalize_audience_drops_unknown():
+    assert related.normalize_audience("PUBLIC") == "public"
+    assert related.normalize_audience("  private ") == "private"
+    assert related.normalize_audience("owned") == ""  # not in VALID_AUDIENCE
+    assert related.normalize_audience(None) == ""
+    assert related.normalize_audience(123) == ""  # non-string: never raises
+
+
+def test_read_drops_non_string_audience_without_breaking_the_whole_config(
+    tmp_path: Path,
+):
+    """A malformed `audience: 123` (a YAML integer) must not raise and must
+    not prevent the rest of the config from loading."""
+    related.related_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    related.related_path(tmp_path).write_text(
+        "related:\n  x:\n    audience: 123\n  y:\n    audience: public\n",
+        encoding="utf-8",
+    )
+    cfg = related.read_related(tmp_path)
+    assert cfg.related["x"].audience == ""
+    assert cfg.related["y"].audience == "public"
+
+
+def test_read_drops_bogus_audience(tmp_path: Path):
+    related.related_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    related.related_path(tmp_path).write_text(
+        "related:\n  x:\n    audience: bogus\n", encoding="utf-8")
+    e = related.read_related(tmp_path).related["x"]
+    assert e.audience == ""  # bogus dropped
+
+
+def test_parse_ai_attribution_drops_unknown_keys_and_nonbool_values():
+    assert related._parse_ai_attribution(
+        {"disclose_on_open": False, "unknown_key": True, "disclose_on_reply": "yes"}
+    ) == {"disclose_on_open": False}  # unknown key + non-bool value both dropped
+    assert related._parse_ai_attribution("not a dict") == {}
+    assert related._parse_ai_attribution(None) == {}
+
+
+def test_no_audience_emits_nothing(tmp_path: Path):
+    cfg = RelatedConfig(related={"x": RelatedEntry(name="x", role="tooling")})
+    related.write_related(tmp_path, cfg)
+    data = yaml.safe_load(related.related_path(tmp_path).read_text(encoding="utf-8"))
+    assert "audience" not in data["related"]["x"]
+    assert "ai_attribution" not in data["related"]["x"]
+
+
+def test_upsert_merges_audience_and_ai_attribution(tmp_path: Path):
+    related.upsert_related(tmp_path, RelatedEntry(name="x", role="tooling"))
+    related.upsert_related(tmp_path, RelatedEntry(
+        name="x", audience="private", ai_attribution={"disclose_on_open": False}))
+    e = related.get_related(tmp_path, "x")
+    assert e.role == "tooling"       # preserved
+    assert e.audience == "private"   # added
+    assert e.ai_attribution == {"disclose_on_open": False}
+    # A second upsert narrowing further merges rather than replaces.
+    related.upsert_related(tmp_path, RelatedEntry(
+        name="x", ai_attribution={"disclose_on_reply": False}))
+    e = related.get_related(tmp_path, "x")
+    assert e.ai_attribution == {
+        "disclose_on_open": False, "disclose_on_reply": False,
+    }
+
+
+def test_effective_audience_never_derives():
+    """Unlike effective_ownership, an unset audience must stay empty --
+    there is no derivation fallback to guess it from. Uses a trusted
+    origin_layer so the policy-weakening trust gate (see the dedicated
+    "untrusted source" tests below) isn't what's under test here."""
+    assert related.effective_audience(RelatedEntry(name="x")) == ""
+    assert related.effective_audience(
+        RelatedEntry(name="x", audience="private", origin_layer="knowledge")
+    ) == "private"
+
+
+def test_effective_ai_attribution_defaults_by_audience():
+    # public/internal/unclassified all default to disclosure required.
+    assert related.effective_ai_attribution(
+        RelatedEntry(name="x", audience="public")) == {
+        "disclose_on_open": True, "disclose_on_reply": True,
+    }
+    assert related.effective_ai_attribution(
+        RelatedEntry(name="x", audience="internal")) == {
+        "disclose_on_open": True, "disclose_on_reply": True,
+    }
+    assert related.effective_ai_attribution(RelatedEntry(name="x")) == {
+        "disclose_on_open": True, "disclose_on_reply": True,
+    }
+    # private (trusted source) defaults both to False.
+    assert related.effective_ai_attribution(
+        RelatedEntry(name="x", audience="private", origin_layer="knowledge")
+    ) == {
+        "disclose_on_open": False, "disclose_on_reply": False,
+    }
+
+
+def test_effective_ai_attribution_override_is_per_key_and_verbatim():
+    # A public repo (trusted source) with only disclose_on_open overridden
+    # off keeps disclose_on_reply at its audience-derived default (True) --
+    # the override is scoped to the key it names, not all-or-nothing.
+    e = RelatedEntry(
+        name="x", audience="public", origin_layer="knowledge",
+        ai_attribution={"disclose_on_open": False},
+    )
+    assert related.effective_ai_attribution(e) == {
+        "disclose_on_open": False, "disclose_on_reply": True,
+    }
+    # A present override key is honored verbatim, in either direction
+    # relative to the audience-derived default -- a private, trusted repo
+    # (default False/False) can still explicitly turn disclose_on_reply ON.
+    e2 = RelatedEntry(
+        name="x", audience="private", origin_layer="knowledge",
+        ai_attribution={"disclose_on_reply": True},
+    )
+    assert related.effective_ai_attribution(e2) == {
+        "disclose_on_open": False, "disclose_on_reply": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Untrusted sources must never be able to WEAKEN AI-attribution disclosure
+# (only an operator-controlled overlay layer can claim `private` or turn a
+# disclosure key off) -- they can still WIDEN it freely.
+# ---------------------------------------------------------------------------
+
+def test_effective_audience_discards_private_from_an_untrusted_source():
+    # origin_layer="" (the default -- no graft provenance at all) and
+    # origin_layer="repository" (a target's own tracked related.yaml) are
+    # both untrusted for this purpose.
+    assert related.effective_audience(
+        RelatedEntry(name="x", audience="private")) == ""
+    assert related.effective_audience(
+        RelatedEntry(name="x", audience="private", origin_layer="repository")
+    ) == ""
+    # "harness" (whichever repo happens to be the current launch/base
+    # anchor -- state_root.config_source_anchors labels it this way
+    # unconditionally) with no origin_anchor at all is untrusted --
+    # there's nothing to compare against the described repo's own
+    # checkout, so it fails closed. See the dedicated harness/self-vs-
+    # sibling tests below for the positive-verification cases.
+    assert related.effective_audience(
+        RelatedEntry(name="x", audience="private", origin_layer="harness")
+    ) == ""
+    # A "plugin"-layer entry is also untrusted for policy-weakening.
+    assert related.effective_audience(
+        RelatedEntry(name="x", audience="private", origin_layer="plugin")
+    ) == ""
+    # public/internal from an untrusted source are fine either way --
+    # widening (or a no-op) is never a safety concern.
+    assert related.effective_audience(
+        RelatedEntry(name="x", audience="public", origin_layer="repository")
+    ) == "public"
+
+
+def test_effective_ai_attribution_discards_narrowing_override_from_an_untrusted_source():
+    # An untrusted repository-layer entry cannot turn disclose_on_open off
+    # for itself, even though a trusted source could.
+    e = RelatedEntry(
+        name="x", audience="public", origin_layer="repository",
+        ai_attribution={"disclose_on_open": False},
+    )
+    assert related.effective_ai_attribution(e) == {
+        "disclose_on_open": True, "disclose_on_reply": True,
+    }
+    # The same override from a trusted layer IS honored (contrast case).
+    e_trusted = RelatedEntry(
+        name="x", audience="public", origin_layer="knowledge",
+        ai_attribution={"disclose_on_open": False},
+    )
+    assert related.effective_ai_attribution(e_trusted) == {
+        "disclose_on_open": False, "disclose_on_reply": True,
+    }
+    # An untrusted source turning a key ON (widening) is still honored --
+    # only narrowing is gated.
+    e_widen = RelatedEntry(
+        name="x", audience="private", origin_layer="repository",
+        ai_attribution={"disclose_on_reply": True},
+    )
+    assert related.effective_ai_attribution(e_widen) == {
+        # audience itself was also discarded (untrusted "private" claim),
+        # so the baseline default is True/True; the explicit True override
+        # on disclose_on_reply is a no-op widening, not narrowing.
+        "disclose_on_open": True, "disclose_on_reply": True,
+    }
+
+
+def test_harness_entry_describing_a_different_repo_is_still_untrusted(
+    monkeypatch,
+):
+    """The exact gap round 6 of review caught: an earlier revision trusted
+    a "harness"-layer entry whenever its origin_anchor differed from the
+    DESCRIBED repo's own checkout, reasoning that meant "describing a
+    sibling, not itself." But that path-inequality alone never establishes
+    the "harness" anchor itself is operator-controlled -- an untrusted
+    launch repo A can commit a related.yaml entry describing some OTHER,
+    registered repo B (not A itself) with `audience: private`, and A's
+    path will always differ from B's. Confirms the entry stays untrusted
+    regardless of what it describes, since "harness" carries no positive
+    signal of operator authorship at all."""
+    from agent_worktrees import repos as repos_mod
+
+    monkeypatch.setattr(
+        repos_mod, "find_repo",
+        lambda name: SimpleNamespace(local_path=lambda plat=None: "/some/other/path")
+        if name == "sibling-repo" else None,
+    )
+    e = RelatedEntry(
+        name="sibling-repo", audience="private", origin_layer="harness",
+        origin_anchor="/path/to/an/untrusted/launch/repo",
+    )
+    assert related.effective_audience(e) == ""
+
+
+def test_harness_layer_from_the_real_anchor_construction_path_is_untrusted(
+    tmp_path, monkeypatch
+):
+    """Drives the REAL `_related_config_source_anchors` ->
+    `state_root.config_source_anchors` -> `config_contribution_anchor`
+    chain (not a hand-built anchor) to prove a target repo's own tracked
+    `related.yaml` -- which that real chain labels `"harness"` purely
+    because it's the current launch/base anchor, with no way to tell it
+    apart from the operator's own control-plane config -- cannot claim
+    `audience: private` for itself. This is the exact gap a prior round of
+    review caught: a hand-constructed test anchor doesn't prove the real
+    production path is actually gated."""
+    from agent_worktrees import related_cli as cli
+    from agent_worktrees import state_root
+
+    repo = tmp_path / "untrusted-target-repo"
+    repo.mkdir()
+    related.write_related(repo, RelatedConfig(related={
+        "untrusted-target-repo": RelatedEntry(
+            name="untrusted-target-repo", audience="private",
+        ),
+    }))
+    monkeypatch.setattr(
+        state_root, "config_source_anchors",
+        lambda *_a, **_k: [SimpleNamespace(anchor=str(repo), origin="harness")],
+    )
+    monkeypatch.setattr(related, "installed_plugin_related_anchors", lambda **_k: [])
+
+    anchors = cli._related_config_source_anchors(str(repo))
+    entry = related.get_related_grafted(anchors, "untrusted-target-repo")
+    assert entry.origin_layer == "harness"  # confirms the real path's own labeling
+    assert related.effective_audience(entry) == ""  # discarded, not "private"
+
+
+def test_show_and_resolve_json_surface_audience_and_resolved_attribution(
+    tmp_path, monkeypatch
+):
+    """CLI-level proof for the Phase 2 consumer contract: both `related
+    show --json` and `related resolve --json` must carry `audience`
+    (`audience_explicit` for `show`) and the resolved `ai_attribution`
+    policy, for every audience value including the unclassified fail-open
+    case. Uses a trusted (`knowledge`-layer) anchor, since an untrusted
+    (`repository`-layer) source is covered separately below -- see
+    `test_effective_audience_discards_private_from_an_untrusted_source`
+    and its ai_attribution counterpart for that gate's own model-level
+    proof, and the `resolve`-path case here for the full CLI wiring."""
+    from agent_worktrees import related_cli as cli
+    from agent_worktrees import repos as repos_mod
+    from agent_worktrees import doctor as doctor_mod
+
+    anchor = tmp_path / "repo"
+    anchor.mkdir()
+    cfg = RelatedConfig(related={
+        "pub": RelatedEntry(name="pub", audience="public"),
+        "priv": RelatedEntry(
+            name="priv", audience="private",
+            ai_attribution={"disclose_on_reply": True},
+        ),
+        "plain": RelatedEntry(name="plain"),  # unclassified
+        # An untrusted (repository-layer) source cannot claim private or
+        # narrow a key, even though it's the same raw YAML shape.
+        "untrusted_priv": RelatedEntry(
+            name="untrusted_priv", audience="private",
+            ai_attribution={"disclose_on_open": False},
+        ),
+    })
+    related.write_related(anchor, cfg)
+    trusted_anchor = related.config_contribution_anchor(anchor, "knowledge")
+    monkeypatch.setattr(cli, "_related_anchor", lambda rest: str(anchor))
+    monkeypatch.setattr(
+        cli, "_related_lookup_anchors",
+        lambda rest, anc, name: ([trusted_anchor], False),
+    )
+    monkeypatch.setattr(repos_mod, "find_repo", lambda name: None)
+    monkeypatch.setattr(
+        doctor_mod, "_read_projects", lambda: (_ for _ in ()).throw(Exception())
+    )
+
+    cases = {
+        "pub": ("public", {"disclose_on_open": True, "disclose_on_reply": True}),
+        "priv": ("private", {"disclose_on_open": False, "disclose_on_reply": True}),
+        "plain": ("", {"disclose_on_open": True, "disclose_on_reply": True}),
+    }
+    for name, (expected_audience, expected_policy) in cases.items():
+        captured: dict = {}
+        monkeypatch.setattr(output, "_json_output", lambda payload: captured.update(payload))
+        rc = cli.cmd_related_dispatch(["show", name, "--json"])
+        assert rc == 0, name
+        assert captured["audience"] == expected_audience, name
+        assert captured["ai_attribution"] == expected_policy, name
+
+        captured2: dict = {}
+        monkeypatch.setattr(output, "_json_output", lambda payload: captured2.update(payload))
+        rc = cli.cmd_related_dispatch(["resolve", name, "--json"])
+        assert rc == 0, name
+        assert captured2["audience"] == expected_audience, name
+        assert captured2["ai_attribution"] == expected_policy, name
+
+    # The untrusted (repository-layer) override from the SAME anchor path,
+    # un-tagged as a trusted contribution, must not weaken disclosure.
+    monkeypatch.setattr(
+        cli, "_related_lookup_anchors",
+        lambda rest, anc, name: ([anc], False),
+    )
+    captured3: dict = {}
+    monkeypatch.setattr(output, "_json_output", lambda payload: captured3.update(payload))
+    rc = cli.cmd_related_dispatch(["resolve", "untrusted_priv", "--json"])
+    assert rc == 0
+    assert captured3["audience"] == ""  # "private" claim discarded
+    assert captured3["ai_attribution"] == {
+        "disclose_on_open": True, "disclose_on_reply": True,
+    }
 
 
 # ---------------------------------------------------------------------------

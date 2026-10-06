@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import socket
+import sys
 import threading
 import time
 
 import httpx
 import pytest
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from agent_dispatch.client import (
@@ -15,20 +18,126 @@ from agent_dispatch.client import (
     DispatchError,
     DispatchUpgradeRequired,
 )
+from agent_dispatch.coordinator_auth import scoped_control_token
+from agent_dispatch.coordinator_loops import _refresh_worktree_status_relay
 from agent_dispatch.coordinator import create_app
 from agent_dispatch.queue import Status
+from agent_dispatch import remote_dispatch
+from agent_dispatch.worktree_status_relay import WorktreeStatusRelayStore
 from tests._helpers import TEST_REPO
 from tests._helpers import RepoDefaultingQueue as TaskQueue
+
+CONTROL_TOKEN = "control-token"
 
 
 @pytest.fixture
 def app(tmp_path):
-    return create_app(TaskQueue(tmp_path / "tasks.db"))
+    return create_app(TaskQueue(tmp_path / "tasks.db"), control_token=CONTROL_TOKEN)
 
 
 @pytest.fixture
 def api(app):
-    return TestClient(app)
+    with TestClient(app) as client:
+        yield client
+
+
+def _registration_machine() -> str:
+    return remote_dispatch.local_machine() or "test-host"
+
+
+def _control_headers(sender: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {CONTROL_TOKEN}",
+        "X-Agent-Dispatch-Sender-Proof": scoped_control_token(
+            CONTROL_TOKEN, f"event-note:{sender}"
+        ),
+    }
+
+
+def _register_event_emitter(api, *, reg_id: str = "emitter-review") -> str:
+    api.app.state.queue.register_registration(
+        "emitter",
+        {
+            "id": "review-emitter",
+            "repo": TEST_REPO,
+            "command": ["echo", "tick"],
+            "interval_seconds": 60,
+        },
+        reg_id=reg_id,
+        machine=_registration_machine(),
+    )
+    return reg_id
+
+
+def test_resource_reservation_api_elects_binds_and_owner_releases(api):
+    key = "forge:github:repository:example/project:issue:7"
+    acquired = api.post(
+        "/resource-reservations/acquire",
+        json={"key": key, "owner": "loop:alpha", "ttl": 60},
+    )
+    assert acquired.status_code == 200
+    assert acquired.json()["granted"]
+    token = acquired.json()["reservation"]["token"]
+
+    stale_same_owner = api.post(
+        "/resource-reservations/acquire",
+        json={"key": key, "owner": "loop:alpha", "ttl": 60},
+    )
+    assert not stale_same_owner.json()["granted"]
+    assert "token" not in stale_same_owner.json()["reservation"]
+
+    renewed = api.post(
+        "/resource-reservations/acquire",
+        json={
+            "key": key,
+            "owner": "loop:alpha",
+            "token": token,
+            "ttl": 60,
+        },
+    )
+    assert renewed.json()["granted"]
+    assert renewed.json()["reservation"]["token"] == token
+
+    denied = api.post(
+        "/resource-reservations/acquire",
+        json={"key": key, "owner": "loop:beta", "ttl": 60},
+    )
+    assert denied.status_code == 200
+    assert not denied.json()["granted"]
+    assert denied.json()["reservation"]["owner"] == "loop:alpha"
+    assert "token" not in denied.json()["reservation"]
+
+    bound = api.post(
+        "/resource-reservations/bind",
+        json={
+            "key": key,
+            "owner": "loop:alpha",
+            "token": token,
+            "task_id": "task-7",
+        },
+    )
+    assert bound.status_code == 200
+    assert bound.json()["task_id"] == "task-7"
+
+    refused = api.post(
+        "/resource-reservations/release",
+        json={"key": key, "owner": "loop:beta", "token": token},
+    )
+    assert refused.status_code == 200
+    assert not refused.json()["released"]
+
+    listed = api.get(
+        "/resource-reservations", params={"owner_prefix": "loop:"}
+    )
+    assert listed.status_code == 200
+    assert [item["key"] for item in listed.json()] == [key]
+
+    released = api.post(
+        "/resource-reservations/release",
+        json={"key": key, "owner": "loop:alpha", "token": token},
+    )
+    assert released.status_code == 200
+    assert released.json()["released"]
 
 
 @pytest.fixture
@@ -99,6 +208,42 @@ def test_client_suspend_resume_release_routes(client, monkeypatch):
     assert released["owner"] is None
 
 
+def test_client_suspend_cooldown_seconds_round_trips_over_http(client):
+    task = client.create("wait")
+    owner = client.claim(worker_id="worker-1", repo=TEST_REPO)["owner"]
+    client.start(task["id"], owner)
+
+    parked = client.suspend(
+        task["id"], owner, reason="waiting", cooldown_seconds=30.0
+    )
+
+    assert parked["monitor_kind"] == "cooldown"
+    assert parked["monitor_not_before"] > parked["updated_at"]
+
+
+def test_client_suspend_cooldown_seconds_omitted_still_applies_default(client):
+    task = client.create("wait")
+    owner = client.claim(worker_id="worker-1", repo=TEST_REPO)["owner"]
+    client.start(task["id"], owner)
+
+    parked = client.suspend(task["id"], owner, reason="waiting")
+
+    assert parked["monitor_kind"] == "cooldown"
+
+
+def test_client_suspend_cooldown_seconds_none_suppresses_the_monitor(client):
+    task = client.create("wait")
+    owner = client.claim(worker_id="worker-1", repo=TEST_REPO)["owner"]
+    client.start(task["id"], owner)
+
+    parked = client.suspend(
+        task["id"], owner, reason="waiting", cooldown_seconds=None
+    )
+
+    assert parked["monitor_kind"] is None
+    assert parked["monitor_not_before"] is None
+
+
 def test_client_resume_can_atomically_adopt_successor_session(
     client, monkeypatch
 ):
@@ -161,13 +306,359 @@ def test_health(api):
     assert r.json()["status"] == "ok"
 
 
+def test_worktree_status_relay_route_reads_local_store(api):
+    relay = api.app.state.worktree_status_relay
+    relay.put(
+        TEST_REPO,
+        "wt1",
+        {"facts": {"claims": {"confirmed": True, "value": {"resources": []}}}},
+        fetched_at=123.0,
+        poll_interval_seconds=10.0,
+    )
+
+    response = api.get(
+        "/worktree-status-relay",
+        params={"repo": TEST_REPO, "worktree_id": "wt1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["worktree_id"] == "wt1"
+    assert response.json()["repo"] == TEST_REPO
+
+
+def test_worktree_status_relays_route_batches_entries(api):
+    relay = api.app.state.worktree_status_relay
+    relay.put(
+        TEST_REPO,
+        "wt1",
+        {"facts": {"claims": {"confirmed": True, "value": {"resources": []}}}},
+        fetched_at=123.0,
+        poll_interval_seconds=10.0,
+    )
+
+    response = api.post(
+        "/worktree-status-relays",
+        json=[
+            {"repo": TEST_REPO, "worktree_id": "wt1"},
+            {"repo": TEST_REPO, "worktree_id": "wt2"},
+        ],
+    )
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {"repo": TEST_REPO, "worktree_id": "wt1", "entry": relay.get(TEST_REPO, "wt1")},
+        {"repo": TEST_REPO, "worktree_id": "wt2", "entry": None},
+    ]
+
+
+def test_create_app_registers_representative_extracted_route_groups(app):
+    route_paths = {
+        route.path for route in app.routes if isinstance(route, APIRoute)
+    }
+    assert {
+        "/health",
+        "/events",
+        "/directory",
+        "/satellites",
+        "/tasks",
+        "/claim",
+        "/spawn-reservations",
+        "/routing-assignments",
+        "/schedules",
+    } <= route_paths
+
+
+def test_health_loops_empty_when_sweep_disabled(api):
+    # The loop-health map is always present once lifespan starts; disabled
+    # loops report zero intervals instead of disappearing.
+    with TestClient(
+        create_app(TaskQueue(api.app.state.queue.db_path), control_token=CONTROL_TOKEN, verification_interval=0.0)
+    ) as client:
+        loops = client.get("/health").json()["loops"]
+        assert loops["liveness_gc"]["base_interval"] == 0.0
+        assert loops["orphan_reap"]["base_interval"] == 0.0
+        assert loops["handoff_fallback"]["base_interval"] == 0.0
+        assert loops["worktree_status_relay"]["base_interval"] == 0.0
+
+
+def test_health_includes_slot_descriptor_shape(api):
+    # process-slot-ownership Phase 5: /health renders a "slot" descriptor
+    # (process -> slot -> owner -> alive?) regardless of what state the
+    # self-retire / abandoned-passive-reap loops happen to be in.
+    slot = api.get("/health").json()["slot"]
+    assert set(slot) == {
+        "pid", "role", "active", "previous",
+        "self_retire", "abandoned_passive_reap",
+    }
+    assert isinstance(slot["pid"], int)
+    assert slot["role"] in ("active", "passive", "unknown")
+    assert set(slot["self_retire"]) == {
+        "enabled", "armed", "generation", "superseded", "confirms",
+    }
+    assert set(slot["abandoned_passive_reap"]) == {
+        "enabled", "armed", "last_outcome",
+    }
+
+
+def test_slot_descriptor_unknown_role_without_routing_table(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from agent_dispatch.coordinator import _slot_descriptor
+
+    monkeypatch.setenv("AGENT_DISPATCH_ROUTING_DIR", str(tmp_path / "no-routing"))
+    slot = _slot_descriptor(SimpleNamespace())
+    assert slot["role"] == "unknown"
+    assert slot["active"] is None
+    assert slot["previous"] is None
+    # No status ever published on app.state -> the descriptor still returns
+    # the documented shape with conservative defaults, never a KeyError.
+    assert slot["self_retire"] == {
+        "enabled": False, "armed": False, "generation": None,
+        "superseded": False, "confirms": 0,
+    }
+    assert slot["abandoned_passive_reap"] == {
+        "enabled": False, "armed": False, "last_outcome": None,
+    }
+
+
+def test_slot_descriptor_reports_active_role_for_own_pid(tmp_path, monkeypatch):
+    import os
+    from types import SimpleNamespace
+
+    from zdd import routing
+
+    from agent_dispatch.coordinator import _slot_descriptor
+
+    routing_dir = tmp_path / "routing"
+    monkeypatch.setenv("AGENT_DISPATCH_ROUTING_DIR", str(routing_dir))
+    routing.publish_active(
+        routing_dir, bind="127.0.0.1", port=9281, pid=os.getpid(), version="1.0",
+    )
+    slot = _slot_descriptor(SimpleNamespace())
+    assert slot["role"] == "active"
+    assert slot["active"]["pid"] == os.getpid()
+
+
+def test_slot_descriptor_reports_unknown_role_when_active_pid_is_null(
+    tmp_path, monkeypatch,
+):
+    """A malformed/legacy routing entry with no recorded pid must never be
+    mistaken for "passive" -- there is nothing to compare against, so the
+    owner question is genuinely unanswerable (Copilot review finding)."""
+    import json
+    from types import SimpleNamespace
+
+    from agent_dispatch.coordinator import _slot_descriptor
+
+    routing_dir = tmp_path / "routing"
+    routing_dir.mkdir(parents=True)
+    (routing_dir / "active.json").write_text(
+        json.dumps({"active": {"bind": "127.0.0.1", "port": 9281, "pid": None}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_DISPATCH_ROUTING_DIR", str(routing_dir))
+    slot = _slot_descriptor(SimpleNamespace())
+    assert slot["role"] == "unknown"
+    assert slot["active"]["pid"] is None
+
+
+def test_slot_descriptor_reports_unknown_role_when_active_pid_is_boolean(
+    tmp_path, monkeypatch,
+):
+    """``bool`` is an ``int`` subclass in Python; a malformed entry with
+    ``pid: true`` must not be mistaken for a real, comparable pid (Copilot
+    review finding)."""
+    import json
+    from types import SimpleNamespace
+
+    from agent_dispatch.coordinator import _slot_descriptor
+
+    routing_dir = tmp_path / "routing"
+    routing_dir.mkdir(parents=True)
+    (routing_dir / "active.json").write_text(
+        json.dumps({"active": {"bind": "127.0.0.1", "port": 9281, "pid": True}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_DISPATCH_ROUTING_DIR", str(routing_dir))
+    slot = _slot_descriptor(SimpleNamespace())
+    assert slot["role"] == "unknown"
+
+
+def test_slot_descriptor_reports_passive_role_for_other_active_pid(
+    tmp_path, monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from zdd import routing
+
+    from agent_dispatch.coordinator import _slot_descriptor
+
+    routing_dir = tmp_path / "routing"
+    monkeypatch.setenv("AGENT_DISPATCH_ROUTING_DIR", str(routing_dir))
+    routing.publish_active(
+        routing_dir, bind="127.0.0.1", port=9281, pid=999999, version="1.0",
+    )
+    slot = _slot_descriptor(SimpleNamespace())
+    assert slot["role"] == "passive"
+    assert slot["active"]["pid"] == 999999
+
+
+def test_self_retire_status_lifecycle_reflects_the_live_loop(tmp_path, monkeypatch):
+    """Copilot review finding on PR #2963: prove the published status actually
+    tracks the running self-retire loop end-to-end (armed -> generation ->
+    superseded/confirms), not just the pure `_slot_descriptor` rendering of
+    prebuilt state. Uses a real app lifespan with a shortened poll interval and
+    a temporary routing table; `is_superseded` is monkeypatched (rather than
+    faking a real listening successor) to keep this fast and deterministic."""
+    import os
+    import time
+
+    from zdd import routing
+
+    routing_dir = tmp_path / "routing"
+    monkeypatch.setenv("AGENT_DISPATCH_ROUTING_DIR", str(routing_dir))
+    monkeypatch.setenv("AGENT_DISPATCH_SELF_RETIRE", "1")
+    monkeypatch.setenv("AGENT_DISPATCH_SELF_RETIRE_POLL_S", "0.05")
+    monkeypatch.setenv("AGENT_DISPATCH_SELF_RETIRE_CONFIRMATIONS", "20")
+    monkeypatch.setenv("AGENT_DISPATCH_ABANDONED_PASSIVE_REAP", "0")
+
+    my_pid = os.getpid()
+    routing.publish_active(
+        routing_dir, bind="127.0.0.1", port=9999, pid=my_pid, version="1.0",
+    )
+
+    # Patched BEFORE the app/lifespan starts: the loop's `from .self_retire
+    # import is_superseded` binds this lambda once, for the coroutine's whole
+    # lifetime, so flipping the mutable flag later (step 3) is what changes
+    # its answer -- re-patching the module attribute after the loop has
+    # already started would not reach the already-bound local name.
+    import agent_dispatch.self_retire as self_retire_mod
+
+    supersede_flag = {"value": False}
+    monkeypatch.setattr(
+        self_retire_mod, "is_superseded", lambda *a, **k: supersede_flag["value"],
+    )
+
+    app = create_app(TaskQueue(tmp_path / "t.db"))
+    with TestClient(app) as client:
+
+        def _wait(predicate, *, timeout=5.0):
+            deadline = time.monotonic() + timeout
+            last = None
+            while time.monotonic() < deadline:
+                last = client.get("/health").json()["slot"]["self_retire"]
+                if predicate(last):
+                    return last
+                time.sleep(0.02)
+            pytest.fail(f"condition not met within {timeout}s; last status={last}")
+
+        # 1. Arms once it observes itself as the routing table's active pid,
+        #    capturing its own generation.
+        armed = _wait(lambda s: s["armed"])
+        assert armed["generation"] is not None
+
+        # 2. Not superseded while nothing supersedes it: the loop keeps polling
+        #    and keeps writing `superseded: False` / `confirms: 0` -- proving
+        #    the status is live-updated on every cycle, not written once and
+        #    forgotten.
+        for _ in range(3):
+            status = client.get("/health").json()["slot"]["self_retire"]
+            assert status["superseded"] is False
+            assert status["confirms"] == 0
+            time.sleep(0.05)
+
+        # 3. Once superseded (simulated by flipping the patched predicate
+        #    rather than standing up a real listening successor process),
+        #    confirms climb toward the confirmation threshold and
+        #    `superseded` flips true.
+        supersede_flag["value"] = True
+        status = _wait(lambda s: s["superseded"] and s["confirms"] >= 1)
+        assert status["superseded"] is True
+        assert status["confirms"] >= 1
+
+
+def test_abandoned_passive_reap_status_lifecycle_reflects_the_live_loop(
+    tmp_path, monkeypatch,
+):
+    """Copilot review finding on PR #2963: the abandoned-passive-reap loop's
+    published status needs its own deterministic lifecycle proof, mirroring
+    the self-retire coverage above -- it arms, then `last_outcome` reflects a
+    real reap cycle's decision (here: a breadcrumb naming a pid that plainly
+    is not a live coordinator, so the cycle's own no-op reasoning is what gets
+    proven live-published, not fabricated)."""
+    import json
+    import os
+    import time
+    from datetime import datetime, timedelta, timezone
+
+    from zdd import routing
+
+    routing_dir = tmp_path / "routing"
+    monkeypatch.setenv("AGENT_DISPATCH_ROUTING_DIR", str(routing_dir))
+    monkeypatch.setenv("AGENT_DISPATCH_SELF_RETIRE", "0")
+    monkeypatch.setenv("AGENT_DISPATCH_ABANDONED_PASSIVE_REAP", "1")
+    monkeypatch.setenv("AGENT_DISPATCH_ABANDONED_PASSIVE_REAP_POLL_S", "0.05")
+
+    my_pid = os.getpid()
+    routing.publish_active(
+        routing_dir, bind="127.0.0.1", port=9999, pid=my_pid, version="1.0",
+    )
+    # An aged, non-terminal breadcrumb naming a pid that is not a live
+    # coordinator process -- a deterministic, real (not monkeypatched) no-op
+    # decision for reap_abandoned_passive_backstop to reach.
+    routing_dir.mkdir(parents=True, exist_ok=True)
+    aged = (datetime.now(timezone.utc) - timedelta(seconds=99999)).isoformat()
+    (routing_dir / "cutover.json").write_text(
+        json.dumps({
+            "state": "started",
+            "started_at": aged,
+            "updated_at": aged,
+            "pid": my_pid,
+            "old": None,
+            "new_port": 9281,
+            "new_pid": 999999,
+            "error": None,
+        }),
+        encoding="utf-8",
+    )
+
+    app = create_app(TaskQueue(tmp_path / "t.db"))
+    with TestClient(app) as client:
+
+        def _wait(predicate, *, timeout=5.0):
+            deadline = time.monotonic() + timeout
+            last = None
+            while time.monotonic() < deadline:
+                last = client.get("/health").json()["slot"]["abandoned_passive_reap"]
+                if predicate(last):
+                    return last
+                time.sleep(0.02)
+            pytest.fail(f"condition not met within {timeout}s; last status={last}")
+
+        armed = _wait(lambda s: s["armed"])
+        assert armed["last_outcome"] is None or isinstance(armed["last_outcome"], dict)
+
+        outcome = _wait(lambda s: s["last_outcome"] is not None)["last_outcome"]
+        assert outcome["reaped"] is False
+        assert outcome["pid"] == 999999
+
+
 def test_create_and_get(api):
-    r = api.post("/tasks", json={"title": "work", "prompt": "go"})
+    r = api.post(
+        "/tasks",
+        json={
+            "title": "work",
+            "prompt": "go",
+            "exclusive_key": "resource:42",
+        },
+    )
     assert r.status_code == 200
     task = r.json()
     assert task["status"] == Status.QUEUED
+    assert task["exclusive_key"] == "resource:42"
     got = api.get(f"/tasks/{task['id']}").json()
     assert got["title"] == "work"
+    assert got["exclusive_key"] == "resource:42"
 
 
 def test_get_missing_is_404(api):
@@ -186,6 +677,748 @@ def test_full_lifecycle_over_http(api):
         f"/tasks/{tid}/complete", json={"worker_id": "w1", "result_ref": "pr/1"}
     ).json()
     assert done["status"] == Status.COMPLETED
+
+
+def test_complete_over_http_retriggers_whole_goal_verification(api, tmp_path):
+    script = tmp_path / "eval.py"
+    script.write_text(
+        "import json, sys\n"
+        "notes = json.load(sys.stdin)['task'].get('event_notes', [])\n"
+        "decision = {'decision': 'confirm'} if notes and notes[-1]['note'] == 'merged' else {'decision': 'noop'}\n"
+        "json.dump(decision, sys.stdout)\n",
+        encoding="utf-8",
+    )
+    api.app.state.queue.register_registration(
+        "evaluator",
+        {
+            "repo": TEST_REPO,
+            "evaluator_ref": "review-loop",
+            "evaluator_spec": {"scripts": {"review-loop": [sys.executable, str(script)]}},
+        },
+        machine=_registration_machine(),
+    )
+    tid = api.post(
+        "/tasks",
+        json={
+            "title": "x",
+            "repo": TEST_REPO,
+            "require_verification": True,
+            "evaluator_ref": "review-loop",
+            "origin_ref": "review-emitter",
+        },
+    ).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+    submitted = api.post(f"/tasks/{tid}/complete", json={"worker_id": "w1"}).json()
+    assert submitted["status"] == Status.SUBMITTED
+    assert api.get(f"/tasks/{tid}").json()["status"] == Status.SUBMITTED
+
+    backfill = api.post(f"/tasks/{tid}/verify-submitted")
+    assert backfill.status_code == 200
+    assert backfill.json()["queued"] is True
+    assert api.app.state.queue.list_verification_requests(tid)
+    sender = _register_event_emitter(api)
+    noted = api.post(
+        f"/tasks/{tid}/event-note",
+        json={"sender": sender, "note": "merged"},
+        headers=_control_headers(sender),
+    )
+    assert noted.status_code == 200
+    for _ in range(100):
+        if api.get(f"/tasks/{tid}").json()["status"] == Status.COMPLETED:
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("event-note verification did not complete asynchronously")
+
+
+def test_verify_submitted_can_opt_in_legacy_row_and_assign_evaluator(api, tmp_path):
+    script = tmp_path / "eval.py"
+    script.write_text(
+        "import json, sys\n"
+        "json.dump({'decision': 'confirm'}, sys.stdout)\n",
+        encoding="utf-8",
+    )
+    api.app.state.queue.register_registration(
+        "evaluator",
+        {
+            "repo": TEST_REPO,
+            "evaluator_ref": "review-loop",
+            "evaluator_spec": {"scripts": {"review-loop": [sys.executable, str(script)]}},
+        },
+        machine=_registration_machine(),
+    )
+    tid = api.post(
+        "/tasks",
+        json={"title": "x", "repo": TEST_REPO},
+    ).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+    submitted = api.post(f"/tasks/{tid}/complete", json={"worker_id": "w1"}).json()
+
+    assert submitted["status"] == Status.COMPLETED
+    # Reopen to submitted to model a historical legacy row.
+    with api.app.state.queue._connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = ?, require_verification = 0, evaluator_ref = NULL WHERE id = ?",
+            (Status.SUBMITTED, tid),
+        )
+    backfill = api.post(
+        f"/tasks/{tid}/verify-submitted",
+        json={"evaluator_ref": "review-loop"},
+    )
+
+    assert backfill.status_code == 200
+    assert backfill.json()["queued"] is True
+    for _ in range(100):
+        if api.get(f"/tasks/{tid}").json()["status"] == Status.COMPLETED:
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("backfill verification did not complete asynchronously")
+
+
+def test_verify_submitted_publishes_bus_event(api, tmp_path):
+    """Phase 3a audit: `verify-submitted` updates `updated_at` with no prior
+    bus event at all -- a pure wake signal is enough."""
+    script = tmp_path / "eval.py"
+    script.write_text(
+        "import json, sys\n"
+        "json.dump({'decision': 'noop'}, sys.stdout)\n",
+        encoding="utf-8",
+    )
+    api.app.state.queue.register_registration(
+        "evaluator",
+        {
+            "repo": TEST_REPO,
+            "evaluator_ref": "review-loop",
+            "evaluator_spec": {"scripts": {"review-loop": [sys.executable, str(script)]}},
+        },
+        machine=_registration_machine(),
+    )
+    tid = api.post("/tasks", json={"title": "x", "repo": TEST_REPO}).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+    api.post(f"/tasks/{tid}/complete", json={"worker_id": "w1"})
+    with api.app.state.queue._connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = ?, require_verification = 0, evaluator_ref = NULL WHERE id = ?",
+            (Status.SUBMITTED, tid),
+        )
+    events = _record_bus_events(api)
+    backfill = api.post(
+        f"/tasks/{tid}/verify-submitted", json={"evaluator_ref": "review-loop"}
+    )
+    assert backfill.status_code == 200
+    assert any(
+        e["type"] == "task.verification_requested" and e["task_id"] == tid
+        for e in events
+    )
+
+
+def test_register_run_waiter_publishes_bus_event(api):
+    """Phase 3a audit: registering a run waiter can move a task from
+    `started` to `suspended` with no prior bus event at all."""
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+    api.post(
+        f"/tasks/{tid}/owner-session",
+        json={"worker_id": "w1", "owner_session_id": "session-1"},
+    )
+    events = _record_bus_events(api)
+    r = api.post(
+        f"/tasks/{tid}/run-waiter/register",
+        json={
+            "worker_id": "w1",
+            "reason": "long-running op",
+            "host": "host-1",
+            "resume_worktree": "wt-1",
+        },
+    )
+    assert r.status_code == 200
+    assert any(
+        e["type"] == "task.run_waiter_registered" and e["task_id"] == tid
+        for e in events
+    )
+
+
+def test_get_task_surfaces_active_run_waiter(api):
+    """2026-10-05: `GET /tasks/{id}` must expose the exact blocking-wait
+    command of an active `run --detach` waiter (the Tasks board/claim-status
+    enrichment both read this field), and must NOT carry a `run_waiter` key
+    at all once no waiter is active -- a bare, never-suspended task predates
+    this feature just as cleanly as one whose waiter already retired."""
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    assert "run_waiter" not in api.get(f"/tasks/{tid}").json()
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+    api.post(
+        f"/tasks/{tid}/owner-session",
+        json={"worker_id": "w1", "owner_session_id": "session-1"},
+    )
+    command = ["agent-worktrees", "pr-watch", "wait", "o/r", "570"]
+    prepared = api.post(
+        f"/tasks/{tid}/run-waiter/register",
+        json={
+            "worker_id": "w1",
+            "reason": "waiting on author",
+            "host": "host-1",
+            "resume_worktree": "wt-1",
+            "command": command,
+        },
+    ).json()
+    # Still just "preparing" -- not yet confirmed alive, so not surfaced.
+    assert "run_waiter" not in api.get(f"/tasks/{tid}").json()
+    armed = api.post(
+        f"/tasks/{tid}/run-waiter/arm",
+        json={
+            "generation": prepared["generation"],
+            "pid": 4242,
+            "host": "host-1",
+            "start_token": "tok-1",
+        },
+    )
+    assert armed.status_code == 200
+    task = api.get(f"/tasks/{tid}").json()
+    assert task["run_waiter"]["command"] == command
+    assert task["run_waiter"]["state"] == "active"
+
+
+def test_bulk_run_waiters_endpoint_keys_by_task_id(api):
+    """2026-10-05: `GET /run-waiters` is the Tasks board's single bulk
+    lookup (no N+1 per-row query) -- every currently-active waiter, keyed by
+    task id, with the same trimmed shape `GET /tasks/{id}`'s `run_waiter`
+    field carries."""
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    assert api.get("/run-waiters").json() == {}
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+    api.post(
+        f"/tasks/{tid}/owner-session",
+        json={"worker_id": "w1", "owner_session_id": "session-1"},
+    )
+    command = ["agent-worktrees", "pr-watch", "wait", "o/r", "570"]
+    prepared = api.post(
+        f"/tasks/{tid}/run-waiter/register",
+        json={
+            "worker_id": "w1",
+            "reason": "waiting on author",
+            "host": "host-1",
+            "resume_worktree": "wt-1",
+            "command": command,
+        },
+    ).json()
+    # Still just "preparing" -- the bulk endpoint only lists active waiters.
+    assert api.get("/run-waiters").json() == {}
+    api.post(
+        f"/tasks/{tid}/run-waiter/arm",
+        json={
+            "generation": prepared["generation"],
+            "pid": 4242,
+            "host": "host-1",
+            "start_token": "tok-1",
+        },
+    )
+    waiters = api.get("/run-waiters").json()
+    assert set(waiters) == {tid}
+    assert waiters[tid]["command"] == command
+    assert waiters[tid]["state"] == "active"
+
+
+
+def test_complete_over_http_triggers_immediate_whole_goal_verification(api, tmp_path):
+    script = tmp_path / "eval.py"
+    script.write_text(
+        "import json, sys\n"
+        "json.dump({'decision': 'confirm'}, sys.stdout)\n",
+        encoding="utf-8",
+    )
+    api.app.state.queue.register_registration(
+        "evaluator",
+        {
+            "repo": TEST_REPO,
+            "evaluator_ref": "review-loop",
+            "evaluator_spec": {"scripts": {"review-loop": [sys.executable, str(script)]}},
+        },
+        machine=_registration_machine(),
+    )
+    tid = api.post(
+        "/tasks",
+        json={"title": "x", "repo": TEST_REPO, "require_verification": True, "evaluator_ref": "review-loop"},
+    ).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+
+    submitted = api.post(f"/tasks/{tid}/complete", json={"worker_id": "w1"}).json()
+
+    assert submitted["status"] == Status.SUBMITTED
+    for _ in range(100):
+        if api.get(f"/tasks/{tid}").json()["status"] == Status.COMPLETED:
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("submitted verification did not complete asynchronously")
+
+
+def test_event_note_wakes_and_supersedes_active_run_waiter(api, monkeypatch):
+    tid = api.post(
+        "/tasks", json={"title": "x", "repo": TEST_REPO, "origin_ref": "review-emitter"}
+    ).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(
+        f"/tasks/{tid}/start",
+        json={"worker_id": "w1", "owner_session_id": "session-1"},
+    )
+    api.post(
+        f"/tasks/{tid}/suspend",
+        json={"worker_id": "w1", "reason": "waiting on external state"},
+    )
+    prepared = api.post(
+        f"/tasks/{tid}/run-waiter/register",
+        json={
+            "worker_id": "w1",
+            "host": "test-host",
+            "reason": "hibernating: sleep 1",
+            "resume_worktree": "m/wt-1",
+            "command": ["sleep", "1"],
+        },
+    )
+    assert prepared.status_code == 200
+    generation = prepared.json()["generation"]
+    armed = api.post(
+        f"/tasks/{tid}/run-waiter/arm",
+        json={
+            "generation": generation,
+            "pid": 101,
+            "host": "test-host",
+            "start_token": "token-101",
+        },
+    )
+    assert armed.status_code == 200
+    sender = _register_event_emitter(api)
+    r = api.post(
+        f"/tasks/{tid}/event-note",
+        json={"sender": sender, "note": "merged upstream"},
+        headers=_control_headers(sender),
+    )
+
+    assert r.status_code == 200
+    assert api.app.state.queue.get_active_run_waiter(tid) is None
+    wakes = api.app.state.queue.list_run_waiter_wakes(tid)
+    assert len(wakes) == 1
+    assert wakes[0].resume_worktree == "m/wt-1"
+    assert wakes[0].status == "pending"
+
+
+def test_reviewer_deadline_recovery_wakes_a_suspended_task_without_a_verdict(api):
+    api.app.state.queue.register_registration(
+        "evaluator",
+        {
+            "repo": TEST_REPO,
+            "evaluator_ref": "review-loop",
+            "evaluator_spec": {"rules": []},
+            "reviewer_loop": {"stale_after_days": 7},
+        },
+        machine=_registration_machine(),
+    )
+    last_commit_at = 1_000_000.0
+    tid = api.post(
+        "/tasks",
+        json={
+            "title": "review PR 42",
+            "repo": TEST_REPO,
+            "origin_ref": "review-emitter",
+            "require_verification": True,
+            "evaluator_ref": "review-loop",
+            "payload_inline": json.dumps(
+                {"reviewer_loop": {"last_commit_at": last_commit_at}}
+            ),
+        },
+    ).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(
+        f"/tasks/{tid}/start",
+        json={"worker_id": "w1", "owner_session_id": "session-1"},
+    )
+    api.post(
+        f"/tasks/{tid}/suspend",
+        json={"worker_id": "w1", "reason": "waiting for the next review round"},
+    )
+    prepared = api.post(
+        f"/tasks/{tid}/run-waiter/register",
+        json={
+            "worker_id": "w1",
+            "host": "test-host",
+            "reason": "hibernating: sleep 1",
+            "resume_worktree": "m/wt-1",
+            "command": ["sleep", "1"],
+        },
+    )
+    assert prepared.status_code == 200
+    armed = api.post(
+        f"/tasks/{tid}/run-waiter/arm",
+        json={
+            "generation": prepared.json()["generation"],
+            "pid": 101,
+            "host": "test-host",
+            "start_token": "token-101",
+        },
+    )
+    assert armed.status_code == 200
+
+    resumed = api.app.state.queue.reconcile_reviewer_deadlines(
+        now=last_commit_at + (8 * 86400.0)
+    )
+
+    assert resumed == 1
+    wakes = api.app.state.queue.list_run_waiter_wakes(tid)
+    assert len(wakes) == 1
+    assert wakes[0].status == "pending"
+    assert api.app.state.queue.get_active_run_waiter(tid) is None
+    assert api.app.state.queue.list_verification_requests(tid) == []
+
+
+def test_event_note_wakes_and_supersedes_preparing_run_waiter(api):
+    tid = api.post(
+        "/tasks", json={"title": "x", "repo": TEST_REPO, "origin_ref": "review-emitter"}
+    ).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(
+        f"/tasks/{tid}/start",
+        json={"worker_id": "w1", "owner_session_id": "session-1"},
+    )
+    api.post(
+        f"/tasks/{tid}/suspend",
+        json={"worker_id": "w1", "reason": "waiting on external state"},
+    )
+    prepared = api.post(
+        f"/tasks/{tid}/run-waiter/register",
+        json={
+            "worker_id": "w1",
+            "host": "test-host",
+            "reason": "hibernating: sleep 1",
+            "resume_worktree": "m/wt-1",
+            "command": ["sleep", "1"],
+        },
+    )
+    assert prepared.status_code == 200
+
+    sender = _register_event_emitter(api)
+    r = api.post(
+        f"/tasks/{tid}/event-note",
+        json={"sender": sender, "note": "merged upstream"},
+        headers=_control_headers(sender),
+    )
+
+    assert r.status_code == 200
+    wakes = api.app.state.queue.list_run_waiter_wakes(tid)
+    assert len(wakes) == 1
+    assert wakes[0].status == "pending"
+    assert (
+        api.app.state.queue.arm_run_waiter(
+            tid,
+            generation=prepared.json()["generation"],
+            pid=101,
+            host="test-host",
+            start_token="token-101",
+        )
+        is None
+    )
+
+
+def test_event_note_after_waiter_finish_does_not_queue_duplicate_wake(api):
+    tid = api.post(
+        "/tasks", json={"title": "x", "repo": TEST_REPO, "origin_ref": "review-emitter"}
+    ).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(
+        f"/tasks/{tid}/start",
+        json={"worker_id": "w1", "owner_session_id": "session-1"},
+    )
+    api.post(
+        f"/tasks/{tid}/suspend",
+        json={"worker_id": "w1", "reason": "waiting on external state"},
+    )
+    prepared = api.post(
+        f"/tasks/{tid}/run-waiter/register",
+        json={
+            "worker_id": "w1",
+            "host": "test-host",
+            "reason": "hibernating: sleep 1",
+            "resume_worktree": "m/wt-1",
+            "command": ["sleep", "1"],
+        },
+    )
+    generation = prepared.json()["generation"]
+    api.post(
+        f"/tasks/{tid}/run-waiter/arm",
+        json={
+            "generation": generation,
+            "pid": 101,
+            "host": "test-host",
+            "start_token": "token-101",
+        },
+    )
+    api.post(
+        f"/tasks/{tid}/run-waiter/finish",
+        json={
+            "generation": generation,
+            "pid": 101,
+            "host": "test-host",
+            "start_token": "token-101",
+            "message": "wait completed",
+        },
+    )
+    sender = _register_event_emitter(api)
+    r = api.post(
+        f"/tasks/{tid}/event-note",
+        json={"sender": sender, "note": "merged upstream"},
+        headers=_control_headers(sender),
+    )
+
+    assert r.status_code == 200
+    wakes = api.app.state.queue.list_run_waiter_wakes(tid)
+    assert len(wakes) == 1
+    assert wakes[0].message == "wait completed"
+
+
+def test_event_note_queues_running_owner_wake(api):
+    tid = api.post(
+        "/tasks", json={"title": "x", "repo": TEST_REPO, "origin_ref": "review-emitter"}
+    ).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(
+        f"/tasks/{tid}/start",
+        json={"worker_id": "w1", "owner_session_id": "session-1"},
+    )
+
+    sender = _register_event_emitter(api)
+    r = api.post(
+        f"/tasks/{tid}/event-note",
+        json={"sender": sender, "note": "new review comment"},
+        headers=_control_headers(sender),
+    )
+
+    assert r.status_code == 200
+    wakes = api.app.state.queue.list_wakes(tid)
+    assert len(wakes) == 1
+    assert wakes[0].status == "pending"
+    assert wakes[0].owner == "w1"
+
+
+def test_event_note_rejects_untrusted_sender(api):
+    tid = api.post(
+        "/tasks", json={"title": "x", "repo": TEST_REPO, "origin_ref": "review-emitter"}
+    ).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(
+        f"/tasks/{tid}/start",
+        json={"worker_id": "w1", "owner_session_id": "session-1"},
+    )
+
+    r = api.post(
+        f"/tasks/{tid}/event-note",
+        json={"sender": "review-emitter", "note": "forged"},
+        headers=_control_headers("review-emitter"),
+    )
+
+    assert r.status_code == 403
+
+
+def test_event_note_rejects_goal_rewrite_fields(api):
+    tid = api.post(
+        "/tasks", json={"title": "x", "repo": TEST_REPO, "origin_ref": "review-emitter"}
+    ).json()["id"]
+    sender = _register_event_emitter(api)
+
+    r = api.post(
+        f"/tasks/{tid}/event-note",
+        json={"sender": sender, "note": "merged", "goal": "replacement"},
+        headers=_control_headers(sender),
+    )
+
+    assert r.status_code == 422
+
+
+def test_run_waiter_arm_rejects_empty_identity_fields(api):
+    tid = api.post(
+        "/tasks", json={"title": "x", "repo": TEST_REPO, "origin_ref": "review-emitter"}
+    ).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(
+        f"/tasks/{tid}/start",
+        json={"worker_id": "w1", "owner_session_id": "session-1"},
+    )
+    api.post(
+        f"/tasks/{tid}/suspend",
+        json={"worker_id": "w1", "reason": "waiting on external state"},
+    )
+    prepared = api.post(
+        f"/tasks/{tid}/run-waiter/register",
+        json={
+            "worker_id": "w1",
+            "host": "test-host",
+            "reason": "hibernating: sleep 1",
+            "resume_worktree": "m/wt-1",
+            "command": ["sleep", "1"],
+        },
+    )
+
+    r = api.post(
+        f"/tasks/{tid}/run-waiter/arm",
+        json={
+            "generation": prepared.json()["generation"],
+            "pid": 0,
+            "host": "",
+            "start_token": "",
+        },
+    )
+
+    assert r.status_code == 422
+
+
+def test_run_waiter_register_requires_owner_session(api):
+    tid = api.post(
+        "/tasks", json={"title": "x", "repo": TEST_REPO, "origin_ref": "review-emitter"}
+    ).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+
+    r = api.post(
+        f"/tasks/{tid}/run-waiter/register",
+        json={
+            "worker_id": "w1",
+            "host": "test-host",
+            "reason": "hibernating: sleep 1",
+            "resume_worktree": "m/wt-1",
+            "command": ["sleep", "1"],
+        },
+    )
+
+    assert r.status_code == 409
+    assert "owner_session_id" in r.json()["detail"]
+
+
+def test_complete_over_http_releases_handoff_claim(api, monkeypatch):
+    """The `/tasks/{id}/complete` route's shared _guard hook releases a
+    handoff task's target-worktree claim on a genuine (non-retry)
+    completion -- covering the CLI, which always talks HTTP."""
+    from agent_dispatch import handoff_claim_release
+
+    tid = api.post(
+        "/tasks",
+        json={
+            "title": "x", "repo": TEST_REPO, "labels": ["handoff"],
+            "target_worktree": "wt-9",
+        },
+    ).json()["id"]
+    api.post(
+        "/claim",
+        json={"worker_id": "m/wt-9", "task_id": tid, "machine": "m", "worktree": "wt-9", "repo": TEST_REPO},
+    )
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "m/wt-9"})
+
+    released = []
+    monkeypatch.setattr(
+        handoff_claim_release, "release_if_handoff",
+        lambda task, task_id=None: released.append((task.get("id"), task.get("target_worktree"))),
+    )
+    done = api.post(
+        f"/tasks/{tid}/complete", json={"worker_id": "m/wt-9", "result_ref": "pr/1"}
+    ).json()
+    assert done["status"] == Status.COMPLETED
+    assert released == [(tid, "wt-9")]
+
+
+def test_complete_over_http_never_releases_a_non_handoff_task(api, monkeypatch):
+    from agent_dispatch import handoff_claim_release
+
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+
+    calls = []
+    monkeypatch.setattr(
+        handoff_claim_release, "_release_task_claim",
+        lambda task_id, **k: calls.append(task_id),
+    )
+    api.post(f"/tasks/{tid}/complete", json={"worker_id": "w1", "result_ref": "pr/1"})
+    time.sleep(0.1)  # let any (wrongly-)spawned release thread run
+    assert calls == []
+
+
+def test_idempotent_result_recording_retry_does_not_re_release(api, monkeypatch):
+    """A retry that only attaches a missing result to an already-SUBMITTED
+    task (event_type stays None) must not fire the release hook again."""
+    from agent_dispatch import handoff_claim_release
+
+    tid = api.post(
+        "/tasks",
+        json={"title": "x", "repo": TEST_REPO, "labels": ["handoff"], "target_worktree": "wt-9"},
+    ).json()["id"]
+    api.post(
+        "/claim",
+        json={"worker_id": "m/wt-9", "task_id": tid, "machine": "m", "worktree": "wt-9", "repo": TEST_REPO},
+    )
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "m/wt-9"})
+    api.post(f"/tasks/{tid}/complete", json={"worker_id": "m/wt-9"})
+
+    released = []
+    monkeypatch.setattr(
+        handoff_claim_release, "release_if_handoff",
+        lambda task, task_id=None: released.append(task.get("id")),
+    )
+    # Retry attaching a result to the already-submitted task.
+    api.post(
+        f"/tasks/{tid}/complete",
+        json={"worker_id": "m/wt-9", "result_ref": "pr/1", "result": {"ok": True}},
+    )
+    assert released == []
+
+
+def test_abandon_over_http_releases_handoff_claim(api, monkeypatch):
+    from agent_dispatch import handoff_claim_release
+
+    tid = api.post(
+        "/tasks", json={"title": "x", "repo": TEST_REPO, "labels": ["handoff"], "target_worktree": "wt-9"},
+    ).json()["id"]
+
+    released = []
+    monkeypatch.setattr(
+        handoff_claim_release, "release_if_handoff",
+        lambda task, task_id=None: released.append((task.get("id"), task.get("target_worktree"))),
+    )
+    abandoned = api.post(
+        f"/tasks/{tid}/abandon", json={"permitted": True, "reason": "test"}
+    ).json()
+    assert abandoned["status"] == Status.ABANDONED
+    assert released == [(tid, "wt-9")]
+
+
+def test_idempotent_abandon_retry_does_not_re_release(api, monkeypatch):
+    """PR #3248 review: `queue.abandon()` is `idempotent_replay=True` --  a
+    retry against an already-abandoned task returns 200 with no error, but
+    must not be treated as a fresh terminal transition. Before
+    `abandon_with_outcome`, the route hard-coded `event_type="task.abandoned"`
+    unconditionally, so every retry re-fired the (up to 15s) release
+    subprocess even though nothing changed."""
+    from agent_dispatch import handoff_claim_release
+
+    tid = api.post(
+        "/tasks", json={"title": "x", "repo": TEST_REPO, "labels": ["handoff"], "target_worktree": "wt-9"},
+    ).json()["id"]
+    first = api.post(f"/tasks/{tid}/abandon", json={"permitted": True, "reason": "test"})
+    assert first.json()["status"] == Status.ABANDONED
+
+    released = []
+    monkeypatch.setattr(
+        handoff_claim_release, "release_if_handoff",
+        lambda task, task_id=None: released.append(task.get("id")),
+    )
+    retry = api.post(f"/tasks/{tid}/abandon", json={"permitted": True, "reason": "retry"})
+    assert retry.json()["status"] == Status.ABANDONED
+    assert released == []
 
 
 def test_structured_result_is_full_on_show_bounded_in_bulk_and_retrievable(api):
@@ -360,7 +1593,7 @@ def test_client_omits_none_result_for_older_coordinator():
 
         seen.update(json.loads(request.content))
         return httpx.Response(
-            200, json={"id": "t1", "status": Status.COMPLETED}
+            200, json={"id": "t1", "status": Status.SUBMITTED}
         )
 
     with DispatchClient(
@@ -374,7 +1607,7 @@ def test_client_omits_none_result_for_older_coordinator():
 def test_client_detects_coordinator_that_drops_structured_result():
     def handler(request):
         return httpx.Response(
-            200, json={"id": "t1", "status": Status.COMPLETED}
+            200, json={"id": "t1", "status": Status.SUBMITTED}
         )
 
     with DispatchClient(
@@ -424,7 +1657,140 @@ def test_activity_over_http(api):
         f"/tasks/{tid}/activity",
         json={"activity": "IDLE", "reservation_key": key},
     )
-    assert invalid.status_code == 409
+    assert invalid.status_code == 200
+    assert invalid.json()["activity"] == "IDLE"
+
+
+def _record_bus_events(api) -> list[dict]:
+    """Phase 3a's event-coverage audit: every board-visible mutation must
+    publish *some* bus event (a pure wake trigger is enough). Patches
+    ``app.state.bus.publish`` to record every call made during the test."""
+    events: list[dict] = []
+    original = api.app.state.bus.publish
+
+    def _record(event: dict) -> None:
+        events.append(event)
+        original(event)
+
+    api.app.state.bus.publish = _record
+    return events
+
+
+def test_heartbeat_over_http_publishes_bus_event(api):
+    """Phase 3a audit: heartbeat updates `updated_at`/leases with no prior
+    bus event at all."""
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+    events = _record_bus_events(api)
+    r = api.post(f"/tasks/{tid}/heartbeat", json={"worker_id": "w1"})
+    assert r.status_code == 200
+    assert any(e["type"] == "task.heartbeat" for e in events)
+
+
+def test_heartbeat_over_http_does_not_emit_telemetry(api):
+    """A heartbeat runs periodically for every live task and never
+    transitions state -- it must still wake the bus (the subscribe relay
+    needs that), but must NOT record a `kind: state_transition` telemetry
+    event, which would otherwise accumulate misleading high-volume records
+    in any configured telemetry spool."""
+    from agent_dispatch import telemetry
+
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+
+    seen: list[dict] = []
+    telemetry.set_telemetry_sink(seen.append)
+    try:
+        r = api.post(f"/tasks/{tid}/heartbeat", json={"worker_id": "w1"})
+        assert r.status_code == 200
+        assert seen == []
+    finally:
+        telemetry.clear_telemetry_sink()
+
+
+def test_activity_over_http_publishes_bus_event(api):
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    reservation = api.post(
+        "/spawn-reservations", json={"task_id": tid, "reserved_by": "sup"}
+    ).json()["reservation"]
+    key = reservation["key"]
+    api.post(
+        f"/spawn-reservations/{key}/spawned",
+        json={"session_handle": "local-body:s1"},
+    )
+    events = _record_bus_events(api)
+    r = api.post(
+        f"/tasks/{tid}/activity",
+        json={"activity": "ACTIVE", "reservation_key": key},
+    )
+    assert r.status_code == 200
+    assert any(e["type"] == "task.activity_updated" for e in events)
+
+
+def test_activity_over_http_does_not_emit_telemetry(api):
+    """Same no-telemetry contract as heartbeat (above) -- activity updates
+    also run periodically for every live task without transitioning
+    state."""
+    from agent_dispatch import telemetry
+
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    reservation = api.post(
+        "/spawn-reservations", json={"task_id": tid, "reserved_by": "sup"}
+    ).json()["reservation"]
+    key = reservation["key"]
+    api.post(
+        f"/spawn-reservations/{key}/spawned",
+        json={"session_handle": "local-body:s1"},
+    )
+
+    seen: list[dict] = []
+    telemetry.set_telemetry_sink(seen.append)
+    try:
+        r = api.post(
+            f"/tasks/{tid}/activity",
+            json={"activity": "ACTIVE", "reservation_key": key},
+        )
+        assert r.status_code == 200
+        assert seen == []
+    finally:
+        telemetry.clear_telemetry_sink()
+
+
+def test_steer_take_over_http_publishes_bus_event(api):
+    """Phase 3a audit: `take_steer` updates `lease_expires_at`/
+    `last_seen_at`/`updated_at` (board-sort-/liveness-relevant) with no
+    prior bus event at all. A pure wake signal is enough -- no task payload
+    is expected on this event."""
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+    api.post(f"/tasks/{tid}/steer", json={"fields": {"note": "look at X"}})
+    events = _record_bus_events(api)
+    r = api.post(
+        f"/tasks/{tid}/steer/take", json={"worker_id": "w1", "all_pending": False}
+    )
+    assert r.status_code == 200
+    assert any(
+        e["type"] == "task.steer_taken" and e["task_id"] == tid for e in events
+    )
+
+
+def test_recover_over_http_publishes_bus_event(api):
+    """Phase 3a audit: manual recovery (`POST /recover`) can requeue,
+    suspend, or dead-letter rows with no event published at all today."""
+    events = _record_bus_events(api)
+    r = api.post("/recover")
+    assert r.status_code == 200
+    assert any(e["type"] == "task.recovered" for e in events)
+
+
+def test_events_route_advertises_ready_frame_capability(api):
+    """Phase 3a: `/health` advertises `/events?ready_frame=1` support so a
+    relay client can gate on genuine daemon support before waiting for the
+    frame -- see `board_relay.py`."""
+    assert api.get("/health").json()["events_ready_frame"] is True
 
 
 def test_goal_and_progress_log_over_http(api):
@@ -464,6 +1830,64 @@ def test_progress_log_missing_task_is_404(api):
     assert api.get("/tasks/nope/progress-log").status_code == 404
 
 
+def test_attachment_history_over_http(api):
+    """durable-attachment-history over the wire: owner-session route ("
+    "/tasks/{id}/owner-session) records durably queryable via GET
+    /tasks/{id}/attachments, surviving a release that clears the current
+    owner-session field."""
+    r = api.post("/tasks", json={"title": "reviewed"})
+    tid = r.json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+    api.post(
+        f"/tasks/{tid}/owner-session",
+        json={"worker_id": "w1", "owner_session_id": "session-a"},
+    )
+    history = api.get(f"/tasks/{tid}/attachments").json()
+    assert len(history) == 1
+    assert history[0]["session_id"] == "session-a"
+    assert history[0]["detached_at"] is None
+
+    api.post(f"/tasks/{tid}/suspend", json={"worker_id": "w1", "reason": "stuck"})
+    api.post(f"/tasks/{tid}/release", json={"worker_id": "w1", "reason": "reset"})
+    history = api.get(f"/tasks/{tid}/attachments").json()
+    assert len(history) == 1
+    assert history[0]["session_id"] == "session-a"
+    assert history[0]["detached_at"] is not None
+    task = api.get(f"/tasks/{tid}").json()
+    assert task["owner_session_id"] is None  # current owner cleared...
+    # ...but the prior session's record is NOT discarded (the whole point).
+
+
+def test_attachment_history_missing_task_is_404(api):
+    assert api.get("/tasks/nope/attachments").status_code == 404
+
+
+def test_tasks_for_session_reverse_lookup_over_http(api):
+    """The reverse of test_attachment_history_over_http: given a session id,
+    GET /sessions/{id}/tasks finds the task(s) it attached to."""
+    r = api.post("/tasks", json={"title": "reviewed"})
+    tid = r.json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+    api.post(
+        f"/tasks/{tid}/owner-session",
+        json={"worker_id": "w1", "owner_session_id": "session-a"},
+    )
+    found = api.get("/sessions/session-a/tasks").json()
+    assert len(found) == 1
+    assert found[0]["task_id"] == tid
+    assert found[0]["detached_at"] is None
+
+
+def test_tasks_for_session_unknown_session_is_empty_not_404(api):
+    """A session id with no attachment anywhere is an empty list -- there is
+    no single task to 404 against, unlike /tasks/{id}/attachments."""
+    r = api.get("/sessions/never-seen-session/tasks")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
 def test_claim_empty_returns_null(api):
     assert api.post(
         "/claim", json={"worker_id": "w1", "repo": TEST_REPO}
@@ -482,6 +1906,81 @@ def test_abandon_requires_permission_over_http(api):
     assert api.post(f"/tasks/{tid}/abandon", json={"permitted": False}).status_code == 409
     ok = api.post(f"/tasks/{tid}/abandon", json={"permitted": True, "reason": "dup"})
     assert ok.status_code == 200 and ok.json()["status"] == Status.ABANDONED
+
+
+def test_hold_and_unhold_over_http(api):
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    held = api.post(f"/tasks/{tid}/hold", json={"reason": "pause", "actor": "op"})
+    assert held.status_code == 200
+    assert held.json()["hold_reason"] == "pause"
+    unheld = api.post(f"/tasks/{tid}/unhold", json={"actor": "op"})
+    assert unheld.status_code == 200
+    assert unheld.json()["hold_reason"] is None
+
+
+def test_hold_rejects_stale_expected_status_over_http(api):
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    stale = api.post(
+        f"/tasks/{tid}/hold",
+        json={"reason": "pause", "actor": "op", "expected_status": "queued"},
+    )
+    assert stale.status_code == 409
+    ok = api.post(
+        f"/tasks/{tid}/hold",
+        json={"reason": "pause", "actor": "op", "expected_status": "claimed"},
+    )
+    assert ok.status_code == 200
+
+
+def test_unexclude_over_http(api):
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+    api.post(
+        f"/tasks/{tid}/yield",
+        json={"worker_id": "w1", "note": "blocked here", "exclude": "machine:only-box"},
+    )
+    assert api.post(f"/tasks/{tid}/unexclude", json={}).json()["excludes"] == []
+
+
+def test_unexclude_removes_only_the_named_token_over_http(api):
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w1"})
+    api.post(
+        f"/tasks/{tid}/yield",
+        json={"worker_id": "w1", "note": "blocked", "exclude": "machine:m1"},
+    )
+    api.post("/claim", json={"worker_id": "w2", "repo": TEST_REPO, "task_id": tid})
+    api.post(f"/tasks/{tid}/start", json={"worker_id": "w2"})
+    api.post(
+        f"/tasks/{tid}/yield",
+        json={"worker_id": "w2", "note": "blocked too", "exclude": "machine:m2"},
+    )
+    cleared = api.post(f"/tasks/{tid}/unexclude", json={"exclude": "machine:m1"})
+    assert cleared.status_code == 200
+    assert cleared.json()["excludes"] == ["machine:m2"]
+
+
+def test_reset_over_http(api):
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    api.post("/claim", json={"worker_id": "w1", "repo": TEST_REPO})
+    reset = api.post(f"/tasks/{tid}/reset", json={"reason": "not like this"})
+    assert reset.status_code == 200
+    body = reset.json()
+    assert body["status"] == Status.PROPOSED
+    assert body["owner"] is None
+
+
+def test_reset_refuses_terminal_and_held_over_http(api):
+    tid = api.post("/tasks", json={"title": "x"}).json()["id"]
+    api.post("/tasks/" + tid + "/abandon", json={"permitted": True})
+    assert api.post(f"/tasks/{tid}/reset", json={}).status_code == 409
+
+    tid2 = api.post("/tasks", json={"title": "y"}).json()["id"]
+    api.post(f"/tasks/{tid2}/hold", json={"reason": "pause", "actor": "op"})
+    assert api.post(f"/tasks/{tid2}/reset", json={}).status_code == 409
 
 
 def test_proposed_not_claimable_then_approved(api):
@@ -615,7 +2114,49 @@ def test_client_round_trip(client):
     done = client.complete(t["id"], "w1", result_ref="pr/9")
     assert done["status"] == Status.COMPLETED
     trail = [e["to_status"] for e in client.events(t["id"])]
-    assert trail == [Status.QUEUED, Status.CLAIMED, Status.STARTED, Status.COMPLETED]
+    assert trail == [
+        Status.QUEUED,
+        Status.CLAIMED,
+        Status.STARTED,
+        Status.SUBMITTED,
+        Status.COMPLETED,
+    ]
+
+
+def test_client_tasks_for_session_round_trip(client):
+    """DispatchClient.tasks_for_session against the real HTTP route (not just
+    the fake client the CLI test exercises, and not just the raw route the
+    coordinator test exercises) -- the actual production path the CLI uses."""
+    t = client.create("via client")
+    client.claim("w1", repo=TEST_REPO)
+    client.start(t["id"], "w1")
+    client.bind_owner_session(t["id"], "w1", "session-via-client")
+
+    found = client.tasks_for_session("session-via-client")
+    assert len(found) == 1
+    assert found[0]["task_id"] == t["id"]
+    assert found[0]["detached_at"] is None
+
+    assert client.tasks_for_session("session-never-seen") == []
+
+
+def test_client_tasks_for_session_url_encodes_reserved_characters(client):
+    """Regression: a session id containing a URL-reserved character (``?``,
+    ``#``) must round-trip correctly, not be mis-parsed as query/fragment
+    syntax when interpolated into the request URL. (A literal ``/`` in a
+    path segment is a separate, ASGI-level limitation -- routers decode
+    ``%2F`` back to ``/`` before matching -- out of scope here.)"""
+    t = client.create("via client")
+    client.claim("w1", repo=TEST_REPO)
+    client.start(t["id"], "w1")
+    reserved_session_id = "sess-with#reserved?chars"
+    client.bind_owner_session(t["id"], "w1", reserved_session_id)
+
+    found = client.tasks_for_session(reserved_session_id)
+    assert len(found) == 1
+    assert found[0]["task_id"] == t["id"]
+    # A DIFFERENT session id must not incidentally match the encoded one.
+    assert client.tasks_for_session("sess-with") == []
 
 
 def test_client_error_maps_to_dispatch_error(client):
@@ -644,7 +2185,8 @@ def test_sse_stream_distinguishes_retry_recorded_result(server_url):
         try:
             for ev in streamer.stream_events():
                 received.append(ev)
-                if ev.get("type") == "task.result_recorded":
+                types = {item.get("type") for item in received}
+                if {"task.result_recorded", "task.completed"} <= types:
                     break
         except Exception:
             return  # stream closed / server stopped -- best effort
@@ -667,6 +2209,7 @@ def test_sse_stream_distinguishes_retry_recorded_result(server_url):
     mutator.start(tid, "w1")
     mutator.complete(tid, "w1")
     mutator.complete(tid, "w1", result={"summary": "done"})
+    mutator.confirm(tid, actor="evaluator")
 
     t.join(timeout=5)
     streamer.close()
@@ -688,6 +2231,64 @@ def test_sse_stream_distinguishes_retry_recorded_result(server_url):
     )
     assert recorded["task"]["has_result"] is True
     assert "result" not in recorded["task"]
+    confirmed = next(e for e in received if e["type"] == "task.completed")
+    assert confirmed["task"]["status"] == "completed"
+
+
+def test_stream_events_ready_frame_handshake(server_url):
+    """Phase 3a: a caller that requests ``ready_frame=True`` sees the ready
+    sentinel as its first item (closing the registration-vs-real-event
+    race); every other caller (the default) never sees it at all, even
+    though the daemon genuinely emits it for an opted-in connection."""
+    streamer = DispatchClient(server_url)
+    watcher = DispatchClient(server_url)  # mirrors `agent-dispatch watch`
+    mutator = DispatchClient(server_url)
+
+    relay_events: list[dict] = []
+    watch_events: list[dict] = []
+
+    def collect_relay():
+        try:
+            for ev in streamer.stream_events(ready_frame=True):
+                relay_events.append(ev)
+                if len(relay_events) >= 2:
+                    break
+        except Exception:
+            return
+
+    def collect_watch():
+        try:
+            for ev in watcher.stream_events():
+                watch_events.append(ev)
+                if ev.get("type") == "task.created":
+                    break
+        except Exception:
+            return
+
+    t1 = threading.Thread(target=collect_relay, daemon=True)
+    t2 = threading.Thread(target=collect_watch, daemon=True)
+    t1.start()
+    t2.start()
+
+    deadline = time.time() + 15
+    while time.time() < deadline and mutator.health().get("subscribers", 0) < 2:
+        time.sleep(0.05)
+    assert mutator.health()["subscribers"] >= 2
+
+    mutator.create("streamed")
+
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+    streamer.close()
+    watcher.close()
+    mutator.close()
+
+    assert relay_events[0] == {"type": "ready"}
+    assert relay_events[1]["type"] == "task.created"
+    # The default (non-opted-in) caller never sees the ready frame at all,
+    # even though the daemon genuinely emitted it on the other connection.
+    assert all(e.get("type") != "ready" for e in watch_events)
+    assert watch_events[0]["type"] == "task.created"
 
 
 def test_health_reports_zero_subscribers_initially(api):
@@ -846,6 +2447,299 @@ def test_gc_disabled_by_default(tmp_path, monkeypatch):
         stop()
 
 
+def test_health_loops_report_liveness_gc_and_orphan_reap(tmp_path, monkeypatch):
+    """The two coordinator polling loops record live status at ``GET /health``
+    once sweep_interval is enabled -- the diagnosis surface requested for
+    'where a stuck poller got stuck' rather than inferring it from an
+    accumulating process census."""
+    from agent_dispatch.coordinator import create_app
+
+    monkeypatch.setattr("agent_dispatch.tracking.liveness_verdict", lambda *a, **k: "unknown")
+    monkeypatch.setattr(
+        "agent_dispatch.identity.resolve_machine", lambda: None
+    )  # degrade-safe no-op for the orphan reaper
+    q = TaskQueue(tmp_path / "tasks.db")
+    url, stop = _boot(create_app(q, sweep_interval=0.2, enable_mcp=False))
+    try:
+        c = DispatchClient(url)
+        deadline = time.time() + 5
+        loops = {}
+        while time.time() < deadline:
+            loops = httpx.get(f"{url}/health", timeout=5).json()["loops"]
+            if (
+                loops.get("liveness_gc", {}).get("total_runs", 0) >= 1
+                and loops.get("orphan_reap", {}).get("total_runs", 0) >= 1
+            ):
+                break
+            time.sleep(0.1)
+        assert loops["liveness_gc"]["total_runs"] >= 1
+        assert loops["liveness_gc"]["in_progress"] is False
+        assert loops["liveness_gc"]["last_error"] is None
+        assert loops["liveness_gc"]["consecutive_failures"] == 0
+        assert loops["orphan_reap"]["total_runs"] >= 1
+        assert loops["orphan_reap"]["in_progress"] is False
+        # The handoff-fallback loop is disabled by default (see
+        # AGENT_DISPATCH_HANDOFF_FALLBACK) -- its health entry is still
+        # present (never a KeyError) but never records a run.
+        assert loops["handoff_fallback"]["total_runs"] == 0
+        c.close()
+    finally:
+        stop()
+
+
+def test_liveness_gc_loop_auto_resumes_a_due_cooldown(tmp_path, monkeypatch):
+    """The liveness GC loop's piggybacked cooldown reconciler (Phase 3 of
+    agent-dispatch-monitor-and-confirmed-state) auto-resumes a suspended
+    task once its default cooldown monitor elapses -- no operator/worker
+    call to ``resume`` required."""
+    from agent_dispatch.coordinator import create_app
+
+    monkeypatch.setattr("agent_dispatch.tracking.liveness_verdict", lambda *a, **k: "unknown")
+    monkeypatch.setattr("agent_dispatch.identity.resolve_machine", lambda: None)
+    q = TaskQueue(tmp_path / "tasks.db")
+    url, stop = _boot(create_app(q, sweep_interval=0.2, enable_mcp=False))
+    try:
+        c = DispatchClient(url)
+        task = c.create("cooldown")
+        owner = c.claim(worker_id="worker-1", repo=TEST_REPO)["owner"]
+        c.start(task["id"], owner)
+        c.suspend(task["id"], owner, reason="waiting", cooldown_seconds=0.3)
+
+        deadline = time.time() + 5
+        status = None
+        while time.time() < deadline:
+            status = c.get(task["id"])["status"]
+            if status == Status.STARTED:
+                break
+            time.sleep(0.1)
+        assert status == Status.STARTED
+        c.close()
+    finally:
+        stop()
+
+
+def test_liveness_gc_publishes_a_bus_event_for_auto_suspend_with_zero_requeued(
+    tmp_path, monkeypatch
+):
+    """Phase 3a audit: the always-on liveness GC loop must publish
+    a board-visible wake whenever it transitions a task at all, not only
+    when `requeued` is nonzero. A CLI-embodied `started` task whose owner
+    resolves to `gone` is auto-*suspended*, not requeued (see
+    `queue_liveness.reconcile_liveness`'s own docstring) -- so a pass that
+    only suspends/dead-letters tasks previously published nothing, leaving
+    that board change invisible to the agent-dispatch relay's fast path
+    (`board_relay.py`) until the next 45s long reconcile."""
+    from agent_dispatch.coordinator import create_app
+
+    # Start with a verdict the GC loop acts on for NOTHING (only "gone" is
+    # ever acted on -- see `queue_liveness.reconcile_liveness`'s `if verdict
+    # != self.LIVENESS_GONE: continue`), so an early GC pass racing the
+    # create/claim/start setup below is a harmless no-op instead of
+    # requeuing the task out from under us. A real-world full-matrix test
+    # run can make that setup take far longer than a short sweep_interval
+    # under heavy host load, so this is not just a hypothetical race -- see
+    # the Phase 3.5 effort notes. Flip to "gone" only once the task is
+    # actually STARTED, so the very next (now harmless-timing) GC pass is
+    # the one that performs the auto-suspend this test is about.
+    verdict = {"value": "unknown"}
+    monkeypatch.setattr(
+        "agent_dispatch.tracking.liveness_verdict",
+        lambda *a, **k: verdict["value"],
+    )
+    monkeypatch.setattr("agent_dispatch.identity.resolve_machine", lambda: None)
+    q = TaskQueue(tmp_path / "tasks.db")
+    app = create_app(q, sweep_interval=1.0, enable_mcp=False)
+
+    events: list[dict] = []
+    original = app.state.bus.publish
+
+    def _record(event: dict) -> None:
+        events.append(event)
+        original(event)
+
+    app.state.bus.publish = _record
+
+    url, stop = _boot(app)
+    try:
+        c = DispatchClient(url)
+        task = c.create("x")
+        owner = c.claim(worker_id="m1/wt1", repo=TEST_REPO)["owner"]
+        c.start(task["id"], owner)
+        verdict["value"] = "gone"
+
+        deadline = time.time() + 10
+        status = None
+        while time.time() < deadline:
+            status = c.get(task["id"])["status"]
+            if status == Status.SUSPENDED:
+                break
+            time.sleep(0.1)
+        assert status == Status.SUSPENDED
+
+        reconciled = [
+            e
+            for e in events
+            if e.get("type") == "task.reconciled" and e.get("suspended", 0) > 0
+        ]
+        assert reconciled, (
+            "expected a task.reconciled bus event with suspended > 0, got: "
+            f"{events}"
+        )
+        # The bug this guards against: a pass with requeued == 0 publishing
+        # nothing at all.
+        assert reconciled[0].get("requeued", 0) == 0
+        c.close()
+    finally:
+        stop()
+
+
+def test_health_loops_report_handoff_fallback_when_enabled(tmp_path, monkeypatch):
+    """Opting in (``handoff_fallback_enabled=True``) arms the coordinator's
+    reconciliation loop alongside liveness GC / orphan reap, on the same
+    ``sweep_interval`` cadence, and it is independently visible at ``GET
+    /health`` -- the same 'where a stuck poller got stuck' diagnosis surface
+    the other two loops already have."""
+    from agent_dispatch.coordinator import create_app
+
+    monkeypatch.setattr("agent_dispatch.tracking.liveness_verdict", lambda *a, **k: "unknown")
+    monkeypatch.setattr("agent_dispatch.identity.resolve_machine", lambda: None)
+    q = TaskQueue(tmp_path / "tasks.db")
+    url, stop = _boot(
+        create_app(
+            q, sweep_interval=0.2, enable_mcp=False,
+            handoff_fallback_enabled=True, handoff_fallback_grace=0.0,
+        )
+    )
+    try:
+        c = DispatchClient(url)
+        deadline = time.time() + 5
+        loops = {}
+        while time.time() < deadline:
+            loops = httpx.get(f"{url}/health", timeout=5).json()["loops"]
+            if loops.get("handoff_fallback", {}).get("total_runs", 0) >= 1:
+                break
+            time.sleep(0.1)
+        assert loops["handoff_fallback"]["total_runs"] >= 1
+        assert loops["handoff_fallback"]["in_progress"] is False
+        assert loops["handoff_fallback"]["last_error"] is None
+        assert loops["handoff_fallback"]["consecutive_failures"] == 0
+        c.close()
+    finally:
+        stop()
+
+
+def test_worktree_status_relay_refresh_skips_other_machines(tmp_path):
+    q = TaskQueue(tmp_path / "tasks.db")
+    q.create(
+        "local-owned",
+        repo=TEST_REPO,
+        target_worktree="wt-local",
+        claim_as="local/wt-local",
+    )
+    q.create(
+        "remote-owned",
+        repo=TEST_REPO,
+        target_worktree="wt-remote",
+        claim_as="remote/wt-remote",
+    )
+    relay = WorktreeStatusRelayStore(tmp_path / "relay.sqlite3")
+    seen: list[tuple[str, str]] = []
+
+    counts = _refresh_worktree_status_relay(
+        q,
+        relay,
+        poll_interval=10.0,
+        resolve_machine=lambda: "local",
+        fetch_bundle=lambda repo, worktree_id: (
+            seen.append((repo, worktree_id))
+            or {"project": "proj", "worktree_id": worktree_id, "facts": {}}
+        ),
+    )
+
+    assert counts["checked"] == 1
+    assert counts["updated"] == 1
+    assert seen == [(TEST_REPO, "wt-local")]
+    assert relay.get(TEST_REPO, "wt-local") is not None
+    assert relay.get(TEST_REPO, "wt-remote") is None
+
+
+def test_worktree_status_relay_refresh_revalidates_explicit_refs(tmp_path):
+    q = TaskQueue(tmp_path / "tasks.db")
+    q.create(
+        "remote-owned",
+        repo=TEST_REPO,
+        target_worktree="wt-remote",
+        claim_as="remote/wt-remote",
+    )
+    relay = WorktreeStatusRelayStore(tmp_path / "relay.sqlite3")
+    seen: list[tuple[str, str]] = []
+
+    counts = _refresh_worktree_status_relay(
+        q,
+        relay,
+        poll_interval=10.0,
+        resolve_machine=lambda: "local",
+        refs=[(TEST_REPO, "wt-remote")],
+        fetch_bundle=lambda repo, worktree_id: (
+            seen.append((repo, worktree_id))
+            or {"project": "proj", "worktree_id": worktree_id, "facts": {}}
+        ),
+    )
+
+    assert counts["checked"] == 0
+    assert counts["updated"] == 0
+    assert seen == []
+
+
+def test_worktree_status_relay_refresh_can_bound_one_worktree_per_cycle(tmp_path):
+    q = TaskQueue(tmp_path / "tasks.db")
+    q.create(
+        "first",
+        repo=TEST_REPO,
+        target_worktree="wt-a",
+        claim_as="local/wt-a",
+    )
+    q.create(
+        "second",
+        repo=TEST_REPO,
+        target_worktree="wt-b",
+        claim_as="local/wt-b",
+    )
+    relay = WorktreeStatusRelayStore(tmp_path / "relay.sqlite3")
+    seen: list[str] = []
+
+    counts = _refresh_worktree_status_relay(
+        q,
+        relay,
+        poll_interval=10.0,
+        resolve_machine=lambda: "local",
+        fetch_bundle=lambda _repo, worktree_id: seen.append(worktree_id) or {
+            "project": "proj", "worktree_id": worktree_id, "facts": {}
+        },
+        max_items=1,
+    )
+
+    assert counts["checked"] == 1
+    assert counts["updated"] == 1
+    assert seen == ["wt-b"]
+
+
+def test_worktree_status_relay_prunes_stale_rows(tmp_path):
+    relay = WorktreeStatusRelayStore(tmp_path / "relay.sqlite3")
+    relay.put(
+        TEST_REPO,
+        "wt-stale",
+        {"facts": {}},
+        fetched_at=10.0,
+        poll_interval_seconds=10.0,
+    )
+
+    removed = relay.prune(retention_seconds=5.0, now=20.0)
+
+    assert removed == 1
+    assert relay.get(TEST_REPO, "wt-stale") is None
+
+
 def test_cli_consume_completes_and_prints_payload(server_url, client, monkeypatch, capsys):
     """``agent-dispatch consume`` drives a proposed handoff to completed and
     prints its payload -- then a second consume of the now-spent baton is
@@ -887,13 +2781,61 @@ def test_cli_consume_completes_and_prints_payload(server_url, client, monkeypatc
     # proves the successor's identity owned it through the complete transition.
     assert done["result_ref"] == "consumed:wt-1"
 
-    # Debounce: consuming the now-completed handoff again is refused (exit 3)
+    # Debounce: consuming the now-spent handoff again is refused (exit 3)
     # with a stop notice instead of a replayed brief.
     assert __main__._cmd_consume(args) == 3
     out = capsys.readouterr().out
-    assert "already COMPLETED" in out
+    assert "already spent" in out
     assert "BRIEF-BODY" not in out
     assert client.get(tid)["status"] == Status.COMPLETED
+
+
+def test_cli_consume_refuses_superseded_handoff(server_url, client, monkeypatch, capsys):
+    """A handoff abandoned because a newer one superseded it is refused (exit
+    3), not delivered: a successor seeded with the stale baton must stand down
+    instead of running the old brief alongside the newer handoff's successor."""
+    import argparse
+
+    from agent_dispatch import __main__
+    from tests._helpers import TEST_REPO
+
+    task = client.create(
+        "handoff",
+        proposed=True,
+        labels=["handoff"],
+        target_worktree="wt-1",
+        payload_inline="STALE-BRIEF",
+        repo=TEST_REPO,
+    )
+    tid = task["id"]
+    client.abandon(
+        tid, permitted=True, reason="superseded by a newer handoff for this worktree"
+    )
+
+    monkeypatch.setattr(__main__, "_client", lambda args: DispatchClient(server_url))
+    monkeypatch.setattr(__main__, "_scope_repo", lambda args: TEST_REPO)
+    args = argparse.Namespace(
+        task_id=tid,
+        worker_id=None,
+        machine="m1",
+        worktree="wt-1",
+        repo=None,
+        result_ref=None,
+        url=None,
+        token=None,
+    )
+
+    assert __main__._cmd_consume(args) == 3
+    captured = capsys.readouterr()
+    out = captured.out
+    assert "was abandoned" in out
+    assert "wt-1" in out
+    assert "STALE-BRIEF" not in out
+    # The notice names no cause (abandonment has several); the event log does.
+    assert "superseded" not in out and "superseded" not in captured.err
+    # context-handoff surfaces stderr first when consume fails.
+    assert "abandoned" in captured.err and "do not act" in captured.err
+    assert client.get(tid)["status"] == Status.ABANDONED
 
 
 # -- satellite presence registry ---------------------------------------------

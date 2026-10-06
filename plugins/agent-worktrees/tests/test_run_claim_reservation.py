@@ -7,8 +7,8 @@ import json
 import types
 
 import agent_worktrees.__main__ as m
+from agent_worktrees import claim_history, state_root, tracking
 from agent_worktrees import config as cfg
-from agent_worktrees import tracking
 
 
 def _seed_owner(tmp_path, monkeypatch):
@@ -19,6 +19,20 @@ def _seed_owner(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cfg, "load_config",
         lambda *a, **k: types.SimpleNamespace(machine="m", repo_name="p"))
+    monkeypatch.setattr(
+        cfg, "load_project_config",
+        lambda name: types.SimpleNamespace(machine="m", repo_name=name),
+    )
+    ready_root = state_root.StateRoot(
+        str(tmp_path), "launch_repo", "p", False, False, True
+    )
+    monkeypatch.setattr(
+        m.state_root_mod,
+        "coordination_readiness",
+        lambda config: state_root.CoordinationReadiness(
+            True, "ready", ready_root
+        ),
+    )
     tracking.create_new_record(
         "owner", "worktree/owner", str(tmp_path / "owner"), "p",
         "m", "windows", tracking_dir)
@@ -55,6 +69,64 @@ def test_run_success_replaces_pending_with_real_claim(
     assert [claim.ref for claim in rec.resources] == ["m/p/child"]
 
 
+def test_run_success_feeds_claim_history_for_a_pr_claim(
+        tmp_path, monkeypatch):
+    """worktree-claims-transitive-finalization Phase 3b: `run`'s own
+    live save site (`_finish_pending`, replacing the pending-ref
+    placeholder with the real claim) must feed the same append-only
+    ownership ledger `pr_ops.py` and the daemon claim verbs already feed,
+    for a produced `pr`-kind claim -- only after the save is confirmed."""
+    _seed_owner(tmp_path, monkeypatch)
+    payload = json.dumps({
+        "success": True, "pr_opened": True,
+        "pr": {"ref": "https://github.com/o/r/pull/9"},
+    })
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=payload))
+    assert m.cmd_run(_args()) == 0
+    events = claim_history.history_for_ref("https://github.com/o/r/pull/9")
+    assert [e["event"] for e in events] == ["claimed"]
+    assert events[0]["worktree_id"] == "owner" and events[0]["machine"] == "m"
+
+
+def test_run_repeat_success_on_same_active_pr_claim_does_not_duplicate_history(
+        tmp_path, monkeypatch):
+    """A retried/re-run `run` re-observing the same already-active PR claim
+    is a no-op reconciliation, not a fresh transition -- must feed exactly
+    one "claimed" event, never two (matches `pr_ops._ensure_pr_claim`'s own
+    idempotency contract)."""
+    _seed_owner(tmp_path, monkeypatch)
+    payload = json.dumps({
+        "success": True, "pr_opened": True,
+        "pr": {"ref": "https://github.com/o/r/pull/9"},
+    })
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=payload))
+    assert m.cmd_run(_args()) == 0
+    assert m.cmd_run(_args()) == 0
+    events = claim_history.history_for_ref("https://github.com/o/r/pull/9")
+    assert [e["event"] for e in events] == ["claimed"]
+
+
+def test_run_success_worktree_claim_does_not_feed_claim_history(
+        tmp_path, monkeypatch):
+    """A `worktree`-kind claim is outside claim_history's scope (`pr`-kind
+    only today) -- `run` producing one must never feed a spurious entry."""
+    path = _seed_owner(tmp_path, monkeypatch)
+    payload = json.dumps({
+        "worktree": {"id": "child", "machine": "m", "repo": "p"}
+    })
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=payload))
+    assert m.cmd_run(_args()) == 0
+    rec = tracking.load_record(path)
+    assert rec.resources[0].kind == "worktree"
+    assert claim_history.history_for_ref("m/p/child") == []
+
+
 def test_run_refuses_cross_machine_owner_before_creation(
         tmp_path, monkeypatch):
     _seed_owner(tmp_path, monkeypatch)
@@ -69,3 +141,101 @@ def test_run_refuses_cross_machine_owner_before_creation(
         inner_command=["resource-create"], owner_ref="other/p/owner")
     assert m.cmd_run(args) == 1
     assert called["run"] is False
+
+
+def test_run_cross_machine_error_precedes_unready_ambient_config(
+    tmp_path,
+    monkeypatch,
+):
+    _seed_owner(tmp_path, monkeypatch)
+    root = state_root.StateRoot(
+        None,
+        "knowledge_repo",
+        "",
+        True,
+        True,
+        False,
+        error="no knowledge_repo is bound",
+    )
+    monkeypatch.setattr(
+        m.state_root_mod,
+        "coordination_readiness",
+        lambda config: state_root.CoordinationReadiness(
+            False,
+            "knowledge_binding_required",
+            root,
+            error="bind the knowledge repository",
+        ),
+    )
+    called = {"run": False}
+    monkeypatch.setattr(
+        m.subprocess,
+        "run",
+        lambda *a, **k: called.__setitem__("run", True),
+    )
+
+    args = argparse.Namespace(
+        inner_command=["resource-create"], owner_ref="other/p/owner"
+    )
+    assert m.cmd_run(args) == 1
+    assert called["run"] is False
+
+
+def test_run_rejects_unready_owner_without_mutation_or_subprocess(
+    tmp_path,
+    monkeypatch,
+):
+    path = _seed_owner(tmp_path, monkeypatch)
+    before = path.read_bytes()
+    root = state_root.StateRoot(
+        None,
+        "knowledge_repo",
+        "",
+        True,
+        True,
+        False,
+        error="no knowledge_repo is bound",
+    )
+    monkeypatch.setattr(
+        m.state_root_mod,
+        "coordination_readiness",
+        lambda config: state_root.CoordinationReadiness(
+            False,
+            "knowledge_binding_required",
+            root,
+            error="bind the knowledge repository",
+        ),
+    )
+    monkeypatch.setattr(
+        m.subprocess,
+        "run",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("unready run launched a subprocess")
+        ),
+    )
+
+    assert m.cmd_run(_args()) == 3
+    assert path.read_bytes() == before
+
+
+def test_owner_config_resolution_failure_is_structured_readiness(
+    tmp_path,
+    monkeypatch,
+):
+    _seed_owner(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        cfg,
+        "load_project_config",
+        lambda name: (_ for _ in ()).throw(
+            ValueError("No repo could be resolved")
+        ),
+    )
+    config = types.SimpleNamespace(machine="m", repo_name="p")
+
+    result = m._coordination_readiness_for_owner_ref(
+        "m/p/owner", config
+    )
+
+    assert result.ready is False
+    assert result.code == "state_root_resolution_failed"
+    assert "No repo could be resolved" in result.error

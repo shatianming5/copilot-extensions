@@ -12,7 +12,11 @@ import json
 import time
 from pathlib import Path
 
+import sys
+
 import pytest
+
+pytestmark = pytest.mark.guard
 
 # The guard ships as a standalone script under scripts/ (deployed to
 # ~/.agent-worktrees/bin/), not as a package module -- load it by path.
@@ -102,6 +106,32 @@ def test_read_tool_into_anchor_allows(tmp_path, anchor):
     assert guard.decide(p, env={}, home=tmp_path, anchors=anchor) is None
 
 
+def test_explicit_invalid_context_never_reads_legacy_registry(
+    tmp_path, monkeypatch
+):
+    invalid = tmp_path / "invalid" / "install.json"
+    invalid.parent.mkdir()
+    invalid.write_text("{", encoding="utf-8")
+    monkeypatch.setattr(
+        guard,
+        "load_worktree_anchors",
+        lambda _root: pytest.fail("legacy registry must not be read"),
+    )
+    env = {
+        "COPILOT_EXTENSIONS_CONTEXT": str(invalid),
+        "AGENT_WORKTREES_PAYLOAD_ROOT": str(
+            Path(__file__).resolve().parents[1]
+        ),
+    }
+
+    with pytest.raises(ValueError):
+        guard.decide(
+            _write("create", tmp_path / "x.py", tmp_path),
+            env=env,
+            home=tmp_path,
+        )
+
+
 def test_relative_write_path_resolves_against_cwd(tmp_path, anchor):
     cwd = Path(anchor[0]["path"]) / "src"
     p = {"toolName": "edit", "cwd": str(cwd), "toolArgs": {"path": "x.py"}}
@@ -125,10 +155,251 @@ def test_shell_git_commit_into_anchor_denies(tmp_path, anchor):
     assert d and d["permissionDecision"] == "deny"
 
 
+def test_shell_git_commit_into_anchor_with_spaced_quoted_dashC_path_denies(tmp_path):
+    """A quoted ``-C "<anchor path with a space>"`` must still be caught by
+    the cheap early-out: a bare ``\\S+`` there only matched the first word
+    of the quoted path, so the whole early-out missed the match and the
+    entire per-segment analysis was skipped, silently allowing the write."""
+    root = _main_checkout(tmp_path, "my anchor repo")
+    spaced_anchor = [{"name": "myrepo", "path": str(root)}]
+    d = guard.decide(_shell(f'git -C "{root}" commit -m x', tmp_path),
+                     env={}, home=tmp_path, anchors=spaced_anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
+def test_shell_git_branch_force_move_into_anchor_with_spaced_quoted_dashC_path_denies(
+    tmp_path,
+):
+    root = _main_checkout(tmp_path, "my anchor repo")
+    spaced_anchor = [{"name": "myrepo", "path": str(root)}]
+    d = guard.decide(_shell(f'git -C "{root}" branch -f main origin/main', tmp_path),
+                     env={}, home=tmp_path, anchors=spaced_anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
 def test_shell_read_into_anchor_allows(tmp_path, anchor):
     gp = anchor[0]["path"]
     assert guard.decide(_shell(f'cat "{gp}/README.md"', tmp_path),
                         env={}, home=tmp_path, anchors=anchor) is None
+
+
+def test_shell_git_pull_ff_only_with_dashC_into_anchor_allows(tmp_path, anchor):
+    """``git pull --ff-only`` is exempt: git structurally refuses instead of
+    ever creating a merge commit or applying ``pull.rebase``, so it can
+    never introduce agent-authored content."""
+    gp = anchor[0]["path"]
+    assert guard.decide(
+        _shell(f'git -C "{gp}" pull --ff-only origin main', tmp_path),
+        env={}, home=tmp_path, anchors=anchor) is None
+
+
+def test_shell_git_pull_ff_only_from_anchor_cwd_allows(tmp_path, anchor):
+    gp = anchor[0]["path"]
+    assert guard.decide(_shell("git pull origin main --ff-only", gp),
+                        env={}, home=tmp_path, anchors=anchor) is None
+
+
+def test_shell_git_fetch_from_anchor_cwd_allows(tmp_path, anchor):
+    gp = anchor[0]["path"]
+    assert guard.decide(_shell("git fetch origin", gp),
+                        env={}, home=tmp_path, anchors=anchor) is None
+
+
+def test_shell_git_bare_pull_without_ff_only_from_anchor_cwd_denies(
+    tmp_path, anchor,
+):
+    """A bare ``git pull`` (no ``--ff-only``) is NOT exempt -- on a diverged
+    anchor its default merge could create a genuine new local commit, so it
+    stays denied exactly like every other git-write verb."""
+    gp = anchor[0]["path"]
+    d = guard.decide(_shell("git pull origin main", gp), env={},
+                     home=tmp_path, anchors=anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
+def test_shell_git_pull_with_ff_only_substring_in_branch_name_denies(
+    tmp_path, anchor,
+):
+    """The ``--ff-only`` match must require a standalone argument, not a
+    substring anywhere in the segment -- a branch name that merely CONTAINS
+    the literal text ``--ff-only`` (no real flag passed) is still an unsafe
+    bare pull and must still deny."""
+    gp = anchor[0]["path"]
+    d = guard.decide(
+        _shell("git pull origin release/--ff-only", gp),
+        env={}, home=tmp_path, anchors=anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
+def test_shell_git_commit_with_pull_ff_only_in_message_denies(
+    tmp_path, anchor,
+):
+    """The ``--ff-only`` exemption must key off the actual git SUBCOMMAND,
+    not a bare substring search -- a ``commit`` whose message happens to
+    contain the literal text ``pull --ff-only`` is still a genuine commit
+    and must still deny."""
+    gp = anchor[0]["path"]
+    d = guard.decide(
+        _shell("git commit -m 'pull --ff-only'", gp),
+        env={}, home=tmp_path, anchors=anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
+def test_shell_git_commit_still_denies_alongside_pull_exemption(
+    tmp_path, anchor,
+):
+    """The ``pull --ff-only`` exemption must not have loosened any OTHER git
+    mutation verb -- ``commit`` (and by the same list, merge/rebase/
+    checkout/etc.) still denies."""
+    gp = anchor[0]["path"]
+    d = guard.decide(_shell("git commit -m x", gp), env={}, home=tmp_path,
+                     anchors=anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
+# -- git branch exemption -------------------------------------------------
+# Recovering a local ``main`` after a deliberate upstream history rewrite
+# (docs/pipelines.md's "If main's history is force-rewritten") uses
+# ``git branch -f main origin/main`` directly against the anchor checkout
+# -- a genuine mutation this guard must catch.
+
+def test_shell_git_branch_force_move_into_anchor_denies(tmp_path, anchor):
+    gp = anchor[0]["path"]
+    d = guard.decide(_shell(f'git -C "{gp}" branch -f main origin/main', tmp_path),
+                     env={}, home=tmp_path, anchors=anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
+def test_shell_git_branch_force_move_from_anchor_cwd_denies(tmp_path, anchor):
+    gp = anchor[0]["path"]
+    d = guard.decide(_shell("git branch -f main origin/main", gp), env={},
+                     home=tmp_path, anchors=anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
+def test_shell_git_branch_delete_from_anchor_cwd_denies(tmp_path, anchor):
+    gp = anchor[0]["path"]
+    d = guard.decide(_shell("git branch -D stale-branch", gp), env={},
+                     home=tmp_path, anchors=anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
+def test_shell_git_branch_move_rename_from_anchor_cwd_denies(tmp_path, anchor):
+    gp = anchor[0]["path"]
+    d = guard.decide(_shell("git branch -m old-name new-name", gp), env={},
+                     home=tmp_path, anchors=anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
+def test_shell_git_branch_combined_short_flags_from_anchor_cwd_denies(tmp_path, anchor):
+    """Git accepts short flags COMBINED into one token (``-df`` = force
+    delete, exactly like ``-d -f``) -- a regex matching only a standalone
+    ``-f``/``-d``/etc. would miss this cluster entirely, wrongly treating a
+    real deletion as a safe read-only invocation."""
+    gp = anchor[0]["path"]
+    d = guard.decide(_shell("git branch -df stale-branch", gp), env={},
+                     home=tmp_path, anchors=anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
+def test_shell_git_branch_bare_listing_from_anchor_cwd_allows(tmp_path, anchor):
+    """A plain ``git branch`` (no args) only lists and must stay allowed."""
+    gp = anchor[0]["path"]
+    assert guard.decide(_shell("git branch", gp), env={}, home=tmp_path,
+                        anchors=anchor) is None
+
+
+def test_shell_git_branch_verbose_list_from_anchor_cwd_allows(tmp_path, anchor):
+    gp = anchor[0]["path"]
+    assert guard.decide(_shell("git branch -vv", gp), env={}, home=tmp_path,
+                        anchors=anchor) is None
+
+
+def test_shell_git_branch_show_current_from_anchor_cwd_allows(tmp_path, anchor):
+    gp = anchor[0]["path"]
+    assert guard.decide(_shell("git branch --show-current", gp), env={},
+                        home=tmp_path, anchors=anchor) is None
+
+
+def test_shell_git_branch_merged_with_embedded_value_from_anchor_cwd_allows(
+    tmp_path, anchor,
+):
+    """A value-bearing read-only flag using the embedded ``=value`` form
+    (no separate positional argument) stays allowed."""
+    gp = anchor[0]["path"]
+    assert guard.decide(_shell("git branch --merged=HEAD", gp), env={},
+                        home=tmp_path, anchors=anchor) is None
+
+
+def test_shell_git_branch_column_with_embedded_value_from_anchor_cwd_allows(
+    tmp_path, anchor,
+):
+    """``--column`` also accepts a value-bearing ``=<options>`` form (e.g.
+    ``--column=dense``), not just the bare flag."""
+    gp = anchor[0]["path"]
+    assert guard.decide(_shell("git branch --column=dense", gp), env={},
+                        home=tmp_path, anchors=anchor) is None
+
+
+def test_shell_git_branch_short_list_flag_from_anchor_cwd_allows(tmp_path, anchor):
+    """``-l`` is git's short form of the read-only ``--list`` mode."""
+    gp = anchor[0]["path"]
+    assert guard.decide(_shell("git branch -l", gp), env={}, home=tmp_path,
+                        anchors=anchor) is None
+
+
+# -- allowlist, not a blacklist: every mutating MODE must be caught, not
+# just the ones an earlier blacklist happened to enumerate --
+# --track/--set-upstream-to/--unset-upstream/--edit-description all mutate
+# a ref or its config but carry none of the blacklisted flags ---------------
+
+def test_shell_git_branch_track_from_anchor_cwd_denies(tmp_path, anchor):
+    """``--track`` creates a new ref plus upstream config -- a real
+    mutation with none of the previously-blacklisted flags."""
+    gp = anchor[0]["path"]
+    d = guard.decide(_shell("git branch --track child main", gp), env={},
+                     home=tmp_path, anchors=anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
+def test_shell_git_branch_set_upstream_to_from_anchor_cwd_denies(tmp_path, anchor):
+    gp = anchor[0]["path"]
+    d = guard.decide(_shell("git branch --set-upstream-to=origin/main", gp),
+                     env={}, home=tmp_path, anchors=anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
+def test_shell_git_branch_unset_upstream_from_anchor_cwd_denies(tmp_path, anchor):
+    gp = anchor[0]["path"]
+    d = guard.decide(_shell("git branch --unset-upstream", gp), env={},
+                     home=tmp_path, anchors=anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
+def test_shell_git_branch_edit_description_from_anchor_cwd_denies(tmp_path, anchor):
+    gp = anchor[0]["path"]
+    d = guard.decide(_shell("git branch --edit-description", gp), env={},
+                     home=tmp_path, anchors=anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
+def test_shell_git_branch_bare_positional_name_from_anchor_cwd_denies(tmp_path, anchor):
+    """A bare positional argument with no recognized flag at all (plain
+    branch creation) is unrecognized and must deny, not be assumed safe."""
+    gp = anchor[0]["path"]
+    d = guard.decide(_shell("git branch new-name", gp), env={},
+                     home=tmp_path, anchors=anchor)
+    assert d and d["permissionDecision"] == "deny"
+
+
+def test_shell_git_commit_with_branch_force_in_message_denies(tmp_path, anchor):
+    """The ``branch`` exemption must key off the actual git SUBCOMMAND, not a
+    bare substring search -- a ``commit`` whose message happens to contain
+    ``branch -f`` is still a genuine commit and must still deny."""
+    gp = anchor[0]["path"]
+    d = guard.decide(_shell("git commit -m 'branch -f cleanup'", gp), env={},
+                     home=tmp_path, anchors=anchor)
+    assert d and d["permissionDecision"] == "deny"
 
 
 # -- cwd-scoped git mutation (no path named) -- the incident-class case --------
@@ -445,13 +716,42 @@ def test_load_worktree_anchors_filters_by_class(tmp_path):
         "    class: worktree\n"
         "    windows: \"C:\\\\Data\\\\Src\\\\other\"\n",
         encoding="utf-8")
-    anchors = guard.load_worktree_anchors(home)
+    anchors = guard.load_worktree_anchors(home / ".agent-worktrees")
     names = {a["name"] for a in anchors}
     assert names == {"copilot-extensions", "other-wt"}  # singleton excluded
     paths = {a["path"] for a in anchors}
     # Double-backslash unescaped to single; both platform paths surfaced.
     assert "C:\\Data\\Src\\copilot-extensions" in paths
     assert "/home/u/copilot-extensions" in paths
+
+
+@pytest.mark.parametrize("no_pyyaml", [False, True])
+def test_base_repo_adoption_is_not_guarded(tmp_path, monkeypatch, no_pyyaml):
+    """projects.yaml ``base_repo: true`` means the anchor IS the working checkout
+    (e.g. a CodeSpace dedicated to one task), even for a ``class: worktree`` repo."""
+    if no_pyyaml:
+        monkeypatch.setitem(sys.modules, "yaml", None)  # force the stdlib parser
+    reg = tmp_path / ".agent-worktrees"
+    reg.mkdir()
+    (reg / "repos.yaml").write_text(
+        "repos:\n"
+        "  example-web:\n"
+        "    class: worktree\n"
+        "    linux: /workspaces/example-web\n"
+        "  other-wt:\n"
+        "    class: worktree\n"
+        "    linux: /src/other\n",
+        encoding="utf-8")
+    (reg / "projects.yaml").write_text(
+        "schema_version: 2\n"
+        "projects:\n"
+        "  example-web:\n"
+        "    base_repo: true\n"
+        "    expose_agent: false\n"
+        "  other-wt:\n"
+        "    base_repo: false\n",
+        encoding="utf-8")
+    assert {a["name"] for a in guard.load_worktree_anchors(reg)} == {"other-wt"}
 
 
 def test_load_worktree_anchors_missing_file_is_empty(tmp_path):

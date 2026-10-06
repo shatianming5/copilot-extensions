@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Request
+from ssh_manager import get_default_manager
 
+from .. import __version__
+from ..config import config_dir
 from ..protocol import HTTP_PROTOCOL_MIN_SUPPORTED, HTTP_PROTOCOL_VERSION
+from ..self_retire import slot_descriptor
 
 router = APIRouter()
 
@@ -20,6 +24,7 @@ async def health(request: Request) -> dict:
     body = {
         "status": "ok",
         "service": "agent-bridge",
+        "version": __version__,
         "ready": bool(getattr(request.app.state, "ready", False)),
         "topology_ready": bool(
             getattr(request.app.state, "topology_ready", False)
@@ -30,7 +35,16 @@ async def health(request: Request) -> dict:
         "draining": draining,
         "protocol_version": HTTP_PROTOCOL_VERSION,
         "min_protocol_version": HTTP_PROTOCOL_MIN_SUPPORTED,
+        "ssh_carriers": get_default_manager().carrier_diagnostics(),
     }
+    # process-slot-ownership Phase 5 (private-downstream-repo): "doctor"/"activity"/cockpit
+    # render process -> slot -> owner -> alive?. Read-only and best-effort; see
+    # slot_descriptor's own docstring for why agent-bridge's shape omits the
+    # abandoned_passive_reap key agent-dispatch's coordinator publishes.
+    body["slot"] = slot_descriptor(
+        config_dir(),
+        self_retire_status=getattr(request.app.state, "self_retire_status", None),
+    )
     readiness_error = getattr(request.app.state, "readiness_error", None)
     if readiness_error:
         body["readiness_error"] = readiness_error

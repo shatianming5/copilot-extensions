@@ -38,6 +38,27 @@ process boundaries, elevated launchers, and out-of-session management callers.
 Catalog adoption does not make those callers payload-aware; they retain their
 current commands until an attributable launcher contract reaches each surface.
 
+### Worktree-picker "Bridges" pivot
+
+The installer drops a pivot manifest at `~/.agent-worktrees/pivots/
+agent-bridge.json` so the agent-worktrees Textual picker grows a **Bridges**
+pivot, rendering the registered-agent roster through `agent-bridge --json
+agents`. The manifest declares `"stream": true, "subscribe": true`
+(pivot-streaming-transport Phase 2): the Picker runs `agents --stream`
+instead of a plain one-shot call, consuming a line-delimited NDJSON envelope
+(`begin`/`row`/`done`) so the roster paints progressively, then holds that
+channel open -- every 45 seconds (`--interval`, matching the Picker's prior
+one-shot repoll cadence) the roster is re-fetched
+in-process and diffed against the last snapshot, emitting `delta`/`removed`
+frames keyed by agent `name` so an open pivot updates live without
+re-invoking the CLI per refresh. Falls back automatically to the plain
+one-shot JSON call on an older `agent-bridge` that doesn't understand
+`--stream`; a held channel that drops mid-session reconnects with bounded
+backoff rather than freezing (the Picker-owned `subscribe` EOF/reconnect
+contract -- see `worktree-manager`'s `tasks.py`). A topology-profile error on
+the initial fetch surfaces as a stream `error` frame (same contract as a
+bridge-connection failure) rather than being silently dropped.
+
 ## How It Works
 
 Agent Bridge runs as a local HTTP service on an OS-assigned loopback port by
@@ -106,6 +127,39 @@ one contiguous, gap-free, duplicate-free stream:
 The caller identity keying the cursor comes from `--caller`, else the current
 worktree (`agent-worktrees get worktree-dir`), else a shared per-session default.
 
+### Remote Bridge carrier operations
+
+Remote consumers use the local Agent Bridge daemon rather than constructing SSH
+commands or learning carrier details. The initial surface is intentionally
+narrow and read-oriented:
+
+```bash
+agent-bridge remote status example-host 11111111-1111-1111-1111-111111111111 \
+  --caller-id supervisor.lane-a --json
+agent-bridge remote live-session example-host 22222222-2222-2222-2222-222222222222 \
+  --json
+agent-bridge remote events example-host 11111111-1111-1111-1111-111111111111 \
+  --caller-id supervisor.lane-a --json
+```
+
+`host` is a topology machine key for a single-environment machine, or an exact
+SSH alias. Multi-environment machines require the alias so Windows, WSL, and
+Linux Bridge daemons cannot be confused. Session arguments are exact
+hosting-Bridge IDs. Status, live-session resolution, event IDs, event names,
+payloads, and timestamps come unchanged from the hosting Bridge. The local
+daemon owns one shared reconnecting carrier per normalized SSH identity and
+does not create another session or event ledger.
+
+Every event consumer supplies its own stable `caller_id`. Remote delivery uses
+that identity's hosting-Bridge cursor and acknowledges only after local output
+has been flushed. Carrier reconnect starts from the hosting Bridge's durable
+acknowledged cursor; a local daemon cutover is likewise recoverable because a
+replacement daemon reuses the same remote cursor authority. Event-log rebuild,
+cursor invalidation, and non-contiguous replay produce a cursor-neutral
+`bridge_control` envelope with `action=full_reconcile`; they are never reported
+as a quiet empty stream. The HTTP equivalents live below
+`/api/v1/remote/{host}/...` and require the ordinary local bearer token.
+
 ### Bounded result snapshots
 
 `result` is the cursor-neutral answer to "what did this delegate produce?":
@@ -121,15 +175,55 @@ The fixed-size response combines current lifecycle/attention state, bounded
 active-work and pending-input fields, the latest completed turn, and a collapsed
 increment of recent work. Reasoning and verbose tool output stay out of the
 ordinary result path; each projected event and completed turn carries an opaque
-detail reference for explicit expansion. The first increment covers
-bridge-owned sessions; represented interactive-session parity remains explicitly
-reduced-fidelity work under issue #1452.
+detail reference for explicit expansion. Bridge-owned sessions recover durable
+turns and event positions. Represented interactive sessions use the same shape
+but explicitly report process-lifetime retention, read-only requests, and
+unavailable durable recovery.
 
 Positions are bridge-issued and must not be parsed or compared across targets.
 They do not read or advance a delivery cursor. A resync rebuild invalidates an
 older position explicitly instead of reusing its event number for different
-history. Empty logs return no position until the first event establishes a
-durable origin.
+history. A represented process replacement uses a new session ID and therefore
+a new position scope; PID-mismatched re-registration is rejected. Empty logs
+return no position until the first event establishes an observable origin.
+Result detail expansion never returns reasoning or nested-agent events.
+
+### Attention waits
+
+Bare `wait` keeps its historical meaning: stream the current turn until it
+settles. Explicit attention flags opt into the cursor-neutral attention
+contract:
+
+```bash
+agent-bridge wait <session> --attention input_required
+agent-bridge wait <session> --attention failed --attention stopped
+agent-bridge wait <session> --all-attention
+agent-bridge wait <session> --all-attention --json
+agent-bridge wait <session> --all-attention --position <opaque-position>
+```
+
+The selected stable reasons are `turn_complete`, `turn_cancelled`, `failed`,
+`input_required`, `permission_required`, `unreachable`, `policy_required`,
+`contract_changed`, `stopped`, and `ended`. `ended` is reserved but does not
+settle in the current production lifecycle because deliberate retirement
+deletes the session and its history; callers that need a replayable terminal
+boundary should select `stopped` until terminal-retention ownership lands.
+
+Human mode retains one SSE delivery loop, renders and acknowledges through the
+settlement boundary, then exits. JSON mode uses only the authenticated bounded
+attention request and never reads or advances a delivery cursor. A service
+restart is retried from the opaque attention position. A deliberate handoff
+continues on a compatible successor; explicit protocol rejection settles as
+`contract_changed`, while inconclusive discovery/reachability remains
+recoverable. Timeout returns `settled: false` with the latest position rather
+than inventing a timeout reason.
+
+The authenticated API is
+`GET /api/v1/sessions/{session-or-worktree}/attention` with repeatable `reason`,
+optional `position`, and bounded `timeout_seconds` query parameters. A live
+manual permission can be resolved through
+`POST /api/v1/sessions/{session}/permission` using the correlated `request_id`
+and one advertised `option_id`.
 
 ### Phased timeouts
 
@@ -162,6 +256,13 @@ inconclusive and blocks duplicate spawn; only confirmed host death permits
 pruning, with an explicit process-group reap if the owned child survived.
 Startup inspection never wakes a stopped CodeSpace; explicit resume may wake
 and revalidate it.
+
+For a stopped trusted-container session, resume first re-resolves the provider's
+current serving generation. If credential relay is enabled, it replaces the
+session's reverse-forward against the daemon's current live relay and proves the
+container-side loopback listener accepts before ACP is marked ready or a queued
+prompt is delivered. Relay setup or verification failure aborts the resume
+explicitly; relay-disabled fleets keep the auth-light path.
 
 ### Session retention & garbage collection
 
@@ -243,10 +344,23 @@ as a `bearer.<token>` WebSocket subprotocol (acp-ui's convention); a plain
 The server negotiates the `acp.v1` subprotocol. Print the token with
 `agent-bridge token` (it lives in `~/.agent-bridge/auth.yaml`).
 
-**Status UX.** `GET /ui` serves a dependency-free status page listing registered
-agents and live sessions, each with a copyable ACP WebSocket URL to paste into
-acp-ui. It calls the token-protected `/api/v1` endpoints (token entered once,
-kept in `localStorage`), so no data is exposed without auth.
+**Control surface.** `GET /ui` (open it signed in with `agent-bridge ui`) is a
+dependency-free task board for the sessions registered with this bridge: each
+worktree task with its orchestrator and supervised venue workers, a session
+viewer that collapses tool calls, new/resume/rename task verbs over the
+`agent-worktrees` CLI (`/api/v1/ui/workspaces`, `/api/v1/ui/tasks`), and the
+ACP agent/session URLs to paste into acp-ui. New task offers the task modes a
+repository declares in `.copilot-extensions/agent-bridge/task-modes.yaml`
+(`ui_task_modes.py`: an id, label, description, and first-message template the
+bridge fills in; the page never sends a template). An earlier task shows its
+last session's transcript read back through the cold-store provider seam
+(`/api/v1/ui/sessions/{id}/history`, mapped to the live stream's kinds and
+bounded) and its branch's own commits (`/api/v1/ui/tasks/{id}/commits`).
+The page, scripts, and stylesheet
+ship as package data (`ui_static/`) served from a fixed allowlist under a CSP
+with no inline code; they carry no data. Data comes only from the
+token-protected `/api/v1` routes, and the task-launching verbs additionally
+require a same-origin request and are rate limited.
 
 > Hosted acp-ui is served over HTTPS, which (per the browser mixed-content rule)
 > can only dial `wss://` — not `ws://localhost`. For a local bridge, use the
@@ -263,6 +377,13 @@ Start with [Getting Started](docs/getting-started.md) for the standalone install
 and first health check. Then use the [`agent-bridge` skill](skills/agent-bridge/SKILL.md)
 and [CLI reference](skills/agent-bridge/references/cli-commands.md) for
 day-to-day dispatch, live-session messaging, handoff, and service control.
+`agent-bridge handoff-request` is an additional external control-plane seam: a
+different extension-enabled session that already stored a durable baton can ask
+the bridge to roll a worktree's current ACP session in place and seed the
+successor with an exact supplied opening prompt. This does **not** replace or
+power agent-bridge's own ACP auto-handoff path: ACP-hosted children still rely
+on the bridge's internal context-pressure detection and self-authored brief
+flow, independent of Copilot CLI extension activation.
 Use [`agent-bridge-troubleshooting`](skills/agent-bridge-troubleshooting/SKILL.md)
 for wedged dispatches, resume issues, relay/auth failures, and repair drills.
 

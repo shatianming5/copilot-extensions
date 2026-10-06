@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
+from platform import system as _platform_system
 
 import pytest
+import yaml
 
 from agent_logger import __version__
 from agent_logger.__main__ import main as cli_main
@@ -17,8 +21,12 @@ from agent_logger.config import (
     find_repo_config,
     load_config,
 )
+from agent_logger.repo_trust import _normalize_git_remote
 from agent_logger.segmenter import prepare_log
 from agent_logger.segmenter.platform import detect_machine, sanitize_path_component
+
+from .conftest import git_test_env as _git_test_env
+from .conftest import init_git_repo as _init_git_repo
 
 
 def test_version_matches_build_info() -> None:
@@ -73,7 +81,7 @@ def test_runtime_is_reconciled_on_every_machine() -> None:
     )
     assert 'VENV="$INSTALL_DIR/versions/$__current"' in install_sh
     assert (
-        'if [[ "$SKIP_PACKAGE_INSTALL" = 0 ]]; then _write_deploy_manifest; fi'
+        'if [[ "$SKIP_PACKAGE_INSTALL" = 0 ]]; then write_deploy_manifest "agent-logger" "agent-logger" "${INSTALL_DIR}" "${PLUGIN_DIR}" "${VENV}"; fi'
         in install_sh
     )
     assert ".install-complete.json" in install_sh
@@ -177,10 +185,188 @@ def test_repo_config_overrides_log_layout_only(tmp_path: Path, monkeypatch) -> N
     assert cfg.closing_remark == "End with one concise takeaway."
 
 
+def test_repo_config_sync_local_path_overrides_machine_local(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """schema v3's one deliberate relaxation: ``sync.local_path`` is honored
+    from repo-local config -- the canonical facility-wide sync destination,
+    the same absolute value for every machine, closing the exact drift that
+    motivated it (a machine with no local sync config at all, or one with a
+    stale/wrong path)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    # No config.yaml at all here -- exactly the "never configured" case this
+    # field exists to fix.
+
+    # A native absolute path (not a hardcoded POSIX literal): the repo
+    # config's local_path must pass this host's own absoluteness check
+    # (see config.py's _validate_native_absolute_path), so it has to be
+    # built from tmp_path the same way the next test does.
+    native_path = str(tmp_path / "mnt" / "nas" / "Lake" / "Copilot" / "sessions")
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".agent-logger.yaml").write_text(
+        f"schema_version: 3\nsync:\n  local_path: {native_path}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(repo)
+
+    cfg = load_config(home=home)
+
+    assert cfg.sync_path == Path(native_path)
+    # Everything else stays machine-local/default -- only the path moved.
+    assert cfg.sync_target == "local"
+
+
+def test_repo_config_sync_local_path_does_not_affect_other_sync_fields(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The relaxation is scoped to exactly one field -- machine identity,
+    the active target choice, and everything else stay machine-local."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "sync:\n  target: onedrive\nmachine:\n  name: my-machine\n",
+        encoding="utf-8",
+    )
+
+    native_path = str(tmp_path / "nas" / "Lake" / "Copilot" / "sessions")
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".agent-logger.yaml").write_text(
+        f"schema_version: 3\nsync:\n  local_path: {native_path}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(repo)
+
+    cfg = load_config(home=home)
+
+    assert cfg.sync_target == "onedrive"  # untouched by the repo config
+    assert cfg.sync_path == Path(native_path)
+
+
+def _foreign_absolute_path() -> str:
+    """An absolute path in the OTHER platform's syntax, foreign to this one."""
+    if _platform_system() == "Windows":
+        return "/mnt/nas/Lake/Copilot/sessions"  # POSIX: no Windows drive letter
+    return r"C:\nas\sessions"  # Windows: no POSIX leading "/"
+
+
+def test_repo_config_foreign_local_path_tolerated_when_target_is_not_local(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A facility-shared sync.local_path written for the rest of a
+    mixed-platform fleet -- "the same absolute value for every machine" --
+    has no single string that's a native absolute path on every platform. A
+    machine whose own resolved target isn't "local" never consumes this
+    value at all, so a foreign-platform value here must not crash the whole
+    config load -- and must not leak into Config.sync_path either, since
+    other consumers (chronicle corpus root, cold-store resolution, origin
+    backfill) read that property regardless of the active sync target."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text("sync:\n  target: ssh\n", encoding="utf-8")
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".agent-logger.yaml").write_text(
+        f"schema_version: 3\nsync:\n  local_path: {_foreign_absolute_path()}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(repo)
+
+    cfg = load_config(home=home)
+    assert cfg.sync_target == "ssh"
+    # Stripped, not leaked: falls back to the default <home>/sessions, never
+    # the raw foreign-platform string a consumer could misread as relative.
+    assert cfg.sync_path == home / "sessions"
+
+
+def test_repo_config_foreign_local_path_tolerates_null_local_target_mapping(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A home config's targets.local can be an explicit null mapping (no
+    override at all) -- the pre-merge snapshot must handle that the same
+    way Config.sync_path itself always has, not crash with AttributeError."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "sync:\n  target: ssh\n  targets:\n    local: null\n",
+        encoding="utf-8",
+    )
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".agent-logger.yaml").write_text(
+        f"schema_version: 3\nsync:\n  local_path: {_foreign_absolute_path()}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(repo)
+
+    cfg = load_config(home=home)
+    assert cfg.sync_target == "ssh"
+    assert cfg.sync_path == home / "sessions"
+
+
+def test_repo_config_foreign_local_path_restores_machine_local_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A foreign repo override must not discard a machine-local
+    sync.targets.local.path a Windows host configured for its own non-local
+    consumers (e.g. a cold-store corpus root) -- it must fall back to that
+    preceding value, not the global <home>/sessions default."""
+    home = tmp_path / "home"
+    home.mkdir()
+    machine_local_path = tmp_path / "machine-local-corpus"
+    (home / "config.yaml").write_text(
+        f"sync:\n  target: ssh\n  targets:\n    local:\n      path: '{machine_local_path}'\n",
+        encoding="utf-8",
+    )
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".agent-logger.yaml").write_text(
+        f"schema_version: 3\nsync:\n  local_path: {_foreign_absolute_path()}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(repo)
+
+    cfg = load_config(home=home)
+    assert cfg.sync_target == "ssh"
+    assert cfg.sync_path == machine_local_path
+
+
+def test_repo_config_foreign_local_path_raises_when_target_is_local(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The same foreign-platform value must still raise when this machine's
+    own resolved target genuinely is "local" -- the hazard
+    (Config.sync_path later doing Path(configured), silently resolving a
+    foreign value as relative to the current working directory) is real in
+    that case, so the deferred native check must still fire."""
+    home = tmp_path / "home"
+    home.mkdir()
+    # No home config.yaml override here -> the default target is "local".
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".agent-logger.yaml").write_text(
+        f"schema_version: 3\nsync:\n  local_path: {_foreign_absolute_path()}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(
+        RepositoryConfigError, match=r"sync\.local_path must be an absolute path"
+    ):
+        load_config(home=home)
+
+
 @pytest.mark.parametrize(
     ("body", "message"),
     [
-        ("schema_version: 2\nlog: {}\n", "schema_version must be 1"),
+        ("schema_version: 0\nlog: {}\n", "schema_version must be >= 1"),
+        ("schema_version: nope\nlog: {}\n", "schema_version must be an integer"),
         ("schema_version: 1\nlog:\n  root: ../logs\n", "must not escape"),
         (
             'schema_version: 1\nlog:\n  path_template: "{repository}/{title}.md"\n',
@@ -204,7 +390,36 @@ def test_repo_config_overrides_log_layout_only(tmp_path: Path, monkeypatch) -> N
         ),
         (
             "schema_version: 1\nsync:\n  target: ssh\nlog: {}\n",
-            r"unsupported field\(s\): sync",
+            r"sync contains unsupported field\(s\): target",
+        ),
+        (
+            "schema_version: 1\nsync:\n  local_path: relative/path\nlog: {}\n",
+            "sync.local_path must be an absolute path",
+        ),
+        (
+            # A bare filesystem root, in THIS host's own native syntax --
+            # "/" is only a native-absolute bare root on POSIX (on Windows
+            # it isn't native-absolute at all, see the foreign-path case
+            # below); "C:\\" is Windows' own equivalent bare drive root.
+            "schema_version: 1\nsync:\n  local_path: "
+            + ("/" if _platform_system() != "Windows" else "'C:\\'")
+            + "\nlog: {}\n",
+            "must not be a bare filesystem root",
+        ),
+        (
+            "schema_version: 1\nsync:\n  local_path: '~/nas'\nlog: {}\n",
+            "must not use '~'",
+        ),
+        (
+            # A path absolute in the OTHER platform's syntax -- foreign to
+            # *this* host regardless of which host runs the suite (see
+            # _foreign_absolute_path() and config.py's
+            # _validate_native_absolute_path: "a foreign-platform path must
+            # never silently resolve relative").
+            "schema_version: 1\nsync:\n  local_path: '"
+            + _foreign_absolute_path()
+            + "'\nlog: {}\n",
+            "sync.local_path must be an absolute path",
         ),
     ],
 )
@@ -218,6 +433,34 @@ def test_repo_config_validation_errors(
 
     with pytest.raises(RepositoryConfigError, match=message):
         load_config(home=tmp_path / "home")
+
+
+def test_repo_config_forward_compatible_future_schema(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A repo config from a NEWER schema than this build supports is read
+    tolerantly: unknown top-level and unknown log fields are ignored (rolling
+    updates), while known log fields are still honored."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".agent-logger.yaml").write_text(
+        "\n".join(
+            [
+                "schema_version: 99",
+                "future_top_block:",
+                "  anything: 1",
+                "log:",
+                "  note_marker: 'NOTE:'",
+                "  future_log_field: whatever",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(repo)
+
+    cfg = load_config(home=tmp_path / "home")
+    assert cfg.repo_config_path == repo / ".agent-logger.yaml"
+    assert cfg.note_marker == "NOTE:"  # known field honored despite unknowns
 
 
 def test_non_logging_config_ignores_invalid_repo_file(
@@ -245,6 +488,440 @@ def test_missing_explicit_repo_config_is_an_error(
 
     with pytest.raises(RepositoryConfigError, match="does not name a file"):
         load_config(home=tmp_path / "home")
+
+
+@pytest.mark.no_autotrust
+def test_explicit_repo_config_env_still_requires_trust(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """AGENT_LOGGER_REPO_CONFIG names a *file*, not a trust decision -- an
+    untrusted (unregistered) checkout must not be able to bypass the gate
+    just because something points this variable at its own repo-local
+    file."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo, remote="https://example.test/example-owner/demo.git", branch="main")
+    config_file = repo / ".agent-logger.yaml"
+    config_file.write_text("log:\n  path_template: logs/{title}.md\n", encoding="utf-8")
+    monkeypatch.setenv("AGENT_WORKTREES_REPOS_YAML", str(tmp_path / "no-such-registry.yaml"))
+    monkeypatch.setenv("AGENT_LOGGER_REPO_CONFIG", str(config_file))
+
+    assert find_repo_config() is None
+
+
+@pytest.mark.no_autotrust
+def test_explicit_repo_config_env_rejects_non_git_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An explicit path with NO git root at all -- e.g. one resolved from an
+    agent-worktrees ``reference``-class registration, which is not
+    guaranteed to be a git checkout -- must not be unconditionally trusted
+    just because there's no git context to evaluate. Falling back to
+    "no git root means trusted" would let a non-git reference path (a
+    read-only mirror, never an operator-reviewed checkout) bypass the gate
+    entirely."""
+    plain_dir = tmp_path / "not-a-git-repo"
+    plain_dir.mkdir()
+    config_file = plain_dir / ".agent-logger.yaml"
+    config_file.write_text("log:\n  path_template: logs/{title}.md\n", encoding="utf-8")
+    monkeypatch.setenv("AGENT_LOGGER_REPO_CONFIG", str(config_file))
+
+    assert find_repo_config() is None
+
+
+@pytest.mark.no_autotrust
+def test_explicit_repo_config_env_honors_override_for_non_git_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The same non-git directory IS honored once the operator explicitly
+    confirms it via AGENT_LOGGER_TRUST_REPO_CONFIG -- the override applies
+    regardless of whether the path is a git checkout at all."""
+    plain_dir = tmp_path / "not-a-git-repo"
+    plain_dir.mkdir()
+    config_file = plain_dir / ".agent-logger.yaml"
+    config_file.write_text("log:\n  path_template: logs/{title}.md\n", encoding="utf-8")
+    monkeypatch.setenv("AGENT_LOGGER_REPO_CONFIG", str(config_file))
+    monkeypatch.setenv("AGENT_LOGGER_TRUST_REPO_CONFIG", str(plain_dir.resolve()))
+
+    assert find_repo_config() == config_file
+
+
+@pytest.mark.no_autotrust
+def test_explicit_repo_config_env_rejects_symlinked_ancestor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """AGENT_LOGGER_REPO_CONFIG naming a path under a symlinked ancestor
+    directory (e.g. install.sh/install.ps1's config-repo discovery pointing
+    at a .config/agent-logger.yaml alias whose .config is a symlink) must
+    be rejected -- the leaf-only is_symlink() check misses this, exactly
+    like normal discovery's own has_symlink_ancestor guard exists for."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo, remote="https://example.test/example-owner/demo.git", branch="main")
+    outside_dir = tmp_path / "outside-config"
+    outside_dir.mkdir()
+    (outside_dir / "agent-logger.yaml").write_text(
+        "log:\n  path_template: logs/{title}.md\n", encoding="utf-8"
+    )
+    (repo / ".config").symlink_to(outside_dir)
+
+    registry = tmp_path / "repos.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "repos": {
+                    "demo": {
+                        "remote": "https://example.test/example-owner/demo.git",
+                        "default_branch": "main",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_WORKTREES_REPOS_YAML", str(registry))
+    monkeypatch.setenv(
+        "AGENT_LOGGER_REPO_CONFIG", str(repo / ".config" / "agent-logger.yaml")
+    )
+
+    assert find_repo_config() is None
+
+
+@pytest.mark.no_autotrust
+def test_explicit_repo_config_env_rejects_symlinked_non_git_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """AGENT_LOGGER_REPO_CONFIG naming a file whose containing directory is
+    ITSELF reached through a symlink, with no git root found anywhere (the
+    agent-worktrees `reference`-class registration case), must be rejected
+    -- even with an explicit trust override matching the resolved target.
+    has_symlink_ancestor() only walks components BETWEEN a root and a
+    candidate; it never inspects the root's OWN ancestry, so without an
+    independent check here a symlinked fallback root would pass unexamined
+    and still load the file at the far end of that link."""
+    real_dir = tmp_path / "real-target"
+    real_dir.mkdir()
+    (real_dir / ".agent-logger.yaml").write_text(
+        "log:\n  path_template: logs/{title}.md\n", encoding="utf-8"
+    )
+
+    link_dir = tmp_path / "link"
+    link_dir.symlink_to(real_dir)
+    explicit_via_link = link_dir / ".agent-logger.yaml"
+
+    monkeypatch.setenv("AGENT_LOGGER_REPO_CONFIG", str(explicit_via_link))
+    monkeypatch.setenv("AGENT_LOGGER_TRUST_REPO_CONFIG", str(real_dir.resolve()))
+
+    assert find_repo_config() is None
+
+
+@pytest.mark.no_autotrust
+def test_explicit_repo_config_env_accepts_relative_override_with_dotdot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A relative AGENT_LOGGER_REPO_CONFIG value containing '..' (e.g.
+    ../trusted/.agent-logger.yaml) that resolves to a genuinely trusted,
+    non-symlinked directory must NOT be rejected merely for containing
+    '..' -- Path.absolute() preserves '..' textually (never normalizes
+    it), so comparing that against Path.resolve() (which DOES collapse
+    '..') would make the symlinked-fallback-root check added for
+    test_explicit_repo_config_env_rejects_symlinked_non_git_root treat
+    ordinary lexical normalization as if it were evidence of a symlink,
+    incorrectly rejecting a valid trust override."""
+    real_dir = tmp_path / "real-target"
+    real_dir.mkdir()
+    config_file = real_dir / ".agent-logger.yaml"
+    config_file.write_text("log:\n  path_template: logs/{title}.md\n", encoding="utf-8")
+
+    cwd_dir = tmp_path / "somewhere"
+    cwd_dir.mkdir()
+    monkeypatch.chdir(cwd_dir)
+    monkeypatch.setenv("AGENT_LOGGER_REPO_CONFIG", "../real-target/.agent-logger.yaml")
+    monkeypatch.setenv("AGENT_LOGGER_TRUST_REPO_CONFIG", str(real_dir.resolve()))
+
+    result = find_repo_config()
+
+    assert result is not None
+    assert result.resolve() == config_file.resolve()
+
+
+@pytest.mark.no_autotrust
+def test_explicit_repo_config_env_rejects_symlink_masked_by_dotdot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """AGENT_LOGGER_REPO_CONFIG naming a path that traverses a symlink and
+    then backs out of it via '..' (e.g. .../link/../trusted/.agent-logger.yaml,
+    where 'link' is a symlink) must still be rejected -- a normpath()-style
+    lexical '..' collapse performed BEFORE comparing against .resolve()
+    would erase the fact the literal route passed through 'link' first,
+    since the collapsed form (.../trusted) has no symlink component left to
+    catch. This must be rejected even though the FINAL resolved target is a
+    perfectly ordinary, non-symlinked, explicitly trusted directory."""
+    real_dir = tmp_path / "real-target"
+    real_dir.mkdir()
+    config_file = real_dir / ".agent-logger.yaml"
+    config_file.write_text("log:\n  path_template: logs/{title}.md\n", encoding="utf-8")
+
+    link_target = tmp_path / "link-target"
+    link_target.mkdir()
+    link_dir = tmp_path / "link"
+    link_dir.symlink_to(link_target)
+
+    explicit_via_dotdot = link_dir / ".." / "real-target" / ".agent-logger.yaml"
+
+    monkeypatch.setenv("AGENT_LOGGER_REPO_CONFIG", str(explicit_via_dotdot))
+    monkeypatch.setenv("AGENT_LOGGER_TRUST_REPO_CONFIG", str(real_dir.resolve()))
+
+    assert find_repo_config() is None
+
+
+@pytest.mark.no_autotrust
+def test_explicit_repo_config_env_accepts_relative_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A RELATIVE AGENT_LOGGER_REPO_CONFIG value must still be honored for a
+    genuinely trusted, non-symlinked repo -- has_symlink_ancestor() computes
+    relative_to() between the (always absolute) discovered git root and the
+    explicit path, which raises (failing *unsafe*) if the explicit path was
+    left relative while the root is absolute. A real relative override
+    (e.g. a machine-local script invoking with a repo-relative path) must
+    not be rejected just because of this internal representation mismatch."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo, remote="https://example.test/example-owner/demo.git", branch="main")
+    config_file = repo / ".agent-logger.yaml"
+    config_file.write_text("log:\n  path_template: logs/{title}.md\n", encoding="utf-8")
+
+    registry = tmp_path / "repos.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "repos": {
+                    "demo": {
+                        "remote": "https://example.test/example-owner/demo.git",
+                        "default_branch": "main",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_WORKTREES_REPOS_YAML", str(registry))
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("AGENT_LOGGER_REPO_CONFIG", ".agent-logger.yaml")
+
+    assert find_repo_config() == config_file
+
+
+@pytest.mark.no_autotrust
+def test_repo_config_rejects_symlinked_candidate(tmp_path: Path, monkeypatch) -> None:
+    """A committed/local symlink standing in for .agent-logger.yaml must be
+    rejected outright -- discovery must never follow a link out of the
+    checkout to read arbitrary machine-local YAML."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo, remote="https://example.test/example-owner/demo.git", branch="main")
+    outside_target = tmp_path / "outside.yaml"
+    outside_target.write_text("log:\n  path_template: logs/{title}.md\n", encoding="utf-8")
+    (repo / ".agent-logger.yaml").symlink_to(outside_target)
+
+    registry = tmp_path / "repos.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "repos": {
+                    "demo": {
+                        "remote": "https://example.test/example-owner/demo.git",
+                        "default_branch": "main",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_WORKTREES_REPOS_YAML", str(registry))
+    monkeypatch.chdir(repo)
+
+    assert find_repo_config() is None
+
+
+@pytest.mark.no_autotrust
+def test_repo_config_rejects_symlinked_ancestor_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Checking only the leaf file misses a repo committing an INTERMEDIATE
+    directory (e.g. .config) as a symlink -- candidate.is_file() would still
+    follow it to read arbitrary content outside the checkout even though the
+    leaf itself is an ordinary file."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo, remote="https://example.test/example-owner/demo.git", branch="main")
+    outside_dir = tmp_path / "outside-config"
+    outside_dir.mkdir()
+    (outside_dir / "agent-logger.yaml").write_text(
+        "log:\n  path_template: logs/{title}.md\n", encoding="utf-8"
+    )
+    (repo / ".config").symlink_to(outside_dir)
+
+    registry = tmp_path / "repos.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "repos": {
+                    "demo": {
+                        "remote": "https://example.test/example-owner/demo.git",
+                        "default_branch": "main",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_WORKTREES_REPOS_YAML", str(registry))
+    monkeypatch.chdir(repo)
+
+    assert find_repo_config() is None
+
+
+@pytest.mark.no_autotrust
+def test_repo_config_ignores_registry_entry_with_non_string_default_branch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A malformed registry entry (default_branch: 123) must not be coerced
+    into a plausible-looking branch name via str(...) -- that could
+    spuriously trust a checkout whose actual branch happens to match the
+    coerced text."""
+    repo = tmp_path / "repo"
+    _init_git_repo(
+        repo, remote="https://example.test/example-owner/demo.git", branch="123"
+    )
+    (repo / ".agent-logger.yaml").write_text(
+        "log:\n  path_template: logs/{title}.md\n", encoding="utf-8"
+    )
+
+    registry = tmp_path / "repos.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "repos": {
+                    "demo": {
+                        "remote": "https://example.test/example-owner/demo.git",
+                        "default_branch": 123,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_WORKTREES_REPOS_YAML", str(registry))
+    monkeypatch.chdir(repo)
+
+    assert find_repo_config() is None
+
+
+@pytest.mark.no_autotrust
+def test_repo_config_ignored_on_conflicting_registered_default_branches(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A checkout with two local remotes that each match a DIFFERENT
+    registered project, with different default branches, has no single
+    resolvable trust decision -- must fail safe to untrusted rather than
+    picking whichever remote git happens to enumerate first."""
+    repo = tmp_path / "repo"
+    _init_git_repo(
+        repo,
+        remote="https://example.test/example-owner/demo.git",
+        branch="main",
+        remote_name="origin",
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "remote",
+            "add",
+            "upstream",
+            "https://example.test/example-owner/other.git",
+        ],
+        check=True,
+        env=_git_test_env(),
+        timeout=20,
+    )
+    (repo / ".agent-logger.yaml").write_text(
+        "log:\n  path_template: logs/{title}.md\n", encoding="utf-8"
+    )
+
+    registry = tmp_path / "repos.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "repos": {
+                    "demo": {
+                        "remote": "https://example.test/example-owner/demo.git",
+                        "default_branch": "main",
+                    },
+                    "other": {
+                        "remote": "https://example.test/example-owner/other.git",
+                        "default_branch": "develop",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_WORKTREES_REPOS_YAML", str(registry))
+    monkeypatch.chdir(repo)
+
+    assert find_repo_config() is None
+
+
+@pytest.mark.no_autotrust
+def test_repo_config_ignores_global_git_config_remote(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The remote probe must be scoped to the checkout's LOCAL config
+    (--local) -- a global/system git config entry matching a registered
+    project must not let a checkout with no local remote at all pass the
+    gate."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo, remote=None, branch="main")
+    (repo / ".agent-logger.yaml").write_text(
+        "log:\n  path_template: logs/{title}.md\n", encoding="utf-8"
+    )
+
+    registry = tmp_path / "repos.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "repos": {
+                    "demo": {
+                        "remote": "https://example.test/example-owner/demo.git",
+                        "default_branch": "main",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_WORKTREES_REPOS_YAML", str(registry))
+
+    # Sandbox a fake "global" git config (never touches the real one) that
+    # declares the same URL as a remote -- git config --local must ignore it.
+    fake_global = tmp_path / "fake-gitconfig"
+    subprocess.run(
+        [
+            "git",
+            "config",
+            "--file",
+            str(fake_global),
+            "remote.origin.url",
+            "https://example.test/example-owner/demo.git",
+        ],
+        check=True,
+        env=_git_test_env(),
+        timeout=20,
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(fake_global))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    monkeypatch.chdir(repo)
+
+    assert find_repo_config() is None
 
 
 def test_config_cli_reports_repository_validation_error(
@@ -277,6 +954,280 @@ def test_repo_config_can_be_disabled(tmp_path: Path, monkeypatch) -> None:
 
     assert cfg.repo_config_path is None
     assert cfg.log_path_template == DEFAULTS["log"]["path_template"]
+
+
+@pytest.mark.no_autotrust
+def test_repo_config_honored_when_registered_and_on_default_branch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The real trust gate: a genuine git checkout whose remote matches a
+    registered project, on that project's registered default branch, gets
+    its repo-local config honored end to end."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo, remote="https://example.test/example-owner/demo.git", branch="main")
+    (repo / ".agent-logger.yaml").write_text(
+        "log:\n  path_template: logs/{title}.md\n",
+        encoding="utf-8",
+    )
+
+    registry = tmp_path / "repos.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "repos": {
+                    "demo": {
+                        "remote": "git@example.test:example-owner/demo.git",
+                        "default_branch": "main",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_WORKTREES_REPOS_YAML", str(registry))
+    monkeypatch.chdir(repo)
+
+    assert find_repo_config() == repo / ".agent-logger.yaml"
+    cfg = load_config(home=tmp_path / "home")
+    assert cfg.log_path_template == "logs/{title}.md"
+
+
+@pytest.mark.no_autotrust
+def test_repo_config_honored_via_agent_home_registry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Without an explicit AGENT_WORKTREES_REPOS_YAML override, the trust
+    gate must still find the registry under $AGENT_HOME -- mirroring
+    agent-worktrees' own legacy registry-root fallback -- rather than only
+    ever looking under the bare ~/.agent-worktrees default."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo, remote="https://example.test/example-owner/demo.git", branch="main")
+    (repo / ".agent-logger.yaml").write_text(
+        "log:\n  path_template: logs/{title}.md\n",
+        encoding="utf-8",
+    )
+
+    agent_home = tmp_path / "custom-agent-home"
+    registry_dir = agent_home / ".agent-worktrees"
+    registry_dir.mkdir(parents=True)
+    (registry_dir / "repos.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "repos": {
+                    "demo": {
+                        "remote": "https://example.test/example-owner/demo.git",
+                        "default_branch": "main",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("AGENT_WORKTREES_REPOS_YAML", raising=False)
+    monkeypatch.setenv("AGENT_HOME", str(agent_home))
+    monkeypatch.chdir(repo)
+
+    assert find_repo_config() == repo / ".agent-logger.yaml"
+
+
+@pytest.mark.no_autotrust
+def test_repo_config_honored_with_non_origin_remote_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A registered checkout using a non-``origin`` local remote name (e.g.
+    ``upstream``) must still be trusted -- the gate matches by URL across
+    ALL local remotes, not a hardcoded ``origin``."""
+    repo = tmp_path / "repo"
+    _init_git_repo(
+        repo,
+        remote="https://example.test/example-owner/demo.git",
+        branch="main",
+        remote_name="upstream",
+    )
+    (repo / ".agent-logger.yaml").write_text(
+        "log:\n  path_template: logs/{title}.md\n",
+        encoding="utf-8",
+    )
+
+    registry = tmp_path / "repos.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "repos": {
+                    "demo": {
+                        "remote": "https://example.test/example-owner/demo.git",
+                        "default_branch": "main",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_WORKTREES_REPOS_YAML", str(registry))
+    monkeypatch.chdir(repo)
+
+    assert find_repo_config() == repo / ".agent-logger.yaml"
+
+
+@pytest.mark.no_autotrust
+def test_repo_config_ignored_when_repo_not_registered(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A real, matching-remote checkout that simply isn't in the registry
+    (or the registry doesn't exist) gets its repo-local config ignored --
+    never an error, just treated as absent."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo, remote="https://example.test/example-owner/demo.git", branch="main")
+    (repo / ".agent-logger.yaml").write_text(
+        "log:\n  path_template: logs/{title}.md\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_WORKTREES_REPOS_YAML", str(tmp_path / "no-such-registry.yaml"))
+    monkeypatch.chdir(repo)
+
+    assert find_repo_config() is None
+    cfg = load_config(home=tmp_path / "home")
+    assert cfg.repo_config_path is None
+    assert cfg.log_path_template == DEFAULTS["log"]["path_template"]
+
+
+@pytest.mark.no_autotrust
+def test_repo_config_ignored_when_not_on_default_branch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A registered repo checked out on a feature/PR branch (not the
+    registered default branch) does not get its repo-local config honored --
+    an unreviewed branch must not be able to redirect facility behavior."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo, remote="https://example.test/example-owner/demo.git", branch="feature-x")
+    (repo / ".agent-logger.yaml").write_text(
+        "log:\n  path_template: logs/{title}.md\n",
+        encoding="utf-8",
+    )
+
+    registry = tmp_path / "repos.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "repos": {
+                    "demo": {
+                        "remote": "https://example.test/example-owner/demo.git",
+                        "default_branch": "main",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_WORKTREES_REPOS_YAML", str(registry))
+    monkeypatch.chdir(repo)
+
+    assert find_repo_config() is None
+
+
+@pytest.mark.no_autotrust
+def test_repo_config_ignored_when_no_git_remote(tmp_path: Path, monkeypatch) -> None:
+    """A real git checkout with no ``origin`` remote at all (e.g. a bare
+    local scratch clone) can never be a registered project, so its
+    repo-local config is ignored."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo, remote=None, branch="main")
+    (repo / ".agent-logger.yaml").write_text(
+        "log:\n  path_template: logs/{title}.md\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(repo)
+
+    assert find_repo_config() is None
+
+
+@pytest.mark.no_autotrust
+def test_repo_config_trust_override_env_bypasses_gate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``AGENT_LOGGER_TRUST_REPO_CONFIG=<path>`` is a machine-local escape
+    hatch for an operator who has independently confirmed one specific
+    checkout is safe -- it must never be settable by the repo itself, only
+    by the local environment, and it is scoped to that exact resolved path
+    (never a global boolean, which would also trust every OTHER unregistered
+    checkout probed in the same process)."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo, remote=None, branch="main")
+    (repo / ".agent-logger.yaml").write_text(
+        "log:\n  path_template: logs/{title}.md\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("AGENT_LOGGER_TRUST_REPO_CONFIG", str(repo.resolve()))
+
+    assert find_repo_config() == repo / ".agent-logger.yaml"
+
+
+@pytest.mark.no_autotrust
+def test_repo_config_trust_override_env_does_not_bypass_other_checkouts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Trusting one checkout via the override must not trust a DIFFERENT
+    unregistered checkout probed in the same process."""
+    trusted = tmp_path / "trusted"
+    _init_git_repo(trusted, remote=None, branch="main")
+    other = tmp_path / "other"
+    _init_git_repo(other, remote=None, branch="main")
+    (other / ".agent-logger.yaml").write_text(
+        "log:\n  path_template: logs/{title}.md\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_LOGGER_TRUST_REPO_CONFIG", str(trusted.resolve()))
+
+    assert find_repo_config(other) is None
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        (
+            "https://example.test/example-owner/demo.git",
+            "git@example.test:example-owner/demo.git",
+        ),
+        (
+            "https://example.test/example-owner/demo",
+            "ssh://git@example.test/example-owner/demo.git",
+        ),
+        (
+            # Host case is folded; path case here is identical so this
+            # doesn't (yet) exercise path-case handling -- see the
+            # dedicated case-sensitivity tests below for that.
+            "https://EXAMPLE.test/example-owner/demo.git",
+            "https://example.test/example-owner/demo",
+        ),
+    ],
+)
+def test_normalize_git_remote_matches_equivalent_forms(a: str, b: str) -> None:
+    assert _normalize_git_remote(a) == _normalize_git_remote(b)
+
+
+def test_normalize_git_remote_distinguishes_different_repos() -> None:
+    assert _normalize_git_remote(
+        "https://example.test/example-owner/demo.git"
+    ) != _normalize_git_remote("https://example.test/example-owner/other.git")
+
+
+def test_normalize_git_remote_path_case_sensitive_on_non_github_host() -> None:
+    """A self-hosted Git server (e.g. Gitea) can be case-sensitive on its
+    filesystem, so path case is preserved -- not folded -- for any host
+    other than github.com."""
+    assert _normalize_git_remote(
+        "https://example.test/Example-Owner/Demo.git"
+    ) != _normalize_git_remote("https://example.test/example-owner/demo.git")
+
+
+def test_normalize_git_remote_path_case_insensitive_on_github() -> None:
+    """github.com is known case-insensitive for owner/repo, so (mirroring
+    agent_worktrees.project_state's own identity resolution) a github.com
+    remote's path case is folded too."""
+    assert _normalize_git_remote(
+        "https://github.com/Example-Owner/Demo.git"
+    ) == _normalize_git_remote("https://github.com/example-owner/demo")
 
 
 def test_organization_cli_reports_manifest_ready_config(

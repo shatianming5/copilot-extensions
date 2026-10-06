@@ -61,8 +61,13 @@ when present, sibling `provenance/` sidecars and, when unfiltered, the
 session-store index files; it never copies installed plugins, credentials,
 settings, or other `~/.copilot` state. Sync scoping can use a repo allowlist,
 denylist, fail-closed behavior for unclassified sessions, and harness-repo
-origin sidecars for downstream routing. Targets implement a small `Target`
-interface
+origin sidecars for downstream routing. **Session `files/` can also
+accumulate generated tool artifacts (venvs, git clones, `node_modules`,
+Chromium profiles) that should never be archived — `sync.detritus` detects
+and excludes these by on-disk signature; see
+[`archival-content-policy.md`](archival-content-policy.md) for the full
+policy, including the categories detritus detection does *not* yet cover.**
+Targets implement a small `Target` interface
 (`push` / `prune` / `doctor` / `describe`):
 
 | Target | Destination |
@@ -134,7 +139,11 @@ evidence, and a session's provider-recorded repository assignment cannot change
 between accepted captures without an explicit checkpoint reset. Repo policy
 reuses the normal session-sync exact classification and `fail_closed`
 semantics; rescued workspace/origin claims cannot opt themselves into the
-corpus. Rescue bytes are copied as data only and are never restored or executed.
+corpus. The reciprocal `agent-worktrees.json` sidecar is preserved only when it
+is bounded schema-v1 JSON for the enclosing session ID. It remains restored
+evidence rather than an authoritative local binding; every rescued session gets
+a `rescued-origin.json` marker even when the provider had no origin sidecar.
+Rescue bytes are copied as data only and are never restored or executed.
 
 Verbose output reports ordering and rejection reasons. Removing
 `$AGENT_LOGGER_HOME/rescue-sync/checkpoint.json` resets ingest ordering without
@@ -194,6 +203,121 @@ when the manifest includes instructions through its **closing-remark seam**.
 The generic skills populate location, naming/template, and optional voice
 fields from repository organization config, so no wrapper is required merely
 to inject those choices. See [manifest-contract.md](manifest-contract.md).
+
+### Cold-store provider (`agent_logger.cold_store`)
+
+agent-logger is the **reference cold-store provider** for agent-bridge's
+`session-fetch` capability (see `docs/architecture.md`'s cold-store-provider
+subsection in the repo root and this effort's Phase 2c): agent-bridge's
+daemon drives `agent-logger session-fetch <session-id> --json` over a process
+boundary whenever its own live session ledger has nothing for the requested
+ID, and this module answers with whatever archival content this host holds.
+
+Resolution walks three tiers, reusing the same `agent_logger.sessions`
+archive-aware seam every other consumer (`collate-session`,
+`ramp-up-session`, the chronicler) already goes through:
+
+1. **Local live directory** — `~/.copilot/session-state/<id>/`.
+2. **On-device compact archive** — `<home>/archived-sessions/<id>.tar.gz`
+   (a session compacted before ever being pushed off this machine).
+3. **The locally synced corpus** — `session-sync`'s local target root,
+   scanned per `<machine>/session-state/<id>/` (synced but not yet
+   compacted) and `<machine>/archived/<id>.tar.gz` (packed at the sync
+   destination), across every machine subtree, exactly as
+   `SyncedSessionSource` does for the chronicler's settle-gated scan.
+
+The registration side (`scripts/register-cold-store-provider.sh` /
+`.ps1`, run from `sessionStart`) drops
+`~/.agent-bridge/cold-store-providers.d/agent-logger.json` following the same
+`references/<template>.json` + payload-local-shim pattern
+`agent-codespaces`/`agent-containers` use for their own `providers.d/`
+namespace-provider registration — a distinct, capability-keyed manifest
+directory, never the namespace one.
+
+### Review annotations (`agent_logger.sessions`)
+
+A durable, per-session sidecar recording which external work item (e.g. a
+code-review pull request) a session worked, so a future consumer can query
+"every session that worked item X" without a raw full-text sweep of every
+session's `events.jsonl` — a sweep that scales poorly and produces false
+positives (a session that only *quotes* another session's transcript, e.g.
+while rendering a digest, matches the same text).
+
+- `SIDECAR_MEMBERS` gains a third entry, `review-annotations.json`, alongside
+  the existing `workspace.yaml`/`origin.json`: it survives
+  `archive_session`/`restore_session`/`remove_archive` exactly like those two,
+  and is served from the uncompressed sidecar (never decompressing the
+  archive) via the same `read_member`/`member_exists` seam.
+- `write_review_annotation(session_dir, *, repo, pr_number, role="reviewer",
+  recorded_at=None)` appends one entry, idempotently — a duplicate
+  `(repo, pr_number, role)` is not re-appended — to a **live** session's
+  sidecar only (an archived session's sidecar is a read-only artifact, not a
+  mutation target). The read-modify-write is serialized with an advisory
+  lock (`review-annotations.json.lock`, via `agent_logger.sync.lock.sync_lock`)
+  and writes through a unique per-call temp file, so two concurrent writers
+  targeting the same session can't race or collide.
+- `read_review_annotations(ref) -> list[dict]` is the read-side counterpart —
+  parity with `read_origin`/`read_workspace`, `[]` when absent, works for both
+  live and archived refs.
+- `session-sync`'s filesystem target excludes any file ending in
+  `.lock`/`.tmp` (not just the legacy exact `.lock`/`lock` names) so a scan
+  can never copy the annotation lock or its atomic-replace temp file
+  mid-write.
+
+This is a write/read primitive only — a queryable index (e.g. "every session
+that reviewed PR N" without iterating every session directory) is a natural
+follow-up once a consumer needs one; none exists yet.
+
+### review-annotation catalog index (`agent_logger.catalog`)
+
+A small SQLite index over the sidecar above, keyed on `(repo, pr_number)`,
+analogous to the chronicle reservation store
+(`agent_logger.chronicle.source.SqliteReservationStore`): derived,
+rebuildable-from-sidecars, never a second source of truth.
+
+- `ReviewCatalogIndex(db_path)` — `record(session_id, repo, pr_number, role,
+  recorded_at)` (idempotent) and `query(repo, pr_number, since=None,
+  until=None) -> list[CatalogEntry]`.
+- `default_index(cfg=None) -> ReviewCatalogIndex` — resolves
+  `Config.catalog_db_path` (`<home>/review-catalog.db` by default,
+  configurable via `catalog.db_path`); the entry point production callers
+  use.
+- `write_review_annotation(..., index=None)` gains an optional `index`
+  parameter: when a caller passes `index=default_index()`, the same call
+  that appends the sidecar entry also records it into the index — no
+  separate wiring needed for a writer that opts in. Passing no `index` (the
+  default) writes the sidecar only, exactly as before this index existed.
+- `rebuild_from_sidecars(index, state_root, *archive_stores) -> int` —
+  additive, idempotent rebuild from every discoverable session's own
+  sidecar; the only path that backfills annotations written before the
+  index existed, or by a writer that never passed `index=`. Exposed as
+  `agent-logger catalog rebuild` (and `catalog status` to print the
+  resolved db path) — run it periodically (a cron tick, mirroring
+  `chronicle tick`) for any deployment where the production annotation
+  writer doesn't pass `index=` directly.
+- `agent_logger.cold_store.query_reviewer_sessions(repo, pr_number,
+  since=None, until=None) -> list[SessionRef]` — the caller-facing query:
+  resolves every catalog hit through the existing three-tier
+  `resolve_session()`, silently skipping anything this host can't resolve
+  (unreachable session treated as "not found", never an error).
+- `agent-logger annotate <session-id> --repo R --pr-number N
+  [--role reviewer] [--recorded-at ISO]` — the cross-repo process-boundary
+  write path, the same integration shape `session-fetch` already
+  establishes for reads (a caller in a different repository shells out
+  rather than importing agent-logger as a library). Resolves `session-id`
+  against the local live session-state tier only (never an archive --
+  `write_review_annotation` requires a live session to mutate), calls
+  `write_review_annotation(..., index=default_index())` so the catalog
+  stays in sync as a side effect, and exits non-zero with a clear stderr
+  message on a missing session or a write failure.
+- `agent-logger catalog query --repo R --pr-number N [--since ISO]
+  [--until ISO]` — the cross-repo process-boundary **read** path, the same
+  integration shape `annotate` establishes for writes (a caller such as
+  a downstream review-link fallback chain shells out rather
+  than importing agent-logger as a library). Thin wrapper over
+  `cold_store.query_reviewer_sessions()`; always exits `0` and prints
+  `{"repo": ..., "pr_number": ..., "sessions": [{"session_id": ..., "kind":
+  "live"|"archive"}, ...]}` — an empty/unresolvable result is not an error.
 
 ## Configuration
 

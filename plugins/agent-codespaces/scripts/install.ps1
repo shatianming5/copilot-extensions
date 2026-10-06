@@ -22,14 +22,43 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('install', 'uninstall', 'status', 'update', 'stamp', 'provision')]
+    [ValidateSet('install', 'uninstall', 'status', 'update', 'stamp', 'provision', 'dev')]
     [string]$Action = 'status',
 
-    [switch]$Force
+    [string]$InstallDir,
+
+    [switch]$Force,
+
+    # Preview mode for the 'uninstall' action: print what WOULD be removed
+    # without touching the filesystem, scheduled task, or SSH connections.
+    [switch]$DryRun
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# === install-contract:test-persistent-environment -- keep byte-identical across installers ===
+function Get-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    return [Environment]::GetEnvironmentVariable($Name, $effectiveTarget)
+}
+
+function Set-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [AllowNull()][string]$Value,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    [Environment]::SetEnvironmentVariable($Name, $Value, $effectiveTarget)
+}
+# === end install-contract:test-persistent-environment ===
 
 # === install-contract:v4 self-stage -- keep byte-identical across plugins ===
 # dotfiles #935: a plugin installer reads its own payload (src/, libs/,
@@ -216,7 +245,9 @@ if ($hasServiceUtils) {
 # -- Metadata -------------------------------------------------------------
 
 $ServiceName     = 'Agent Codespaces'
-$InstallDir      = Join-Path $env:USERPROFILE '.agent-codespaces'
+if (-not $InstallDir) {
+    $InstallDir = Join-Path $env:USERPROFILE '.agent-codespaces'
+}
 $LocalBin        = Join-Path $env:USERPROFILE '.local\bin'
 $ScriptDir       = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PluginDir       = (Resolve-Path (Join-Path $ScriptDir '..')).Path
@@ -309,6 +340,38 @@ if (-not (Test-Path (Join-Path $CredRelayDir 'pyproject.toml'))) {
 $CfgMigrateDir   = Join-Path $PluginDir 'libs\config-migrate'
 if (-not (Test-Path (Join-Path $CfgMigrateDir 'pyproject.toml'))) {
     $CfgMigrateDir = Join-Path $RepoRoot 'libs\config-migrate'
+}
+# zdd dir (uv-editable canonical reference in a dev checkout, real copy in a
+# materialized release payload): plugin-vendored or repo-root.
+$ZddDir          = Join-Path $PluginDir 'libs\zdd'
+if (-not (Test-Path (Join-Path $ZddDir 'pyproject.toml'))) {
+    $ZddDir = Join-Path $RepoRoot 'libs\zdd'
+}
+# venue-copilot dir (uv-editable canonical reference in a dev checkout, real
+# copy in a materialized release payload): plugin-vendored or repo-root.
+$VenueCopilotDir = Join-Path $PluginDir 'libs\venue-copilot'
+if (-not (Test-Path (Join-Path $VenueCopilotDir 'pyproject.toml'))) {
+    $VenueCopilotDir = Join-Path $RepoRoot 'libs\venue-copilot'
+}
+# session-liveness-probe dir (uv-editable canonical reference in a dev
+# checkout, real copy in a materialized release payload): plugin-vendored or
+# repo-root.
+$SessionLivenessProbeDir = Join-Path $PluginDir 'libs\session-liveness-probe'
+if (-not (Test-Path (Join-Path $SessionLivenessProbeDir 'pyproject.toml'))) {
+    $SessionLivenessProbeDir = Join-Path $RepoRoot 'libs\session-liveness-probe'
+}
+# single-instance-lease dir (uv-editable canonical reference in a dev
+# checkout, real copy in a materialized release payload): plugin-vendored or
+# repo-root.
+$SingleInstanceLeaseDir = Join-Path $PluginDir 'libs\single-instance-lease'
+if (-not (Test-Path (Join-Path $SingleInstanceLeaseDir 'pyproject.toml'))) {
+    $SingleInstanceLeaseDir = Join-Path $RepoRoot 'libs\single-instance-lease'
+}
+# remote-login-shell dir (uv-editable canonical reference in a dev checkout,
+# real copy in a materialized release payload): plugin-vendored or repo-root.
+$RemoteLoginShellDir = Join-Path $PluginDir 'libs\remote-login-shell'
+if (-not (Test-Path (Join-Path $RemoteLoginShellDir 'pyproject.toml'))) {
+    $RemoteLoginShellDir = Join-Path $RepoRoot 'libs\remote-login-shell'
 }
 
 $DeploySourcePaths = @('plugins/agent-codespaces/')
@@ -561,12 +624,21 @@ function Assert-Uv {
 }
 
 function Install-PackageInto {
-    <# uv pip install the vendored libs (ssh-manager, credential-relay) then
-       agent-codespaces into the given venv python. Non-editable; deps resolved
-       from pyproject.toml. The vendored libs are force-reinstalled so a local
-       code change propagates even without a version bump (uv otherwise skips a
-       same-version path dep, leaving the venv stale). #>
-    param([string]$Python)
+    <# uv pip install the vendored libs (ssh-manager, credential-relay, zdd,
+       venue-copilot, session-liveness-probe, single-instance-lease,
+       remote-login-shell) then agent-codespaces into the
+       given venv python. Non-editable by default;
+       deps resolved from pyproject.toml. The vendored libs are force-reinstalled
+       so a local code change propagates even without a version bump (uv
+       otherwise skips a same-version path dep, leaving the venv stale).
+
+       -Editable (mutable-dev-slot, #3376): installs every one of these
+       path-dependencies with `uv pip install -e` instead, so the venv's
+       site-packages resolve straight back to this worktree's own checkout --
+       an ordinary source edit takes effect without re-running the installer.
+       Used only for the mutable `versions/dev` slot; never for a real
+       (numbered) version. #>
+    param([string]$Python, [switch]$Editable)
     if (-not (Test-Path (Join-Path $SshMgrDir 'pyproject.toml'))) {
         Write-ServiceErr "ssh-manager source not found at $SshMgrDir"
         return $false
@@ -579,31 +651,90 @@ function Install-PackageInto {
         Write-ServiceErr "config-migrate source not found at $CfgMigrateDir"
         return $false
     }
+    if (-not (Test-Path (Join-Path $ZddDir 'pyproject.toml'))) {
+        Write-ServiceErr "zdd source not found at $ZddDir"
+        return $false
+    }
+    if (-not (Test-Path (Join-Path $VenueCopilotDir 'pyproject.toml'))) {
+        Write-ServiceErr "venue-copilot source not found at $VenueCopilotDir"
+        return $false
+    }
+    if (-not (Test-Path (Join-Path $SessionLivenessProbeDir 'pyproject.toml'))) {
+        Write-ServiceErr "session-liveness-probe source not found at $SessionLivenessProbeDir"
+        return $false
+    }
+    if (-not (Test-Path (Join-Path $SingleInstanceLeaseDir 'pyproject.toml'))) {
+        Write-ServiceErr "single-instance-lease source not found at $SingleInstanceLeaseDir"
+        return $false
+    }
+    if (-not (Test-Path (Join-Path $RemoteLoginShellDir 'pyproject.toml'))) {
+        Write-ServiceErr "remote-login-shell source not found at $RemoteLoginShellDir"
+        return $false
+    }
     # Pre-strip: rename any locked console-script trampoline aside so uv can write
     # a fresh one (Windows denies overwriting an in-use .exe -- os error 5; the
     # stale binstub or a live `agent-codespaces ssh` session may hold it open).
     Remove-ConsoleTrampolines -VenvDir (Split-Path -Parent (Split-Path -Parent $Python))
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    & uv pip install --python $Python --reinstall-package agent-ssh-manager "$SshMgrDir" --quiet 2>&1 | Out-Null
+    $modeArgs = @(if ($Editable) { '--editable' } else { '--reinstall-package', 'agent-ssh-manager' })
+    & uv pip install --python $Python @modeArgs "$SshMgrDir" --quiet 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         $ErrorActionPreference = $prevEAP
         Write-ServiceErr "ssh-manager install failed"
         return $false
     }
-    & uv pip install --python $Python --reinstall-package agent-credential-relay "$CredRelayDir" --quiet 2>&1 | Out-Null
+    $modeArgs = @(if ($Editable) { '--editable' } else { '--reinstall-package', 'agent-credential-relay' })
+    & uv pip install --python $Python @modeArgs "$CredRelayDir" --quiet 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         $ErrorActionPreference = $prevEAP
         Write-ServiceErr "credential-relay install failed"
         return $false
     }
-    & uv pip install --python $Python --reinstall-package agent-config-migrate "$CfgMigrateDir" --quiet 2>&1 | Out-Null
+    $modeArgs = @(if ($Editable) { '--editable' } else { '--reinstall-package', 'agent-config-migrate' })
+    & uv pip install --python $Python @modeArgs "$CfgMigrateDir" --quiet 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         $ErrorActionPreference = $prevEAP
         Write-ServiceErr "config-migrate install failed"
         return $false
     }
-    & uv pip install --python $Python --reinstall-package agent-codespaces "$PluginDir" --quiet 2>&1 | Out-Null
+    $modeArgs = @(if ($Editable) { '--editable' } else { '--reinstall-package', 'agent-zdd' })
+    & uv pip install --python $Python @modeArgs "$ZddDir" --quiet 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $ErrorActionPreference = $prevEAP
+        Write-ServiceErr "zdd install failed"
+        return $false
+    }
+    $modeArgs = @(if ($Editable) { '--editable' } else { '--reinstall-package', 'agent-venue-copilot' })
+    & uv pip install --python $Python @modeArgs "$VenueCopilotDir" --quiet 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $ErrorActionPreference = $prevEAP
+        Write-ServiceErr "venue-copilot install failed"
+        return $false
+    }
+    $modeArgs = @(if ($Editable) { '--editable' } else { '--reinstall-package', 'agent-session-liveness-probe' })
+    & uv pip install --python $Python @modeArgs "$SessionLivenessProbeDir" --quiet 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $ErrorActionPreference = $prevEAP
+        Write-ServiceErr "session-liveness-probe install failed"
+        return $false
+    }
+    $modeArgs = @(if ($Editable) { '--editable' } else { '--reinstall-package', 'agent-single-instance-lease' })
+    & uv pip install --python $Python @modeArgs "$SingleInstanceLeaseDir" --quiet 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $ErrorActionPreference = $prevEAP
+        Write-ServiceErr "single-instance-lease install failed"
+        return $false
+    }
+    $modeArgs = @(if ($Editable) { '--editable' } else { '--reinstall-package', 'agent-remote-login-shell' })
+    & uv pip install --python $Python @modeArgs "$RemoteLoginShellDir" --quiet 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $ErrorActionPreference = $prevEAP
+        Write-ServiceErr "remote-login-shell install failed"
+        return $false
+    }
+    $modeArgs = @(if ($Editable) { '--editable' } else { '--reinstall-package', 'agent-codespaces' })
+    & uv pip install --python $Python @modeArgs "$PluginDir" --quiet 2>&1 | Out-Null
     $rc = $LASTEXITCODE
     $ErrorActionPreference = $prevEAP
     if ($rc -ne 0) {
@@ -629,6 +760,130 @@ function Deploy-Package {
     # prunes any stale copy and guards against one lingering.
     return $true
 }
+
+# === mutable-dev-slot (#3376/Phase 2) ===
+function Deploy-VersionedRuntimeHelper {
+    <# Copy versioned_runtime.py into the plugin's own root (sibling of
+       versions/), so the DEPLOYED agent-codespaces CLI's `dev-release`/
+       `dev-status` verbs can shell out to it even when the operator is not
+       standing in a source checkout (docs/patterns/mutable-dev-slot.md
+       Runtime accessibility, option 1). Best-effort -- never fatal. #>
+    if (-not $VersionedRuntime) { return }
+    try {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'versioned_runtime.py') `
+            -Destination (Join-Path $InstallDir 'versioned_runtime.py') -Force
+    } catch {
+        Write-ServiceWarn "Could not stage versioned_runtime.py into ${InstallDir}: $_"
+    }
+}
+
+function Resolve-DevSlotOwner {
+    <# The absolute worktree checkout path claiming/releasing the mutable dev
+       slot -- the same value + resolution `agent-codespaces`' own
+       cross-machine CodeSpace claims already use as their `owner`
+       (docs/patterns/mutable-dev-slot.md). Falls back to this repo checkout's
+       own root when `agent-worktrees` is unavailable (e.g. a bare clone). #>
+    if (Get-Command 'agent-worktrees' -ErrorAction SilentlyContinue) {
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $out = (& agent-worktrees get worktree-dir 2>$null | Out-String).Trim()
+        $ErrorActionPreference = $prevEAP
+        if ($LASTEXITCODE -eq 0 -and $out) { return $out }
+    }
+    return $RepoRoot
+}
+
+function Invoke-Dev {
+    <# Claim + (re)build the mutable `versions/dev` slot IN PLACE (an editable
+       install against THIS checkout), then activate it. Safe to call
+       repeatedly across an iteration loop: the dev venv is reused, only the
+       editable package links are refreshed -- not a fresh venv every call.
+       Release with the deployed CLI's own `dev-release` verb (not this
+       installer -- see docs/patterns/mutable-dev-slot.md). #>
+    Write-ServiceHeader "$ServiceName (dev slot)"
+    if (-not $VersionedRuntime) {
+        Write-ServiceErr 'dev mode requires the versioned-runtime layout (no version in pyproject.toml?)'
+        return $false
+    }
+    foreach ($dir in @($InstallDir, $LocalBin)) {
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    }
+    Deploy-VersionedRuntimeHelper
+
+    $owner = Resolve-DevSlotOwner
+    $devDir = Join-Path (Join-Path $InstallDir 'versions') 'dev'
+    $devPython = Join-Path $devDir 'Scripts\python.exe'
+
+    Assert-Uv
+    if (-not (Test-PythonVenv -Dir $devDir -Python $devPython)) {
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        & uv venv $devDir --python 3.11 --allow-existing 2>&1 | Out-Null
+        $ErrorActionPreference = $prevEAP
+        if (-not (Test-PythonVenv -Dir $devDir -Python $devPython)) {
+            Write-ServiceErr "dev venv creation failed at $devDir"
+            return $false
+        }
+        Write-ServiceOk "dev venv created at $devDir"
+    } else {
+        Write-ServiceOk "Reusing existing dev venv at $devDir (mutable in place)"
+    }
+
+    $prevVersionResult = Invoke-VersionedRuntime -Arguments @('--root', $InstallDir, '--link-name', '.venv', 'current')
+    $prevVersion = $prevVersionResult.Output
+
+    $claimArgs = @('--root', $InstallDir, 'dev-claim', '--owner', $owner)
+    if ($prevVersion) { $claimArgs += @('--previous-version', $prevVersion) }
+    if ($Force) { $claimArgs += '--force' }
+    $claim = Invoke-VersionedRuntime -Arguments $claimArgs
+    if ($claim.ExitCode -eq 2) {
+        Write-ServiceErr "dev slot is already claimed by a different owner: $($claim.Output)"
+        Write-ServiceErr "Pass -Force to override, or release it from its current owner first."
+        return $false
+    } elseif ($claim.ExitCode -ne 0) {
+        Write-ServiceErr "dev-claim failed: $($claim.Output)"
+        return $false
+    }
+    $restoreNote = if ($prevVersion) { " (restores to '$prevVersion' on release)" } else { '' }
+    Write-ServiceOk "dev slot claimed by ${owner}${restoreNote}"
+
+    if (-not (Install-PackageInto -Python $devPython -Editable)) { return $false }
+    # NOTE: deliberately do NOT call Stamp-BuildInfo here -- an editable
+    # install's "package dir" resolves straight back to src/agent_codespaces/
+    # in THIS checkout, so stamping would write _build_info.py into tracked
+    # source rather than an installed copy. `agent-codespaces version` in dev
+    # mode falls back to the plain importlib-derived __version__, which is
+    # enough for dev-mode diagnostics.
+
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & $devPython -c 'import agent_codespaces' 2>$null
+    $healthOk = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = $prevEAP
+    if (-not $healthOk) {
+        Write-ServiceErr 'dev slot failed its health gate (import agent_codespaces) -- not activating'
+        return $false
+    }
+
+    $mc = Invoke-VersionedRuntime -Arguments @('--root', $InstallDir, '--link-name', '.venv', 'mark-complete', 'dev')
+    if ($mc.ExitCode -ne 0) {
+        Write-ServiceErr "Failed to mark dev slot complete: $($mc.Output)"
+        return $false
+    }
+    $act = Invoke-VersionedRuntime -Arguments @('--root', $InstallDir, '--link-name', '.venv', 'activate', 'dev', '--no-link')
+    if ($act.ExitCode -ne 0) {
+        Write-ServiceErr "Failed to activate dev slot: $($act.Output)"
+        return $false
+    }
+    Write-ServiceOk "dev slot active (current-version -> dev, editable install from $PluginDir)"
+
+    Deploy-SelfProvisioningBinstub
+    Write-Host ''
+    Write-ServiceOk "$ServiceName dev slot ready. Edit $PluginDir and re-run 'dev' to refresh."
+    Write-ServiceOk "Release when done: agent-codespaces dev-release"
+    return $true
+}
+# === end mutable-dev-slot ===
 
 function Deploy-Venv {
     <# Create the Python venv via uv. Deps come from pyproject at package
@@ -803,9 +1058,9 @@ exit /b %ERRORLEVEL%
     Write-ServiceOk "Binstub: $ps1Path (+ .cmd fallback, self-provisioning)"
 
     # Ensure ~/.local/bin is on User PATH
-    $currentUserPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+    $currentUserPath = Get-CopilotPersistentEnvironmentVariable -Name 'PATH' -Target 'User'
     if (-not ($currentUserPath -split ';' | Where-Object { $_ -eq $LocalBin })) {
-        [System.Environment]::SetEnvironmentVariable('PATH', "$LocalBin;$currentUserPath", 'User')
+        Set-CopilotPersistentEnvironmentVariable -Name 'PATH' -Value "$LocalBin;$currentUserPath" -Target 'User'
         $env:PATH = "$LocalBin;$env:PATH"
         Write-ServiceChanged "Added $LocalBin to User PATH"
     }
@@ -853,29 +1108,42 @@ function Write-DeployManifest {
 
 # -- Actions ---------------------------------------------------------------
 
-# -- Connection Owner service (config-gated; default off) ------------------
+# -- Connection Owner service (config-gated; default on, on-demand) --------
 # The persistent per-machine Connection Owner relay daemon (dotfiles#1320/#1333)
 # is provisioned as a per-user scheduled task, but ONLY when connection_owner is
-# enabled in config. Default off -> the task is ensured ABSENT, so a machine with
-# the feature disabled is unchanged (truly inert). Enabling it is "flip the
-# config, run update" (the install/update convergence contract, ce#488). The task
+# enabled in config -- default is now ON (the daemon + defer wiring finished
+# rolling out; this is the login-triggered convenience, not the only way it
+# starts: a tenant (ssh/dispatch) also spins it up itself on-demand if it isn't
+# already running, and the daemon exits on its own once idle -- see
+# connection_owner.idle_shutdown_after). An explicit opt-out -> the task is
+# ensured ABSENT, so a machine that disabled the feature is unchanged (truly
+# inert; on-demand spin-up also respects the disabled config). The task
 # launches through the stable self-provisioning binstub (agent-codespaces.ps1),
 # which resolves the active versioned slot at runtime, so it survives updates.
 $OwnerTaskName = 'agent-codespaces-owner'
 
 function Get-ConnectionOwnerConfig {
     <# Ask the freshly-built runtime whether the Connection Owner is enabled.
-       Returns @{ Enabled = <bool>; Interval = <double> }; disabled on any
-       failure (never throws). #>
-    $result = @{ Enabled = $false; Interval = 15.0 }
+       Returns @{ Known = <bool>; Enabled = <bool>; Interval = <double> }. A
+       query failure is UNKNOWN: do not create a new login service, but also do
+       not delete an existing one unless the runtime explicitly says disabled. #>
+    $result = @{ Known = $false; Enabled = $false; Interval = 15.0 }
     $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     try {
         $env:PYTHONUTF8 = '1'
         $json = & $LinkPython -m agent_codespaces owner --status 2>$null
         if ($LASTEXITCODE -eq 0 -and $json) {
             $obj = (($json | Out-String).Trim() | ConvertFrom-Json)
-            $result.Enabled = [bool]$obj.enabled
-            if ($obj.reconcile_interval) { $result.Interval = [double]$obj.reconcile_interval }
+            # Known only for an object with a real boolean ``enabled`` (and a
+            # convertible interval): ``{}``, ``null`` or a truncated payload stays
+            # unknown, so it can never unregister an existing Owner task.
+            if ($obj -is [psobject] -and $obj.PSObject.Properties['enabled'] -and $obj.enabled -is [bool]) {
+                $interval = $result.Interval
+                if ($obj.reconcile_interval) { $interval = [double]$obj.reconcile_interval }
+                $result.Enabled = $obj.enabled
+                $result.Interval = $interval
+                $result.Known = $true
+            }
         }
     } catch { }
     $ErrorActionPreference = $prevEAP
@@ -902,6 +1170,10 @@ function Sync-ConnectionOwnerService {
        register + start the per-user scheduled task; disabled (default) -> ensure
        it is absent. Idempotent + additive; failures are non-fatal to install. #>
     $co = Get-ConnectionOwnerConfig
+    if (-not $co.Known) {
+        Write-ServiceWarn "Connection Owner config query failed; leaving any existing scheduled task unchanged"
+        return
+    }
     if (-not $co.Enabled) {
         Unregister-ConnectionOwnerService
         return
@@ -929,9 +1201,26 @@ function Sync-ConnectionOwnerService {
             -DontStopIfGoingOnBatteries -StartWhenAvailable `
             -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
             -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-        Register-ScheduledTask -TaskName $OwnerTaskName -Action $action -Trigger $trigger `
-            -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-        Write-ServiceChanged "Registered Connection Owner scheduled task ($OwnerTaskName; interval=$($co.Interval)s)"
+        # Idempotent no-op when nothing changed (mirrors agent-vault/agent-index/
+        # agent-dispatch): the task's action points at a stable binstub
+        # ($stub) plus a stable host binary ($exe, resolved above the same way
+        # those plugins do), so it is byte-identical across routine updates and
+        # never needs a rewrite. Registering it again via `-Force` regardless
+        # requires the same elevation as any other Task Scheduler write, so a
+        # routine, nothing-changed update would otherwise fail with the same
+        # Access-Denied WARN every single run on a non-elevated host.
+        $existingTask = Get-ScheduledTask -TaskName $OwnerTaskName -ErrorAction SilentlyContinue
+        $existingAction = if ($existingTask) { @($existingTask.Actions) | Select-Object -First 1 } else { $null }
+        $actionCurrent = $existingAction -and
+            $existingAction.Execute -eq $action.Execute -and
+            ("$($existingAction.Arguments)").Trim() -eq ("$($action.Arguments)").Trim()
+        if ($actionCurrent) {
+            Write-ServiceOk "Connection Owner scheduled task already correct ($OwnerTaskName) -- left registered as-is"
+        } else {
+            Register-ScheduledTask -TaskName $OwnerTaskName -Action $action -Trigger $trigger `
+                -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+            Write-ServiceChanged "Registered Connection Owner scheduled task ($OwnerTaskName; interval=$($co.Interval)s)"
+        }
         try {
             Start-ScheduledTask -TaskName $OwnerTaskName -ErrorAction Stop
             Write-ServiceOk 'Connection Owner daemon started'
@@ -960,6 +1249,10 @@ function Invoke-Install {
 
     # Versioned layout (#581): health-gate the slot + swap the `.venv` link.
     if (-not (Invoke-VersionedActivate)) { throw 'Runtime activation failed' }
+
+    # Stage versioned_runtime.py at the root so the deployed CLI's
+    # dev-release/dev-status verbs work without a source checkout (#3376).
+    Deploy-VersionedRuntimeHelper
 
     # Deploy binstub
     Deploy-SelfProvisioningBinstub
@@ -994,7 +1287,7 @@ function Invoke-Install {
         throw 'Runtime verification failed'
     }
 
-    # Connection Owner daemon (config-gated; default off -> ensured absent).
+    # Connection Owner daemon (config-gated; default on unless opted out).
     Sync-ConnectionOwnerService
 
     Write-Host ''
@@ -1028,12 +1321,25 @@ function Stop-ManagedSshConnections {
 
 function Invoke-Uninstall {
     Write-ServiceHeader "$ServiceName Uninstall"
+    if ($DryRun) { Write-Host '(dry run -- nothing will be changed)' -ForegroundColor Yellow }
 
-    # Remove the Connection Owner scheduled task (if provisioned).
-    Unregister-ConnectionOwnerService
+    if ($DryRun) {
+        if (Get-ScheduledTask -TaskName $OwnerTaskName -ErrorAction SilentlyContinue) {
+            Write-Host "[dry-run] would stop + remove scheduled task: $OwnerTaskName"
+        } else {
+            Write-ServiceSkipped "Connection Owner scheduled task not present: $OwnerTaskName"
+        }
+        $socketDir = Join-Path $InstallDir 'sockets'
+        if (Test-Path $socketDir) {
+            Write-Host "[dry-run] would stop managed SSH connections under: $socketDir"
+        }
+    } else {
+        # Remove the Connection Owner scheduled task (if provisioned).
+        Unregister-ConnectionOwnerService
 
-    # Stop managed SSH ControlMaster connections before removing files.
-    Stop-ManagedSshConnections
+        # Stop managed SSH ControlMaster connections before removing files.
+        Stop-ManagedSshConnections
+    }
 
     # A marketplace invocation self-stages below the runtime tree. Leave that
     # working directory before removing the tree so uninstall never deletes its
@@ -1041,8 +1347,10 @@ function Invoke-Uninstall {
     $cwd = [IO.Directory]::GetCurrentDirectory()
     $installPrefix = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\', '/')
     if ($cwd.StartsWith($installPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-        Set-Location -LiteralPath $env:USERPROFILE
-        [IO.Directory]::SetCurrentDirectory($env:USERPROFILE)
+        if (-not $DryRun) {
+            Set-Location -LiteralPath $env:USERPROFILE
+            [IO.Directory]::SetCurrentDirectory($env:USERPROFILE)
+        }
     }
 
     # Remove binstub
@@ -1050,8 +1358,12 @@ function Invoke-Uninstall {
     foreach ($stub in @('agent-codespaces.ps1', 'agent-codespaces.cmd')) {
         $stubPath = Join-Path $LocalBin $stub
         if (Test-Path $stubPath) {
-            Remove-Item $stubPath -Force
-            Write-ServiceChanged "Removed binstub: $stubPath"
+            if ($DryRun) {
+                Write-Host "[dry-run] would remove binstub: $stubPath"
+            } else {
+                Remove-Item $stubPath -Force
+                Write-ServiceChanged "Removed binstub: $stubPath"
+            }
             $removedStub = $true
         }
     }
@@ -1059,15 +1371,24 @@ function Invoke-Uninstall {
         Write-ServiceSkipped "Binstub not found"
     }
 
-    # Remove install directory
+    # Remove install directory (config, DB, venv -- agent-codespaces has no
+    # -Purge distinction; uninstall always removes the whole install dir).
     if (Test-Path $InstallDir) {
-        Remove-Item $InstallDir -Recurse -Force
-        Write-ServiceChanged "Removed: $InstallDir"
+        if ($DryRun) {
+            Write-Host "[dry-run] would remove (config + DB + venv): $InstallDir"
+        } else {
+            Remove-Item $InstallDir -Recurse -Force
+            Write-ServiceChanged "Removed: $InstallDir"
+        }
     } else {
         Write-ServiceSkipped "Install directory not found"
     }
 
-    Write-ServiceOk "$ServiceName uninstalled"
+    if ($DryRun) {
+        Write-Host "$ServiceName uninstall dry run complete -- nothing was changed" -ForegroundColor Yellow
+    } else {
+        Write-ServiceOk "$ServiceName uninstalled"
+    }
 }
 
 function Invoke-Status {
@@ -1201,6 +1522,10 @@ function Invoke-Update {
     # Versioned layout (#581): health-gate the slot + swap the `.venv` link.
     if (-not (Invoke-VersionedActivate)) { throw 'Runtime activation failed' }
 
+    # Stage versioned_runtime.py at the root so the deployed CLI's
+    # dev-release/dev-status verbs work without a source checkout (#3376).
+    Deploy-VersionedRuntimeHelper
+
     # Re-deploy binstub
     Deploy-SelfProvisioningBinstub
 
@@ -1216,7 +1541,7 @@ function Invoke-Update {
     # Update manifest
     Write-DeployManifest
 
-    # Connection Owner daemon (config-gated; default off -> ensured absent).
+    # Connection Owner daemon (config-gated; default on unless opted out).
     Sync-ConnectionOwnerService
 
     Write-ServiceOk "$ServiceName updated"
@@ -1288,6 +1613,7 @@ try {
         'update'    { Invoke-Update }
         'stamp'     { Invoke-Stamp }
         'provision' { Invoke-Install }
+        'dev'       { if (-not (Invoke-Dev)) { exit 1 } }
     }
 } catch {
     Write-ServiceErr $_.Exception.Message

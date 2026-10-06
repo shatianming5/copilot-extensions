@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from agent_codespaces import lease as lease_mod
-from agent_codespaces.__main__ import _BUSY_EXIT, main
+from agent_codespaces.__main__ import _BUSY_EXIT, _COORDINATION_EXIT, main
 
 
 def _fake_lease(cs: str, owner: str) -> "lease_mod.Lease":
@@ -42,6 +42,55 @@ def test_claim_cmd_bounces_on_conflict(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "BUSY" in err
     assert "/wt/a" in err
+
+
+def test_claim_cmd_blocks_on_coordination_rejection(monkeypatch, capsys):
+    monkeypatch.delenv("AGENT_CODESPACES_DISABLE_CLAIM", raising=False)
+    monkeypatch.setattr(lease_mod, "active_worktree_ids", lambda: {"/wt/a"})
+
+    def _claim(cs, owner, **kw):
+        raise lease_mod.CoordinationRejected(
+            "knowledge_binding_required: repair binding"
+        )
+
+    monkeypatch.setattr(lease_mod, "claim", _claim)
+    rc = main(["claim", "cs-x", "--owner", "/wt/a"])
+    assert rc == _COORDINATION_EXIT
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err
+    assert "knowledge_binding_required" in err
+
+
+def test_claim_cmd_passes_rejection_to_existing_owner_logic(
+    monkeypatch,
+    capsys,
+):
+    from agent_codespaces import coordination
+
+    monkeypatch.delenv("AGENT_CODESPACES_DISABLE_CLAIM", raising=False)
+    monkeypatch.setattr(lease_mod, "active_worktree_ids", lambda: {"/wt/a"})
+    monkeypatch.setattr(
+        coordination,
+        "owner_ref",
+        lambda explicit=None, session_id=None: "machine/project/worktree",
+    )
+    rejected = coordination.PreflightResult(
+        "rejected",
+        code="knowledge_binding_required",
+        detail="repair binding",
+    )
+    monkeypatch.setattr(coordination, "preflight", lambda holder: rejected)
+    seen = {}
+
+    def _claim(cs, owner, **kwargs):
+        seen["preflight"] = kwargs["preflight_result"]
+        return _fake_lease(cs, owner)
+
+    monkeypatch.setattr(lease_mod, "claim", _claim)
+    rc = main(["claim", "cs-x", "--owner", "/wt/a"])
+    assert rc == 0
+    assert seen["preflight"] is rejected
+    assert "Claimed cs-x" in capsys.readouterr().out
 
 
 def test_claim_cmd_force_passes_through(monkeypatch):
@@ -87,6 +136,47 @@ def test_release_claim_cmd(monkeypatch, capsys):
     assert "Released claim on cs-x" in capsys.readouterr().out
 
 
+def test_release_claim_cmd_all_releases_every_claim_for_owner(monkeypatch, capsys):
+    """The safety-net bulk form (``--all``, no CodeSpace positional) used by
+    ``agent-worktrees finalize`` -- releases every claim the owner holds via
+    ``lease.release_worktree_claims``, not a single named CodeSpace."""
+    monkeypatch.delenv("AGENT_CODESPACES_DISABLE_CLAIM", raising=False)
+    seen: dict = {}
+
+    def fake_release_all(owner, **kw):
+        seen["owner"] = owner
+        return ["cs-a", "cs-b"]
+
+    monkeypatch.setattr(lease_mod, "release_worktree_claims", fake_release_all)
+
+    rc = main(["release-claim", "--owner", "/wt/a", "--all"])
+
+    assert rc == 0
+    assert seen == {"owner": "/wt/a"}
+    out = capsys.readouterr().out
+    assert "Released 2 claim(s)" in out
+    assert "cs-a" in out and "cs-b" in out
+
+
+def test_release_claim_cmd_all_with_nothing_to_release(monkeypatch, capsys):
+    monkeypatch.delenv("AGENT_CODESPACES_DISABLE_CLAIM", raising=False)
+    monkeypatch.setattr(lease_mod, "release_worktree_claims", lambda owner, **kw: [])
+
+    rc = main(["release-claim", "--owner", "/wt/a", "--all"])
+
+    assert rc == 0
+    assert "No claims owned by" in capsys.readouterr().out
+
+
+def test_release_claim_cmd_requires_name_or_all(monkeypatch, capsys):
+    monkeypatch.delenv("AGENT_CODESPACES_DISABLE_CLAIM", raising=False)
+
+    rc = main(["release-claim", "--owner", "/wt/a"])
+
+    assert rc == 2
+    assert "Either a CodeSpace name or --all" in capsys.readouterr().err
+
+
 def test_claim_cmd_disabled_env_is_noop(monkeypatch, capsys):
     """With the global escape hatch set, the CLI ``claim`` is a no-op success --
     parity with the ``ssh`` direct path, so a daemon shelling ``claim`` with
@@ -106,6 +196,38 @@ def test_claim_cmd_disabled_env_is_noop(monkeypatch, capsys):
     assert "disabled" in capsys.readouterr().out.lower()
 
 
+def test_claim_cmd_disabled_env_still_preflights_owner_ref(
+    monkeypatch,
+    capsys,
+):
+    from agent_codespaces import coordination
+
+    monkeypatch.setenv("AGENT_CODESPACES_DISABLE_CLAIM", "1")
+    monkeypatch.setattr(
+        coordination,
+        "owner_ref",
+        lambda explicit=None, session_id=None: explicit,
+    )
+    monkeypatch.setattr(
+        coordination,
+        "preflight",
+        lambda holder: coordination.PreflightResult(
+            "rejected",
+            code="knowledge_binding_required",
+            detail="repair binding",
+        ),
+    )
+
+    rc = main([
+        "claim",
+        "cs-x",
+        "--holder-ref",
+        "machine/project/worktree",
+    ])
+    assert rc == _COORDINATION_EXIT
+    assert "knowledge_binding_required" in capsys.readouterr().err
+
+
 def test_release_claim_cmd_disabled_env_is_noop(monkeypatch, capsys):
     monkeypatch.setenv("AGENT_CODESPACES_DISABLE_CLAIM", "1")
     called = {"release": False}
@@ -117,3 +239,49 @@ def test_release_claim_cmd_disabled_env_is_noop(monkeypatch, capsys):
     assert rc == 0
     assert called["release"] is False
     assert "disabled" in capsys.readouterr().out.lower()
+
+
+def test_leases_json_filters_by_owner(monkeypatch, capsys):
+    """The read-only query surface a caller (e.g. `agent-worktrees finalize`'s
+    claim-WARNING step) uses to discover which CodeSpaces a worktree still
+    holds -- never releases anything itself."""
+    leases = [
+        _fake_lease("cs-a", "/wt/a"),
+        _fake_lease("cs-b", "/wt/b"),
+    ]
+    monkeypatch.setattr(lease_mod, "list_leases", lambda: leases)
+
+    rc = main(["leases", "--owner", "/wt/a", "--json"])
+
+    assert rc == 0
+    import json
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == [
+        {"codespace": "cs-a", "owner": "/wt/a", "kind": "claim", "host": "h", "pid": 1},
+    ]
+
+
+def test_leases_json_without_owner_lists_everything(monkeypatch, capsys):
+    leases = [_fake_lease("cs-a", "/wt/a"), _fake_lease("cs-b", "/wt/b")]
+    monkeypatch.setattr(lease_mod, "list_leases", lambda: leases)
+
+    rc = main(["leases", "--json"])
+
+    assert rc == 0
+    import json
+
+    payload = json.loads(capsys.readouterr().out)
+    assert {p["codespace"] for p in payload} == {"cs-a", "cs-b"}
+
+
+def test_leases_json_empty(monkeypatch, capsys):
+    monkeypatch.setattr(lease_mod, "list_leases", lambda: [])
+
+    rc = main(["leases", "--owner", "/wt/nonexistent", "--json"])
+
+    assert rc == 0
+    import json
+
+    assert json.loads(capsys.readouterr().out) == []
+

@@ -33,6 +33,11 @@ def _neutralize_l2(monkeypatch):
 
     monkeypatch.setattr(coordination, "owner_ref", lambda *a, **k: None)
     monkeypatch.setattr(
+        coordination,
+        "preflight",
+        lambda *a, **k: coordination.PreflightResult("absent"),
+    )
+    monkeypatch.setattr(
         coordination, "acquire",
         lambda *a, **k: coordination.L2Result("unavailable"),
     )
@@ -59,3 +64,24 @@ def _neutralize_l2(monkeypatch):
     # it (None -> no identity -> fence proceeds without shelling out) so the ssh
     # CLI tests never touch host state. Tests covering the fence opt back in.
     monkeypatch.setattr(coordination, "harness_identity", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_launch_memory(monkeypatch, tmp_path):
+    """Keep detached launches' flag records (``launch_memory``) out of the host."""
+    from agent_codespaces import launch_memory
+
+    monkeypatch.setattr(launch_memory, "LAUNCHES_DIR", tmp_path / "launches")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_owner_local_forward_beacon(monkeypatch, tmp_path):
+    """Keep Connection Owner local-forward readiness beacons out of the host."""
+    from agent_codespaces import owner_local_forwards
+
+    monkeypatch.setattr(
+        owner_local_forwards,
+        "ACTIVE_LOCAL_FORWARDS_FILE",
+        tmp_path / "connection-owner.local-forwards.json",
+    )
+    monkeypatch.setattr(owner_local_forwards, "ensure_runtime_dir", lambda: None)

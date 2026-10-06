@@ -65,7 +65,14 @@ class NotGitRepositoryError(ManifestError):
 
 
 def _legacy_moves(repo_path: Path, repo_name: str) -> list[tuple[Path, Path]]:
-    legacy = repo_path / discover.LEGACY_MACHINE_STATE_DIR
+    structured_legacy = repo_path / discover.LEGACY_MACHINE_STATE_ROOT
+    flat_legacy = repo_path / discover.LEGACY_MACHINE_STATE_DIR
+    if structured_legacy.exists() and flat_legacy.exists():
+        raise ManifestError(
+            f"refusing migration with both {structured_legacy} and {flat_legacy} present"
+        )
+
+    legacy = structured_legacy if structured_legacy.exists() else flat_legacy
     if legacy.exists() and not legacy.is_dir():
         raise ManifestError(f"{legacy}: legacy package path is not a directory")
     if not legacy.exists():
@@ -74,6 +81,22 @@ def _legacy_moves(repo_path: Path, repo_name: str) -> list[tuple[Path, Path]]:
     root = repo_path / discover.MACHINE_STATE_ROOT
     moves: list[tuple[Path, Path]] = []
     target_names: dict[str, Path] = {}
+
+    if legacy == structured_legacy:
+        discover._validate_canonical_root(legacy)
+        for entry in sorted(legacy.iterdir()):
+            target = root / entry.name
+            folded = str(target).casefold()
+            if folded in target_names:
+                raise ManifestError(
+                    f"{entry}: migration target collides with {target_names[folded]}"
+                )
+            if target.exists():
+                raise ManifestError(f"{target}: migration target already exists")
+            target_names[folded] = entry
+            moves.append((entry, target))
+        return moves
+
     package_names: dict[str, Path] = {}
     for entry in sorted(legacy.iterdir()):
         if not entry.is_file():
@@ -108,9 +131,15 @@ def _legacy_moves(repo_path: Path, repo_name: str) -> list[tuple[Path, Path]]:
     return moves
 
 
-def inspect_repo_layout(repo_path: Path, repo_name: str, machine: str) -> LayoutReport:
+def inspect_repo_layout(
+    repo_path: Path,
+    repo_name: str,
+    machine: str,
+    accepted_machines: tuple[str, ...] | None = None,
+) -> LayoutReport:
     repo_path = repo_path.expanduser().absolute()
     root = repo_path / discover.MACHINE_STATE_ROOT
+    structured_legacy = repo_path / discover.LEGACY_MACHINE_STATE_ROOT
     legacy = repo_path / discover.LEGACY_MACHINE_STATE_DIR
     findings: list[LayoutFinding] = []
 
@@ -132,17 +161,31 @@ def inspect_repo_layout(repo_path: Path, repo_name: str, machine: str) -> Layout
                 "error", "invalid-layout", f"{legacy}: legacy package path is not a directory"
             )],
         )
+    if structured_legacy.exists() and not structured_legacy.is_dir():
+        return LayoutReport(
+            repo_name,
+            str(repo_path),
+            "malformed",
+            findings=[LayoutFinding(
+                "error", "invalid-layout", f"{structured_legacy}: legacy package path is not a directory"
+            )],
+        )
 
     if root.is_dir():
-        mixed = legacy.is_dir()
+        mixed = structured_legacy.is_dir() or legacy.is_dir()
         if mixed:
             findings.append(LayoutFinding(
                 "error",
                 "mixed-layout",
-                f"{legacy} is ignored because {root} exists; finish or revert the migration",
+                f"legacy package roots are ignored because {root} exists; finish or revert the migration",
             ))
         try:
-            packages = discover.packages_in_repo(repo_path, repo_name, machine)
+            packages = discover.packages_in_repo(
+                repo_path,
+                repo_name,
+                machine,
+                accepted_machines=accepted_machines,
+            )
         except ManifestError as exc:
             findings.append(LayoutFinding("error", "invalid-layout", str(exc)))
             packages = []
@@ -158,9 +201,51 @@ def inspect_repo_layout(repo_path: Path, repo_name: str, machine: str) -> Layout
             repo_name, str(repo_path), status, len(packages), findings
         )
 
+    if structured_legacy.is_dir() and legacy.is_dir():
+        return LayoutReport(
+            repo_name,
+            str(repo_path),
+            "mixed",
+            findings=[LayoutFinding(
+                "error",
+                "mixed-layout",
+                f"{structured_legacy} and {legacy} coexist; finish or revert the migration",
+            )],
+        )
+
+    if structured_legacy.is_dir():
+        try:
+            packages = discover.packages_in_repo(
+                repo_path,
+                repo_name,
+                machine,
+                accepted_machines=accepted_machines,
+            )
+        except ManifestError as exc:
+            return LayoutReport(
+                repo_name,
+                str(repo_path),
+                "malformed",
+                0,
+                [LayoutFinding("error", "legacy-not-migratable", str(exc))],
+            )
+        findings.append(LayoutFinding(
+            "advisory",
+            "legacy-layout",
+            f"run `agent-machines migrate --repo {repo_name}` to preview migration",
+        ))
+        return LayoutReport(
+            repo_name, str(repo_path), "legacy", len(packages), findings
+        )
+
     if legacy.is_dir():
         try:
-            packages = discover.packages_in_repo(repo_path, repo_name, machine)
+            packages = discover.packages_in_repo(
+                repo_path,
+                repo_name,
+                machine,
+                accepted_machines=accepted_machines,
+            )
         except ManifestError as exc:
             return LayoutReport(
                 repo_name,
@@ -282,10 +367,11 @@ def inspect_layouts(
     repo: str | None = None,
     registry: dict | None = None,
     projects: dict | None = None,
+    accepted_machines: tuple[str, ...] | None = None,
 ) -> list[LayoutReport]:
     if repo:
         name, path = resolve_repo(repo, registry, projects)
-        return [inspect_repo_layout(path, name, machine)]
+        return [inspect_repo_layout(path, name, machine, accepted_machines)]
 
     reports: list[LayoutReport] = []
     for candidate in _adopted_repos(registry, projects):
@@ -308,7 +394,9 @@ def inspect_layouts(
                 )],
             ))
             continue
-        reports.append(inspect_repo_layout(path, name, machine))
+        reports.append(
+            inspect_repo_layout(path, name, machine, accepted_machines)
+        )
     return reports
 
 
@@ -320,24 +408,26 @@ def migrate_repo_layout(
 ) -> MigrationResult:
     repo_path = repo_path.expanduser().absolute()
     root = repo_path / discover.MACHINE_STATE_ROOT
+    structured_legacy = repo_path / discover.LEGACY_MACHINE_STATE_ROOT
     legacy = repo_path / discover.LEGACY_MACHINE_STATE_DIR
 
     if root.exists() and not root.is_dir():
         raise ManifestError(f"{root}: canonical package path is not a directory")
     if root.exists():
-        if legacy.exists():
+        if structured_legacy.exists() or legacy.exists():
             raise ManifestError(
-                f"refusing mixed-layout migration: both {root} and {legacy} exist"
+                f"refusing mixed-layout migration: {root} coexists with legacy package roots"
             )
         return MigrationResult(
             repo_name, str(repo_path), "already-canonical", not apply, False
         )
-    if not legacy.exists():
+    if not structured_legacy.exists() and not legacy.exists():
         return MigrationResult(
             repo_name, str(repo_path), "no-layout", not apply, False
         )
 
     planned = _legacy_moves(repo_path, repo_name)
+    legacy_root = structured_legacy if structured_legacy.exists() else legacy
     moves = [MigrationMove(str(source), str(target)) for source, target in planned]
     if not planned:
         return MigrationResult(
@@ -350,13 +440,14 @@ def migrate_repo_layout(
 
     completed: list[tuple[Path, Path]] = []
     try:
-        (root / discover.ALL_PACKAGES_DIR).mkdir(parents=True, exist_ok=False)
+        root.mkdir(parents=True, exist_ok=False)
         for source, target in planned:
             if target.exists():
                 raise FileExistsError(f"migration target appeared during apply: {target}")
+            target.parent.mkdir(parents=True, exist_ok=True)
             source.replace(target)
             completed.append((source, target))
-        legacy.rmdir()
+        legacy_root.rmdir()
     except OSError as exc:
         rollback_errors: list[str] = []
         for source, target in reversed(completed):
@@ -365,7 +456,12 @@ def migrate_repo_layout(
                 target.replace(source)
             except OSError as rollback_exc:
                 rollback_errors.append(str(rollback_exc))
-        for directory in (root / discover.ALL_PACKAGES_DIR, root):
+        cleanup = sorted(
+            {target.parent for _, target in planned} | {root},
+            key=lambda path: len(path.parts),
+            reverse=True,
+        )
+        for directory in cleanup:
             try:
                 if directory.exists() and not any(directory.iterdir()):
                     directory.rmdir()

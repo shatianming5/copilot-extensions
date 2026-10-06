@@ -112,6 +112,48 @@ def test_sustained_outage_is_framed_as_resumable(capsys):
     assert all(word not in err.lower() for word in ("died", "stale", "gone"))
 
 
+def test_main_reports_uncaught_bridge_client_error_cleanly(monkeypatch, capsys):
+    """Regression (#3179): a command handler that does not wrap every internal
+    client call in its own try/except (e.g. `create`, whose only local guards
+    are for a 404 pre-check and an agent-session conflict) used to let a
+    ``BridgeClientError`` escape as a raw, unhandled Python traceback -- which
+    a caller shelling out to this CLI (agent-dispatch's headless spawn) could
+    not distinguish from a genuine, permanent failure. ``main`` now frames any
+    such escape as a clean one-line error with a nonzero exit, never a
+    traceback."""
+    from agent_bridge.client import BridgeClientError
+
+    def _raises_client_error(_args):
+        raise BridgeClientError(503, "agent-bridge is draining for a redeploy")
+
+    class _Args:
+        func = staticmethod(_raises_client_error)
+        project = None
+
+    monkeypatch.setattr(m, "build_parser", lambda: _FakeParser(_Args()))
+    monkeypatch.setattr(m, "_guard_project_scope", lambda parser, args: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        m.main([])
+
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "[FAIL]" in err
+    assert "HTTP 503" in err
+    assert "Traceback" not in err
+
+
+class _FakeParser:
+    def __init__(self, args):
+        self._args = args
+
+    def parse_args(self, argv):
+        return self._args
+
+    def print_help(self):
+        pass
+
+
 class _RecordingRenderer(_Renderer):
     def render_event(self, etype, data):
         return data.get("text", "")
@@ -199,3 +241,105 @@ def test_stream_feed_reports_settled_404_as_resumable(monkeypatch, capsys):
     assert "resumable" in err
     assert "not found" not in err  # no death verdict
     assert all(word not in err.lower() for word in ("died", "stale", "gone"))
+
+
+def test_stream_feed_follows_worktree_handle_across_handoff(monkeypatch, capsys):
+    monkeypatch.setattr(m, "_RECONNECT_BACKOFF", 0)
+
+    class _Client:
+        def __init__(self):
+            self.stream_calls: list[str] = []
+            self.cursors = {"s1": 0, "s2": 0}
+
+        def get_cursor(self, sid, *, caller_id=None):
+            return self.cursors[sid]
+
+        def get_session(self, sid):
+            if sid == "s1":
+                return {"session_id": "s1", "worktree_id": "wt-1", "status": "stopped"}
+            if sid == "s2":
+                return {"session_id": "s2", "worktree_id": "wt-1", "status": "idle"}
+            raise AssertionError(f"unexpected session lookup {sid}")
+
+        def list_sessions(self, *, status=None):
+            if self.stream_calls and self.stream_calls[-1] == "s1":
+                return [
+                    {"session_id": "s2", "worktree_id": "wt-1", "status": "idle"},
+                    {"session_id": "s1", "worktree_id": "wt-1", "status": "stopped"},
+                ]
+            return [{"session_id": "s1", "worktree_id": "wt-1", "status": "idle"}]
+
+        def stream_events(self, sid, *, after=0, caller_id=None):
+            self.stream_calls.append(sid)
+            if sid == "s1":
+                yield {"event": "agent_message", "id": "1", "data": {"text": "before"}}
+                yield {
+                    "event": "session_handoff",
+                    "id": "2",
+                    "data": {"rolled_from": "s1", "rolled_to": "s2"},
+                }
+                yield {"event": "turn_complete", "id": "3", "data": {}}
+                return
+            yield {"event": "agent_message", "id": "1", "data": {"text": "after"}}
+            yield {"event": "turn_complete", "id": "2", "data": {}}
+
+        def refresh_endpoint(self):
+            return False
+
+        def ack_cursor(self, sid, up_to, *, caller_id=None):
+            self.cursors[sid] = max(self.cursors[sid], up_to)
+            return self.cursors[sid]
+
+        def read_range(self, sid, *, start=0, end=None):
+            return []
+
+    result = m._stream_feed(
+        _Client(),
+        "s1",
+        caller_id=None,
+        renderer=_RecordingRenderer(),
+        command_timeout=0,
+        follow_handle="wt-1",
+    )
+
+    assert result == "complete"
+    err = capsys.readouterr().err
+    assert "Session handed off -> s2; continuing to follow." in err
+
+
+def test_stream_feed_literal_session_id_does_not_retarget(monkeypatch, capsys):
+    from agent_bridge.client import BridgeClientError
+
+    monkeypatch.setattr(m, "_RECONNECT_BACKOFF", 0)
+    monkeypatch.setattr(m, "_STREAM_404_GRACE_S", 0.0)
+    calls = {"resolve": 0}
+
+    class _Client:
+        def get_cursor(self, sid, *, caller_id=None):
+            return 0
+
+        def stream_events(self, sid, *, after=0, caller_id=None):
+            raise BridgeClientError(404, "session not found")
+
+        def resolve_live_session(self, handle):
+            calls["resolve"] += 1
+            return {"session_id": "replacement"}
+
+        def refresh_endpoint(self):
+            return False
+
+        def ack_cursor(self, sid, up_to, *, caller_id=None):
+            return up_to
+
+        def read_range(self, sid, *, start=0, end=None):
+            return []
+
+        def get_session(self, sid):
+            return {"status": "running"}
+
+    result = m._stream_feed(
+        _Client(), "sess-1", caller_id=None, renderer=_Renderer(), command_timeout=0
+    )
+    assert result == "error"
+    assert calls["resolve"] == 0
+    assert "[RETRY]" in capsys.readouterr().err

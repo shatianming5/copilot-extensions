@@ -6,7 +6,7 @@
   machines, and venue providers.
 - **Scope:** leaf (a per-plugin vision under the [agent-fabric](../../agent-fabric/README.md) branch)
 - **Status:** Draft
-- **Last revised:** 2026-08-31
+- **Last revised:** 2026-09-28
 - **Reality docs:** [`plugins/agent-bridge/README.md`](../../../plugins/agent-bridge/README.md) ·
   [`plugins/agent-bridge/docs/architecture.md`](../../../plugins/agent-bridge/docs/architecture.md)
 
@@ -57,7 +57,32 @@ recoverable, or rollback reference still depends on it.
 The **bridge daemon** is the per-machine runtime that exposes the local control
 plane, hosts or represents sessions, streams session events, and participates in
 the wider mesh. Each machine may run its own bridge; together they make local
-and remote sessions visible through one coordination surface.
+and remote sessions visible through one coordination surface. Exactly **one**
+bridge daemon owns this per-machine role regardless of how many Copilot
+sessions, hooks, or extension callbacks reach it — the suite-wide
+[*process-count-scales-with-services-not-sessions*](../../plugin-services/README.md#process-count-scales-with-services-not-sessions)
+guarantee applied to the mesh. A hook or extension that needs the bridge
+resolves and reaches this one daemon; it never spawns a rival to be sure one is
+there.
+
+### the daemon generation and its session-host handoff
+
+An install/update is not a fork in behavior — it is the **one** way the bridge
+daemon ever moves from one running generation to the next, whether triggered by
+a background reconcile, an operator-invoked update, or any future caller. A new
+generation stands up its own slot, confirms it is actually reachable, and only
+then may the prior generation let go. What makes that safe rather than merely
+sequenced is the **session-host handoff**: every hosted session-host process is
+durably recorded — its location, port, and the daemon generation that currently
+owns it — so a *specific*, narrow ownership claim (not "the daemon is up") is
+what the new generation actually waits to acquire, and what the prior generation
+actually releases, one host at a time, before it retires. A generation that
+terminates abruptly rather than releasing cleanly leaves a claim a **future**
+generation can recognize as stale and recover — the durable record, not a live
+handshake with the dead process, is what makes recovery possible. Upstream
+callers are shielded from all of this by the fabric's own routing/discovery
+seam: they resolve *the current generation*, never a specific process, so a
+cutover in flight looks like nothing worse than a brief, buffered pause.
 
 ### bridge CLI
 
@@ -106,12 +131,29 @@ host remains authoritative and the bridge acts as a proxy or fidelity-declared
 projection. The bridge maps between roles without pretending the protocols have
 identical identity, lifecycle, replay semantics, or ownership.
 
-### session host
+### session host provider
 
-The **Session Host** is the stable kernel that owns a hosted Copilot child and
-its protocol pipes. Fronts may update or disconnect; the host keeps the child and
-its session identity alive until the bridge deliberately drains, hands off, stops,
-or ends it.
+The bridge's **Session Host** is one provider of the fabric's
+[session-hosting](../../session-hosting/README.md) capability. It owns a hosted
+Copilot child and its protocol pipes; fronts may update or disconnect while the
+host keeps the child alive until deliberate drain, handoff, stop, or end. It is
+not the universal implementation for interactive Copilot: CLI/mux, graphical,
+SDK, and third-party hosts may own peer execution providers while the bridge
+coordinates with or represents them honestly.
+
+### cold-store providers
+
+Not every session the bridge is asked for is live. A **cold-store provider**
+registers with the bridge — the same `providers.d/` manifest-drop,
+process-boundary-driven pattern namespace providers (`codespace:`,
+`container:`) already use — to answer *"give me this session's content"* when
+no hosted or represented process can. The bridge tries its own live session
+ledger first; only when a target genuinely has nothing live registered does it
+ask a cold-store provider, which resolves whatever distinction its own domain
+draws between a local filesystem copy and a durable archive, and returns the
+content honestly. This keeps the bridge the single caller-facing surface for
+**any** session — live or not — without the bridge itself ever learning
+archival formats: that knowledge stays inside the provider that owns it.
 
 ### session and event ledger
 
@@ -120,12 +162,32 @@ boundaries, context usage, delivery cursors, target linkage, and terminal
 outcomes. It is the source that CLIs, UI/fronts, other agents, and recovery
 flows read when they need to know what happened.
 
+A session carries two distinct identifiers: the bridge's own internal
+`session_id` (for a live bridge-owned session, a short-lived escrow id that
+only correlates a spawn attempt to its bridge session while creating it --
+not durable once the session ends) and the real Copilot `acp_session_id`
+(durable everywhere: live-then-cold-store resolution, the archive, any
+future consumer). Every session response also carries a computed
+`durable_session_id` (`acp_session_id` when known, else `session_id`) so no
+caller has to rederive this precedence itself. A caller persisting or
+deep-linking a session reference always uses `durable_session_id`, never
+`session_id` directly -- conflating them broke agent-dispatch's
+`owner_session_id` capture for every headless dispatch task, silently
+breaking every downstream "View reviewer" deep link until caught and fixed
+(copilot-extensions PR #2964).
+
 ### topology and resolver layer
 
 The resolver layer turns a caller's target into a reachable session or agent by
 combining project context, worktree context, machine topology, agent profiles,
 namespace providers, and capability hints. The caller names the target; the
-bridge determines which route can honestly serve it.
+bridge determines which route can honestly serve it. This is what
+*resolve-by-any-origin-reference* (see Features) rides on top of when the
+caller's reference is a delegated task rather than a session or worktree
+directly — concretely, `GET /api/v1/dispatch-tasks/{id}/session`
+(`routes/dispatch_tasks.py`), which consults the agent-dispatch coordinator's
+task record and durable attachment history before applying this same layer's
+any-session-any-registered-worktree resolution.
 
 ### peer bridges
 
@@ -161,6 +223,14 @@ A hosted session can outlive the bridge frontend, any watching client, and a
 transport reconnect. The Session Host keeps the child and its pipes alive while
 the bridge reconciles back to durable session state and consumers reattach by
 cursor.
+
+### session-host-provider-participation
+
+The bridge can act as a full execution-host provider for sessions it owns and as
+a coordination client or fidelity-declared projection for sessions owned by
+another provider. Durable worktree identity and responsibility remain in
+agent-worktrees; bridge hosting contributes execution lifecycle and observations
+without taking over that ledger.
 
 ### cli-and-api-control-plane
 
@@ -275,12 +345,24 @@ delivery progress, topology, capability resolution, peer reachability, drain
 state, current heads, and stranded hosts are visible from logs, CLI output, and
 event streams before a caller needs to guess.
 
+### one-canonical-deploy-path
+
+There is exactly **one** way the bridge daemon ever updates — an install, a
+background reconcile, and an operator-invoked update all resolve to the same
+generation-cutover behavior. Nothing named "restart" or "redeploy" is a
+lighter-weight, un-orchestrated alternative that skips draining or the
+session-host handoff; a raw stop/start of the daemon process is not a
+supported maintenance path.
+
 ### graceful-deployment-and-version-survival
 
 Bridge updates cooperate with live sessions. Frontends reattach where compatible;
 in-flight work is drained, cancelled-and-resumed, or handed off deliberately; and
 older hosts remain bounded but alive long enough for their children to reach a
-safe stop.
+safe stop. The prior generation confirms the next generation is actually up
+before it lets go of anything, and each session-host's ownership moves from one
+generation to the next individually and durably recorded — never inferred from
+"the new daemon is reachable" alone.
 
 ### version-skew-safe-contract-evolution
 
@@ -298,6 +380,49 @@ fabric knows how to resolve, including projects whose working body lives on
 another machine or venue provider. The reachable set is a catalog, not a
 collection of one-off connection recipes.
 
+### any-session-any-registered-worktree-regardless-of-liveness
+
+A caller asking for a specific session by ID gets an honest answer for **any
+worktree the fabric has ever registered** — not only the ones currently
+hosting a live process. Liveness changes *how* the answer is produced (a
+hosted child answers directly; a represented interactive session answers
+through its adapter; neither answers, and a cold-store provider is asked
+instead), never *whether* one is attempted. The caller is never required to
+already know a session is dead before asking for it. This applies to a
+session's **transcript/event content**, not only its metadata — including a
+**solo session with no worktree at all**: the same cold-store answer that
+resolves a worktree-scoped session's content resolves a bare session id's
+content too, so a consumer with only a session id in hand never needs a
+separate archival dependency just to render the transcript.
+
+### listing-defaults-to-registered-excludes-archived
+
+A single, explicitly-addressed session or worktree is always resolvable (see
+*any-session-any-registered-worktree-regardless-of-liveness* above) — but an
+**enumeration** (list every worktree's sessions, list every worktree an agent
+knows about) defaults to the **registered** set agent-worktrees itself
+currently tracks, excluding any worktree it has marked **archived**. An
+archived worktree's sessions remain reachable by direct reference through the
+cold-store path; they simply do not appear in a default listing next to live
+and active work. A caller that genuinely wants the archived set asks for it
+explicitly — the bridge never silently expands a listing's scope to include
+retired history the caller didn't ask for.
+
+### resolve-by-any-origin-reference
+
+A caller rarely starts with a session ID in hand — it has a worktree ID, or a
+delegated task's own reference (an agent-dispatch task id, a queue entry, any
+other origin's durable handle on the work). The fabric resolves **any** of
+these to the same session the same way: derive the worktree, then apply
+*any-session-any-registered-worktree-regardless-of-liveness* to it. No caller
+invents its own naming convention or per-consumer lookup to get there — a
+Neuron Forge deep-link, a Dampener review-status link, an Adjudication Board
+run record, and a human reading agent-dispatch's own history all resolve
+through the identical primitive. Where the reference is a delegated task,
+resolution consults the delegation layer's own durable attachment history
+(not only its current live owner) so a caller can still resolve a task whose
+current session has since moved on or ended.
+
 ### satellite-exposure-and-federation
 
 A field or otherwise one-way-reachable machine can expose its local bridge to
@@ -310,7 +435,9 @@ limited to a tunnel-only client.
 A hosted session can roll itself to a successor in the same worktree when asked
 or when context pressure requires it under policy. The retiring session's
 continuation seeds the successor, the head moves deliberately, and watchers are
-told that the work continues under the successor identity.
+told that the work continues under the successor identity. The bridge performs
+this changeover as the owning session-host provider; generic handoff policy and
+durable worktree succession remain outside its process mechanics.
 
 ## Behaviors
 
@@ -332,6 +459,24 @@ Stopping, updating, cutting over, or retiring a session first seeks a safe
 state: finish the turn, cancel gracefully, mark for resume, carry context
 forward, and only then let go. A hard kill is an explicit last resort, never the
 normal maintenance path.
+
+### the next generation earns the handoff, never assumes it
+
+A new daemon generation is not entitled to a session-host merely by starting
+successfully. It acquires that specific host's ownership claim — durably, one
+host at a time — and only the prior generation that actually held the claim
+releases it. A generation that dies before releasing leaves its claims
+recognizably stale rather than silently orphaned, so a **later** generation can
+recover them without ever needing to talk to the process that held them.
+
+### the outgoing generation waits for confirmation, not for Copilot
+
+The prior generation's only obligations before it may terminate are: see the
+next generation actually running, hand off (or durably record as stale-
+recoverable) every session-host claim it held, and let any single in-flight
+event finish crossing the wire. It never waits on a Copilot turn, a client, or
+anything the *next* generation is now responsible for — that dependency is
+exactly what turns an update into an outage.
 
 ### one-owner-many-callers
 
@@ -448,13 +593,39 @@ authoritative log rather than silently diverging.
 
 A session never remains indefinitely "running" after its turn has actually
 ended. Clean finish, child death, interrupted stream, and frontend loss all
-eventually reconcile to a persisted terminal turn state.
+eventually reconcile to a persisted terminal turn state. Read surfaces also
+derive an **at-rest** verdict from the durable event tail, so a stale ACP
+"live/running" flag cannot hide a completed response from schedulers waiting on
+the turn boundary.
+
+### cache-is-a-hint-never-authority
+
+The bridge may cache liveness, status, or reachability for performance, but a
+cache is a **hint**, not a verdict. A cache miss, a stale entry, or any
+ambiguity between what the cache claims and what a decision actually needs
+requires a live probe of the real target before the bridge or a consumer acts
+on it; the fresh result then backfills the cache rather than being discarded.
+This governs the bridge's own internal state (e.g. a session's durable
+`status` after a daemon restart or redeploy) exactly as it governs an external
+reader deciding whether to resume a session the bridge reports on: neither may
+treat a cached or persisted value as ground truth for a consequential
+decision (resume, recovery, takeover) without a live check backing it up. A
+three-tier **hot/warm/cold** liveness read (always observed, never
+cache-gated) is the reference shape for that live check.
 
 ### local-first-peer-mesh
 
 Every participating bridge can host local sessions and initiate outbound reach.
 The mesh does not require a single central bridge to become the only neck the
 whole fabric depends on.
+
+### archived-is-opt-in-never-ambient
+
+Every worktree- or session-listing surface treats an **archived** worktree
+(agent-worktrees' own post-finalization terminus) as excluded by default,
+mirroring agent-worktrees' own registered-by-default listing. Inclusion is a
+caller's explicit ask (a parameter, a flag, a dedicated route), never the
+ambient default a generic listing quietly widens to over time.
 
 ### attributed-prompt-injection
 
@@ -507,12 +678,22 @@ machine may deliberately gate outbound reach until policy allows it.
 - **Not the task queue.** Durable, claimable, fire-and-forget work belongs to
   agent-dispatch. The bridge may embody or message workers, but queue state and
   scheduling are sibling-layer concerns.
-- **Not the git worktree manager.** agent-worktrees owns worktree creation,
-  finalization, picker pool state, and the passive ground-layer session
-  primitives the bridge coordinates over.
+- **Not the git worktree or agency-state manager.** agent-worktrees owns
+  worktree creation, finalization, relationships, claims, disposition, and
+  durable execution lineage. The bridge hosts or coordinates execution against
+  that state.
+- **Not the universal interactive Copilot host.** The bridge is a full provider
+  for sessions it owns and an honest coordinator for other hosts. It does not
+  require every CLI, SDK, App, multiplexer, or third-party rig to surrender its
+  native process and interaction ownership.
 - **Not the connectivity provisioner.** SSH keys, host adoption, tunnel setup,
   and reachability verification belong to the connectivity layer; the bridge
   routes over declared reachability.
+- **Not multiple deploy behaviors.** A separate "just restart it" maintenance
+  path that bypasses the session-host handoff is not a smaller, faster
+  alternative — it is an outage the vision explicitly excludes. Any operator
+  or automated affordance that stops and starts the daemon goes through the
+  same one cutover.
 - **Not a web UX.** A rich UI/front may consume the bridge, but the bridge is the
   runtime and headless control plane underneath it.
 - **Not a scheduler inside the caller.** The bridge can hold an attached
@@ -539,6 +720,9 @@ machine may deliberately gate outbound reach until policy allows it.
 
 - Parent vision: [agent-fabric](../../agent-fabric/README.md) — §Concepts/
   *agent-bridge — the coordination layer*.
+- Cross-cutting hosting vision:
+  [session-hosting](../../session-hosting/README.md) — the provider boundary
+  agent-bridge implements for sessions it owns.
 - Sibling leaf: [agent-dispatch](../agent-dispatch/README.md) — the delegation
   layer that records claimable work, may embody workers through this runtime,
   and can hibernate a genuinely asynchronous wait until work needs attention.
@@ -546,11 +730,62 @@ machine may deliberately gate outbound reach until policy allows it.
   bridge's cross-machine reach rides on.
 - Venue provider: [agent-codespaces](../agent-codespaces/README.md) — a remote
   venue presented through the bridge's coordination contract.
+- Cold-store provider: [agent-logger](../agent-logger/README.md) — registers
+  with the bridge to answer for a session that has nothing live, resolving its
+  own local-filesystem-vs-durable-archive distinction internally.
 - Reality docs: [`plugins/agent-bridge/README.md`](../../../plugins/agent-bridge/README.md) ·
   [`plugins/agent-bridge/docs/architecture.md`](../../../plugins/agent-bridge/docs/architecture.md).
 
 ## Provenance
 
+- **2026-09-21** — Extended *any-session-any-registered-worktree-regardless
+  -of-liveness* to explicitly cover transcript/event content (not only
+  metadata) and solo sessions with no worktree at all. Implemented as a new
+  ``GET /api/v1/sessions/{id}/transcript`` bare route, backed by the same
+  cold-store provider the worktree-scoped transcript route already uses --
+  closing a gap a downstream consumer's session-worktree-archive-linkout
+  effort (Phase 2d) flagged as a small, feasible follow-up (letting a
+  solo-session consumer, e.g. Neuron Forge, retire its own direct
+  Permanent Record dependency).
+
+- **2026-09-20** — Added *listing-defaults-to-registered-excludes-archived*
+  (Features) and *archived-is-opt-in-never-ambient* (Behaviors): every
+  worktree/session listing surface excludes an agent-worktrees-archived
+  worktree by default, mirroring agent-worktrees' own new
+  *registered-by-default-listing* (see that plugin's vision, same date).
+  Mined from the same operator directive during `private-downstream-repo`
+  `session-worktree-archive-linkout` Phase 2b: agent-bridge should not
+  invent its own archival reconstruction for a worktree agent-worktrees has
+  already tombstoned — it should simply respect that tombstone's default
+  exclusion, surfacing it only on an explicit ask.
+- **2026-09-20** — Closed a reality gap in *session and event ledger*: the
+  concept already implied `acp_session_id` is the durable identity, but no
+  session response exposed an unambiguous field callers could persist or
+  deep-link with, so `session_id` (agent-bridge's own non-durable escrow id
+  for a live session) got used instead in practice. Added a computed
+  `durable_session_id` field (`acp_session_id` when known, else `session_id`)
+  to every session response and documented the precedence explicitly.
+  Prompted by tracing agent-dispatch's `owner_session_id` capture bug back to
+  exactly this ambiguity, which had silently broken every downstream "View
+  reviewer" deep link (copilot-extensions PR #2964).
+- **2026-09-19** — Added *resolve-by-any-origin-reference*: a caller resolves
+  a session from any durable origin handle (worktree ID, an agent-dispatch
+  task reference, etc.), not only a session ID directly — through the same
+  primitive `any-session-any-registered-worktree-regardless-of-liveness`
+  already provides, extended to consult the delegation layer's own durable
+  attachment history when resolving a delegated task. Prompted by a Dampener
+  UI link reaching for a bespoke, per-consumer worktree-naming convention
+  instead of a shared resolution primitive.
+- **2026-09-12** — Added `cache-is-a-hint-never-authority`: a cache miss or
+  ambiguity must trigger a live probe before a consequential decision, and the
+  live result backfills the cache. Extends the vision to hold the bridge's own
+  internal state (not just external consumers) to the same never-trust-cache-
+  alone rule. Mined from operator guidance.
+- **2026-09-04** — Clarified agent-bridge as one execution-host provider and
+  coordination surface within a plural hosting ecosystem. Bridge-owned ACP and
+  headless sessions retain durable hosting and replay, while CLI/mux, SDK, App,
+  and third-party interactive hosts may remain peer providers. Durable worktree
+  agency state stays with agent-worktrees.
 - **2026-08-31** — Added explicit version-skew-safe contract evolution as the
   shared foundation beneath AHP host convergence and native-sub-agent-like
   delegation control. The foundation owns negotiation, session pinning,
@@ -573,3 +808,49 @@ machine may deliberately gate outbound reach until policy allows it.
   binding the fabric's address-any-project guidance at the agent-* leaves. Closes
   the structural gap that agent-bridge had no canonical per-plugin vision leaf
   alongside its siblings.
+- **2026-09-18** — Added §Concepts/*cold-store providers* and
+  §Features/*any-session-any-registered-worktree-regardless-of-liveness*.
+  Course correction from a downstream facility's own build-out: retrieving a
+  cold (no longer live) session's content was drifting toward a bespoke
+  caller-side fallback (a consuming UI reaching around the bridge to a
+  domain-specific archival service directly) instead of staying inside the
+  bridge's existing single-caller-facing-surface promise. Generalized the
+  already-proven `providers.d/` namespace-provider pattern (`codespace:`,
+  `container:`) to a second provider *kind* — cold-store, keyed by capability
+  (session retrieval) rather than address namespace — so the bridge remains
+  the one thing every caller asks, whether the answer is live or not, while
+  archival-format knowledge (unpacked vs. packed, local vs. durable archive)
+  stays inside the provider that owns it. Paired with a new
+  §Features/*cold-store-provider-registration* on the agent-logger leaf,
+  which registers as the reference (and likely only) implementation.
+
+- **2026-09-28** — Added §Concepts/*the daemon generation and its
+  session-host handoff*, §Features/*one-canonical-deploy-path*, §Behaviors/
+  *the next generation earns the handoff, never assumes it* and *the
+  outgoing generation waits for confirmation, not for Copilot*, and a
+  matching §Non-Goals/*not multiple deploy behaviors*. Prompted by a live
+  incident: a facility's `agent-bridge` daemon hadn't picked up a needed fix
+  in 18+ days despite repeated `copilot plugin update` runs, because the
+  only update trigger (a `sessionStart` background-reconcile hook) is opt-in
+  per project and was never enabled there — a silent, undetectable gap. That
+  investigation also surfaced that `agent-bridge deploy` (a real ZDD cutover
+  via the shared `zdd` lib's `CutoverOrchestrator`) and `agent-bridge service
+  restart` (a raw stop-then-start with no cutover at all) are two genuinely
+  different behaviors reachable for the same maintenance intent — exactly
+  the kind of special-cased variant this revision closes off. It also
+  surfaced that the generic cutover orchestrator coordinates only with the
+  daemon's own drain endpoint, not with individual `session-host`
+  subprocesses — durable session-host locations exist (`HostIndex`), but
+  carry no per-generation ownership claim, no graceful-release notification,
+  and no stale-claim recovery for an abruptly-terminated generation. Intent
+  mined from the operator's own detailed redesign: a new generation stands
+  up its slot, confirms liveness, and only then may the prior generation
+  begin releasing session-host claims one at a time (durably recorded, so a
+  future generation can recover a claim whose owner died mid-release);
+  upstream callers are shielded by the existing routing/discovery seam
+  (`zdd.routing`'s `active.json` table) the same way session-host clients
+  already tolerate a daemon changeover. This vision states the *should-be*
+  (one behavior, generation-scoped claims, liveness-gated handoff,
+  caller-transparent cutover); the concrete claim schema, recovery protocol,
+  and CLI unification are carved as the `agent-bridge-unified-zdd-cutover`
+  effort, which also tracks the confirmed root cause of the 18-day gap.

@@ -158,30 +158,30 @@ Tracked by #1449.
 
 ### Phase 1A — Deliver bounded accumulated results (#1452)
 
-- [ ] Return bounded current state, latest result, and incremental work since a
+- [x] Return bounded current state, latest result, and incremental work since a
       caller-held position.
-- [ ] Keep raw events and full detail available through explicit fidelity and
+- [x] Keep raw events and full detail available through explicit fidelity and
       recovery access rather than injecting them into the ordinary caller path.
-- [ ] Use only stable event or projection identities supplied by #1138.
-- [ ] Represent truncation, unavailable detail, and reduced-fidelity targets
+- [x] Use only stable event or projection identities supplied by #1138.
+- [x] Represent truncation, unavailable detail, and reduced-fidelity targets
       explicitly.
-- [ ] Consume #1045's liveness/progress inspection plane for "is it advancing?"
+- [x] Consume #1045's liveness/progress inspection plane for "is it advancing?"
       while owning the result projection for "what did it produce?"; do not add
       a second competing status payload.
 
 ### Phase 1B — Make waits attention-oriented (#1450)
 
-- [ ] Let a retained caller or subscriber wait for selected attention boundaries
+- [x] Let a retained caller or subscriber wait for selected attention boundaries
       rather than only transport completion or one successful turn.
-- [ ] Return a bounded structured reason, durable position, and current target
+- [x] Return a bounded structured reason, durable position, and current target
       identity at settlement.
-- [ ] Resume ordinary transport interruptions by cursor inside the retained
+- [x] Resume ordinary transport interruptions by cursor inside the retained
       relationship instead of settling the wait prematurely.
-- [ ] Carry an attention subscription across a deliberate successor handoff
+- [x] Carry an attention subscription across a deliberate successor handoff
       only when the successor negotiates semantics compatible with the caller's
       retained contract. Otherwise settle with an explicit contract-changed
       attention reason and the successor identity.
-- [ ] Consume #22's terminal-event reconciliation for transport failure; #1450
+- [x] Consume #22's terminal-event reconciliation for transport failure; #1450
       owns wait settlement semantics, not the underlying terminal emission.
 
 ### Phase 2 — Make steering queue-first and handoff-safe (#1451)
@@ -343,10 +343,43 @@ ownership.
 ### 2026-09-01 — Phase 1A bounded-result proposal
 
 - Claimed #1452 and carved the focused
-  [`agent-bridge-delegated-result-snapshots`](../agent-bridge-delegated-result-snapshots/README.md)
+  [`agent-bridge-delegated-result-snapshots`](../../2026/09/01%20agent-bridge-delegated-result-snapshots/README.md)
   stretch.
 - Selected a reader-only projection over existing status, persisted turns, and
   event logs, with no new durable writer or competing progress payload.
 - Kept event-log continuity private behind opaque rebuild-safe positions and
   left richer progress proof plus the general immutable-reference contract with
   #1045/#1138.
+
+### 2026-09-01 — Phase 1A bounded results completed
+
+- Merged the bridge-owned bounded result reader in
+  [#1566](https://github.com/ThomasMichon/copilot-extensions/pull/1566).
+- Merged reduced-fidelity represented-session parity in
+  [#1588](https://github.com/ThomasMichon/copilot-extensions/pull/1588).
+- Archived the completed focused effort and transferred the delegation program's
+  next independent reader slice to #1450.
+
+### 2026-09-01 — Phase 1B attention-wait proposal
+
+- Claimed #1450 and carved the focused
+  [`agent-bridge-attention-waits`](../agent-bridge-attention-waits/README.md)
+  stretch.
+- Selected a deterministic earliest-boundary attention projection over the
+  existing event, succession, and bounded-result authorities, retaining the
+  HTTP or CLI invocation itself as the wake channel and adding only the narrow
+  permission correlation needed for an answerable live request.
+- Kept terminal-event emission with #22, handoff creation with #112, and durable
+  contract registration and writer fencing with #1460/#1468.
+
+### 2026-09-03 — Phase 1B attention waits completed
+
+- Merged cursor-neutral selected-reason waits, attached streaming settlement,
+  permission correlation, failed-state publication, and compatible successor
+  following through #1899.
+- Archived the focused `agent-bridge-attention-waits` effort. Reachability
+  terminal-event production remains with #22, policy-event production with its
+  future owner, and replayable deliberate-end tombstones with a future
+  terminal-retention owner; the wait surface no longer overclaims those gates.
+- Phase 2 / #1451 is the next delegation-control slice once #1460/#1468 permit
+  its durable queue and admission writers.

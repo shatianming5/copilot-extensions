@@ -85,3 +85,18 @@ def test_active_paths_union_lock_and_mux():
 
     assert active == {"/tmp/a", "/tmp/b"}
     m_has.assert_not_called()
+
+
+def test_active_paths_include_hosted_session_bindings():
+    rec = _rec("aaaa", path="/tmp/a")
+    rec.execution_leg = tracking.ExecutionLegBinding(
+        provider="ahp",
+        state="active",
+        binding_revision=1,
+        blob={"session_id": "11111111-1111-1111-1111-111111111111"},
+    )
+
+    with patch("agent_worktrees.sessions._list_mux_sessions", return_value={}):
+        active = cli._build_active_paths([rec], session_ctx=_empty_ctx())
+
+    assert active == {"/tmp/a"}

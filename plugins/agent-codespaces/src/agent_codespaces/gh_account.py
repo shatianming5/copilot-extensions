@@ -15,9 +15,11 @@ each plugin has its own venv and a cross-plugin Python import is fragile -- and
 mints a per-account ``GH_TOKEN`` via ``gh auth token --user <login>`` for the
 subprocess environment.
 
-Everything degrades to today's **ambient** behavior when agent-worktrees or
-``gh`` is unavailable, or when no account maps for the owner -- so wiring this
+Without explicit installation context, lookups degrade to **ambient** behavior
+when agent-worktrees or ``gh`` is unavailable, or when no account maps for the owner -- so wiring this
 in is additive and safe: a repo with no mapping behaves exactly as before.
+With explicit context, lookups use the same-cell peer boundary; rejected
+receipts propagate and cannot select ambient authentication.
 """
 
 from __future__ import annotations
@@ -28,8 +30,11 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 
 from agent_procutil import no_window_flags
+
+from . import worktrees
 
 log = logging.getLogger("agent-codespaces")
 
@@ -40,11 +45,19 @@ def _creation_flags() -> int:
 
 def _agent_worktrees_bin() -> str | None:
     """Locate the ``agent-worktrees`` CLI on PATH, or None."""
-    return shutil.which("agent-worktrees")
+    return shutil.which("agent-worktrees")  # marketplace-isolation: allow _lookup uses this only without explicit installation context
+
+
+def account_for_repo(slug: str | None) -> str | None:
+    """Resolve an account without reusing another installation's cached state."""
+    if worktrees.explicit_context():
+        worktrees.validate_context()
+        return _account_for_repo.__wrapped__(slug)
+    return _account_for_repo(slug)
 
 
 @functools.lru_cache(maxsize=256)
-def account_for_repo(slug: str | None) -> str | None:
+def _account_for_repo(slug: str | None) -> str | None:
     """Resolve the gh login for a repo ``owner/name`` slug, or None.
 
     Shells ``agent-worktrees repos account-for <slug>``.  Returns None when
@@ -53,16 +66,8 @@ def account_for_repo(slug: str | None) -> str | None:
     """
     if not slug:
         return None
-    aw = _agent_worktrees_bin()
-    if not aw:
-        return None
-    try:
-        result = subprocess.run(
-            [aw, "repos", "account-for", slug],
-            capture_output=True, text=True, timeout=10,
-            creationflags=_creation_flags(),
-        )
-    except Exception:
+    result = _lookup("repos", "account-for", slug)
+    if result is None:
         return None
     if result.returncode != 0:
         return None
@@ -70,8 +75,16 @@ def account_for_repo(slug: str | None) -> str | None:
     return login or None
 
 
-@functools.lru_cache(maxsize=64)
 def token_for_account(login: str | None) -> str | None:
+    """Avoid reusing credentials across explicit installation contexts."""
+    if worktrees.explicit_context():
+        worktrees.validate_context()
+        return _token_for_account.__wrapped__(login)
+    return _token_for_account(login)
+
+
+@functools.lru_cache(maxsize=64)
+def _token_for_account(login: str | None) -> str | None:
     """Mint a ``gh`` OAuth token for ``login`` via ``gh auth token --user``.
 
     Returns None when ``gh`` is unavailable or ``login`` is not an
@@ -115,8 +128,152 @@ def env_for_repo(slug: str | None, base: dict | None = None) -> dict:
     return env_for_account(account_for_repo(slug), base)
 
 
-@functools.lru_cache(maxsize=1)
+def active_account(host: str = "github.com", *, timeout: float = 10.0) -> str | None:
+    """Return gh's active account for ``host`` without changing global auth."""
+    try:
+        result = subprocess.run(
+            [
+                "gh", "auth", "status", "--active",
+                "--hostname", host, "--json", "hosts",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=_creation_flags(),
+        )
+    except Exception:
+        return None
+    # A failed API check can make gh exit nonzero while its JSON still names
+    # the active login, so parse whatever it printed.
+    try:
+        data = json.loads(result.stdout or "{}")
+    except Exception:
+        return None
+    entries = ((data.get("hosts") or {}).get(host) or []) if isinstance(data, dict) else []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        # The configured active login, even if gh's API check timed out or
+        # errored: account selection must not depend on that probe (the
+        # credential preflight reports whether the account is usable).
+        if entry.get("active") is True:
+            login = str(entry.get("login") or "").strip()
+            return login or None
+    return None
+
+
+def credential_account_for_codespace(name: str) -> str | None:
+    """Account to pass as github.com credential username for this connection.
+
+    The persisted binding is authoritative: an unreadable binding (lock
+    contention) is unknown, not absent, so this returns None rather than guess
+    the ambient account (matching :func:`fast_credential_account_for_codespace`).
+    With no binding, the existing CodeSpace resolver runs; ``None`` there means
+    this CodeSpace is operated through ambient gh auth, so use gh's active account.
+    """
+    from . import account_binding
+
+    try:
+        bound = account_binding.bound_account_or_raise(name)
+    except Exception:
+        log.warning("CodeSpace %s account binding is unavailable; not guessing an account", name)
+        return None
+    if bound:
+        return bound
+    try:
+        from .lifecycle import account_for_codespace
+
+        account = account_for_codespace(name)
+    except worktrees.ContextRefused:
+        raise
+    except Exception:
+        account = None
+    return account or active_account()
+
+
+def fast_credential_account_for_codespace(
+    name: str, *, timeout: float = 3.0, resolve_timeout: float = 8.0,
+) -> str | None:
+    """Account for launch env (incl. daemon-restart recovery, which reaches here
+    without the namespace readiness step that normally writes the binding).
+
+    The binding is authoritative. A missing binding is not proof of ambient
+    ownership (it may predate bindings), so a bounded live listing resolves it:
+    a mapped owner is bound and returned; the active account is used only when
+    the listing shows the CodeSpace under ambient auth. An unreadable binding,
+    a failed or slow listing, or a CodeSpace the listing doesn't show returns
+    None -- no account named, never a guess."""
+    deadline = time.monotonic() + max(0.1, timeout)
+    from . import account_binding
+
+    try:
+        account = account_binding.bound_account_or_raise(
+            name, timeout=max(0.1, deadline - time.monotonic()))
+    except Exception:
+        log.warning("CodeSpace %s account binding is unavailable; not guessing an account", name)
+        return None
+    if account:
+        return account
+    owner = _discover_owner(name, resolve_timeout)
+    if owner is None:
+        log.warning("CodeSpace %s owner is unresolved; not naming a GitHub account", name)
+        return None
+    if owner:
+        return owner
+    return active_account(timeout=max(0.1, min(timeout, resolve_timeout)))
+
+
+def _discover_owner(name: str, timeout: float) -> str | None:
+    """The listed owner of ``name`` (bound on discovery), ``""`` when it is
+    listed under ambient auth, or None when unknown within ``timeout``."""
+    import threading
+
+    result: list[str | None] = [None]
+
+    def run() -> None:
+        try:
+            from . import account_binding
+            from .lifecycle import list_codespaces
+
+            for cs in list_codespaces():
+                if cs.name == name:
+                    if cs.account:
+                        account_binding.bind(name, cs.account, cs.repository)
+                    result[0] = cs.account or ""
+                    return
+        except Exception:
+            log.debug("CodeSpace %s owner discovery failed", name, exc_info=True)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(max(0.1, timeout))
+    return None if worker.is_alive() else result[0]
+
+
 def mapped_accounts() -> tuple[str, ...]:
+    """Keep namespaced account reads fresh across cells and receipt changes."""
+    if worktrees.explicit_context():
+        return _mapped_accounts.__wrapped__()
+    return _mapped_accounts()
+
+
+def _lookup(*args: str) -> subprocess.CompletedProcess[str] | None:
+    if worktrees.explicit_context():
+        return worktrees.run(*args, timeout=10)
+    aw = _agent_worktrees_bin()
+    if not aw:
+        return None
+    try:
+        return subprocess.run(
+            [aw, *args], capture_output=True, text=True, timeout=10,
+            creationflags=_creation_flags(),
+        )
+    except Exception:
+        return None
+
+
+@functools.lru_cache(maxsize=1)
+def _mapped_accounts() -> tuple[str, ...]:
     """Distinct gh logins in the agent-worktrees ``account_map``.
 
     The candidate set for cross-account CodeSpace discovery: to see a CodeSpace
@@ -125,16 +282,8 @@ def mapped_accounts() -> tuple[str, ...]:
     exists (caller then lists under the ambient account only -- today's
     behavior).
     """
-    aw = _agent_worktrees_bin()
-    if not aw:
-        return ()
-    try:
-        result = subprocess.run(
-            [aw, "repos", "account", "list", "--json"],
-            capture_output=True, text=True, timeout=10,
-            creationflags=_creation_flags(),
-        )
-    except Exception:
+    result = _lookup("repos", "account", "list", "--json")
+    if result is None:
         return ()
     if result.returncode != 0:
         return ()
@@ -153,6 +302,6 @@ def mapped_accounts() -> tuple[str, ...]:
 
 def clear_caches() -> None:
     """Drop memoized lookups (test hook / after an auth change)."""
-    account_for_repo.cache_clear()
-    token_for_account.cache_clear()
-    mapped_accounts.cache_clear()
+    _account_for_repo.cache_clear()
+    _token_for_account.cache_clear()
+    _mapped_accounts.cache_clear()

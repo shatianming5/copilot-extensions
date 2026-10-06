@@ -18,6 +18,7 @@ import logging
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .config_sources import SSHConfig
@@ -59,6 +60,24 @@ class CodespaceConfigSource:
     @property
     def codespace_name(self) -> str:
         return self._codespace_name
+
+    @property
+    def gh_env(self) -> dict | None:
+        """The pinned ``gh`` subprocess environment, or ``None`` (ambient).
+
+        Read by :class:`~ssh_manager.manager.ConnectionManager` (duck-typed
+        via ``getattr(config_source, "gh_env", None)``, so a plain
+        ``ConfigSource`` without this property is unaffected) and threaded
+        onto every SSH subprocess for the resulting connection -- not just
+        this source's own ``gh codespace ssh --config`` fetch. Without this,
+        the config fetch could be correctly pinned to the CodeSpace's owning
+        account while the actual connection (and, on Windows, the embedded
+        ProxyCommand's ``gh cs ssh --stdio`` child) silently fell back to
+        the ambient/active ``gh`` account -- a confusing 404 ("getting full
+        codespace details") whenever that ambient account differs from the
+        CodeSpace's owner.
+        """
+        return self._gh_env
 
     def get_ssh_config(self) -> SSHConfig:
         if self._config is not None:
@@ -104,10 +123,23 @@ class CodespaceConfigSource:
                 )
                 continue
             if result.returncode != 0:
-                raise RuntimeError(
-                    f"gh codespace ssh --config failed "
-                    f"(rc={result.returncode}): {result.stderr.strip()}"
+                from .manager import TRANSIENT_SSH_STDERR
+
+                stderr = (result.stderr or "").strip()
+                last_error = RuntimeError(
+                    f"gh codespace ssh --config failed (rc={result.returncode}): {stderr}"
                 )
+                # A dev-tunnel reset is retried; a genuine gh error (unknown
+                # CodeSpace, auth) fails at once.
+                if attempt < len(_FETCH_TIMEOUTS) and TRANSIENT_SSH_STDERR.search(stderr):
+                    log.info(
+                        "gh codespace ssh --config attempt %d/%d hit a transient "
+                        "tunnel error for %s; retrying: %s",
+                        attempt, len(_FETCH_TIMEOUTS), self._codespace_name, stderr[:200],
+                    )
+                    time.sleep(2.0 * attempt)
+                    continue
+                raise last_error
             return result.stdout
         raise last_error  # type: ignore[misc]
 

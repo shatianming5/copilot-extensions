@@ -17,17 +17,86 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('install', 'init', 'stamp', 'provision', 'slot-provision', 'slot-validate', 'slot-complete', 'slot-completion-validate')]
+    [ValidateSet('install', 'init', 'stamp', 'stamp-binstub', 'provision', 'cell-provision', 'cell-repair', 'cell-uninstall', 'cell-attribute-legacy', 'cell-deactivate', 'cell-retire-legacy', 'slot-provision', 'slot-validate', 'slot-complete', 'slot-completion-validate', 'slot-cutover')]
     [string]$Action = 'install',
     [string]$InstallDir,
     [string]$Context,
     [string]$ExpectedMarketplaceId,
     [string]$DurableHome,
+    [string]$OriginPayloadRoot,
+    [string]$ExpectedNamespaceGeneration,
+    [string]$ExpectedInstallGeneration,
+    [string]$ExpectedActivationGeneration,
+    [string]$ExpectedTombstoneActivationGeneration,
+    [switch]$ExpectTombstoneAbsent,
+    [string]$ExpectedCurrentVersion,
+    [switch]$ExpectCurrentAbsent,
+    [string]$ExpectedLastKnownGoodVersion,
+    [switch]$ExpectLastKnownGoodAbsent,
+    [string]$ExpectedPayloadRoot,
+    [string]$ExpectedPayloadVersion,
+    [string]$SnapshotId,
+    [string]$RuntimeVersion,
+    [string]$MaintenanceToken,
     [switch]$Force
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+
+if ($Action -in @('cell-repair', 'cell-uninstall', 'cell-attribute-legacy', 'cell-deactivate', 'cell-retire-legacy')) {
+    $lifecycleArgs = @($Action)
+    $names = @{
+        Context = 'context'; DurableHome = 'durable-home'; ExpectedMarketplaceId = 'expected-marketplace-id'
+        ExpectedNamespaceGeneration = 'expected-namespace-generation'; ExpectedInstallGeneration = 'expected-install-generation'
+        ExpectedActivationGeneration = 'expected-activation-generation'; ExpectedTombstoneActivationGeneration = 'expected-tombstone-activation-generation'
+        ExpectTombstoneAbsent = 'expect-tombstone-absent'
+        ExpectedCurrentVersion = 'expected-current-version'; ExpectCurrentAbsent = 'expect-current-absent'
+        ExpectedLastKnownGoodVersion = 'expected-last-known-good-version'; ExpectLastKnownGoodAbsent = 'expect-last-known-good-absent'
+        ExpectedPayloadRoot = 'expected-payload-root'; ExpectedPayloadVersion = 'expected-payload-version'
+        SnapshotId = 'snapshot-id'; RuntimeVersion = 'runtime-version'; MaintenanceToken = 'maintenance-token'
+    }
+    foreach ($key in $PSBoundParameters.Keys) {
+        if ($key -eq 'Action') { continue }
+        if (-not $names.ContainsKey($key)) { throw "Unsupported cell lifecycle parameter: $key" }
+        $value = $PSBoundParameters[$key]
+        if ($value -is [Management.Automation.SwitchParameter]) {
+            if ($value.IsPresent) { $lifecycleArgs += "--$($names[$key])" }
+        } else {
+            $lifecycleArgs += @("--$($names[$key])", [string]$value)
+        }
+    }
+    $python = Get-Command python -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $python) { throw 'Cell lifecycle management requires an existing Python 3.10+ interpreter' }
+    Set-Location -LiteralPath $env:USERPROFILE
+    [IO.Directory]::SetCurrentDirectory($env:USERPROFILE)
+    & $python.Source -I (Join-Path $PSScriptRoot 'cell_lifecycle.py') @lifecycleArgs
+    exit $LASTEXITCODE
+}
+
+# === install-contract:test-persistent-environment -- keep byte-identical across installers ===
+function Get-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    return [Environment]::GetEnvironmentVariable($Name, $effectiveTarget)
+}
+
+function Set-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [AllowNull()][string]$Value,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    [Environment]::SetEnvironmentVariable($Name, $Value, $effectiveTarget)
+}
+# === end install-contract:test-persistent-environment ===
+$CellMode = $false
 
 if ($InstallDir) {
     $InstallDir = [IO.Path]::GetFullPath($InstallDir)
@@ -42,10 +111,12 @@ $probePayload = if ($env:COPILOT_PLUGIN_STAGED_FROM) {
 }
 $probeHost = (Get-Process -Id $PID).Path
 if ($Action -notin @(
+    'cell-provision',
     'slot-provision',
     'slot-validate',
     'slot-complete',
-    'slot-completion-validate'
+    'slot-completion-validate',
+    'slot-cutover'
 )) {
     $probeLegacyRoot = if ($InstallDir) {
         [IO.Path]::GetFullPath($InstallDir)
@@ -65,10 +136,12 @@ if ($Action -notin @(
 # The dependency-light cell-slot runner does not need the legacy installer's
 # payload self-stage, whose staging root is itself legacy state.
 $cellSlotAction = $Action -in @(
+    'cell-provision',
     'slot-provision',
     'slot-validate',
     'slot-complete',
-    'slot-completion-validate'
+    'slot-completion-validate',
+    'slot-cutover'
 )
 if ($cellSlotAction) {
     Set-Location -LiteralPath $env:USERPROFILE
@@ -77,6 +150,22 @@ if ($cellSlotAction) {
 $cellSlotDirect = $cellSlotAction -and -not $env:COPILOT_PLUGIN_INSTALL_STAGED
 if ($cellSlotDirect) {
     $env:COPILOT_PLUGIN_INSTALL_STAGED = 'cell-slot-action'
+}
+
+# Review finding (round 10): `stamp-binstub` (#3303, full-harness-startup-
+# reliability) exists SPECIFICALLY so bootstrap-check.ps1's synchronous
+# sessionStart-hook call stays sub-second, inside its 15s hook timeout. But
+# the self-stage block right below unconditionally copies the WHOLE plugin
+# payload (Copy-Item -Recurse, no excludes) before ANY action dispatches on
+# a real marketplace install -- exactly the cost this two-stage split
+# exists to avoid backgrounding, silently reintroducing the same
+# command-not-found race on a slow disk/first invocation. Skip self-stage
+# for this action alone, the same way cell-/slot- actions already do:
+# Invoke-StampBinstubOnly only ever reads/writes via $probePayload/
+# $InstallDir (never $PluginDir, since the round-7 fix), so it needs no
+# staged copy to run correctly.
+if ($Action -eq 'stamp-binstub' -and -not $env:COPILOT_PLUGIN_INSTALL_STAGED) {
+    $env:COPILOT_PLUGIN_INSTALL_STAGED = 'stamp-binstub-fast-path'
 }
 
 # === install-contract:v4 self-stage -- keep byte-identical across plugins ===
@@ -252,6 +341,404 @@ function Write-Skip    { param([string]$Msg) Write-Host "  [SKIP] $Msg" -Foregro
 function Write-Fail    { param([string]$Msg) Write-Host "  [FAIL] $Msg" -ForegroundColor Red }
 function Write-Step    { param([string]$Msg) Write-Host "  ...    $Msg" -ForegroundColor DarkGray }
 
+function Get-CellDeployManifest {
+    param(
+        [Parameter(Mandatory)][string]$ManifestPath,
+        [Parameter(Mandatory)][string]$ContextPath,
+        [Parameter(Mandatory)][string]$MarketplaceId
+    )
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        if (
+            (Test-Path -LiteralPath $ManifestPath) -or
+            $null -ne (
+                Get-Item -LiteralPath $ManifestPath -Force -ErrorAction SilentlyContinue
+            )
+        ) {
+            throw 'Cell deploy manifest must be an ordinary file'
+        }
+        return $null
+    }
+    if (
+        (Get-Item -LiteralPath $ManifestPath -Force).Attributes -band
+        [IO.FileAttributes]::ReparsePoint
+    ) {
+        throw 'Cell deploy manifest must be an ordinary file'
+    }
+    try {
+        $manifest = Get-Content -LiteralPath $ManifestPath -Raw |
+            ConvertFrom-Json
+    } catch {
+        throw 'Cell deploy manifest is malformed'
+    }
+    if (
+        (
+            $manifest.schema_version -isnot [int] -and
+            $manifest.schema_version -isnot [long]
+        ) -or
+        [long]$manifest.schema_version -ne 4 -or
+        [string]$manifest.service -cne 'agent-machines' -or
+        [string]$manifest.installation.marketplaceId -cne $MarketplaceId -or
+        [string]$manifest.installation.pluginId -cne 'agent-machines' -or
+        [string]$manifest.installation.context -cne ($ContextPath -replace '\\', '/') -or
+        [string]$manifest.source.repo -cne 'copilot-extensions' -or
+        [string]$manifest.source.plugin -cne 'agent-machines' -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.source.kind) -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.source.path) -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.source.version) -or
+        (
+            $null -ne $manifest.source.commit -and
+            $manifest.source.commit -isnot [string]
+        ) -or
+        (
+            $null -ne $manifest.source.branch -and
+            $manifest.source.branch -isnot [string]
+        ) -or
+        $manifest.source.dirty -isnot [bool] -or
+        [string]$manifest.runtime.kind -cne 'python' -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.runtime.version) -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.runtime.path) -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.runtime.interpreter) -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.runtime.selectedBy.kind) -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.runtime.selectedBy.path) -or
+        [string]$manifest.runtime.selectedBy.version -cne
+            [string]$manifest.runtime.version
+    ) {
+        throw 'Cell deploy manifest identity or source provenance is invalid'
+    }
+    $pluginRoot = Split-Path -Parent $ManifestPath
+    $expectedRuntime = Join-Path (
+        Join-Path $pluginRoot 'versions'
+    ) ([string]$manifest.runtime.version)
+    $expectedInterpreter = if ($env:OS -eq 'Windows_NT') {
+        Join-Path $expectedRuntime 'Scripts\python.exe'
+    } else {
+        Join-Path $expectedRuntime 'bin/python'
+    }
+    $pathComparer = if ($env:OS -eq 'Windows_NT') {
+        [StringComparer]::OrdinalIgnoreCase
+    } else {
+        [StringComparer]::Ordinal
+    }
+    try {
+        $runtimePathValue = [string]$manifest.runtime.path
+        $runtimeInterpreterValue = [string]$manifest.runtime.interpreter
+        if ($env:OS -eq 'Windows_NT') {
+            $runtimePathValue = $runtimePathValue -replace '/', '\'
+            $runtimeInterpreterValue = $runtimeInterpreterValue -replace '/', '\'
+        }
+        $runtimePath = [IO.Path]::GetFullPath(
+            $runtimePathValue
+        )
+        $runtimeInterpreter = [IO.Path]::GetFullPath(
+            $runtimeInterpreterValue
+        )
+    } catch {
+        throw 'Cell deploy manifest runtime paths are invalid'
+    }
+    if (
+        -not $pathComparer.Equals(
+            $runtimePath,
+            [IO.Path]::GetFullPath($expectedRuntime)
+        ) -or
+        -not $pathComparer.Equals(
+            $runtimeInterpreter,
+            [IO.Path]::GetFullPath($expectedInterpreter)
+        )
+    ) {
+        throw 'Cell deploy manifest runtime selection escapes its installation'
+    }
+    return $manifest
+}
+
+function Write-CellDeployManifest {
+    param(
+        [Parameter(Mandatory)][string]$PluginRoot,
+        [Parameter(Mandatory)][string]$SourcePluginDir,
+        [Parameter(Mandatory)][string]$SourceVersion,
+        [Parameter(Mandatory)][string]$RuntimeSlot,
+        [Parameter(Mandatory)][string]$RuntimeVersion,
+        [Parameter(Mandatory)][string]$ContextPath,
+        [Parameter(Mandatory)][string]$MarketplaceId,
+        [switch]$PreserveSource
+    )
+    $selectedSourcePath = $SourcePluginDir
+    $selectedSourceVersion = $SourceVersion
+    $sourcePath = if ($env:COPILOT_PLUGIN_STAGED_FROM) {
+        $env:COPILOT_PLUGIN_STAGED_FROM
+    } else {
+        $SourcePluginDir
+    }
+    $kind = if (($sourcePath -replace '\\', '/') -match '/\.copilot/installed-plugins/') {
+        'marketplace'
+    } else {
+        'local'
+    }
+    $commit = $null
+    $branch = $null
+    $dirty = $false
+    $manifestPath = Join-Path $PluginRoot 'deploy-manifest.json'
+    $existing = if ($PreserveSource) {
+        Get-CellDeployManifest `
+            -ManifestPath $manifestPath `
+            -ContextPath $ContextPath `
+            -MarketplaceId $MarketplaceId
+    } else {
+        $null
+    }
+    if ($null -ne $existing) {
+        $kind = [string]$existing.source.kind
+        $SourcePluginDir = [string]$existing.source.path
+        $SourceVersion = [string]$existing.source.version
+        $commit = $existing.source.commit
+        $branch = $existing.source.branch
+        $dirty = [bool]$existing.source.dirty
+    }
+    elseif ($kind -eq 'local') {
+        $repoRoot = Split-Path -Parent (Split-Path -Parent $SourcePluginDir)
+        try {
+            $commit = git -C $repoRoot rev-parse --short HEAD 2>$null
+            $branch = git -C $repoRoot rev-parse --abbrev-ref HEAD 2>$null
+            $dirty = [bool](git -C $repoRoot status --porcelain 2>$null)
+        } catch {
+            $commit = 'unknown'
+            $branch = 'unknown'
+            $dirty = $false
+        }
+    }
+    $runtimeInterpreter = if ($env:OS -eq 'Windows_NT') {
+        (Join-Path $RuntimeSlot 'Scripts\python.exe') -replace '\\', '/'
+    } else {
+        (Join-Path $RuntimeSlot 'bin/python') -replace '\\', '/'
+    }
+    $selectedKind = if (
+        ($selectedSourcePath -replace '\\', '/') -match
+        '/\.copilot/installed-plugins/'
+    ) {
+        'marketplace'
+    } else {
+        'local'
+    }
+    $manifest = [ordered]@{
+        schema_version = 4
+        service = 'agent-machines'
+        deployed_at = (Get-Date -Format 'o')
+        deployed_by = "$([Environment]::MachineName.ToLowerInvariant())-$(
+            if ($env:OS -eq 'Windows_NT') { 'windows' } else { 'posix' }
+        )"
+        source = [ordered]@{
+            kind = $kind
+            path = ($SourcePluginDir -replace '\\', '/')
+            repo = 'copilot-extensions'
+            plugin = 'agent-machines'
+            version = $SourceVersion
+            commit = $commit
+            branch = $branch
+            dirty = $dirty
+        }
+        runtime = [ordered]@{
+            kind = 'python'
+            version = $RuntimeVersion
+            path = ($RuntimeSlot -replace '\\', '/')
+            interpreter = $runtimeInterpreter
+            selectedBy = [ordered]@{
+                kind = $selectedKind
+                path = ($selectedSourcePath -replace '\\', '/')
+                version = $selectedSourceVersion
+            }
+        }
+        installation = [ordered]@{
+            marketplaceId = $MarketplaceId
+            pluginId = 'agent-machines'
+            context = ($ContextPath -replace '\\', '/')
+        }
+    }
+    $tmp = "$manifestPath.tmp.$PID"
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    [IO.File]::WriteAllText(
+        $tmp,
+        (($manifest | ConvertTo-Json -Depth 6) + [Environment]::NewLine),
+        $utf8
+    )
+    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        $backup = "$manifestPath.backup.$PID"
+        [IO.File]::Replace($tmp, $manifestPath, $backup)
+        Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    } else {
+        [IO.File]::Move($tmp, $manifestPath)
+    }
+}
+
+function Get-CellSnapshotOwnerText {
+    return (
+        @(
+            'copilot-extensions.agent-machines.snapshot-publish:v1'
+            "marketplaceId=$ExpectedMarketplaceId"
+            'pluginId=agent-machines'
+            "snapshotId=$SrcVersion"
+        ) -join "`n"
+    ) + "`n"
+}
+
+function Test-OwnedCellSnapshot {
+    param([Parameter(Mandatory)][string]$Root)
+    $marker = Join-Path $Root '.agent-machines-snapshot-publish-owner'
+    if (
+        -not (Test-Path -LiteralPath $Root -PathType Container) -or
+        ((Get-Item -LiteralPath $Root -Force).Attributes -band
+            [IO.FileAttributes]::ReparsePoint) -or
+        -not (Test-Path -LiteralPath $marker -PathType Leaf) -or
+        ((Get-Item -LiteralPath $marker -Force).Attributes -band
+            [IO.FileAttributes]::ReparsePoint)
+    ) {
+        return $false
+    }
+    $actual = [IO.File]::ReadAllText($marker).Replace("`r`n", "`n").TrimEnd("`n")
+    $expected = (Get-CellSnapshotOwnerText).Replace("`r`n", "`n").TrimEnd("`n")
+    return $actual -ceq $expected
+}
+
+function Remove-OwnedCellSnapshot {
+    param([Parameter(Mandatory)][string]$Root)
+    if (-not (Test-OwnedCellSnapshot -Root $Root)) { return $false }
+    Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction Stop
+    return $true
+}
+
+function Ensure-CellSnapshot {
+    param([Parameter(Mandatory)][string]$SnapshotRoot)
+    $ownerMarkerName = '.agent-machines-snapshot-publish-owner'
+    $ownerMarker = Join-Path $SnapshotRoot $ownerMarkerName
+    $provenance = Join-Path $SnapshotRoot 'snapshot-provenance.json'
+    if (
+        (Test-Path -LiteralPath $SnapshotRoot) -or
+        $null -ne (Get-Item -LiteralPath $SnapshotRoot -Force -ErrorAction SilentlyContinue)
+    ) {
+        if (
+            -not (Test-Path -LiteralPath $provenance) -and
+            $null -eq (Get-Item -LiteralPath $provenance -Force -ErrorAction SilentlyContinue) -and
+            (Test-OwnedCellSnapshot -Root $SnapshotRoot)
+        ) {
+            if (-not (Remove-OwnedCellSnapshot -Root $SnapshotRoot)) {
+                throw 'Cannot recover the owned incomplete cell snapshot'
+            }
+        } else {
+            & $probeHost -NoProfile -ExecutionPolicy Bypass -File $slotRunner `
+                snapshot-validate `
+                -Context $Context `
+                -ExpectedMarketplaceId $ExpectedMarketplaceId `
+                -ExpectedPluginId agent-machines `
+                -SnapshotId $SrcVersion `
+                -DurableHome $DurableHome | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw 'Existing cell snapshot provenance validation failed'
+            }
+            if (Test-OwnedCellSnapshot -Root $SnapshotRoot) {
+                Remove-Item -LiteralPath $ownerMarker -Force -ErrorAction Stop
+            }
+            return
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $snapshotsRoot -PathType Container)) {
+        New-Item -ItemType Directory -Path $snapshotsRoot -Force | Out-Null
+    }
+    $payloadOwnerMarker = Join-Path $PluginDir $ownerMarkerName
+    if (
+        (Test-Path -LiteralPath $payloadOwnerMarker) -or
+        $null -ne (
+            Get-Item -LiteralPath $payloadOwnerMarker -Force -ErrorAction SilentlyContinue
+        )
+    ) {
+        throw 'Payload uses the reserved cell snapshot publication marker'
+    }
+    $stage = Join-Path $snapshotsRoot (
+        ".agent-machines-snapshot-$SrcVersion-$PID-$([Guid]::NewGuid().ToString('N'))"
+    )
+    New-Item -ItemType Directory -Path $stage -ErrorAction Stop | Out-Null
+    $stageMarker = Join-Path $stage $ownerMarkerName
+    $utf8NoBomLocal = New-Object System.Text.UTF8Encoding $false
+    [IO.File]::WriteAllText(
+        $stageMarker,
+        (Get-CellSnapshotOwnerText),
+        $utf8NoBomLocal
+    )
+    try {
+        Get-ChildItem -LiteralPath $PluginDir -Force | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName `
+                -Destination (Join-Path $stage $_.Name) `
+                -Recurse -Force -ErrorAction Stop
+        }
+    } catch {
+        [void](Remove-OwnedCellSnapshot -Root $stage)
+        throw 'Cannot copy the payload into the cell snapshot staging directory'
+    }
+    if (
+        (Test-Path -LiteralPath $SnapshotRoot) -or
+        $null -ne (Get-Item -LiteralPath $SnapshotRoot -Force -ErrorAction SilentlyContinue)
+    ) {
+        [void](Remove-OwnedCellSnapshot -Root $stage)
+        & $probeHost -NoProfile -ExecutionPolicy Bypass -File $slotRunner `
+            snapshot-validate `
+            -Context $Context `
+            -ExpectedMarketplaceId $ExpectedMarketplaceId `
+            -ExpectedPluginId agent-machines `
+            -SnapshotId $SrcVersion `
+            -DurableHome $DurableHome | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Concurrent cell snapshot publication is invalid'
+        }
+        return
+    }
+    try {
+        [IO.Directory]::Move($stage, $SnapshotRoot)
+    } catch {
+        if (Test-Path -LiteralPath $stage -PathType Container) {
+            [void](Remove-OwnedCellSnapshot -Root $stage)
+        }
+        throw 'Cannot atomically publish the staged cell snapshot'
+    }
+
+    # Test-only interruption seam: production never sets this variable.
+    if ($env:AGENT_MACHINES_CELL_SNAPSHOT_FAIL_BEFORE_STAMP) {
+        [void](Remove-OwnedCellSnapshot -Root $SnapshotRoot)
+        throw 'Injected failure before cell snapshot provenance publication'
+    }
+    & $probeHost -NoProfile -ExecutionPolicy Bypass -File $slotRunner `
+        snapshot-stamp `
+        -Context $Context `
+        -ExpectedMarketplaceId $ExpectedMarketplaceId `
+        -ExpectedPluginId agent-machines `
+        -ExpectedNamespaceGeneration $cellNamespaceGeneration `
+        -ExpectedInstallGeneration $cellInstallGeneration `
+        -SnapshotId $SrcVersion `
+        -DurableHome $DurableHome | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        if (
+            -not (Test-Path -LiteralPath $provenance) -and
+            $null -eq (
+                Get-Item -LiteralPath $provenance -Force -ErrorAction SilentlyContinue
+            )
+        ) {
+            [void](Remove-OwnedCellSnapshot -Root $SnapshotRoot)
+        }
+        throw 'Cell snapshot provenance publication failed'
+    }
+    & $probeHost -NoProfile -ExecutionPolicy Bypass -File $slotRunner `
+        snapshot-validate `
+        -Context $Context `
+        -ExpectedMarketplaceId $ExpectedMarketplaceId `
+        -ExpectedPluginId agent-machines `
+        -SnapshotId $SrcVersion `
+        -DurableHome $DurableHome | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Published cell snapshot provenance validation failed'
+    }
+    if (-not (Test-OwnedCellSnapshot -Root $SnapshotRoot)) {
+        throw 'Cell snapshot publication ownership marker changed'
+    }
+    Remove-Item -LiteralPath $ownerMarker -Force -ErrorAction Stop
+}
+
 # -- Paths --------------------------------------------------------------
 
 $PluginDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -261,6 +748,7 @@ if (-not $InstallDir) {
     $InstallDir = Join-Path $env:USERPROFILE '.agent-machines'
 }
 $InstallDir = [IO.Path]::GetFullPath($InstallDir)
+$DefaultInstallDir = [IO.Path]::GetFullPath((Join-Path $env:USERPROFILE '.agent-machines'))
 $VenvDir  = Join-Path $InstallDir '.venv'
 $LocalBin = Join-Path $env:USERPROFILE '.local\bin'
 
@@ -301,6 +789,118 @@ if ($SrcVersion) {
 }
 # === end install-contract:v3 versioned-venv ===
 
+if (
+    $Action -in @('cell-provision', 'slot-cutover') -and
+    -not $env:AGENT_MACHINES_CELL_PROVISION_LOCK_HELD
+) {
+    if ([string]::IsNullOrWhiteSpace($Context)) {
+        Write-Fail "$Action requires -Context; ambient COPILOT_EXTENSIONS_CONTEXT is not authorization"
+        exit 2
+    }
+    if ([string]::IsNullOrWhiteSpace($ExpectedMarketplaceId)) {
+        Write-Fail "$Action requires -ExpectedMarketplaceId"
+        exit 2
+    }
+    $lockRunner = Join-Path $PSScriptRoot 'installation-context\installation-context.ps1'
+    if (-not (Test-Path -LiteralPath $lockRunner -PathType Leaf)) {
+        Write-Fail 'Installation-context runner is unavailable'
+        exit 1
+    }
+    $lockDurableHome = $DurableHome
+    if (-not $lockDurableHome) {
+        $lockDurableHome = $Context
+        1..5 | ForEach-Object {
+            $lockDurableHome = Split-Path -Parent $lockDurableHome
+        }
+    }
+    $lockValidatedJson = @(
+        & $probeHost -NoProfile -ExecutionPolicy Bypass -File $lockRunner `
+            validate `
+            -Context $Context `
+            -ExpectedMarketplaceId $ExpectedMarketplaceId `
+            -ExpectedPluginId agent-machines `
+            -DurableHome $lockDurableHome
+    )
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "$Action context receipt validation failed before provisioning lock"
+        exit 1
+    }
+    try {
+        $lockValidated = ($lockValidatedJson -join "`n") | ConvertFrom-Json
+    } catch {
+        Write-Fail "$Action received malformed context validation before provisioning lock"
+        exit 1
+    }
+    $lockPluginRoot = [string]$lockValidated.pluginRoot
+    if (
+        -not $lockPluginRoot -or
+        -not (Test-Path -LiteralPath $lockPluginRoot -PathType Container)
+    ) {
+        Write-Fail "$Action context receipt did not resolve a plugin root"
+        exit 1
+    }
+    $lockPath = Join-Path $lockPluginRoot '.payload-provision.lock'
+    $lock = $null
+    while (-not $lock) {
+        try {
+            $lock = [IO.File]::Open(
+                $lockPath,
+                [IO.FileMode]::OpenOrCreate,
+                [IO.FileAccess]::ReadWrite,
+                [IO.FileShare]::None
+            )
+        } catch {
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    $lockForward = @()
+    foreach ($key in $PSBoundParameters.Keys) {
+        $value = $PSBoundParameters[$key]
+        if ($value -is [Management.Automation.SwitchParameter]) {
+            if ($value.IsPresent) { $lockForward += "-$key" }
+        } else {
+            $lockForward += "-$key"
+            $lockForward += [string]$value
+        }
+    }
+    $priorLockMarker = $env:AGENT_MACHINES_CELL_PROVISION_LOCK_HELD
+    try {
+        $env:AGENT_MACHINES_CELL_PROVISION_LOCK_HELD = '1'
+        & $probeHost -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @lockForward
+        $lockedStatus = $LASTEXITCODE
+    } finally {
+        if ($null -eq $priorLockMarker) {
+            Remove-Item Env:AGENT_MACHINES_CELL_PROVISION_LOCK_HELD -ErrorAction SilentlyContinue
+        } else {
+            $env:AGENT_MACHINES_CELL_PROVISION_LOCK_HELD = $priorLockMarker
+        }
+        $lock.Dispose()
+    }
+    exit $lockedStatus
+}
+
+# Test-only witness: the parent lock wrapper remains alive while this child
+# represents the complete cell transaction. Concurrent tests assert that these
+# start/end pairs never overlap. Production never sets this variable.
+if (
+    $Action -eq 'cell-provision' -and
+    $env:AGENT_MACHINES_CELL_PROVISION_LOCK_SMOKE
+) {
+    Add-Content -LiteralPath $env:AGENT_MACHINES_CELL_PROVISION_LOCK_SMOKE `
+        -Value "start $PID"
+    $smokeDelay = 1000
+    if ($env:AGENT_MACHINES_CELL_PROVISION_LOCK_SMOKE_MILLISECONDS) {
+        [void][int]::TryParse(
+            $env:AGENT_MACHINES_CELL_PROVISION_LOCK_SMOKE_MILLISECONDS,
+            [ref]$smokeDelay
+        )
+    }
+    Start-Sleep -Milliseconds ([Math]::Max(0, $smokeDelay))
+    Add-Content -LiteralPath $env:AGENT_MACHINES_CELL_PROVISION_LOCK_SMOKE `
+        -Value "end $PID"
+    exit 0
+}
+
 if ($Action -in @(
     'slot-provision',
     'slot-validate',
@@ -340,7 +940,414 @@ if ($Action -in @(
     exit $LASTEXITCODE
 }
 
+if ($Action -eq 'slot-cutover') {
+    if ([string]::IsNullOrWhiteSpace($Context)) {
+        Write-Fail 'slot-cutover requires -Context; ambient COPILOT_EXTENSIONS_CONTEXT is not authorization'
+        exit 2
+    }
+    if ([string]::IsNullOrWhiteSpace($ExpectedMarketplaceId)) {
+        Write-Fail 'slot-cutover requires -ExpectedMarketplaceId'
+        exit 2
+    }
+    if (
+        [string]::IsNullOrWhiteSpace($ExpectedNamespaceGeneration) -or
+        [string]::IsNullOrWhiteSpace($ExpectedInstallGeneration)
+    ) {
+        Write-Fail 'slot-cutover requires expected namespace and install generations'
+        exit 2
+    }
+    if (-not $ExpectCurrentAbsent -and [string]::IsNullOrWhiteSpace($ExpectedCurrentVersion)) {
+        Write-Fail 'slot-cutover requires -ExpectedCurrentVersion or -ExpectCurrentAbsent'
+        exit 2
+    }
+    if ($ExpectCurrentAbsent -and -not [string]::IsNullOrWhiteSpace($ExpectedCurrentVersion)) {
+        Write-Fail 'slot-cutover accepts only one current-version expectation'
+        exit 2
+    }
+    if (-not $SrcVersion) {
+        Write-Fail 'Cannot determine plugin version from pyproject.toml'
+        exit 1
+    }
+    $slotRunner = Join-Path $PSScriptRoot 'installation-context\installation-context.ps1'
+    if (-not (Test-Path -LiteralPath $slotRunner -PathType Leaf)) {
+        Write-Fail 'Installation-context runner is unavailable'
+        exit 1
+    }
+    $slotArgs = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $slotRunner,
+        'slot-cutover',
+        '-Context', $Context,
+        '-ExpectedMarketplaceId', $ExpectedMarketplaceId,
+        '-ExpectedPluginId', 'agent-machines',
+        '-ExpectedPayloadRoot', $PluginDir,
+        '-ExpectedPayloadVersion', $SrcVersion,
+        '-SnapshotId', $SrcVersion,
+        '-RuntimeVersion', $SrcVersion,
+        '-ExpectedNamespaceGeneration', $ExpectedNamespaceGeneration,
+        '-ExpectedInstallGeneration', $ExpectedInstallGeneration
+    )
+    if ($ExpectCurrentAbsent) {
+        $slotArgs += '-ExpectCurrentAbsent'
+    } else {
+        $slotArgs += @('-ExpectedCurrentVersion', $ExpectedCurrentVersion)
+    }
+    if ($DurableHome) { $slotArgs += @('-DurableHome', $DurableHome) }
+    $cutoverDurableHome = $DurableHome
+    if (-not $cutoverDurableHome) {
+        $cutoverDurableHome = $Context
+        1..5 | ForEach-Object {
+            $cutoverDurableHome = Split-Path -Parent $cutoverDurableHome
+        }
+    }
+    $validatedJson = @(
+        & $probeHost -NoProfile -ExecutionPolicy Bypass -File $slotRunner `
+            validate `
+            -Context $Context `
+            -ExpectedMarketplaceId $ExpectedMarketplaceId `
+            -ExpectedPluginId agent-machines `
+            -DurableHome $cutoverDurableHome
+    )
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail 'slot-cutover could not validate manifest paths'
+        exit 1
+    }
+    try {
+        $validated = ($validatedJson -join "`n") | ConvertFrom-Json
+    } catch {
+        Write-Fail 'slot-cutover received malformed manifest paths'
+        exit 1
+    }
+    if (-not $validated.pluginRoot -or -not $validated.versionsRoot) {
+        Write-Fail 'slot-cutover could not resolve manifest paths'
+        exit 1
+    }
+    try {
+        $currentManifest = Get-CellDeployManifest `
+            -ManifestPath (Join-Path ([string]$validated.pluginRoot) 'deploy-manifest.json') `
+            -ContextPath $Context `
+            -MarketplaceId $ExpectedMarketplaceId
+        if ($ExpectCurrentAbsent) {
+            if ($null -ne $currentManifest) {
+                throw 'Cell deploy manifest exists while current runtime is expected absent'
+            }
+        } else {
+            $manifestCurrentMarker = Join-Path (
+                [string]$validated.pluginRoot
+            ) 'current-version'
+            if (
+                $null -eq $currentManifest -or
+                -not (Test-Path -LiteralPath $manifestCurrentMarker -PathType Leaf) -or
+                ((Get-Item -LiteralPath $manifestCurrentMarker -Force).Attributes -band
+                    [IO.FileAttributes]::ReparsePoint) -or
+                ([IO.File]::ReadAllText($manifestCurrentMarker)).Trim() -cne
+                    [string]$currentManifest.runtime.version
+            ) {
+                throw 'Cell deploy manifest does not match the current runtime selection'
+            }
+        }
+    } catch {
+        Write-Fail "Existing cell deploy manifest is invalid; refusing runtime cutover: $_"
+        exit 1
+    }
+    $cutoverJson = @(& $probeHost @slotArgs)
+    $cutoverStatus = $LASTEXITCODE
+    if ($cutoverJson.Count -gt 0) {
+        $cutoverJson | ForEach-Object { Write-Output $_ }
+    }
+    if ($cutoverStatus -ne 0) { exit $cutoverStatus }
+    try {
+        $cutover = ($cutoverJson -join "`n") | ConvertFrom-Json
+    } catch {
+        Write-Fail 'slot-cutover returned an invalid result'
+        exit 1
+    }
+    if ([string]$cutover.status -ceq 'ready') {
+        Write-CellDeployManifest `
+            -PluginRoot ([string]$validated.pluginRoot) `
+            -SourcePluginDir $PluginDir `
+            -SourceVersion $SrcVersion `
+            -RuntimeSlot (Join-Path ([string]$validated.versionsRoot) $SrcVersion) `
+            -RuntimeVersion $SrcVersion `
+            -ContextPath $Context `
+            -MarketplaceId $ExpectedMarketplaceId `
+            -PreserveSource
+    }
+    elseif ([string]$cutover.status -cne 'revalidation-required') {
+        Write-Fail 'slot-cutover returned an invalid result'
+        exit 1
+    }
+    exit 0
+}
+
+if ($Action -eq 'cell-provision') {
+    if ([string]::IsNullOrWhiteSpace($Context)) {
+        Write-Fail 'cell-provision requires -Context; ambient COPILOT_EXTENSIONS_CONTEXT is not authorization'
+        exit 2
+    }
+    if ([string]::IsNullOrWhiteSpace($ExpectedMarketplaceId)) {
+        Write-Fail 'cell-provision requires -ExpectedMarketplaceId'
+        exit 2
+    }
+    if (-not $OriginPayloadRoot) { $OriginPayloadRoot = $PluginDir }
+    try {
+        $OriginPayloadRoot = (Resolve-Path -LiteralPath $OriginPayloadRoot).Path
+    } catch {
+        Write-Fail 'cell-provision origin payload root is unavailable'
+        exit 2
+    }
+    if (-not $DurableHome) {
+        $DurableHome = $Context
+        1..5 | ForEach-Object { $DurableHome = Split-Path -Parent $DurableHome }
+    }
+    $slotRunner = Join-Path $PSScriptRoot 'installation-context\installation-context.ps1'
+    $statusJson = @(
+        & $probeHost -NoProfile -ExecutionPolicy Bypass -File $slotRunner `
+            status `
+            -Context $Context `
+            -PayloadRoot $OriginPayloadRoot `
+            -PluginId agent-machines `
+            -ExpectedMarketplaceId $ExpectedMarketplaceId `
+            -ExpectedPluginId agent-machines `
+            -ExpectedPayloadRoot $OriginPayloadRoot `
+            -DurableHome $DurableHome `
+            -LegacyRoot (Join-Path $env:USERPROFILE '.agent-machines') # marketplace-isolation: allow legacy compatibility root
+    )
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail 'cell-provision could not validate installation activation'
+        exit 1
+    }
+    try { $status = ($statusJson -join "`n") | ConvertFrom-Json } catch {
+        Write-Fail 'cell-provision received malformed installation status'
+        exit 1
+    }
+    if (
+        [string]$status.status -cne 'ready' -or
+        [string]$status.reason -cne 'namespaced-active' -or
+        [string]$status.actualMode -cne 'namespaced'
+    ) {
+        Write-Fail (
+            'cell-provision requires an active validated namespaced installation ' +
+            "(status=$($status.status) reason=$($status.reason))"
+        )
+        exit 3
+    }
+    $validatedJson = @(
+        & $probeHost -NoProfile -ExecutionPolicy Bypass -File $slotRunner `
+            validate `
+            -Context $Context `
+            -ExpectedMarketplaceId $ExpectedMarketplaceId `
+            -ExpectedPluginId agent-machines `
+            -ExpectedPayloadRoot $OriginPayloadRoot `
+            -DurableHome $DurableHome
+    )
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail 'cell-provision context receipt validation failed'
+        exit 1
+    }
+    try { $validated = ($validatedJson -join "`n") | ConvertFrom-Json } catch {
+        Write-Fail 'cell-provision received malformed context validation'
+        exit 1
+    }
+    $pluginRoot = [string]$validated.pluginRoot
+    $snapshotsRoot = [string]$validated.snapshotsRoot
+    $versionsRoot = [string]$validated.versionsRoot
+    $cellNamespaceGeneration = [string]$validated.namespaceGeneration
+    $cellInstallGeneration = [string]$validated.generation
+    if (
+        -not $pluginRoot -or
+        -not $snapshotsRoot -or
+        -not $versionsRoot -or
+        -not $cellNamespaceGeneration -or
+        -not $cellInstallGeneration
+    ) {
+        Write-Fail 'cell-provision context receipt is incomplete'
+        exit 1
+    }
+    $currentMarker = Join-Path (Split-Path -Parent $versionsRoot) 'current-version'
+    if (
+        (Test-Path -LiteralPath $currentMarker -PathType Leaf) -and
+        -not ((Get-Item -LiteralPath $currentMarker -Force).Attributes -band
+            [IO.FileAttributes]::ReparsePoint) -and
+        ([IO.File]::ReadAllText($currentMarker)).Trim() -ceq $SrcVersion
+    ) {
+        $currentCutoverJson = @(
+            & $probeHost -NoProfile -ExecutionPolicy Bypass -File $slotRunner `
+                slot-cutover `
+                -Context $Context `
+                -ExpectedMarketplaceId $ExpectedMarketplaceId `
+                -ExpectedPluginId agent-machines `
+                -ExpectedPayloadRoot $OriginPayloadRoot `
+                -ExpectedPayloadVersion $SrcVersion `
+                -SnapshotId $SrcVersion `
+                -RuntimeVersion $SrcVersion `
+                -ExpectedNamespaceGeneration $cellNamespaceGeneration `
+                -ExpectedInstallGeneration $cellInstallGeneration `
+                -ExpectedCurrentVersion $SrcVersion `
+                -DurableHome $DurableHome
+        )
+        $currentCutoverStatus = $LASTEXITCODE
+        try {
+            $currentCutover = ($currentCutoverJson -join "`n") | ConvertFrom-Json
+        } catch {
+            $currentCutover = $null
+        }
+        if (
+            $currentCutoverStatus -ne 0 -or
+            $null -eq $currentCutover -or
+            [string]$currentCutover.status -cne 'ready'
+        ) {
+            Write-Fail "selected cell runtime $SrcVersion failed immutable cutover validation"
+            exit 1
+        }
+        Write-CellDeployManifest `
+            -PluginRoot $pluginRoot `
+            -SourcePluginDir $OriginPayloadRoot `
+            -SourceVersion $SrcVersion `
+            -RuntimeSlot (Join-Path $versionsRoot $SrcVersion) `
+            -RuntimeVersion $SrcVersion `
+            -ContextPath $Context `
+            -MarketplaceId $ExpectedMarketplaceId
+        Write-Ok "Runtime version $SrcVersion is already selected in installation cell"
+        exit 0
+    }
+    $snapshotRoot = Join-Path $snapshotsRoot $SrcVersion
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($PluginDir, $snapshotRoot)) {
+        try {
+            Ensure-CellSnapshot -SnapshotRoot $snapshotRoot
+        } catch {
+            Write-Fail "cell snapshot publication failed: $_"
+            exit 1
+        }
+        $snapshotInstaller = Join-Path $snapshotRoot 'scripts\init.ps1'
+        if (-not (Test-Path -LiteralPath $snapshotInstaller -PathType Leaf)) {
+            Write-Fail 'cell snapshot installer is unavailable'
+            exit 1
+        }
+        $env:COPILOT_PLUGIN_STAGED_FROM = $OriginPayloadRoot
+        & $probeHost -NoProfile -ExecutionPolicy Bypass -File $snapshotInstaller `
+            -Action cell-provision `
+            -Context $Context `
+            -ExpectedMarketplaceId $ExpectedMarketplaceId `
+            -DurableHome $DurableHome `
+            -OriginPayloadRoot $OriginPayloadRoot
+        exit $LASTEXITCODE
+    }
+    $CellMode = $true
+    $InstallDir = $pluginRoot
+    $VenvDir = Join-Path $versionsRoot $SrcVersion
+    if ($env:OS -eq 'Windows_NT') {
+        $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
+    } else {
+        $VenvPython = Join-Path $VenvDir 'bin/python'
+    }
+    $LinkDir = $VenvDir
+    $LinkPython = $VenvPython
+    $env:COPILOT_PLUGIN_STAGED_FROM = $OriginPayloadRoot
+    & $probeHost -NoProfile -ExecutionPolicy Bypass -File $slotRunner `
+        slot-provision `
+        -Context $Context `
+        -ExpectedMarketplaceId $ExpectedMarketplaceId `
+        -ExpectedPluginId agent-machines `
+        -ExpectedPayloadRoot $OriginPayloadRoot `
+        -ExpectedPayloadVersion $SrcVersion `
+        -SnapshotId $SrcVersion `
+        -RuntimeVersion $SrcVersion `
+        -DurableHome $DurableHome | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail 'cell runtime-slot ownership provisioning failed'
+        exit 1
+    }
+}
+
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+
+# Publish a file's content atomically: write to a same-directory temp file,
+# then replace/rename into place. Review finding (round 8): `Move-Item -Force`
+# does NOT guarantee an atomic replace on every supported PowerShell runtime
+# -- notably Windows PowerShell 5.1, whose -Force implementation can delete
+# the existing destination before moving the new one in, leaving a brief
+# window with NO destination file at all (worse than a torn write for a
+# concurrent reader). [System.IO.File]::Replace() IS an atomic NTFS replace;
+# use it whenever a destination already exists, and fall back to a plain
+# Move-Item (itself an atomic rename when the destination is absent) for a
+# genuinely first-ever publish.
+#
+# NOTE: passing $null (or "") for Replace()'s destinationBackupFileName
+# throws "The path is empty" on this codebase's actual runtimes (confirmed
+# on both Windows PowerShell 5.1 and pwsh) despite that being the documented
+# no-backup form -- give it a real, own-PID-suffixed backup path instead and
+# discard it immediately after; Replace() itself is still the atomic step.
+#
+# NOTE: Replace()/rename can also throw a transient IOException ("used by
+# another process") if any reader briefly has the destination open without
+# FILE_SHARE_DELETE at that exact instant (a real, if narrow, Windows
+# sharing-violation window -- e.g. a concurrent read of the very marker or
+# binstub this publishes). Retry briefly rather than treating that as fatal.
+function Publish-FileAtomically {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory)]$Encoding
+    )
+    # File.Replace requires fully-qualified paths -- a relative path throws
+    # "The path is not of a legal form."
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $tmp = "$fullPath.tmp-$PID"
+    [System.IO.File]::WriteAllText($tmp, $Content, $Encoding)
+    for ($attempt = 1; $true; $attempt++) {
+        try {
+            if (Test-Path -LiteralPath $fullPath) {
+                $backup = "$fullPath.bak-$PID"
+                [System.IO.File]::Replace($tmp, $fullPath, $backup)
+                Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+            } else {
+                # Review finding (round 9): this is also called from UNLOCKED
+                # call sites (e.g. the regular, non-stamp install path), so
+                # two racing first-time installs can both pass the Test-Path
+                # check above before either publishes. Omit -Force here: a
+                # plain Move-Item throws if a concurrent writer created the
+                # destination in that gap, instead of silently -Force
+                # deleting+recreating the very no-file window this whole
+                # helper exists to prevent. Caught below and retried, which
+                # re-checks Test-Path and takes the safe Replace() branch.
+                Move-Item -LiteralPath $tmp -Destination $fullPath
+            }
+            return
+        } catch {
+            if ($attempt -ge 20) { throw }
+            Start-Sleep -Milliseconds 15
+        }
+    }
+}
+
+# Same-directory atomic copy of an on-disk source file (the resolver files),
+# reusing the exact same Replace-or-Move guarantee (and retry) as
+# Publish-FileAtomically.
+function Copy-FileAtomically {
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$DestPath
+    )
+    $fullDest = [IO.Path]::GetFullPath($DestPath)
+    $tmp = "$fullDest.tmp-$PID"
+    Copy-Item -LiteralPath $SourcePath -Destination $tmp -Force
+    for ($attempt = 1; $true; $attempt++) {
+        try {
+            if (Test-Path -LiteralPath $fullDest) {
+                $backup = "$fullDest.bak-$PID"
+                [System.IO.File]::Replace($tmp, $fullDest, $backup)
+                Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+            } else {
+                # Same non-overwriting-move rationale as Publish-FileAtomically.
+                Move-Item -LiteralPath $tmp -Destination $fullDest
+            }
+            return
+        } catch {
+            if ($attempt -ge 20) { throw }
+            Start-Sleep -Milliseconds 15
+        }
+    }
+}
 
 # === install-contract:v3 strip-trampolines -- keep byte-identical across plugins ===
 function Remove-ConsoleTrampolines {
@@ -690,7 +1697,7 @@ function Invoke-VersionedSlotClean {
        --allow-existing` over a corpse (#935); the current/active slot is never
        tossed (link-name derived from $LinkDir so the guard works per plugin).
        No-op in legacy mode. #>
-    if (-not $VersionedRuntime) { return }
+    if (-not $VersionedRuntime -or $CellMode) { return }
     $vr = Join-Path $PSScriptRoot 'versioned_runtime.py'
     $py = Get-BootstrapPython
     if (-not $py) { return }
@@ -762,7 +1769,11 @@ function Deploy-SelfProvisioningBinstub {
     if (-not (Test-Path $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
     foreach ($r in @('resolve-runtime.ps1', 'resolve-runtime.sh')) {
         $rSrc = Join-Path $PSScriptRoot $r
-        if (Test-Path $rSrc) { Copy-Item $rSrc (Join-Path $binDir $r) -Force }
+        # Review finding (round 8): a plain Copy-Item -Force truncates the
+        # destination before copying, so a binstub sourcing this resolver
+        # concurrently could read a partial/empty script even though the
+        # binstub itself is atomically replaced. Publish atomically instead.
+        if (Test-Path $rSrc) { Copy-FileAtomically -SourcePath $rSrc -DestPath (Join-Path $binDir $r) }
     }
     if ($env:OS -ne 'Windows_NT') {
         $stubPath = Join-Path $LocalBin 'agent-machines'
@@ -778,7 +1789,10 @@ _i="`$(cat "`$_root/payload-dir" 2>/dev/null)/scripts/init.sh"
 if [ -n "`$_i" ] && [ -f "`$_i" ]; then echo "[agent-machines] runtime not provisioned; run: bash \"`$_i\" provision" >&2; else echo "[agent-machines] runtime not provisioned and the installer was not found; re-enable the plugin, then retry." >&2; fi
 exit 1
 "@
-        [System.IO.File]::WriteAllText($stubPath, $stubContent, $utf8NoBom)
+        # Publish atomically -- a reader mid-write must never observe a
+        # truncated/torn binstub, nor a brief no-file window on a replace
+        # (see Publish-FileAtomically's own rationale above).
+        Publish-FileAtomically -Path $stubPath -Content $stubContent -Encoding $utf8NoBom
         Write-Ok "Binstub: $stubPath"
         return
     }
@@ -834,8 +1848,139 @@ if %ERRORLEVEL%==0 set "_PSX=pwsh"
 for /f "usebackq delims=" %%p in (`%_PSX% -NoProfile -ExecutionPolicy Bypass -Command "$env:AGENT_RT_ROOT='%_ROOT%'; . '%_ROOT%\bin\resolve-runtime.ps1'; if ($AgentRtPy) { $AgentRtPy }" 2^>nul`) do set "_PY=%%p"
 goto :eof
 '@
-    [System.IO.File]::WriteAllText($cmdPath, $cmdContent, $utf8NoBom)
+    Publish-FileAtomically -Path $cmdPath -Content $cmdContent -Encoding $utf8NoBom
     Write-Ok "Binstub: $cmdPath (self-provisioning)"
+}
+
+# Serializes every stamp-family action (this fast binstub-only path AND the
+# full Invoke-Stamp below) against concurrent invocations -- e.g. two fresh
+# sessions launching their sessionStart hook at nearly the same instant --
+# under ONE named mutex keyed by the install dir, so they can never observe
+# or produce a half-written binstub/marker set.
+function Enter-StampLock {
+    $stampHash = [BitConverter]::ToString(
+        [Security.Cryptography.SHA256]::Create().ComputeHash(
+            [Text.Encoding]::UTF8.GetBytes($InstallDir.ToLowerInvariant())
+        )
+    ).Replace('-', '').Substring(0, 24)
+    $stampMutexName = if ($env:OS -eq 'Windows_NT') {
+        "Local\CopilotExtensions.AgentMachines.Stamp.$stampHash"
+    } else {
+        "CopilotExtensions.AgentMachines.Stamp.$stampHash"
+    }
+    $mutex = New-Object Threading.Mutex($false, $stampMutexName)
+    $held = $false
+    try {
+        $held = $mutex.WaitOne([TimeSpan]::FromSeconds(20))
+    } catch [Threading.AbandonedMutexException] {
+        $held = $true
+    }
+    if (-not $held) { $mutex.Dispose(); throw 'Timed out waiting for the agent-machines stamp lock.' }
+    return $mutex
+}
+
+# Fast entry point (#3303, full-harness-startup-reliability Round 2): deploy
+# ONLY the self-provisioning binstub -- no snapshot copy -- so a sessionStart
+# hook can call this SYNCHRONOUSLY (sub-second: just a couple of small file
+# writes) to guarantee the launcher is on PATH before the hook returns, then
+# background the slower full `stamp` (below) for the snapshot copy. Without
+# this split, backgrounding the whole `stamp` action left a window where a
+# session's very first turn could invoke `agent-machines` before the
+# background job had created it (command-not-found race).
+#
+# KNOWN GAP, deliberately deferred (review round 8): payload-dir and
+# payload-origin are each published atomically on their own (see
+# Publish-FileAtomically), but the PAIR is not published as one atomic unit --
+# a reader could still observe one file's NEW value alongside the other's OLD
+# value mid-publish (e.g. a stale dir with a fresh origin). Fixing this
+# correctly means either merging both values into one atomically-published
+# marker file or having the .cmd/.sh readers take the stamp lock too; both
+# markers are read by several OTHER call sites across this plugin
+# (invoke-payload-runtime.ps1/.sh, installation-context, receipts, the CLI),
+# so redesigning the on-disk format is real, valuable future work but out of
+# this short-PR-cycle round's scope -- logged in the effort's Round Ledger.
+function Invoke-StampBinstubOnly {
+    # Review finding (round 10): Deploy-SelfProvisioningBinstub generates a
+    # launcher whose self-provisioning path hardcodes
+    # `%USERPROFILE%\.agent-machines` (and `$HOME/.agent-machines` for its
+    # POSIX stub) as the marker root -- it does NOT follow a custom
+    # -InstallDir. A custom -InstallDir would therefore publish markers the
+    # generated launcher can never read, producing a broken (127-on-first-
+    # use) binstub. bootstrap-check.ps1's real sessionStart-hook call never
+    # passes -InstallDir for this action, so reject it explicitly here
+    # rather than silently deploying a launcher that cannot work.
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($InstallDir, $DefaultInstallDir)) {
+        Write-Fail "stamp-binstub only supports the default install dir ($DefaultInstallDir) -- the generated launcher hardcodes that root and cannot read markers written to '$InstallDir'."
+        exit 1
+    }
+    # Review finding (round 11): this used to take the SAME Enter-StampLock
+    # mutex Invoke-Stamp holds across its whole (multi-second) snapshot copy.
+    # A concurrent slow `stamp` already holding it made this "fast" path wait
+    # behind it for up to 20 seconds -- reintroducing the very hook-timeout
+    # race this two-stage split exists to prevent. Deliberately NOT taking
+    # any lock here: every operation below (Publish-FileAtomically's marker
+    # writes, Deploy-SelfProvisioningBinstub's stub/resolver writes) was
+    # already hardened in round 9 to be safe under UNLOCKED concurrent
+    # callers -- non-overwriting Move-Item with retry-through-Replace() on a
+    # destination race -- so this fast path no longer needs mutual exclusion
+    # to be correct, only to be genuinely fast.
+    foreach ($dir in @($InstallDir, $LocalBin)) {
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    }
+    # Review finding: without a usable payload-dir marker, the generated
+    # binstub's self-provisioning path (":_prov" in the .cmd) reads an
+    # empty %_ROOT%\payload-dir, finds no installer, and exits 127 --
+    # even though the binstub itself now exists. Point the marker at a
+    # durable payload root as an immediate, correct fallback (see the
+    # round-7 comment below for exactly which one and why); the
+    # background `stamp` overwrites both markers with the real snapshot
+    # path once its copy completes, same as before.
+    $payloadDirMarker = Join-Path $InstallDir 'payload-dir'
+    $payloadOriginMarker = Join-Path $InstallDir 'payload-origin'
+    # Publish atomically (Replace-or-Move via Publish-FileAtomically): a
+    # generated binstub reads payload-dir OUTSIDE any lock, so a direct
+    # truncating write or a non-atomic Move-Item here could hand a
+    # concurrent reader an empty/partial marker and a spurious exit 127.
+    # Review finding (round 7): the ORIGINAL fix pointed the marker at
+    # $PluginDir -- on a marketplace install this is the per-invocation
+    # `.install-stage/<ts>-<pid>/...` copy the install-contract self-stage
+    # above creates, NOT a durable location. Once this process exits, a
+    # LATER invocation's own self-stage reaper (see the dead-stage-dir
+    # cleanup a few hundred lines above) is free to delete this exact
+    # stage dir, leaving payload-dir pointing at a missing scripts\init.ps1
+    # and a spurious exit 127. $probePayload is the durable original
+    # payload root (the marketplace's own installed-plugins singleton, or
+    # the value COPILOT_PLUGIN_STAGED_FROM was already re-exec'd with) --
+    # it is never a throwaway per-invocation directory, so use it here
+    # instead; the background `stamp` still overwrites both markers with
+    # the even-more-durable snapshot path once its copy completes.
+    #
+    # Review finding (round 12): without ANY lock, this fast path can now
+    # run concurrently with -- or even AFTER -- a full `stamp` that already
+    # published a real `snapshots/<version>` marker, unconditionally
+    # overwriting `payload-dir` back to this fallback and silently
+    # regressing an already-valid, more-durable snapshot marker to the
+    # weaker one. Make the payload-dir write CREATE-ONLY: skip it entirely
+    # if the marker already resolves to something with a real
+    # scripts\init.ps1 (whether from a concurrent/prior full `stamp` or a
+    # concurrent/prior stamp-binstub), so this fast path can never regress
+    # an already-valid marker -- it only ever fills in a genuinely missing
+    # or broken one. payload-origin needs no such guard: both functions
+    # always write it the identical value ($probePayload).
+    $payloadDirAlreadyValid = $false
+    if (Test-Path -LiteralPath $payloadDirMarker -PathType Leaf) {
+        try {
+            $existingPayloadDir = (Get-Content -LiteralPath $payloadDirMarker -Raw -ErrorAction Stop).Trim()
+            if ($existingPayloadDir -and (Test-Path -LiteralPath (Join-Path $existingPayloadDir 'scripts\init.ps1') -PathType Leaf)) {
+                $payloadDirAlreadyValid = $true
+            }
+        } catch {}
+    }
+    if (-not $payloadDirAlreadyValid) {
+        Publish-FileAtomically -Path $payloadDirMarker -Content $probePayload -Encoding $utf8NoBom
+    }
+    Publish-FileAtomically -Path $payloadOriginMarker -Content $probePayload -Encoding $utf8NoBom
+    Deploy-SelfProvisioningBinstub
 }
 
 function Invoke-Stamp {
@@ -847,53 +1992,81 @@ function Invoke-Stamp {
     Write-Host ''
     Write-Host '=== agent-machines stamp (defer runtime to first use) ===' -ForegroundColor Cyan
     if (-not $SrcVersion) { Write-Fail 'Cannot stamp: no version in pyproject.toml'; exit 1 }
-    $stampHash = [BitConverter]::ToString(
-        [Security.Cryptography.SHA256]::Create().ComputeHash(
-            [Text.Encoding]::UTF8.GetBytes($InstallDir.ToLowerInvariant())
-        )
-    ).Replace('-', '').Substring(0, 24)
-    $stampMutexName = if ($env:OS -eq 'Windows_NT') {
-        "Local\CopilotExtensions.AgentMachines.Stamp.$stampHash"
-    } else {
-        "CopilotExtensions.AgentMachines.Stamp.$stampHash"
+    # Same round-10 finding as Invoke-StampBinstubOnly above: the generated
+    # launcher's marker root is hardcoded, not -InstallDir-aware.
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($InstallDir, $DefaultInstallDir)) {
+        Write-Fail "stamp only supports the default install dir ($DefaultInstallDir) -- the generated launcher hardcodes that root and cannot read markers written to '$InstallDir'."
+        exit 1
     }
-    $stampMutex = New-Object Threading.Mutex($false, $stampMutexName)
-    $stampLockHeld = $false
+    $stampMutex = Enter-StampLock
     try {
-        try {
-            $stampLockHeld = $stampMutex.WaitOne([TimeSpan]::FromSeconds(20))
-        } catch [Threading.AbandonedMutexException] {
-            $stampLockHeld = $true
-        }
-        if (-not $stampLockHeld) { throw 'Timed out waiting for the agent-machines stamp lock.' }
     foreach ($dir in @($InstallDir, $LocalBin)) {
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     }
     $payloadDirMarker = Join-Path $InstallDir 'payload-dir'
     $payloadOriginMarker = Join-Path $InstallDir 'payload-origin'
-    Remove-Item $payloadDirMarker, $payloadOriginMarker -Force -ErrorAction SilentlyContinue
+    # Review finding (round 7): this used to Remove-Item both markers HERE,
+    # before the (slow, several-second) snapshot copy below even starts --
+    # deleting the marker `stamp-binstub` already published and leaving NONE
+    # at all for the entire copy duration. A first-turn invocation racing that
+    # window reads a MISSING payload-dir (not merely a stale one) and 127s --
+    # exactly the regression this whole two-stage split exists to prevent, and
+    # strictly worse than a torn write. Do NOT pre-clear: the atomic
+    # Move-Item -Force further below replaces each marker in place only once
+    # the new snapshot is actually ready, so the previous usable marker (or,
+    # on a genuinely first-ever stamp, the absence of one) is left untouched
+    # until then.
     $snapDir = Join-Path (Join-Path $InstallDir 'snapshots') $SrcVersion
-    $snapTmp = "$snapDir.tmp-$PID"
-    if (Test-Path $snapTmp) { Remove-Item $snapTmp -Recurse -Force -ErrorAction SilentlyContinue }
-    New-Item -ItemType Directory -Path $snapTmp -Force | Out-Null
-    $exclude = @('.git', '__pycache__', '.venv', 'node_modules', 'build', 'dist', '.pytest_cache', '.mypy_cache', 'tests')
-    Get-ChildItem -LiteralPath $PluginDir -Force | Where-Object { $exclude -notcontains $_.Name } | ForEach-Object {
-        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $snapTmp $_.Name) -Recurse -Force
+    # Review finding (round 9): re-stamping the SAME version (e.g. two
+    # first-install sessionStart hooks, one after another) used to
+    # unconditionally Remove-Item the existing $snapDir before copying a
+    # fresh one -- deleting the snapshot payload-dir STILL advertises as
+    # live, well before the marker is switched to anything else, since a
+    # reader (the binstub) never takes this mutex. A first-turn invocation
+    # racing that window reads a missing scripts\init.ps1 and 127s. Since a
+    # re-stamp of the identical $SrcVersion would copy byte-identical
+    # content anyway, skip the whole remove+recopy dance when a snapshot for
+    # this exact version already looks valid -- the fast, safe, idempotent
+    # path -- and only build a fresh one when it's genuinely missing/broken.
+    $snapAlreadyValid = Test-Path (Join-Path (Join-Path $snapDir 'scripts') 'init.ps1')
+    if (-not $snapAlreadyValid) {
+        $snapTmp = "$snapDir.tmp-$PID"
+        if (Test-Path $snapTmp) { Remove-Item $snapTmp -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -ItemType Directory -Path $snapTmp -Force | Out-Null
+        $exclude = @('.git', '__pycache__', '.venv', 'node_modules', 'build', 'dist', '.pytest_cache', '.mypy_cache', 'tests')
+        Get-ChildItem -LiteralPath $PluginDir -Force | Where-Object { $exclude -notcontains $_.Name } | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $snapTmp $_.Name) -Recurse -Force
+        }
+        # A concurrent re-stamp of the SAME version (two first-install hooks
+        # racing, neither serialized against the other's Test-Path check
+        # above) could have already built $snapDir by now. Rename the
+        # now-redundant old copy aside (a directory rename is metadata-only,
+        # far faster than the delete this replaces) rather than deleting the
+        # live, currently-advertised snapshot outright, then move the fresh
+        # copy into place and reap the aside-renamed old one.
+        if (Test-Path $snapDir) {
+            $snapStale = "$snapDir.stale-$PID"
+            Rename-Item -LiteralPath $snapDir -NewName (Split-Path -Leaf $snapStale) -ErrorAction SilentlyContinue
+        }
+        Move-Item -LiteralPath $snapTmp -Destination $snapDir -Force
+        Get-ChildItem -LiteralPath (Split-Path -Parent $snapDir) -Directory -Filter "$(Split-Path -Leaf $snapDir).stale-*" -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
     }
-    if (Test-Path $snapDir) { Remove-Item $snapDir -Recurse -Force -ErrorAction SilentlyContinue }
-    Move-Item -LiteralPath $snapTmp -Destination $snapDir -Force
-    [System.IO.File]::WriteAllText($payloadOriginMarker, $probePayload, $utf8NoBom)
-    [System.IO.File]::WriteAllText($payloadDirMarker, $snapDir, $utf8NoBom)
+    # Same atomic-publish rationale as Invoke-StampBinstubOnly above: a
+    # generated binstub reads payload-dir outside this stamp mutex.
+    Publish-FileAtomically -Path $payloadOriginMarker -Content $probePayload -Encoding $utf8NoBom
+    Publish-FileAtomically -Path $payloadDirMarker -Content $snapDir -Encoding $utf8NoBom
     [System.IO.File]::WriteAllText((Join-Path $InstallDir 'stamped-version'), $SrcVersion, $utf8NoBom)
     Write-Ok "Snapshot: $snapDir"
     Deploy-SelfProvisioningBinstub
     Write-Ok 'Stamped: agent-machines binstub on PATH; runtime provisions on first use.'
     } finally {
-        if ($stampLockHeld) { [void]$stampMutex.ReleaseMutex() }
+        [void]$stampMutex.ReleaseMutex()
         $stampMutex.Dispose()
     }
 }
 
+if ($Action -eq 'stamp-binstub') { Invoke-StampBinstubOnly; exit 0 }
 if ($Action -eq 'stamp') { Invoke-Stamp; exit 0 }
 
 # -- Preflight checks --------------------------------------------------
@@ -943,30 +2116,35 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
         $ErrorActionPreference = 'Continue'
         & winget install --id astral-sh.uv --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
         $ErrorActionPreference = $prevEAP
-        $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+        $env:PATH = (Get-CopilotPersistentEnvironmentVariable -Name 'PATH' -Target 'Machine') + ';' + (Get-CopilotPersistentEnvironmentVariable -Name 'PATH' -Target 'User')
         if (Get-Command uv -ErrorAction SilentlyContinue) { Write-Ok 'uv installed' }
     }
 }
 
 # -- 1. Create directories ---------------------------------------------
 
-foreach ($dir in @($InstallDir, $LocalBin)) {
+foreach ($dir in @($InstallDir)) {
     if (-not (Test-Path $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
+}
+if (-not $CellMode -and -not (Test-Path $LocalBin)) {
+    New-Item -ItemType Directory -Path $LocalBin -Force | Out-Null
 }
 Write-Ok "Directories: $InstallDir"
 
 # -- 1b. Deploy the session-start hook (version-gated runtime reconcile) --
 # hooks.json runs ~/.agent-machines/bin/bootstrap-check.ps1 at session start; it
 # re-runs this installer only when the deployed version drifts from the payload.
-$BinHookDir = Join-Path $InstallDir 'bin'
-if (-not (Test-Path $BinHookDir)) { New-Item -ItemType Directory -Path $BinHookDir -Force | Out-Null }
-foreach ($h in @('bootstrap-check.ps1', 'bootstrap-check.sh')) {
-    $hSrc = Join-Path $PSScriptRoot $h
-    if (Test-Path $hSrc) { Copy-Item $hSrc (Join-Path $BinHookDir $h) -Force }
+if (-not $CellMode) {
+    $BinHookDir = Join-Path $InstallDir 'bin'
+    if (-not (Test-Path $BinHookDir)) { New-Item -ItemType Directory -Path $BinHookDir -Force | Out-Null }
+    foreach ($h in @('bootstrap-check.ps1', 'bootstrap-check.sh', 'bootstrap-killswitch-guard.ps1', 'bootstrap-killswitch-guard.sh')) {
+        $hSrc = Join-Path $PSScriptRoot $h
+        if (Test-Path $hSrc) { Copy-Item $hSrc (Join-Path $BinHookDir $h) -Force }
+    }
+    Write-Ok "Session-start hook: $BinHookDir\bootstrap-check.ps1"
 }
-Write-Ok "Session-start hook: $BinHookDir\bootstrap-check.ps1"
 
 # -- 2. Create venv ----------------------------------------------------
 
@@ -1015,6 +2193,41 @@ if ($Force -or -not (Test-Path $VenvPython)) {
     Write-Skip 'Venv already exists'
 }
 
+# -- 2b. Preinstall uv-editable canonical libs (non-uv fallback) -------
+# `agent-dropin-registry`/`agent-plugin-resolve`/`agent-plugin-activation`/
+# `agent-procutil` are `uv`-editable canonical references (vendor-pointer-
+# generalization effort, Phase 1: no local copy in a dev checkout at all).
+# When `uv` is unavailable, the fallback below uses bare `python -m pip
+# install`, which does NOT honor `[tool.uv.sources]` -- without a
+# preinstall, that path cannot resolve these dependencies and may instead
+# try (and fail) to resolve same-named index packages. `plugin-activation`
+# is installed LAST since it imports `dropin_registry`/`plugin_resolve` at
+# module load time.
+$haveUv = [bool](Get-Command uv -ErrorAction SilentlyContinue)
+foreach ($lib in @(
+    @{ Dir = 'dropin-registry'; Pkg = 'agent-dropin-registry' },
+    @{ Dir = 'plugin-resolve'; Pkg = 'agent-plugin-resolve' },
+    @{ Dir = 'agent-procutil'; Pkg = 'agent-procutil' },
+    @{ Dir = 'plugin-activation'; Pkg = 'agent-plugin-activation' }
+)) {
+    $libDir = Join-Path $PluginDir "libs\$($lib.Dir)"
+    if (-not (Test-Path (Join-Path $libDir 'pyproject.toml'))) {
+        $libDir = Join-Path $PluginDir "..\..\libs\$($lib.Dir)"
+    }
+    if (Test-Path (Join-Path $libDir 'pyproject.toml')) {
+        if ($haveUv) {
+            & uv pip install --python $VenvPython --reinstall-package $lib.Pkg "$libDir" --quiet 2>&1 | Out-Null
+        } else {
+            & $VenvPython -m pip install --quiet "$libDir" 2>&1 | Out-Null
+        }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail "$($lib.Dir) library install failed"
+            exit 1
+        }
+        Write-Ok "$($lib.Dir) installed"
+    }
+}
+
 # -- 3. Install the package into the venv (uv pip install) -------------
 
 $prevEAP = $ErrorActionPreference
@@ -1022,9 +2235,19 @@ $ErrorActionPreference = 'Continue'
 # Pre-strip any locked console-script trampoline so uv can overwrite it (os err 5).
 Remove-ConsoleTrampolines -VenvDir $VenvDir
 if (Get-Command uv -ErrorAction SilentlyContinue) {
-    & uv pip install --python $VenvPython "$PluginDir" --quiet 2>&1 | Out-Null
+    if ($CellMode) {
+        & uv pip install --python $VenvPython "$PluginDir" --quiet 2>&1 |
+            ForEach-Object { Write-Host $_ }
+    } else {
+        & uv pip install --python $VenvPython "$PluginDir" --quiet 2>&1 | Out-Null
+    }
 } else {
-    & $VenvPython -m pip install --quiet "$PluginDir" 2>&1 | Out-Null
+    if ($CellMode) {
+        & $VenvPython -m pip install --quiet "$PluginDir" 2>&1 |
+            ForEach-Object { Write-Host $_ }
+    } else {
+        & $VenvPython -m pip install --quiet "$PluginDir" 2>&1 | Out-Null
+    }
 }
 $pkgResult = $LASTEXITCODE
 $ErrorActionPreference = $prevEAP
@@ -1044,8 +2267,6 @@ if ($VersionedRuntime) {
     # python (stdlib-only helper); a CLI plugin has no daemon holding the link, so
     # the swap is immediately safe.
     $VrScript = Join-Path $PSScriptRoot 'versioned_runtime.py'
-    # Capture the currently-active version so gc can retain it as previous-good.
-    $PrevVersion = ("" + (& $VenvPython $VrScript --root $InstallDir --link-name '.venv' current 2>$null)).Trim()
     # Health-gate: never swap the stable `.venv` link onto a slot whose package
     # does not import -- a broken build must not become the live runtime.
     & $VenvPython -c 'import agent_machines' 2>$null
@@ -1054,34 +2275,89 @@ if ($VersionedRuntime) {
         exit 1
     }
     Invoke-VersionedMarkComplete
-    & $VenvPython $VrScript --root $InstallDir --link-name '.venv' activate $SrcVersion --no-link 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Fail "Failed to activate versioned venv (.venv -> versions/$SrcVersion)"
-        exit 1
-    }
-    Write-Ok "Runtime version $SrcVersion active (.venv -> versions/$SrcVersion)"
-    # GC superseded version slots, keeping the current + previous-good and any
-    # slot with a live process (--protect-pids), so old versions do not pile up.
-    if ($PrevVersion) {
-        & $VenvPython $VrScript --root $InstallDir --link-name '.venv' gc --protect-pids --keep $PrevVersion 2>&1 |
-            ForEach-Object { Write-Host "  ...    gc: $_" -ForegroundColor DarkGray }
+    if ($CellMode) {
+        & $probeHost -NoProfile -ExecutionPolicy Bypass -File $slotRunner `
+            slot-complete `
+            -Context $Context `
+            -ExpectedMarketplaceId $ExpectedMarketplaceId `
+            -ExpectedPluginId agent-machines `
+            -ExpectedPayloadRoot $OriginPayloadRoot `
+            -ExpectedPayloadVersion $SrcVersion `
+            -SnapshotId $SrcVersion `
+            -RuntimeVersion $SrcVersion `
+            -DurableHome $DurableHome | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail 'Cell runtime completion publication failed'
+            exit 1
+        }
+        $currentMarker = Join-Path $InstallDir 'current-version'
+        $cutoverArgs = @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $slotRunner,
+            'slot-cutover',
+            '-Context', $Context,
+            '-ExpectedMarketplaceId', $ExpectedMarketplaceId,
+            '-ExpectedPluginId', 'agent-machines',
+            '-ExpectedPayloadRoot', $OriginPayloadRoot,
+            '-ExpectedPayloadVersion', $SrcVersion,
+            '-SnapshotId', $SrcVersion,
+            '-RuntimeVersion', $SrcVersion,
+            '-ExpectedNamespaceGeneration', $cellNamespaceGeneration,
+            '-ExpectedInstallGeneration', $cellInstallGeneration,
+            '-DurableHome', $DurableHome
+        )
+        if (
+            (Test-Path -LiteralPath $currentMarker -PathType Leaf) -and
+            -not ((Get-Item -LiteralPath $currentMarker -Force).Attributes -band
+                [IO.FileAttributes]::ReparsePoint)
+        ) {
+            $cutoverArgs += @(
+                '-ExpectedCurrentVersion',
+                ([IO.File]::ReadAllText($currentMarker)).Trim()
+            )
+        } else {
+            $cutoverArgs += '-ExpectCurrentAbsent'
+        }
+        & $probeHost @cutoverArgs | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail 'Cell runtime-slot cutover failed'
+            exit 1
+        }
+        Write-Ok "Runtime version $SrcVersion selected in installation cell"
     } else {
-        & $VenvPython $VrScript --root $InstallDir --link-name '.venv' gc --protect-pids 2>&1 |
-            ForEach-Object { Write-Host "  ...    gc: $_" -ForegroundColor DarkGray }
+        # Capture the currently-active version so gc can retain it as previous-good.
+        $PrevVersion = ("" + (& $VenvPython $VrScript --root $InstallDir --link-name '.venv' current 2>$null)).Trim()
+        & $VenvPython $VrScript --root $InstallDir --link-name '.venv' activate $SrcVersion --no-link 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail "Failed to activate versioned venv (.venv -> versions/$SrcVersion)"
+            exit 1
+        }
+        Write-Ok "Runtime version $SrcVersion active (.venv -> versions/$SrcVersion)"
+        # GC superseded version slots, keeping the current + previous-good and any
+        # slot with a live process (--protect-pids), so old versions do not pile up.
+        if ($PrevVersion) {
+            & $VenvPython $VrScript --root $InstallDir --link-name '.venv' gc --protect-pids --keep $PrevVersion 2>&1 |
+                ForEach-Object { Write-Host "  ...    gc: $_" -ForegroundColor DarkGray }
+        } else {
+            & $VenvPython $VrScript --root $InstallDir --link-name '.venv' gc --protect-pids 2>&1 |
+                ForEach-Object { Write-Host "  ...    gc: $_" -ForegroundColor DarkGray }
+        }
     }
 }
 # === end install-contract:v3 versioned-venv activate ===
 
 # -- 4. Deploy binstub -------------------------------------------------
 
-Deploy-SelfProvisioningBinstub
+if (-not $CellMode) {
+    Deploy-SelfProvisioningBinstub
+}
 
 # -- 5. Write deploy manifest ------------------------------------------
 
 # Unified schema_version 3 manifest (install-contract): records the source
 # footprint (marketplace vs local) so deploys are auditable like the siblings.
 $manifestPath = Join-Path $InstallDir 'deploy-manifest.json'
-$kind = Get-SourceKind -PluginPath $PluginDir
+$sourcePluginDir = if ($CellMode) { $OriginPayloadRoot } else { $PluginDir }
+$kind = Get-SourceKind -PluginPath $sourcePluginDir
 $ver = '0.0.0'
 $pyproj = Join-Path $PluginDir 'pyproject.toml'
 if (Test-Path $pyproj) {
@@ -1090,32 +2366,44 @@ if (Test-Path $pyproj) {
 }
 $commit = $null; $branch = $null; $dirty = $false
 if ($kind -eq 'local') {
-    $repoRoot = Split-Path -Parent (Split-Path -Parent $PluginDir)
+    $repoRoot = Split-Path -Parent (Split-Path -Parent $sourcePluginDir)
     $git = Get-GitInfo -Path $repoRoot
     $commit = $git.commit; $branch = $git.branch; $dirty = $git.dirty
 }
-$manifest = [ordered]@{
-    schema_version = 3
-    service        = 'agent-machines'
-    deployed_at    = (Get-Date -Format 'o')
-    deployed_by    = "$($env:COMPUTERNAME.ToLower())-windows"
-    source         = [ordered]@{
-        kind    = $kind
-        path    = ($PluginDir -replace '\\', '/')
-        repo    = 'copilot-extensions'
-        plugin  = 'agent-machines'
-        version = $ver
-        commit  = $commit
-        branch  = $branch
-        dirty   = $dirty
+if ($CellMode) {
+    Write-CellDeployManifest `
+        -PluginRoot $InstallDir `
+        -SourcePluginDir $sourcePluginDir `
+        -SourceVersion $ver `
+        -RuntimeSlot $VenvDir `
+        -RuntimeVersion $SrcVersion `
+        -ContextPath $Context `
+        -MarketplaceId $ExpectedMarketplaceId
+    Write-Ok "Deploy manifest written (source: $kind)"
+} else {
+    $manifest = [ordered]@{
+        schema_version = 3
+        service        = 'agent-machines'
+        deployed_at    = (Get-Date -Format 'o')
+        deployed_by    = "$($env:COMPUTERNAME.ToLower())-windows"
+        source         = [ordered]@{
+            kind    = $kind
+            path    = ($sourcePluginDir -replace '\\', '/')
+            repo    = 'copilot-extensions'
+            plugin  = 'agent-machines'
+            version = $ver
+            commit  = $commit
+            branch  = $branch
+            dirty   = $dirty
+        }
+        venv           = ($LinkDir -replace '\\', '/')
+        runtime        = 'python'
     }
-    venv           = ($LinkDir -replace '\\', '/')
-    runtime        = 'python'
+    $tmp = "$manifestPath.tmp"
+    $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path $tmp -Encoding UTF8
+    Move-Item -Force -Path $tmp -Destination $manifestPath
+    Write-Ok "Deploy manifest written (source: $kind)"
 }
-$tmp = "$manifestPath.tmp"
-$manifest | ConvertTo-Json -Depth 4 | Set-Content -Path $tmp -Encoding UTF8
-Move-Item -Force -Path $tmp -Destination $manifestPath
-Write-Ok "Deploy manifest written (source: $kind)"
 
 # -- 6. Verify ----------------------------------------------------------
 
@@ -1141,9 +2429,9 @@ $pathDirs = $env:PATH -split ';'
 if ($pathDirs -contains $LocalBin) {
     Write-Ok "PATH: $LocalBin is on PATH"
 } else {
-    $currentUserPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+    $currentUserPath = Get-CopilotPersistentEnvironmentVariable -Name 'PATH' -Target 'User'
     if (-not ($currentUserPath -split ';' | Where-Object { $_ -eq $LocalBin })) {
-        [System.Environment]::SetEnvironmentVariable('PATH', "$LocalBin;$currentUserPath", 'User')
+        Set-CopilotPersistentEnvironmentVariable -Name 'PATH' -Value "$LocalBin;$currentUserPath" -Target 'User'
         $env:PATH = "$LocalBin;$env:PATH"
         Write-Ok "PATH: Added $LocalBin to User PATH"
     }
@@ -1151,5 +2439,9 @@ if ($pathDirs -contains $LocalBin) {
 
 Write-Host ''
 Write-Host '=== agent-machines init complete ===' -ForegroundColor Cyan
-Write-Host '  Try: agent-machines version' -ForegroundColor DarkGray
+if ($CellMode) {
+    Write-Host '  Runtime is ready through the owning payload command.' -ForegroundColor DarkGray
+} else {
+    Write-Host '  Try: agent-machines version' -ForegroundColor DarkGray
+}
 exit 0

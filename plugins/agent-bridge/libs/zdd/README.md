@@ -24,8 +24,20 @@ long-lived process you must update, which re-introduces the very downtime it was
 meant to remove (and demands socket hand-off between proxy generations --
 hardest on Windows). A file has no process to update.
 
+A **watchdog counterpart**, `reap_stale_active`, complements the client-side
+self-heal above for a process that polls on its own schedule rather than only
+reading the table per-request: it retires an `active` that names a dead pid/port
+(promoting a live `previous`, or clearing the table), and separately heals a
+table that has **no `active` claim at all** -- the shape a clean shutdown
+(`clear_if_owner`) leaves behind when no successor ever publishes itself, which
+otherwise strands every consumer indefinitely. Both promotions require the
+candidate `previous` to have both a live listener *and* a positive recorded
+pid confirmed alive, reducing (though not eliminating -- pid reuse races
+remain a residual, narrower risk) the chance an unrelated service that later
+reuses the same port gets mistaken for the real daemon.
+
 Key API: `Endpoint`, `read_active_endpoint`, `publish_active`,
-`clear_if_owner`, `routing_table_path`.
+`clear_if_owner`, `reap_stale_active`, `routing_table_path`.
 
 ### `zdd.cutover` -- the cutover orchestrator
 
@@ -34,6 +46,17 @@ a fresh port, health-gate it, flip the routing table, drain the old daemon, then
 retire it. The sequence is reversible up to an explicit commit point, with
 rollback and commit-forward (if the old endpoint is unreachable, it commits to
 the healthy new one rather than stranding clients).
+
+### `zdd.diagnostics` -- daemon-health audit + repair
+
+`audit_daemon_health()` and `apply_daemon_health()` let a consumer surface the
+field-proven abnormal cutover states uniformly through its own doctor/health
+command: duplicate resident daemons, stranded old survivors from an aborted
+cutover, never-promoted abandoned passives, and stale superseded generations
+that should already have self-retired. Destructive repairs are gated on the
+same two rules everywhere: first confirm a validated live owner from the
+consumer's lock/routing state, then terminate only through an identity-bound
+OS handle tied to the target process's start time.
 
 ## Consumer contract
 
@@ -60,10 +83,18 @@ follow the table -- short-lived clients re-read `active.json` directly; a servic
 behind a fixed external port (e.g. reached through a reverse tunnel) instead has
 a hop watch the table and re-point at the live port.
 
+## Vendoring
+
+On `dev`, consumers may reference `libs/zdd` canonically via
+`[tool.uv.sources]` with `editable = true` instead of carrying a local
+`plugins/<plugin>/libs/zdd` copy. Promotion materializes that canonical
+reference back into a real local `libs/zdd/` tree for shipped `main` payloads,
+so development stays DRY without weakening the self-contained release payload.
+
 ## Development
 
 ```bash
-pip install -e ".[dev]"
+uv pip install -e ".[dev]"
 pytest
 ruff check .
 ```

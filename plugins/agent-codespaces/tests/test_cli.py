@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import types
 from unittest.mock import patch
 
 import pytest
@@ -92,6 +93,18 @@ class TestCLI:
             rc = main(["list", "--json"])
         assert rc == 0
 
+    def test_sync_sessions_balks_when_gh_missing(self, capsys):
+        """sync-sessions is a gh-dependent verb (status lookup + SSH connect) --
+        it must balk the same as every other CodeSpace-operating verb rather
+        than fall through to an opaque runtime failure."""
+        with patch("agent_codespaces.__main__._gh_binary_available",
+                   return_value=False):
+            rc = main(["sync-sessions", "cs-a"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "gh" in err.lower()
+        assert "sync-sessions" in err
+
     def test_local_verb_does_not_balk_without_gh(self, capsys):
         """A local/report-only verb (version) must keep working with no gh."""
         with patch("agent_codespaces.__main__._gh_binary_available",
@@ -110,10 +123,28 @@ class TestCLI:
         )
         rc = main(["config", "migrate"])
         assert rc == 0
-        canonical = repo / ".agent-codespaces" / "config.yaml"
+        canonical = repo / ".copilot-extensions" / "agent-codespaces" / "config.yaml"
         assert canonical.exists()
         assert "machine_type: big" in canonical.read_text()
         assert not (repo / "codespaces.yaml").exists()
+        assert "Migrated" in capsys.readouterr().out
+
+    def test_config_migrate_relocates_legacy_directory_config(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        repo = tmp_path / "repo"
+        legacy = repo / ".agent-codespaces"
+        legacy.mkdir(parents=True)
+        (legacy / "config.yaml").write_text("defaults:\n  machine_type: big\n")
+        monkeypatch.setattr(
+            "agent_codespaces.__main__._resolve_repo_root", lambda: repo
+        )
+        rc = main(["config", "migrate"])
+        assert rc == 0
+        canonical = repo / ".copilot-extensions" / "agent-codespaces" / "config.yaml"
+        assert canonical.exists()
+        assert "machine_type: big" in canonical.read_text()
+        assert not (legacy / "config.yaml").exists()
         assert "Migrated" in capsys.readouterr().out
 
     def test_config_migrate_noop_without_legacy(
@@ -137,14 +168,33 @@ class TestCLI:
             runtime / "adopted-repos.yaml",
         )
         monkeypatch.setattr("agent_codespaces.__main__.RUNTIME_DIR", runtime)
-        monkeypatch.setattr(
-            "agent_codespaces.__main__.ADOPTED_REPOS_FILE",
-            runtime / "adopted-repos.yaml",
-        )
         rc = main(["status"])
         assert rc == 0
         out = capsys.readouterr().out
         assert "agent-codespaces status" in out
+
+    def test_install_path_config_migrate_does_not_touch_repo_config(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        runtime = tmp_path / ".agent-codespaces"
+        runtime.mkdir()
+        manifest = runtime / "adopted-repos.yaml"
+        manifest.write_text("# adopted repos\nrepos:\n  - path: /tmp/legacy\n", encoding="utf-8")
+        repo = tmp_path / "repo"
+        repo_config = repo / ".copilot-extensions" / "agent-codespaces" / "config.yaml"
+        repo_config.parent.mkdir(parents=True)
+        repo_config.write_text("defaults:\n  machine_type: repo-owned\n", encoding="utf-8")
+
+        monkeypatch.setattr("agent_codespaces.config.RUNTIME_DIR", runtime)
+        monkeypatch.setattr("agent_codespaces.config.ADOPTED_REPOS_FILE", manifest)
+
+        rc = main(["config-migrate"])
+
+        assert rc == 0
+        assert "config-migrate:" in capsys.readouterr().out
+        assert repo_config.read_text(encoding="utf-8") == (
+            "defaults:\n  machine_type: repo-owned\n"
+        )
 
 
 class TestDeleteSyncHook:
@@ -174,6 +224,66 @@ class TestDeleteSyncHook:
         assert rc == 0
         delete.assert_called_once_with("cs-1", force=True)
         assert "Pre-delete session recovery failed" in capsys.readouterr().err
+
+
+class TestLockWidening:
+    """session-rescue-parity Phase 1's recorded lock-widening decision: a
+    destructive caller must hold the SSH target lock across its FULL
+    sync-then-act sequence, not only the sync sub-step -- these tests
+    exercise the real ``ssh_manager.TargetLock`` file (not a synthetic
+    stand-in) through the actual `_cmd_delete` dispatch path, proving the
+    lock file is still present (held) when the destructive action itself
+    runs, and gone (released) only once the whole command completes."""
+
+    def test_delete_holds_lock_across_sync_and_delete(self, capsys):
+        seen = {}
+
+        def fake_sync(name, verbose=False, lock=None):
+            assert lock is not None, "sync_codespace_sessions must receive the widened lock"
+            seen["path"] = lock.path
+            assert lock.path.exists(), "the lock must already be held during sync"
+            return {"ok": True, "session_count": 1, "detail": "ok"}
+
+        def fake_delete(name, force=False):
+            assert seen["path"].exists(), (
+                "the lock must still be held during delete_codespace -- "
+                "it must not be released between sync and the destructive action"
+            )
+
+        with patch("agent_codespaces.__main__.sync_codespace_sessions", side_effect=fake_sync), \
+             patch("agent_codespaces.__main__.delete_codespace", side_effect=fake_delete):
+            rc = main(["delete", "cs-lockcheck"])
+
+        assert rc == 0
+        assert not seen["path"].exists(), "the lock must be released once the command completes"
+
+    def test_delete_balks_when_lock_is_busy(self, capsys):
+        import os
+
+        import ssh_manager
+
+        # TargetLock is re-entrant for the SAME pid, so a same-process
+        # acquire() would not exercise the busy path at all -- write the
+        # lock file directly with a genuinely different, live pid (this
+        # process's own parent), exactly as a real second process would.
+        holder_lock = ssh_manager.TargetLock("cs-busycheck", op="codespace-lifecycle")
+        holder_lock.path.parent.mkdir(parents=True, exist_ok=True)
+        holder_lock.path.write_text(
+            f'{{"pid": {os.getppid()}, "op": "codespace-lifecycle", '
+            f'"target": "cs-busycheck", "started_at": 0.0, "host": ""}}',
+            encoding="utf-8",
+        )
+        try:
+            with patch("agent_codespaces.__main__.sync_codespace_sessions") as sync, \
+                 patch("agent_codespaces.__main__.delete_codespace") as delete:
+                rc = main(["delete", "cs-busycheck"])
+        finally:
+            holder_lock.path.unlink(missing_ok=True)
+
+        assert rc == 1
+        sync.assert_not_called()
+        delete.assert_not_called()
+        assert "BUSY" in capsys.readouterr().err
 
 
 class TestFinalize:
@@ -608,6 +718,30 @@ class TestNamespaceSeams:
         assert rc == 0
         assert _json.loads(capsys.readouterr().out)[0]["name"] == "cs-a"
 
+    def test_namespace_list_tolerates_query_failure(self, capsys):
+        """A CodeSpace-listing failure (missing `codespace` OAuth scope, no
+        `gh` auth, network unreachable, etc.) must never be a hard
+        requirement to resolve any agent -- CodeSpaces are optional, and a
+        host that doesn't use them has no reason to carry that scope.
+        Confirmed live, Lambda-Core, 2026-10-04: an uncaught failure here
+        propagated as a non-zero exit from this CLI, which agent-bridge's
+        own namespace-resolver consumer surfaced as 404s for completely
+        unrelated, purely-static agents -- starving the Intelligence
+        Dampener reviewer-dispatch pool for hours. This must report zero
+        CodeSpaces (exit 0) instead of crashing."""
+        import json as _json
+
+        async def _list_specs(self):
+            raise RuntimeError(
+                "gh codespace list failed: HTTP 403: Must have admin rights "
+                "to Repository."
+            )
+
+        with patch("agent_codespaces.resolver.CodespaceResolver.list_specs", _list_specs):
+            rc = main(["namespace-list"])
+        assert rc == 0
+        assert _json.loads(capsys.readouterr().out) == []
+
     def test_namespace_resolve_json_and_argv(self, capsys):
         import json as _json
         seen = {}
@@ -658,6 +792,60 @@ class TestNamespaceSeams:
 
         with patch("agent_codespaces.resolver.CodespaceResolver.ensure_ready", _fail):
             assert main(["namespace-ensure-ready", "cs-a"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_namespace_ensure_ready_persists_discovered_account(self, monkeypatch):
+        from agent_codespaces.resolver import CodespaceResolver
+
+        bound = []
+        monkeypatch.setattr(
+            "agent_codespaces.resolver.list_codespaces",
+            lambda: [
+                types.SimpleNamespace(
+                    name="cs-a",
+                    display_name="cs-a",
+                    repository="example-org/example",
+                    branch="main",
+                    state="Available",
+                    account="alice",
+                )
+            ],
+        )
+        monkeypatch.setattr(
+            "agent_codespaces.account_binding.bind",
+            lambda name, account, repo="": bound.append((name, account, repo)),
+        )
+
+        await CodespaceResolver().ensure_ready("cs-a")
+
+        assert bound == [("cs-a", "alice", "example-org/example")]
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("already_bound, raises", [(None, True), ("alice", False)])
+    async def test_namespace_ensure_ready_surfaces_a_lost_account_binding(
+        self, monkeypatch, already_bound, raises,
+    ):
+        from agent_codespaces.resolver import CodespaceResolver
+
+        monkeypatch.setattr(
+            "agent_codespaces.resolver.list_codespaces",
+            lambda: [types.SimpleNamespace(
+                name="cs-a", display_name="cs-a", repository="example-org/example",
+                branch="main", state="Available", account="alice")],
+        )
+
+        def _bind(*_a, **_k):
+            raise RuntimeError("Could not acquire account binding lock")
+
+        monkeypatch.setattr("agent_codespaces.account_binding.bind", _bind)
+        monkeypatch.setattr("agent_codespaces.account_binding.bound_account",
+                            lambda name: already_bound)
+        if raises:
+            with pytest.raises(RuntimeError, match="alice.*couldn't be recorded"):
+                await CodespaceResolver().ensure_ready("cs-a")
+        else:
+            await CodespaceResolver().ensure_ready("cs-a")
 
 
 class TestRecycleSafetyGate:

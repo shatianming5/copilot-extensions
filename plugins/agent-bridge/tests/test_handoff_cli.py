@@ -1,4 +1,4 @@
-"""Tests for `agent-bridge handoff` verb (session-or-worktree resolution).
+"""Tests for `agent-bridge handoff*` verbs.
 
 `handoff <target>` first tries an owned ACP session; on 404 it treats the
 target as a worktree handle and hands off that worktree's current session.
@@ -8,6 +8,7 @@ Mirrors the resume verb's resolution order.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import pytest
 
@@ -16,11 +17,24 @@ from agent_bridge.client import BridgeClientError
 
 
 class _FakeClient:
-    def __init__(self, *, session_handoff=None, worktree_handoff=None):
+    def __init__(
+        self,
+        *,
+        session_handoff=None,
+        worktree_handoff=None,
+        handoff_request=None,
+        agents=None,
+    ):
         self._session_handoff = session_handoff
         self._worktree_handoff = worktree_handoff
+        self._handoff_request = handoff_request
+        self._agents = list(agents or [])
         self.session_calls: list[tuple[str, str | None, bool]] = []
         self.worktree_calls: list[tuple[str, str | None, bool]] = []
+        self.request_calls: list[tuple[str, str, str, str | None]] = []
+
+    def list_agents(self):
+        return list(self._agents)
 
     def handoff_session(self, session_id, *, reason=None, seed=True):
         self.session_calls.append((session_id, reason, seed))
@@ -30,13 +44,45 @@ class _FakeClient:
 
     def handoff_worktree(self, worktree_id, *, reason=None, seed=True):
         self.worktree_calls.append((worktree_id, reason, seed))
-        if isinstance(self._worktree_handoff, Exception):
-            raise self._worktree_handoff
-        return self._worktree_handoff
+        result = (
+            self._worktree_handoff(worktree_id, reason=reason, seed=seed)
+            if callable(self._worktree_handoff)
+            else self._worktree_handoff
+        )
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def handoff_request(
+        self, worktree_id, *, session_id, seed_text, handoff_token=None
+    ):
+        self.request_calls.append(
+            (worktree_id, session_id, seed_text, handoff_token)
+        )
+        if isinstance(self._handoff_request, Exception):
+            raise self._handoff_request
+        return self._handoff_request
 
 
 def _args(target, *, reason=None, no_seed=False):
     return argparse.Namespace(session_id=target, reason=reason, no_seed=no_seed)
+
+
+def _request_args(
+    *,
+    worktree_id="wt-1",
+    session_id="sess-1",
+    handoff_token="task:1",
+    seed="/consume-handoff task:1",
+    json=False,
+):
+    return argparse.Namespace(
+        worktree_id=worktree_id,
+        session_id=session_id,
+        handoff_token=handoff_token,
+        seed=seed,
+        json=json,
+    )
 
 
 def _patch_client(monkeypatch, client):
@@ -98,3 +144,416 @@ def test_worktree_not_found_reports_and_exits(monkeypatch, capsys):
         m._cmd_handoff(_args("ghost"))
     err = capsys.readouterr().err
     assert "neither a bridge-owned session nor a worktree" in err
+
+
+def test_singleton_repo_handoff_falls_back_to_anchor_key(monkeypatch, capsys):
+    client = _FakeClient(
+        session_handoff=BridgeClientError(404, "not an owned session"),
+        worktree_handoff=lambda worktree_id, **_: (
+            BridgeClientError(404, "no session for worktree")
+            if worktree_id != "llama.cpp@anchor"
+            else {"status": "idle", "session_id": "succ-anchor-2"}
+        ),
+        agents=[{"name": "llama.cpp@Atlas-Core", "project": "llama.cpp"}],
+    )
+    _patch_client(monkeypatch, client)
+    monkeypatch.setattr(
+        "agent_bridge.resume_handoff_cli.find_singleton_repo",
+        lambda target: (
+            type("Repo", (), {"name": "llama.cpp", "path": "/repo/llama.cpp"})()
+            if target == "llama.cpp"
+            else None
+        ),
+    )
+
+    m._cmd_handoff(_args("llama.cpp@Atlas-Core"))
+
+    assert client.worktree_calls == [
+        ("llama.cpp@Atlas-Core", None, True),
+        ("llama.cpp@anchor", None, True),
+    ]
+    assert "Repo llama.cpp handed off -> successor succ-anchor-2 (idle)" in (
+        capsys.readouterr().out
+    )
+
+
+def test_handoff_request_json_round_trips(monkeypatch, capsys):
+    client = _FakeClient(
+        handoff_request={
+            "session_id": "succ-2",
+            "acp_session_id": "acp-succ-2",
+            "status": "idle",
+        }
+    )
+    _patch_client(monkeypatch, client)
+
+    m._cmd_handoff_request(_request_args(json=True))
+
+    assert client.request_calls == [
+        ("wt-1", "sess-1", "/consume-handoff task:1", "task:1")
+    ]
+    payload = m.json.loads(capsys.readouterr().out)
+    assert payload == {
+        "accepted": True,
+        "worktree_id": "wt-1",
+        "requested_session_id": "sess-1",
+        "handoff_token": "task:1",
+        "successor_session_id": "succ-2",
+        "successor_acp_session_id": "acp-succ-2",
+        "successor_status": "idle",
+    }
+
+
+def test_handoff_request_no_session_degrades_cleanly(monkeypatch, capsys):
+    client = _FakeClient(
+        handoff_request=BridgeClientError(
+            404, "No current session found for worktree wt-1 matching sess-1"
+        )
+    )
+    _patch_client(monkeypatch, client)
+
+    with pytest.raises(SystemExit):
+        m._cmd_handoff_request(_request_args())
+    err = capsys.readouterr().err
+    assert "No current session for worktree wt-1 matches sess-1" in err
+
+
+class _FakeCompletedProcess:
+    def __init__(self, stdout: str, returncode: int = 0, stderr: str = ""):
+        self.stdout = stdout
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+def _check_args(*, worktree_id=None, all=False, execute=False, json=False):
+    return argparse.Namespace(worktree_id=worktree_id, all=all, execute=execute, json=json)
+
+
+class TestHandoffCheck:
+    """``agent-bridge handoff-check`` -- a thin passthrough to
+    ``agent-worktrees handoffs-check``, the ground-layer owner of the mux/pane
+    primitives a CLI-hosted worktree's cutover depends on."""
+
+    @pytest.fixture(autouse=True)
+    def _no_explicit_context(self, monkeypatch):
+        """These tests exercise the legacy ambient-PATH fallback; the
+        same-cell path is covered separately below."""
+        monkeypatch.delenv("COPILOT_EXTENSIONS_CONTEXT", raising=False)
+
+    def test_no_agent_worktrees_on_path_fails_fast(self, monkeypatch):
+        monkeypatch.delenv("COPILOT_EXTENSIONS_CONTEXT", raising=False)
+        monkeypatch.setattr(m.shutil, "which", lambda name: None)
+        with pytest.raises(SystemExit):
+            m._cmd_handoff_check(_check_args(worktree_id="wt-1"))
+
+    def test_passes_worktree_id_and_execute_through(self, monkeypatch):
+        monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/agent-worktrees")
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return _FakeCompletedProcess(
+                m.json.dumps({"checked": 1, "found": 0, "executed": True, "findings": []})
+            )
+
+        monkeypatch.setattr(m.subprocess, "run", fake_run)
+
+        with pytest.raises(SystemExit) as exc_info:
+            m._cmd_handoff_check(_check_args(worktree_id="wt-1", execute=True, json=True))
+
+        assert exc_info.value.code == 0
+        assert captured["argv"] == [
+            "/usr/bin/agent-worktrees", "handoffs-check", "--json",
+            "--worktree-id", "wt-1", "--execute",
+        ]
+
+    def test_passes_all_flag_through(self, monkeypatch):
+        monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/agent-worktrees")
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return _FakeCompletedProcess(
+                m.json.dumps({"checked": 3, "found": 0, "executed": False, "findings": []})
+            )
+
+        monkeypatch.setattr(m.subprocess, "run", fake_run)
+
+        with pytest.raises(SystemExit):
+            m._cmd_handoff_check(_check_args(all=True, json=True))
+
+        assert captured["argv"] == [
+            "/usr/bin/agent-worktrees", "handoffs-check", "--json", "--all",
+        ]
+
+    def test_strips_leaked_agent_rt_root_from_child_env(self, monkeypatch):
+        """Regression: agent-bridge's own runtime-gate.sh exports
+        AGENT_RT_ROOT (pointing at THIS plugin's runtime root) before
+        dispatching into agent_bridge's python. Left alone, that export
+        leaks into this subprocess and hijacks agent-worktrees' own
+        resolve-runtime.sh (which honors the same variable name),
+        silently resolving to agent-bridge's python instead of
+        agent-worktrees' -- a "No module named agent_worktrees" failure
+        that looks identical to agent-worktrees itself being broken."""
+        monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/agent-worktrees")
+        monkeypatch.setenv("AGENT_RT_ROOT", "/home/example/.agent-bridge")
+        monkeypatch.setenv("AGENT_RT_PY", "/home/example/.agent-bridge/versions/x/bin/python")
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return _FakeCompletedProcess(
+                m.json.dumps({"checked": 1, "found": 0, "executed": False, "findings": []})
+            )
+
+        monkeypatch.setattr(m.subprocess, "run", fake_run)
+
+        with pytest.raises(SystemExit):
+            m._cmd_handoff_check(_check_args(all=True, json=True))
+
+        assert captured["env"] is not None
+        assert "AGENT_RT_ROOT" not in captured["env"]
+        assert "AGENT_RT_PY" not in captured["env"]
+
+    def test_json_output_round_trips_the_underlying_payload(self, monkeypatch, capsys):
+        monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/agent-worktrees")
+        payload = {
+            "checked": 1, "found": 1, "executed": True,
+            "findings": [{
+                "worktree_id": "wt-1", "predecessor_session_id": "old-sess",
+                "retire_pane": "%9", "executed": True, "retired": True,
+            }],
+        }
+        monkeypatch.setattr(
+            m.subprocess, "run",
+            lambda argv, **kwargs: _FakeCompletedProcess(m.json.dumps(payload)),
+        )
+
+        with pytest.raises(SystemExit):
+            m._cmd_handoff_check(_check_args(worktree_id="wt-1", execute=True, json=True))
+
+        assert m.json.loads(capsys.readouterr().out) == payload
+
+    def test_human_readable_output_reports_each_finding(self, monkeypatch, capsys):
+        monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/agent-worktrees")
+        payload = {
+            "checked": 1, "found": 1, "executed": True,
+            "findings": [{
+                "worktree_id": "wt-1", "predecessor_session_id": "old-sess",
+                "retire_pane": "%9", "executed": True, "retired": True,
+            }],
+        }
+        monkeypatch.setattr(
+            m.subprocess, "run",
+            lambda argv, **kwargs: _FakeCompletedProcess(m.json.dumps(payload)),
+        )
+
+        with pytest.raises(SystemExit):
+            m._cmd_handoff_check(_check_args(worktree_id="wt-1", execute=True))
+
+        out = capsys.readouterr().out
+        assert "retired predecessor old-sess" in out
+
+    def test_no_findings_reports_clean(self, monkeypatch, capsys):
+        monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/agent-worktrees")
+        monkeypatch.setattr(
+            m.subprocess, "run",
+            lambda argv, **kwargs: _FakeCompletedProcess(
+                m.json.dumps({"checked": 1, "found": 0, "executed": False, "findings": []})
+            ),
+        )
+
+        with pytest.raises(SystemExit):
+            m._cmd_handoff_check(_check_args(worktree_id="wt-1"))
+
+        assert "no stalled predecessor retirements found" in capsys.readouterr().out
+
+    def test_underlying_error_reports_failure_not_success(self, monkeypatch, capsys):
+        """Regression: an error payload from agent-worktrees (e.g. an unknown
+        worktree) must be surfaced as a failure, not silently read as "no
+        findings" (which looked identical: no "findings" key either way)."""
+        monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/agent-worktrees")
+        monkeypatch.setattr(
+            m.subprocess, "run",
+            lambda argv, **kwargs: _FakeCompletedProcess(
+                m.json.dumps({"error": "Worktree not found: wt-missing"}), returncode=1,
+            ),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            m._cmd_handoff_check(_check_args(worktree_id="wt-missing"))
+
+        assert exc_info.value.code != 0
+        assert "Worktree not found: wt-missing" in capsys.readouterr().err
+
+    def test_unparseable_output_reports_failure_not_success(self, monkeypatch, capsys):
+        monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/agent-worktrees")
+        monkeypatch.setattr(
+            m.subprocess, "run",
+            lambda argv, **kwargs: _FakeCompletedProcess("not json", returncode=0),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            m._cmd_handoff_check(_check_args(worktree_id="wt-1"))
+
+        assert exc_info.value.code != 0
+        err = capsys.readouterr().err
+        assert "no stalled predecessor retirements found" not in err
+        assert "unparseable" in err
+
+    def test_unparseable_nonzero_exit_surfaces_stderr(self, monkeypatch, capsys):
+        """Regression: a nonzero exit with non-JSON stdout took the
+        json.loads except branch, which set payload["error"] directly --
+        skipping the later stderr-attaching check entirely (it only ran
+        when payload had no "error" yet) and hiding the diagnostic."""
+        monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/agent-worktrees")
+        proc = _FakeCompletedProcess("not json", returncode=1)
+        proc.stderr = "some underlying failure text"
+        monkeypatch.setattr(m.subprocess, "run", lambda argv, **kwargs: proc)
+
+        with pytest.raises(SystemExit) as exc_info:
+            m._cmd_handoff_check(_check_args(worktree_id="wt-1"))
+
+        assert exc_info.value.code != 0
+        err = capsys.readouterr().err
+        assert "some underlying failure text" in err
+
+    def test_empty_stdout_nonzero_exit_reports_failure_not_success(self, monkeypatch, capsys):
+        """Regression: a nonzero agent-worktrees exit with completely empty
+        stdout (no JSON at all) made json.loads fall back to "{}" -- which
+        looks identical, from cmd_handoff_check's perspective, to a
+        legitimate "no findings" result. Must surface the failure (and its
+        stderr) instead of silently reporting success."""
+        monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/agent-worktrees")
+        proc = _FakeCompletedProcess("", returncode=1)
+        proc.stderr = "some underlying failure text"
+        monkeypatch.setattr(m.subprocess, "run", lambda argv, **kwargs: proc)
+
+        with pytest.raises(SystemExit) as exc_info:
+            m._cmd_handoff_check(_check_args(worktree_id="wt-1"))
+
+        assert exc_info.value.code != 0
+        err = capsys.readouterr().err
+        assert "no stalled predecessor retirements found" not in err
+        assert "exited 1" in err
+        assert "some underlying failure text" in err
+
+
+class TestHandoffCheckSameCell:
+    """Same-cell resolution (marketplace-scoped-installations, Phase 2
+    caller conversion): under an explicit installation-cell context,
+    ``handoff-check`` resolves ``agent-worktrees`` only through the
+    validated same-cell peer boundary, never an ambient ``PATH`` command.
+    Mirrors agent-logger's ``test_worktrees_peer.py`` pattern."""
+
+    @pytest.fixture
+    def owner(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+        cell = tmp_path / "marketplaces" / "test-cell"
+        root = cell / "plugins" / "agent-bridge"
+        root.mkdir(parents=True)
+        (cell / "plugins" / "agent-worktrees").mkdir()
+        own = {"cellRoot": str(cell), "pluginRoot": str(root)}
+        monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", str(root / "install.json"))
+        # AGENT_BRIDGE_PAYLOAD_ROOT is a distinct, replaceable path (the
+        # marketplace source payload runtime-gate resolves *from*), never
+        # equal to the cell-namespaced plugin root in a real install --
+        # setting it here to something else proves resolution does not use
+        # it. install_dir() (AGENT_BRIDGE_INSTALL_DIR) is what runtime-gate
+        # actually sets to the validated plugin root.
+        monkeypatch.setenv("AGENT_BRIDGE_PAYLOAD_ROOT", str(tmp_path / "not-the-plugin-root"))
+        monkeypatch.setattr(m, "install_dir", lambda: root)
+
+        def _validate_owner(owner_name: str, own_root: Path, raw_context: str) -> dict[str, str]:
+            assert own_root == root, f"expected the plugin root ({root}), got {own_root}"
+            return own
+
+        monkeypatch.setattr(m._peer_launch, "validate_owner", _validate_owner)
+        monkeypatch.setattr(m.shutil, "which", lambda _: pytest.fail("ambient PATH selected"))
+        return own
+
+    def test_uses_native_same_cell_prefix(
+        self, owner: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        prefix = m._peer_launch.launch_prefix(
+            "agent-bridge", Path(owner["pluginRoot"]),
+            str(Path(owner["pluginRoot"]) / "install.json"), "agent-worktrees",
+        )
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return _FakeCompletedProcess(
+                m.json.dumps({"checked": 1, "found": 0, "executed": False, "findings": []})
+            )
+
+        monkeypatch.setattr(m.subprocess, "run", fake_run)
+
+        with pytest.raises(SystemExit):
+            m._cmd_handoff_check(_check_args(worktree_id="wt-1"))
+
+        assert captured["argv"] == [
+            *prefix, "handoffs-check", "--json", "--worktree-id", "wt-1",
+        ]
+
+    def test_no_peer_installed_is_genuine_absence_not_legacy_fallback(
+        self, owner: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+    ) -> None:
+        """A valid owner with no same-cell agent-worktrees peer is genuine
+        absence -- reported the same as "no command found", never a reason
+        to search ambient PATH for a foreign cell's binary (this command's
+        ``--execute`` mutates state). The message names the scoped-cell
+        absence distinctly from an ambient-PATH miss so operators do not try
+        to repair PATH for a peer that is simply not installed in this cell."""
+        (tmp_path / "marketplaces" / "test-cell" / "plugins" / "agent-worktrees").rmdir()
+        monkeypatch.setattr(
+            m.subprocess, "run", lambda *a, **k: pytest.fail("no launch should be attempted"),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            m._cmd_handoff_check(_check_args(worktree_id="wt-1"))
+
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "not installed in this installation cell" in err
+        assert "not on PATH" not in err
+
+    def test_invalid_owner_context_fails_closed_not_legacy_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, capsys,
+    ) -> None:
+        """An owner/receipt/governance refusal must propagate, never degrade
+        to the legacy ambient lookup: since ``--execute`` mutates predecessor
+        state, silently falling back could operate on another cell's
+        ``agent-worktrees``."""
+        monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", "{")
+        monkeypatch.setattr(
+            m._peer_launch, "validate_owner",
+            lambda *a: (_ for _ in ()).throw(ValueError("bad receipt")),
+        )
+        monkeypatch.setattr(m.shutil, "which", lambda _: pytest.fail("ambient PATH selected"))
+        monkeypatch.setattr(
+            m.subprocess, "run", lambda *a, **k: pytest.fail("no launch should be attempted"),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            m._cmd_handoff_check(_check_args(worktree_id="wt-1"))
+
+        assert exc_info.value.code == 1
+        assert "bad receipt" in capsys.readouterr().err
+
+    def test_same_cell_spawn_is_windowless(
+        self, owner: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured.update(kwargs)
+            return _FakeCompletedProcess(
+                m.json.dumps({"checked": 1, "found": 0, "executed": False, "findings": []})
+            )
+
+        monkeypatch.setattr(m.subprocess, "run", fake_run)
+
+        with pytest.raises(SystemExit):
+            m._cmd_handoff_check(_check_args(worktree_id="wt-1"))
+
+        assert captured == {**captured, **m.no_window_kwargs()}

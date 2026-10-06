@@ -27,12 +27,19 @@ Worktree Picker's CodeSpaces pivot (Phase 3 / #709) renders the derived view.
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import shlex
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
-from .config import _repo_matches_codespace
+from .driving_worktrees import codespace_claim_owner_worktrees
 from .lease import Lease, list_leases
 from .lifecycle import CodespaceInfo, classify_state, list_codespaces
 from .status import STATE_PRUNABLE, STATE_RECOVERED, list_status
@@ -508,108 +515,97 @@ def plan_allocation(
     *,
     repo: str,
     new_cores: int = 0,
+    workstream_box: str | None = None,
 ) -> AllocationDecision:
     """Resolve a venue request for ``repo`` to a reuse/create/recycle/pressure
-    decision -- the pure core of ``reuse-before-create`` + ``budget-not-exceeded``
-    (Phase 2 / #708).
+    decision -- the pure core of ``persist-for-workstream`` + ``budget-not-exceeded``
+    (Phase 2b / #708, superseding Phase 2's cross-workstream reuse).
 
-    Precedence (first match wins):
-      1. **Reuse** a suitable idle/clean box for ``repo``. A *running* candidate
-         costs no extra budget and is always chosen first; a *stopped* one (boots
-         on connect, spends its cores) is chosen only when it fits the headroom.
+    ``workstream_box`` names the CodeSpace the requesting workstream (effort, or
+    else its driving worktree) already claimed on a prior request, if any --
+    resolved by the caller (see ``driving_worktrees.resolve_workstream_box``),
+    never guessed here. Precedence (first match wins):
+
+      1. **Resume** ``workstream_box`` when it is still in the pool -- this
+         workstream's own persistent box, running or stopped, reused
+         regardless of its disposition. A workstream never falls back to
+         borrowing a DIFFERENT idle/clean box for ``repo`` just because one
+         happens to be free: that box belongs to no one *yet*, not to this
+         request, and grabbing it would strand whichever workstream created it
+         once it comes looking for it again. When ``workstream_box`` no longer
+         exists (recycled, deleted out of band), falls through to create.
       2. Else **create** a fresh box when the intended machine (``new_cores``)
-         fits the headroom.
-      3. Else (no headroom) **recycle** a running *stale* box to reclaim its cores,
-         then reuse-a-stopped-candidate / create -- but only when the reclaim
-         actually makes the activation fit.
-      4. Else **pressure**: the pool is full and nothing is recyclable -- surface
-         it (``N/M cores``) rather than silently over-provision or fail opaquely.
+         fits the headroom -- always a **new**, dedicated box for this
+         workstream, never someone else's idle one.
+      3. Else (no headroom) **recycle** a running *stale* box to reclaim its
+         cores, then create -- but only when the reclaim actually makes the
+         fresh create fit. (Staleness recycling itself is Phase 4 / #710; this
+         planner only consumes the disposition, never decides *when* a box
+         ages to stale.)
+      4. Else **pressure**: the pool is full and nothing is recyclable --
+         surface it (``N/M cores``) rather than silently over-provision or
+         fail opaquely.
 
     Pure + side-effect-free (a planner, not an executor). ``new_cores`` is the
-    intended new box's core cost; ``0``/unknown is treated as a conservative ``1``
-    so a full pool still blocks a create. Budget-correct: no returned action
-    pushes ``spent`` past the ceiling.
+    intended new box's core cost; ``0``/unknown is treated as a conservative
+    ``1`` so a full pool still blocks a create. Budget-correct: no returned
+    action pushes ``spent`` past the ceiling.
     """
     needed = new_cores if new_cores > 0 else 1
     headroom = budget.headroom_cores
 
-    matching = [m for m in members if _repo_matches_codespace(repo, m.repository)]
-    reusable = [m for m in matching if m.disposition in (IDLE, CLEAN)]
+    if workstream_box:
+        mine = next((m for m in members if m.name == workstream_box), None)
+        if mine is not None:
+            cost = 0 if mine.running else (mine.cores if mine.cores > 0 else 1)
+            return AllocationDecision(
+                action=ALLOC_REUSE, codespace=mine.name,
+                reason=(
+                    f"resuming this workstream's own CodeSpace '{mine.name}' "
+                    f"for {repo}" + (
+                        " (already running; no extra budget)" if mine.running
+                        else f" (stopped; boots on connect, {cost} core(s))"
+                    )
+                ),
+                headroom_cores=headroom, needed_cores=cost,
+            )
+        # Named but no longer in the pool (recycled/deleted out of band) --
+        # fall through to CREATE below rather than silently adopting a
+        # different box, which would be exactly the cross-workstream reuse
+        # this planner retires.
 
-    def _reuse_key(m: PoolMember) -> tuple:
-        return (
-            0 if m.running else 1,               # running first (0 extra cores)
-            0 if m.disposition == CLEAN else 1,  # a rescued clean box over a bare idle
-            m.idle_age if m.idle_age is not None else 0.0,  # freshest first
-            m.name,
-        )
-
-    reusable.sort(key=_reuse_key)
-
-    # 1. Reuse a running candidate -- always fits (already spending its cores).
-    running_reuse = next((m for m in reusable if m.running), None)
-    if running_reuse is not None:
-        return AllocationDecision(
-            action=ALLOC_REUSE, codespace=running_reuse.name,
-            reason=(f"reusing running {running_reuse.disposition} CodeSpace "
-                    f"'{running_reuse.name}' for {repo} "
-                    f"(no new create, no extra budget)"),
-            headroom_cores=headroom, needed_cores=0,
-        )
-
-    # A stopped reuse candidate boots on connect -> costs its cores.
-    stopped_reuse = next((m for m in reusable if not m.running), None)
-    stopped_cost = (
-        (stopped_reuse.cores if stopped_reuse.cores > 0 else 1)
-        if stopped_reuse is not None else 0
-    )
-
-    # 2. Reuse a stopped candidate, or create fresh, when it fits the headroom.
-    if stopped_reuse is not None and headroom >= stopped_cost:
-        return AllocationDecision(
-            action=ALLOC_REUSE, codespace=stopped_reuse.name,
-            reason=(f"reusing stopped {stopped_reuse.disposition} CodeSpace "
-                    f"'{stopped_reuse.name}' for {repo} (boots on connect; "
-                    f"{stopped_cost} core(s) fit the {headroom}-core headroom)"),
-            headroom_cores=headroom, needed_cores=stopped_cost,
-        )
+    # 2. Create a fresh, dedicated box when it fits the headroom.
     if headroom >= needed:
         return AllocationDecision(
             action=ALLOC_CREATE, codespace=None,
-            reason=(f"no reusable CodeSpace for {repo}; creating fresh "
-                    f"({needed} core(s) fit the {headroom}-core headroom)"),
+            reason=(f"no box claimed by this workstream for {repo}; creating "
+                    f"a fresh one ({needed} core(s) fit the {headroom}-core "
+                    f"headroom)"),
             headroom_cores=headroom, needed_cores=needed,
         )
 
-    # 3. No headroom -- recycle a running stale box to reclaim its cores. Prefer
-    # the activation needing the least reclaim: reuse a stopped candidate if one
-    # exists, else a fresh create.
-    if stopped_reuse is not None:
-        follow, follow_cs, follow_cost = "reuse", stopped_reuse.name, stopped_cost
-    else:
-        follow, follow_cs, follow_cost = "create", None, needed
-
+    # 3. No headroom -- recycle a running stale box to reclaim cores, then
+    # create the workstream's own fresh box (never reuse the recycled box's
+    # sibling or any other stranger box).
     stale = [m for m in members if m.disposition == STALE and m.running]
     stale.sort(key=lambda m: (-(m.idle_age or 0.0), -m.cores, m.name))
     for m in stale:
-        if headroom + m.cores >= follow_cost:
-            then_verb = (f"reuse '{follow_cs}'" if follow == "reuse"
-                         else "create a fresh box")
+        if headroom + m.cores >= needed:
             return AllocationDecision(
                 action=ALLOC_RECYCLE, codespace=m.name,
                 reason=(f"pool full ({budget.spent_cores}/{budget.total_cores} "
                         f"cores); recycle stale '{m.name}' (+{m.cores} cores) "
-                        f"then {then_verb} for {repo}"),
-                then=follow, then_codespace=follow_cs,
-                headroom_cores=headroom, needed_cores=follow_cost,
+                        f"then create a fresh box for {repo}"),
+                then="create", then_codespace=None,
+                headroom_cores=headroom, needed_cores=needed,
             )
 
     # 4. Nothing recyclable frees enough -- surface the pressure.
     return AllocationDecision(
         action=ALLOC_PRESSURE, codespace=None,
         reason=(f"pool full: {budget.spent_cores}/{budget.total_cores} cores in "
-                f"use, {headroom} free; no idle/clean box to reuse and no stale "
-                f"box to recycle for {repo}"),
+                f"use, {headroom} free; no box claimed by this workstream and "
+                f"no stale box to recycle for {repo}"),
         headroom_cores=headroom, needed_cores=needed,
     )
 
@@ -617,6 +613,25 @@ def plan_allocation(
 def _short_repo(repository: str) -> str:
     """The trailing path segment of an ``owner/name`` repo id (display only)."""
     return repository.rsplit("/", 1)[-1] if repository else repository
+
+
+def _configured_workspace_repo(repository: str | None) -> str | None:
+    """Declarative workspace repo for a CodeSpace launcher repo, if configured.
+
+    Reads ``repos.<repo>.workspace_repo`` from agent-codespaces config as a
+    cheap local fast-path for callers that only need to know which logical
+    product repo a GitHub-hosted CodeSpace repo is configured to host.
+    """
+    if not repository:
+        return None
+    try:
+        from .config import load_merged_config
+
+        repo_cfg = load_merged_config(include_cwd=False).repos.get(repository)
+    except Exception:
+        return None
+    workspace_repo = repo_cfg.workspace_repo if repo_cfg else None
+    return workspace_repo if isinstance(workspace_repo, str) and workspace_repo else None
 
 
 def _worktree_dir_id(worktree_path: str | None) -> str:
@@ -638,6 +653,559 @@ def _short_claim_ref(ref: str) -> str:
     tail = ref.rsplit("/", 1)[-1]
     worktree = tail.split("#", 1)[0]
     return f"{worktree}@{machine}" if machine else worktree
+
+
+def _claims_summary_for_worktree(worktree_id: str) -> str:
+    """The ranked ``claims_summary`` for the worktree claiming this box
+    (picker-venue-pivots Phase 1), via the shared ``agent_worktrees.claims_rank``
+    module -- the same ranking every claims-showing pivot consumes.
+
+    Lazily imports ``agent_worktrees`` (mirroring ``config
+    ._registered_repo_paths``'s own cross-plugin pattern): agent-codespaces
+    does not declare a hard dependency on agent-worktrees, so an environment
+    where it is not installed alongside still renders a full payload -- just
+    without a ``claims_summary``. Never raises: an empty/unknown ``worktree_id``,
+    a missing record, or an import failure all degrade to ``""``.
+    """
+    if not worktree_id:
+        return ""
+    try:
+        from agent_worktrees import claim_kinds_registry, claims_rank, tracking
+    except ImportError:
+        return ""
+    try:
+        record = tracking.load_record_by_id(worktree_id)
+    except Exception:
+        return ""
+    if record is None:
+        return ""
+    try:
+        pecking_order = claim_kinds_registry.effective_pecking_order()
+        label_overrides = claim_kinds_registry.effective_label_overrides()
+    except Exception:
+        pecking_order = None
+        label_overrides = None
+    try:
+        return claims_rank.summarize_claims(
+            record.resources,
+            pecking_order=pecking_order,
+            label_overrides=label_overrides,
+        )
+    except Exception:
+        return ""
+
+
+def _driving_worktree_id(member: PoolMember) -> str:
+    """The full driving-worktree id when this CodeSpace is locally backed by a
+    tracked worktree, else ``""``.
+
+    The existing ``worktree`` picker field intentionally remains the compact
+    cross-link token Phases 1-2 already use for title/claims correlation
+    (beacon / effort / local worktree id). Phase 4's drill-in actions need the
+    **full** tracked worktree id because the picker's internal worktree jump
+    resolves rows by stable id, not a 4-char beacon/preview token.
+    """
+    if member.holder_worktree:
+        return _worktree_dir_id(member.holder_worktree)
+    return ""
+
+
+def _driving_worktree_mark(*, has_driving_worktree: bool, orphaned: bool) -> str:
+    """The reserved line-two mark for a row's most relevant relation."""
+    if orphaned:
+        return "\u26a0"
+    if has_driving_worktree:
+        return "\u2192"
+    return ""
+
+
+def _prefixed_subtitle(
+    subtitle: str,
+    *,
+    has_driving_worktree: bool,
+    orphaned: bool,
+) -> str:
+    """Apply the reserved Phase 4 line-two mark to the composed subtitle."""
+    mark = _driving_worktree_mark(
+        has_driving_worktree=has_driving_worktree,
+        orphaned=orphaned,
+    )
+    if mark and subtitle and not subtitle.startswith(f"{mark} "):
+        return f"{mark} {subtitle}"
+    return subtitle
+
+
+def _worktree_status_for_worktree(worktree_id: str) -> dict[str, Any]:
+    """A read-only Worktree Status card payload for the driving worktree, or
+    an explicit unavailable card when this row isn't backed by a resolvable
+    tracked worktree."""
+    unavailable = {
+        "title": "Worktree status unavailable",
+        "status": "unknown",
+        "link": None,
+        "body": "No tracked driving worktree is recorded for this CodeSpace.",
+    }
+    if not worktree_id:
+        return unavailable
+    try:
+        from agent_worktrees import claim_kinds_registry, claims_rank, status_bar_cli, tracking
+    except ImportError:
+        return unavailable
+    try:
+        record = tracking.load_record_by_id(worktree_id)
+    except Exception:
+        return unavailable
+    if record is None:
+        return unavailable
+    try:
+        payload = status_bar_cli._status_segment_json(record.path)
+    except Exception:
+        payload = None
+    try:
+        claims = claims_rank.summarize_claims(
+            record.resources,
+            pecking_order=claim_kinds_registry.effective_pecking_order(),
+            label_overrides=claim_kinds_registry.effective_label_overrides(),
+        )
+    except Exception:
+        claims = ""
+    state = str((payload or {}).get("state") or "unknown")
+    closure = (payload or {}).get("closure") or {}
+    git_bits = [
+        f"ahead {payload.get('ahead', 0)}" if payload is not None else None,
+        f"behind {payload.get('behind', 0)}" if payload is not None else None,
+        "dirty" if payload and payload.get("dirty") else "clean" if payload else None,
+    ]
+    git_summary = ", ".join(bit for bit in git_bits if bit)
+    live = (
+        "mux live" if record.mux_live is True else
+        "bound live" if record.bound_live is True else
+        "idle"
+    )
+    body = "\n".join([
+        f"- Repo: `{record.repo}`",
+        f"- Worktree: `{record.worktree_id}`",
+        f"- Branch: `{record.branch}`",
+        f"- Turns: {(payload or {}).get('turn_count', 0)}",
+        f"- Live: {live}",
+        f"- Git: {state}" + (f" ({git_summary})" if git_summary else ""),
+        f"- Closure: {closure.get('label', 'unknown')}",
+        f"- Claims: {claims or 'none'}",
+    ])
+    return {
+        "title": f"Worktree {record.worktree_id} ({record.repo})",
+        "status": closure.get("style") or state,
+        "link": None,
+        "body": body,
+    }
+
+
+def _codespace_git_probe_command(repository: str | None) -> str:
+    """A bash snippet that probes the real workspace git remote + branch."""
+    workspace = ""
+    if repository:
+        try:
+            from .config import load_merged_config
+
+            workspace = (
+                load_merged_config(include_cwd=False).resolved_workspace_folder_for(repository)
+                or ""
+            )
+        except Exception:
+            workspace = ""
+    workspace_literal = shlex.quote(workspace) if workspace else '""'
+    return (
+        f"repo={workspace_literal}; "
+        'if [ -z "$repo" ] || ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; '
+        'then repo="${WORKING_DIRECTORY:-${VM_REPO_PATH:-$PWD}}"; fi; '
+        'origin=$(git -C "$repo" config --get remote.origin.url 2>/dev/null || true); '
+        'branch=$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || '
+        'git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || true); '
+        'printf "origin=%s\\nbranch=%s\\n" "$origin" "$branch"'
+    )
+
+
+@dataclass(frozen=True)
+class _AdoRepoRef:
+    host: str
+    organization: str
+    project: str
+    repository: str
+
+    def api_base(self) -> str:
+        if self.host.endswith(".visualstudio.com"):
+            return f"https://{self.host}/{self.project}"
+        return f"https://{self.host}/{self.organization}/{self.project}"
+
+    def pr_url(self, pr_id: int) -> str:
+        return f"{self.api_base()}/_git/{self.repository}/pullrequest/{pr_id}"
+
+
+def _ado_remote_ref(remote_url: str) -> _AdoRepoRef | None:
+    """Parse an Azure DevOps git remote into its repo coordinates."""
+    url = (remote_url or "").strip()
+    if not url:
+        return None
+    ssh = re.match(
+        r"^(?:ssh://)?git@(?P<host>ssh\.dev\.azure\.com)[:/](?:v3/)?(?P<org>[^/]+)/(?P<project>[^/]+)/(?P<repo>[^/\s]+)$",
+        url,
+        re.IGNORECASE,
+    )
+    if ssh:
+        return _AdoRepoRef(
+            host="dev.azure.com",
+            organization=str(ssh.group("org")),
+            project=str(ssh.group("project")),
+            repository=str(ssh.group("repo")),
+        )
+    parsed = urllib.parse.urlsplit(url)
+    host = (parsed.hostname or "").lower()
+    parts = [part for part in parsed.path.split("/") if part]
+    if host == "dev.azure.com" and len(parts) >= 4 and parts[2] == "_git":
+        repo_index = 4 if len(parts) >= 5 and parts[3] == "_optimized" else 3
+        return _AdoRepoRef(
+            host=host,
+            organization=parts[0],
+            project=parts[1],
+            repository=parts[repo_index],
+        )
+    if host.endswith(".visualstudio.com") and len(parts) >= 3 and parts[1] == "_git":
+        repo_index = 3 if len(parts) >= 4 and parts[2] == "_optimized" else 2
+        return _AdoRepoRef(
+            host=host,
+            organization=host.split(".", 1)[0],
+            project=parts[0],
+            repository=parts[repo_index],
+        )
+    return None
+
+
+def _codespace_git_probe(
+    codespace_name: str,
+    repository: str | None = None,
+    owner_worktree: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Best-effort remote-origin + checked-out-branch probe inside one CodeSpace."""
+    command = _codespace_git_probe_command(repository)
+    if owner_worktree:
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable, "-m", "agent_codespaces", "ssh", codespace_name,
+                    "--effort", owner_worktree,
+                    "--remote-cmd", command,
+                    "--timeout", "90",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=150,
+            )
+        except Exception:
+            return None, None
+        if proc.returncode != 0:
+            return None, None
+        output = proc.stdout or ""
+    else:
+        try:
+            from . import gh_account
+            from .lifecycle import account_for_codespace
+        except Exception:
+            return None, None
+        try:
+            account = account_for_codespace(codespace_name)
+        except Exception:
+            account = None
+        try:
+            proc = subprocess.run(
+                [
+                    "gh", "codespace", "ssh", "-c", codespace_name,
+                    "--", "-T", "bash", "-lc", command,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                env=gh_account.env_for_account(account),
+            )
+        except Exception:
+            return None, None
+        if proc.returncode != 0:
+            return None, None
+        output = proc.stdout or ""
+    origin = None
+    branch = None
+    for line in output.splitlines():
+        key, _, value = line.partition("=")
+        if key == "origin":
+            origin = value.strip() or None
+        elif key == "branch":
+            branch = value.strip() or None
+    return origin, branch
+
+
+def _codespace_remote_origin_url(
+    codespace_name: str,
+    repository: str | None = None,
+) -> str | None:
+    """Best-effort remote-origin probe inside one CodeSpace."""
+    origin, _branch = _codespace_git_probe(codespace_name, repository)
+    return origin
+
+
+def _codespace_current_branch(
+    codespace_name: str,
+    repository: str | None = None,
+) -> str | None:
+    """Best-effort current branch probe inside one CodeSpace's real workspace."""
+    _origin, branch = _codespace_git_probe(codespace_name, repository)
+    return branch
+
+
+def _ado_rest_bearer() -> str | None:
+    """Best-effort ADO REST bearer from the same sources the relay uses."""
+    try:
+        from .auth_preflight import _ado_scope
+        from credential_relay.sources.injected_token import InjectedTokenSource
+        from credential_relay.sources.az_login import AzLoginSource
+        import asyncio
+    except Exception:
+        return None
+
+    async def _resolve() -> str | None:
+        scope = _ado_scope()
+        for source in (
+            InjectedTokenSource(allowed_resources=["*"]),
+            AzLoginSource(allowed_resources=["*"], cache_ttl_override=0),
+        ):
+            try:
+                response = await source.resolve(
+                    "get-azure-token",
+                    {"scope": scope},
+                    timeout=30.0,
+                )
+            except Exception:
+                continue
+            if not response:
+                continue
+            match = re.search(r"(?:^|[\r\n])token=(.+)", str(response))
+            if match:
+                return match.group(1).strip()
+        return None
+
+    try:
+        return asyncio.run(_resolve())
+    except Exception:
+        return None
+
+
+def _normalize_branch_ref(branch: str) -> str | None:
+    value = (branch or "").strip()
+    if not value or value == "HEAD":
+        return None
+    return value if value.startswith("refs/heads/") else f"refs/heads/{value}"
+
+
+def _workspace_pr_ref(
+    codespace_name: str,
+    branch: str,
+    *,
+    remote_url: str | None = None,
+    expected_repository: str | None = None,
+) -> str | None:
+    """The active ADO PR for this branch, optionally constrained by repo."""
+    branch_ref = _normalize_branch_ref(branch)
+    if not branch_ref:
+        return None
+    remote = _ado_remote_ref(
+        remote_url if remote_url is not None else (_codespace_remote_origin_url(codespace_name) or "")
+    )
+    if remote is None:
+        return None
+    if expected_repository and remote.repository.casefold() != expected_repository.casefold():
+        return None
+    token = _ado_rest_bearer()
+    if not token:
+        return None
+    query = urllib.parse.urlencode({"searchCriteria.sourceRefName": branch_ref, "searchCriteria.status": "active", "api-version": "7.1"})
+    url = (
+        f"{remote.api_base()}/_apis/git/repositories/"
+        f"{urllib.parse.quote(remote.repository, safe='')}/pullrequests?{query}"
+    )
+    request = urllib.request.Request(url)
+    request.add_header("Authorization", f"Bearer {token}")
+    request.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = response.read().decode("utf-8")
+    except Exception:
+        return None
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return None
+    values = data.get("value") if isinstance(data, dict) else None
+    if not isinstance(values, list) or not values:
+        return None
+    pr_id = values[0].get("pullRequestId")
+    try:
+        pr_number = int(pr_id)
+    except (TypeError, ValueError):
+        return None
+    return remote.pr_url(pr_number)
+
+
+def _auto_claim_workspace_pr(
+    codespace_name: str,
+    repository: str,
+    _branch: str,
+    worktree_id: str,
+) -> str | None:
+    """Best-effort producer for the workspace-repo PR auto-claim."""
+    if not worktree_id:
+        return None
+    try:
+        from agent_worktrees import tracking
+    except ImportError:
+        return None
+    try:
+        record = tracking.load_record_by_id(worktree_id)
+    except Exception:
+        return None
+    if record is None:
+        return None
+    owner_ref = record.owner_ref or tracking.format_claim_ref(
+        getattr(record, "machine", None),
+        getattr(record, "repo", None),
+        getattr(record, "worktree_id", worktree_id),
+    )
+    owner_worktree = getattr(record, "path", None) or getattr(record, "worktree_path", None)
+    configured_workspace_repo = _configured_workspace_repo(repository)
+    candidate_repo = configured_workspace_repo or repository
+    expected_repository = _short_repo(candidate_repo) if candidate_repo else None
+    if expected_repository and expected_repository.endswith("-codespaces"):
+        expected_repository = expected_repository[:-len("-codespaces")]
+    remote_url, branch = _codespace_git_probe(
+        codespace_name,
+        repository,
+        owner_worktree,
+    )
+    pr_ref = _workspace_pr_ref(
+        codespace_name,
+        branch or "",
+        remote_url=remote_url,
+        expected_repository=expected_repository,
+    )
+    if not pr_ref:
+        return None
+    try:
+        from .coordination import journal_claim
+    except Exception:
+        return pr_ref
+    journal_claim("pr", pr_ref, owner_ref)
+    return pr_ref
+
+
+#: agent-bridge liveness labels (``LiveSessionInfo.liveness`` /
+#: ``routes.live_sessions._live_liveness``) that read as "a turn is actually
+#: running right now" for the picker's compact ``sess`` column -- "stalled"
+#: still means a turn is in flight (just silent past the stall threshold), so
+#: it counts as LIVE alongside "active"; only "idle"/None do not.
+_LIVE_TURN_LIVENESS = frozenset({"active", "stalled"})
+
+
+def _bridge_client_from_env() -> Any | None:
+    """A ``BridgeClient`` dialed at the locally-configured agent-bridge
+    daemon, or ``None`` when agent-bridge isn't installed alongside, has no
+    auth token yet (not started), or any other resolution step fails.
+
+    Deliberately **not** ``BridgeClient.from_config()`` -- that classmethod
+    prints to stderr and calls ``sys.exit(1)`` when the auth token is
+    missing, which is correct for a one-shot CLI command but would corrupt
+    (or kill) `agent-codespaces pool --picker-json`'s own output merely
+    because agent-bridge happens not to be running. This replicates its
+    config/port/token resolution (routing-table re-resolution omitted --
+    per the original's own comment, that's "an optimization, never a hard
+    dependency") but degrades to ``None`` instead of exiting.
+    """
+    try:
+        import yaml
+        from agent_bridge.client import BridgeClient
+        from agent_bridge.config import config_dir
+        from agent_bridge.models import default_port
+    except ImportError:
+        return None
+    try:
+        cfg_path = config_dir() / "config.yaml"
+        auth_path = config_dir() / "auth.yaml"
+        if not auth_path.exists():
+            return None
+        auth_data = yaml.safe_load(auth_path.read_text(encoding="utf-8")) or {}
+        token = auth_data.get("token")
+        if not token:
+            return None
+        port = default_port()
+        bind = "127.0.0.1"
+        if cfg_path.exists():
+            data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            port = data.get("port") or port
+            bind = data.get("bind", bind) or bind
+        if bind in ("0.0.0.0", ""):
+            bind = "127.0.0.1"
+        elif bind == "::":
+            bind = "::1"
+        return BridgeClient(f"http://{bind}:{port}", str(token), timeout=5)
+    except Exception:
+        return None
+
+
+def _live_session_for_venue(kind: str, target: str) -> dict[str, Any] | None:
+    """The registered agent-bridge live session whose ``venue`` targets this
+    ``kind``/``target`` (e.g. ``"codespace"``/a CodeSpace name), or ``None``
+    when agent-bridge is unreachable/not installed or no session matches.
+
+    Never raises -- an offline or absent agent-bridge simply means no
+    live-session join, not a broken pool listing (picker-venue-pivots
+    Phase 1)."""
+    if not target:
+        return None
+    client = _bridge_client_from_env()
+    if client is None:
+        return None
+    try:
+        sessions = client.list_live_sessions(include_dead=False)
+    except Exception:
+        return None
+    for session in sessions or []:
+        venue = (session or {}).get("venue") or {}
+        if venue.get("kind") == kind and venue.get("target") == target:
+            return session
+    return None
+
+
+def _sess_column(live_session: dict[str, Any] | None, worktree_id: str) -> str:
+    """The Worktrees pane's own compact ``sess``/``live`` column vocabulary
+    (picker-venue-pivots design), reused as-is: ``"LIVE"`` when agent-bridge
+    reports an actually-running turn, ``"IDLE"`` when a worktree is driving
+    but no turn is live, else ``""`` when nothing is driving at all."""
+    if live_session and live_session.get("liveness") in _LIVE_TURN_LIVENESS:
+        return "LIVE"
+    if worktree_id:
+        return "IDLE"
+    return ""
+
+
+def _activity_from_live_session(live_session: dict[str, Any] | None) -> str:
+    """The transient-activity half of line two: the live session's most
+    recent ``latest_progress`` beat (``"{phase}: {summary}"``, or just
+    ``summary`` with no phase), or ``""`` when there is no live session or
+    it hasn't reported one yet (graceful-absence, never a placeholder)."""
+    if not live_session:
+        return ""
+    progress = live_session.get("latest_progress") or {}
+    summary = progress.get("summary") if isinstance(progress, dict) else None
+    if not summary:
+        return ""
+    phase = progress.get("phase")
+    return f"{phase}: {summary}" if phase else str(summary)
 
 
 def picker_payload(
@@ -668,6 +1236,7 @@ def picker_payload(
     actionable missing-``codespace``-scope notice (#980).
     """
     entries: list[dict] = []
+    claim_owner_worktrees = codespace_claim_owner_worktrees(m.name for m in members if m.holder_effort and not m.holder_worktree)
     for m in sorted(members, key=lambda x: (x.repository, x.disposition, x.name)):
         if m.holder_effort:
             holder = f"{m.holder_effort}@{m.holder_host or '?'}"
@@ -678,15 +1247,14 @@ def picker_payload(
             holder = _short_claim_ref(m.l2_holder)
         else:
             holder = ""
+        driving_worktree_id = _driving_worktree_id(m) or claim_owner_worktrees.get(m.name, "")
+        has_driving_worktree = bool(driving_worktree_id)
         friendly = m.display_name or m.name
-        # The claiming worktree's short id: the cross-machine beacon (the 4-hex
-        # borrowing-worktree id) when held elsewhere, else the local lease's
-        # effort id, else a #897 claim's owner worktree dir name (3b -- so a
-        # claim-held box surfaces WHICH worktree locks it, not a blank). The
-        # Picker correlates this to the worktree's TASK title.
-        worktree = m.beacon or m.holder_effort or _worktree_dir_id(m.holder_worktree)
-        # A concise uppercase status for the compact table: RUNNING when live,
-        # STALE for an aged recycle candidate, else STOPPED.
+        worktree = (
+            m.beacon or driving_worktree_id or m.holder_effort
+            or _worktree_dir_id(m.holder_worktree)
+        )
+        # Compact status: RUNNING when live, STALE if an aged recycle candidate, else STOPPED.
         if m.running:
             status = "RUNNING"
         elif m.disposition == STALE:
@@ -695,8 +1263,7 @@ def picker_payload(
             status = "STOPPED"
         # Grouping key: repo @ account (the account is a shared-pool axis).
         group = f"{_short_repo(m.repository)} @ {m.account or 'ambient'}"
-        # Second-line fallback (durable id + claim) kept for pivots that opt into
-        # a subtitle; the compact grouped layout uses columns instead.
+        # Second-line fallback (durable id + claim); the grouped layout uses columns.
         subtitle = m.name if friendly != m.name else ""
         if m.holder_effort:
             claim = f"claimed by {m.holder_effort}"
@@ -712,6 +1279,29 @@ def picker_payload(
             # 3b: make the stale lock legible on the fallback subtitle too.
             gone = "\u26a0 holder worktree gone (orphaned lock)"
             subtitle = f"{subtitle} · {gone}" if subtitle else gone
+        # Phase 1 (picker-venue-pivots): the agent-bridge live-session join,
+        # keyed on venue.kind == "codespace" + venue.target == this box's own
+        # name -- the transient-activity half of line two, and the sess/live
+        # column signal. "" / "" / blank when agent-bridge is unreachable, not
+        # installed, or no session is registered for this box (see
+        # _live_session_for_venue / _activity_from_live_session / _sess_column).
+        live_session = _live_session_for_venue("codespace", m.name)
+        activity = _activity_from_live_session(live_session)
+        if activity:
+            subtitle = f"{subtitle} - {activity}" if subtitle else f"{friendly} - {activity}"
+        elif has_driving_worktree and not subtitle and not m.orphaned:
+            subtitle = friendly
+        subtitle = _prefixed_subtitle(
+            subtitle,
+            has_driving_worktree=has_driving_worktree,
+            orphaned=m.orphaned,
+        )
+        _auto_claim_workspace_pr(
+            m.name,
+            m.repository,
+            m.branch,
+            driving_worktree_id,
+        )
         entries.append({
             "id": m.name,
             "name": m.name,            # durable GitHub-assigned id
@@ -719,7 +1309,18 @@ def picker_payload(
             "group": group,            # repo @ account (section grouping)
             "status": status,          # RUNNING / STALE / STOPPED (compact STATE)
             "worktree": worktree,      # claiming worktree short id (-> TASK title)
+            "worktree_id": driving_worktree_id,  # full tracked id for drill-in
+            "has_driving_worktree": "true" if has_driving_worktree else "false",
             "subtitle": subtitle,      # optional 2nd line (durable id + claim)
+            "activity": activity,      # worker's latest progress (worktree-row worker line)
+            "session_id": (live_session or {}).get("session_id") or "",  # Send message target
+            "worktree_status": _worktree_status_for_worktree(driving_worktree_id),
+            # Phase 1 (picker-venue-pivots): the claiming worktree's ranked claims-list
+            # (via claims_rank) -- "" when unclaimed or agent-worktrees is absent.
+            "claims_summary": _claims_summary_for_worktree(driving_worktree_id or worktree),
+            # Phase 1: the Worktrees pane's own compact sess/live column,
+            # reused as-is -- LIVE/IDLE/blank (see _sess_column).
+            "sess": _sess_column(live_session, worktree),
             "repository": m.repository,
             "repo": _short_repo(m.repository),
             "branch": m.branch,
@@ -729,6 +1330,7 @@ def picker_payload(
             "cores": str(m.cores) if m.cores_known else "?",
             "running": m.running,
             "holder": holder,
+            "effort": m.holder_effort or "",  # claim owner label (attach --effort)
             # health vs. use: two distinct axes (venue-pool Phase 3 / #709).
             "health": "running" if m.running else "stopped",
             "use": "in-use" if m.disposition == IN_USE else "free",

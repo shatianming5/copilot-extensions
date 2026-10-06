@@ -7,7 +7,7 @@ to ``agent-worktrees --json``); it owns no worktree logic or state, and imports
 nothing from the plugin — the process boundary that keeps the coupling one-way.
 
 The UI takes an **injected source** (``Callable[[], list[Worktree]]``) so it can
-render live engine data, a fake/demo engine (Aperture Labs), or a fixture in a
+render live engine data, a fake/demo engine (Example Labs), or a fixture in a
 test, all identically. A headless :func:`capture_svg` renders a screenshot with
 no terminal for demos and golden checks.
 """
@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -24,7 +23,7 @@ from textual.app import App, ComposeResult
 from textual.events import Key
 from textual.widgets import DataTable, Footer, Header, Static, Tab, Tabs
 
-from . import demo
+from . import demo, demo_engine
 from . import engine_client as ec
 from .engine_client import EngineError, Worktree
 from .pivot_runtime import PivotLoadError, PivotPayload, load_pivot
@@ -135,6 +134,17 @@ class LaunchRequest:
     boundary, compose by mux capability, run). ``mode`` maps to the engine's
     ``resolve`` selectors: ``resume`` -> ``--worktree-id``, ``bare-resume`` ->
     ``--worktree-id --bare-resume``, ``new`` -> ``--new``.
+
+    ``new_window``, unlike every other field here, is NOT dispatched through
+    the exit-the-app-then-run cycle above -- it opens a brand-new, visible
+    terminal window running the launch while the Picker/TUI keeps running
+    (see ``headed_actions.open_worktree_cli_headed``), so it is only ever
+    handed directly to ``_run_launch`` from inside a still-running screen,
+    never via ``LaunchRequest`` -> ``app.exit()`` -> the ``_run_production_picker``
+    dispatch loop. Supported only for a local, mux-presented launch resolved
+    to the relocated ``launch-session.{ps1,sh}`` script; requesting it for a
+    remote/AHP/non-exec plan is a clear error in ``_run_launch``, never a
+    silent fallback that would block the caller's own process instead.
     """
 
     project: str
@@ -142,8 +152,11 @@ class LaunchRequest:
     mode: str
     title: str | None = None
     no_mux: bool = False
+    ahp: bool = False
     machine: str | None = None
     environment: str | None = None
+    seed_prompt: str | None = None
+    new_window: bool = False
 
 
 def _state_cell(w: Worktree) -> str:
@@ -650,13 +663,13 @@ def engine_context_source(project: str) -> ContextSource:
 
 
 def demo_source() -> Source:
-    """A source backed by the bundled Aperture Labs fake engine.
+    """A source backed by the bundled Example Labs fake engine.
 
     Routes through ``engine_client`` + a subprocess to the fake engine, so the
     demo exercises the exact render path (spawn → JSON → dataclass) the real
     engine uses — the process boundary is never bypassed.
     """
-    ec.set_engine_command([sys.executable, "-m", "worktree_manager.demo_engine"])
+    ec.set_engine_command(demo_engine.command_argv())
     return lambda: ec.list_worktrees(demo.DEMO_PROJECT)
 
 

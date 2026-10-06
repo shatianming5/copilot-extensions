@@ -1,11 +1,11 @@
-# The Worktree Picker
+# The Worktree Manager Picker
 
-The **Picker** is the interactive terminal UI you get when you run a project
-binstub with no arguments (`my-project`). It's the front door to the whole
-worktree lifecycle: it lists every worktree, lets you **resume** or **create**
-one, runs the setup script, and launches the Copilot session — keeping worktrees
-fresh and services deployed along the way. This is the operator walkthrough; for
-the pivot-registry internals see
+The interactive **Picker** now lives in the standalone **Worktree Manager**.
+Running a project binstub with no arguments (`my-project`) hands off to that
+manager when it is installed; otherwise the plugin surfaces the guided
+install/onboarding trigger instead of a bundled in-plugin TUI. This is the
+operator walkthrough for that front door; for the agent-worktrees engine-side
+pivot-registry internals see
 [architecture.md § Picker Pivot Registry](architecture.md#picker-pivot-registry-cross-plugin),
 and for the states and landing flow see
 [worktree-lifecycle.md](worktree-lifecycle.md).
@@ -19,8 +19,8 @@ my-project                         # bare project binstub (no subcommand)
 launch-session.{ps1,sh}            # ① pre-flight freshness (see below)
    │
    ▼
-agent-worktrees resolve            # ② the Picker — you select or create a worktree
-   │                                  emits a JSON launch plan, then exits
+agent-worktrees resolve            # ② engine resolution; when Worktree Manager is
+   │                                  installed the Picker drives this boundary
    ▼
 knowledge plugin composition       # ③ paired harness only; settings.local.json
    │                                  is ready before Copilot plugin discovery
@@ -34,7 +34,8 @@ Copilot CLI session                # ⑤ your work happens here (often in a mux 
 post-exit checks                   # ⑥ detect completion; finalize if pushed
 ```
 
-Running the bare binstub always opens the Picker. To **skip** it and drive
+Running the bare binstub opens the Worktree Manager Picker when available, or
+the install trigger when it is not. To **skip** the Picker entirely and drive
 worktrees programmatically, use `agent-worktrees create [--json]` (no launch) or
 `agent-worktrees resolve --new` (create + launch a muxed session) — see
 [cli-reference.md](cli-reference.md). Why sessions run in a multiplexer at all
@@ -43,24 +44,20 @@ worktrees programmatically, use `agent-worktrees create [--json]` (no launch) or
 > **The bare-invocation seam (Phase 6).** A bare, no-args `<project>` is the
 > *human-facing* path, and it resolves through a **seam**: if the out-of-plugin
 > **Worktree Manager** (`worktree-manager`) is on PATH, the engine hands off to
-> it; otherwise it falls back to this bundled Picker. PATH presence of
-> `worktree-manager` is the whole signal — no registration file. Any *args* route
+> it; otherwise it shows the trustworthy install trigger. Any *args* route
 > programmatically to the tool CLI and never touch the seam, so an agent running
 > `<project> <verb>` never loads a Picker. The Manager reaches the engine only via
 > its machine-readable verbs — see the
 > [engine ↔ Picker `--json` contract](engine-picker-contract.md). (The seam lives
 > in the CLI so bare invocation always resolves sanely even through a stale
-> binstub; see the Phase 6 effort for the never-break 6a→6b→6c sequence.)
+> binstub; see the Phase 6 effort for the never-break 6a→6c sequence.)
 >
-> **When the bundled Picker is retired (6c).** The fallback then becomes a
-> **trustworthy install trigger**: with no Manager on PATH, bare `<project>`
-> prints the Manager's verifiable source
+> **With no Manager installed.** Bare `<project>` prints the Manager's
+> verifiable source
 > (`https://github.com/ThomasMichon/copilot-extensions`) and the platform install
 > one-liner (`worktree-manager/bootstrap.{sh,ps1}`) so a user who was on the full
 > version is guided to install it — never a silent break, and never an
-> auto-executed remote script. This is capability-gated on the `picker_tui`
-> package, so it stays dormant (no nag) while the Picker still ships and activates
-> automatically once 6c removes it.
+> auto-executed remote script.
 
 ### ① Freshness done for you at launch
 
@@ -69,7 +66,8 @@ never work against a stale tree or runtime:
 
 - **Pre-flight auto-update** — if the anchor repo has new commits affecting the
   worktree manager, the launcher re-runs the installer. Skip with `--no-update`
-  or `WORKTREE_NO_UPDATE=1`.
+  or `WORKTREE_NO_UPDATE=1`; the Picker then shows **Updates paused** and does
+  not expose a refresh action from another launch's staged-update status.
 - **Repo-adopted plugin reconciliation** — for each `<name>@copilot-extensions`
   in the anchor's `.github/copilot/settings.json`, the launcher ensures the
   payload is installed and its runtime matches (version-keyed, so an unchanged
@@ -114,9 +112,14 @@ with `Tab`:
   local host git-classifies its own worktrees; remote machines report their state
   over SSH.
 - **Worktree rows** — each shows machine · environment · `repo:id4` and a **state
-  block** (`WIP`, `DIRTY`, `UNUSED`, `CONVO 💬N`, `FINAL`, `ORPHAN`) with an
+  block** (`WIP`, `DIRTY`, `UNUSED`, `CONVO 💬N`, `FINAL`, `MERGED`, `ORPHAN`) with an
   `↑ahead`/`↓behind` sync tag. Same vocabulary as the status bar and
   [worktree-lifecycle.md § states](worktree-lifecycle.md#worktree-states). The
+  `RELATION` column independently summarizes reciprocal session metadata as
+  `BOUND`, `CONTROL`, `HANDOFF`, `TERM`, or `AMBIG`; the legacy ANSI Picker
+  appends the same tag to each worktree label. This presentation never changes
+  the git/lifecycle state block or which session is authoritative for resume.
+  The
   `LIVE` column distinguishes an attached (`●N`) or detached (`○`) terminal
   multiplexer, a live Copilot process without a mux (`PROC`), and stale PID-lock
   residue without a live process (`LOCK`).
@@ -142,11 +145,9 @@ constants:
 | `Space` | Select / deselect the focused worktree row (multi-select set) |
 
 > On **Windows over SSH** the TUI auto-falls back to a simpler legacy picker
-> (a ConPTY keyboard limitation). You can force either one for a single run with
-> `AGENT_WORKTREES_LEGACY_PICKER=1` (the rollback switch) or
-> `AGENT_WORKTREES_NEW_PICKER=1`, or persist a machine default with
-> `agent-worktrees picker disable` / `enable` (writes `new_picker`). See
-> [config-reference.md](config-reference.md).
+> (a ConPTY keyboard limitation). This fallback is automatic and unconditional
+> -- there is no supported way to opt out of the Textual picker otherwise; the
+> legacy picker is retired everywhere else.
 
 ## Core actions
 
@@ -170,7 +171,10 @@ session.
 ### Per-worktree actions
 `Enter` on a row opens its sub-menu — resume, plus context actions such as
 **Jump to host** for a bridge/system row (navigates to the owning machine tab and
-highlights the worktree by its stable id).
+highlights the worktree by its stable id). A worktree with one validated,
+unambiguous controller target also offers **Go to controller**. That action
+navigates to the exact loaded local or remote worktree row; it never rebinds the
+child or substitutes the controller for the child's resume target.
 
 Installed plugins can **contribute their own actions** onto this sub-menu (e.g. a
 bridge's "Send message", a dispatcher's "Dispatch task here") via a
@@ -335,29 +339,29 @@ captured with no live terminal and no human watching:
 > ever looks inert. See
 > [architecture.md](architecture.md#the-picker-render-flow----never-block-on-cross-processio-invariant).
 
-- **Screenshot for auditing** — `<project> picker screenshot` renders the current
-  picker headlessly and writes it out for review. `--format svg` (default) is a
-  standalone screenshot with colours preserved; `--format text` is the plain
-  character grid; `--format ansi` is the colour-aware grid. `--out FILE` writes a
-  file (else stdout), `--live` uses the multi-machine SSH source. Resolves the
-  project from the cwd like every other verb (or pass `--project`).
-- **Character-grid tests** — `picker_tui.capture` (`screen_to_text` /
-  `screen_to_ansi` / `screen_to_svg`, and `capture()` to spin the app headlessly
-  over a fixture fleet) lets tests assert *what the operator would see* — focus,
-  selection, state blocks, colour-as-semantics — as a golden character grid.
-  `tests/test_picker_capture.py` snapshots representative states
-  (`tests/goldens/picker/`); regenerate goldens with
-  `AGENT_WORKTREES_UPDATE_GOLDENS=1`.
+- **Screenshot for auditing** — `worktree-manager picker screenshot <project>`
+  renders the current picker headlessly and writes it out for review. `--format
+  svg` (default) is a standalone screenshot with colours preserved; `--format
+  text` is the plain character grid; `--format ansi` is the colour-aware grid.
+  `--out FILE` writes a file (else stdout), `--live` uses the multi-machine SSH
+  source.
+- **Character-grid tests** — `worktree_manager.production_picker.picker_tui.capture`
+  (`screen_to_text` / `screen_to_ansi` / `screen_to_svg`, and `capture()` to spin
+  the app headlessly over a fixture fleet) lets tests assert *what the operator
+  would see* — focus, selection, state blocks, colour-as-semantics — as a golden
+  character grid. The canonical snapshots now live under
+  `worktree-manager/tests/production_picker/`.
 
 ### Shareable & animated demo captures
 
 The same capture seam produces **safe-to-publish** imagery from real fleet data:
 
-- **Obscured render** — `picker_tui.obscure.obscured_source()` turns real
-  `list --json` dumps into a synthetic source with identifying particulars
-  scrubbed (machine names -> codenames, repo/branch -> generic, titles -> a demo
-  pool, PR url/number/sha and paths/summaries removed) while preserving the
-  *shape* (states, sync tags, ages, dispositions) that makes it look authentic.
+- **Obscured render** — `worktree_manager.production_picker.picker_tui.obscure`
+  turns real `list --json` dumps into a synthetic source with identifying
+  particulars scrubbed (machine names -> codenames, repo/branch -> generic,
+  titles -> a demo pool, PR url/number/sha and paths/summaries removed) while
+  preserving the *shape* (states, sync tags, ages, dispositions) that makes it
+  look authentic.
 - **Animated walkthrough** — `capture_frames_async()` drives the picker through a
   scripted keyboard tour (switch pivot -> move selection -> open/close a menu)
   and returns a frame per step.
@@ -376,15 +380,14 @@ The same capture seam produces **safe-to-publish** imagery from real fleet data:
 The Picker reflects **live** state, not a snapshot: rows carry git-derived
 state + sync tags, a staged runtime update surfaces as an "apply staged update +
 restart the picker" row, and `r` refreshes (re-scanning contributed pivots).
-Merged worktrees show as `FINAL`/completed and are cleared by Cleanup, not left
-lying as open work.
+Merged worktrees show as `FINAL` or `MERGED` (see
+[worktree-lifecycle.md § FINAL vs MERGED](worktree-lifecycle.md#final-vs-merged----the-closure-descriptor-split))
+and are cleared by Cleanup, not left lying as open work.
 
 ## Related config
 
 | Key / env | Effect |
 |-----------|--------|
-| `new_picker` (config; default `true`) | Textual TUI vs legacy picker. `picker disable`/`enable` persists it. |
-| `AGENT_WORKTREES_LEGACY_PICKER` / `AGENT_WORKTREES_NEW_PICKER` | Force one picker for a single invocation (legacy wins). |
 | `auto_fast_forward` (config; default `true`) | Auto-FF a clean, stale worktree on resume. |
 | `copilot_profiles` (config) | The backend profiles offered in the Configuration → Profiles grid. |
 | `WORKTREE_NO_UPDATE=1` / `WORKTREE_NO_RECONCILE=1` | Skip pre-flight auto-update / repo-plugin reconciliation at launch. |
@@ -402,3 +405,23 @@ Full key reference: [config-reference.md](config-reference.md).
   non-interactive verbs.
 - [Architecture § Picker Pivot Registry](architecture.md#picker-pivot-registry-cross-plugin)
   — how cross-plugin pivots and actions work.
+### Frame-health diagnostics
+
+Every generated project binstub appends a `binstub_start` record to
+`~/.agent-worktrees/logs/picker-launches.jsonl`. The Picker appends
+`launcher_start`, `resolve_start`, `resolve_handler_start`,
+`picker_dispatch_start`, `textual_app_start`, and `textual_first_refresh` as the
+launch advances, all with the same `launch_id`. These always-on records provide
+historical blank-window timings without enabling verbose diagnostics.
+
+Set `AGENT_WORKTREES_PICKER_FRAME_HEALTH=1` before launching a project Picker
+to add event-loop gaps of 500 ms or more to the same launch trace. The timer
+callback only enqueues bounded records; a daemon writer owns filesystem I/O.
+Override the diagnostic destination by setting the variable to a path, or the threshold with
+`AGENT_WORKTREES_PICKER_FRAME_GAP_SECONDS`.
+
+Subscribe while reproducing:
+
+```powershell
+Get-Content "$HOME\.agent-worktrees\logs\picker-launches.jsonl" -Wait
+```

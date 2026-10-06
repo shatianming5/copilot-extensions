@@ -57,6 +57,7 @@ _DEFAULT_MINUTES = 20
 _TERMINAL_STATES = frozenset({"completed", "finalized", "removed", "pruned"})
 
 _OFF_VALUES = frozenset({"0", "off", "false", "no"})
+_UNSET = object()
 
 
 def _truthy_off(val: str | None) -> bool:
@@ -128,16 +129,19 @@ def _nudge_text(calls: int, minutes: int) -> str:
     return (
         f"[agent-worktrees] It's been {calls} tool call(s) / ~{minutes} min since "
         "this worktree's Picker disposition was last written, and the focus or "
-        "state may have moved. If so, refresh the highest-signal status the "
-        "Picker has: run `agent-worktrees status --summary \"<where things "
-        "stand>\"` -- add `--title \"<short headline>\"` if the focus changed, and "
-        "keep `--follow-up`/`--resolved` accurate. If nothing consequential "
-        "changed, ignore this."
+        "state may have moved. If so, refresh it: `agent-worktrees status "
+        "--activity \"<current sub-task>\"` most often (pass this whenever the "
+        "immediate focus shifts); add `--summary \"<updated recap>\"` only "
+        "occasionally, to fold newly completed work into the existing summary; "
+        "add `--title \"<short headline>\"` only rarely, when the worktree's "
+        "main theme genuinely changed. Keep `--follow-up`/`--resolved` "
+        "accurate. If nothing consequential changed, ignore this."
     )
 
 
 def decide(
     payload: dict, *, env=None, home=None, now: float | None = None,
+    tracking_record=_UNSET, deadline: float | None = None,
 ) -> str | None:
     """Return the ``additionalContext`` reminder string, or None for a no-op.
 
@@ -150,16 +154,23 @@ def decide(
         return None
     home = Path(home) if home is not None else Path.home()
     now = time.time() if now is None else now
+    if deadline is not None and time.time() >= deadline:
+        return None
 
     cwd = str(payload.get("cwd") or "") or os.getcwd()
     aw = home / ".agent-worktrees"
-    found = _find_tracking_yaml(cwd, home)
+    found = (
+        _find_tracking_yaml(cwd, home)
+        if tracking_record is _UNSET else tracking_record
+    )
     if not found:
         return None
     worktree_id, yaml_path = found
 
     note_at, state = _read_record_fields(yaml_path)
     if state in _TERMINAL_STATES:
+        if deadline is not None and time.time() >= deadline:
+            return None
         # Sealed disposition -- stop nudging and drop any sidecar.
         _clear_sidecar(aw, worktree_id)
         return None
@@ -193,6 +204,8 @@ def decide(
         # resets independently.
         data = {"count": 0, "window_start": now, "seen_note_at": note_at}
 
+    if deadline is not None and time.time() >= deadline:
+        return None
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         sidecar.write_text(json.dumps(data), encoding="utf-8")

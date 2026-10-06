@@ -75,6 +75,23 @@ def test_sweep_resolver_exception_is_spare(tmp_path):
     assert flipped == [] and rec.resources[0].state == "active"
 
 
+def test_sweep_settles_merged_pr_claim_as_released_not_abandoned():
+    """pr-merge-obligation-gate defense 2: a `pr`-kind claim's gone-and-safe
+    verdict means "this PR is provably merged" (sweep.py's `pr_merged`) -- a
+    clean, successful completion, never an involuntary reclaim. Every OTHER
+    kind still gets `abandoned` (unchanged)."""
+    claims = [
+        tracking.ResourceClaim(kind="pr", ref="o/r#1", state="active"),
+        tracking.ResourceClaim(kind="worktree", ref="m/p/gone-safe", state="active"),
+    ]
+    rec = _rec(claims)
+    flipped = tracking.sweep_abandoned_obligations(
+        rec, gone_of=lambda c: True, safe_of=lambda c: True, save=False)
+    assert {c.ref for c in flipped} == {"o/r#1", "m/p/gone-safe"}
+    assert claims[0].state == "released"
+    assert claims[1].state == "abandoned"
+
+
 # ── _claims_sweep CLI (child-record resolution) ──────────────────────────────
 
 def _seed_project(tmp_path, monkeypatch, machine="m", project="p"):
@@ -127,10 +144,54 @@ def test_cli_sweep_apply_abandons_finalized_child_claim(tmp_path, monkeypatch, c
     tdir = _seed_project(tmp_path, monkeypatch)
     _child(tdir, "wt-child", "finalized")
     _owner_with_claim(tdir, "wt-owner", "m/p/wt-child")
+    logged = []
+    monkeypatch.setattr(m.activity, "log_event", lambda *a, **k: logged.append((a, k)))
     rc = m.cmd_claims(_sweep_args(apply=True))
     assert rc == 0
     owner = tracking.load_record(tdir / "wt-owner.yaml")
     assert owner.resources[0].state == "abandoned"
+    assert logged == [(("claim_abandoned",), {
+        "worktree_id": "wt-owner", "kind": "worktree", "ref": "m/p/wt-child"})]
+
+
+def test_cli_sweep_dry_run_does_not_log(tmp_path, monkeypatch, capfd):
+    tdir = _seed_project(tmp_path, monkeypatch)
+    _child(tdir, "wt-child", "finalized")
+    _owner_with_claim(tdir, "wt-owner", "m/p/wt-child")
+    logged = []
+    monkeypatch.setattr(m.activity, "log_event", lambda *a, **k: logged.append((a, k)))
+    rc = m.cmd_claims(_sweep_args(apply=False))
+    assert rc == 0
+    assert logged == []
+
+
+def test_cli_sweep_apply_feeds_claim_history_for_pr_kind(tmp_path, monkeypatch, capfd):
+    """The never-wedge sweep is another real place a pr-kind claim gets
+    released (abandoned) outside the three single-claim verbs -- it must
+    feed the same ownership-history ledger, attributed to the RECORD's own
+    machine (never the ambient config's -- a renamed/migrated machine can
+    differ)."""
+    tdir = _seed_project(tmp_path, monkeypatch, machine="config-machine")
+    rec = tracking.create_new_record(
+        "wt-owner", "worktree/wt-owner", str(tdir.parent / "wt-owner"), "p",
+        "record-machine", "windows", tdir,
+    )
+    tracking.add_resource_claim(
+        rec, tracking.ResourceClaim(
+            kind="pr", ref="o/r#1", created_at=tracking._now_iso(), state="active"),
+        save=False,
+    )
+    tracking.save_record(rec, tdir / "wt-owner.yaml")
+    import agent_worktrees.sweep as sweep_mod
+    monkeypatch.setattr(
+        sweep_mod, "make_resolvers", lambda config: (lambda c: True, lambda c: True))
+    rc = m.cmd_claims(_sweep_args(apply=True))
+    assert rc == 0
+    from agent_worktrees import claim_history
+    events = claim_history.history_for_ref("o/r#1")
+    assert [e["event"] for e in events] == ["released"]
+    assert events[0]["note"] == "merged"
+    assert events[0]["machine"] == "record-machine"
 
 
 def test_cli_sweep_spares_orphaned_and_active_children(tmp_path, monkeypatch, capfd):

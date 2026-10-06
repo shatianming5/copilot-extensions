@@ -47,9 +47,26 @@ def _write_payload(root: Path, version: str) -> None:
     pkg = root / "worktree-manager" / "src" / "worktree_manager"
     pkg.mkdir(parents=True, exist_ok=True)
     (pkg / "__init__.py").write_text(f'__version__ = "{version}"\n', "utf-8")
+    (pkg / "__main__.py").write_text("", "utf-8")
     (root / "worktree-manager" / "pyproject.toml").write_text(
         f"[project]\nname='copilot-extensions-worktree-manager'\nversion='{version}'\n",
         "utf-8",
+    )
+
+
+def _write_payload_with_unresolvable_pointer(root: Path, version: str) -> None:
+    """Like ``_write_payload``, but the payload's own ``libs/<lib>`` carries
+    an un-materialized vendor pointer, and the remote has NO top-level
+    ``libs/`` of its own -- the "no monorepo ancestor to resolve canonical
+    from" case ``_materialize_payload_pointers`` must refuse rather than
+    silently ship."""
+    _write_payload(root, version)
+    copy_dir = root / "worktree-manager" / "libs" / "shared-lib"
+    (copy_dir / "src" / "shared_lib").mkdir(parents=True)
+    (copy_dir / "src" / "shared_lib" / "__init__.py").write_text("# stub\n", "utf-8")
+    (copy_dir / "VENDOR_POINTER.json").write_text(
+        '{"schema": "copilot-extensions.vendor-pointer", "version": 1, '
+        '"source": "libs/shared-lib", "kind": "src-passthrough"}\n', "utf-8",
     )
 
 
@@ -73,7 +90,60 @@ def _seed_older_install(tmp: Path, root: Path, version: str) -> None:
     assert res.action == "installed" and current_version(root) == version
 
 
-def test_self_update_fetches_local_remote_and_publishes_new_slot(tmp_path, monkeypatch):
+@pytest.fixture(autouse=True)
+def _isolate_provider_registry(monkeypatch, tmp_path):
+    """Every real ``self_install()``/``self_update(dry_run=False)`` call in
+    this file reaches ``_write_control_plane_provider_manifest``, which
+    writes to ``control_plane_providers_dir()`` -- **not** gated by ``root``
+    the way the marker/slot/binstub writes are. Each test here already
+    isolates the binstub command via ``si.local_bin`` (so the manifest's own
+    *content* -- ``command``/``provider_root`` -- correctly points at
+    ``tmp_path``), but without ALSO isolating where that manifest file gets
+    *written*, every test wrote it straight through to the real
+    ``~/.agent-worktrees/control-plane-providers.d/worktree-manager.json`` on
+    any machine that ran this suite natively -- clobbering the real
+    worktree-manager registration with this test's own tmp_path-rooted
+    values and leaving it broken long after the run that caused it had
+    finished (the exact production incident this fixture closes). Autouse,
+    not opt-in per test, both because every test here needs it and because
+    an easy-to-forget opt-in is exactly how this leaked in the first place
+    (same convention as ``test_self_install.py``'s
+    ``_patch_provider_registry``).
+    """
+    registry = tmp_path / ".agent-worktrees" / "control-plane-providers.d"
+    monkeypatch.setattr(si, "control_plane_providers_dir", lambda: registry)
+    return registry
+
+
+@pytest.fixture
+def mock_cutover(monkeypatch):
+    """This file is about the real git-fetch -> versioned-slot-publish delivery
+    path, not daemon cutover -- but every ``self_update(dry_run=False)`` call
+    below still reaches its own real (unmocked) cutover step,
+    ``mux_daemon_cutover.activate_after_update`` -> ``spawn_passive``, which
+    launches a REAL, detached/breakaway background OS process (see
+    ``spawn_passive``'s ``windowless_daemon_kwargs(breakaway=True)``) rooted at
+    this test's own ``tmp_path``. That process outlives both the test and the
+    whole pytest run -- pytest's teardown has no handle on a detached child --
+    and this exact pattern was confirmed to leak a real, persistent Windows
+    user-PATH mutation pointing at a since-deleted tmp_path on a machine that
+    ran the suite natively (see ``test_update.py``'s
+    ``test_self_update_without_git_falls_back_to_tarball``). Mock it here too,
+    for every test in this file that drives a real ``self_update``.
+    """
+    seen: dict[str, object] = {}
+
+    def _fake_cutover(**kw):
+        seen["cutover_kwargs"] = kw
+        return {"action": "cutover", "result": {"ok": True}}
+
+    monkeypatch.setattr(
+        "worktree_manager.mux_daemon_cutover.activate_after_update", _fake_cutover
+    )
+    return seen
+
+
+def test_self_update_fetches_local_remote_and_publishes_new_slot(tmp_path, monkeypatch, mock_cutover):
     root = tmp_path / "root"
     monkeypatch.setattr(si, "local_bin", lambda: tmp_path / "localbin")
     _seed_older_install(tmp_path, root, "1.0.0")
@@ -94,7 +164,35 @@ def test_self_update_fetches_local_remote_and_publishes_new_slot(tmp_path, monke
     assert (version_slot("9.9.9", root) / "src" / "worktree_manager" / "__init__.py").exists()
 
 
-def test_self_update_second_run_is_version_gated(tmp_path, monkeypatch):
+def test_self_update_reports_error_and_cleans_up_when_pointer_unresolvable(tmp_path, monkeypatch, mock_cutover):
+    """Round-8 review finding: self_update() must translate a materialization
+    failure into a clean SelfUpdateResult(action="error") -- not let the
+    RuntimeError escape past self_update's own documented best-effort/
+    non-fatal contract -- and must not leave a broken slot behind that a
+    later needs_install() existence check could mistake for a valid
+    install."""
+    root = tmp_path / "root"
+    monkeypatch.setattr(si, "local_bin", lambda: tmp_path / "localbin")
+    _seed_older_install(tmp_path, root, "1.0.0")
+
+    remote = tmp_path / "remote"
+    remote.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(remote)], check=True)
+    _write_payload_with_unresolvable_pointer(remote, "9.9.9")
+    subprocess.run(["git", "-C", str(remote), *_GIT_ID, "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(remote), *_GIT_ID, "commit", "-q", "-m", "payload"],
+                   check=True)
+    sc.set_source(repo=str(remote), root=root)
+
+    res = self_update(root=root, ref="main", dry_run=False)
+    assert res.action == "error"
+    assert "unmaterialized vendor pointers" in (res.reason or "")
+    # The prior install is untouched, and no broken new slot was left behind.
+    assert current_version(root) == "1.0.0"
+    assert not version_slot("9.9.9", root).exists()
+
+
+def test_self_update_second_run_is_version_gated(tmp_path, monkeypatch, mock_cutover):
     root = tmp_path / "root"
     monkeypatch.setattr(si, "local_bin", lambda: tmp_path / "localbin")
     _seed_older_install(tmp_path, root, "1.0.0")
@@ -111,7 +209,7 @@ def test_self_update_second_run_is_version_gated(tmp_path, monkeypatch):
     assert current_version(root) == "9.9.9"
 
 
-def test_self_update_fetch_path_honors_switched_source(tmp_path, monkeypatch):
+def test_self_update_fetch_path_honors_switched_source(tmp_path, monkeypatch, mock_cutover):
     """After the first update, re-pointing the source config at a different remote
     must take effect on the *fetch* path (staging already exists) — i.e. the
     override is authoritative every run, not just on the initial clone."""
@@ -134,7 +232,7 @@ def test_self_update_fetch_path_honors_switched_source(tmp_path, monkeypatch):
     assert version_slot("9.9.10", root).is_dir()
 
 
-def test_self_update_uses_configured_ref(tmp_path, monkeypatch):
+def test_self_update_uses_configured_ref(tmp_path, monkeypatch, mock_cutover):
     """With no explicit ref, self_update fetches the branch from the source config."""
     root = tmp_path / "root"
     monkeypatch.setattr(si, "local_bin", lambda: tmp_path / "localbin")

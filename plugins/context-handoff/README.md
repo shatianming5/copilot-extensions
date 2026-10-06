@@ -2,13 +2,238 @@
 
 Context window monitoring and session handoff for GitHub Copilot CLI.
 
-This plugin ships three cooperating pieces:
+This plugin tracks context pressure, stores durable handoff briefs, and
+preserves native `/goal` execution across an explicitly requested live handoff.
+`continue_handoff` delegates process launch to Herdr or agent-worktrees and
+admits the successor before allowing identity-checked predecessor retirement.
+The legacy `trigger_handoff` signal-only route remains available for older
+text-only records.
+
+This plugin ships four cooperating payload pieces:
 
 | Piece | Type | Role |
 |-------|------|------|
-| **continuity guidance hook** | Declarative `sessionStart` hook | Injects a concise, owner-marked `additionalContext` kernel that tells objective-owning sessions to work thoroughly across context windows, treat handoff as a relay rather than completion, and move unfinished planning into execution without bypassing required gates |
-| **context-handoff extension** | Copilot CLI session extension (`extension.mjs`) | Monitors `session.usage_info` for exact token counts; applies percentage-based soft/hard thresholds (55% / 70% by default) with optional repository overrides, delivered on the next idle; provides `generate_handoff_prompt`, `save_handoff_prompt`, `consume_handoff`, `continue_handoff`, and `retry_handoff_cutover` tools plus the **`/handoff-continue`** and **`/resume-handoff`** slash commands. In Herdr, `save_handoff_prompt` writes a checkout-scoped one-time machine-local file without probing agent-worktrees, and `continue_handoff` calls the installed `copilot-pane launch --task-file` path exactly once to create a seeded sibling while retaining the predecessor. Outside Herdr, a reachable coordinator plus linked worktree still stores a `proposed`/`handoff` task and uses the existing mux cutover, with the prior machine-local file fallback. `retry_handoff_cutover` re-attempts a live cutover from the **already-saved** handoff without regeneration. `/resume-handoff` digs up this checkout's pending handoff (task, else file), consumes it once, and **injects its continuation prompt into the current session** |
-| **context-handoff skill** | Skill | The `/handoff` workflow -- composes the continuation prompt from the extension's structured facts and the agent's live context. (Resume is handled by the extension's `/resume-handoff` command, which injects the handoff; the skill documents both) |
+| **continuity guidance hook** | Declarative `sessionStart` hook | Writes the full owner-marked continuity contract to the exact session folder and emits only `{}` |
+| **context-handoff extension** | Copilot CLI session extension (`extension.mjs`) | Monitors `session.usage_info` for exact token counts; applies percentage-based soft/hard/**force** thresholds (55% / 70% / 79% by default) with optional repository overrides, delivered on the next idle -- soft/hard warnings fire under the default `manual-only` mode too (any mode other than `off`); only the force tier's auto-draft/store/trigger + mutating-tool-call denial, and `trigger_handoff`'s live-cutover signaling, are opt-in (`mode: auto` in `.context-handoff/config.yaml`; the default, `manual-only`, always still stores/seeds a handoff on request, see § Thresholds); provides `generate_handoff_prompt`, `save_handoff_prompt`, `consume_handoff`, and `trigger_handoff` tools plus **`/handoff-continue`**, **`/consume-handoff`**, and the compatibility **`/resume-handoff`** alias |
+| **context-handoff skill** | Skill | Owns the `/handoff` workflow: compose the continuation prompt from the extension's structured facts and the agent's live context, decide when to store it, and decide whether to ask or trigger |
+| **payload-local fallback CLI** | Node script (`handoff-cli.mjs`) | Extension-free facts, save, trigger, task/file consume, `check-heads` auditing, a safe `retry-cutover` remediation for a superseded session, a lock/rebase-safe `sync-worktree` (shared with the force-tier path), `list-sessions`/`get-previous-session` lineage lookups, and `abort` to cancel a pending handoff before it's consumed. Invoked by exact verified plugin-root-relative path; it has no PATH binstub or install/runtime step and shares `handoff-core.mjs` with the extension |
+
+## The boundary
+
+`context-handoff` owns **continuity policy and baton storage**:
+
+1. detect context pressure (soft/hard warnings fire under the default
+   `manual-only` mode too; always available on request),
+2. help the agent compose the right brief,
+3. store that brief durably,
+4. expose a short recovery seed,
+5. signal that pickup is requested (opt-in: `mode: auto` only -- see
+   § Thresholds),
+6. report whether anything seems to have picked the request up (same
+   opt-in scope as 5).
+
+It does **not** own:
+
+- mux / tmux / psmux / Herdr orchestration,
+- successor process creation,
+- pane retirement,
+- PID verification,
+- in-process cutover choreography.
+
+If a control plane is present, it can watch the pending handoff state this
+plugin leaves behind and perform the actual cutover. If not, the plugin still
+returns a short handoff seed a human can use manually.
+
+**Fork exception -- native goal continuity.** A baton that carries a native
+goal (Copilot/Grok `/goal`) is launched by this plugin itself through
+`continue_handoff`, because the successor must start with the frozen objective
+before any control plane could seed it; see the next section.
+
+## Native goal continuity
+
+Requires Node.js and Copilot CLI **1.0.84-3** (the tested native API version).
+The extension uses the public SDK plus the published
+`session.autopilotObjective.getState` RPC, never patched CLI internals.
+
+1. Save the brief and call `continue_handoff` with its exact `HANDOFF_SEED`.
+   `/handoff-continue` requests both operations. Save alone does not launch.
+2. The source stops automatic execution, finishes the current turn, and freezes
+   final native usage at `session.idle`.
+3. A fixed, named successor starts **without `-i` or a model admission turn**.
+   Public workspace APIs carry the native-generated opaque objective snapshot;
+   normal exit and cold resume hydrate the native objective registry.
+4. The brief becomes `context-handoff.md` in the successor's session workspace.
+   Shared task/file consumption, model/agent/permission checks, and mux
+   bind/link/head acknowledgement precede activation.
+5. A running objective gets at most one business continuation. A queued send ID
+   alone is not admission: its exact public `user.message` must be observed
+   before predecessor retirement. Herdr retirement verifies the recorded
+   pane, terminal, and session identity.
+
+| Source intent | Successor behavior |
+|---|---|
+| Running, finite remaining budget | Resume with exactly `max(0, cap - exact native usage)` remaining |
+| Running, unlimited | Remain unlimited; an internal native ID may change |
+| Paused or exhausted | Remain stopped; no automatic business message |
+| Completed | Remain completed; never reopen automatically |
+| No native goal | Preserve the profile and brief without creating a goal or sending a business message |
+
+Credit limits are native **soft caps**, not hard billing limits. Preserve
+native decimal/nano-AIU accounting; zero never means unlimited. Stopped goals
+may retain the original positive cap and spent amount, including overshoot.
+Running goals display the real native GoalPanel. Native interactive/paused/
+completed modes intentionally hide it; do not add credits or enable autopilot
+just to display a panel.
+
+The runtime preserves the source model, reasoning effort, context tier, agent,
+`COPILOT_HOME`, and permission mode. Native handoffs on both Herdr and mux
+currently support only `allow-all`; manual/assisted sources are rejected
+**before pausing the source or creating a pane**, not silently widened.
+The direct native mux CLI and prepare/resume launcher enforce the same limit.
+Ordinary non-native handoff behavior is unchanged.
+First use in an empty profile can require native extension
+trust confirmation for the plugin's existing capabilities.
+
+For a custom-agent launch, receiver bootstrap subscribes to native
+`subagent.selected` / `subagent.deselected` events before checking the current
+agent. A transient default agent during cold resume is not a settled profile:
+bootstrap waits for selection without blocking extension initialization.
+Default-agent launches do not wait for a custom-selection event. Admission
+still compares every profile field exactly; a genuine mismatch reports the
+field's expected and observed values and preserves the source.
+
+Install context-handoff, agent-worktrees, and agent-dispatch as sibling plugin
+payloads in the same installation root. The shared core resolves its runtime
+peers relative to that root; installing only context-handoff in a different
+root from its peers does not provide a working mux/task fallback. Use the
+official plugin manager for all three payloads, not installed-cache copies.
+
+Linux Herdr/file-backed two-CLI handoffs, repeat handoffs, and native retry/
+conflict boundaries have real-runtime coverage. Task/mux ownership and psmux
+spaced-argument transport have regression fixtures; this is not a claim of
+real Windows acceptance.
+
+### Source-private observers
+
+On the tested CLI 1.0.84-5 task API, native `session.idle` waits for attached
+shells. `continue_handoff` checks the actual source task roster before pausing
+or arming cutover. Pass `observers` only for explicitly owned, separate
+read-only observers of independently running jobs:
+`{shell_id, job: {host, id, identity, artifact_path, terminal_path, reattach}}`.
+The checkpoint preserves the original job and runtime observer identity
+before reporting that the attached observer must be parked. Verify separation
+from the job, stop only that exact shell using `stop_bash`, and retry the same
+request. No process is automatically signalled; undeclared attached work is
+not a disposable observer. The job must persist terminal results without its
+observer.
+
+The restored brief carries this metadata without executing it. After native
+admission, inspect durable terminal evidence first; a job can finish during
+the observation gap. Otherwise attach a fresh event-driven observer to the
+same job and record its new identity. Never reuse an old shell ID as proof,
+relaunch a job, or change goal/mode/budget. Paused/no-goal handoffs do not gain
+an automatic observation or business turn. See the skill for preparation.
+
+### Recovery
+
+- Retain the source checkpoint and fixed successor identity on failure.
+  `retry_handoff_cutover` reuses the existing saved request; do not save a new
+  baton while an existing launch is unresolved.
+- Interrupted first trust resumes the already-created empty receiver UUID.
+  A prepared receiver resumes instead of provisioning a second session.
+- For a profile rejection before consumption, first verify the source's
+  frozen profile and receiver identity. After installing the corrected plugin,
+  exit only the failed receiver and run `native-launch.mjs --checkpoint PATH
+  --cli COPILOT -- [original host options]` in that same pane and working
+  directory. A `prepared` checkpoint selects cold resume of the same UUID and
+  token; do not create a new pane, resave the baton, change its goal, or widen
+  permissions. A genuine mismatch must be resolved, not bypassed.
+- Receiver preparation waits for the source's host-launch receipt before
+  writing its own checkpoint. Startup/trust can finish while this event-driven
+  wait is pending. An unknown host launch requires inspection of that receiver,
+  not another spawn.
+- A nonzero mux CLI exit can still carry a retained `new_pane` receipt
+  (for example, exit 4 while session association is pending). Publish that
+  receipt and reuse the receiver; retry must not create another pane.
+  Structured pre-spawn rejections (exit 1/2/3, including no live mux) clear the
+  launch request so an explicit retry is possible. A mux timeout, missing
+  receipt, or malformed response leaves the request unresolved and the source
+  preserved; a missing pane ID alone is not permission to respawn.
+- A known queued send waits for its exact native event without resending.
+  A lost acknowledgement reconciles the unique continuation from public events;
+  an unknown outcome with no matching event stops and preserves the source.
+- Only an owned activation with an unchanged event watermark and no business
+  submission can be reactivated after an unlimited cold resume. Its prior
+  internal ID is recorded. Identical goal text alone never proves ownership.
+  A user's replacement objective is a conflict, not permission to overwrite it.
+- Ordinary admitted deliveries never rebuild the goal or replay the message.
+  The CLI fallback shares the restoration gate and cannot bypass hydration.
+
+## Managed worker continuity
+
+An ordinary session may register its frontend with the paired lifecycle module
+without restoring a handoff. If registration fails, startup and tool errors
+identify that registration failure and the unavailable managed-launch capability.
+Only startup with a native checkpoint reports a restoration failure and a
+preserved predecessor; the underlying failure remains visible in both cases.
+Reload also refreshes frontend registration for an already managed session.
+An existing logical binding is not proof that its current extension/process
+registration has survived a paired update.
+
+The optional lifecycle bridge preserves an external managed-worker registry;
+it does not add a scheduler, a second registry, or a new goal/admission turn.
+Only sources with a managed session reference use the bridge. Unmanaged
+handoffs keep their existing behavior.
+
+The trusted hosted `copilot-pane lifecycle` interface owns stable registry,
+logical owner/worker IDs, generations, current bindings, result persistence and
+acceptance. Native checkpoints carry its non-executable receipt and frozen
+mode/depth/configuration selectors, not commands from the handoff brief.
+The module prepares the fixed receiver's reference before launch. A fresh
+receiver directory cannot imply an empty worker roster.
+
+In a paired Herdr configuration, native startup advertises the loaded
+protocol/plugin path and actual frontend identity through that same external
+module. Only a fresh CLI that loaded the installed completion hook can become
+a new managed root; pre-installation sessions remain on the ordinary untracked
+path. Unmanaged non-Herdr startup does not invoke this bridge.
+
+After native hydration/consumption, profile checks and (when running) the
+observed continuation event, `native-runtime.mjs` commits external authority
+before native predecessor retirement. The successor is then the only logical
+owner, including during retirement failure. `herdr.mjs` remains the physical
+retirement owner: its managed route checks the original process family through
+the same lifecycle interface and can recover a lost close receipt only when
+the exact source pane and processes are already gone. Retiring a source does
+not close its logical worker or still-running children.
+
+Managed preparation/cold resume uses the same receiver UUID and reapplies the
+frozen mode/depth/configuration selectors at the hosted shim's final exec.
+This preserves explicit off and external delegation depth through shell
+startup/dotenv. Model, permissions, goal intent and exact remaining soft caps
+remain owned by the existing native restoration path.
+
+`retry_handoff_cutover` in that fixed receiver recovers failed preparation,
+consumption/admission, registry commitment or retirement without re-saving,
+spawning another receiver, re-consuming an acknowledged baton, or replaying
+business continuation. Failure receipts stay in the checkpoint. A completed
+lifecycle-retirement receipt is not reapplied to a later handoff generation.
+Unknown native send outcomes still require the matching event; retries never
+guess delivery.
+
+Validate and deploy the native bridge and external lifecycle module together,
+using supported source-plugin/user-extension discovery for isolated local
+validation and the repository's supported deployment flow. Do not patch an
+installed cache or copy authentication files. An unpaired managed source
+fails visibly instead of falling back to an empty/unmanaged registry.
+Current process-family/exit validation is Linux/Herdr-specific; this adds no
+macOS or Windows managed-worker acceptance claim.
+
+An external preToolUse completion guard can deny `task_complete` in allow-all
+autopilot (verified on CLI 1.0.84-5). Ordinary interactive final answers have
+no such tool. Neither handoff nor the bridge enables autopilot to obtain a
+gate: paused/exhausted/completed/no-goal intent is preserved, and explicit
+parent acceptance remains necessary in interactive mode.
 
 ## Why the monitor is an extension
 
@@ -26,331 +251,730 @@ hook surface a plugin normally uses cannot replicate it:
 
 So token monitoring and idle-boundary nudges require the extension payload.
 The ambient continuity contract does not: it is delivered independently through
-the plugin's declarative `sessionStart` hook, following the repository's
-context-injection pattern.
+the plugin's static instruction pointer plus a declarative `sessionStart` file
+writer.
 
-The hook intentionally treats plugin enablement as its applicability gate. Its
-policy is capability-generic and source-neutral, so it does not inspect
-`sessionStart` `cwd` or `source`, assume a mux or worktree is present, or exclude
-resumed sessions. Detailed handoff mechanics select the available task, file,
-live-cutover, or paste path on demand.
-
-## How the extension is delivered (no install step)
+## How the extension is delivered
 
 This is a **plugin-contributed extension**. The Copilot CLI discovers
 extensions contributed by **enabled** installed plugins directly from the
-plugin's `extensions/` directory (the `plugin` extension source) -- it scans
-each `extensions/<name>/` subdir holding an `extension.{mjs,cjs,js}` file. This
-plugin ships exactly one:
+plugin's `extensions/` directory. This plugin ships exactly one:
 
-```
+```text
 plugins/context-handoff/extensions/context-handoff/extension.mjs
 ```
 
 There is **no** installed runtime, venv, binstub, copy to
 `~/.copilot/extensions/`, deploy manifest, or `scripts/install.*`. Enabling the
 plugin is the whole setup; the extension activates on the **next** Copilot CLI
-session (extensions are scanned at startup).
-
-## Requirements
-
-Two conditions must hold for the extension to load -- both are handled outside
-this plugin:
-
-1. **The plugin must be enabled.** `context-handoff@copilot-extensions: true`
-   in `enabledPlugins` (user `~/.copilot/settings.json`, or a repo's
-   `.github/copilot/settings.json`). A marketplace plugin's `extensions/` dir is
-   only scanned when the plugin is enabled.
-2. **`experimental: true`** in `~/.copilot/settings.json` -- the CLI gates *all*
-   extension loading behind it. Set it directly if your environment has not
-   already done so. This plugin does not set it and does not require registering
-   the repo with agent-worktrees.
-
-Herdr live cutover is optional. When the current process has
-`HERDR_ENV=1` plus `HERDR_PANE_ID`, the extension expects the separately managed
-`~/.local/bin/copilot-pane` launcher. No extra environment variable or manual
-seed command is required; `/handoff-continue` selects that path automatically
-and resolves the checkout from `herdr pane current --current` rather than a
-possibly stale Copilot process cwd.
+session.
 
 ## Verify
 
-A session where the plugin hook loaded receives an owner marker beginning with
-`[owner: context-handoff@...]` in `additionalContext`. Without an adopted
-aggregate authority, an adjacent agent-worktrees payload also contributes that
-payload's exact command in an honestly attributed `adjacent-compatibility`
-catalog. Adjacency is a payload-presence check, not an assertion that
-agent-worktrees is enabled in the current session; the catalog reports `ready`
-only when both its command and installer are present, otherwise `unavailable`.
-With the exact compatible `context-injection@copilot-extensions` authority
-adopted, this plugin contributes only its compact continuity kernel and
-agent-worktrees contributes its own catalog to the deterministic aggregate.
-The POSIX compatibility catalog requires a system
-`python3` or `python`; without one, the valid continuity kernel still emits by
-itself. A standalone context-handoff installation also emits only its own
-kernel. A loaded extension exposes the `generate_handoff_prompt`,
-`save_handoff_prompt`, `consume_handoff`, `continue_handoff`, and
-`retry_handoff_cutover` tools, plus
-`/handoff-continue` and `/resume-handoff`; `/extensions` lists it with source **plugin**. It
-intentionally does **not** emit a user-visible "Session started" breadcrumb. If
-it does not load, confirm both requirements above and start a fresh session (the
-`context-handoff-setup` troubleshooting skill walks through this).
+A session where the plugin hooks loaded receives the full owner-marked
+continuity contract in
+`instructions/context-handoff/session-guidance.instructions.md` beneath its
+exact session folder. The checked-in static pointer instructs the agent to read
+that file if present. The hook itself emits only `{}`.
+
+A loaded extension exposes `generate_handoff_prompt`, `save_handoff_prompt`,
+`consume_handoff`, `continue_handoff`, `retry_handoff_cutover`, and
+`trigger_handoff`, plus `/handoff-continue` and
+`/resume-handoff`; `/extensions` lists it with source **plugin**. It
+intentionally does **not** emit a user-visible "Session started" breadcrumb.
+
+## The intended workflow
+
+### 1. Compose and store early
+
+When the session reaches a natural stopping point and you are not yet ready to
+trigger (no pickup needed right now):
+
+1. call `generate_handoff_prompt`,
+2. compose the full markdown brief,
+3. call `save_handoff_prompt`.
+
+That is the routine, safe, non-committal step. It preserves the baton before
+context gets tighter, but it does **not** arm pickup or request that any
+external system create a successor. **This sequence is not the
+context-pressure-driven trigger path** -- when context pressure is rising and
+you intend to trigger a handoff now, see section 2 below instead, which syncs
+*before* composing so the stored baton reflects the synced state.
+
+### 2. Context-pressure-driven handoff: trigger directly
+
+If the reason for the handoff is **context pressure** and the objective still
+has more work left to do, the agent should sync the worktree onto the latest
+default branch first (see "Sync before triggering" in the `context-handoff`
+skill -- never blanket-commits, and skips cleanly rather than blocking if
+anything looks unsafe), *then* compose/save the brief so it reflects the
+synced (or un-synced/conflicted) state, then call `trigger_handoff`. This
+path does **not** ask for confirmation first.
+
+### 3. Turn-end follow-ups ask before triggering
+
+If the requested work is done and the agent would otherwise end the turn by
+listing follow-up ideas or questions, the flow is different:
+
+- **compose + save** the baton,
+- **ask the user** whether to continue via handoff,
+- only after a brief yes (for example, "sure"), **sync the worktree** (same
+  rule as above), then **always recompose and re-save** the baton -- even if
+  the sync looked like a no-op, since a WIP commit or a failed sync still
+  changes what the successor needs to know -- so it reflects the post-sync
+  state, then call `trigger_handoff`.
+
+Only this turn-end follow-up path is skipped by autopilot mode or prior user
+pre-authorization.
+
+### 3. Let one session own one slice
+
+When a repository uses both **efforts** and **handoffs**, the combination is
+meant to keep sessions well scoped. A single session should not "bite off" an
+entire long-running effort just because the overall objective is still active.
+Instead, one session advances one natural slice confidently, reaches a clean
+boundary, writes the relay delta, and hands the next slice to the successor.
+The effort remains the durable source of truth; the handoff carries only the
+immediate baton.
+
+## `trigger_handoff`: legacy signal-only contract
+
+New extension saves include a native-presence checkpoint (including explicit
+absence). `trigger_handoff` directs these records to `continue_handoff` so that
+a text pickup cannot bypass native restoration. For older text-only records,
+the signal-only contract below applies.
+
+- For **context-pressure-driven** handoffs with remaining work, call it
+  immediately after `save_handoff_prompt`.
+- For **turn-end / follow-up** handoffs, call it only after the user says yes,
+  unless autopilot or prior pre-authorization applies.
+
+It always:
+
+1. drops the composed handoff markdown in the current session's session-state
+   folder,
+2. durably stores it (`agent-dispatch` task-backed storage when available,
+   otherwise a worktree-state file),
+3. notes it in the worktree's own record via `agent-worktrees note-handoff`
+   (this creates a `pending_handoffs` entry -- lineage/tracking state, so a
+   manually-consuming successor can later be promoted to head via
+   `link-succession` regardless of mode). This step runs in **every** mode,
+   including `off` -- `off` disables only automatic/unprompted behavior, never
+   a manually-invoked `trigger_handoff` (see `note-handoff --live-cutover`
+   below for the piece that's actually mode-gated).
+
+**Only when `.context-handoff/config.yaml`'s `mode` is `auto`** (the default
+is `manual-only`) does it additionally arm **live-cutover**:
+
+4. pass `--live-cutover` to the same `note-handoff` call from step 3 --
+   agent-worktrees' resident status-monitor requires this exact flag on the
+   entry (not merely the entry's existence) before it will ever discover and
+   claim it on its own; refresh worktree-visible PENDING-HANDOFF state -- the
+   signal the monitor watches for -- when `agent-worktrees` is available,
+5. best-effort ping `agent-bridge` if present,
+6. wait up to 30 seconds for the CUTOVER to start -- not for the successor to
+   fully finish cold-starting and consume the handoff, which legitimately
+   takes longer (40-90+ seconds) and isn't worth blocking on.
+
+Regardless of mode, it always:
+
+7. check once whether the session-state marker was consumed, the worktree
+   recorded a successor, the dispatch task moved out of `proposed` /
+   `queued`, or (the earlier, cheaper signal) the resident status-monitor
+   has already logged a `handoff_cutover_spawn` for this token -- under
+   `manual-only` this is a single check with no polling wait (steps 4-6 are
+   the only ones actually skipped),
+8. print manual continuation instructions -- distinctly worded when
+   automatic cutover is simply disabled by `mode` versus when it was
+   attempted and nothing happened, or a distinct "already under way" note if
+   a spawn is merely in flight,
+9. always end by printing the final short handoff prompt/seed.
+
+That final seed is the "if your download doesn't start, click here" fallback:
+it gives a human or control system enough to continue even if none of the
+signaling paths responded during the grace window, or automatic cutover was
+never wired up at all under the default mode.
+
+A real successor's Copilot cold-start (loading MCP servers/skills before it
+can even run its own `sessionStart` hook) routinely takes 40-90+ seconds --
+much longer than the 30-second wait, and full pickup was the only signal
+`trigger_handoff` used to check. Under `mode: auto`, `trigger_handoff` treats
+the resident status-monitor's `handoff_cutover_spawn` activity marker --
+which fires much sooner, as soon as the cutover itself starts -- as an
+earlier, distinct "spawn acknowledged" signal, so the predecessor reports
+real progress within the original 30-second window instead of a false
+"nothing happened".
+
+## Storage
+
+`save_handoff_prompt` and `trigger_handoff` use the same durable store
+selection: 
+
+| Coordinator availability | Storage |
+|---|---|
+| Active Herdr pane | checkout-scoped one-time file, independent of agent-worktrees |
+| `agent-dispatch` reachable | proposed, handoff-labeled task pinned to the current worktree |
+| no `agent-dispatch` | one-time JSON file under the machine-local worktree state directory |
+
+In both cases the plugin also returns a bounded one-line seed. The seed is a
+locator, not the handoff itself: it contains a task lead, a recommendation to
+use `/consume-handoff`, and one opaque `task:<id>` or `file:<id>` recovery
+locator.
+
+## Resuming
+
+A saved handoff is **never** auto-loaded merely by opening another session.
+An explicitly launched native successor deterministically consumes its assigned
+brief during bootstrap, without an initial model prompt.
+
+- `/consume-handoff` is the canonical slash command. It prefers a pending
+  worktree-pinned agent-dispatch handoff task and otherwise falls back to the
+  newest matching unconsumed worktree-state handoff file.
+- `/resume-handoff` is a compatibility alias for `/consume-handoff`.
+- If the extension is unavailable, use the payload-local CLI and pass the
+  recovery locator to `consume --locator`.
+
+For a natural-language "resume from handoff" request, sweep the current
+worktree's own state first rather than doing a global search.
+
+### Already-claimed handoffs
+
+A consume attempt that fails because the handoff was already consumed (or is
+currently being consumed elsewhere) always reports the claimant's session id,
+via `result.claimedBySession` and inline in the message text -- for both the
+file-backed and agent-dispatch task-backed stores. When this happens, state
+the claimant session id to the user and offer to file a bug (do not file one
+automatically): repeated or racing consumption of the same handoff is
+typically a sign of a real defect upstream, not routine behavior.
+
+### Extension-host disconnected mid-call
+
+A handoff tool call -- `consume_handoff` most commonly -- can fail with
+something like "Extension disconnected before responding to tool call" when
+the Copilot CLI's extension host restarts mid-call, for example while a
+background plugin update or reconciliation pass is being applied. A following
+notification that the available tool set changed (tools disappearing and
+reappearing) is a strong corroborating signal that this is what happened.
+
+This is a **transport-level failure, not a semantic answer**. Unlike an
+already-claimed response (which always names a claimant session), a
+disconnect carries no information about whether the underlying store was
+read, mutated, or left untouched -- it is not evidence that no handoff is
+pending.
+
+1. Do not conclude "nothing is pending" or reconstruct a different objective
+   from session history solely because the call errored this way.
+2. Once the tool set stabilizes (previously-lost tools become available
+   again), retry the identical call once.
+3. If the tool remains unavailable, or the retry fails the same way, fall
+   back to the payload-local CLI (`consume --locator`, `facts`,
+   `check-heads`) -- it talks to the durable stores directly and does not
+   depend on the extension host being up.
+4. Only report "nothing pending" once that CLI-backed retry also finds none.
+
+## Handoff-lifecycle observability
+
+`trigger_handoff` is stage 6 of a wider 13-stage cutover lifecycle spanning
+this plugin, the resident `agent-worktrees` status monitor, and the mux
+layer -- worktree creation through the predecessor's confirmed retirement.
+The full stage vocabulary, the two durable stores that record it
+(`activity.jsonl`'s rolling log and `handoff_trace.py`'s unrotated
+per-worktree store), and the diagnostic tools available today
+(`agent-worktrees handoffs-check`, `agent-bridge handoff-check`) are
+documented in
+[`agent-worktrees`'s architecture doc](../agent-worktrees/docs/architecture.md#handoff-cutover-lifecycle-the-13-stage-trace)
+-- read that first when a handoff appears to have gone sideways rather than
+re-deriving the sequence from scratch. `handoffs-check` diagnoses (and can
+repair) an **unretired predecessor after a spawn is recorded** -- a
+successor associated as a candidate *or* already linked, plus a recorded
+spawn event, with no confirmed retirement since. Its read-only report does
+**not** itself confirm the pane is still alive (no `_mux_pane_alive()` call
+in that path) -- it lists every such unretired case as a candidate, even one
+whose pane already exited without ever being logged as retired; `--execute`
+is the step that performs the live check and actually resolves it. It does
+**not** diagnose "ack but no pane at all" (a host acknowledgement with no
+successor ever recorded) -- that case has no dedicated diagnostic yet; a
+dedicated
+`handoff-trace` render command is
+still open follow-on work.
+
+## Plugin-load reliability
+
+Whether this extension's tools (`generate_handoff_prompt`,
+`save_handoff_prompt`, `consume_handoff`, `trigger_handoff`) are even
+*available* in a given session is a separate question from the
+handoff-lifecycle observability above -- if the extension never loads, none
+of that machinery is reachable at all. Copilot CLI already writes a
+per-launch diagnostic log for every extension fork under
+`~/.copilot/logs/extensions/plugin-<name>_<name>-<launch-epoch-ms>-<pid>.log`,
+ending in a terminal marker (`ready`, `ready-timeout`,
+`peer-closed-before-ready`, or an `exit code=N disposition=<disposition>`
+line) -- real, already-being-written data, no new instrumentation required
+to read it.
+
+`scripts/extension_load_reliability.py` summarizes that data into a
+reliability report for one plugin over a time window:
+
+```
+python scripts/extension_load_reliability.py --plugin context-handoff --days 7
+python scripts/extension_load_reliability.py --plugin context-handoff \
+  --split-at 2026-09-21T05:00:00+00:00 --json   # before/after a fix
+```
+
+`--split-at` partitions the window into `before`/`after` summaries around a
+timestamp, e.g. when a fix's new version actually lands on a machine (a
+merge only primes deployment; check the installed plugin's own version/mtime
+under `~/.copilot/installed-plugins/` to find when it actually took effect,
+not the merge time). Empirically, a plugin's own `ready-timeout` rate has
+tracked closely with *every* concurrently-launching plugin's rate on the
+same machine, not just the ones with heavier load-time work -- consistent
+with shared host/CPU contention across simultaneously-forking extensions
+being a real contributor, not only a given plugin's own synchronous work.
+Compare against a sibling plugin's rate over the same window before
+attributing a change in rate to a specific fix.
+
+### Post-readiness crash diagnostics
+
+The launch log above records only a terminal disposition and exit code --
+if the extension reaches `ready` and then stops with no further harness
+output (observed and diagnosed on at least one host, with no root cause
+identified yet), the launch log alone cannot say *why*, or even *whether it
+was actually a crash at all* -- see "interpreting an entry" below.
+`extension.mjs` registers `process.on('uncaughtException'
+/'unhandledRejection'/'exit'/'SIGTERM'/'SIGINT'/'SIGHUP')` handlers (added
+directly above the `--- State ---` section) that write a synchronous,
+durable diagnostic line the instant anything goes wrong to
+`<os.tmpdir()>/context-handoff-extension-crash.log` (e.g.
+`/tmp/context-handoff-extension-crash.log` on Linux/macOS,
+`%TEMP%\context-handoff-extension-crash.log` on Windows). Read this file
+after a suspected crash.
+
+Each log entry begins with a line stamped `<ISO timestamp> pid=<pid>
+<label>: <detail>`. For an `uncaughtException`/`unhandledRejection` entry,
+`<detail>` is produced by `describeFailure()`: a multi-line `Error.stack`
+when the thrown/rejected value has one (only that first, stamped line
+carries the timestamp/pid/label prefix -- the stack's own trailing `at ...`
+lines that follow are not individually stamped, so correlate by that first
+line); a single-line `String(value)` when it does not (a thrown value is
+not required to be an `Error`); or the fixed fallback string
+`<failure detail unavailable: describing it threw>` if even that extraction
+itself throws (a hostile/buggy `.stack` getter or `Symbol.toPrimitive`/
+`toString`). `<detail>` for the exit/exception/rejection/signal handlers
+always includes `ready=true`/`ready=false` -- an in-memory-only flag (never
+itself written on its own) set once `joinSession()` actually resolves, so a
+captured failure's line says whether it happened before or after this
+instance reached readiness.
+
+This file is:
+
+- **Created privately, symlink-safe.** `os.tmpdir()` is commonly a shared,
+  world-writable directory on POSIX (`/tmp`); a predictable filename there
+  is both world-readable by default and a symlink-attack target. The first
+  write opens it with `O_CREAT|O_WRONLY|O_APPEND|O_NOFOLLOW|O_NONBLOCK` and
+  mode `0o600` -- private to this user, and the kernel itself refuses to
+  open through a pre-existing symlink rather than following it (and refuses
+  to block indefinitely against a pre-created FIFO with no reader). Neither
+  flag exists on Windows (no equivalent local-multi-user attack surface
+  there in the same shape); the file descriptor, once opened, is reused for
+  every subsequent write in the same process. **On POSIX**, a pre-existing
+  file that this user does not own, or that grants group/other any access,
+  is refused outright rather than written to or "fixed in place" -- **this
+  check does not run on Windows** (no POSIX uid/mode model there, and no
+  `process.getuid`), so a pre-existing file at this path on Windows is
+  accepted regardless of its ownership or permissions.
+- **Only records the interesting cases, by design.** A routine `code=0`
+  exit is never logged: this extension's own module is dynamically
+  re-imported many times over a machine's lifetime (once per discovery
+  pass, plus once per reconnect/resume), and logging every uneventful fork
+  would make this file rotate away its own history far more often than it
+  otherwise would (see the size-rotation bullet below) -- the existing
+  lifecycle-logging pattern
+  (`docs/patterns/lifecycle-activity-logging.md`) deliberately bounds or
+  reboot-volatilizes every tier it defines, and this file has neither
+  property beyond its coarse size trigger, so it must not record routine
+  events at all. Only an
+  `uncaughtException`/`unhandledRejection` (+ non-zero `exit`), a caught
+  `SIGTERM`/`SIGINT`/`SIGHUP`, or a genuinely non-zero exit for some other
+  reason produces an entry.
+- **Size-rotated at a coarse 1 MiB threshold, no other retention.** No
+  scheduled or calendar-based cleanup exists beyond that size trigger;
+  treat it as a manually-cleared scratch file for anything the size-based
+  rotation described below does not already handle. `SIGTERM`
+  specifically is the Copilot CLI's own **routine** mechanism for `/clear`
+  and foreground-session replacement (see "Interpreting an entry" below),
+  so -- unlike the suppressed `code=0` exit path above -- ordinary,
+  expected signal churn alone still appends a line every time, with no
+  natural ceiling on a long-lived, handoff-heavy host. Rather than stop
+  recording a legitimate signal (which would defeat the entire "distinguish
+  a routine stop from a crash" purpose of this file), each process checks
+  the file's size once, at its own first write: if it has grown to 1 MiB or
+  more, it is **rotated** -- renamed aside to a per-process, uniquely-named
+  `.stale-<pid>-<timestamp>-<uuid>` sidecar **in its own dedicated
+  `context-handoff-crash-sidecars/` subdirectory** (created on demand next
+  to the log file itself, and re-validated on every rotation and purge as
+  a real, non-symlink, privately-owned-and-permissioned (0700 on POSIX)
+  directory before anything is ever renamed into or purged from it -- a
+  plain "create if missing" call alone would otherwise treat an
+  attacker-planted symlink, or a pre-existing directory with permissive
+  group/other bits, as fine to use, silently redirecting rotations
+  elsewhere or exposing sidecars to another local user; a directory that
+  fails this check simply means rotation is skipped for that call, not
+  that diagnostic logging itself fails), with a fresh file opened at the original path --
+  rather than truncated in place. This matters because the file is shared
+  by every extension instance on the machine (see the next bullet): an
+  in-place reset is not serialized across processes, so a second process's
+  own reset could otherwise erase the crash entry a first process just
+  finished appending moments earlier. The rename is guarded by an identity
+  check first (the file currently at this path must still have the same
+  device+inode this process actually opened and measured as oversized --
+  empirically confirmed reliable on both POSIX and Windows) -- a *blind*
+  rename of whatever currently sits at the path, with no such check, could
+  otherwise rename a different process's already-rotated, already-live
+  fresh file into this process's own sidecar, silently detaching that
+  process's diagnostics from the well-known path.
+  Immediately after a rotation, the same process also opportunistically
+  purges old sidecars from that same dedicated subdirectory (never the
+  shared parent directory the log file itself lives in -- see below for
+  why), by age -- **read from the rotation timestamp embedded directly in
+  the sidecar's own filename** (`.stale-<pid>-<timestamp>-<uuid>`), never
+  the filesystem's mtime -- older than 24 hours. mtime was tried first, but
+  is observable (and mutable) by every other process on the host from the
+  instant a rename completes: a concurrent process's own purge could run
+  against a brand-new sidecar before this process got a chance to
+  separately re-stamp its mtime, see the oversized source file's old,
+  pre-rotation mtime, and delete it immediately -- a genuine cross-process
+  race. Baking the timestamp into the name atomically, in the very same
+  `renameSync()` call that creates the sidecar, removes that window
+  entirely: there is no longer a separate step (and therefore no race)
+  between "this sidecar exists" and "its age is correctly and immutably
+  knowable" by any process that reads its name. The dedicated subdirectory
+  matters for a second, independent reason: this purge is bounded to a
+  fixed number of directory entries read per call (see the module's own
+  comments for why), since it can run synchronously inside a
+  signal-handling path with a hard termination deadline -- but a bounded
+  scan of the log's own *shared parent* directory (commonly `os.tmpdir()`,
+  populated by every other application on the host too) could keep landing
+  on the same leading, unrelated entries every single call and never reach
+  this log's own sidecars at all, no matter how many rotations ever ran. A
+  directory that holds nothing but this log's own sidecars has no such
+  adversarial population ahead of them, so the same bounded scan is
+  actually guaranteed to make progress. This age gate bounds the
+  *cumulative* disk usage many rotations over a long-lived host would
+  otherwise leave unbounded, without reintroducing the destructive race a
+  blind/unconditional delete would risk. This bounds growth across
+  the many separate short-lived processes that are the actual growth vector
+  (though not a single pathological process logging in a tight loop -- not
+  a real shape here, since at most a handful of entries are ever logged per
+  process lifetime). A rotation discards nothing at the moment it happens
+  -- the oversized content survives under its sidecar name until that
+  sidecar eventually ages out -- but the live path itself becomes a rolling
+  window, not a permanent record; any sidecar an operator needs to inspect
+  sooner than its own 24-hour purge is still a manually-cleared scratch
+  file like the log itself.
+- **A failed file write falls back to a best-effort line on stderr, not
+  silence.** Since these listeners suppress Node's own default
+  uncaught-exception report, a log write that fails for any reason
+  (missing directory, full disk, an untrusted pre-existing path, ...) would
+  otherwise leave neither a file entry nor any stderr output -- exactly the
+  original silent-exit symptom this module exists to diagnose, just moved
+  one layer down. Look for a
+  `context-handoff emergency diagnostics (log write failed): <label>: ...`
+  line on stderr in that case; it covers every failure path here,
+  including a plain non-zero `process.exit()` with no preceding
+  exception/rejection/signal, and is deliberately printed at most once per
+  process (a later handler -- e.g. the `exit` event that always follows an
+  `uncaughtException` handler's own `process.exit(1)` -- does not repeat
+  the same underlying failure as a second, redundant line).
+- **Shared by every extension instance on the machine -- correlate by `pid=`
+  and timestamp before drawing a conclusion.** This is one fixed,
+  machine-global path, and multiple `context-handoff` processes (across
+  different worktrees, sessions, or simply overlapping discovery/reconnect
+  forks) can each append to it independently, interleaved in whatever order
+  they actually wrote. A `signal: ...` line followed somewhere later in the
+  file by an `exit: code=...` line does **not** by itself mean that exit
+  belongs to the same process that received the signal -- it can belong to
+  an unrelated instance, or (rarely) a later instance that reused the same
+  PID after the first exited. Always check that the `pid=` value matches
+  between the lines you are comparing, and that their timestamps are close
+  enough in sequence to plausibly be the same launch, before concluding
+  whether a given signal was followed by an exit or not.
+
+**Interpreting an entry -- a `SIGTERM`/`SIGINT`/`SIGHUP` line does not by
+itself mean a crash.** The Copilot CLI's own documented extension lifecycle
+stops and reloads every extension process "on `/clear` (or if the
+foreground session is replaced)" via SIGTERM (then SIGKILL after 5s if it
+doesn't exit) -- a routine, expected event, not a bug. A signal handler here
+logs, then **removes its own listener and re-sends the identical signal to
+itself**, so the OS's default disposition genuinely terminates the process
+by that signal -- Node then reports the same `(code=null,
+signal="SIGTERM"/"SIGINT"/"SIGHUP")` shape a parent observes with no
+diagnostics installed at all (deliberately *not* converted into
+`process.exit(128 + signum)`, which would silently change that contract for
+any host code that distinguishes a signal-terminated child from a normal
+exit). Because the re-raised signal kills the process before Node's own
+`exit` event gets a chance to run, **a `signal: <name>` line with no
+following `exit: code=...` line is the *expected* shape for this legitimate,
+host-initiated stop** -- not evidence of a crash.
+
+**On Windows, this same routine host-initiated stop leaves no entry in this
+file at all.** `child_process`/`process.kill()`-delivered `SIGTERM` on
+Windows terminates the target process unconditionally at the OS level,
+bypassing any registered `process.on('SIGTERM', ...)` JS listener entirely
+(empirically confirmed against this repo's actual Node/Windows runtime --
+see the tests) -- so the signal handler above never runs, and a routine
+`/clear`/foreground-session-replacement stop on this platform is
+indistinguishable, from this file alone, from the "no entry at all" cases
+below. This is a genuine platform gap, not a bug in this module: Windows
+gives a JS process no hook into a routine external `SIGTERM` in the first
+place.
+
+So, reading a launch's entries in this file (if any) -- **always match `pid=`
+between the lines being compared first** (see the correlation bullet
+above):
+
+- `signal: SIGTERM`/`SIGINT`/`SIGHUP`, no `exit` line **for that same
+  `pid=`** -- an expected, host-initiated stop (`/clear`, foreground session
+  replaced, or a real Ctrl+C/HUP). Given how handoff/session-switch-heavy
+  some workflows are, this may explain a large share of historical `exit
+  code=1 disposition=stopped-normally` launch-log entries that were never
+  actually crashes. **POSIX only** -- see the Windows note above.
+- `uncaughtException`/`unhandledRejection` (with a stack), followed by
+  `exit: code=1` **for that same `pid=`** -- a genuine bug, but not
+  necessarily in this extension's own code: these handlers observe the
+  entire process, so the stack can equally point into the bundled SDK, the
+  CLI's own harness/runtime, or another dependency loaded into the same
+  process. Read the stack itself to identify the actual source rather than
+  assuming this extension's code is always at fault; the trailing
+  `ready=true`/`ready=false` on both lines says whether the failure hit
+  before or after this instance reached readiness. If the crash log's own
+  write also failed (missing directory, full disk, an untrusted
+  pre-existing path, ...), look for a
+  `context-handoff emergency diagnostics (log write failed): ...` line on
+  stderr instead -- a best-effort fallback specifically so a logging
+  failure never reproduces the original silent-exit symptom this module
+  exists to diagnose.
+- A **standalone** `exit: code=1 ready=...` line, **with no preceding**
+  `uncaughtException`/`unhandledRejection`/`signal` line for that same
+  `pid=` -- the process reached the exit handler with a non-zero code
+  through some other path entirely (a bare `process.exit(1)` elsewhere in
+  the code, for instance), without ever raising a captured exception,
+  rejection, or signal here. There is no stack to inspect for this shape;
+  correlate the timestamp/`pid=` against whatever other logs this host
+  keeps (the harness's own launch log, application logs, etc.) to find
+  what actually called `process.exit(1)`.
+- **No entry at all for a launch whose own harness log shows it reached
+  `ready` and then stopped** -- four distinct possibilities, not just one:
+  the ordinary case is simply a routine `code=0` exit, which is never logged
+  by design (see above); on Windows specifically, a routine `SIGTERM`
+  host-initiated stop is *also* never logged, since the signal never reaches
+  the JS handler at all (see the Windows note above) -- check the stderr
+  fallback described just above before assuming a missing entry means
+  something worse. Beyond those two routine cases, either something
+  bypassed Node's own signal/exit handling entirely (`SIGKILL`, an external
+  whole-process-tree kill -- registering a handler for a given event cannot
+  help when the process never gets to run any more JS at all), **or**
+  `createEmergencyLog()`'s own open/write attempt failed *and* its stderr
+  fallback was unavailable, itself failed, or was simply uncaptured by
+  whatever is holding this process's stderr (its own defensive contract:
+  diagnostic logging must never itself become a second crash cause) -- for
+  example the crash log's directory is missing, the disk is full, or the
+  pre-existing-file ownership/mode check rejected an untrusted file at that
+  path (see the private-file-creation note above), *and* stderr 2 was
+  itself closed/broken or not being captured anywhere. A missing entry does
+  not, by itself, distinguish these; check that the log's parent directory
+  exists and is writable by this user, and check for a captured stderr
+  fallback line, before concluding it must have been a force-kill.
+
+## Payload-local CLI fallback
+
+When the extension does not resolve or fails to load, the plugin's payload
+files are still on disk. Resolve the verified `handoff-cli.mjs` relative to the
+installed plugin root and invoke it with `node`.
+
+```bash
+CH_ROOT="${COPILOT_PLUGIN_ROOT:-}"
+if [ ! -f "$CH_ROOT/plugin.json" ]; then
+  CH_ROOT="$HOME/.copilot/installed-plugins/copilot-extensions/context-handoff"
+  provenance="$(node -e 'const fs=require("fs"),m=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); console.log(`${m.name||""}|${m.repository||""}`)' "$CH_ROOT/plugin.json" 2>/dev/null)"
+  [ "$provenance" = "context-handoff|https://github.com/ThomasMichon/copilot-extensions" ] ||
+    { echo "canonical context-handoff@copilot-extensions payload not found" >&2; exit 1; }
+fi
+CH="$CH_ROOT/extensions/context-handoff/handoff-cli.mjs"
+[ -f "$CH" ] || { echo "context-handoff payload-local CLI not found" >&2; exit 1; }
+
+node "$CH" facts --json --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" check-heads --json --cwd "$PWD"
+node "$CH" retry-cutover --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" sync-worktree --json --cwd "$PWD"
+node "$CH" save --title "<topic>" --prompt-file "<handoff.md>" \
+  --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" trigger --title "<topic>" --prompt-file "<handoff.md>" \
+  --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" trigger --handoff-token "<HANDOFF_TOKEN>" \
+  --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" consume --locator "task:<task-id>" \
+  --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" consume --locator "file:<handoff-id>" \
+  --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" list-sessions --json --cwd "$PWD"
+node "$CH" get-previous-session --json --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+node "$CH" abort --locator "task:<task-id>" --reason "<why>" --cwd "$PWD"
+```
+
+PowerShell uses the same verified, plugin-folder-relative invocation:
+
+```powershell
+$chRoot = $env:COPILOT_PLUGIN_ROOT
+if (-not (Test-Path -LiteralPath "$chRoot\plugin.json")) {
+  $chRoot = Join-Path $HOME '.copilot\installed-plugins\copilot-extensions\context-handoff'
+  try { $manifest = Get-Content -Raw "$chRoot\plugin.json" | ConvertFrom-Json } catch { $manifest = $null }
+  if ($manifest.name -ne 'context-handoff' -or
+      $manifest.repository -ne 'https://github.com/ThomasMichon/copilot-extensions') {
+    throw 'canonical context-handoff@copilot-extensions payload not found'
+  }
+}
+$ch = Join-Path $chRoot 'extensions\context-handoff\handoff-cli.mjs'
+if (-not (Test-Path -LiteralPath $ch -PathType Leaf)) { throw 'context-handoff payload-local CLI not found' }
+node $ch facts --json --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch check-heads --json --cwd $PWD
+node $ch retry-cutover --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch sync-worktree --json --cwd $PWD
+node $ch save --title '<topic>' --prompt-file '<handoff.md>' --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch trigger --title '<topic>' --prompt-file '<handoff.md>' --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch trigger --handoff-token '<HANDOFF_TOKEN>' --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch consume --locator 'task:<task-id>' --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch consume --locator 'file:<handoff-id>' --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch list-sessions --json --cwd $PWD
+node $ch get-previous-session --json --session-id $env:COPILOT_AGENT_SESSION_ID --cwd $PWD
+node $ch abort --locator 'task:<task-id>' --reason '<why>' --cwd $PWD
+```
+
+## Last-resort fallback: write the file yourself
+
+The tool-backed path (`save_handoff_prompt` / `trigger_handoff` /
+`consume_handoff`) and the payload-local CLI fallback above both assume
+*something* still works -- the extension host, `node`, or a reachable store.
+When even that assumption is unsafe (the extension is disconnected, the CLI
+fails the same way, or storage reports "no safe task or file store was
+available"), the **most durable** continuation path needs none of it: an
+ordinary file write, plus a short prompt a human pastes into a fresh session
+after `/clear`. This always works because it depends on nothing but the
+agent's normal ability to write a file and print text.
+
+1. Compose the same markdown brief the Template section describes.
+2. Write it with an ordinary file write -- no MCP tool call, no extension, no
+   `node` -- to a stable path under the current session's own state folder:
+   the same `~/.copilot/session-state/<session-id>/` directory the extension
+   itself already uses (for example
+   `~/.copilot/session-state/<session-id>/files/handoff-<slug>.md`). Create the
+   `files/` directory first if it does not already exist -- it is not
+   guaranteed to be pre-created. This directory persists independent of the
+   extension, the payload-local CLI, and any store selection.
+3. State the exact absolute path to the user.
+4. Give the user a short prompt to paste into a new session after `/clear`,
+   naming that exact path and instructing the next session to read it and
+   resume the objective it describes -- not merely recap it. For example:
+
+   ```text
+   /clear
+   Read <absolute-path-to-file> and resume the objective it describes.
+   ```
+
+5. This path has no automatic pickup, no claim tracking, and no
+   supersession -- it is a manual handoff between two humans/agents. Prefer
+   the tool-backed and CLI-backed paths above whenever either is reachable;
+   reserve this one for when both have failed.
+
+## Auditing handoff head alignment
+
+`check-heads` compares the authoritative `agent-worktrees head-session --json`
+ledger view for each known worktree against the resident status-monitor's
+current registry of `wt-<id>` sessions. Its main failure mode is a pending
+handoff that still exists in the ledger but is not currently reachable through
+the monitor's served-session roster, which means a proactive cutover spawn will
+not visit that worktree.
+
+- `pending-handoff-unregistered` — the ledger still has one or more pending
+  handoffs, but the monitor currently has no registered `wt-<id>` target for
+  that worktree.
+- `pending-handoff-registry-path-mismatch` — the monitor has a registered
+  `wt-<id>` entry, but it points at a different checkout path than the worktree
+  inventory row being audited.
+
+Use the command directly:
+
+```bash
+node "$CH" check-heads --json --cwd "$PWD"
+```
+
+If you are looking at a superseded predecessor session and the worktree already
+has a live successor pane, use:
+
+```bash
+node "$CH" retry-cutover --session-id "$COPILOT_AGENT_SESSION_ID" --cwd "$PWD"
+```
+
+That shells to `agent-worktrees handoff-cutover --retry --session-id <sid> --json`: it
+first checks whether the latest handoff already has a live successor pane and,
+if so, refocuses that existing pane instead of spawning a duplicate successor.
+Only when no live successor exists does it fall back to a fresh spawn attempt.
+
+If the ledger itself is stale, repair the underlying worktree state with
+`agent-worktrees doctor --fix`, or explicitly repoint the head with
+`agent-worktrees conclude-session` / `link-succession` once you know the exact
+predecessor and successor ids.
 
 ## Thresholds
 
 | Threshold | Behavior |
 |-----------|----------|
-| 55% of window | Soft reminder: hand off at the next clean boundary |
-| 70% of window | Urgent reminder: hand off now; compaction remains at ~80% |
+| 55% of window | Soft reminder: compose/store a baton at the next clean boundary and trigger directly if work still remains |
+| 70% of window | Urgent reminder: preserve the baton now and trigger directly; compaction remains at ~80% |
+| 79% of window | **Force tier** (only when `mode: auto`; a no-op under the default `manual-only`): the extension does it *for* the agent -- auto-drafts a handoff from whatever session facts are available, stores and triggers it via the same path `save_handoff_prompt`/`trigger_handoff` use, and denies further mutating tool calls (read-only inspection still allowed) for the rest of the session. This is the last chance to capture state before the runtime's own auto-compaction (~80%) destroys it -- it does not wait for the agent to act. Lifted only by a successful compaction (the operator may then keep working in the same session instead of switching to the handed-off one); at most one auto-handoff per session |
 
-An owning repository may override either percentage in
-`.context-handoff/config.yaml`:
+An owning repository may override these defaults in `.context-handoff/config.yaml`,
+and a user may set lower-priority personal defaults in
+`~/.context-handoff/config.yaml`. The repo layer merges per key over the user
+layer, so a repo that only sets `mode` still inherits user-level thresholds.
 
 ```yaml
+mode: auto         # auto | manual-only | off
 thresholds:
   soft_percent: 65
-  hard_percent: 75
+  hard_tokens: 75000
+  force_percent: 78
 ```
 
-The extension discovers the nearest Git repository root from the session's
-starting directory, so the same config applies from nested directories and Git
-worktrees. Values must be integers from 1 through 79, and `soft_percent` must be
-lower than `hard_percent`. Invalid config produces a visible warning and uses
-the 55% / 70% defaults. If the runtime does not report a window size, the
-extension reports utilization as unknown and does not invent an absolute
-threshold.
+**The default mode is `manual-only`, not `auto`** -- the force-tier
+auto-trigger and `trigger_handoff`'s live-cutover wiring (the
+`handoff_requested` activity event agent-worktrees' resident status-monitor
+watches for, and the agent-bridge ping) are opt-in: a repo (or a user,
+via the home-directory layer) must explicitly set `mode: auto` in
+`.context-handoff/config.yaml` to enable them. The soft/hard context-pressure
+warnings above fire under `manual-only` too -- only the force tier's own
+automatic handoff and any live pickup signaling wait for `mode: auto`.
+`save_handoff_prompt`,
+`trigger_handoff`, and `consume_handoff` all keep working under
+`manual-only` -- `trigger_handoff` still stores/seeds/notes the handoff and
+prints the manual pickup instructions, it just never arms the resident
+monitor's live-cutover (the `note-handoff` ledger entry itself is still
+recorded under `manual-only`; only its `--live-cutover` flag is `mode: auto`
+gated -- this is what lets a manually-consumed successor still be promoted
+to the worktree's head regardless of mode).
+`mode: off` disables only automatic/unprompted behavior -- the soft/hard
+context-pressure nudges above, and the force tier's own auto-draft/store/
+trigger. It does **not** disable the manual entry points: `generate_handoff_
+prompt`, `save_handoff_prompt`, `trigger_handoff`, `consume_handoff`, and
+their `/handoff-continue` / `/consume-handoff` / `/resume-handoff` slash
+commands all keep working exactly as under `manual-only`, including
+`trigger_handoff`'s ledger note. A session or operator who explicitly reaches
+for the mechanism gets it, regardless of the repo's automatic-behavior
+policy; `off` only means "don't nudge me, and don't ever act on my behalf."
 
-Reminder state resets after a successful compaction.
-
-In both cases the extension emits a user-visible `session.log` warning and an
-agent-facing `session.send()` nudge. The nudge is queued by
-`session.usage_info` and delivered only at the next `session.idle` boundary, so
-it does not interrupt an in-flight turn. Failures to send the nudge are logged
-as warnings; they do not block the session.
-
-## Live cutover keeps a recovery predecessor
-
-Native-goal handoffs use the cold-resume sequence below rather than submitting
-the seed as a business prompt. The existing seed transport in this section
-continues to serve plain handoffs without a native objective.
-
-A live cutover (`continue_handoff`) selects the pane host already carrying the
-current session. In Herdr it writes the successor seed to a short-lived,
-owner-readable task file and invokes `~/.local/bin/copilot-pane launch --role
-coordinator --cwd <cwd> --host local --task-file <file>`. The launcher creates
-one sibling Copilot and submits that seed as its first prompt. Context-handoff
-does not infer completion from Herdr status and does not retire the predecessor
-pane.
-
-Outside Herdr, the existing mux path passes the exact first prompt through
-Copilot's native `-i` argv before the process starts; it never relies on
-terminal readiness parsing or `send-keys`. The prompt begins with the task title
-(for useful successor title inference), names the intended worktree id and cwd,
-names the dispatch task, and gives the exact consume/bind/retire/complete
-commands. It does **not** retire the predecessor on the predecessor's next idle.
-
-The successor's first command loads the brief and binds the new session to the
-handoff's exact durable token. That atomic bind links the numbered handoff,
-records the outgoing session as **`handed-off`**, advances the replayable head
-ledger, and then retires the predecessor pane through
-`agent-worktrees handoff-cutover --retire-pane`.
-
-This keeps recovery safe: if the successor never comes up or never consumes the
-handoff, the predecessor pane remains available and the terminal is not closed.
-Herdr keeps that pane unconditionally. Mux metadata records the predecessor's
-session; retirement verifies that the pane token still belongs to that session,
-so a token reused after a mux restart is treated as already gone rather than an
-unrelated pane to interrupt.
-
-### Continuity is objective-driven, not phase-driven
-
-The successor seed and `/resume-handoff` prompt treat the handoff as active
-responsibility for the original objective. A completed predecessor phase is
-history, not evidence that the broader work is done. After loading the brief,
-the successor continues every actionable phase already permitted by the
-original request without waiting for another user nudge. One session may consume
-a handoff, drive many additional slices, and hand off again when its own context
-fills.
-
-The handoff template therefore separates the continuing parent objective and
-successor work roster from completed progress, and distinguishes the current
-handoff task's completion gate from the worktree's true completion gate. If no
-actionable work remains and the parent objective is genuinely complete, the
-session should finish instead of creating a live successor only to report
-closure.
-
-When agent-worktrees reports a valid open `active_effort`, the skill uses a
-smaller effort-backed shape: repository-relative effort pointer, participant,
-current/next slice, and only the predecessor's immediate blockers, decisions,
-in-flight work, and required confirmations. The effort README remains the
-single durable request/plan/journal; the baton does not copy it. Repositories
-without effort adoption, stale/closed bindings, and objectives with no effort
-continue to use the full standalone handoff.
-
-The live `-i` seed reinforces that contract before the successor reads the
-baton: an active effort is the source of truth and completion gate, so the
-successor selects its next authorized Plan or Validation Plan item and drives
-toward `Done` rather than finalizing after a handoff task, phase, or pull request.
-
-**Plain failed-successor recovery (`retry_handoff_cutover`).** The native `-i`
-transport is receipt-checked by the pane wrapper; a rejected flag or immediately
-exiting successor is reaped without retiring the predecessor. Plain public
-continue/retry now arms the saved baton for launch at source idle. It shares
-native handoff's receipt classification: a structured mux exit 1/2/3 without a
-pane permits an explicit retry using the same seed; a retained receiver receipt
-is reused without respawning. Unknown/malformed outcomes and exit 4 without a
-pane remain unresolved, not automatically retryable. Receiver-written checkpoint
-fields are retained when the source publishes a receipt. Run explicit retry
-from the preserved predecessor; do not regenerate the baton.
-
-**Extension-load race (self-healing seed).** A live cutover seeds the
-successor's **first turn**, which can run before the context-handoff extension
-has finished (re)loading on the fresh launch — so `consume_handoff` is in the
-tool catalog (tool search finds it) but invoking it fails with a transient
-**400 / tool-not-found**. Because the session must exist (a prompt submitted)
-before the extension can activate, the extension cannot pre-empt this from
-inside. So the **cutover seed itself carries a retry-on-not-ready instruction**:
-if the first `consume_handoff` call errors while the extension is still loading,
-the successor waits briefly and retries the same call (up to 5 attempts) so the
-launch self-heals. The human-facing *paste* prompt (resumed in an
-already-loaded session, no race) stays short and omits the clause.
-
-This split follows the repo-wide
-[`primitives below, orchestration above`](../../docs/patterns/README.md)
-invariant: agent-worktrees provides the lower-level session/worktree mechanisms,
-while context-handoff composes the handoff policy above them.
-
-### Native goal restoration and recovery
-
-A native objective is not restored merely by writing its JSON file. The old
-`nativeContinuation` implementation wrote persistence and compared that file;
-it did not prove that the live native registry had hydrated the goal. This
-version replaces that path with a `nativeGoal` stage ledger:
-
-1. Save the brief and reserve one successor UUID. On explicit cutover, capture
-   the exact model, effort, context tier, custom agent and permission profile,
-   pause the source, then freeze its opaque objective snapshot at session idle
-   after usage settles.
-2. Launch an empty **named** receiver with that profile. Store the opaque
-   snapshot through the workspace API and exit normally. No old history or
-   business prompt is copied into preparation.
-3. Cold-resume the same UUID. Read the live native objective projection and
-   confirm identity, lifecycle and exact nano-AIU usage before consuming the
-   task/file baton.
-4. Bind a mux successor to the existing fork's exact handoff token and head.
-   For a running goal, reactivate only its remaining budget and admit one
-   continuation message. Paused, exhausted and completed goals remain stopped.
-   Native reactivation may allocate a new internal ID without creating a
-   second logical transfer or message.
-5. Retire the identity-matched predecessor only after admission. Herdr reuses
-   the existing terminal/session identity checks. Mux uses this fork's explicit
-   `bind-session` and `handoff-cutover --retire-pane` contract; no upstream
-   signal-only monitor, reviewer-loop or state-root framework is required.
-
-Native handoff currently supports **allow-all only** on both hosts. Manual and
-assisted native requests are rejected before source pause or receiver creation,
-including the direct mux CLI and preparation/resume runner. The extension never
-changes the permission mode to make admission succeed. Herdr's separately
-managed `copilot-pane` must support `--native-handoff` and `--native-launcher`.
-The existing agent-worktrees/agent-dispatch commands must resolve from the
-session's normal command environment; no installer or resolution policy changes
-are part of this feature.
-
-Custom-agent selection can arrive after extension startup. Bootstrap subscribes
-before reading the agent, waits without blocking extension initialization, and
-then asserts the exact profile. Default-agent launches do not wait for a custom
-selection event. A genuine mismatch stops admission without forcing a profile.
-Public `consume_handoff` (task, file or path) and `/resume-handoff` wait for this
-same bootstrap promise before reading or consuming a baton. A hydration
-acknowledgement alone is not permission to race bootstrap's pending workspace
-RPC or submit another continuation. Bootstrap uses the core consumer directly,
-without waiting on its own promise; idle/user-message reconciliation starts
-only after bootstrap publishes the receiver path.
-
-Recovery reuses the same checkpoint, receiver and token. Structured mux exit
-1/2/3 receipts prove a pre-creation rejection and permit an explicit retry.
-Exit 4 with a retained `new_pane` is persisted even though the CLI exited
-nonzero; it is not permission to spawn again. A missing receipt, malformed
-response or exit-4 result without a pane stays unresolved. Unknown Herdr launch
-outcomes also remain unresolved. Inspect the existing receiver rather than
-blindly replaying it. A lost task-consume acknowledgement similarly stops for
-inspection instead of consuming again.
-
-Legacy `nativeContinuation` / `nativeState` batons are explicitly rejected
-before consumption. Save a fresh native baton from the preserved source;
-copying an old file is not evidence of native hydration. The SDK-free fallback
-cannot perform native migration and refuses these batons. Ordinary paste/resume,
-effort/status records and unrelated fork behavior remain on their existing paths;
-plain live cutover uses the idle scheduling and receipt recovery described above.
-
-## Standalone and degraded modes
-
-The plugin remains useful in a plain Copilot CLI session with only
-`context-handoff@copilot-extensions` enabled:
-
-- `generate_handoff_prompt` and `save_handoff_prompt` work without
-  agent-dispatch. Herdr sessions use checkout-scoped context-handoff state;
-  other sessions use agent-worktrees when it can resolve a worktree state
-  directory.
-- If `agent-dispatch` is absent or unhealthy, `save_handoff_prompt` writes a
-  one-time file outside the repo checkout. Herdr stores it under
-  `~/.copilot/context-handoff/checkouts/<checkout>/handoff/` without requiring
-  agent-worktrees, using the current pane cwd as `<checkout>`. Linked worktrees
-  and adopted anchors outside Herdr keep their existing agent-worktrees state
-  namespaces.
-- File consumption uses an atomic claim. A dead consumer's claim is recoverable,
-  and a retry from the same successor session can recover delivery after the
-  durable spent mark; another session still receives the one-time stop notice.
-- `continue_handoff` is best-effort. Herdr launches one sibling through
-  `copilot-pane`; after successful consumption, the successor verifies the
-  recorded predecessor pane/session and stops that exact pane. A linked worktree otherwise
-  targets its `wt-<id>` mux; an adopted anchor targets the exact caller-owned
-  mux containing the predecessor pane. Without a live pane host it does nothing
-  destructive and tells the agent to use the saved paste or `/resume-handoff`
-  fallback.
-- `/resume-handoff` first tries a pinned agent-dispatch handoff task when that
-  stack is available; otherwise it falls back to the newest unconsumed
-  checkout-scoped handoff file for the current CWD.
-
-For a **natural-language** resume request handled by the skill (for example,
-"resume from handoff" without an exact id), discovery is deliberately
-checkout-local first: resolve `agent-worktrees get worktree-state-dir`, consume
-the newest valid unconsumed file under its `handoff/` directory, then inspect
-the worktree's local disposition history (when the checkout is a linked
-worktree) for an exact task-backed handoff pointer. The same first step works
-after restarting in an adopted anchor because its `@anchor` state namespace is
-stable. A broader agent-dispatch list is only a fallback and must be filtered
-to the current worktree before selecting a task; cross-session history is last.
-
-### The `handoff-cli.mjs` fallback (extension didn't load at all)
-
-Everything above assumes the **extension is loaded** so its tools exist. When it
-is **not** — most importantly a **Bare-resumed session**, where the CLI loads no
-extensions at all (`extensions list` shows nothing, so there are no
-`*_handoff` tools) — the plugin's **payload files are still on disk**, so an
-agent can drive the identical store + live-cutover through a standalone Node CLI:
-
-```bash
-CH="$HOME/.copilot/installed-plugins/copilot-extensions/context-handoff/extensions/context-handoff/handoff-cli.mjs"
-node "$CH" cutover  --title "<topic>" --prompt-file <handoff.md>   # store + live cutover
-node "$CH" save     --title "<topic>" --prompt-file <handoff.md>   # store + paste prompt (no cutover)
-node "$CH" continue --seed "<HANDOFF_SEED>"                         # trigger a cutover for a seed
-node "$CH" consume  --handoff-id <id>                               # load a file handoff + mark consumed
-```
-
-The CLI is a thin wrapper over **`handoff-core.mjs`** — the SDK-free store/trigger
-core (same on-disk format, Herdr-first and mux-preserving cutover selection, same
-issue-#853 bash-first seed shape from `cutover-seed.mjs`). A handoff it stores is
-therefore byte-compatible with `consume_handoff` / `/resume-handoff`. Session id
-defaults to `$COPILOT_AGENT_SESSION_ID`; `--session-id`/`--cwd` override; `--no-task`
-forces the file store; `--json` emits a machine-readable result. The agent
-composes the handoff markdown itself (the extension's in-memory session facts —
-token counts, per-turn edits — are unavailable out-of-band).
-
-> **Module layout.** `cutover-seed.mjs` (pure seed builders) and
-> `handoff-core.mjs` (SDK-free store/trigger) are both importable without loading
-> the session extension. `extension.mjs` and `handoff-cli.mjs` are the two
-> front-ends; the extension is the live-monitor + tool surface, the CLI is the
-> extension-free fallback. (`extension.mjs` still carries its own copies of the
-> store helpers today; folding it onto `handoff-core.mjs` to retire the
-> duplication is a test-guarded follow-up.)
+Each threshold tier may use either `<tier>_percent` or `<tier>_tokens`. Mixed
+configs are allowed per tier; percent tiers resolve against the live session
+token limit, token tiers stay fixed. If a mixed config's effective ordering is
+only knowable once the live token limit arrives, that final ordering check is
+deferred until then. Invalid config produces a visible warning and uses the
+55% / 70% / 79% defaults. If the runtime does not report a window size,
+percent-based tiers remain unknown, while absolute-token tiers still work.

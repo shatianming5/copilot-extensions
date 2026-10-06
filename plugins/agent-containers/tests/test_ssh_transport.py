@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from agent_containers import docker_proxy
 from agent_containers import ssh_transport as transport
 
 
@@ -42,7 +44,7 @@ def test_staged_input_is_binary_to_preserve_lf(monkeypatch):
     assert "text" not in seen
 
 
-def test_prepare_ssh_config_uses_docker_only_as_proxy(monkeypatch, tmp_path):
+def test_prepare_ssh_config_uses_docker_directly_off_windows(monkeypatch, tmp_path):
     monkeypatch.setattr(transport, "_SSH_DIR", tmp_path)
     monkeypatch.setattr(
         transport,
@@ -51,6 +53,7 @@ def test_prepare_ssh_config_uses_docker_only_as_proxy(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(transport, "_install_authorized_key", lambda *args: None)
     monkeypatch.setattr(transport, "_container_id", lambda name: "a" * 64)
+    monkeypatch.setattr(transport, "_is_windows", lambda: False)
 
     config = transport.prepare_ssh_config("repo-1", "vscode")
 
@@ -60,8 +63,303 @@ def test_prepare_ssh_config_uses_docker_only_as_proxy(monkeypatch, tmp_path):
         "/usr/sbin/sshd -i -e -o GatewayPorts=no"
     ) in text
     assert "StrictHostKeyChecking accept-new" in text
+    assert f'IdentityFile "{transport._config_path(Path(config.identity_file))}"' in text
     assert config.host_alias.endswith("-" + ("a" * 12))
     assert config.user == "vscode"
+    # Surfaced on the returned SSHConfig too (not just embedded in the
+    # rendered file's text) so a Windows caller reconstructing SSHConfig from
+    # this value alone (e.g. over the agent-bridge provider seam) can still
+    # detect the ProxyCommand and route it through a windowless broker.
+    assert config.proxy_command == (
+        "docker exec -i -u root repo-1 /usr/sbin/sshd -i -e -o GatewayPorts=no"
+    )
+
+
+def test_prepare_ssh_config_uses_windowless_broker_on_windows(monkeypatch, tmp_path):
+    monkeypatch.setattr(transport, "_SSH_DIR", tmp_path)
+    monkeypatch.setattr(
+        transport,
+        "_ensure_host_key",
+        lambda: (tmp_path / "id_ed25519", "ssh-ed25519 AAAA"),
+    )
+    monkeypatch.setattr(transport, "_install_authorized_key", lambda *args: None)
+    monkeypatch.setattr(transport, "_container_id", lambda name: "a" * 64)
+    monkeypatch.setattr(transport, "_is_windows", lambda: True)
+    monkeypatch.setattr(docker_proxy, "ensure_broker", lambda *args: 54321)
+
+    config = transport.prepare_ssh_config("repo-1", "vscode")
+
+    text = Path(config.config_file).read_text(encoding="utf-8")
+    assert "HostName 127.0.0.1" in text
+    assert "Port 54321" in text
+    assert "HostKeyAlias agent-container-repo-1-aaaaaaaaaaaa" in text
+    assert "ProxyCommand docker exec" not in text
+    assert f'IdentityFile "{transport._config_path(Path(config.identity_file))}"' in text
+    # No file-embedded ProxyCommand to surface when the windowless broker
+    # already owns the docker-exec child (HostName/Port route there instead).
+    assert config.proxy_command is None
+
+
+def test_docker_broker_uses_binary_pipes_and_suppresses_window(monkeypatch):
+    seen = {}
+    process = SimpleNamespace(
+        stdin=SimpleNamespace(),
+        stdout=SimpleNamespace(),
+        wait=lambda: 17,
+        poll=lambda: 17,
+    )
+
+    def fake_popen(args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return process
+
+    monkeypatch.setattr(docker_proxy.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        docker_proxy,
+        "no_window_kwargs",
+        lambda: {"creationflags": 0x08000000},
+    )
+    monkeypatch.setattr(
+        docker_proxy.threading,
+        "Thread",
+        lambda **kwargs: SimpleNamespace(
+            start=lambda: None,
+            join=lambda timeout=None: None,
+        ),
+    )
+    connection = SimpleNamespace(close=lambda: None)
+
+    docker_proxy._serve_connection("repo-1", connection)
+
+    assert seen["args"] == [
+        "docker",
+        "exec",
+        "-i",
+        "-u",
+        "root",
+        "repo-1",
+        "/usr/sbin/sshd",
+        "-i",
+        "-e",
+        "-o",
+        "GatewayPorts=no",
+    ]
+    assert seen["kwargs"] == {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.DEVNULL,
+        "creationflags": 0x08000000,
+    }
+
+
+def test_docker_broker_health_accepts_fragmented_control_response(monkeypatch):
+    class Connection:
+        def __init__(self):
+            self.responses = iter((b"po", b"ng\n"))
+            self.sent = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def sendall(self, data):
+            self.sent.append(data)
+
+        def recv(self, _size):
+            return next(self.responses)
+
+    connection = Connection()
+    monkeypatch.setattr(
+        docker_proxy.socket,
+        "create_connection",
+        lambda *_args, **_kwargs: connection,
+    )
+    endpoint = {
+        "schema_version": 1,
+        "container": "repo-1",
+        "container_id": "a" * 64,
+        "runtime": str(Path(docker_proxy.__file__).resolve()),
+        "port": 54320,
+        "control_port": 54321,
+    }
+
+    assert docker_proxy._healthy_endpoint(endpoint, "repo-1", "a" * 64)
+    assert connection.sent == [b"ping\n"]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("port", None),
+        ("port", "invalid"),
+        ("port", 0),
+        ("control_port", None),
+        ("control_port", "invalid"),
+        ("control_port", 65536),
+    ],
+)
+def test_docker_broker_rejects_invalid_endpoint_ports(
+    monkeypatch,
+    field,
+    value,
+):
+    endpoint = {
+        "schema_version": 1,
+        "container": "repo-1",
+        "container_id": "a" * 64,
+        "runtime": str(Path(docker_proxy.__file__).resolve()),
+        "port": 54320,
+        "control_port": 54321,
+    }
+    if value is None:
+        endpoint.pop(field)
+    else:
+        endpoint[field] = value
+    monkeypatch.setattr(
+        docker_proxy.socket,
+        "create_connection",
+        lambda *_args, **_kwargs: pytest.fail("invalid endpoint must not connect"),
+    )
+
+    assert not docker_proxy._healthy_endpoint(endpoint, "repo-1", "a" * 64)
+
+
+def test_docker_broker_control_exits_when_listener_closes():
+    listener = SimpleNamespace(
+        accept=lambda: (_ for _ in ()).throw(OSError("closed")),
+    )
+
+    assert docker_proxy._serve_control(listener) is None
+
+
+def test_docker_broker_failed_start_retires_process_and_endpoint(
+    monkeypatch,
+    tmp_path,
+):
+    endpoint_file = tmp_path / "proxy.json"
+
+    class Process:
+        pid = 123
+
+        def __init__(self):
+            self.running = True
+            self.terminated = False
+            self.waited = False
+
+        def poll(self):
+            return None if self.running else 0
+
+        def terminate(self):
+            self.terminated = True
+            self.running = False
+
+        def wait(self, timeout):
+            self.waited = True
+            return 0
+
+    process = Process()
+
+    def fake_popen(args, **_kwargs):
+        endpoint_file.write_text(json.dumps({"pid": process.pid}), encoding="utf-8")
+        return process
+
+    monkeypatch.setattr(docker_proxy.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(docker_proxy, "_healthy_endpoint", lambda *_args: False)
+    monkeypatch.setattr(docker_proxy, "windowless_daemon_kwargs", lambda **_kwargs: {})
+
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        docker_proxy.ensure_broker(
+            "repo-1",
+            "a" * 64,
+            endpoint_file,
+            timeout=0,
+        )
+
+    assert process.terminated
+    assert process.waited
+    assert not endpoint_file.exists()
+
+
+def test_docker_broker_clean_early_exit_fails_without_waiting(
+    monkeypatch,
+    tmp_path,
+):
+    process = SimpleNamespace(
+        pid=123,
+        poll=lambda: 0,
+    )
+    monkeypatch.setattr(
+        docker_proxy.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    monkeypatch.setattr(docker_proxy, "_healthy_endpoint", lambda *_args: False)
+    monkeypatch.setattr(docker_proxy, "windowless_daemon_kwargs", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        docker_proxy.time,
+        "sleep",
+        lambda _seconds: pytest.fail("early broker exit should not sleep"),
+    )
+
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        docker_proxy.ensure_broker(
+            "repo-1",
+            "a" * 64,
+            tmp_path / "proxy.json",
+            timeout=10,
+        )
+
+
+def test_docker_broker_starts_in_hidden_console_daemon(monkeypatch, tmp_path):
+    endpoint_file = tmp_path / "proxy.json"
+    seen = {}
+    launch_marker = object()
+    launch_options = {}
+    process = SimpleNamespace(pid=123, poll=lambda: None)
+
+    def fake_popen(args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        endpoint_file.write_text(
+            json.dumps({"pid": process.pid, "port": 54320}),
+            encoding="utf-8",
+        )
+        return process
+
+    def fake_daemon_kwargs(*, breakaway):
+        launch_options["breakaway"] = breakaway
+        return {"startupinfo": launch_marker}
+
+    health_results = iter((False, True))
+    monkeypatch.setattr(docker_proxy.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        docker_proxy,
+        "_healthy_endpoint",
+        lambda *_args: next(health_results),
+    )
+    monkeypatch.setattr(
+        docker_proxy,
+        "windowless_daemon_kwargs",
+        fake_daemon_kwargs,
+    )
+
+    assert (
+        docker_proxy.ensure_broker(
+            "repo-1",
+            "a" * 64,
+            endpoint_file,
+        )
+        == 54320
+    )
+    assert seen["args"][0] == docker_proxy.sys.executable
+    assert seen["kwargs"]["startupinfo"] is launch_marker
+    assert launch_options["breakaway"] is True
+    # Never the caller's ambient cwd -- this is a long-lived detached
+    # proxy daemon rooted at HOME instead.
+    assert seen["kwargs"]["cwd"] == docker_proxy.os.path.expanduser("~")
 
 
 @pytest.mark.parametrize("container,user", [
@@ -142,8 +440,9 @@ def test_build_ssh_command_uses_shared_builder(monkeypatch):
     config = SimpleNamespace()
     seen = {}
 
-    def fake_build(cfg, cmd, *, reverse_forwards=None):
+    def fake_build(cfg, cmd, *, reverse_forwards=None, pty=False):
         seen["reverse_forwards"] = reverse_forwards
+        seen["pty"] = pty
         return ["ssh", "target", cmd]
 
     monkeypatch.setattr(transport.shutil, "which", lambda name: "ssh")
@@ -160,3 +459,20 @@ def test_build_ssh_command_uses_shared_builder(monkeypatch):
         "ssh", "target", "echo ok"
     ]
     assert seen["reverse_forwards"] == ["9857:127.0.0.1:61234"]
+    assert seen["pty"] is False
+
+
+def test_build_ssh_command_forwards_pty(monkeypatch):
+    config = SimpleNamespace()
+    seen = {}
+
+    def fake_build(cfg, cmd, *, reverse_forwards=None, pty=False):
+        seen["pty"] = pty
+        return ["ssh", "-t", "target", cmd]
+
+    monkeypatch.setattr(transport.shutil, "which", lambda name: "ssh")
+    monkeypatch.setattr(transport, "build_remote_exec_args", fake_build)
+    assert transport.build_ssh_command(
+        config, "agent-worktrees copilot", pty=True,
+    ) == ["ssh", "-t", "target", "agent-worktrees copilot"]
+    assert seen["pty"] is True

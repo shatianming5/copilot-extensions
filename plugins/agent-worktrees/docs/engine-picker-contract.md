@@ -1,11 +1,11 @@
 # The engine ↔ Picker `--json` contract
 
-The interactive front-end (the **Worktree Manager**'s Picker, Phase 6b — and the
-still-bundled Picker until Phase 6c) reaches the `agent-worktrees` engine **only**
-by shelling out to its machine-readable CLI verbs: `<project> <verb> --json`,
-never `import agent_worktrees`. That process boundary is what keeps the coupling
-one-way and dependency-free (the Picker owns no worktree logic or state), and it
-is why the TUI framework (Textual) stays entirely out of the plugin engine.
+The interactive front-end (the **Worktree Manager**'s Picker) reaches the
+`agent-worktrees` engine **only** by shelling out to its machine-readable CLI
+verbs: `<project> <verb> --json`, never `import agent_worktrees`. That process
+boundary is what keeps the coupling one-way and dependency-free (the Picker owns
+no worktree logic or state), and it is why the TUI framework (Textual) stays
+entirely out of the plugin engine.
 
 ## Provider-backed source registry
 
@@ -149,10 +149,14 @@ version and be coordinated with the Manager.
 
 | Verb (as invoked) | Purpose | Notes |
 |---|---|---|
-| `<project> list --json --classify --mux-details` | The core enumeration — every worktree with git-derived `state`, sync tags, and mux details. | `--include-other-platforms` (Windows), `--cache-only` (fast paint), `--stream` (incremental) are **optional** accelerators; the engine must still answer without them. An engine too old for `--classify` is tolerated by re-running without it. |
+| `<project> list --json --classify --mux-details` | The core enumeration — every worktree with git-derived `state`, sync tags, mux details, and additive normalized `reciprocal_relation` presentation state. | `--include-other-platforms` (Windows), `--cache-only` (fast paint), `--stream` (incremental) are **optional** accelerators; the engine must still answer without them. An engine too old for `--classify` is tolerated by re-running without it. A Picker facing an older engine treats a missing reciprocal field as legacy data; it never infers controller authority from partial fields. |
 | `<project> list-sessions --worktree <id> --json` | Sessions belonging to a worktree. | |
 | `<project> recent-messages --worktree <id> --limit N --json` | Last few conversation turns (the read-only Messages overlay). | |
-| `<project> profiles get --json` | Current backend-profile grid. | |
+| `<project> picker-paths --json` | Low-frequency Picker runtime paths: `{"version":1,"install_dir":"<abs>","installed_plugins_dir":"<abs>"}`. | Contract v1 additive addition for Phase 3d Group A. These are one-shot setup reads (pivot registry scan), not render-tick data. |
+| `<project> picker-bootstrap --json` | Runner bootstrap decisions: `{"version":1,"project":"<resolved-project>","should_switch_cwd":<bool>,"cwd":"<normalized-abs-path>\|null","default_live":<bool>}`. | Contract v1 additive addition for Phase 3d Group B. This exposes the high-level decision `runner._prepare()` needs without pinning private helper names or config objects. `default_live` is the engine-owned "not inside SSH" decision; `cwd` is populated only when the caller should switch to the resolved anchor first. |
+| `<project> picker-reconcile-local --json [--worktree-id <id> ...]` | Group C's coarse-grained local reconcile-and-stamp batch: `{"version":1,"rows":[{"id":"<wt>","pr":{...}\|null,"prs":[...],"pr_count":N,"session_bound_live":true?,"session_lock_live":true?,"session_lock_stale":true?,"stale_lock_pids":[...],"mux_session":<bool>,"mux_clients":N,"mux_attached":<bool>},...],"summary":{"platform":"windows\|wsl\|linux","requested_worktree_ids":["..."],"record_count":N,"pr_terminal_count":N,"bound_visible_change_count":N,"had_unresolved_bound":<bool>,"mux_scan_ok":<bool>}}`. | Contract v1 additive addition for Phase 3d Group C. Omitting `--worktree-id` means "all current-platform local tracking records"; repeating it narrows the sweep for a future per-row refresh path. The row keys intentionally reuse the Picker's existing list-row names for the Group C-owned subset only, so the Manager can merge this payload onto today's downstream consumers without inventing a second vocabulary. Best-effort lock semantics stay unchanged: record enumeration is lock-free, provider/network work never holds a batch-wide tracking lock, and any tracking writes still happen only through the engine's existing short-lived stamp helpers. |
+| `<project> state-root --json` | Resolve the state-root checkout for visibility-gated pivots. | Existing state-root envelope (`state_root`/`source`/`repo`/`stateless`/`requires_external`/`bound`/`error`) is now also consumed by the Picker's contributed-pivot visibility gate. Callers may parse the JSON even when the command exits non-zero for an unbound external state root. |
+| `<project> stage-update --indicator-state --json` | Cosmetic staged-update glyph state: `{"version":1,"indicator_state":"paused|checking|available|current|idle"}`. | Additive Phase 3d Group A extension on the existing `stage-update` verb. A newer Picker tolerates an older engine rejecting `--indicator-state` by degrading this glyph rather than failing startup. |
 | `<project> get <key>` | Scalar project value (e.g. `machine`, paths). | Plain value on stdout, **not** JSON — a deliberate exception for single-scalar reads. |
 
 ## Pinned action verbs (the Picker's control plane)
@@ -160,14 +164,17 @@ version and be coordinated with the Manager.
 | Verb (as invoked) | Purpose |
 |---|---|
 | `<project> create [--json]` | Make a worktree, no launch (the programmatic "New worktree"). |
-| `<project> resolve --json (--worktree-id <id> \| --new \| --base) [--bare-resume] [--machine <name> --environment <env> --target-no-mux]` | Emit the launch plan the front-end acts on: local resume/create/base-repo execution, or an environment-specific remote SSH handoff carrying the same selection. |
+| `<project> resolve --json (--worktree-id <id> \| --new \| --base) [--bare-resume] [--machine <name> --environment <env> --target-no-mux]` | Emit the launch plan the front-end acts on: local resume/create/base-repo execution, or an environment-specific remote SSH handoff carrying the same selection. | Existing Group B remote seam; no payload/version change was needed for Step 2 because the remote plan already carries the Picker's public machine/environment answer (`action`/`ssh_alias`/`remote_command`/`machine`/`display_name`). |
+| `<project> repair-stale-anchor --json` | Targeted stale-anchor self-heal: `{"version":1,"project":"<resolved-project>","status":"unchanged\|repaired\|still-missing","self_present_before":<bool>,"self_present_after":<bool>}`. | Contract v1 additive addition for Phase 3d Group B. One-shot background-safe repair hook replacing the in-process `_heal_stale_anchor_if_self_missing` dependency. |
 | `<project> restart <id> --json` | Restart a worktree's session. |
 | `<project> reclaim --worktree-id <id> …` | Kill the exact bound orphan process so a session can be re-opened. |
+| `<project> reap-sessions --json [--worktree-id <id> ...] [--include-manager-owned] [--dry-run] [--grace-hours <hours>]` | Reap orphaned mux sessions in one background sweep. | Phase 3d Step 8 uses this for Manager-owned housekeeping: repeatable `--worktree-id` scopes the sweep to the Manager's own candidates, `--include-manager-owned` lifts the ordinary "hands off the Manager's mux lane" guard only for that caller, and the Manager may reuse the verb's existing dry-run / grace-window controls when validating or tuning that sweep. |
+| `<project> reap-shells --json --yes` | Reap orphaned launcher shells in one background sweep. | Existing public verb, now consumed by the Manager's housekeeping thread instead of via an in-process import. |
+| `<project> sweep-managed --json` | Reap leaked managed (`system`/`bridge`) worktrees in one background sweep. | Contract v1 additive addition for Phase 3d Step 8's focused housekeeping cutover. |
+| `<project> sweep-finished-sessions --json` | Run the finished-session auto-clean sweep in one background pass. | Contract v1 additive addition for Phase 3d Step 8; preserves the engine-owned cleanup semantics while removing the Manager's last in-process import of the sweep helper. |
 | `<project> finalize <id> --json` | Finalize a merged/completed worktree. |
 | `<project> sync --worktree-id <id> --json` | Fast-forward a clean, strictly-behind worktree. |
 | `<project> cleanup [--worktree-id <id>] [--clean] [--bare-only --yes] --json` | Remove completed/gone worktrees (single or bulk). |
-| `<project> profiles apply --json …` | Apply / reset the backend-profile grid. |
-
 ## What is *not* in the contract
 
 - **Human-formatted (non-`--json`) output.** Only the machine-readable shapes
@@ -175,6 +182,9 @@ version and be coordinated with the Manager.
 - **The bare, no-args invocation itself.** `<project>` with no args is the
   **seam** (DQ7): it resolves to the front-end (Manager if on PATH, else the
   bundled Picker) — it is not a data verb and returns no contract payload.
+- **Backend-profile reads/writes.** The old `profiles get/apply` engine verbs
+  are gone; the backend-profile grid now belongs to Worktree Manager's own
+  control plane rather than this engine contract.
 - **Internal helpers** the engine does not expose as `--json` verbs.
 
 ## See also

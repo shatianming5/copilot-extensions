@@ -44,12 +44,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+from agent_procutil import no_window_kwargs
 from typing import Any
 
 import yaml
 from zdd.routing import read_active_endpoint
 
 from .config import config_dir, load_config
+from .install_paths import elevated_task_name, install_dir
 
 log = logging.getLogger("agent-bridge")
 
@@ -60,7 +63,7 @@ log = logging.getLogger("agent-bridge")
 # with ``discovered_port()``. This constant applies only when no routing table
 # has been published yet (e.g. an older sub-daemon that still pinned 9281).
 ELEVATED_PORT = 9281
-TASK_NAME = "agent-bridge-elevated"
+TASK_NAME = elevated_task_name()
 _SUBDIR = "elevated"
 
 # The elevated sub-daemon self-terminates after this many seconds with no active
@@ -167,6 +170,7 @@ def _write_launcher(ed: Path, port: int) -> Path:
     launcher = ed / "launcher.cmd"
     launcher.write_text(
         "@echo off\r\n"
+        f'set "AGENT_BRIDGE_INSTALL_DIR={install_dir()}"\r\n'
         f'set "AGENT_BRIDGE_CONFIG_DIR={ed}"\r\n'
         f'"{py}" -m agent_bridge start --port {port} --bind 127.0.0.1 '
         f'--idle-shutdown {IDLE_SHUTDOWN_SECONDS} '
@@ -217,6 +221,7 @@ def _task_registered() -> bool:
         out = subprocess.run(
             ["schtasks", "/query", "/tn", TASK_NAME],
             capture_output=True, text=True,
+            **no_window_kwargs(),
         )
         return out.returncode == 0
     except OSError:
@@ -237,6 +242,7 @@ def _task_headless() -> bool:
         out = subprocess.run(
             ["schtasks", "/query", "/tn", TASK_NAME, "/xml", "ONE"],
             capture_output=True, text=True,
+            **no_window_kwargs(),
         )
         if out.returncode != 0:
             return False
@@ -254,6 +260,7 @@ def _run_task() -> int:
     """
     out = subprocess.run(
         ["schtasks", "/run", "/tn", TASK_NAME], capture_output=True, text=True,
+        **no_window_kwargs(),
     )
     if out.returncode != 0:
         log.warning(
@@ -267,6 +274,7 @@ def _end_task() -> int:
     """Terminate the running task instance (elevated) without a UAC prompt."""
     out = subprocess.run(
         ["schtasks", "/end", "/tn", TASK_NAME], capture_output=True, text=True,
+        **no_window_kwargs(),
     )
     return out.returncode
 
@@ -281,6 +289,7 @@ def _run_elevated(script: Path) -> int:
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
         capture_output=True,
         text=True,
+        **no_window_kwargs(),
     )
     if proc.returncode != 0:
         log.warning(
@@ -529,6 +538,7 @@ def status() -> dict:
         out = subprocess.run(
             ["schtasks", "/query", "/tn", TASK_NAME, "/fo", "LIST"],
             capture_output=True, text=True,
+            **no_window_kwargs(),
         )
         info["task_registered"] = out.returncode == 0
     except OSError:

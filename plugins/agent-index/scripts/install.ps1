@@ -6,12 +6,21 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('install', 'update', 'status', 'start', 'stop', 'ensure', 'uninstall', 'engine', 'engine-update', 'register-tasks', 'stamp', 'provision', 'slot-provision', 'slot-validate', 'slot-complete', 'slot-completion-validate')]
+    [ValidateSet('install', 'update', 'status', 'start', 'stop', 'ensure', 'uninstall', 'engine', 'engine-update', 'register-tasks', 'stamp', 'provision', 'cell-provision', 'cell-recover', 'slot-provision', 'slot-validate', 'slot-complete', 'slot-completion-validate', 'slot-cutover')]
     [string]$Action = 'install',
     [string]$InstallDir,
     [string]$Context,
     [string]$ExpectedMarketplaceId,
     [string]$DurableHome,
+    [string]$OriginPayloadRoot,
+    [string]$ExpectedNamespaceGeneration,
+    [string]$ExpectedInstallGeneration,
+    [string]$ExpectedCurrentVersion,
+    [string]$TargetPayloadRoot,
+    [string]$TargetPayloadVersion,
+    [string]$TargetSnapshotId,
+    [string]$TargetRuntimeVersion,
+    [switch]$ExpectCurrentAbsent,
     [switch]$NoService,
     [switch]$Purge,
     [switch]$Force,
@@ -19,7 +28,20 @@ param(
     # refuses scheduled-task CREATION without admin. Opt-in only; default is
     # user-mode with no elevation. Never elevates install/update -- only the
     # `register-tasks` action (see docs/install-contract.md § Hard rules).
-    [switch]$AllowTaskElevation
+    [switch]$AllowTaskElevation,
+
+    # DEPRECATED / no-op (Thread B): the graceful zdd cutover
+    # (Invoke-ServiceCutover -> `agent_index deploy`) is already the DEFAULT on
+    # `update` whenever a live, healthy service is running -- activation always
+    # cuts over automatically, so this opt-in is not required. The switch is
+    # still ACCEPTED (so a caller such as the launch-path reconciler, which
+    # appends it whenever a plugin declares `"zeroDowntimeUpdate": true`,
+    # doesn't break) but has no effect.
+    [switch]$ZeroDowntime,
+
+    # Preview mode for the 'uninstall' action: print what WOULD be removed
+    # without touching the filesystem, scheduled tasks, or services.
+    [switch]$DryRun
 )
 
 Set-StrictMode -Version 2.0
@@ -56,10 +78,13 @@ $probePayload = if ($env:COPILOT_PLUGIN_STAGED_FROM) {
 # runtime. Status remains read-only and does not need mutation authorization.
 if ($Action -notin @(
     'status',
+    'cell-provision',
+    'cell-recover',
     'slot-provision',
     'slot-validate',
     'slot-complete',
-    'slot-completion-validate'
+    'slot-completion-validate',
+    'slot-cutover'
 )) {
     $probeLegacyRoot = if ($InstallDir) {
         [IO.Path]::GetFullPath($InstallDir)
@@ -80,10 +105,13 @@ if ($Action -notin @(
 # Status and dependency-light cell-slot actions do not enter the self-stage
 # block that creates and reaps legacy staging directories.
 $cellSlotAction = $Action -in @(
+    'cell-provision',
+    'cell-recover',
     'slot-provision',
     'slot-validate',
     'slot-complete',
-    'slot-completion-validate'
+    'slot-completion-validate',
+    'slot-cutover'
 )
 if ($cellSlotAction) {
     Set-Location -LiteralPath $env:USERPROFILE
@@ -91,10 +119,13 @@ if ($cellSlotAction) {
 }
 $skipSelfStage = $Action -in @(
     'status',
+    'cell-provision',
+    'cell-recover',
     'slot-provision',
     'slot-validate',
     'slot-complete',
-    'slot-completion-validate'
+    'slot-completion-validate',
+    'slot-cutover'
 ) -and
     -not $env:COPILOT_PLUGIN_INSTALL_STAGED
 if ($skipSelfStage) {
@@ -277,16 +308,26 @@ function Write-Ok      { param([string]$Msg) Write-Host "  [OK]   $Msg" -Foregro
 function Write-Skip    { param([string]$Msg) Write-Host "  [SKIP] $Msg" -ForegroundColor Cyan }
 function Write-Fail    { param([string]$Msg) Write-Host "  [FAIL] $Msg" -ForegroundColor Red }
 function Write-Warn    { param([string]$Msg) Write-Host "  [WARN] $Msg" -ForegroundColor Yellow }
+function Write-Step    { param([string]$Msg) Write-Host "  ...    $Msg" -ForegroundColor DarkGray }
 
 $PluginDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $PkgSrcDir = Join-Path $PluginDir 'src\agent_index'
 if (-not $InstallDir) { $InstallDir = Join-Path $env:USERPROFILE '.agent-index' }
 $InstallDir = [IO.Path]::GetFullPath($InstallDir)
 $VenvDir  = Join-Path $InstallDir '.venv'
+# The historical (pre-versioned-runtime) real venv/junction path -- distinct
+# from $VenvDir/$LinkDir below, which the versioned-runtime block repoints at
+# the freshly-built versions/<v> slot (always a real, non-link directory).
+# Guarding a legacy-migration stop MUST use this real path, never the
+# build-target one, or the guard fires on every routine update and force-stops
+# the daemon each time (service-lifecycle-supervision.md's "Guard a
+# legacy-migration stop on the real link path, not the built slot" gotcha).
+$LegacyVenvDir = $VenvDir
 $LocalBin = Join-Path $env:USERPROFILE '.local\bin'
 $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 $TaskName = 'agent-index'
+$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $EnvFile = Join-Path $InstallDir 'service.env'
 $Launcher = Join-Path $InstallDir 'service.ps1'
 
@@ -328,6 +369,98 @@ if ($true) {  # always versioned (junction-free marker model; COPILOT_EXT_NO_VER
         $LinkDir = $VenvDir
         $LinkPython = $VenvPython
     }
+}
+
+if ($Action -in @('cell-provision', 'cell-recover', 'slot-cutover')) {
+    if ([string]::IsNullOrWhiteSpace($Context)) {
+        Write-Fail "$Action requires -Context; ambient COPILOT_EXTENSIONS_CONTEXT is not authorization"
+        exit 2
+    }
+    if ([string]::IsNullOrWhiteSpace($ExpectedMarketplaceId)) {
+        Write-Fail "$Action requires -ExpectedMarketplaceId"
+        exit 2
+    }
+    $cellRuntime = Join-Path $PSScriptRoot 'cell-runtime.py'
+    if (-not (Test-Path -LiteralPath $cellRuntime -PathType Leaf)) {
+        Write-Fail 'Installation-cell runtime coordinator is unavailable'
+        exit 1
+    }
+    $cellPython = $null
+    foreach ($candidate in @('python', 'python3', 'py')) {
+        $found = Get-Command $candidate -ErrorAction SilentlyContinue
+        if (-not $found) { continue }
+        if ($candidate -eq 'py') {
+            $resolved = @(& $found.Source -3 -c 'import sys; print(sys.executable)' 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $resolved.Count -gt 0) {
+                $cellPython = ("$($resolved[-1])").Trim()
+            }
+        } else {
+            $cellPython = $found.Source
+        }
+        if ($cellPython) { break }
+    }
+    if (-not $cellPython) {
+        Write-Fail 'Python 3.10+ is required for installation-cell lifecycle actions'
+        exit 1
+    }
+    $cellArgs = @(
+        $cellRuntime,
+        $Action,
+        '--context', $Context,
+        '--expected-marketplace-id', $ExpectedMarketplaceId
+    )
+    if ($DurableHome) {
+        $cellArgs += @('--durable-home', $DurableHome)
+    }
+    if ($Action -eq 'cell-provision') {
+        if ($OriginPayloadRoot) {
+            $cellArgs += @('--origin-payload-root', $OriginPayloadRoot)
+        }
+    } elseif ($Action -eq 'slot-cutover') {
+        if (
+            [string]::IsNullOrWhiteSpace($ExpectedNamespaceGeneration) -or
+            [string]::IsNullOrWhiteSpace($ExpectedInstallGeneration)
+        ) {
+            Write-Fail 'slot-cutover requires expected namespace and install generations'
+            exit 2
+        }
+        if (
+            [string]::IsNullOrWhiteSpace($TargetPayloadRoot) -or
+            [string]::IsNullOrWhiteSpace($TargetPayloadVersion) -or
+            [string]::IsNullOrWhiteSpace($TargetSnapshotId) -or
+            [string]::IsNullOrWhiteSpace($TargetRuntimeVersion)
+        ) {
+            Write-Fail 'slot-cutover requires explicit target payload, snapshot, and runtime identity'
+            exit 2
+        }
+        if (
+            ($ExpectCurrentAbsent -and $ExpectedCurrentVersion) -or
+            (-not $ExpectCurrentAbsent -and
+                [string]::IsNullOrWhiteSpace($ExpectedCurrentVersion))
+        ) {
+            Write-Fail 'slot-cutover requires exactly one current-version expectation'
+            exit 2
+        }
+        $cellArgs += @(
+            '--expected-namespace-generation', $ExpectedNamespaceGeneration,
+            '--expected-install-generation', $ExpectedInstallGeneration,
+            '--target-payload-root', $TargetPayloadRoot,
+            '--target-payload-version', $TargetPayloadVersion,
+            '--target-snapshot-id', $TargetSnapshotId,
+            '--target-runtime-version', $TargetRuntimeVersion
+        )
+        if ($ExpectCurrentAbsent) {
+            $cellArgs += '--expect-current-absent'
+        } else {
+            $cellArgs += @('--expected-current-version', $ExpectedCurrentVersion)
+        }
+    }
+    Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+    Remove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue
+    Set-Location -LiteralPath $PluginDir
+    [IO.Directory]::SetCurrentDirectory($PluginDir)
+    & $cellPython -I -X utf8 @cellArgs
+    exit $LASTEXITCODE
 }
 
 if ($Action -in @(
@@ -376,6 +509,51 @@ function Test-VenvIsLink {
     catch { return $false }
 }
 
+function Test-RuntimeOrigin {
+    param([string]$Python, [string]$Slot)
+    if (
+        -not (Test-Path -LiteralPath $Python -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $Slot -PathType Container)
+    ) {
+        return $false
+    }
+    $priorCwd = [IO.Directory]::GetCurrentDirectory()
+    $priorLocation = Get-Location
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        Set-Location -LiteralPath $Slot
+        [IO.Directory]::SetCurrentDirectory($Slot)
+        $originOutput = @(
+            & $Python -I -X utf8 -c (
+                'from pathlib import Path; import agent_index; ' +
+                'print(Path(agent_index.__file__).resolve())'
+            ) 2>$null
+        )
+        if ($LASTEXITCODE -ne 0 -or $originOutput.Count -eq 0) {
+            return $false
+        }
+        $origin = [IO.Path]::GetFullPath(("$($originOutput[-1])").Trim())
+        $slotRoot = (Resolve-Path -LiteralPath $Slot).Path.TrimEnd(
+            [IO.Path]::DirectorySeparatorChar,
+            [IO.Path]::AltDirectorySeparatorChar
+        )
+        return (
+            (Test-Path -LiteralPath $origin -PathType Leaf) -and
+            $origin.StartsWith(
+                $slotRoot + [IO.Path]::DirectorySeparatorChar,
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        )
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $previousPreference
+        Set-Location -LiteralPath $priorLocation
+        [IO.Directory]::SetCurrentDirectory($priorCwd)
+    }
+}
+
 function Invoke-VersionedActivate {
     if (-not $VersionedRuntime) { return $true }
     # Monotonic activation (dotfiles #1508): never flip the active runtime BACKWARD.
@@ -395,7 +573,7 @@ function Invoke-VersionedActivate {
             return $true
         }
     }
-    if ((Test-Path $LinkDir) -and -not (Test-VenvIsLink $LinkDir)) {
+    if ((Test-Path $LegacyVenvDir) -and -not (Test-VenvIsLink $LegacyVenvDir)) {
         try { Invoke-Stop | Out-Null } catch {}
     }
     $vr = Join-Path $PSScriptRoot 'versioned_runtime.py'
@@ -409,8 +587,7 @@ function Invoke-VersionedActivate {
         Write-Fail "Refusing to activate incomplete runtime slot versions/$SrcVersion"
         return $false
     }
-    & $py -c 'import agent_index' *> $null
-    if ($LASTEXITCODE -ne 0) {
+    if (-not (Test-RuntimeOrigin -Python $py -Slot $VenvDir)) {
         Write-Fail "Refusing to activate runtime slot versions/$SrcVersion because agent_index is not importable"
         return $false
     }
@@ -1067,6 +1244,111 @@ exit /b %ERRORLEVEL%
     Write-Ok "Binstub: $ps1Path (+ .cmd fallback, setup-gated)"
 }
 
+function Install-ServerVenv {
+    <# agent-index-server-venv-split: provision a sibling SERVER venv inside
+       the current runtime slot ($VenvDir\server), installing the full
+       agent-index[store,server] package -- so `spawn_passive` (and, once its
+       own dispatcher retarget lands, `cmd_start`/`cmd_cell_start`) can run the
+       FastAPI/uvicorn/pydantic service from a venv separate from the
+       client/orchestrator's own, keeping a pure client's install footprint
+       light. This is the exact sibling path `config.server_venv_python()`
+       already resolves (a `server` subdirectory of whichever directory
+       contains the current interpreter's own `Scripts`/`bin` folder) --
+       provisioning here just makes that existing, previously-inert resolver
+       find something.
+
+       Host role only: a client never runs the service, so it never needs
+       this second venv. Provisioning failures are WARN, never FAIL --
+       `config.server_venv_python()` already falls back to `$null` (in-process
+       `serve()`, or the shared venv for `spawn_passive`) when no sibling
+       exists, so a failure here must never block the primary client
+       install/update.
+
+       Prefers a signed base Python via `--copies` (mirroring the main venv's
+       own preference, see `Get-SignedBasePython`'s docstring): the resulting
+       python.exe is BOTH spawnable over a non-interactive SSH logon AND
+       Smart-App-Control-allowed, same rationale as the primary slot. Falls
+       back to `uv venv` (or a bare `python -m venv`) only when no signed base
+       is available. Note this is NOT a latency optimization -- CPython's own
+       Windows venv launcher re-execs the base interpreter as a child process
+       either way (`--copies` and a plain/uv-created venv launcher both do
+       this; confirmed empirically), so preferring the signed base changes
+       SSH/SAC compatibility, not the number of process hops a spawn takes. #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRole,
+        [Parameter(Mandatory)][AllowNull()][string]$PythonCmd
+    )
+    if ($InstallRole -ne 'host') {
+        Write-Skip 'Server venv: skipped (client role never runs the service)'
+        return
+    }
+
+    $serverVenvDir = Join-Path $VenvDir 'server'
+    $serverVenvPython = Join-Path $serverVenvDir 'Scripts\python.exe'
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+
+    if (-not (Test-Path $serverVenvPython)) {
+        $created = $false
+        $signedBase = Get-SignedBasePython
+        if ($signedBase) {
+            & $signedBase -m venv --copies --clear $serverVenvDir 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $serverVenvPython)) {
+                $created = $true
+                Write-Ok "Server venv created from signed Python ($signedBase)"
+            } else {
+                Write-Warn 'Signed-Python server venv creation failed -- falling back to uv'
+            }
+        }
+        if (-not $created) {
+            if (Get-Command uv -ErrorAction SilentlyContinue) {
+                $prevLoc = Get-Location
+                Set-Location "$env:SystemDrive\"
+                try { & uv venv $serverVenvDir --allow-existing 2>&1 | Out-Null } finally { Set-Location $prevLoc }
+            } elseif ($PythonCmd) {
+                & $PythonCmd -m venv $serverVenvDir 2>&1 | Out-Null
+            }
+            if (Test-Path $serverVenvPython) { $created = $true }
+        }
+        if (-not $created) {
+            $ErrorActionPreference = $prevEAP
+            Write-Warn "Server venv creation failed -- $serverVenvPython not found (spawn_passive falls back to the shared venv)"
+            return
+        }
+    }
+
+    $ZddDir = Resolve-Zdd
+    if ($ZddDir) {
+        if (Get-Command uv -ErrorAction SilentlyContinue) {
+            & uv pip install --python $serverVenvPython "$ZddDir" --reinstall-package agent-zdd --refresh-package agent-zdd --quiet 2>&1 | Out-Null
+        } else {
+            & $serverVenvPython -m pip install "$ZddDir" 2>&1 | Out-Null
+        }
+        if ($LASTEXITCODE -ne 0) {
+            $ErrorActionPreference = $prevEAP
+            Write-Warn "Server venv zdd install failed (exit $LASTEXITCODE) -- spawn_passive falls back to the shared venv"
+            return
+        }
+    }
+    Remove-ConsoleTrampolines -VenvDir $serverVenvDir
+
+    $serverPkgSpec = "$PluginDir[store,server]"
+    if (Get-Command uv -ErrorAction SilentlyContinue) {
+        $srvOut = & uv pip install --python $serverVenvPython $serverPkgSpec 2>&1 | Out-String
+    } else {
+        $srvOut = & $serverVenvPython -m pip install $serverPkgSpec 2>&1 | Out-String
+    }
+    if ($LASTEXITCODE -ne 0) {
+        $ErrorActionPreference = $prevEAP
+        Write-Warn 'Server venv package install failed -- spawn_passive falls back to the shared venv'
+        Write-Host $srvOut
+        return
+    }
+    $ErrorActionPreference = $prevEAP
+    Remove-ConsoleTrampolines -VenvDir $serverVenvDir
+    Write-Ok "Server venv provisioned: $serverVenvDir"
+}
+
 function Install-Runtime {
     if (-not (Test-Path $PkgSrcDir)) { Write-Fail "Package source not found at $PkgSrcDir"; exit 1 }
     $pythonCmd = $null
@@ -1103,8 +1385,9 @@ function Install-Runtime {
         if (Test-Path -LiteralPath $activePython -PathType Leaf) {
             & $activePython (Join-Path $PSScriptRoot 'versioned_runtime.py') --root $InstallDir --link-name '.venv' is-complete $activeVersion *> $null
             if ($LASTEXITCODE -eq 0) {
-                & $activePython -c 'import agent_index' *> $null
-                $activeReady = $LASTEXITCODE -eq 0
+                $activeReady = Test-RuntimeOrigin `
+                    -Python $activePython `
+                    -Slot (Join-Path (Join-Path $InstallDir 'versions') $activeVersion)
             }
         }
         if (-not $activeReady) {
@@ -1129,8 +1412,7 @@ function Install-Runtime {
         if (Test-Path -LiteralPath $VenvPython -PathType Leaf) {
             & $VenvPython $vr --root $InstallDir --link-name '.venv' is-complete $SrcVersion *> $null
             if ($LASTEXITCODE -eq 0) {
-                & $VenvPython -c 'import agent_index' *> $null
-                $slotReady = $LASTEXITCODE -eq 0
+                $slotReady = Test-RuntimeOrigin -Python $VenvPython -Slot $VenvDir
             }
         }
         if (-not $slotReady -or $env:AGENT_INDEX_REBUILD_CURRENT -eq '1') {
@@ -1227,14 +1509,42 @@ function Install-Runtime {
         Write-Fail 'Cannot locate zdd library. Reinstall the agent-index plugin from the marketplace (copilot plugin install agent-index@copilot-extensions), then rerun this installer.'
         exit 1
     }
+
+    # agent-procutil is a `uv`-editable canonical reference in a dev
+    # checkout (vendor-pointer-generalization effort: no local copy at
+    # all) and not on PyPI -- pre-install it the same way as zdd above, so
+    # the non-uv (bare-pip) fallback below can still resolve it.
+    $ProcutilDir = Resolve-VendoredLib -LibName 'agent-procutil'
+    if ($ProcutilDir) {
+        if (Get-Command uv -ErrorAction SilentlyContinue) {
+            $procutilOut = & uv pip install --python $VenvPython "$ProcutilDir" --reinstall-package agent-procutil --refresh-package agent-procutil --quiet 2>&1
+        } else {
+            $procutilOut = & $VenvPython -m pip install "$ProcutilDir" 2>&1
+        }
+        if ($LASTEXITCODE -ne 0) {
+            $ErrorActionPreference = $prevEAP
+            Write-Fail "agent-procutil install failed (exit $LASTEXITCODE)"
+            if ($procutilOut) { Write-Host ($procutilOut | Out-String) }
+            exit 1
+        }
+    }
     Remove-ConsoleTrampolines -VenvDir $VenvDir
-    # A client delegates read commands to the indexer host over SSH and runs NO
-    # local store/engine, so it installs only the light base package (CLI +
-    # transport + service shell). The host adds the [store] extra
-    # (lancedb/pyarrow/tree-sitter/numpy) it needs to read/write the index --
-    # those have no Windows-ARM64 wheels and are unneeded (and unbuildable) on a
-    # client, so gating keeps an ARM64 client provisionable.
-    $pkgSpec = if ((Get-InstallRole) -eq 'host') { "$PluginDir[store]" } else { "$PluginDir" }
+    # A host runs the local indexing/vector-store stack and the FastAPI/uvicorn
+    # server, so it needs the [store,server] extras (numpy, pyarrow, lancedb,
+    # tree-sitter*, mcp, fastapi, uvicorn, pydantic); a client stays on the
+    # light base deps only (no local store, no server -- see
+    # agent-index-server-venv-split, which will eventually move [server] into
+    # its own dedicated per-version venv instead of this shared one). This is
+    # distinct from -- and must never pull in -- the durable agent-index-engine
+    # program (torch), which is provisioned exclusively by `engine`/
+    # `engine-update` (see durable-vs-versioned-runtime.md). Resolve role
+    # BEFORE the package install so a host's versioned venv actually carries
+    # what its own service/search/index code imports -- Get-ActivationRole
+    # falls back to Get-MachineRole, so this is correct even before any
+    # per-repo role config exists.
+    $installRole = Get-ActivationRole
+    if ($installRole -eq 'unconfigured') { $installRole = Get-MachineRole }
+    $pkgSpec = if ($installRole -eq 'host') { "$PluginDir[store,server]" } else { "$PluginDir" }
     if (Get-Command uv -ErrorAction SilentlyContinue) {
         $out = & uv pip install --python $VenvPython $pkgSpec 2>&1 | Out-String
     } else {
@@ -1250,6 +1560,8 @@ function Install-Runtime {
     Remove-ConsoleTrampolines -VenvDir $VenvDir
     Write-Ok 'Package installed: agent-index'
 
+    Install-ServerVenv -InstallRole $installRole -PythonCmd $pythonCmd
+
     Deploy-SetupGatedBinstub
 
     $prevVersion = ''
@@ -1257,8 +1569,7 @@ function Install-Runtime {
         $prevVersion = Get-VersionedCurrent
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        & $VenvPython -c 'import agent_index' 2>$null
-        $slotOk = ($LASTEXITCODE -eq 0)
+        $slotOk = Test-RuntimeOrigin -Python $VenvPython -Slot $VenvDir
         $ErrorActionPreference = $prevEAP
         if (-not $slotOk) {
             Write-Fail "Fresh runtime slot failed its health gate (versions/$SrcVersion) -- not activating"
@@ -1277,8 +1588,7 @@ function Install-Runtime {
 
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    & $LinkPython -c 'import agent_index' 2>$null
-    $importOk = ($LASTEXITCODE -eq 0)
+    $importOk = Test-RuntimeOrigin -Python $LinkPython -Slot $LinkDir
     $ErrorActionPreference = $prevEAP
     if ($importOk) { Write-Ok 'Verification: module imports successfully' }
     else { Write-Fail 'Verification: module import failed'; exit 1 }
@@ -1391,15 +1701,6 @@ function Get-ActivationRole {
     return $(if ($role -in @('host', 'client')) { $role } else { 'unconfigured' })
 }
 
-function Get-InstallRole {
-    # Preserve host/store dependencies whenever this machine explicitly owns a
-    # host runtime, even if the update was invoked from a client/unconfigured
-    # repository. This keeps a permitted cutover from activating a light slot.
-    $machineRole = Get-MachineRole
-    if ($machineRole -eq 'host') { return 'host' }
-    return Get-ActivationRole
-}
-
 function Test-EnginePort {
     $eh = '127.0.0.1'; $ep = 8421
     if ($env:AGENT_INDEX_ENGINE_HOST) { $eh = $env:AGENT_INDEX_ENGINE_HOST }
@@ -1415,7 +1716,7 @@ function Test-EnginePort {
 }
 
 function Install-Engine {
-    # Provision the DURABLE engine venv (agent-index[engine], the torch stack) at
+    # Provision the DURABLE engine venv (agent-index-engine, the torch stack) at
     # AGENT_INDEX_ENGINE_HOME. Built ONCE and skipped if present (idempotent);
     # never rebuilt by a service `update`. Non-fatal -- a failure here leaves the
     # light, torch-free service fully functional. With -Upgrade, an existing venv
@@ -1475,11 +1776,37 @@ function Install-Engine {
         }
     }
 
-    # agent-index[engine] -- the heavy embedding stack into the DURABLE venv only.
+    # agent-procutil is likewise a `uv`-editable canonical reference in a
+    # dev checkout (no local copy, not on PyPI) -- pre-install it the same
+    # way as zdd above. Unlike zdd's own silently-ignored failure, a
+    # failed refresh here must fail the whole engine install: `agent-index`
+    # declares only an UNVERSIONED `agent-procutil` requirement, so the
+    # main-package install below could still "succeed" against a stale
+    # copy already present in a preserved engine venv, silently shipping
+    # old shared code (PR #4465 review).
+    $engRc = 0
+    $ProcutilDir = Resolve-VendoredLib -LibName 'agent-procutil'
+    if ($ProcutilDir) {
+        if (Get-Command uv -ErrorAction SilentlyContinue) {
+            & uv pip install --python $EngineVenvPython "$ProcutilDir" --reinstall-package agent-procutil --refresh-package agent-procutil --quiet 2>&1 |
+                ForEach-Object { Write-Host "  ...    $_" -ForegroundColor DarkGray }
+        } else {
+            & $EngineVenvPython -m pip install "$ProcutilDir" 2>&1 |
+                ForEach-Object { Write-Host "  ...    $_" -ForegroundColor DarkGray }
+        }
+        $engRc = $LASTEXITCODE
+    }
+
+    # agent-index-engine (plugins/agent-index/server/) -- a SEPARATE, independently
+    # installable program that owns the heavy embedding stack, into the DURABLE
+    # venv only. It depends on the light `agent-index` base package (index_config,
+    # engine.generation, engine.client) -- installed first, exactly like the zdd
+    # pre-install above, since neither is on PyPI and a plain `pip install
+    # agent-index-engine` cannot resolve "agent-index" on its own.
     #
     # Torch install is TWO STEPS so a GPU host works even behind a managed/CFS
     # package feed:
-    #   1. Install agent-index[engine] from the DEFAULT feed (governed mirror or
+    #   1. Install agent-index-engine from the DEFAULT feed (governed mirror or
     #      public PyPI). This pulls the CPU torch wheel plus ALL of torch's
     #      pure-python deps (sympy, networkx, jinja2, ...) and the rest of the
     #      engine stack (transformers, sentence-transformers, numpy).
@@ -1493,27 +1820,44 @@ function Install-Engine {
     #      by the step-1 versions; --no-deps skips re-resolving them through the
     #      blocked host.
     $torchIdx = $env:AGENT_INDEX_TORCH_INDEX
-    if (Get-Command uv -ErrorAction SilentlyContinue) {
-        $pipArgs = @('pip', 'install', '--python', $EngineVenvPython, "$PluginDir[store,engine]")
-        if ($Upgrade) { $pipArgs += '--upgrade' }
-        $engOut = & uv @pipArgs 2>&1
+    $engOut = @()
+    if ($engRc -ne 0) {
+        # agent-procutil's own preinstall above already failed -- skip the
+        # rest of the engine install rather than risk silently accepting a
+        # stale copy already present in a preserved engine venv.
+    } elseif (Get-Command uv -ErrorAction SilentlyContinue) {
+        $baseOut = & uv pip install --python $EngineVenvPython "$PluginDir" 2>&1
         $engRc = $LASTEXITCODE
+        $engOut = @($baseOut)
+        if ($engRc -eq 0) {
+            $pipArgs = @('pip', 'install', '--python', $EngineVenvPython, "$PluginDir\server")
+            if ($Upgrade) { $pipArgs += '--upgrade' }
+            $srvOut = & uv @pipArgs 2>&1
+            $engRc = $LASTEXITCODE
+            $engOut += @($srvOut)
+        }
         if ($engRc -eq 0 -and $torchIdx) {
             Write-Host "  ...    Swapping in CUDA torch from the configured CUDA wheel index (wheel only, --no-deps)" -ForegroundColor DarkGray
             $torchOut = & uv pip install --python $EngineVenvPython --index-url $torchIdx --no-deps --reinstall-package torch torch 2>&1
             $engRc = $LASTEXITCODE
-            $engOut = @($engOut) + @($torchOut)
+            $engOut += @($torchOut)
         }
     } else {
-        $pipArgs = @('-m', 'pip', 'install', "$PluginDir[store,engine]")
-        if ($Upgrade) { $pipArgs += '--upgrade' }
-        $engOut = & $EngineVenvPython @pipArgs 2>&1
+        $baseOut = & $EngineVenvPython -m pip install "$PluginDir" 2>&1
         $engRc = $LASTEXITCODE
+        $engOut = @($baseOut)
+        if ($engRc -eq 0) {
+            $pipArgs = @('-m', 'pip', 'install', "$PluginDir\server")
+            if ($Upgrade) { $pipArgs += '--upgrade' }
+            $srvOut = & $EngineVenvPython @pipArgs 2>&1
+            $engRc = $LASTEXITCODE
+            $engOut += @($srvOut)
+        }
         if ($engRc -eq 0 -and $torchIdx) {
             Write-Host "  ...    Swapping in CUDA torch from the configured CUDA wheel index (wheel only, --no-deps)" -ForegroundColor DarkGray
             $torchOut = & $EngineVenvPython -m pip install --index-url $torchIdx --no-deps --force-reinstall torch 2>&1
             $engRc = $LASTEXITCODE
-            $engOut = @($engOut) + @($torchOut)
+            $engOut += @($torchOut)
         }
     }
     $ErrorActionPreference = $prevEAP
@@ -1541,9 +1885,9 @@ function Restart-EngineDaemon {
         Start-ScheduledTask -TaskName $EngineTaskName -ErrorAction SilentlyContinue
         Write-Ok "Engine daemon restarted via task: $EngineTaskName"
     } elseif (Test-Path $EngineVenvPython) {
-        & $EngineVenvPython -m agent_index engine stop 2>&1 | Out-Host
+        & $EngineVenvPython -I -X utf8 -m agent_index engine stop 2>&1 | Out-Host
         Start-Sleep -Seconds 1
-        & $EngineVenvPython -m agent_index engine start 2>&1 | Out-Host
+        & $EngineVenvPython -I -X utf8 -m agent_index engine start 2>&1 | Out-Host
         Write-Ok 'Engine daemon restarted (user-mode, new engine runtime loaded)'
     } else {
         Write-Skip 'Engine runtime not provisioned -- restart skipped'
@@ -1568,10 +1912,88 @@ if (Test-Path `$envFile) {
         }
     }
 }
-& '$($EngineVenvPython -replace "'","''")' -m agent_index engine run
+& '$($EngineVenvPython -replace "'","''")' -I -X utf8 -m agent_index engine run
 exit `$LASTEXITCODE
 "@
     [System.IO.File]::WriteAllText($EngineLauncher, $engLauncher, $utf8NoBom)
+}
+
+function Remove-LogonAutostart {
+    param([Parameter(Mandatory)][string]$Name)
+    try {
+        if (Get-ItemProperty -Path $RunKey -Name $Name -ErrorAction SilentlyContinue) {
+            Remove-ItemProperty -Path $RunKey -Name $Name -ErrorAction Stop
+            Write-Ok "Logon auto-start removed (HKCU Run '$Name')"
+        }
+    } catch {
+        Write-Warn "Could not remove logon auto-start '$Name' (HKCU Run): $($_.Exception.Message)"
+    }
+}
+
+function Start-LauncherDetached {
+    param(
+        [Parameter(Mandatory)][string]$LauncherPath,
+        [Parameter(Mandatory)][string]$Kind
+    )
+    $taskArgs = "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$LauncherPath`""
+    try {
+        Start-Process -FilePath 'conhost.exe' -ArgumentList $taskArgs -WindowStyle Hidden | Out-Null
+        Write-Ok "$Kind launched as a detached background process"
+    } catch {
+        Write-Warn "Could not start $Kind process: $($_.Exception.Message)"
+    }
+    return $taskArgs
+}
+
+function Install-LogonAutostartEntry {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$LauncherPath,
+        [Parameter(Mandatory)][string]$Kind,
+        [Parameter(Mandatory)][scriptblock]$IsHealthy,
+        [Parameter(Mandatory)][string]$ScheduledTaskName
+    )
+    if (Get-ScheduledTask -TaskName $ScheduledTaskName -ErrorAction SilentlyContinue) {
+        Remove-LogonAutostart -Name $Name
+        Write-Skip "$Kind logon auto-start skipped -- scheduled task '$ScheduledTaskName' is the explicit machine-local supervisor"
+        return
+    }
+    if (-not (& $IsHealthy)) {
+        [void](Start-LauncherDetached -LauncherPath $LauncherPath -Kind $Kind)
+    } else {
+        Write-Skip "$Kind already running -- not starting a second instance"
+    }
+    $taskArgs = "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$LauncherPath`""
+    try {
+        if (-not (Test-Path $RunKey)) { New-Item -Path $RunKey -Force | Out-Null }
+        New-ItemProperty -Path $RunKey -Name $Name -Value "conhost.exe $taskArgs" `
+            -PropertyType String -Force | Out-Null
+        Write-Ok "Logon auto-start registered (HKCU Run '$Name') -- durable without elevation"
+    } catch {
+        Write-Warn "Could not register logon auto-start '$Name' (HKCU Run): $($_.Exception.Message)"
+    }
+}
+
+function Install-LogonAutostart {
+    # Default durable tier: zero-elevation interactive-logon auto-start for the
+    # service and durable engine. Scheduled tasks remain an explicit opt-in
+    # upgrade and supersede the matching HKCU Run entry when present.
+    if ($NoService) { Write-Skip 'Logon auto-start skipped (-NoService)'; return }
+    if ((Get-ActivationRole) -ne 'host') {
+        Write-Skip 'Logon auto-start skipped (role is not host)'
+        return
+    }
+    Write-ServiceFiles
+    Install-LogonAutostartEntry -Name $TaskName -LauncherPath $Launcher -Kind 'Service' `
+        -IsHealthy { Test-ServiceHealthy } -ScheduledTaskName $TaskName
+    if (-not (Test-Path $EngineVenvPython)) {
+        Remove-LogonAutostart -Name $EngineTaskName
+        Write-Skip 'Engine logon auto-start skipped -- durable engine runtime not provisioned'
+        return
+    }
+    Write-EngineFiles
+    Install-LogonAutostartEntry -Name $EngineTaskName -LauncherPath $EngineLauncher -Kind 'Engine daemon' `
+        -IsHealthy { Test-EnginePort } -ScheduledTaskName $EngineTaskName
 }
 
 # ── Scheduled-task registration: OPT-IN ADVANCED TIER ONLY (never the default) ─
@@ -1707,12 +2129,17 @@ function Invoke-ScopedElevation {
 
 function Invoke-RegisterTasks {
     # The ONLY task-scheduling entry point that may elevate -- and it elevates
-    # ONLY itself (task registration), never a full install/update. Opt-in via
-    # -AllowTaskElevation / AGENT_INDEX_ALLOW_TASK_ELEVATION=1.
+    # ONLY itself (task registration), never a full install/update. This is an
+    # explicit per-machine upgrade from the default HKCU Run tier to Windows
+    # Scheduled Tasks for boxes that want pre-login start / restart policy /
+    # missed-trigger recovery. Opt-in via -AllowTaskElevation /
+    # AGENT_INDEX_ALLOW_TASK_ELEVATION=1.
     if ((Test-TaskElevationOptIn) -and -not (Test-Elevated)) {
         [void](Invoke-ScopedElevation -ElevAction 'register-tasks')
         return
     }
+    Remove-LogonAutostart -Name $TaskName
+    Remove-LogonAutostart -Name $EngineTaskName
     Register-EngineDaemon
     Install-Service
 }
@@ -1761,11 +2188,11 @@ if (Test-Path -LiteralPath `$_resolver -PathType Leaf) {
 }
 `$_py = `$AgentRtPy
 if (`$_py) {
-    & `$_py -c 'import agent_index' *> `$null
+    & `$_py -I -X utf8 -c 'import agent_index' *> `$null
     if (`$LASTEXITCODE -ne 0) { `$_py = `$null }
 }
 if (-not `$_py) { [Console]::Error.WriteLine('[agent-index] no complete, importable runtime slot is available.'); exit 1 }
-& `$_py -m agent_index start
+& `$_py -I -X utf8 -m agent_index start
 exit `$LASTEXITCODE
 "@
     [System.IO.File]::WriteAllText($Launcher, $launcherContent, $utf8NoBom)
@@ -1808,9 +2235,20 @@ function Get-ActiveSlotPython {
         $p = Join-Path $InstallDir "versions\$ver\Scripts\python.exe"
         if (Test-Path -LiteralPath $p) { return $p }
     }
-    # Marker missing/stale: match the binstub's resolution -- fall back to the
-    # LATEST built slot under versions\* (a real installed runtime) before the
-    # build's $LinkPython, so a present-but-unmarked runtime is still found.
+    # #742: marker missing/stale -> prefer last-known-good (the last version
+    # `activate()` published) over a raw newest-slot guess, which could bind a
+    # still-installing/never-activated slot mid-swap.
+    try {
+        $lkg = ([IO.File]::ReadAllText((Join-Path $InstallDir 'last-known-good'))).Trim()
+    } catch { $lkg = '' }
+    if ($lkg) {
+        $lp = Join-Path $InstallDir "versions\$lkg\Scripts\python.exe"
+        if (Test-Path -LiteralPath $lp) { return $lp }
+    }
+    # Marker and last-known-good missing/stale: match the binstub's resolution --
+    # fall back to the LATEST built slot under versions\* (a real installed
+    # runtime) before the build's $LinkPython, so a present-but-unmarked runtime
+    # is still found.
     $latest = Get-ChildItem (Join-Path $InstallDir 'versions') -Directory -ErrorAction SilentlyContinue |
         Sort-Object Name | ForEach-Object { Join-Path $_.FullName 'Scripts\python.exe' } |
         Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Last 1
@@ -1853,7 +2291,7 @@ function Ensure-ServiceRunning {
     if (-not (Test-Path $activePy)) { Write-Skip 'Runtime not installed -- service not ensured'; return }
     Write-ServiceFiles
     if (Test-ServiceHealthy) { Write-Skip 'Service already healthy (user-mode daemon serving)'; return }
-    & $activePy -m agent_index deploy 2>&1 | Out-Host
+    & $activePy -I -X utf8 -m agent_index deploy 2>&1 | Out-Host
     if (Test-ServiceHealthy) { Write-Ok 'Service ensured (user-mode daemon)' }
     else { Write-Warn 'Service ensure attempted -- endpoint not yet healthy (it may still be starting)' }
 }
@@ -1865,7 +2303,7 @@ function Ensure-EngineRunning {
     if (-not (Test-Path $EngineVenvPython)) { Write-Skip 'Engine runtime not provisioned -- engine not ensured'; return }
     Write-EngineFiles
     if (Test-EnginePort) { Write-Skip 'Engine already serving -- leaving the warm engine untouched'; return }
-    & $EngineVenvPython -m agent_index engine start 2>&1 | Out-Host
+    & $EngineVenvPython -I -X utf8 -m agent_index engine start 2>&1 | Out-Host
     Write-Ok 'Engine ensured (user-mode durable daemon)'
 }
 
@@ -1901,7 +2339,7 @@ function Invoke-ServiceCutover {
     Write-ServiceFiles
     if (Test-ServiceHealthy) {
         Write-Step 'Graceful cutover: moving the live service to the new build (zdd active/passive flip)...'
-        & $LinkPython -m agent_index deploy 2>&1 | Out-Host
+        & $LinkPython -I -X utf8 -m agent_index deploy 2>&1 | Out-Host
         if (Test-ServiceHealthy) { Write-Ok 'Service cut over to the new build (routing flipped; old drained + retired)' }
         else { Write-Warn 'Service cutover attempted -- endpoint not yet healthy (it may still be starting)' }
     } else {
@@ -1976,15 +2414,62 @@ function Invoke-Start {
 }
 
 function Invoke-Stop {
-    if (Test-Path $LinkPython) { & $LinkPython -m agent_index stop | Out-Host }
+    if (Test-Path $LinkPython) {
+        & $LinkPython -I -X utf8 -m agent_index stop | Out-Host
+        # The durable engine daemon is a SEPARATE detached process from the
+        # light service stopped above (daemon.py, launched by 'engine start' /
+        # Ensure-Running via a plain detached Popen, not necessarily under
+        # $EngineTaskName). Stop-ScheduledTask below only tears down a task-
+        # tracked process tree -- it does not touch this one if it was ever
+        # started directly, so a bare Stop-ScheduledTask leaves it running
+        # indefinitely (the "kill the detached child, not just the task"
+        # gotcha in service-lifecycle-supervision.md). `engine stop` uses the
+        # daemon's own pid file and is idempotent -- a no-op when the engine
+        # was never started.
+        & $LinkPython -I -X utf8 -m agent_index engine stop | Out-Host
+    }
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
         Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         Write-Ok "Service task stopped: $TaskName"
     }
+    if (Get-ScheduledTask -TaskName $EngineTaskName -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $EngineTaskName -ErrorAction SilentlyContinue
+        Write-Ok "Engine daemon task stopped: $EngineTaskName"
+    }
 }
 
 function Invoke-Uninstall {
+    if ($DryRun) {
+        Write-Host '(dry run -- nothing will be changed)' -ForegroundColor Yellow
+        Write-Host '[dry-run] would stop agent-index'
+        if (Get-ItemProperty -Path $RunKey -Name $TaskName -ErrorAction SilentlyContinue) {
+            Write-Host "[dry-run] would remove logon auto-start (HKCU Run): $TaskName"
+        }
+        if (Get-ItemProperty -Path $RunKey -Name $EngineTaskName -ErrorAction SilentlyContinue) {
+            Write-Host "[dry-run] would remove logon auto-start (HKCU Run): $EngineTaskName"
+        }
+        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+            Write-Host "[dry-run] would remove scheduled task: $TaskName"
+        }
+        if (Get-ScheduledTask -TaskName $EngineTaskName -ErrorAction SilentlyContinue) {
+            Write-Host "[dry-run] would stop + remove scheduled task: $EngineTaskName"
+        }
+        foreach ($stub in @('agent-index.ps1', 'agent-index.cmd')) {
+            $p = Join-Path $LocalBin $stub
+            if (Test-Path $p) { Write-Host "[dry-run] would remove binstub: $p" }
+        }
+        if ($Purge) {
+            if (Test-Path $EngineHome) { Write-Host "[dry-run] would PURGE engine home: $EngineHome" }
+            if (Test-Path $InstallDir) { Write-Host "[dry-run] would PURGE: $InstallDir" }
+        } else {
+            Write-Host "[dry-run] engine home + install dir would be kept (-Purge to delete)"
+        }
+        Write-Host 'agent-index uninstall dry run complete -- nothing was changed' -ForegroundColor Yellow
+        return
+    }
     Invoke-Stop
+    Remove-LogonAutostart -Name $TaskName
+    Remove-LogonAutostart -Name $EngineTaskName
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     }
@@ -2004,29 +2489,33 @@ function Invoke-Uninstall {
 switch ($Action) {
     'install' {
         Install-Runtime
-        $role = Get-ActivationRole
-        if ($role -eq 'host') {
-            Install-Engine | Out-Null
-        } else {
-            Write-Skip "Engine runtime skipped (role: $role) -- set 'role: host' in $InstallDir\config.yaml or AGENT_INDEX_ROLE=host to host the durable engine"
-        }
-        Ensure-Running   # DEFAULT user-mode start (no scheduled task, no elevation)
+        Invoke-ServiceCutover
+        Install-LogonAutostart
+        Write-Skip 'Durable engine runtime unchanged; use engine / engine-update for the heavy stack'
     }
     'update' {
         Invoke-DowngradeGuard
         Install-Runtime
-        # Engine daemon: warm-preserving OUTLIVE + reconnect guarantee (Thread B;
-        # durable-vs-versioned-runtime). The heavy embedding engine runs in its own
-        # durable venv on a FIXED endpoint (127.0.0.1:8421); a service update never
-        # rebuilds or restarts it, and the new service reconnects to the same warm
-        # engine. Ensure-EngineRunning leaves a serving engine untouched and only
-        # starts one if it is down, so the cutover always has a reconnect target.
-        if ((Get-ActivationRole) -eq 'host') { Ensure-EngineRunning }
-        # Service: installer-driven zdd cutover -- move a live (even healthy) service
-        # to the new slot, rather than leaving stale code serving.
         Invoke-ServiceCutover
+        Install-LogonAutostart
+        Write-Skip 'Durable engine runtime unchanged; use engine / engine-update for the heavy stack'
     }
-    'ensure' { Ensure-Running }  # user-mode auto-run safety net (sessionStart hook) -- start if not already healthy
+    'ensure' {
+        # User-mode safety net + default durable auto-start registration; also
+        # stamps the binstub on a never-provisioned machine (fits a sessionStart
+        # hook's grace window -- no venv build, no heavy runtime provisioning here).
+        $ps1Stub = Join-Path $LocalBin 'agent-index.ps1'
+        if (-not (Test-Path -LiteralPath $ps1Stub -PathType Leaf)) {
+            foreach ($dir in @($InstallDir, $LocalBin)) {
+                if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            }
+            $payloadDirMarker = Join-Path $InstallDir 'payload-dir'
+            [IO.File]::WriteAllText($payloadDirMarker, $probePayload, (New-Object System.Text.UTF8Encoding($false)))
+            Deploy-SetupGatedBinstub
+        }
+        Ensure-Running
+        Install-LogonAutostart
+    }
     'register-tasks' { Invoke-RegisterTasks }  # OPT-IN advanced tier (scheduled tasks) -- the sole action that may (opt-in) self-elevate that ONE step
     'engine' { Install-Engine | Out-Null; Ensure-EngineRunning }        # explicit host-side provisioning (role-independent), user-mode
     'engine-update' { if (Install-Engine -Upgrade) { Restart-EngineDaemon } }  # rebuild durable engine venv + restart daemon (decoupled from service update)
@@ -2035,5 +2524,9 @@ switch ($Action) {
     'stop' { Invoke-Stop }
     'uninstall' { Invoke-Uninstall }
     'stamp' { Invoke-Stamp }
-    'provision' { Install-Runtime; Ensure-Running }
+    'provision' {
+        Install-Runtime
+        Invoke-ServiceCutover
+        Write-Skip 'Durable engine runtime unchanged; use engine / engine-update for the heavy stack'
+    }
 }

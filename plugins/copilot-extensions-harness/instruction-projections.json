@@ -1,0 +1,38 @@
+{
+  "schema": "copilot-extensions.instruction-projections",
+  "version": 1,
+  "projections": [
+    {
+      "id": "contribution-boundary",
+      "template": "instructions/contribution-boundary.instructions.md",
+      "destination": ".github/instructions/copilot-extensions-harness/contribution-boundary.instructions.md",
+      "customizationKind": "instructions",
+      "applyTo": "**",
+      "legacyMarkers": []
+    },
+    {
+      "id": "cross-repo-debug-tracking",
+      "template": "instructions/cross-repo-debug-tracking.instructions.md",
+      "destination": ".github/instructions/copilot-extensions-harness/cross-repo-debug-tracking.instructions.md",
+      "customizationKind": "instructions",
+      "applyTo": "**",
+      "legacyMarkers": []
+    },
+    {
+      "id": "commented-review-verdict",
+      "template": "instructions/commented-review-verdict.instructions.md",
+      "destination": ".github/instructions/copilot-extensions-harness/commented-review-verdict.instructions.md",
+      "customizationKind": "instructions",
+      "applyTo": "**",
+      "legacyMarkers": []
+    },
+    {
+      "id": "validate-and-promote-triage",
+      "template": "instructions/validate-and-promote-triage.instructions.md",
+      "destination": ".github/instructions/copilot-extensions-harness/validate-and-promote-triage.instructions.md",
+      "customizationKind": "instructions",
+      "applyTo": "**",
+      "legacyMarkers": []
+    }
+  ]
+}

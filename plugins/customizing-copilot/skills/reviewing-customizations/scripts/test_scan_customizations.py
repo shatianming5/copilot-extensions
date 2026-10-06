@@ -44,8 +44,6 @@ def _settings(
     repo: Path,
     enabled: dict,
     marketplaces: dict,
-    *,
-    aggregation: object | None = None,
 ) -> None:
     p = repo / ".github" / "copilot" / "settings.json"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -53,23 +51,6 @@ def _settings(
         "enabledPlugins": enabled, "extraKnownMarketplaces": marketplaces,
     }
     p.write_text(json.dumps(payload), encoding="utf-8")
-    if aggregation is not None:
-        config = repo / ".context-injection" / "config.yaml"
-        config.parent.mkdir(parents=True, exist_ok=True)
-        if not isinstance(aggregation, dict):
-            config.write_text(f"{aggregation!r}\n", encoding="utf-8")
-        else:
-            lines: list[str] = []
-            for key, value in aggregation.items():
-                if isinstance(value, dict):
-                    lines.append(f"{key}:")
-                    lines.extend(
-                        f"  {nested_key}: {nested_value}"
-                        for nested_key, nested_value in value.items()
-                    )
-                else:
-                    lines.append(f"{key}: {value}")
-            config.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _marketplace(
@@ -102,6 +83,83 @@ def _installed_plugin(root: Path, mkt: str, name: str, *,
     )
 
 
+def _write_output_free_bootstrap(plugin: Path) -> None:
+    scripts = plugin / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "bootstrap-check.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -u\n"
+        "session_start_json_emitted=0\n"
+        "emit_session_start_json() {\n"
+        "  if [ \"${session_start_json_emitted:-0}\" -eq 0 ]; then\n"
+        "    printf '{}'\n"
+        "    session_start_json_emitted=1\n"
+        "  fi\n"
+        "}\n"
+        "trap 'emit_session_start_json' EXIT\n"
+        "echo '[diagnostic]' >&2\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    (scripts / "bootstrap-check.ps1").write_text(
+        "$ErrorActionPreference = 'SilentlyContinue'\n"
+        "$script:SessionStartJsonEmitted = $false\n"
+        "function Write-SessionStartJson {\n"
+        "    if (-not $script:SessionStartJsonEmitted) {\n"
+        "        [Console]::Out.Write('{}')\n"
+        "        $script:SessionStartJsonEmitted = $true\n"
+        "    }\n"
+        "}\n"
+        "try {\n"
+        "    [Console]::Error.WriteLine('[diagnostic]')\n"
+        "} finally { Write-SessionStartJson }\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+
+
+def _write_standard_writer(plugin: Path) -> None:
+    scripts = plugin / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "write-session-guidance.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -uo pipefail\n"
+        "root=\"${COPILOT_PLUGIN_ROOT:-$(cd -- \"$(dirname -- \"${BASH_SOURCE[0]}\")/..\" && pwd -P)}\"\n"
+        "script=\"$root/scripts/write_session_guidance.py\"\n"
+        "python=\"$(command -v python3 || command -v python || true)\"\n"
+        "if [[ -z \"$python\" || ! -f \"$script\" ]]; then\n"
+        "    printf '{}'\n"
+        "    exit 0\n"
+        "fi\n"
+        "PYTHONPATH=\"\" \"$python\" \"$script\" || printf '{}'\n",
+        encoding="utf-8",
+    )
+    (scripts / "write-session-guidance.ps1").write_text(
+        "$ErrorActionPreference = 'SilentlyContinue'\n"
+        "$root = if ($env:COPILOT_PLUGIN_ROOT) { $env:COPILOT_PLUGIN_ROOT } else { Split-Path -Parent $PSScriptRoot }\n"
+        "$script = Join-Path (Join-Path $root 'scripts') 'write_session_guidance.py'\n"
+        "$python = Get-Command python -CommandType Application -All -ErrorAction SilentlyContinue | Select-Object -First 1\n"
+        "if (-not $python -or -not (Test-Path -LiteralPath $script -PathType Leaf)) {\n"
+        "    [Console]::Out.Write('{}')\n"
+        "    exit 0\n"
+        "}\n"
+        "$env:PYTHONPATH = ''\n"
+        "try {\n"
+        "    & $python.Source $script\n"
+        "    if ($LASTEXITCODE -ne 0) { [Console]::Out.Write('{}') }\n"
+        "} catch {\n"
+        "    [Console]::Out.Write('{}')\n"
+        "}\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    (scripts / "write_session_guidance.py").write_text(
+        "import sys\n"
+        "sys.stdout.write(\"{}\")\n",
+        encoding="utf-8",
+    )
+
+
 def _session_plugin(
     root: Path,
     marketplace: str,
@@ -121,6 +179,8 @@ def _session_plugin(
         "version": "1.0.0",
         "hooks": "hooks.json",
     }
+    if marketplace == "copilot-extensions":
+        manifest["repository"] = scan.COPILOT_EXTENSIONS_SOURCE
     if declaration != "missing":
         manifest["sessionContext"] = "session-context.json"
     (plugin / "plugin.json").write_text(
@@ -133,8 +193,14 @@ def _session_plugin(
                 "sessionStart": (
                     [{
                         "type": "command",
-                        "bash": "do-not-report-this-command",
-                        "powershell": "do-not-report-this-command",
+                        "bash": (
+                            's="$COPILOT_PLUGIN_ROOT/scripts/bootstrap-check.sh"; '
+                            'bash "$s"'
+                        ),
+                        "powershell": (
+                            "$s = Join-Path $env:COPILOT_PLUGIN_ROOT "
+                            "'scripts\\bootstrap-check.ps1'; & $s"
+                        ),
                     }]
                     if session_start
                     else []
@@ -143,13 +209,15 @@ def _session_plugin(
         }),
         encoding="utf-8",
     )
+    if session_start:
+        _write_output_free_bootstrap(plugin)
     if declaration != "missing":
         if side_effects is None:
             side_effects = (
                 "none" if contributors else "restart-safe-idempotent"
             )
         if context_behavior is None:
-            context_behavior = "authority-aware" if contributors else "none"
+            context_behavior = "direct" if contributors else "none"
         payload = {
             "schema": scan.SESSION_CONTEXT_SCHEMA,
             "version": scan.SESSION_CONTEXT_VERSION,
@@ -187,65 +255,8 @@ def _pure_contributor(name: str = "ambient") -> dict:
     }
 
 
-def _adoption(
-    authority: str = "context-injection@copilot-extensions",
-) -> dict:
-    return {
-        "schema": scan.SESSION_CONTEXT_ADOPTION_SCHEMA,
-        "version": 1,
-        "authority": authority,
-        "engine": {
-            "schema": scan.SESSION_CONTEXT_ENGINE_SCHEMA,
-            "version": scan.SESSION_CONTEXT_ENGINE_VERSION,
-        },
-    }
-
-
-def _aggregate_authority(
-    root: Path,
-    marketplace: str = "copilot-extensions",
-) -> Path:
-    authority = _session_plugin(
-        root,
-        marketplace,
-        "context-injection",
-        side_effects="none",
-        context_behavior="aggregate-authority",
-    )
-    manifest_path = authority / "plugin.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["sessionContextEngine"] = "engine.json"
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    (authority / "engine.json").write_text(
-        json.dumps({
-            "schema": scan.SESSION_CONTEXT_ENGINE_SCHEMA,
-            "version": scan.SESSION_CONTEXT_ENGINE_VERSION,
-        }),
-        encoding="utf-8",
-    )
-    return authority
-
-
 def _isolate_user_settings(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(scan.Path, "home", lambda: tmp_path / "empty-home")
-
-
-def _scan_contributor_with_authority(
-    repo: Path,
-    installed: Path,
-) -> tuple[dict, scan.Report]:
-    _settings(
-        repo,
-        {
-            "ambient-policy@copilot-extensions": True,
-            "context-injection@copilot-extensions": True,
-        },
-        {},
-        aggregation=_adoption(),
-    )
-    sources = scan.assemble_enabled_plugins(repo, installed_root=installed)
-    report = scan.Report()
-    return scan.scan_session_context(repo, sources, report), report
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +411,369 @@ def test_local_settings_can_disable_base_plugin(tmp_path: Path):
         installed_root=tmp_path / "none",
         home=tmp_path / "home",
     ) == []
+
+
+def test_agent_worktrees_repo_marketplace_resolves_via_registry(
+    tmp_path: Path, monkeypatch,
+):
+    # A marketplace declared via {"source": "agent-worktrees-repo", "repo":
+    # "<name>"} resolves that repo's local checkout through the trusted
+    # agent-worktrees registry (mocked here), then treats it exactly like a
+    # directory marketplace rooted there -- portable across machines since
+    # the declaration carries only a stable repo name, never an absolute path.
+    other_repo = tmp_path / "other-repo-checkout"
+    (other_repo / ".ai" / "cap" / "skills").mkdir(parents=True)
+    _skill(other_repo / ".ai" / "cap" / "skills", "cap")
+    (other_repo / ".ai" / "cap" / "plugin.json").write_text(
+        json.dumps({"name": "cap", "version": "1.0.0"}), encoding="utf-8",
+    )
+    _marketplace(
+        other_repo / ".ai",
+        "other-marketplace",
+        entries=[{"name": "cap", "source": "cap"}],
+    )
+
+    def fake_which(name):
+        return "/usr/bin/agent-worktrees" if name == "agent-worktrees" else None
+
+    def fake_run(argv, **kwargs):
+        assert argv[1:3] == ["repos", "find"]
+        assert argv[3] == "other-repo-alias"
+        return scan.subprocess.CompletedProcess(
+            argv, 0, stdout=f"{other_repo}\n", stderr="",
+        )
+
+    monkeypatch.setattr(scan.shutil, "which", fake_which)
+    monkeypatch.setattr(scan.subprocess, "run", fake_run)
+
+    repo = tmp_path / "consuming-repo"
+    repo.mkdir()
+    _settings(
+        repo,
+        {"cap@other-marketplace": True},
+        {
+            "other-marketplace": {
+                "source": {
+                    "source": "agent-worktrees-repo",
+                    "repo": "other-repo-alias",
+                },
+            },
+        },
+    )
+
+    sources = scan.assemble_enabled_plugins(
+        repo,
+        installed_root=tmp_path / "none",
+        home=tmp_path / "home",
+    )
+    assert len(sources) == 1
+    assert sources[0].payload_root == (other_repo / ".ai" / "cap").resolve()
+
+
+def test_agent_worktrees_repo_marketplace_prefers_explicit_command(
+    tmp_path: Path, monkeypatch,
+):
+    """A caller-supplied resolved command must win over `PATH` -- the whole
+    point is not selecting a different marketplace/cell's ambient install."""
+    other_repo = tmp_path / "other-repo-checkout"
+    (other_repo / ".ai" / "cap" / "skills").mkdir(parents=True)
+    _skill(other_repo / ".ai" / "cap" / "skills", "cap")
+    (other_repo / ".ai" / "cap" / "plugin.json").write_text(
+        json.dumps({"name": "cap", "version": "1.0.0"}), encoding="utf-8",
+    )
+    _marketplace(
+        other_repo / ".ai",
+        "other-marketplace",
+        entries=[{"name": "cap", "source": "cap"}],
+    )
+
+    commands = []
+
+    def fake_which(name):
+        if name == "agent-worktrees":
+            return str(tmp_path / "wrong-cell" / "agent-worktrees")
+        return None
+
+    def fake_run(argv, **kwargs):
+        commands.append(argv)
+        assert argv[1:3] == ["repos", "find"]
+        return scan.subprocess.CompletedProcess(
+            argv, 0, stdout=f"{other_repo}\n", stderr="",
+        )
+
+    monkeypatch.setattr(scan.shutil, "which", fake_which)
+    monkeypatch.setattr(scan.subprocess, "run", fake_run)
+
+    repo = tmp_path / "consuming-repo"
+    repo.mkdir()
+    _settings(
+        repo,
+        {"cap@other-marketplace": True},
+        {
+            "other-marketplace": {
+                "source": {
+                    "source": "agent-worktrees-repo",
+                    "repo": "other-repo-alias",
+                },
+            },
+        },
+    )
+
+    resolved = str(tmp_path / "right-cell" / "agent-worktrees")
+    sources = scan.assemble_enabled_plugins(
+        repo,
+        installed_root=tmp_path / "none",
+        home=tmp_path / "home",
+        agent_worktrees_command=resolved,
+    )
+    assert len(sources) == 1
+    assert commands and all(c[0] == resolved for c in commands)
+    assert sources[0].origin == "other-marketplace/cap"
+    # Cross-repo (repo dir isn't a parent of the resolved payload) -> external,
+    # unlike an in-repo ./.ai directory marketplace which is "controlled".
+    assert sources[0].controlled is False
+
+
+@pytest.mark.parametrize(
+    "break_it",
+    ["no_cli", "cli_fails", "empty_output", "bad_repo_name", "not_a_directory"],
+)
+def test_agent_worktrees_repo_marketplace_unresolvable_cases(
+    tmp_path: Path, monkeypatch, break_it: str,
+):
+    repo_name = "not a valid name!" if break_it == "bad_repo_name" else "some-repo"
+
+    def fake_which(name):
+        if break_it == "no_cli":
+            return None
+        return "/usr/bin/agent-worktrees" if name == "agent-worktrees" else None
+
+    def fake_run(argv, **kwargs):
+        if break_it == "cli_fails":
+            return scan.subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
+        if break_it == "empty_output":
+            return scan.subprocess.CompletedProcess(argv, 0, stdout="   \n", stderr="")
+        if break_it == "not_a_directory":
+            missing = tmp_path / "does-not-exist"
+            return scan.subprocess.CompletedProcess(argv, 0, stdout=f"{missing}\n", stderr="")
+        raise AssertionError("fake_run should not be reached for this case")
+
+    monkeypatch.setattr(scan.shutil, "which", fake_which)
+    monkeypatch.setattr(scan.subprocess, "run", fake_run)
+
+    repo = tmp_path / "consuming-repo"
+    repo.mkdir()
+    _settings(
+        repo,
+        {"cap@other-marketplace": True},
+        {
+            "other-marketplace": {
+                "source": {
+                    "source": "agent-worktrees-repo",
+                    "repo": repo_name,
+                },
+            },
+        },
+    )
+
+    sources = scan.assemble_enabled_plugins(
+        repo,
+        installed_root=tmp_path / "none",
+        home=tmp_path / "home",
+    )
+    # Unresolvable -> falls through to the generic installed-plugins
+    # footprint (matching an ordinary unresolvable external marketplace),
+    # never raises.
+    assert len(sources) == 1
+    assert sources[0].payload_root == tmp_path / "none" / "other-marketplace" / "cap"
+
+
+def test_agent_worktrees_repo_explicit_unhostable_ps1_raises(
+    tmp_path: Path, monkeypatch,
+):
+    """An explicitly resolved .ps1 command with no PowerShell host must
+    raise -- unlike the ambient-resolution failures above, it must NOT
+    silently fall through to inspecting the unrelated installed-root
+    footprint (that would be a marketplace/cell provenance mismatch, not a
+    graceful degrade)."""
+    if os.name != "nt":
+        return
+    monkeypatch.setattr(scan.shutil, "which", lambda _name: None)
+
+    repo = tmp_path / "consuming-repo"
+    repo.mkdir()
+    _settings(
+        repo,
+        {"cap@other-marketplace": True},
+        {
+            "other-marketplace": {
+                "source": {
+                    "source": "agent-worktrees-repo",
+                    "repo": "some-repo",
+                },
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="PowerShell"):
+        scan.assemble_enabled_plugins(
+            repo,
+            installed_root=tmp_path / "none",
+            home=tmp_path / "home",
+            agent_worktrees_command=r"C:\right-cell\agent-worktrees.ps1",
+        )
+
+
+@pytest.mark.parametrize(
+    "break_it",
+    ["launch_error", "cli_fails", "empty_output", "not_a_directory"],
+)
+def test_agent_worktrees_repo_explicit_command_failure_raises(
+    tmp_path: Path, monkeypatch, break_it: str,
+):
+    """Any failure of an *explicitly* supplied command must raise, not
+    silently fall through to inspecting the unrelated installed-root
+    footprint -- the same provenance-mismatch risk as the Windows .ps1
+    case above, just for every other failure mode (a stale/wrong path,
+    a CLI that errors, a timeout, ...)."""
+    explicit = str(tmp_path / "right-cell" / "agent-worktrees")
+
+    def fake_run(argv, **kwargs):
+        if break_it == "launch_error":
+            raise OSError("no such file or directory")
+        if break_it == "cli_fails":
+            return scan.subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom")
+        if break_it == "empty_output":
+            return scan.subprocess.CompletedProcess(argv, 0, stdout="   \n", stderr="")
+        if break_it == "not_a_directory":
+            missing = tmp_path / "does-not-exist"
+            return scan.subprocess.CompletedProcess(argv, 0, stdout=f"{missing}\n", stderr="")
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(scan.subprocess, "run", fake_run)
+
+    repo = tmp_path / "consuming-repo"
+    repo.mkdir()
+    _settings(
+        repo,
+        {"cap@other-marketplace": True},
+        {
+            "other-marketplace": {
+                "source": {
+                    "source": "agent-worktrees-repo",
+                    "repo": "some-repo",
+                },
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="some-repo"):
+        scan.assemble_enabled_plugins(
+            repo,
+            installed_root=tmp_path / "none",
+            home=tmp_path / "home",
+            agent_worktrees_command=explicit,
+        )
+
+
+def test_agent_worktrees_repo_blank_explicit_command_raises(
+    tmp_path: Path, monkeypatch,
+):
+    """An explicitly supplied but blank command (e.g. `--agent-worktrees-path
+    ""`) must raise, not silently fall back to `shutil.which` -- `bool("")`
+    is `False`, so a naive truthiness check would wrongly treat this as
+    'no explicit command was given' and use ambient PATH."""
+    monkeypatch.setattr(
+        scan.shutil, "which", lambda _name: str(tmp_path / "wrong-cell" / "agent-worktrees")
+    )
+
+    repo = tmp_path / "consuming-repo"
+    repo.mkdir()
+    _settings(
+        repo,
+        {"cap@other-marketplace": True},
+        {
+            "other-marketplace": {
+                "source": {
+                    "source": "agent-worktrees-repo",
+                    "repo": "some-repo",
+                },
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="blank"):
+        scan.assemble_enabled_plugins(
+            repo,
+            installed_root=tmp_path / "none",
+            home=tmp_path / "home",
+            agent_worktrees_command="",
+        )
+
+
+def test_main_forwards_agent_worktrees_path_with_from_settings(
+    tmp_path: Path, monkeypatch,
+):
+    """`--agent-worktrees-path` must reach the real scanner CLI boundary
+    (main()), not just the assembler function called directly -- a future
+    change could parse the flag yet drop it before the actual call."""
+    other_repo = tmp_path / "other-repo-checkout"
+    (other_repo / ".ai" / "cap" / "skills").mkdir(parents=True)
+    _skill(other_repo / ".ai" / "cap" / "skills", "cap")
+    (other_repo / ".ai" / "cap" / "plugin.json").write_text(
+        json.dumps({"name": "cap", "version": "1.0.0"}), encoding="utf-8",
+    )
+    _marketplace(
+        other_repo / ".ai",
+        "other-marketplace",
+        entries=[{"name": "cap", "source": "cap"}],
+    )
+
+    commands = []
+
+    def fake_which(name):
+        if name == "agent-worktrees":
+            return str(tmp_path / "wrong-cell" / "agent-worktrees")
+        return None
+
+    def fake_run(argv, **kwargs):
+        commands.append(argv)
+        return scan.subprocess.CompletedProcess(
+            argv, 0, stdout=f"{other_repo}\n", stderr="",
+        )
+
+    monkeypatch.setattr(scan.shutil, "which", fake_which)
+    monkeypatch.setattr(scan.subprocess, "run", fake_run)
+
+    repo = tmp_path / "consuming-repo"
+    repo.mkdir()
+    _settings(
+        repo,
+        {"cap@other-marketplace": True},
+        {
+            "other-marketplace": {
+                "source": {
+                    "source": "agent-worktrees-repo",
+                    "repo": "other-repo-alias",
+                },
+            },
+        },
+    )
+    home = tmp_path / "home"
+    copilot = home / ".copilot"
+    copilot.mkdir(parents=True, exist_ok=True)
+    (copilot / "config.json").write_text(
+        json.dumps({"trustedFolders": [str(repo)]}), encoding="utf-8",
+    )
+    monkeypatch.setattr(scan.Path, "home", lambda: home)
+
+    resolved = str(tmp_path / "right-cell" / "agent-worktrees")
+    assert scan.main([
+        str(repo), "--from-settings", "--agent-worktrees-path", resolved,
+    ]) == 0
+
+    assert commands, "agent-worktrees-repo resolution was never attempted"
+    assert all(c[0] == resolved for c in commands), commands
 
 
 def test_assemble_github_marketplace_is_external_with_source(tmp_path: Path):
@@ -596,6 +970,124 @@ def test_controlled_plugin_agents_get_frontmatter_and_recursion_checks(
     assert any(f.check == "anti-recursion" for f in report.findings)
 
 
+def test_controlled_plugin_without_agents_manifest_declaration_is_blocking(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plugin = repo / ".ai" / "cap"
+    agents = plugin / "agents"
+    agents.mkdir(parents=True)
+    (agents / "worker.agent.md").write_text(
+        "---\ndescription: Worker.\ntools: ['*']\n---\n\n# Worker\n",
+        encoding="utf-8",
+    )
+    # No plugin.json / .claude-plugin/plugin.json at all -- the manifest is
+    # simply absent, which must still surface the finding (not merely a
+    # falsy `agents` value).
+    source = scan.PluginSource(
+        skills_root=plugin / "skills",
+        origin="repo-plugins/cap",
+        controlled=True,
+    )
+
+    report = scan.run(repo, [source])
+
+    finding = next(
+        f for f in report.findings if f.check == "agent-manifest-declaration"
+    )
+    assert finding.severity == scan.BLOCKING
+    assert finding.path == str((agents / "worker.agent.md").resolve())
+    assert "agents/*.agent.md" in finding.message
+    assert '"agents": "agents/"' in finding.message
+
+
+def test_external_plugin_without_agents_manifest_declaration_is_warning(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plugin = tmp_path / "installed" / "mkt" / "external"
+    agents = plugin / "agents"
+    agents.mkdir(parents=True)
+    (agents / "worker.agent.md").write_text(
+        "---\ndescription: Worker.\ntools: ['*']\n---\n\n# Worker\n",
+        encoding="utf-8",
+    )
+    source = scan.PluginSource(
+        skills_root=plugin / "skills",
+        origin="mkt/external",
+        controlled=False,
+        source="https://github.com/example/external",
+        version="4.5.6",
+    )
+
+    report = scan.run(repo, [source])
+
+    finding = next(
+        f for f in report.findings if f.check == "agent-manifest-declaration"
+    )
+    assert finding.severity == scan.WARNING
+    assert finding.path == "<plugin:mkt/external@4.5.6>/agents/worker.agent.md"
+    assert "cannot edit its installed payload" in finding.message
+
+
+def test_plugin_with_truthy_agents_manifest_declaration_passes(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plugin = repo / ".ai" / "cap"
+    agents = plugin / "agents"
+    agents.mkdir(parents=True)
+    (agents / "worker.agent.md").write_text(
+        "---\ndescription: Worker.\ntools: ['*']\n---\n\n# Worker\n",
+        encoding="utf-8",
+    )
+    (plugin / "plugin.json").write_text(
+        json.dumps({"name": "cap", "agents": "agents/"}),
+        encoding="utf-8",
+    )
+    source = scan.PluginSource(
+        skills_root=plugin / "skills",
+        origin="repo-plugins/cap",
+        controlled=True,
+    )
+
+    report = scan.run(repo, [source])
+
+    assert not any(
+        f.check == "agent-manifest-declaration" for f in report.findings
+    )
+
+
+def test_agent_manifest_declaration_check_covers_frontmatter_less_agents(
+    tmp_path: Path,
+):
+    """Regression: the manifest-declaration check must fire even for a plugin
+    whose only agent file has no YAML frontmatter -- that file's per-file
+    loop `continue`s immediately after the (separate) frontmatter check, so
+    the manifest check must run before that early exit, not after it."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plugin = repo / ".ai" / "cap"
+    agents = plugin / "agents"
+    agents.mkdir(parents=True)
+    (agents / "missing.agent.md").write_text(
+        "# Missing frontmatter\n", encoding="utf-8"
+    )
+    source = scan.PluginSource(
+        skills_root=plugin / "skills",
+        origin="repo-plugins/cap",
+        controlled=True,
+    )
+
+    report = scan.run(repo, [source])
+
+    assert any(f.check == "agent-frontmatter" for f in report.findings)
+    assert any(
+        f.check == "agent-manifest-declaration" for f in report.findings
+    )
+
+
 def test_task_capable_project_agent_requires_self_guard(tmp_path: Path):
     repo = tmp_path / "repo"
     agents = repo / ".github" / "agents"
@@ -610,6 +1102,119 @@ def test_task_capable_project_agent_requires_self_guard(tmp_path: Path):
     finding = next(f for f in report.findings if f.check == "anti-recursion")
     assert finding.severity == scan.BLOCKING
     assert "`worker` agent" in finding.message
+
+
+def test_explicit_owned_agent_root_adds_blocking_agent_checks(tmp_path: Path):
+    repo = tmp_path / "repo"
+    agents = repo / "services" / "document-intake-bureau" / "agents"
+    agents.mkdir(parents=True)
+    agent = agents / "document-intake-processor.agent.md"
+    agent.write_text("# Missing frontmatter\n", encoding="utf-8")
+
+    assert not any(
+        finding.check == "agent-frontmatter"
+        for finding in scan.run(repo).findings
+    )
+
+    roots = scan.resolve_owned_agent_roots(
+        repo, ["services/document-intake-bureau/agents"],
+    )
+    report = scan.run(repo, owned_agent_roots=roots)
+
+    finding = next(
+        finding
+        for finding in report.findings
+        if finding.check == "agent-frontmatter"
+    )
+    assert finding.severity == scan.BLOCKING
+    assert finding.path == str(agent.resolve())
+
+
+def test_owned_agent_root_is_shallow_and_agent_only(tmp_path: Path):
+    repo = tmp_path / "repo"
+    agents = repo / "services" / "example" / "agents"
+    nested = agents / "nested"
+    nested.mkdir(parents=True)
+    (agents / "reader.agent.md").write_text(
+        "---\ndescription: Reader.\ntools: ['read']\n---\n\n# Reader\n",
+        encoding="utf-8",
+    )
+    (nested / "ignored.agent.md").write_text(
+        "# Missing frontmatter\n", encoding="utf-8",
+    )
+    (agents / "README.md").write_text(
+        "# Not an agent\n", encoding="utf-8",
+    )
+
+    roots = scan.resolve_owned_agent_roots(
+        repo, ["services/example/agents"],
+    )
+    report = scan.run(repo, owned_agent_roots=roots)
+
+    assert not any(
+        finding.check == "agent-frontmatter"
+        for finding in report.findings
+    )
+
+
+def test_owned_agent_root_rejects_traversal(
+    tmp_path: Path,
+    capsys,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    assert scan.main([
+        str(repo),
+        "--owned-agent-root",
+        "../outside",
+    ]) == 2
+    assert "--owned-agent-root" in capsys.readouterr().err
+
+
+def test_owned_agent_root_reports_missing_directory(tmp_path: Path, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    assert scan.main([
+        str(repo),
+        "--owned-agent-root",
+        "missing",
+    ]) == 2
+    assert "does not exist" in capsys.readouterr().err
+
+
+def test_owned_agent_root_rejects_absolute_path(tmp_path: Path, capsys):
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    repo.mkdir()
+    outside.mkdir()
+
+    assert scan.main([
+        str(repo),
+        "--owned-agent-root",
+        str(outside.resolve()),
+    ]) == 2
+    assert "repository-relative" in capsys.readouterr().err
+
+
+def test_owned_agent_root_rejects_symlink_escape(tmp_path: Path, capsys):
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    repo.mkdir()
+    outside.mkdir()
+    link = repo / "service-agents"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    assert scan.main([
+        str(repo),
+        "--owned-agent-root",
+        "service-agents",
+    ]) == 2
+    assert "must not be a symlink" in capsys.readouterr().err
 
 
 def test_task_disabled_agent_is_exempt_from_self_guard(tmp_path: Path):
@@ -821,7 +1426,7 @@ def test_agent_mcp_agent_rejects_negated_fallback(tmp_path: Path):
     assert any(f.check == "mcp-fallback" for f in report.findings)
 
 
-def test_agent_mcp_agent_accepts_conditional_auth_opt_out(tmp_path: Path):
+def test_agent_mcp_agent_rejects_conditional_auth_opt_out(tmp_path: Path):
     repo = tmp_path / "repo"
     agents = repo / ".github" / "agents"
     agents.mkdir(parents=True)
@@ -842,6 +1447,7 @@ def test_agent_mcp_agent_accepts_conditional_auth_opt_out(tmp_path: Path):
 
     report = scan.run(repo)
 
+    assert any(f.check == "mcp-fallback-disabled" for f in report.findings)
     assert not any(f.check == "mcp-fallback" for f in report.findings)
 
 
@@ -878,6 +1484,96 @@ def test_fallback_parser_rejects_common_negations():
         "Use neither the materialized fleet nor any CLI fallback.",
     ):
         assert not scan.has_mcp_fallback(phrase)
+
+
+def test_has_disabled_mcp_fallback_marker_detects_the_obsolete_phrasing():
+    assert scan.has_disabled_mcp_fallback_marker(
+        "Materialized CLI fallback: disabled by the authorization gate."
+    )
+    assert scan.has_disabled_mcp_fallback_marker(
+        "Materialized CLI fallback: disabled because authorization uses a "
+        "conditional gate."
+    )
+    assert not scan.has_disabled_mcp_fallback_marker(
+        "On catalog failure use the materialized fleet."
+    )
+
+
+def test_agent_mcp_agent_with_fallback_but_no_shell_tool_is_flagged(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    agents = repo / ".github" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "service.agent.md").write_text(
+        "---\n"
+        "description: Service.\n"
+        "tools: ['read', 'search', 'service/*']\n"
+        "mcp-servers:\n"
+        "  service:\n"
+        "    command: agent-mcp\n"
+        "---\n\n"
+        "## MCP Readiness\n"
+        "Probe service_health. On catalog failure use the materialized fleet.\n"
+        "Do NOT use the task tool to spawn another service agent.\n",
+        encoding="utf-8",
+    )
+
+    report = scan.run(repo)
+
+    assert any(f.check == "mcp-fallback-needs-shell-tool" for f in report.findings)
+
+
+def test_agent_mcp_agent_with_fallback_and_execute_tool_passes(tmp_path: Path):
+    repo = tmp_path / "repo"
+    agents = repo / ".github" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "service.agent.md").write_text(
+        "---\n"
+        "description: Service.\n"
+        "tools: ['read', 'search', 'execute', 'service/*']\n"
+        "mcp-servers:\n"
+        "  service:\n"
+        "    command: agent-mcp\n"
+        "---\n\n"
+        "## MCP Readiness\n"
+        "Probe service_health. On catalog failure use the materialized fleet.\n"
+        "Do NOT use the task tool to spawn another service agent.\n",
+        encoding="utf-8",
+    )
+
+    report = scan.run(repo)
+
+    assert not any(
+        f.check == "mcp-fallback-needs-shell-tool" for f in report.findings
+    )
+
+
+def test_agent_mcp_agent_with_unrestricted_tools_never_needs_shell_flag(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    agents = repo / ".github" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "service.agent.md").write_text(
+        "---\n"
+        "description: Service.\n"
+        "tools: ['*']\n"
+        "mcp-servers:\n"
+        "  service:\n"
+        "    command: agent-mcp\n"
+        "---\n\n"
+        "## MCP Readiness\n"
+        "Probe service_health. On catalog failure use the materialized fleet.\n"
+        "Do NOT use the task tool to spawn another service agent.\n",
+        encoding="utf-8",
+    )
+
+    report = scan.run(repo)
+
+    assert not any(
+        f.check == "mcp-fallback-needs-shell-tool" for f in report.findings
+    )
 
 
 def test_external_plugin_agent_guard_is_origin_version_advisory(tmp_path: Path):
@@ -1392,7 +2088,7 @@ def test_same_named_external_plugin_does_not_use_editable_suite_source(
         "role": "legacy-direct-or-unknown",
         "session_start": "yes",
         "declaration": "missing",
-        "possible_non_empty": "unknown",
+        "possible_non_empty": "yes",
     }]
 
 
@@ -1423,17 +2119,21 @@ def test_suite_identity_uses_editable_plugin_source(
     assert scan._editable_plugin_footprint(repo, sources[0]) == editable
 
 
-def test_session_context_rejects_unadopted_aggregate_authority(
+def test_session_context_accepts_output_free_stack(
     tmp_path: Path, monkeypatch,
 ):
     _isolate_user_settings(tmp_path, monkeypatch)
     repo = tmp_path / "repo"
     repo.mkdir()
     installed = tmp_path / "installed"
-    _aggregate_authority(installed)
+    for name in ("session-file-writer", "provider-registration"):
+        _session_plugin(installed, "copilot-extensions", name)
     _settings(
         repo,
-        {"context-injection@copilot-extensions": True},
+        {
+            "session-file-writer@copilot-extensions": True,
+            "provider-registration@copilot-extensions": True,
+        },
         {},
     )
     sources = scan.assemble_enabled_plugins(repo, installed_root=installed)
@@ -1441,332 +2141,200 @@ def test_session_context_rejects_unadopted_aggregate_authority(
 
     inventory = scan.scan_session_context(repo, sources, report)
 
-    assert inventory["disposition"] == "unproven-aggregate-authority"
-    assert inventory["authority_proven"] is False
-    assert any(
-        finding.check == "session-context-authority"
-        and finding.severity == scan.BLOCKING
-        and "no complete repository adoption" in finding.message
-        for finding in report.findings
-    )
+    assert inventory["disposition"] == "output-free-stack"
+    assert report.blocking == 0
+    assert {
+        entry["role"] for entry in inventory["plugins"]
+    } == {"proven-output-free"}
+    assert {
+        entry["possible_non_empty"] for entry in inventory["plugins"]
+    } == {"no"}
 
 
-def test_session_context_accepts_exact_direct_authority(
-    tmp_path: Path, monkeypatch,
+def test_named_bootstrap_check_with_json_only_stdout_is_output_free(
+    tmp_path: Path,
 ):
-    _isolate_user_settings(tmp_path, monkeypatch)
     repo = tmp_path / "repo"
     repo.mkdir()
-    installed = tmp_path / "installed"
-    authority = _aggregate_authority(installed)
-    contributor = _session_plugin(
-        installed,
-        "copilot-extensions",
-        "ambient-policy",
-        contributors=[_pure_contributor()],
+    plugin = _session_plugin(
+        repo,
+        "plugins",
+        "session-file-writer",
     )
-    side_effect = _session_plugin(
-        installed,
-        "copilot-extensions",
+    source = scan.PluginSource(
+        skills_root=plugin / "skills",
+        origin="copilot-extensions/session-file-writer",
+        controlled=True,
+    )
+    report = scan.Report()
+
+    inventory = scan.scan_session_context(repo, [source], report)
+
+    assert scan._session_start_is_structurally_output_free(plugin) is True
+    assert inventory["disposition"] == "output-free-stack"
+    assert inventory["plugins"][0]["role"] == "proven-output-free"
+    assert report.blocking == 0
+
+
+def test_session_context_accepts_standard_writer_without_declaration(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plugin = _session_plugin(
+        repo,
+        "plugins",
+        "session-file-writer",
+        declaration="missing",
+    )
+    hooks = json.loads((plugin / "hooks.json").read_text(encoding="utf-8"))
+    entry = hooks["hooks"]["sessionStart"][0]
+    entry["bash"] = (
+        's="$COPILOT_PLUGIN_ROOT/scripts/write-session-guidance.sh"; '
+        'bash "$s"'
+    )
+    entry["powershell"] = (
+        "$s = Join-Path $env:COPILOT_PLUGIN_ROOT "
+        "'scripts\\write-session-guidance.ps1'; & $s"
+    )
+    (plugin / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
+    _write_standard_writer(plugin)
+    source = scan.PluginSource(
+        skills_root=plugin / "skills",
+        origin="copilot-extensions/session-file-writer",
+        controlled=True,
+    )
+    report = scan.Report()
+
+    inventory = scan.scan_session_context(repo, [source], report)
+
+    assert inventory["disposition"] == "output-free-stack"
+    assert inventory["plugins"][0]["role"] == "proven-output-free"
+    assert report.blocking == 0
+
+
+def test_named_bootstrap_check_with_stdout_text_is_rejected(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plugin = _session_plugin(
+        repo,
+        "plugins",
         "provider-registration",
     )
-    mixed = _session_plugin(
-        installed,
-        "copilot-extensions",
-        "mixed-capability",
-        contributors=[_pure_contributor("mixed")],
-        side_effects="restart-safe-idempotent",
-        context_behavior="authority-aware",
+    scripts = plugin / "scripts"
+    (scripts / "bootstrap-check.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'Updating runtime payload...'\n"
+        "printf '{}'\n",
+        encoding="utf-8",
     )
-    _settings(
-        repo,
-        {
-            "context-injection@copilot-extensions": True,
-            "ambient-policy@copilot-extensions": True,
-            "provider-registration@copilot-extensions": True,
-            "mixed-capability@copilot-extensions": True,
-        },
-        {},
-        aggregation=_adoption(),
+    (scripts / "bootstrap-check.ps1").write_text(
+        "Write-Host 'Updating runtime payload...'\n"
+        "[Console]::Out.Write('{}')\n",
+        encoding="utf-8",
     )
-    sources = [
-        scan.PluginSource(
-            skills_root=authority / "skills",
-            origin="copilot-extensions/context-injection",
-        ),
-        scan.PluginSource(
-            skills_root=contributor / "skills",
-            origin="copilot-extensions/ambient-policy",
-        ),
-        scan.PluginSource(
-            skills_root=side_effect / "skills",
-            origin="copilot-extensions/provider-registration",
-        ),
-        scan.PluginSource(
-            skills_root=mixed / "skills",
-            origin="copilot-extensions/mixed-capability",
-        ),
-    ]
+    source = scan.PluginSource(
+        skills_root=plugin / "skills",
+        origin="copilot-extensions/provider-registration",
+        controlled=True,
+    )
     report = scan.Report()
 
-    inventory = scan.scan_session_context(repo, sources, report)
+    inventory = scan.scan_session_context(repo, [source], report)
 
-    assert inventory["authority_proven"] is True
-    assert inventory["disposition"] == "repository-authority-proven"
-    assert report.blocking == 0
-    roles = {
-        entry["identity"]: entry["role"]
-        for entry in inventory["plugins"]
-    }
-    assert roles["copilot-extensions/context-injection"] == (
-        "aggregate-authority"
-    )
-    assert roles["copilot-extensions/ambient-policy"] == (
-        "complete-declared-contributor"
-    )
-    assert roles["copilot-extensions/provider-registration"] == (
-        "complete-declared-side-effect-only"
-    )
-    assert roles["copilot-extensions/mixed-capability"] == (
-        "complete-declared-contributor"
-    )
-    possible_non_empty = {
-        entry["identity"]: entry["possible_non_empty"]
-        for entry in inventory["plugins"]
-    }
-    assert possible_non_empty["copilot-extensions/context-injection"] == "yes"
-    assert possible_non_empty["copilot-extensions/ambient-policy"] == "no"
-    assert possible_non_empty["copilot-extensions/mixed-capability"] == "no"
-    rendered = json.dumps(inventory)
-    assert "do-not-report-this-command" not in rendered
-    assert "scripts/emit-context" not in rendered
+    assert scan._session_start_is_structurally_output_free(plugin) is False
+    assert inventory["plugins"][0]["role"] == "legacy-direct-or-unknown"
+    assert inventory["plugins"][0]["possible_non_empty"] == "yes"
 
 
-@pytest.mark.parametrize(
-    "participant_case",
-    [
-        "unclassified",
-        "incomplete",
-        "direct",
-        "side-effect-incomplete",
-        "contributor-without-hook",
-        "invalid-contributor-id",
-    ],
-)
-def test_adopted_stack_rejects_unsafe_session_start_participant(
-    tmp_path: Path,
-    monkeypatch,
-    participant_case: str,
-):
-    _isolate_user_settings(tmp_path, monkeypatch)
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    installed = tmp_path / "installed"
-    authority = _aggregate_authority(installed)
-    participant_options: dict = {}
-    if participant_case == "unclassified":
-        participant_options["declaration"] = "missing"
-    elif participant_case == "incomplete":
-        participant_options["declaration"] = "incomplete"
-    elif participant_case == "direct":
-        participant_options.update(
-            contributors=[_pure_contributor()],
-            context_behavior="none",
-        )
-    elif participant_case == "contributor-without-hook":
-        participant_options.update(
-            contributors=[_pure_contributor()],
-            session_start=False,
-        )
-    elif participant_case == "invalid-contributor-id":
-        participant_options["contributors"] = [
-            _pure_contributor("bad/id")
-        ]
-    else:
-        participant_options.update(
-            side_effects="none",
-            context_behavior="none",
-        )
-    participant = _session_plugin(
-        installed,
-        "copilot-extensions",
-        "participant",
-        **participant_options,
-    )
-    _settings(repo, {}, {}, aggregation=_adoption())
-    sources = [
-        scan.PluginSource(
-            skills_root=authority / "skills",
-            origin="copilot-extensions/context-injection",
-        ),
-        scan.PluginSource(
-            skills_root=participant / "skills",
-            origin="copilot-extensions/participant",
-        ),
-    ]
-    report = scan.Report()
-
-    inventory = scan.scan_session_context(repo, sources, report)
-
-    assert inventory["authority_proven"] is False
-    assert inventory["disposition"] == "unproven-aggregate-authority"
-    assert any(
-        finding.check == "session-context-authority"
-        and "unclassified, incomplete, or not authority-aware"
-        in finding.message
-        for finding in report.findings
-    )
-
-
-def test_adopted_stack_rejects_malformed_repository_config(
+def test_suppressed_maintenance_invocation_alongside_standard_writer_is_output_free(
     tmp_path: Path,
 ):
+    """A second sessionStart entry that fires an arbitrary fire-and-forget
+    maintenance script (e.g. an idempotent installer 'ensure' re-run) is
+    output-free when every stream from that invocation is redirected to null
+    and the command unconditionally ends with the canonical empty-JSON
+    literal -- matching agent-index's real hooks.json shape
+    (ThomasMichon/copilot-extensions#3429)."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    _settings(repo, {}, {}, aggregation=True)
-    report = scan.Report()
-
-    inventory = scan.scan_session_context(repo, [], report)
-
-    assert inventory["authority_proven"] is False
-    assert any(
-        finding.check == "session-context-authority"
-        and finding.severity == scan.BLOCKING
-        for finding in report.findings
+    plugin = _session_plugin(repo, "plugins", "agent-index-like")
+    hooks = json.loads((plugin / "hooks.json").read_text(encoding="utf-8"))
+    hooks["hooks"]["sessionStart"][0]["bash"] = (
+        's="$COPILOT_PLUGIN_ROOT/scripts/write-session-guidance.sh"; bash "$s"'
     )
-
-
-def test_adopted_stack_rejects_unknown_repository_config_key(
-    tmp_path: Path,
-):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    adoption = _adoption()
-    adoption["unexpected"] = "rejected"
-    _settings(repo, {}, {}, aggregation=adoption)
-    report = scan.Report()
-
-    inventory = scan.scan_session_context(repo, [], report)
-
-    assert inventory["authority_proven"] is False
-    assert any(
-        finding.check == "session-context-authority"
-        and finding.severity == scan.BLOCKING
-        for finding in report.findings
+    hooks["hooks"]["sessionStart"][0]["powershell"] = (
+        "$s = Join-Path $env:COPILOT_PLUGIN_ROOT "
+        "'scripts\\write-session-guidance.ps1'; & $s"
     )
-
-
-def test_adopted_stack_rejects_previous_context_engine_version(
-    tmp_path: Path,
-):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    adoption = _adoption()
-    adoption["engine"]["version"] = scan.SESSION_CONTEXT_ENGINE_VERSION - 1
-    _settings(repo, {}, {}, aggregation=adoption)
-    report = scan.Report()
-
-    inventory = scan.scan_session_context(repo, [], report)
-
-    assert inventory["authority_proven"] is False
-    assert any(
-        finding.check == "session-context-authority"
-        and finding.severity == scan.BLOCKING
-        for finding in report.findings
-    )
-
-
-def test_adopted_stack_rejects_invalid_source_qualified_identity(
-    tmp_path: Path,
-):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _settings(
-        repo,
-        {},
-        {},
-        aggregation=_adoption(
-            authority="context-injection@repo_context"
+    hooks["hooks"]["sessionStart"].append({
+        "type": "command",
+        "bash": (
+            'r="${COPILOT_PLUGIN_ROOT:-$PWD}"; s="$r/scripts/install.sh"; '
+            'if [ -f "$s" ]; then bash "$s" ensure >/dev/null 2>&1 || true; fi; '
+            "printf '{}'"
         ),
+        "powershell": (
+            "$r = $env:COPILOT_PLUGIN_ROOT; $s = (Join-Path $r 'scripts\\install.ps1'); "
+            "try { if (Test-Path -LiteralPath $s -PathType Leaf) { & $s ensure *> $null } } "
+            "catch {}; [Console]::Out.Write('{}')"
+        ),
+    })
+    (plugin / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
+    _write_standard_writer(plugin)
+    source = scan.PluginSource(
+        skills_root=plugin / "skills",
+        origin="copilot-extensions/agent-index-like",
+        controlled=True,
     )
     report = scan.Report()
 
-    inventory = scan.scan_session_context(repo, [], report)
+    inventory = scan.scan_session_context(repo, [source], report)
 
-    assert inventory["authority_proven"] is False
-    assert any(
-        finding.check == "session-context-authority"
-        and finding.severity == scan.BLOCKING
-        for finding in report.findings
-    )
-
-
-@pytest.mark.parametrize("authority_first", [False, True])
-def test_enabled_plugins_key_order_does_not_affect_context_authority(
-    tmp_path: Path, monkeypatch, authority_first: bool,
-):
-    _isolate_user_settings(tmp_path, monkeypatch)
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    installed = tmp_path / "installed"
-    _aggregate_authority(installed)
-    _session_plugin(installed, "copilot-extensions", "ambient-policy")
-    enabled_items = [
-        ("ambient-policy@copilot-extensions", True),
-        ("context-injection@copilot-extensions", True),
-    ]
-    if authority_first:
-        enabled_items.reverse()
-    _settings(
-        repo,
-        dict(enabled_items),
-        {},
-        aggregation=_adoption(),
-    )
-    sources = scan.assemble_enabled_plugins(repo, installed_root=installed)
-    report = scan.Report()
-
-    inventory = scan.scan_session_context(repo, sources, report)
-
-    assert inventory["authority_proven"] is True
-    assert inventory["disposition"] == "repository-authority-proven"
+    assert scan._session_start_is_structurally_output_free(plugin) is True
+    assert inventory["disposition"] == "output-free-stack"
+    assert inventory["plugins"][0]["role"] == "proven-output-free"
     assert report.blocking == 0
 
 
-def test_session_context_rejects_second_authority(
-    tmp_path: Path, monkeypatch,
+def test_suppressed_maintenance_invocation_without_guaranteed_tail_is_rejected(
+    tmp_path: Path,
 ):
-    _isolate_user_settings(tmp_path, monkeypatch)
+    """The suppressed-invocation acceptance path requires the command to
+    unconditionally end with the canonical empty-JSON literal -- redirecting
+    output alone is not sufficient, since a command that could still emit
+    something else afterward is not provably output-free."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    installed = tmp_path / "installed"
-    _aggregate_authority(installed)
-    _aggregate_authority(installed, "other-market")
-    _settings(
-        repo,
-        {
-            "context-injection@copilot-extensions": True,
-            "context-injection@other-market": True,
-        },
-        {},
-        aggregation=_adoption(),
+    plugin = _session_plugin(repo, "plugins", "half-suppressed")
+    hooks = json.loads((plugin / "hooks.json").read_text(encoding="utf-8"))
+    hooks["hooks"]["sessionStart"][0]["bash"] = (
+        'r="${COPILOT_PLUGIN_ROOT:-$PWD}"; s="$r/scripts/install.sh"; '
+        'if [ -f "$s" ]; then bash "$s" ensure >/dev/null 2>&1 || true; fi; '
+        "echo done; printf '{}'"
     )
-    sources = scan.assemble_enabled_plugins(repo, installed_root=installed)
+    hooks["hooks"]["sessionStart"][0]["powershell"] = (
+        "$r = $env:COPILOT_PLUGIN_ROOT; $s = (Join-Path $r 'scripts\\install.ps1'); "
+        "try { if (Test-Path -LiteralPath $s -PathType Leaf) { & $s ensure *> $null } } "
+        "catch {}; Write-Host 'done'; [Console]::Out.Write('{}')"
+    )
+    (plugin / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
+    source = scan.PluginSource(
+        skills_root=plugin / "skills",
+        origin="copilot-extensions/half-suppressed",
+        controlled=True,
+    )
     report = scan.Report()
 
-    inventory = scan.scan_session_context(repo, sources, report)
+    inventory = scan.scan_session_context(repo, [source], report)
 
-    assert inventory["authority_proven"] is False
-    assert inventory["disposition"] == "unproven-aggregate-authority"
-    finding = next(
-        finding for finding in report.findings
-        if finding.check == "session-context-authority"
-    )
-    assert finding.severity == scan.BLOCKING
-    assert "multiple aggregate authorities" in finding.message
+    assert scan._session_start_is_structurally_output_free(plugin) is False
+    assert inventory["plugins"][0]["role"] == "legacy-direct-or-unknown"
 
 
-def test_known_session_start_without_declaration_blocks_authority(
+def test_session_context_accepts_one_declared_output(
     tmp_path: Path, monkeypatch,
 ):
     _isolate_user_settings(tmp_path, monkeypatch)
@@ -1776,38 +2344,66 @@ def test_known_session_start_without_declaration_blocks_authority(
     _session_plugin(
         installed,
         "copilot-extensions",
-        "legacy-policy",
-        declaration="missing",
+        "ambient-policy",
+        contributors=[_pure_contributor()],
     )
-    _aggregate_authority(installed)
+    _session_plugin(
+        installed,
+        "copilot-extensions",
+        "session-file-writer",
+    )
     _settings(
         repo,
         {
-            "legacy-policy@copilot-extensions": True,
-            "context-injection@copilot-extensions": True,
+            "ambient-policy@copilot-extensions": True,
+            "session-file-writer@copilot-extensions": True,
         },
         {},
-        aggregation=_adoption(),
     )
     sources = scan.assemble_enabled_plugins(repo, installed_root=installed)
     report = scan.Report()
 
     inventory = scan.scan_session_context(repo, sources, report)
 
-    assert inventory["authority_proven"] is False
-    assert any(
-        finding.check == "session-context-declaration"
-        and finding.severity == scan.BLOCKING
-        for finding in report.findings
+    assert inventory["disposition"] == "single-possible-output"
+    assert report.blocking == 0
+    output = next(
+        entry for entry in inventory["plugins"]
+        if entry["identity"] == "copilot-extensions/ambient-policy"
     )
-    assert any(
-        finding.check == "session-context-collision"
-        and finding.severity == scan.BLOCKING
-        for finding in report.findings
-    )
+    assert output["role"] == "complete-declared-output-capable"
+    assert output["possible_non_empty"] == "yes"
 
 
-def test_impure_contributor_is_incomplete_and_blocks_authority(
+@pytest.mark.parametrize("declaration", ["missing", "incomplete"])
+def test_structurally_proven_hook_without_complete_declaration_is_output_free(
+    tmp_path: Path,
+    monkeypatch,
+    declaration: str,
+):
+    _isolate_user_settings(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    installed = tmp_path / "installed"
+    _session_plugin(
+        installed,
+        "copilot-extensions",
+        "legacy-policy",
+        declaration=declaration,
+    )
+    _settings(repo, {"legacy-policy@copilot-extensions": True}, {})
+    sources = scan.assemble_enabled_plugins(repo, installed_root=installed)
+    report = scan.Report()
+
+    inventory = scan.scan_session_context(repo, sources, report)
+
+    assert inventory["disposition"] == "output-free-stack"
+    assert report.blocking == 0
+    assert inventory["plugins"][0]["role"] == "proven-output-free"
+    assert inventory["plugins"][0]["possible_non_empty"] == "no"
+
+
+def test_invalid_output_declaration_does_not_claim_output_free(
     tmp_path: Path, monkeypatch,
 ):
     _isolate_user_settings(tmp_path, monkeypatch)
@@ -1822,124 +2418,15 @@ def test_impure_contributor_is_incomplete_and_blocks_authority(
         "ambient-policy",
         contributors=[contributor],
     )
-    _aggregate_authority(installed)
-    _settings(
-        repo,
-        {
-            "ambient-policy@copilot-extensions": True,
-            "context-injection@copilot-extensions": True,
-        },
-        {},
-        aggregation=_adoption(),
-    )
+    _settings(repo, {"ambient-policy@copilot-extensions": True}, {})
     sources = scan.assemble_enabled_plugins(repo, installed_root=installed)
     report = scan.Report()
 
     inventory = scan.scan_session_context(repo, sources, report)
 
-    ambient = next(
-        entry for entry in inventory["plugins"]
-        if entry["identity"] == "copilot-extensions/ambient-policy"
-    )
-    assert ambient["role"] == "legacy-direct-or-unknown"
-    assert ambient["declaration"] == "incomplete"
-    assert any(
-        finding.check == "session-context-declaration"
-        for finding in report.findings
-    )
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("order", "first"),
-        ("timeoutSeconds", 0),
-        ("maxBytes", 65537),
-    ],
-)
-def test_invalid_contributor_bounds_are_incomplete_and_block_authority(
-    tmp_path: Path,
-    monkeypatch,
-    field: str,
-    value: object,
-):
-    _isolate_user_settings(tmp_path, monkeypatch)
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    installed = tmp_path / "installed"
-    contributor = _pure_contributor()
-    contributor[field] = value
-    _session_plugin(
-        installed,
-        "copilot-extensions",
-        "ambient-policy",
-        contributors=[contributor],
-    )
-    _aggregate_authority(installed)
-
-    inventory, report = _scan_contributor_with_authority(repo, installed)
-
-    ambient = next(
-        entry for entry in inventory["plugins"]
-        if entry["identity"] == "copilot-extensions/ambient-policy"
-    )
-    assert ambient["declaration"] == "incomplete"
-    assert inventory["authority_proven"] is False
-    assert any(
-        finding.check == "session-context-declaration"
-        and finding.severity == scan.BLOCKING
-        for finding in report.findings
-    )
-
-
-@pytest.mark.parametrize("command_case", ["escape", "missing", "suffix"])
-def test_invalid_contributor_command_is_incomplete_and_blocks_authority(
-    tmp_path: Path,
-    monkeypatch,
-    command_case: str,
-):
-    _isolate_user_settings(tmp_path, monkeypatch)
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    installed = tmp_path / "installed"
-    contributor = _pure_contributor()
-    if command_case == "escape":
-        contributor["bash"] = ["../outside.sh"]
-    elif command_case == "missing":
-        contributor["bash"] = ["scripts/missing.sh"]
-    else:
-        contributor["bash"] = ["scripts/emit-context.txt"]
-    plugin = _session_plugin(
-        installed,
-        "copilot-extensions",
-        "ambient-policy",
-        contributors=[contributor],
-        create_commands=False,
-    )
-    powershell = plugin / "scripts" / "emit-context.ps1"
-    powershell.parent.mkdir(parents=True)
-    powershell.write_text("", encoding="utf-8")
-    if command_case == "escape":
-        (plugin.parent / "outside.sh").write_text("", encoding="utf-8")
-    elif command_case == "suffix":
-        (plugin / "scripts" / "emit-context.txt").write_text(
-            "", encoding="utf-8"
-        )
-    _aggregate_authority(installed)
-
-    inventory, report = _scan_contributor_with_authority(repo, installed)
-
-    ambient = next(
-        entry for entry in inventory["plugins"]
-        if entry["identity"] == "copilot-extensions/ambient-policy"
-    )
-    assert ambient["declaration"] == "incomplete"
-    assert inventory["authority_proven"] is False
-    assert any(
-        finding.check == "session-context-declaration"
-        and finding.severity == scan.BLOCKING
-        for finding in report.findings
-    )
+    assert inventory["disposition"] == "single-possible-output"
+    assert inventory["plugins"][0]["declaration"] == "incomplete"
+    assert inventory["plugins"][0]["possible_non_empty"] == "yes"
 
 
 def test_unknown_external_plugin_output_is_warning_only(
@@ -1971,7 +2458,7 @@ def test_unknown_external_plugin_output_is_warning_only(
     assert warning.severity == scan.WARNING
 
 
-def test_unknown_external_keeps_adopted_stack_unproven(
+def test_unknown_external_plus_output_fails_closed(
     tmp_path: Path, monkeypatch,
 ):
     _isolate_user_settings(tmp_path, monkeypatch)
@@ -1984,23 +2471,20 @@ def test_unknown_external_keeps_adopted_stack_unproven(
         "ambient-policy",
         contributors=[_pure_contributor()],
     )
-    _aggregate_authority(installed)
     _settings(
         repo,
         {
             "ambient-policy@copilot-extensions": True,
             "opaque@external-market": True,
-            "context-injection@copilot-extensions": True,
         },
         {},
-        aggregation=_adoption(),
     )
     sources = scan.assemble_enabled_plugins(repo, installed_root=installed)
     report = scan.Report()
 
     inventory = scan.scan_session_context(repo, sources, report)
 
-    assert inventory["disposition"] == "unproven-aggregate-authority"
+    assert inventory["disposition"] == "unsafe-multiple-output"
     assert report.blocking > 0
     assert any(
         finding.check == "session-context-unknown"
@@ -2008,13 +2492,13 @@ def test_unknown_external_keeps_adopted_stack_unproven(
         for finding in report.findings
     )
     assert any(
-        finding.check == "session-context-authority"
+        finding.check == "session-context-collision"
         and finding.severity == scan.BLOCKING
         for finding in report.findings
     )
 
 
-def test_multiple_direct_contributors_without_authority_block(
+def test_multiple_possible_outputs_block(
     tmp_path: Path, monkeypatch,
 ):
     _isolate_user_settings(tmp_path, monkeypatch)
@@ -2046,6 +2530,30 @@ def test_multiple_direct_contributors_without_authority_block(
         finding.check == "session-context-collision"
         and finding.severity == scan.BLOCKING
         for finding in report.findings
+    )
+
+
+def test_suite_session_start_stack_is_output_free_without_authority():
+    root = Path(__file__).resolve().parents[5]
+    sources = []
+    for plugin in sorted((root / "plugins").iterdir()):
+        manifest = scan._load_json(plugin / "plugin.json")
+        if not manifest:
+            continue
+        sources.append(scan.PluginSource(
+            skills_root=plugin / "skills",
+            origin=f"copilot-extensions/{plugin.name}",
+            controlled=True,
+        ))
+    report = scan.Report()
+
+    inventory = scan.scan_session_context(root, sources, report)
+
+    assert inventory["disposition"] == "output-free-stack"
+    assert report.blocking == 0
+    assert all(
+        entry["possible_non_empty"] == "no"
+        for entry in inventory["plugins"]
     )
 
 
@@ -2194,6 +2702,61 @@ def test_metadata_inventory_covers_supported_repo_surfaces(tmp_path: Path):
     )
 
 
+def test_owned_agent_root_joins_context_budget_metadata(tmp_path: Path):
+    repo = tmp_path / "repo"
+    agents = repo / "services" / "document-intake-bureau" / "agents"
+    docs = repo / "services" / "document-intake-bureau" / "docs"
+    agents.mkdir(parents=True)
+    docs.mkdir(parents=True)
+    _agent(
+        agents,
+        "document-intake-processor",
+        desc="Document intake processor.",
+    )
+    (docs / "README.md").write_text(
+        "# Service documentation\n", encoding="utf-8",
+    )
+    roots = scan.resolve_owned_agent_roots(
+        repo, ["services/document-intake-bureau/agents"],
+    )
+
+    budget = scan.build_context_budget(
+        repo,
+        home=tmp_path / "home",
+        owned_agent_roots=roots,
+    )
+    paths = {
+        entry["path"]
+        for entry in budget["metadata_upper_bounds"]["files"]
+    }
+
+    assert (
+        "services/document-intake-bureau/agents/"
+        "document-intake-processor.agent.md"
+    ) in paths
+    assert "services/document-intake-bureau/docs/README.md" not in paths
+
+
+def test_default_budget_does_not_add_unenabled_repo_plugin_agents(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _agent(
+        repo / "plugins" / "local-plugin" / "agents",
+        "local-agent",
+        desc="Local plugin agent.",
+    )
+
+    budget = scan.build_context_budget(repo, home=tmp_path / "home")
+    paths = {
+        entry["path"]
+        for entry in budget["metadata_upper_bounds"]["files"]
+    }
+
+    assert "plugins/local-plugin/agents/local-agent.agent.md" not in paths
+
+
 def test_custom_instruction_dirs_accept_comma_separator(
     tmp_path: Path, monkeypatch,
 ):
@@ -2297,7 +2860,6 @@ def test_context_budget_splits_hooks_without_executing(
     source = scan.PluginSource(
         skills_root=plugin / "skills", origin="market/plugin",
     )
-
     budget = scan.build_context_budget(repo, [source], home=home)
     hooks = budget["hook_registrations"]
     context_hooks = hooks["additional_context_capable"]
@@ -2342,6 +2904,139 @@ def test_context_budget_splits_hooks_without_executing(
     assert "payload size unknown (not additionalContext)" in output
 
 
+def _write_session_file_hook(marker_dir_name: str) -> dict:
+    """A sessionStart command hook that writes a session-scoped file.
+
+    Mirrors the real facility write_session_guidance.py contract: it derives
+    the session-state root from $HOME/$USERPROFILE (never a hardcoded path)
+    and writes under instructions/<marker_dir_name>/.
+    """
+    session_id = "scan-customizations-dynamic-capture"
+    bash = (
+        f'mkdir -p "$HOME/.copilot/session-state/{session_id}/instructions/'
+        f'{marker_dir_name}" && printf \'dynamic content\' > '
+        f'"$HOME/.copilot/session-state/{session_id}/instructions/'
+        f'{marker_dir_name}/topic.instructions.md"'
+    )
+    powershell = (
+        f"New-Item -ItemType Directory -Force -Path "
+        f"\"$env:USERPROFILE\\.copilot\\session-state\\{session_id}\\"
+        f"instructions\\{marker_dir_name}\" | Out-Null; Set-Content -Path "
+        f"\"$env:USERPROFILE\\.copilot\\session-state\\{session_id}\\"
+        f"instructions\\{marker_dir_name}\\topic.instructions.md\" "
+        f"-Value 'dynamic content' -NoNewline"
+    )
+    return {"type": "command", "bash": bash, "powershell": powershell}
+
+
+def test_capture_dynamic_disabled_by_default(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    plugin = tmp_path / "plugin"
+    (plugin / "skills").mkdir(parents=True)
+    (plugin / "hooks.json").write_text(json.dumps({
+        "version": 1,
+        "hooks": {"sessionStart": [_write_session_file_hook("plugin-x")]},
+    }), encoding="utf-8")
+    source = scan.PluginSource(
+        skills_root=plugin / "skills", origin="market/plugin",
+    )
+
+    budget = scan.build_context_budget(repo, [source], home=home)
+    dynamic = budget["dynamic_session_files"]
+    assert dynamic == {
+        "captured": False, "totals": {
+            "characters": 0, "bytes": 0, "words": 0, "estimated_tokens": 0,
+        }, "files": [], "errors": [],
+    }
+    assert not (home / ".copilot" / "session-state").exists()
+
+
+def test_capture_dynamic_sandboxes_and_measures_session_files(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    plugin = tmp_path / "plugin"
+    (plugin / "skills").mkdir(parents=True)
+    (plugin / "hooks.json").write_text(json.dumps({
+        "version": 1,
+        "hooks": {"sessionStart": [_write_session_file_hook("plugin-x")]},
+    }), encoding="utf-8")
+    source = scan.PluginSource(
+        skills_root=plugin / "skills", origin="market/plugin",
+    )
+
+    budget = scan.build_context_budget(
+        repo, [source], home=home, capture_dynamic=True,
+    )
+    dynamic = budget["dynamic_session_files"]
+    assert dynamic["captured"] is True
+    assert dynamic["errors"] == []
+    assert len(dynamic["files"]) == 1
+    entry = dynamic["files"][0]
+    assert entry["path"] == "<session-instructions>/plugin-x/topic.instructions.md"
+    assert entry["characters"] == len("dynamic content")
+    assert dynamic["totals"]["characters"] == len("dynamic content")
+
+    # The real home fixture is never touched -- only the disposable sandbox.
+    assert not (home / ".copilot" / "session-state").exists()
+
+
+def test_capture_dynamic_reports_hook_failures_without_raising(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    plugin = tmp_path / "plugin"
+    (plugin / "skills").mkdir(parents=True)
+    (plugin / "hooks.json").write_text(json.dumps({
+        "version": 1,
+        "hooks": {"sessionStart": [{
+            "type": "command",
+            "bash": "exit 3",
+            "powershell": "exit 3",
+        }]},
+    }), encoding="utf-8")
+    source = scan.PluginSource(
+        skills_root=plugin / "skills", origin="market/plugin",
+    )
+
+    budget = scan.build_context_budget(
+        repo, [source], home=home, capture_dynamic=True,
+    )
+    dynamic = budget["dynamic_session_files"]
+    assert dynamic["files"] == []
+    assert len(dynamic["errors"]) == 1
+    assert dynamic["errors"][0]["plugin"] == "plugin:market/plugin"
+    assert "exit code" in dynamic["errors"][0]["detail"]
+
+
+def test_capture_dynamic_skips_repo_and_user_hooks(tmp_path: Path):
+    """Only plugin-owned sessionStart hooks run; repo/user ones never do."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home = tmp_path / "home"
+    user_hooks = home / ".copilot" / "hooks"
+    user_hooks.mkdir(parents=True)
+    (user_hooks / "personal.json").write_text(json.dumps({
+        "hooks": {"sessionStart": [_write_session_file_hook("user-plugin")]},
+    }), encoding="utf-8")
+    (repo / "hooks.json").write_text(json.dumps({
+        "version": 1,
+        "hooks": {"sessionStart": [_write_session_file_hook("repo-plugin")]},
+    }), encoding="utf-8")
+
+    budget = scan.build_context_budget(
+        repo, [], home=home, capture_dynamic=True,
+    )
+    dynamic = budget["dynamic_session_files"]
+    assert dynamic["files"] == []
+    assert dynamic["errors"] == []
+
+
 def test_json_context_budget_shape(tmp_path: Path, capsys, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -2356,6 +3051,7 @@ def test_json_context_budget_shape(tmp_path: Path, capsys, monkeypatch):
         "token_estimate",
         "static_instruction_payloads",
         "metadata_upper_bounds",
+        "dynamic_session_files",
         "hook_registrations",
         "known_totals",
     }
@@ -2382,12 +3078,15 @@ def test_json_from_settings_includes_identity_role_inventory(
     repo.mkdir()
     home = tmp_path / "home"
     installed = home / ".copilot" / "installed-plugins"
-    _aggregate_authority(installed)
+    _session_plugin(
+        installed,
+        "copilot-extensions",
+        "session-file-writer",
+    )
     _settings(
         repo,
-        {"context-injection@copilot-extensions": True},
+        {"session-file-writer@copilot-extensions": True},
         {},
-        aggregation=_adoption(),
     )
     copilot = home / ".copilot"
     copilot.mkdir(parents=True, exist_ok=True)
@@ -2402,21 +3101,16 @@ def test_json_from_settings_includes_identity_role_inventory(
     output = capsys.readouterr().out
     payload = json.loads(output)
     assert payload["session_context"] == {
-        "disposition": "repository-authority-proven",
-        "authority_proven": True,
+        "disposition": "output-free-stack",
         "plugins": [{
-            "identity": "copilot-extensions/context-injection",
-            "role": "aggregate-authority",
+            "identity": "copilot-extensions/session-file-writer",
+            "role": "proven-output-free",
             "session_start": "yes",
             "declaration": "complete",
-            "possible_non_empty": "yes",
+            "possible_non_empty": "no",
         }],
     }
-    assert not any(
-        finding["check"] == "session-context-authority"
-        and finding["severity"] == scan.BLOCKING
-        for finding in payload["findings"]
-    )
+    assert payload["blocking"] == 0
 
 
 def test_from_settings_ignores_untrusted_repository_settings(
@@ -2426,10 +3120,14 @@ def test_from_settings_ignores_untrusted_repository_settings(
     repo.mkdir()
     home = tmp_path / "home"
     installed = home / ".copilot" / "installed-plugins"
-    _aggregate_authority(installed)
+    _session_plugin(
+        installed,
+        "copilot-extensions",
+        "session-file-writer",
+    )
     _settings(
         repo,
-        {"context-injection@copilot-extensions": True},
+        {"session-file-writer@copilot-extensions": True},
         {},
     )
     monkeypatch.setattr(scan.Path, "home", lambda: home)
@@ -2439,7 +3137,6 @@ def test_from_settings_ignores_untrusted_repository_settings(
     output = capsys.readouterr().out
     payload = json.loads(output)
     assert payload["session_context"]["plugins"] == []
-    assert payload["session_context"]["authority_proven"] is False
     assert "do-not-report-this-command" not in output
 
 
@@ -2526,3 +3223,303 @@ def test_json_without_context_budget_preserves_default_shape(
     payload = json.loads(capsys.readouterr().out)
 
     assert "context_budget" not in payload
+
+
+# ---------------------------------------------------------------------------
+# _plugin_commit / resolve_pinned_commits (immutable-pin resolver, effort
+# ambient-guidance-navigability, issue #3132)
+# ---------------------------------------------------------------------------
+
+
+def _run_git(cwd: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+def _git_available() -> bool:
+    import shutil
+
+    return shutil.which("git") is not None
+
+
+def _clean_git_checkout(repo: Path) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    _run_git(repo, "init", "-q")
+    _run_git(repo, "config", "user.email", "test@example.com")
+    _run_git(repo, "config", "user.name", "Test")
+    (repo / "plugin.json").write_text(
+        json.dumps({"name": "cap", "version": "1.0.0"}), encoding="utf-8"
+    )
+    _run_git(repo, "add", "-A")
+    _run_git(repo, "commit", "-q", "-m", "initial")
+
+
+@pytest.mark.skipif(not _git_available(), reason="git is not installed")
+def test_plugin_commit_resolves_head_inside_a_git_checkout(tmp_path: Path):
+    repo = tmp_path / "repo"
+    _clean_git_checkout(repo)
+
+    sha = scan._plugin_commit(repo)
+
+    assert len(sha) == 40
+    assert all(ch in "0123456789abcdef" for ch in sha)
+
+
+@pytest.mark.skipif(not _git_available(), reason="git is not installed")
+def test_plugin_commit_empty_with_a_modified_tracked_file(tmp_path: Path):
+    repo = tmp_path / "repo"
+    _clean_git_checkout(repo)
+    (repo / "plugin.json").write_text(
+        json.dumps({"name": "cap", "version": "1.0.1"}), encoding="utf-8"
+    )
+
+    # A modified tracked file means the payload on disk no longer matches
+    # HEAD -- pinning it would be a false claim of reproducibility.
+    assert scan._plugin_commit(repo) == ""
+
+
+@pytest.mark.skipif(not _git_available(), reason="git is not installed")
+def test_plugin_commit_empty_with_an_untracked_file(tmp_path: Path):
+    repo = tmp_path / "repo"
+    _clean_git_checkout(repo)
+    (repo / "extra.json").write_text("{}", encoding="utf-8")
+
+    # An untracked file within the payload is exactly as unproven as a
+    # modification -- HEAD alone does not describe it.
+    assert scan._plugin_commit(repo) == ""
+
+
+@pytest.mark.skipif(not _git_available(), reason="git is not installed")
+def test_plugin_commit_ignores_ambient_git_dir_override(
+    tmp_path: Path, monkeypatch
+):
+    import subprocess
+
+    repo = tmp_path / "repo"
+    _clean_git_checkout(repo)
+    other_repo = tmp_path / "other"
+    _clean_git_checkout(other_repo)
+
+    # An inherited GIT_DIR/GIT_WORK_TREE pointing at a DIFFERENT repository
+    # must never redirect this probe away from the `-C <footprint>` target.
+    monkeypatch.setenv("GIT_DIR", str(other_repo / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other_repo))
+
+    sha = scan._plugin_commit(repo)
+    clean_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    expected = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        env=clean_env,
+    ).stdout.strip()
+
+    assert sha == expected
+
+
+@pytest.mark.skipif(not _git_available(), reason="git is not installed")
+def test_plugin_commit_empty_with_an_ignored_file(tmp_path: Path):
+    repo = tmp_path / "repo"
+    _clean_git_checkout(repo)
+    (repo / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    _run_git(repo, "add", "-A")
+    _run_git(repo, "commit", "-q", "-m", "add gitignore")
+    (repo / "ignored.txt").write_text("stray content\n", encoding="utf-8")
+
+    # An ignored file inside the payload is exactly as unproven against
+    # HEAD as an untracked one -- the projection scanner does not consult
+    # .gitignore, so plain `git status --porcelain` (which omits ignored
+    # entries) would wrongly report this payload as clean.
+    assert scan._plugin_commit(repo) == ""
+
+
+@pytest.mark.skipif(not _git_available(), reason="git is not installed")
+def test_plugin_commit_detects_untracked_file_despite_local_config(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    _clean_git_checkout(repo)
+    _run_git(repo, "config", "status.showUntrackedFiles", "no")
+    (repo / "extra.json").write_text("{}", encoding="utf-8")
+
+    # `status.showUntrackedFiles=no` would otherwise hide a genuinely new,
+    # uncommitted payload file from even the default untracked reporting --
+    # --untracked-files=all must force full enumeration regardless.
+    assert scan._plugin_commit(repo) == ""
+
+
+def test_plugin_commit_empty_when_head_moves_during_the_check(
+    tmp_path: Path, monkeypatch
+):
+    # The clean check and rev-parse are two separate subprocesses with no
+    # shared lock -- if HEAD moves between the "before" and "after" reads
+    # (a concurrent commit/checkout), the payload's provenance is no longer
+    # certain and must not be pinned.
+    repo = tmp_path / "repo"
+    calls = {"n": 0}
+
+    def fake_head(_git, _footprint):
+        calls["n"] += 1
+        return "a" * 40 if calls["n"] == 1 else "b" * 40
+
+    monkeypatch.setattr(scan, "_git_head", fake_head)
+    monkeypatch.setattr(scan, "_payload_is_clean", lambda _git, _footprint: True)
+    monkeypatch.setattr(scan.shutil, "which", lambda _name: "git")
+
+    assert scan._plugin_commit(repo) == ""
+
+
+@pytest.mark.skipif(not _git_available(), reason="git is not installed")
+def test_assemble_never_pins_an_uncontrolled_directory_marketplace_source(
+    tmp_path: Path,
+):
+    # A plain `directory` marketplace source is an arbitrary local path --
+    # it could point at a payload copied into a subdirectory of some
+    # entirely unrelated git repository (as it does here). footprint being
+    # non-None alone must not be treated as trusted checkout provenance:
+    # only `controlled` (this reviewing repo's own tree) or an
+    # `agent-worktrees-repo` resolution qualify.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    unrelated_checkout = tmp_path / "unrelated"
+    plugin = unrelated_checkout / "payloads" / "cap"
+    (plugin / "skills").mkdir(parents=True)
+    _skill(plugin / "skills", "cap")
+    (plugin / "plugin.json").write_text(
+        json.dumps({"name": "cap", "version": "1.0.0"}), encoding="utf-8"
+    )
+    _marketplace(
+        unrelated_checkout,
+        "outside-plugins",
+        plugin_root="payloads",
+        entries=[{"name": "cap", "source": "cap"}],
+    )
+    _run_git(unrelated_checkout, "init", "-q")
+    _run_git(unrelated_checkout, "config", "user.email", "test@example.com")
+    _run_git(unrelated_checkout, "config", "user.name", "Test")
+    _run_git(unrelated_checkout, "add", "-A")
+    _run_git(unrelated_checkout, "commit", "-q", "-m", "add payload")
+    _settings(
+        repo,
+        {"cap@outside-plugins": True},
+        {
+            "outside-plugins": {
+                "source": {
+                    "source": "directory",
+                    "path": str(unrelated_checkout),
+                },
+            },
+        },
+    )
+
+    sources = scan.assemble_enabled_plugins(
+        repo, installed_root=tmp_path / "none", home=tmp_path / "home"
+    )
+
+    assert len(sources) == 1
+    assert sources[0].controlled is False
+    assert sources[0].is_local_checkout is False
+    assert sources[0].commit == ""
+
+
+@pytest.mark.skipif(not _git_available(), reason="git is not installed")
+def test_assemble_never_pins_an_installed_root_footprint(tmp_path: Path):
+    # A plain installed-plugins footprint is a copied external payload with
+    # no source-commit provenance of its own -- even when the installed
+    # root happens to live inside an unrelated git checkout (as it does
+    # here), assemble_enabled_plugins must never call _plugin_commit()
+    # against it.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    installed = tmp_path / "installed"
+    _clean_git_checkout(installed)
+    _installed_plugin(installed, "some-market", "cap")
+    _run_git(installed, "add", "-A")
+    _run_git(installed, "commit", "-q", "-m", "add plugin payload")
+    _settings(repo, {"cap@some-market": True}, {})
+
+    sources = scan.assemble_enabled_plugins(
+        repo, installed_root=installed, home=tmp_path / "home"
+    )
+
+    assert len(sources) == 1
+    assert sources[0].commit == ""
+
+
+@pytest.mark.skipif(not _git_available(), reason="git is not installed")
+def test_sources_from_raw_dir_never_pins_a_copied_payload(tmp_path: Path):
+    installed = tmp_path / "installed"
+    _clean_git_checkout(installed)
+    _installed_plugin(installed, "some-market", "cap")
+    _run_git(installed, "add", "-A")
+    _run_git(installed, "commit", "-q", "-m", "add plugin payload")
+
+    sources = scan._sources_from_raw_dir(installed)
+
+    assert len(sources) == 1
+    assert sources[0].commit == ""
+
+
+def test_plugin_commit_empty_outside_a_git_checkout(tmp_path: Path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "plugin.json").write_text(
+        json.dumps({"name": "cap", "version": "1.0.0"}), encoding="utf-8"
+    )
+
+    assert scan._plugin_commit(plain) == ""
+
+
+def test_plugin_commit_empty_when_git_unavailable(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(scan.shutil, "which", lambda _name: None)
+
+    assert scan._plugin_commit(tmp_path) == ""
+
+
+@pytest.mark.skipif(not _git_available(), reason="git is not installed")
+def test_resolve_pinned_commits_re_probes_fresh_not_the_stale_field(
+    tmp_path: Path,
+):
+    # resolve_pinned_commits must NOT trust PluginSource.commit (captured at
+    # discovery time) -- it re-probes fresh, so a checkout that advanced
+    # since discovery (e.g. across a `refresh`) is reflected correctly.
+    checkout = tmp_path / "checkout"
+    _clean_git_checkout(checkout)
+    stale_sha = scan._plugin_commit(checkout)
+    (checkout / "plugin.json").write_text(
+        json.dumps({"name": "cap", "version": "1.0.1"}), encoding="utf-8"
+    )
+    _run_git(checkout, "add", "-A")
+    _run_git(checkout, "commit", "-q", "-m", "advance")
+    fresh_sha = scan._plugin_commit(checkout)
+    assert fresh_sha != stale_sha
+
+    local = scan.PluginSource(
+        skills_root=checkout / "skills",
+        origin="copilot-extensions/cap",
+        commit=stale_sha,  # deliberately stale
+        is_local_checkout=True,
+    )
+
+    result = scan.resolve_pinned_commits([local])
+
+    assert result == {"cap@copilot-extensions": fresh_sha}
+
+
+def test_resolve_pinned_commits_never_pins_a_non_local_checkout_source(
+    tmp_path: Path,
+):
+    # is_local_checkout=False (the default) must never be re-probed or
+    # pinned, regardless of what its (informational-only) commit field or
+    # payload_root on disk look like.
+    unpinned = scan.PluginSource(
+        skills_root=Path("/y/skills"),
+        origin="third-party-marketplace/some-plugin",
+        commit="a" * 40,
+        is_local_checkout=False,
+    )
+
+    result = scan.resolve_pinned_commits([unpinned])
+
+    assert result == {}

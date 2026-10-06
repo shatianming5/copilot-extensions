@@ -245,8 +245,54 @@ class CleanupDisposition:
 
     cleanable: bool
     bucket: str   # clean | active | unused | conversation | follow-up |
-    #               open-pr | closed-unmerged | dirty | wip | unmerged
+    #               held-claims | held-claims-cross-machine | open-pr |
+    #               closed-unmerged | dirty | wip | unmerged
     reason: str
+
+
+def _count_cross_machine_worktree_claims(
+    held_claims: list, this_machine: str,
+) -> int:
+    """How many of ``held_claims`` (outbound claims THIS record holds) are
+    ``worktree``-kind claims whose qualified ref names a worktree hosted on
+    a DIFFERENT machine than ``this_machine`` -- i.e. the claim's TARGET
+    lives remotely, not this record itself.
+
+    This proves only that the target is remote, nothing about its state:
+    an ``active`` claim here may be a genuinely busy remote worktree, not
+    an idle/settled one -- this count never implies the target is safe,
+    settled, or self-resolving. Nothing today actually sweeps/settles this
+    kind of claim either way (``sweep.gone_of``/``safe_of`` both spare an
+    unjudgeable cross-machine ref, and ``worktree`` isn't in
+    ``sweep._LEASEABLE_KINDS``). See the ``cross_machine_claims`` doc on
+    :func:`assemble_closure_descriptor` for what this does and doesn't claim.
+
+    ``this_machine`` falsy/unknown (a legacy record with an empty
+    ``machine``, ``tracking.py``) means we cannot tell local from remote at
+    all -- never guess cross-machine from an unknown identity; this always
+    returns ``0`` in that case, keeping the conservative generic bucket.
+    """
+    if not this_machine:
+        return 0
+    count = 0
+    for claim in held_claims:
+        if claim.kind != "worktree":
+            continue
+        parsed = tracking.parse_claim_ref(claim.ref)
+        if parsed is None or not parsed.is_qualified:
+            continue
+        if parsed.machine != this_machine:
+            count += 1
+    return count
+
+
+def cross_machine_claim_count(rec: tracking.WorktreeRecord) -> int:
+    """How many of ``rec``'s own LIVE claims are cross-machine
+    ``worktree``-kind claims -- the one count every
+    :func:`assemble_closure_descriptor` caller shares.
+    """
+    return _count_cross_machine_worktree_claims(
+        [c for c in rec.resources if c.is_live], rec.machine)
 
 
 def cleanup_disposition(
@@ -265,19 +311,25 @@ def cleanup_disposition(
     needs a git branch-merged check the caller owns.  Everything else flows
     from :func:`assess`.
 
-    Safety invariant: a ``finalized`` worktree (or one git proves COMPLETED) is
-    always cleanable -- its work is at minimum pushed to the remote feature
-    branch, so removing the local copy loses nothing.  This preserves the
-    long-standing default and avoids over-preserving on a *stale* local PR
-    state (use ``--reconcile-prs`` / live reconcile to refine those).
+    Safety invariant: a ``finalized`` worktree (or one git proves COMPLETED)
+    is cleanable **provided its working tree carries no uncommitted content**
+    (``info.dirty == 0``) -- at that point its work is at minimum pushed to
+    the remote feature branch, so removing the local copy loses nothing. This
+    preserves the long-standing default and avoids over-preserving on a
+    *stale* local PR state (use ``--reconcile-prs`` / live reconcile to
+    refine those). A worktree finalized earlier and modified afterward
+    (``info.dirty > 0``, whether classified ``DIRTY`` or an ``ORPHAN`` that
+    still carries a dirty count) is excluded from this shortcut regardless of
+    ``rec.status`` -- see the ``info.dirty > 0`` guard below.
 
-    The **one exception** is an IN-FLIGHT claimed resource (agent-fabric
-    `claimed-resource-not-reclaimed`): when ``claimant_alive`` is injected and
-    the claimant is alive / not-confirmed-gone, a still-in-flight resource is
-    spared because its owner may still be using it. A FINISHED claimed resource
-    (finalized / merged / git-COMPLETED) is NOT spared -- it is collectable even
-    under a live claimant, so a host kept open for days does not
-    pin its merged children.
+    Beyond the dirty exclusion, the other exception is an IN-FLIGHT claimed
+    resource (agent-fabric `claimed-resource-not-reclaimed`): when
+    ``claimant_alive`` is injected and the claimant is alive /
+    not-confirmed-gone, a still-in-flight resource is spared because its
+    owner may still be using it. A FINISHED claimed resource (finalized /
+    merged / git-COMPLETED) is NOT spared -- it is collectable even under a
+    live claimant, so a host kept open for days does not pin its merged
+    children.
     """
     v = assess(rec, info, turn_count=turn_count, claimant_alive=claimant_alive)
     S = git_ops.WorktreeState
@@ -293,19 +345,70 @@ def cleanup_disposition(
     if v.category == "claimed":
         return CleanupDisposition(False, "claimed", v.reason)
 
-    # worktree-status-core: an agent-asserted follow-up overrides a would-be
-    # SAFE verdict. A finalized/merged/completed worktree the agent flagged as
-    # having actionable follow-ups (un-pushed change, undeployed merge, leftover
-    # temp state) is REVIEW -- never auto-pruned SAFE. Only downgrades the
-    # clean/SAFE path; a dirty/wip/open-pr worktree is already non-cleanable, so
-    # the flag adds nothing there.
-    if rec.follow_up and (
+    # worktree-finality-and-obligations (effort): a HELD outbound resource
+    # claim (``active`` or ``at-rest`` -- see ``ResourceClaim.is_live``)
+    # overrides a would-be SAFE verdict, mirroring the follow-up gate below.
+    # Since a finalized owner can now accept a new claim (finalize is not
+    # terminal; see ``tracking.add_resource_claim``), cleanup must not treat
+    # ``status == finalized`` as proof the worktree is claim-free -- only
+    # ``finalize`` itself re-validates and releases at-rest claims. A
+    # ``released``/``abandoned`` claim is not held and does not block.
+    #
+    # This is also why Phase 8's ``kind="session"`` claim needs no
+    # userPromptSubmit-driven reopen mechanism for cleanup safety: a session
+    # claim only ever becomes ``released`` via a genuine ``sessionEnd``
+    # (process exit), never while the process is still running -- so a
+    # still-live session settled to ``at-rest`` by a mid-conversation
+    # ``finalize`` call is STILL ``is_live`` here and still blocks pruning,
+    # exactly like an ``active`` one. An earlier design (built, then
+    # reverted -- see PR history around #3349) added a per-prompt hook to
+    # flip such a claim's own state back to ``active``; tracing
+    # ``add_resource_claim``'s reopen path showed that flip never even
+    # changes ``rec.status`` (an already-live claim never triggers
+    # ``reopen_finalized_owner``), so it had no effect on this check either
+    # -- purely cosmetic, not worth a subprocess spawn on every submitted
+    # prompt.
+    held_claims = [c for c in rec.resources if c.is_live]
+    if held_claims and (
         rec.status == "finalized" or info.state == S.COMPLETED
-        or v.category == "merged"
+        or v.category in ("merged", "empty", "conversation-only")
+    ):
+        # When EVERY held claim targets a worktree on a different machine,
+        # this isn't a LOCAL blocker -- it's an outbound claim ON a worktree
+        # hosted remotely, not something held locally. NOT a claim this is
+        # known to self-clear: today nothing actually sweeps/settles this
+        # kind of claim (see _count_cross_machine_worktree_claims's
+        # docstring) -- this bucket only names WHERE the target lives, not
+        # that it needs no further look.
+        xm = _count_cross_machine_worktree_claims(held_claims, rec.machine)
+        if xm == len(held_claims):
+            return CleanupDisposition(
+                False, "held-claims-cross-machine",
+                f"{v.reason} · {len(held_claims)} cross-machine claim(s) "
+                "(target worktree hosted elsewhere)")
+        return CleanupDisposition(
+            False, "held-claims",
+            f"{v.reason} · {len(held_claims)} held resource claim(s) pending")
+
+    # worktree-status-core: an agent-asserted follow-up overrides a would-be
+    # SAFE verdict. A finalized/merged/completed worktree with actionable
+    # follow-ups (un-pushed change, undeployed merge, leftover temp state) is
+    # REVIEW -- never auto-pruned SAFE. Only downgrades the clean/SAFE path; a
+    # dirty/wip/open-pr worktree is already non-cleanable, so this adds nothing
+    # there. worktree-finality-and-obligations Phase 3: counts the itemized
+    # `follow_ups` ledger (open/pending-transfer items), falling back to the
+    # legacy boolean when the ledger is empty -- see
+    # `tracking.effective_open_follow_up_count`. Validation Plan "Blocker
+    # precedence": also applies to UNUSED (``empty``)/CONVO
+    # (``conversation-only``), mirroring the held-claims override above.
+    open_follow_ups = tracking.effective_open_follow_up_count(rec)
+    if open_follow_ups and (
+        rec.status == "finalized" or info.state == S.COMPLETED
+        or v.category in ("merged", "empty", "conversation-only")
     ):
         return CleanupDisposition(
             False, "follow-up",
-            f"{v.reason} · agent flagged follow-ups pending")
+            f"{v.reason} · {open_follow_ups} open follow-up(s) pending")
 
     # citadel paired-worktree BOTH-gate (#957): a paired -harness/-knowledge
     # worktree is prunable only once BOTH halves are finalized. When the
@@ -328,6 +431,39 @@ def cleanup_disposition(
                 f"{v.reason} · held until BOTH paired worktrees finalized "
                 f"({why})")
 
+    # (#2635-class ordering fix, extended by the cleanup-toctou-revalidation
+    # effort): WIP and un-included conversation-only must be checked BEFORE
+    # the finalized/COMPLETED shortcut below -- a record whose tracking
+    # status is "finalized" (or whose git state reads COMPLETED) can still
+    # gain a committed WIP change or a fresh conversation turn since that
+    # status was set. Trusting the shortcut first would let a stale
+    # "finalized" status silently mask fresh unsafe content, mirroring the
+    # `dirty` ordering bug PR #2635 already fixed one check below. When
+    # `include_conversations` is set, conversation-only content is meant to
+    # be cleanable, so it is intentionally left to fall through to its later
+    # category check rather than being blocked here.
+    if info.state == S.WIP:
+        return CleanupDisposition(False, "wip", v.reason)
+    if v.category == "conversation-only" and not include_conversations:
+        return CleanupDisposition(False, "conversation", v.reason)
+
+    # Safety invariant (mirrors _apply_tracking_override in __main__.py): any
+    # uncommitted content must never be treated as cleanable via the raw
+    # rec.status == "finalized" shortcut below. A worktree finalized earlier
+    # and modified afterward still carries a tracking status of "finalized",
+    # but that status describes work already verified safe on the default
+    # branch at finalize time -- it says nothing about content added since.
+    # Checked two ways so neither a missing count nor a stale state label
+    # slips through: info.state == S.DIRTY is kept as an explicit fallback
+    # because some callers (e.g. __main__._classify_from_cache) reconstruct
+    # a WorktreeStateInfo from a cached git_state string without
+    # repopulating `dirty`, so state == DIRTY, dirty == 0 can reach here;
+    # info.dirty > 0 is needed separately because an ORPHAN classification
+    # (no merge base) can also carry a nonzero dirty count with state !=
+    # DIRTY. Neither check alone covers both gaps.
+    if info.state == S.DIRTY or info.dirty > 0:
+        return CleanupDisposition(False, "dirty", v.reason)
+
     if rec.status == "finalized" or info.state == S.COMPLETED:
         return CleanupDisposition(True, "clean", v.reason)
 
@@ -342,12 +478,20 @@ def cleanup_disposition(
             include_unused or include_conversations, "unused", v.reason)
     if v.category == "conversation-only":
         return CleanupDisposition(include_conversations, "conversation", v.reason)
-    if info.state == S.DIRTY:
-        return CleanupDisposition(False, "dirty", v.reason)
-    if info.state == S.WIP:
-        return CleanupDisposition(False, "wip", v.reason)
     return CleanupDisposition(False, "unmerged", v.reason)
 
+
+# ── Canonical closure descriptor ─────────────────────────────────────────
+# Split into closure_descriptor.py (module-size cap); re-exported here so
+# every existing prune.X call site keeps working unchanged.
+from .closure_descriptor import (  # noqa: E402,F401
+    BLOCKER_CODES,
+    DESCRIPTOR_VERSION,
+    FACT_NAMES,
+    ClosureDescriptor,
+    assemble_closure_descriptor,
+    interpret_descriptor_payload,
+)
 
 def default_paired_sibling_final(
     rec: tracking.WorktreeRecord,

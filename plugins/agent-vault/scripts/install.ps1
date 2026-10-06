@@ -39,11 +39,38 @@ param(
     [switch]$NoService,
 
     [switch]$Purge,
-    [switch]$Force
+    [switch]$Force,
+
+    # Preview mode for the 'uninstall' action: print what WOULD be removed
+    # without touching the filesystem or scheduled task.
+    [switch]$DryRun
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+
+# === install-contract:test-persistent-environment -- keep byte-identical across installers ===
+function Get-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    return [Environment]::GetEnvironmentVariable($Name, $effectiveTarget)
+}
+
+function Set-CopilotPersistentEnvironmentVariable {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [AllowNull()][string]$Value,
+        [Parameter(Mandatory)][ValidateSet('User', 'Machine')][string]$Target
+    )
+    $testMode = $env:COPILOT_EXTENSIONS_TEST_CONTAINED -eq '1' -or [bool]$env:PYTEST_CURRENT_TEST
+    $effectiveTarget = if ($testMode) { 'Process' } else { $Target }
+    [Environment]::SetEnvironmentVariable($Name, $Value, $effectiveTarget)
+}
+# === end install-contract:test-persistent-environment ===
 
 # === install-contract:v4 self-stage -- keep byte-identical across plugins ===
 # dotfiles #935: a plugin installer reads its own payload (src/, libs/,
@@ -218,19 +245,44 @@ function Write-Fail    { param([string]$Msg) Write-Host "  [FAIL] $Msg" -Foregro
 function Write-Warn    { param([string]$Msg) Write-Host "  [WARN] $Msg" -ForegroundColor Yellow }
 function Write-Step    { param([string]$Msg) Write-Host "  ...    $Msg" -ForegroundColor DarkGray }
 
+. (Join-Path $PSScriptRoot 'installer-engine.ps1')
+
 $PluginDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $PkgSrcDir = Join-Path $PluginDir 'src\agent_vault'
 
 if (-not $InstallDir) {
     $InstallDir = Join-Path $env:USERPROFILE '.agent-vault'
 }
+$InstallDir = [IO.Path]::GetFullPath($InstallDir)
+$legacyInstallDir = [IO.Path]::GetFullPath((Join-Path $env:USERPROFILE '.agent-vault'))
+$serviceSuffix = if ([StringComparer]::OrdinalIgnoreCase.Equals($InstallDir, $legacyInstallDir)) {
+    ''
+} else {
+    $serviceSha = [Security.Cryptography.SHA256]::Create()
+    try {
+        ([BitConverter]::ToString(
+            $serviceSha.ComputeHash(
+                [Text.Encoding]::UTF8.GetBytes($InstallDir.ToLowerInvariant())
+            )
+        )).Replace('-', '').Substring(0, 12).ToLowerInvariant()
+    } finally {
+        $serviceSha.Dispose()
+    }
+}
+$installationId = [string]$env:AGENT_VAULT_INSTALLATION_ID
+$RunDir = Join-Path $InstallDir 'run'
+$SocketPath = Join-Path $RunDir 'agent-vault.sock'
+$PipePath = if ($serviceSuffix) { "\\.\pipe\agent-vault-$serviceSuffix" } else { "\\.\pipe\agent-vault" }
+$PidFile = Join-Path $RunDir 'agent-vault-service.pid'
+$LogFile = Join-Path (Join-Path $InstallDir 'logs') 'agent-vault-service.log'
 $VenvDir     = Join-Path $InstallDir '.venv'
 $LocalBin    = Join-Path $env:USERPROFILE '.local\bin'
 $VenvPython  = Join-Path $VenvDir 'Scripts\python.exe'
 $BinstubPs1  = Join-Path $LocalBin 'agent-vault.ps1'
 $BinstubCmd  = Join-Path $LocalBin 'agent-vault.cmd'
 $Binstub     = $BinstubPs1
-$TaskName    = 'AgentVault'
+$TaskName    = if ($serviceSuffix) { "AgentVault-$serviceSuffix" } else { 'AgentVault' }
+$TaskLauncher = Join-Path $InstallDir 'service.ps1'
 $utf8NoBom   = New-Object System.Text.UTF8Encoding $false
 
 # === install-contract:v3 versioned-venv (agent-vault: .venv-as-junction) ===
@@ -351,61 +403,85 @@ function Invoke-VersionedGc {
 }
 # === end install-contract:v3 versioned-venv helpers ===
 
-function Get-SignedBasePython {
-    <# Return a SAC-trusted (Authenticode-signed) base Python (>=3.10), or $null.
-       Smart App Control blocks the unsigned uv-managed Python and console-script
-       trampoline; a venv built from a signed base with `--copies` has a signed
-       python.exe that SAC allows. #>
-    if ($env:OS -ne 'Windows_NT') { return $null }
-    $cands = @()
-    if (Get-Command py -ErrorAction SilentlyContinue) {
-        foreach ($v in '3.13', '3.12', '3.11', '3.10') {
-            $p = (& py "-$v" -c "import sys;print(sys.executable)" 2>$null | Out-String).Trim()
-            if ($LASTEXITCODE -eq 0 -and $p) { $cands += $p }
+function Test-UvConfiguredIndex {
+    $configPaths = if ($env:UV_CONFIG_FILE) {
+        @($env:UV_CONFIG_FILE)
+    } else {
+        $paths = @()
+        $roaming = [Environment]::GetFolderPath('ApplicationData')
+        if ($roaming) {
+            $paths += Join-Path $roaming 'uv\uv.toml'
+        }
+        if ($env:PROGRAMDATA) {
+            $paths += Join-Path $env:PROGRAMDATA 'uv\uv.toml'
+        }
+        $paths
+    }
+    foreach ($configPath in $configPaths) {
+        if (-not $configPath -or -not (Test-Path -LiteralPath $configPath)) { continue }
+        $inIndex = $false
+        foreach ($line in Get-Content -LiteralPath $configPath) {
+            $value = ($line -replace '\s+#.*$', '').Trim()
+            if ($value -match '^index-url\s*=') { return $true }
+            if ($value -match '^\[\[index\]\]$') {
+                $inIndex = $true
+                continue
+            }
+            if ($value -match '^\[') { $inIndex = $false }
+            if ($inIndex -and $value -match '^default\s*=\s*true$') {
+                return $true
+            }
         }
     }
-    foreach ($c in ($cands | Select-Object -Unique)) {
-        if (Test-Path $c) {
-            try { if ((Get-AuthenticodeSignature $c).Status -eq 'Valid') { return $c } } catch {}
-        }
-    }
-    return $null
+    return $false
 }
 
-function New-SignedVenv {
-    <# Create or rebuild $VenvDir so its python.exe is SAC-trusted. Prefers a
-       signed base Python via `--copies`; rebuilds an existing unsigned venv;
-       falls back to uv (unsigned) when no signed Python exists. Returns $true
-       if $VenvPython is present afterward. #>
-    # #935: toss an INCOMPLETE prior slot first so we never build over a corpse.
-    Invoke-VersionedSlotClean
-    if ((Test-Path $VenvPython) -and ($env:OS -eq 'Windows_NT')) {
-        $sig = try { (Get-AuthenticodeSignature $VenvPython).Status } catch { 'Unknown' }
-        if ($sig -ne 'Valid' -and (Get-SignedBasePython)) {
-            Write-Step 'Existing venv python is unsigned (Smart App Control-incompatible) -- rebuilding from signed Python'
-            try { Remove-Item -Recurse -Force $VenvDir -ErrorAction Stop }
-            catch { Write-Warn "Could not remove existing venv (in use?): $_" }
-        }
-    }
-    if (Test-Path $VenvPython) { return $true }
-
-    $signedBase = Get-SignedBasePython
-    if ($signedBase) {
-        & $signedBase -m venv --copies $VenvDir 2>&1 | Out-Null
-        if (Test-Path $VenvPython) {
-            Write-Ok "Venv created from signed Python ($signedBase)"
-            return $true
-        }
-        Write-Warn 'Signed-Python venv creation failed -- falling back to uv'
-    } elseif ($env:OS -eq 'Windows_NT') {
-        Write-Warn 'No signed system Python found -- using uv (unsigned). On Smart App Control machines, install python.org Python 3.10+ and re-run.'
-    }
+function Ensure-UvIndex {
+    if ($env:UV_DEFAULT_INDEX -or $env:UV_INDEX_URL -or (Test-UvConfiguredIndex)) { return }
+    $idx = ''
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    & uv venv $VenvDir --python 3.10 --allow-existing 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { & uv venv $VenvDir --allow-existing 2>&1 | Out-Null }
-    $ErrorActionPreference = $prevEAP
-    return (Test-Path $VenvPython)
+    try {
+        if (Get-Command pip -CommandType Application -ErrorAction SilentlyContinue) {
+            $out = & pip config get global.index-url 2>$null
+            if ($LASTEXITCODE -eq 0) { $idx = ($out | Out-String).Trim() }
+        }
+        if (-not $idx) {
+            if (Get-Command py -CommandType Application -ErrorAction SilentlyContinue) {
+                $out = & py -3 -m pip config get global.index-url 2>$null
+                if ($LASTEXITCODE -eq 0) { $idx = ($out | Out-String).Trim() }
+            } elseif (Get-Command python -CommandType Application -ErrorAction SilentlyContinue) {
+                $out = & python -m pip config get global.index-url 2>$null
+                if ($LASTEXITCODE -eq 0) { $idx = ($out | Out-String).Trim() }
+            }
+        }
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+    if (-not $idx) {
+        $configPaths = @($env:PIP_CONFIG_FILE)
+        $roaming = [Environment]::GetFolderPath('ApplicationData')
+        if ($roaming) {
+            $configPaths += Join-Path $roaming 'pip\pip.ini'
+        }
+        if ($env:PROGRAMDATA) {
+            $configPaths += Join-Path $env:PROGRAMDATA 'pip\pip.ini'
+        }
+        foreach ($configPath in $configPaths) {
+            if (-not $configPath -or -not (Test-Path -LiteralPath $configPath)) { continue }
+            $match = Select-String -LiteralPath $configPath `
+                -Pattern '^\s*index-url\s*=\s*(\S+)\s*$' |
+                Select-Object -First 1
+            if ($match) {
+                $idx = $match.Matches[0].Groups[1].Value
+                break
+            }
+        }
+    }
+    if ($idx) {
+        $env:UV_DEFAULT_INDEX = $idx
+        Write-Step 'uv index derived from pip config (governed-feed bridge)'
+    }
 }
 
 # === install-contract:v3 source-kind -- keep byte-identical across plugins ===
@@ -594,113 +670,68 @@ function Test-KeePassXCCli {
 }
 
 function Write-Binstubs {
-    param([string]$PythonExe)
-
-    # Self-provisioning binstubs (#1393): fast-path the built versioned slot's
-    # python; if no slot is built yet (a `stamp` deferred the venv), provision on
-    # first use by running the slot-local snapshot's `scripts/install.ps1 provision`,
-    # then dispatch. Opt out with AGENT_VAULT_NO_SELFPROVISION=1. Launch the slot
-    # python DIRECTLY via -m (never the SAC-blocked console-script trampoline, and
-    # never *traversing* a junction -- dotfiles #637).
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-
-    # Co-deploy the canonical resolvers so every launcher (binstub + the at-logon
-    # scheduled task) resolves identically (uniform-runtime-resolution, #765).
-    $binDir = Join-Path $InstallDir 'bin'
-    if (-not (Test-Path $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
-    foreach ($r in @('resolve-runtime.ps1', 'resolve-runtime.sh')) {
-        $rSrc = Join-Path $PSScriptRoot $r
-        if (Test-Path $rSrc) { Copy-Item $rSrc (Join-Path $binDir $r) -Force }
-    }
-
-    $ps1 = @'
-$env:PYTHONUTF8 = '1'
-$_root = Join-Path $env:USERPROFILE '.agent-vault'
-$_resolver = Join-Path $_root 'bin\resolve-runtime.ps1'
-function _Resolve-Py {
-    $AgentRtPy = $null
-    if (Test-Path -LiteralPath $_resolver) { $env:AGENT_RT_ROOT = $_root; . $_resolver }
-    return $AgentRtPy
-}
-$_py = _Resolve-Py
-if ($_py) { & $_py -m agent_vault @args; exit $LASTEXITCODE }
-if ($env:AGENT_VAULT_NO_SELFPROVISION) { [Console]::Error.WriteLine('[agent-vault] runtime not provisioned (AGENT_VAULT_NO_SELFPROVISION set).'); exit 1 }
-$_snap = ''
-try { $_snap = ([IO.File]::ReadAllText((Join-Path $_root 'payload-dir'))).Trim() } catch {}
-$_inst = if ($_snap) { Join-Path $_snap 'scripts\install.ps1' } else { '' }
-if (-not ($_inst -and (Test-Path -LiteralPath $_inst))) { [Console]::Error.WriteLine('[agent-vault] cannot self-provision: snapshot installer not found. Re-enable the plugin, then retry.'); exit 127 }
-[Console]::Error.WriteLine('[agent-vault] runtime not provisioned -- provisioning on first use (acquires uv + builds a venv; ~30-120s). Do not kill; extend your timeout.')
-[Console]::Error.WriteLine('::agent-provisioning:: plugin=agent-vault eta_seconds=120 reason=first-use')
-$_pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
-$_exe = if ($_pwsh) { $_pwsh.Source } else { 'powershell.exe' }
-& $_exe -NoProfile -ExecutionPolicy Bypass -File $_inst provision 2>&1 | ForEach-Object { [Console]::Error.WriteLine($_) }
-$_py = _Resolve-Py
-if ($_py) { & $_py -m agent_vault @args; exit $LASTEXITCODE }
-[Console]::Error.WriteLine('[agent-vault] provisioning did not yield a runtime. See the log above; retry, or run the snapshot installer manually.')
-exit 1
-'@
-    [System.IO.File]::WriteAllText($BinstubPs1, $ps1, $utf8NoBom)
-
-    # cmd fallback: delegate entirely to the .ps1 binstub so resolution stays
-    # uniform with the canonical resolve-runtime.ps1 chain and self-provisioning
-    # is shared. PowerShell is always present on Windows (this cmd already shelled
-    # to it to provision).
-    $cmd = @'
-@echo off
-setlocal
-set "PYTHONUTF8=1"
-set "_PS1=%USERPROFILE%\.local\bin\agent-vault.ps1"
-if not exist "%_PS1%" (echo [agent-vault] binstub not found: %_PS1%>&2 & exit /b 127)
-where pwsh >nul 2>&1
-if %ERRORLEVEL%==0 (pwsh -NoProfile -ExecutionPolicy Bypass -File "%_PS1%" %*) else (powershell -NoProfile -ExecutionPolicy Bypass -File "%_PS1%" %*)
-exit /b %ERRORLEVEL%
-'@
-    [System.IO.File]::WriteAllText($BinstubCmd, $cmd, $utf8NoBom)
-
-    Write-Ok "Binstub: $BinstubPs1 (+ .cmd fallback, self-provisioning)"
+    Write-SimpleBinstub `
+        -CommandName 'agent-vault' `
+        -ModuleName 'agent_vault' `
+        -RuntimeRoot $InstallDir `
+        -LocalBin $LocalBin `
+        -InstallBinDir (Join-Path $InstallDir 'bin') `
+        -SnapshotInstallerPath 'scripts\install.ps1' `
+        -NoSelfProvisionEnv 'AGENT_VAULT_NO_SELFPROVISION' `
+        -ResolverPs1Source (Join-Path $PSScriptRoot 'resolve-runtime.ps1') `
+        -ResolverShSource (Join-Path $PSScriptRoot 'resolve-runtime.sh')
 }
 
-function Write-Manifest {
-    $manifestPath = Join-Path $InstallDir 'deploy-manifest.json'
-    $kind = Get-SourceKind -PluginPath $PluginDir
-    $ver = '0.0.0'
-    $pyproj = Join-Path $PluginDir 'pyproject.toml'
-    if (Test-Path $pyproj) {
-        $verLine = Select-String -Path $pyproj -Pattern '^\s*version\s*=' | Select-Object -First 1
-        if ($verLine) { $ver = ($verLine.Line -replace '.*=\s*"([^"]+)".*','$1') }
-    }
-    if ($ver -eq '0.0.0') {
-        $sourceVersion = Get-SourceVersion
-        if ($sourceVersion) { $ver = $sourceVersion }
-    }
-    $commit = $null; $branch = $null; $dirty = $false
-    if ($kind -eq 'local') {
-        $repoRoot = Split-Path -Parent (Split-Path -Parent $PluginDir)
-        $git = Get-GitInfo -Path $repoRoot
-        $commit = $git.commit; $branch = $git.branch; $dirty = $git.dirty
-    }
-    $manifest = [ordered]@{
-        schema_version = 3
-        service        = 'agent-vault'
-        deployed_at    = (Get-Date -Format 'o')
-        deployed_by    = "$($env:COMPUTERNAME.ToLower())-windows"
-        source         = [ordered]@{
-            kind    = $kind
-            path    = ($PluginDir -replace '\\', '/')
-            repo    = 'copilot-extensions'
-            plugin  = 'agent-vault'
-            version = $ver
-            commit  = $commit
-            branch  = $branch
-            dirty   = $dirty
+function Resolve-SnapshotInstallerEngineSource {
+    param([Parameter(Mandatory)][ValidateSet('ps1', 'sh')][string]$Ext)
+    $localEngine = Join-Path $PSScriptRoot ("installer-engine.$Ext")
+    if (Test-Path -LiteralPath $localEngine) { return $localEngine }
+    return Join-Path (Join-Path $PSScriptRoot '..\..\..\libs\installer-engine') ("installer-engine.$Ext")
+}
+
+function Materialize-SnapshotLibs {
+    param([Parameter(Mandatory)][string]$SnapshotDir)
+    $libsDir = Join-Path $SnapshotDir 'libs'
+    if (-not (Test-Path $libsDir)) { New-Item -ItemType Directory -Path $libsDir -Force | Out-Null }
+    foreach ($lib in @('zdd', 'agent-procutil', 'single-instance-lease')) {
+        $source = Join-Path $PluginDir "libs\$lib"
+        if (-not (Test-Path (Join-Path $source 'pyproject.toml'))) {
+            $source = Join-Path $PluginDir "..\..\libs\$lib"
         }
-        venv           = ($LinkDir -replace '\\', '/')
-        runtime        = 'python'
+        if (-not (Test-Path (Join-Path $source 'pyproject.toml'))) { continue }
+        $destination = Join-Path $libsDir $lib
+        if ([System.IO.Path]::GetFullPath($source) -eq [System.IO.Path]::GetFullPath($destination)) {
+            continue
+        }
+        Remove-Item -LiteralPath $destination -Recurse -Force -ErrorAction SilentlyContinue
+        Copy-Item -LiteralPath $source -Destination $destination -Recurse -Force
     }
-    $tmp = "$manifestPath.tmp"
-    $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path $tmp -Encoding UTF8
-    Move-Item -Force -Path $tmp -Destination $manifestPath
-    Write-Ok "Deploy manifest written (source: $kind)"
+}
+
+function Materialize-SnapshotInstallerEngine {
+    param([Parameter(Mandatory)][string]$SnapshotDir)
+    $scriptsDir = Join-Path $SnapshotDir 'scripts'
+    if (-not (Test-Path $scriptsDir)) { New-Item -ItemType Directory -Path $scriptsDir -Force | Out-Null }
+    foreach ($name in @('installer-engine.ps1', 'installer-engine.sh')) {
+        $ext = [System.IO.Path]::GetExtension($name).TrimStart('.')
+        $source = Resolve-SnapshotInstallerEngineSource -Ext $ext
+        $destination = Join-Path $scriptsDir $name
+        if ([System.IO.Path]::GetFullPath($source) -ne [System.IO.Path]::GetFullPath($destination)) {
+            Copy-Item -LiteralPath $source -Destination $destination -Force
+        }
+    }
+    $installSh = Join-Path $scriptsDir 'install.sh'
+    if (Test-Path $installSh) {
+        $shText = [System.IO.File]::ReadAllText($installSh)
+        $shText = $shText.Replace('. "$SCRIPT_DIR/../../../libs/installer-engine/installer-engine.sh"', '. "$SCRIPT_DIR/installer-engine.sh"')
+        [System.IO.File]::WriteAllText($installSh, $shText, $utf8NoBom)
+    }
+    $installPs1 = Join-Path $scriptsDir 'install.ps1'
+    if (Test-Path $installPs1) {
+        $ps1Text = [System.IO.File]::ReadAllText($installPs1)
+        $ps1Text = $ps1Text.Replace('. (Join-Path $PSScriptRoot ''..\..\..\libs\installer-engine\installer-engine.ps1'')', '. (Join-Path $PSScriptRoot ''installer-engine.ps1'')')
+        [System.IO.File]::WriteAllText($installPs1, $ps1Text, $utf8NoBom)
+    }
 }
 
 function Install-Runtime {
@@ -716,17 +747,22 @@ function Install-Runtime {
     }
     Write-Ok "Python: $pythonCmd"
 
+    Ensure-UvIndex
+    $uvPath = Ensure-Uv -InstallRoot $InstallDir
+    if (-not $uvPath) {
+        Write-Fail 'uv is required but could not be resolved or acquired'
+        exit 1
+    }
+
     foreach ($dir in @($InstallDir, $LocalBin)) {
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     }
     Write-Ok "Directories: $InstallDir"
 
-    if (-not (New-SignedVenv)) {
-        Write-Step 'Creating venv via python -m venv...'
-        $prevEAP = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        & $pythonCmd -m venv $VenvDir 2>&1 | Out-Null
-        $ErrorActionPreference = $prevEAP
+    Invoke-VersionedSlotClean
+    if (-not (New-SignedVenv -VenvDir $VenvDir -VenvPython $VenvPython -PythonVersion '3.10' -UvCommand $uvPath -RequireSignedBase ($env:OS -eq 'Windows_NT') -AllowExisting $true)) {
+        Write-Fail "Failed to create venv at $VenvDir"
+        exit 1
     }
     if (-not (Test-Path $VenvPython)) {
         Write-Fail "Venv creation failed -- $VenvPython not found"
@@ -738,12 +774,44 @@ function Install-Runtime {
     Remove-ConsoleTrampolines -VenvDir $VenvDir
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    if (Get-Command uv -ErrorAction SilentlyContinue) {
-        $pkgOut = & uv pip install --python $VenvPython "$PluginDir" --quiet 2>&1
-    } else {
-        $pkgOut = & $VenvPython -m pip install --quiet "$PluginDir" 2>&1
+    # Every `[tool.uv.sources]` workspace path dep -- both the zdd
+    # canonical-on-dev / materialized-on-release reference and the other
+    # `uv`-editable canonical references (`agent-procutil`,
+    # `agent-single-instance-lease`: vendor-pointer-generalization effort,
+    # Phase 1) -- needs an explicit pre-install here: `uv` resolves
+    # `[tool.uv.sources]` fine when installing the main package directly,
+    # but the non-uv (bare `pip install`) fallback below ignores that
+    # table entirely.
+    foreach ($lib in @('zdd', 'agent-procutil', 'single-instance-lease')) {
+        $libDir = Join-Path $PluginDir "libs\$lib"
+        if (-not (Test-Path (Join-Path $libDir 'pyproject.toml'))) {
+            $libDir = Join-Path $PluginDir "..\..\libs\$lib"
+        }
+        if (Test-Path (Join-Path $libDir 'pyproject.toml')) {
+            if (Get-Command uv -ErrorAction SilentlyContinue) {
+                $libResult = Invoke-UvPipInstallResilient -UvCommand 'uv' -Arguments @('--python', $VenvPython, "$libDir", '--quiet')
+                $libOut = $libResult.Output
+                $libExit = $libResult.ExitCode
+            } else {
+                $libOut = & $VenvPython -m pip install --quiet "$libDir" 2>&1
+                $libExit = $LASTEXITCODE
+            }
+            if ($libExit -ne 0) {
+                $ErrorActionPreference = $prevEAP
+                Write-Fail "$lib library install failed"
+                if ($libOut) { Write-Host ($libOut | Out-String) }
+                exit 1
+            }
+        }
     }
-    $pkgResult = $LASTEXITCODE
+    if (Get-Command uv -ErrorAction SilentlyContinue) {
+            $pkgResultObj = Invoke-UvPipInstallResilient -UvCommand 'uv' -PayloadDirToScrub $PluginDir -Arguments @('--python', $VenvPython, '--no-deps', "$PluginDir", '--quiet')
+            $pkgOut = $pkgResultObj.Output
+        $pkgResult = $pkgResultObj.ExitCode
+    } else {
+            $pkgOut = & $VenvPython -m pip install --quiet --no-deps "$PluginDir" 2>&1
+            $pkgResult = $LASTEXITCODE
+    }
     $ErrorActionPreference = $prevEAP
     if ($pkgResult -ne 0) {
         Write-Fail "Package install failed (exit $pkgResult)"
@@ -775,8 +843,8 @@ function Install-Runtime {
 
     # Binstub + manifest resolve through the stable `.venv` link ($LinkPython /
     # $LinkDir), never a versions/<v> absolute a later `gc` could remove.
-    Write-Binstubs -PythonExe $LinkPython
-    Write-Manifest
+    Write-Binstubs
+    Write-DeployManifest -Service 'agent-vault' -Plugin 'agent-vault' -InstallPath $InstallDir -PluginPath $PluginDir -VenvPath $LinkDir -GetSourceKind ${function:Get-SourceKind} -GetGitInfo ${function:Get-GitInfo} -PayloadHash (Get-PayloadHash)
 
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
@@ -796,9 +864,9 @@ function Install-Runtime {
         Write-Warn 'Prerequisite missing: keepassxc-cli (KeePassXC). agent-vault installed, but unlocks will fail until KeePassXC is present.'
     }
 
-    $currentUserPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+    $currentUserPath = Get-CopilotPersistentEnvironmentVariable -Name 'PATH' -Target 'User'
     if (-not ($currentUserPath -split ';' | Where-Object { $_ -eq $LocalBin })) {
-        [System.Environment]::SetEnvironmentVariable('PATH', "$LocalBin;$currentUserPath", 'User')
+        Set-CopilotPersistentEnvironmentVariable -Name 'PATH' -Value "$LocalBin;$currentUserPath" -Target 'User'
         $env:PATH = "$LocalBin;$env:PATH"
         Write-Ok "PATH: Added $LocalBin to User PATH"
     }
@@ -818,24 +886,44 @@ function Register-AgentVaultTask {
         return
     }
 
-    # Launch the daemon through the RESOLVED versions/<v> slot python, not the
-    # `.venv` junction: a RedirectionGuard-enforcing task context would be blocked
-    # from *traversing* the junction (dotfiles #637), and conhost execs the target
-    # directly with no launcher script to resolve it at runtime -- so resolve the
-    # slot here via the canonical marker chain (uniform-runtime-resolution, #765):
-    # current-version -> last-known-good -> newest complete slot, so the at-logon
-    # daemon binds the same slot as the binstub. The task is re-registered every
-    # install/update and `gc` keeps the current slot, so this tracks the active
-    # version. Falls back to $LinkPython only if the resolver isn't deployed yet.
-    $_root = Split-Path $LinkDir
-    if ((Split-Path -Leaf $_root) -eq 'versions') { $_root = Split-Path $_root }
-    $taskPy = $null
-    $_resolver = Join-Path $_root 'bin\resolve-runtime.ps1'
-    if (Test-Path -LiteralPath $_resolver) { $env:AGENT_RT_ROOT = $_root; . $_resolver; $taskPy = $AgentRtPy }
-    if (-not ($taskPy -and (Test-Path -LiteralPath $taskPy))) { $taskPy = $LinkPython }
+    # #1836: the launcher itself resolves the active slot via the canonical
+    # marker chain (uniform-runtime-resolution, #765; the SAME resolve-runtime.ps1
+    # chain the binstub uses) at PROCESS START, exactly like agent-bridge's/
+    # agent-dispatch's launchers -- never a concrete versions/<v> path baked in
+    # at registration time. `.venv` itself is never traversed here (a
+    # RedirectionGuard-enforcing task context would be blocked from *traversing*
+    # the junction, dotfiles #637); $LinkPython is only the last-resort fallback
+    # for a host where the resolver hasn't been deployed yet.
+    New-Item -ItemType Directory -Force -Path $RunDir, (Join-Path $InstallDir 'logs') | Out-Null
+    $portDirective = if ($installationId) {
+        "`$env:AGENT_VAULT_PORT = '0'"
+    } else {
+        "Remove-Item Env:AGENT_VAULT_PORT -ErrorAction SilentlyContinue"
+    }
+    [System.IO.File]::WriteAllText($TaskLauncher, @"
+`$env:PYTHONUTF8 = '1'
+`$env:AGENT_VAULT_HOME = '$($InstallDir -replace "'","''")'
+`$env:AGENT_VAULT_RUN_DIR = '$($RunDir -replace "'","''")'
+`$env:AGENT_VAULT_CORE_RUN_DIR = '$((Join-Path $InstallDir 'core') -replace "'","''")'
+`$env:AGENT_VAULT_CACHE_DIR = '$((Join-Path $InstallDir 'cache') -replace "'","''")'
+`$env:AGENT_VAULT_SOCKET = '$($SocketPath -replace "'","''")'
+`$env:AGENT_VAULT_PIPE = '$($PipePath -replace "'","''")'
+`$env:AGENT_VAULT_PID = '$($PidFile -replace "'","''")'
+`$env:AGENT_VAULT_LOG = '$($LogFile -replace "'","''")'
+`$env:AGENT_VAULT_TASK_NAME = '$($TaskName -replace "'","''")'
+`$env:AGENT_VAULT_INSTALLATION_ID = '$($installationId -replace "'","''")'
+$portDirective
+`$_root = '$($InstallDir -replace "'","''")'
+`$_resolver = Join-Path `$_root 'bin\resolve-runtime.ps1'
+`$_py = `$null
+if (Test-Path -LiteralPath `$_resolver) { `$env:AGENT_RT_ROOT = `$_root; . `$_resolver; `$_py = `$AgentRtPy }
+if (-not (`$_py -and (Test-Path -LiteralPath `$_py))) { `$_py = '$($LinkPython -replace "'","''")' }
+& `$_py -m agent_vault.service --foreground --persistent
+exit `$LASTEXITCODE
+"@, $utf8NoBom)
     $action = New-ScheduledTaskAction `
         -Execute 'conhost.exe' `
-        -Argument "--headless `"$taskPy`" -m agent_vault.service --foreground --persistent" `
+        -Argument "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$TaskLauncher`"" `
         -WorkingDirectory $InstallDir
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $trigger.Delay = 'PT15S'
@@ -848,10 +936,25 @@ function Register-AgentVaultTask {
         -RestartCount 3 `
         -RestartInterval (New-TimeSpan -Minutes 1)
 
+    # Register-ONCE model (#1836), same as agent-bridge/agent-dispatch: the
+    # launcher path/working directory are stable across ordinary updates (the
+    # launcher body above is what resolves the active slot, dynamically, at
+    # every run), so a task whose Action already matches is already correct --
+    # re-registering (Set-ScheduledTask) is reserved for a genuine definition
+    # migration (e.g. an install-dir move), not every install/update.
     $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($existing) {
-        Set-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings | Out-Null
-        Write-Ok "Scheduled task updated ($TaskName, at logon, 15s delay)"
+        $existingAction = $existing.Actions | Select-Object -First 1
+        $matchesDesired = $existingAction -and
+            $existingAction.Execute -eq $action.Execute -and
+            $existingAction.Arguments -eq $action.Arguments -and
+            $existingAction.WorkingDirectory -eq $action.WorkingDirectory
+        if ($matchesDesired) {
+            Write-Ok "Scheduled task already correct ($TaskName, at logon, 15s delay) -- left registered as-is"
+        } else {
+            Set-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings | Out-Null
+            Write-Ok "Scheduled task updated ($TaskName, at logon, 15s delay)"
+        }
     } else {
         Register-ScheduledTask -TaskName $TaskName `
             -Action $action -Trigger $trigger -Settings $settings `
@@ -860,7 +963,33 @@ function Register-AgentVaultTask {
     }
 
     Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+
+    # #1836/readiness-flap: Start-ScheduledTask is fire-and-forget, and the task
+    # itself only resolves + launches the active slot -- it does not confirm the
+    # replacement daemon actually comes up. Poll the fixed endpoint so
+    # install/update never silently returns "done" while the service is still
+    # down (e.g. immediately after Stop-VaultDaemonGraceful released it, or a
+    # slow first import on a cold venv).
+    $py = if (Test-Path $LinkPython) { $LinkPython } else { $null }
+    if ($py) {
+        $ready = $false
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Milliseconds 250
+            & $py -m agent_vault.service --ping 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+        }
+        $ErrorActionPreference = $prevEAP
+        if ($ready) {
+            Write-Ok 'agent-vault service is running (post-(re)start readiness confirmed)'
+        } else {
+            Write-Fail 'agent-vault service did not become reachable within 10s after (re)start'
+            exit 1
+        }
+    }
 }
+
 
 function Invoke-Stamp {
     # Fast base install (#1393, snapshot slot model): copy the payload SOURCE into
@@ -883,6 +1012,8 @@ function Invoke-Stamp {
     Get-ChildItem -LiteralPath $PluginDir -Force | Where-Object { $exclude -notcontains $_.Name } | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $snapTmp $_.Name) -Recurse -Force
     }
+    Materialize-SnapshotLibs -SnapshotDir $snapTmp
+    Materialize-SnapshotInstallerEngine -SnapshotDir $snapTmp
     if (Test-Path $snapDir) { Remove-Item $snapDir -Recurse -Force -ErrorAction SilentlyContinue }
     Move-Item -LiteralPath $snapTmp -Destination $snapDir -Force
     [System.IO.File]::WriteAllText((Join-Path $InstallDir 'payload-dir'), $snapDir, $utf8NoBom)
@@ -923,8 +1054,31 @@ function Stop-VaultDaemonGraceful {
         & $py -m agent_vault.service --ping 2>$null | Out-Null
         if ($LASTEXITCODE -ne 0) { break }
     }
+    $stillRunning = ($LASTEXITCODE -eq 0)
+    if ($stillRunning) {
+        # The graceful `--stop` request did not retire the process within the
+        # drain window (observed in practice: an asyncio shutdown race can leave
+        # the old daemon's OS process alive even after it stops answering as the
+        # advertised endpoint). Force-retire it by PID from the run-dir marker so
+        # a stuck predecessor never lingers to contend for the fixed endpoint
+        # with the daemon this update starts next -- otherwise repeated updates
+        # accumulate zombie processes that intermittently win the port/pipe bind
+        # race and make readiness flap.
+        $oldPid = $null
+        if (Test-Path $PidFile) {
+            $oldPid = (Get-Content -LiteralPath $PidFile -Raw -ErrorAction SilentlyContinue).Trim()
+        }
+        if ($oldPid -match '^\d+$' -and (Get-Process -Id ([int]$oldPid) -ErrorAction SilentlyContinue)) {
+            Stop-Process -Id ([int]$oldPid) -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 250
+            Write-Warn "Old vault daemon (PID $oldPid) did not retire gracefully within 5s -- force-stopped"
+        } else {
+            Write-Warn 'Old vault daemon did not retire gracefully within 5s, and its PID could not be confirmed for a force-stop'
+        }
+    } else {
+        Write-Ok 'Old vault daemon drained + stopped (in-flight request finished; endpoint released for the new build)'
+    }
     $ErrorActionPreference = $prevEAP
-    Write-Ok 'Old vault daemon drained + stopped (in-flight request finished; endpoint released for the new build)'
     return $true
 }
 
@@ -954,12 +1108,23 @@ function Invoke-Update {
 
 function Invoke-Start {
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if (-not $task) {
-        Write-Fail "No AgentVault task installed -- run: install.ps1 -Action install"
+    if ($task) {
+        Start-ScheduledTask -TaskName $TaskName
+        Write-Ok 'agent-vault service started (Scheduled Task)'
+        return
+    }
+    # #1836: `start` must not depend on a registered Scheduled Task (a
+    # client-only -NoService host, or the ScheduledTasks module being
+    # unavailable, must still be able to start the daemon). Converge on the
+    # SAME idempotent, health-gated user-mode ensure path the CLI's own
+    # `agent-vault start` uses (cmd_start -> ensure_service/start_service in
+    # cli.py) -- no PowerShell-side process-spawning logic duplicated here.
+    if (-not (Test-Path $LinkPython)) {
+        Write-Fail "agent-vault runtime not installed -- run: install.ps1 -Action install"
         exit 1
     }
-    Start-ScheduledTask -TaskName $TaskName
-    Write-Ok 'agent-vault service started'
+    & $LinkPython -m agent_vault start
+    exit $LASTEXITCODE
 }
 
 function Invoke-Stop {
@@ -1013,34 +1178,59 @@ function Invoke-Status {
 }
 
 function Invoke-Uninstall {
-    Write-Host ''; Write-Host '=== agent-vault uninstall ===' -ForegroundColor Cyan; Write-Host ''
-    Invoke-Stop
+    Write-Host ''; Write-Host '=== agent-vault uninstall ===' -ForegroundColor Cyan
+    if ($DryRun) { Write-Host '(dry run -- nothing will be changed)' -ForegroundColor Yellow }
+    Write-Host ''
+    if ($DryRun) {
+        Write-Host '[dry-run] would stop agent-vault'
+    } else {
+        Invoke-Stop
+    }
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-        Write-Ok 'Scheduled task removed'
+        if ($DryRun) {
+            Write-Host "[dry-run] would remove scheduled task: $TaskName"
+        } else {
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Ok 'Scheduled task removed'
+        }
     }
     foreach ($stub in @($BinstubPs1, $BinstubCmd)) {
         if (Test-Path $stub) {
-            Remove-Item $stub -Force -ErrorAction SilentlyContinue
-            Write-Ok "Binstub removed: $stub"
+            if ($DryRun) {
+                Write-Host "[dry-run] would remove binstub: $stub"
+            } else {
+                Remove-Item $stub -Force -ErrorAction SilentlyContinue
+                Write-Ok "Binstub removed: $stub"
+            }
         }
     }
     if ($Purge) {
-        if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
-        Write-Ok "Runtime purged: $InstallDir"
+        if (Test-Path $InstallDir) {
+            if ($DryRun) { Write-Host "[dry-run] would PURGE: $InstallDir" }
+            else { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue; Write-Ok "Runtime purged: $InstallDir" }
+        }
     } else {
         # Remove the runtime venv. In the versioned layout this is the `.venv`
         # link AND the whole versions/ tree; otherwise the single real venv dir.
         if ($VersionedRuntime) {
-            if (Test-VenvIsLink $LinkDir) { & cmd /c rmdir "$LinkDir" 2>$null }
-            elseif (Test-Path $LinkDir) { Remove-Item -Recurse -Force $LinkDir -ErrorAction SilentlyContinue }
-            $verRoot = Join-Path $InstallDir 'versions'
-            if (Test-Path $verRoot) { Remove-Item -Recurse -Force $verRoot -ErrorAction SilentlyContinue }
+            if ($DryRun) {
+                if ((Test-VenvIsLink $LinkDir) -or (Test-Path $LinkDir)) { Write-Host "[dry-run] would remove: $LinkDir" }
+                $verRoot = Join-Path $InstallDir 'versions'
+                if (Test-Path $verRoot) { Write-Host "[dry-run] would remove: $verRoot" }
+            } else {
+                if (Test-VenvIsLink $LinkDir) { & cmd /c rmdir "$LinkDir" 2>$null }
+                elseif (Test-Path $LinkDir) { Remove-Item -Recurse -Force $LinkDir -ErrorAction SilentlyContinue }
+                $verRoot = Join-Path $InstallDir 'versions'
+                if (Test-Path $verRoot) { Remove-Item -Recurse -Force $verRoot -ErrorAction SilentlyContinue }
+            }
         } elseif (Test-Path $VenvDir) {
-            Remove-Item -Recurse -Force $VenvDir -ErrorAction SilentlyContinue
+            if ($DryRun) { Write-Host "[dry-run] would remove venv: $VenvDir" }
+            else { Remove-Item -Recurse -Force $VenvDir -ErrorAction SilentlyContinue }
         }
-        Write-Ok 'Venv removed (state kept; -Purge to delete)'
+        if ($DryRun) { Write-Host "[dry-run] state at $InstallDir would be kept (-Purge to delete)" }
+        else { Write-Ok 'Venv removed (state kept; -Purge to delete)' }
     }
+    if ($DryRun) { Write-Host 'agent-vault uninstall dry run complete -- nothing was changed' -ForegroundColor Yellow }
 }
 
 switch ($Action) {

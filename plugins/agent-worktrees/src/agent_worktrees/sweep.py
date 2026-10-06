@@ -28,7 +28,7 @@ from agent_procutil import no_window_flags
 
 from . import claimant as _claimant
 from . import config as cfg
-from . import git_ops, obligations, tracking
+from . import git_ops, obligations, tracking, tracking_claims
 
 log = logging.getLogger(__name__)
 
@@ -38,8 +38,17 @@ log = logging.getLogger(__name__)
 #: mirror generically -- it never learns any single resource plugin's internals,
 #: only the shared obligation vocabulary + the lease store. agent-codespaces
 #: populates it for ``codespace`` (at clean disconnect -> ``at-rest``, at release
-#: -> ``released``); ``container`` is reserved for agent-containers.
-_LEASEABLE_KINDS: frozenset[str] = frozenset({"codespace", "container"})
+#: -> ``released``); ``container`` is reserved for agent-containers. ``task``
+#: (ThomasMichon/copilot-extensions#2584) is populated by
+#: ``agent_dispatch.hibernation_claims`` via :mod:`task_claim_registry`'s 4-tier
+#: origin chain rather than :mod:`lease_config`'s stricter bound-knowledge-repo-
+#: only policy -- see :func:`lease_disposition_of`.
+_LEASEABLE_KINDS: frozenset[str] = frozenset({"codespace", "container", "task"})
+
+#: Kinds within :data:`_LEASEABLE_KINDS` that resolve their lease origin through
+#: :mod:`task_claim_registry`'s 4-tier chain instead of the default
+#: :func:`lease_config.load_lease_settings` (bound-knowledge-repo-only).
+_EXTERNALLY_DISCOVERABLE_KINDS: frozenset[str] = frozenset({"task"})
 
 #: A full GitHub PR URL, e.g. ``https://github.com/owner/repo/pull/123``.
 _GH_PR_URL = re.compile(
@@ -210,10 +219,20 @@ def lease_disposition_of(
     failure, or any error -> ``None`` (spare; the sweep never abandons on an
     unreadable mirror). A present lease with no/``active`` disposition normalizes
     to ``active`` -> also spare.
+
+    ``kind`` in :data:`_EXTERNALLY_DISCOVERABLE_KINDS` (``task``) resolves its
+    lease origin through :mod:`task_claim_registry`'s 4-tier chain instead of
+    the default bound-knowledge-repo-only :func:`lease_config.load_lease_settings`
+    -- see that module's docstring (ThomasMichon/copilot-extensions#2584).
     """
     try:
-        from . import lease_config, lease_store
-        settings = lease_config.load_lease_settings()
+        from . import lease_store
+        if kind in _EXTERNALLY_DISCOVERABLE_KINDS:
+            from . import task_claim_registry
+            settings = task_claim_registry.load_task_claim_settings()
+        else:
+            from . import lease_config
+            settings = lease_config.load_lease_settings()
         snapshot = lease_store.GitLeaseStore(settings).inspect(kind, ref)
     except Exception as exc:  # unconfigured / network / protocol -> spare
         log.debug("lease disposition read for %s/%s degraded: %s", kind, ref, exc)
@@ -254,6 +273,13 @@ def _github_pr_view_args(ref: str) -> list[str] | None:
     ambiguous without a repo).
     """
     ref = (ref or "").strip()
+    # Reached only via pr_merged/claim_gone/claim_safe's dispatch, keyed
+    # exclusively on kind="pr" -- restrict to that exact kind, not the
+    # broader PR_LIKE_KINDS, so a mismatched bug/issue-kind canonical ref
+    # can never be silently accepted/queried as a PR target here.
+    ref = tracking_claims.decanonicalize_ref(
+        ref, expected_kinds=frozenset({"pr"}),
+    )
     m = _GH_PR_URL.match(ref)
     if m:
         return [ref]
@@ -307,6 +333,13 @@ def _ado_pr_view_args(ref: str) -> list[str] | None:
     any other shape yields ``None`` (spare).
     """
     ref = (ref or "").strip()
+    # Reached only via pr_merged/claim_gone/claim_safe's dispatch, keyed
+    # exclusively on kind="pr" -- restrict to that exact kind, not the
+    # broader PR_LIKE_KINDS, so a mismatched bug/issue-kind canonical ref
+    # can never be silently accepted/queried as a PR target here.
+    ref = tracking_claims.decanonicalize_ref(
+        ref, expected_kinds=frozenset({"pr"}),
+    )
     m = _ADO_PR_VSTS.match(ref)
     if m:
         return ["--id", m.group(2), "--org", f"https://{m.group(1)}/"]
@@ -375,6 +408,33 @@ def pr_merged(ref: str) -> bool | None:
     return None
 
 
+def session_claim_gone(claim: tracking.ResourceClaim, config: cfg.Config) -> bool | None:
+    """Is a ``kind="session"`` claim's own Copilot session **provably gone**?
+
+    A session claim's ref is self-referential (``format_claim_ref(machine,
+    project, worktree_id, session=session_id)`` names the SAME worktree that
+    holds the claim, not a child) so :func:`load_claim_child_record` resolves
+    it correctly with no special-casing. Corroborated against a real PID
+    check for that SPECIFIC session id (:func:`sessions.session_id_is_live`,
+    factored out of ``worktree_session_lock_state``'s "any session" check) --
+    never inferred from staleness/timestamps alone -- so a crashed/killed
+    session cannot wedge finalize forever, matching the invariant every other
+    claim kind already gets from this sweep. Cross-machine (or otherwise
+    unresolvable) is ``None`` (spare); the record itself being gone entirely
+    is a stronger, positive "gone" signal than any per-session PID check.
+    """
+    parsed = tracking.parse_claim_ref(claim.ref)
+    if parsed is None or not parsed.session:
+        return None
+    record, judgeable = load_claim_child_record(claim.ref, config)
+    if not judgeable:
+        return None
+    if record is None:
+        return True
+    from . import sessions
+    return not sessions.session_id_is_live(record, parsed.session)
+
+
 def claim_gone(claim: tracking.ResourceClaim, config: cfg.Config) -> bool | None:
     """Tri-state **gone** verdict, dispatched by claim kind.
 
@@ -382,7 +442,9 @@ def claim_gone(claim: tracking.ResourceClaim, config: cfg.Config) -> bool | None
     (:func:`gone_of`). A leaseable kind (codespace/container) is *gone* when its
     lease mirror shows the obligation settled (:func:`leaseable_settled`). A
     ``pr`` claim is *gone* when its PR (GitHub **or** ADO) is provably merged
-    (:func:`pr_merged`). Every other kind is ``None`` (spare).
+    (:func:`pr_merged`). A ``session`` claim is *gone* when its own Copilot
+    process is confirmed dead (:func:`session_claim_gone`). Every other kind
+    is ``None`` (spare).
     """
     if claim.kind == "worktree":
         return gone_of(claim.ref)
@@ -390,6 +452,8 @@ def claim_gone(claim: tracking.ResourceClaim, config: cfg.Config) -> bool | None
         return leaseable_settled(claim, config)
     if claim.kind == "pr":
         return pr_merged(claim.ref)
+    if claim.kind == "session":
+        return session_claim_gone(claim, config)
     return None
 
 
@@ -399,7 +463,12 @@ def claim_safe(claim: tracking.ResourceClaim, config: cfg.Config) -> bool | None
     A ``worktree`` claim proves safety from the child's record/branch
     (:func:`safe_of`). A leaseable kind proves it from the lease's settled
     disposition mirror (:func:`leaseable_settled`). A ``pr`` claim proves it from
-    a provably-merged PR (:func:`pr_merged`). Every other kind is ``None``.
+    a provably-merged PR (:func:`pr_merged`). A ``session`` claim carries no
+    separate at-risk payload of its own -- any uncommitted work the session
+    left behind is exactly what the descriptor's own dirtiness/open-claims
+    facts already surface independently -- so its ``safe`` verdict mirrors
+    :func:`session_claim_gone`'s own verdict (gone implies safe) rather than
+    running a second, separate probe. Every other kind is ``None``.
     """
     if claim.kind == "worktree":
         return safe_of(claim, config)
@@ -407,6 +476,8 @@ def claim_safe(claim: tracking.ResourceClaim, config: cfg.Config) -> bool | None
         return leaseable_settled(claim, config)
     if claim.kind == "pr":
         return pr_merged(claim.ref)
+    if claim.kind == "session":
+        return session_claim_gone(claim, config)
     return None
 
 
@@ -433,9 +504,11 @@ def self_heal(
 
     The never-wedge sweep applied to a single owner -- used by finalize's
     obligation gate to self-heal against a crashed/missed settlement before it
-    would block. Returns the claims it flipped to ``abandoned`` (empty on a
-    no-op). Conservative: only definitive gone-AND-safe claims flip; unknown is
-    spare.
+    would block. Returns the claims it flipped to ``abandoned`` (or, for a
+    ``pr``-kind claim whose PR is provably merged, ``released`` -- a clean
+    completion, not a reclaim; see `tracking_claims.sweep_abandoned_obligations`).
+    Empty on a no-op. Conservative: only definitive gone-AND-safe claims flip;
+    unknown is spare.
     """
     g, s = make_resolvers(config)
     return tracking.sweep_abandoned_obligations(

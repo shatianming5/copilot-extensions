@@ -30,7 +30,21 @@ def _make_source(root: Path) -> Path:
     (sess / "events.jsonl").write_text('{"ts": 1}\n', encoding="utf-8")
     (sess / "workspace.yaml").write_text("id: abc-123\n", encoding="utf-8")
     (sess / ".lock").write_text("pid", encoding="utf-8")  # should be excluded
+    (sess / "LOCK").write_text("volatile", encoding="utf-8")
     return src
+
+
+def _add_chromium_profile(session: Path, name: str = "browser-run") -> Path:
+    profile = session / "files" / "tool-output" / name
+    default = profile / "Default"
+    network = default / "Network"
+    network.mkdir(parents=True)
+    (profile / "Local State").write_text("{}", encoding="utf-8")
+    (default / "Preferences").write_text("{}", encoding="utf-8")
+    (network / "Cookies").write_bytes(b"cookies")
+    (profile / "component_crx_cache").mkdir()
+    (profile / "component_crx_cache" / "large").write_bytes(b"x" * 1024)
+    return profile
 
 
 def test_registry_names_and_classes() -> None:
@@ -49,16 +63,396 @@ def test_build_target_unknown_raises() -> None:
 
 def test_local_target_push_excludes_lock_and_writes_meta(tmp_path: Path) -> None:
     src = _make_source(tmp_path)
+    projection = src / "session-state" / "abc-123" / "agent-worktrees.json"
+    projection.write_bytes(b"{opaque-future-or-malformed-projection")
+    (src / "session-state" / "abc-123" / "review-annotations.json.lock").write_text("1")
+    (src / "session-state" / "abc-123" / "review-annotations.json.abc123.tmp").write_text("[]")
+    (src / "session-state" / "abc-123" / "inuse.4242.hold").write_bytes(b"")
+    (src / "session-state" / "abc-123" / "inuse.4242.lock").write_text("4242")
     dest_root = tmp_path / "dest"
     target = LocalTarget({"path": str(dest_root)})
 
     result = target.push(src, "m1")
     assert result.ok
-    assert result.file_count == 2  # events.jsonl + workspace.yaml, not .lock
+    assert result.file_count == 3
     machine_dir = dest_root / "m1"
     assert (machine_dir / "session-state" / "abc-123" / "events.jsonl").is_file()
+    assert (
+        machine_dir / "session-state" / "abc-123" / "agent-worktrees.json"
+    ).read_bytes() == projection.read_bytes()
     assert not (machine_dir / "session-state" / "abc-123" / ".lock").exists()
+    assert not (machine_dir / "session-state" / "abc-123" / "LOCK").exists()
+    assert not (
+        machine_dir / "session-state" / "abc-123" / "review-annotations.json.lock"
+    ).exists()
+    assert not (
+        machine_dir / "session-state" / "abc-123" / "review-annotations.json.abc123.tmp"
+    ).exists()
+    assert not (
+        machine_dir / "session-state" / "abc-123" / "inuse.4242.hold"
+    ).exists()
+    assert not (
+        machine_dir / "session-state" / "abc-123" / "inuse.4242.lock"
+    ).exists()
     assert (machine_dir / "sync-meta.json").is_file()
+
+
+def test_local_target_push_excludes_hold_marker_without_opening_it(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Regression test for a live Copilot session's ``inuse.<pid>.hold`` marker.
+
+    Unlike a locked browser database (a Windows sharing violation, deferred as
+    a retryable partial), a ``.hold`` marker can raise a plain
+    ``PermissionError`` with no ``winerror`` at all -- previously unrecognized
+    by ``_is_windows_sharing_violation`` and left to abort the entire push
+    rather than being skipped. It must never even be opened.
+    """
+    from agent_logger.sync.targets import filesystem
+
+    src = _make_source(tmp_path)
+    (src / "session-state" / "abc-123" / "inuse.4242.hold").write_bytes(b"")
+    original = filesystem.open_regular_no_follow
+
+    def fail_if_opened(source: Path):
+        if source.name == "inuse.4242.hold":
+            raise PermissionError(13, "Permission denied", str(source))
+        return original(source)
+
+    monkeypatch.setattr(filesystem, "open_regular_no_follow", fail_if_opened)
+    target = LocalTarget({"path": str(tmp_path / "dest")})
+
+    result = target.push(src, "m1")
+
+    assert result.ok, result.detail
+    assert not (
+        tmp_path / "dest" / "m1" / "session-state" / "abc-123" / "inuse.4242.hold"
+    ).exists()
+
+
+
+def test_local_target_excludes_and_removes_chromium_profile(
+    tmp_path: Path,
+) -> None:
+    src = _make_source(tmp_path)
+    session = src / "session-state" / "abc-123"
+    profile = _add_chromium_profile(session)
+    lookalike = session / "files" / "lookalike"
+    (lookalike / "Default").mkdir(parents=True)
+    (lookalike / "Local State").write_text("keep", encoding="utf-8")
+    dest_root = tmp_path / "dest"
+    stale_profile = (
+        dest_root
+        / "m1"
+        / profile.relative_to(src)
+    )
+    stale_profile.mkdir(parents=True)
+    (stale_profile / "stale.bin").write_bytes(b"stale")
+
+    result = LocalTarget({"path": str(dest_root)}).push(src, "m1")
+
+    assert result.ok
+    assert result.excluded_file_count == 4
+    assert result.excluded_byte_count == 1035
+    assert result.excluded_roots == (
+        str(profile.relative_to(src)),
+    )
+    machine = dest_root / "m1"
+    assert not (machine / profile.relative_to(src)).exists()
+    assert (
+        machine / lookalike.relative_to(src) / "Local State"
+    ).read_text(encoding="utf-8") == "keep"
+    metadata = json.loads((machine / "sync-meta.json").read_text())
+    assert metadata["excluded_detritus_root_count"] == 1
+    assert metadata["excluded_detritus_file_count"] == 4
+    assert metadata["excluded_detritus_byte_count"] == 1035
+    assert metadata["excluded_detritus_measurement_complete"] is True
+    assert metadata["excluded_detritus_roots"] == [
+        str(profile.relative_to(src))
+    ]
+
+
+def test_local_target_removes_destination_only_chromium_profile(
+    tmp_path: Path,
+) -> None:
+    src = _make_source(tmp_path)
+    dest_root = tmp_path / "dest"
+    destination_session = dest_root / "m1" / "session-state" / "old"
+    profile = _add_chromium_profile(destination_session)
+
+    result = LocalTarget({"path": str(dest_root)}).push(src, "m1")
+
+    assert result.ok
+    assert not profile.exists()
+    assert (src / "session-state" / "abc-123" / "events.jsonl").is_file()
+
+
+def test_chromium_signature_requires_expected_names_and_types(
+    tmp_path: Path,
+) -> None:
+    src = _make_source(tmp_path)
+    files = src / "session-state" / "abc-123" / "files"
+    bad_name = files / "bad-name"
+    (bad_name / "Profile backup" / "Network").mkdir(parents=True)
+    (bad_name / "Local State").write_text("keep", encoding="utf-8")
+    (bad_name / "Profile backup" / "Preferences").write_text(
+        "keep",
+        encoding="utf-8",
+    )
+    bad_types = files / "bad-types"
+    (bad_types / "Local State").mkdir(parents=True)
+    (bad_types / "Default" / "Preferences").mkdir(parents=True)
+    (bad_types / "Default" / "Network").write_text("keep", encoding="utf-8")
+    dest_root = tmp_path / "dest"
+
+    result = LocalTarget({"path": str(dest_root)}).push(src, "m1")
+
+    assert result.ok
+    published = dest_root / "m1" / "session-state" / "abc-123" / "files"
+    assert (published / "bad-name" / "Local State").is_file()
+    assert (published / "bad-types" / "Default" / "Network").is_file()
+    assert result.excluded_roots == ()
+
+
+def test_local_target_excludes_venv_git_clone_and_node_modules(
+    tmp_path: Path,
+) -> None:
+    src = _make_source(tmp_path)
+    session = src / "session-state" / "abc-123"
+    files = session / "files"
+
+    venv = files / "install-probe"
+    certifi = venv / "Lib" / "site-packages" / "pip" / "_vendor" / "certifi"
+    certifi.mkdir(parents=True)
+    (certifi / "cacert.pem").write_bytes(b"-----BEGIN CERTIFICATE-----")
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+
+    clone = files / "harness-clone"
+    (clone / ".git").mkdir(parents=True)
+    (clone / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (clone / "README.md").write_text("hello\n", encoding="utf-8")
+
+    modules = files / "tool" / "node_modules"
+    pkg = modules / "left-pad"
+    pkg.mkdir(parents=True)
+    (pkg / "index.js").write_text("module.exports = {}\n", encoding="utf-8")
+
+    dest_root = tmp_path / "dest"
+
+    result = LocalTarget({"path": str(dest_root)}).push(src, "m1")
+
+    assert result.ok
+    published = dest_root / "m1" / "session-state" / "abc-123" / "files"
+    assert not (published / "install-probe").exists()
+    assert not (published / "harness-clone").exists()
+    assert not (published / "tool" / "node_modules").exists()
+    assert set(result.excluded_roots) == {
+        str(Path("session-state/abc-123/files/install-probe")),
+        str(Path("session-state/abc-123/files/harness-clone")),
+        str(Path("session-state/abc-123/files/tool/node_modules")),
+    }
+
+
+def test_detritus_measurement_race_does_not_block_exclusion(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync import detritus
+
+    src = _make_source(tmp_path)
+    session = src / "session-state" / "abc-123"
+    profile = _add_chromium_profile(session)
+    real_scan = detritus._scan_entries
+
+    def fail_cache(path: Path):
+        if path.name == "component_crx_cache":
+            raise FileNotFoundError(path)
+        return real_scan(path)
+
+    monkeypatch.setattr(detritus, "_scan_entries", fail_cache)
+    dest_root = tmp_path / "dest"
+
+    result = LocalTarget({"path": str(dest_root)}).push(src, "m1")
+
+    assert result.ok
+    assert result.excluded_roots == (str(profile.relative_to(src)),)
+    assert result.excluded_measurement_complete is False
+    assert not (dest_root / "m1" / profile.relative_to(src)).exists()
+
+
+def test_new_detritus_during_copy_is_removed_and_retried(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync import detritus
+    from agent_logger.sync.targets import filesystem
+
+    src = _make_source(tmp_path)
+    session = src / "session-state" / "abc-123"
+    profile = _add_chromium_profile(session)
+    actual = detritus.discover_session_detritus(src, None)
+    calls = 0
+
+    def discover(_source: Path, _included):
+        nonlocal calls
+        calls += 1
+        return detritus.DetritusSummary() if calls == 1 else actual
+
+    monkeypatch.setattr(filesystem, "discover_session_detritus", discover)
+    dest_root = tmp_path / "dest"
+
+    result = LocalTarget({"path": str(dest_root)}).push(src, "m1")
+
+    assert not result.ok
+    assert "changed during publication" in result.detail
+    assert not (dest_root / "m1" / profile.relative_to(src)).exists()
+
+
+def test_detritus_cleanup_rejects_symlinked_destination_ancestor(
+    tmp_path: Path,
+) -> None:
+    src = _make_source(tmp_path)
+    session = src / "session-state" / "abc-123"
+    profile = _add_chromium_profile(session)
+    dest_root = tmp_path / "dest"
+    outside = tmp_path / "outside"
+    outside_profile = outside / profile.name
+    outside_profile.mkdir(parents=True)
+    marker = outside_profile / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    linked_parent = (
+        dest_root
+        / "m1"
+        / "session-state"
+        / "abc-123"
+        / "files"
+        / "tool-output"
+    )
+    linked_parent.parent.mkdir(parents=True)
+    try:
+        linked_parent.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink creation is unavailable")
+
+    result = LocalTarget({"path": str(dest_root)}).push(src, "m1")
+
+    assert not result.ok
+    assert "detritus cleanup failed" in result.detail
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_selected_session_replacement_removes_chromium_profile(
+    tmp_path: Path,
+) -> None:
+    src = _make_source(tmp_path)
+    session = src / "session-state" / "abc-123"
+    profile = _add_chromium_profile(session)
+    dest_root = tmp_path / "dest"
+    destination_profile = dest_root / "m1" / profile.relative_to(src)
+    destination_profile.mkdir(parents=True)
+    (destination_profile / "stale.bin").write_bytes(b"stale")
+
+    result = LocalTarget({"path": str(dest_root)}).push(
+        src,
+        "m1",
+        {"abc-123"},
+    )
+
+    assert result.ok
+    assert not destination_profile.exists()
+    assert (
+        dest_root / "m1" / "session-state" / "abc-123" / "events.jsonl"
+    ).is_file()
+
+
+def test_selected_session_retries_when_detritus_appears(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync import detritus
+    from agent_logger.sync.targets import filesystem
+
+    src = _make_source(tmp_path)
+    session = src / "session-state" / "abc-123"
+    profile = _add_chromium_profile(session)
+    actual = detritus.discover_session_detritus(src, {"abc-123"})
+    calls = 0
+
+    def discover(_source: Path, _included):
+        nonlocal calls
+        calls += 1
+        return detritus.DetritusSummary() if calls == 1 else actual
+
+    monkeypatch.setattr(filesystem, "discover_session_detritus", discover)
+    dest_root = tmp_path / "dest"
+
+    result = LocalTarget({"path": str(dest_root)}).push(
+        src,
+        "m1",
+        {"abc-123"},
+    )
+
+    assert result.ok, result.detail
+    assert not (dest_root / "m1" / profile.relative_to(src)).exists()
+    assert calls >= 3
+
+
+def test_selected_session_migrates_legacy_rescue_snapshot_detritus(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync import detritus, provenance
+    from agent_logger.sync.targets import filesystem
+
+    src = _make_source(tmp_path)
+    session = src / "session-state" / "abc-123"
+    profile = _add_chromium_profile(session)
+    provenance_dir = src / "provenance"
+    provenance_dir.mkdir()
+    (provenance_dir / "abc-123.json").write_text(
+        json.dumps(
+            {
+                "provider": "agent-containers",
+                "session_id": "abc-123",
+                "capture_id": "capture-1",
+                "captured_at": "2026-09-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    dest_root = tmp_path / "dest"
+    real_discover = filesystem.discover_session_detritus
+    monkeypatch.setattr(
+        filesystem,
+        "discover_session_detritus",
+        lambda _source, _included: detritus.DetritusSummary(),
+    )
+    first = LocalTarget({"path": str(dest_root)}).push(
+        src,
+        "m1",
+        {"abc-123"},
+    )
+    assert first.ok
+    snapshot = provenance.rescue_snapshot_path(
+        dest_root / "m1",
+        "abc-123",
+        "capture-1",
+    )
+    snapshot_profile = snapshot / profile.relative_to(session)
+    assert os.path.isdir(provenance._windows_extended_path(snapshot_profile))
+
+    monkeypatch.setattr(filesystem, "discover_session_detritus", real_discover)
+    second = LocalTarget({"path": str(dest_root)}).push(
+        src,
+        "m1",
+        {"abc-123"},
+    )
+
+    assert second.ok, second.detail
+    assert not os.path.exists(provenance._windows_extended_path(snapshot_profile))
+    assert os.path.isfile(
+        provenance._windows_extended_path(snapshot / "events.jsonl")
+    )
 
 
 def test_local_target_push_is_incremental(tmp_path: Path) -> None:
@@ -69,6 +463,206 @@ def test_local_target_push_is_incremental(tmp_path: Path) -> None:
     second = target.push(src, "m1")
     assert second.ok
     assert second.file_count == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing violation behavior")
+def test_local_target_push_defers_locked_files(monkeypatch, tmp_path: Path) -> None:
+    from agent_logger.sync.targets import filesystem
+
+    src = _make_source(tmp_path)
+    target = LocalTarget({"path": str(tmp_path / "dest")})
+    original = filesystem.open_regular_no_follow
+
+    def open_unless_locked(source: Path):
+        if source.name == "events.jsonl":
+            raise PermissionError(
+                13,
+                "The process cannot access the file",
+                str(source),
+                32,
+            )
+        return original(source)
+
+    monkeypatch.setattr(filesystem, "open_regular_no_follow", open_unless_locked)
+
+    result = target.push(src, "m1")
+
+    machine_dir = tmp_path / "dest" / "m1"
+    assert result.ok
+    assert "skipped 1 locked file(s), will retry" in result.detail
+    assert not (
+        machine_dir / "session-state" / "abc-123" / "events.jsonl"
+    ).exists()
+    assert (
+        machine_dir / "session-state" / "abc-123" / "workspace.yaml"
+    ).is_file()
+    metadata = json.loads((machine_dir / "sync-meta.json").read_text())
+    assert metadata["status"] == "partial"
+    assert metadata["deferred_file_count"] == 1
+    assert metadata["deferred_files"] == [
+        str(Path("session-state") / "abc-123" / "events.jsonl")
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing violation behavior")
+def test_windows_sharing_violation_accepts_plain_oserror() -> None:
+    from agent_logger.sync.targets import filesystem
+
+    error = OSError("sharing violation")
+    error.winerror = 32
+
+    assert filesystem._is_windows_sharing_violation(error)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path namespace behavior")
+def test_windows_extended_path_formats_drive_and_unc_paths() -> None:
+    from agent_logger.sync import provenance
+
+    drive = Path(r"C:\example\session.json")
+    unc = Path(r"\\server\share\session.json")
+    extended = Path(r"\\?\C:\example\session.json")
+
+    assert provenance.windows_extended_path(drive) == (
+        r"\\?\C:\example\session.json"
+    )
+    assert provenance.windows_extended_path(unc) == (
+        r"\\?\UNC\server\share\session.json"
+    )
+    assert provenance.windows_extended_path(extended) == str(extended)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows MAX_PATH regression")
+def test_local_target_push_handles_long_temporary_path(tmp_path: Path) -> None:
+    src = _make_source(tmp_path)
+    dest_root = tmp_path / ("d" * 48)
+    source_parent = src / "session-state" / "abc-123" / "files"
+    destination_parent = (
+        dest_root / "m1" / "session-state" / "abc-123" / "files"
+    )
+    destination = destination_parent / "description"
+    legacy_temporary = destination.with_name(
+        f".{destination.name}.{'f' * 32}.tmp"
+    )
+    if len(str(destination)) >= 260:
+        pytest.skip("temporary test root already exceeds MAX_PATH")
+    while len(str(legacy_temporary)) < 260:
+        source_parent /= "x"
+        destination_parent /= "x"
+        destination = destination_parent / "description"
+        legacy_temporary = destination.with_name(
+            f".{destination.name}.{'f' * 32}.tmp"
+        )
+
+    assert len(str(destination)) < 260
+    assert len(str(legacy_temporary)) >= 260
+    source_parent.mkdir(parents=True)
+    (source_parent / "description").write_text("long path", encoding="utf-8")
+
+    result = LocalTarget({"path": str(dest_root)}).push(src, "m1")
+
+    assert result.ok, result.detail
+    assert destination.read_text(encoding="utf-8") == "long path"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows MAX_PATH regression")
+def test_local_target_push_handles_long_source_and_destination_paths(
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync import provenance
+
+    src = _make_source(tmp_path)
+    dest_root = tmp_path / ("d" * 48)
+    source_parent = src / "session-state" / "abc-123" / "files"
+    destination_parent = (
+        dest_root / "m1" / "session-state" / "abc-123" / "files"
+    )
+    while len(str(source_parent)) < 260:
+        source_parent /= "x"
+        destination_parent /= "x"
+
+    source = source_parent / "events.jsonl"
+    destination = destination_parent / "events.jsonl"
+    os.makedirs(provenance._windows_extended_path(source_parent), exist_ok=True)
+    with open(
+        provenance._windows_extended_path(source),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        f.write("long paths")
+
+    result = LocalTarget({"path": str(dest_root)}).push(src, "m1")
+
+    assert result.ok, result.detail
+    with open(provenance._windows_extended_path(destination), encoding="utf-8") as f:
+        assert f.read() == "long paths"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows MAX_PATH regression")
+def test_filtered_push_handles_long_source_and_staging_paths(
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync import provenance
+
+    src = _make_source(tmp_path)
+    dest_root = tmp_path / ("d" * 48)
+    source_parent = src / "session-state" / "abc-123" / "files"
+    destination_parent = (
+        dest_root / "m1" / "session-state" / "abc-123" / "files"
+    )
+    while len(str(source_parent)) < 260:
+        source_parent /= "x"
+        destination_parent /= "x"
+
+    source = source_parent / "events.jsonl"
+    destination = destination_parent / "events.jsonl"
+    os.makedirs(provenance._windows_extended_path(source_parent), exist_ok=True)
+    with open(
+        provenance._windows_extended_path(source),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        f.write("selected long paths")
+    provenance_dir = src / "provenance"
+    provenance_dir.mkdir()
+    source_provenance = provenance_dir / "abc-123.json"
+    source_provenance.write_text(
+        json.dumps(
+            {
+                "provider": "agent-containers",
+                "session_id": "abc-123",
+                "capture_id": "capture-1",
+                "captured_at": "2026-09-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = LocalTarget({"path": str(dest_root)}).push(
+        src,
+        "m1",
+        {"abc-123"},
+    )
+
+    assert result.ok, result.detail
+    with open(provenance._windows_extended_path(destination), encoding="utf-8") as f:
+        assert f.read() == "selected long paths"
+    snapshot = provenance.rescue_snapshot_path(
+        dest_root / "m1",
+        "abc-123",
+        "capture-1",
+    )
+    snapshot_file = snapshot / destination.relative_to(
+        dest_root / "m1" / "session-state" / "abc-123"
+    )
+    with open(
+        provenance._windows_extended_path(snapshot_file),
+        encoding="utf-8",
+    ) as f:
+        assert f.read() == "selected long paths"
+    assert result.file_count == 8
+    assert not (
+        dest_root / "m1" / ".session-sync-replacement"
+    ).exists()
 
 
 def test_filtered_local_target_push_is_incremental(tmp_path: Path) -> None:
@@ -207,6 +801,30 @@ def test_recursive_cleanup_refuses_link(tmp_path: Path) -> None:
     with pytest.raises(OSError, match="reparse point"):
         filesystem._remove_path_checked(linked)
     assert (outside / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows read-only directory behavior")
+def test_recursive_cleanup_removes_read_only_directories(tmp_path: Path) -> None:
+    import ctypes
+
+    from agent_logger.sync import provenance
+    from agent_logger.sync.targets import filesystem
+
+    root = tmp_path / "read-only-tree"
+    child = root / "child"
+    child.mkdir(parents=True)
+    (child / "data.txt").write_text("data", encoding="utf-8")
+    set_attributes = ctypes.WinDLL("kernel32", use_last_error=True).SetFileAttributesW
+    set_attributes.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+    set_attributes.restype = ctypes.c_int
+    assert set_attributes(provenance._windows_extended_path(child), 0x1)
+    try:
+        filesystem._remove_tree_checked(root)
+    finally:
+        if child.exists():
+            set_attributes(provenance._windows_extended_path(child), 0x80)
+
+    assert not root.exists()
 
 
 def test_recovery_manifest_cannot_target_machine_root(tmp_path: Path) -> None:
@@ -436,6 +1054,160 @@ def test_ssh_target_describe_and_doctor() -> None:
     assert not SshTarget({}).doctor().ok
 
 
+def test_ssh_executable_prefers_sibling_of_rsync_on_windows(monkeypatch, tmp_path: Path):
+    """An MSYS2/Cygwin-runtime rsync.exe (the only rsync distribution
+    generally available on Windows) that spawns a *different-runtime* ssh
+    for its own `-e ssh` child -- e.g. the native Win32 OpenSSH client --
+    corrupts the rsync protocol handshake across that runtime boundary
+    (reproduced live: the ssh session itself completes and exchanges bytes,
+    but rsync reports "connection unexpectedly closed (0 bytes received so
+    far)"). A sibling ssh binary in the same directory as the resolved
+    rsync shares its runtime, so it must be preferred."""
+    from agent_logger.sync.targets import ssh
+
+    rsync_dir = tmp_path / "msys64" / "usr" / "bin"
+    rsync_dir.mkdir(parents=True)
+    rsync_exe = rsync_dir / "rsync.exe"
+    rsync_exe.write_text("", encoding="utf-8")
+    ssh_exe = rsync_dir / "ssh.exe"
+    ssh_exe.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(ssh, "_IS_WINDOWS", True)
+    monkeypatch.setattr(ssh.shutil, "which", lambda _name: str(rsync_exe))
+    assert ssh._ssh_executable() == str(ssh_exe)
+
+
+def test_ssh_executable_falls_back_without_sibling(monkeypatch, tmp_path: Path):
+    from agent_logger.sync.targets import ssh
+
+    rsync_dir = tmp_path / "some-other-rsync-dist"
+    rsync_dir.mkdir(parents=True)
+    rsync_exe = rsync_dir / "rsync.exe"
+    rsync_exe.write_text("", encoding="utf-8")
+    # No sibling ssh.exe written here.
+
+    monkeypatch.setattr(ssh, "_IS_WINDOWS", True)
+    monkeypatch.setattr(ssh.shutil, "which", lambda _name: str(rsync_exe))
+    assert ssh._ssh_executable() == "ssh"
+
+
+def test_ssh_executable_is_plain_ssh_on_posix(monkeypatch, tmp_path: Path):
+    from agent_logger.sync.targets import ssh
+
+    rsync_dir = tmp_path / "usr" / "bin"
+    rsync_dir.mkdir(parents=True)
+    (rsync_dir / "rsync").write_text("", encoding="utf-8")
+    (rsync_dir / "ssh").write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(ssh, "_IS_WINDOWS", False)
+    monkeypatch.setattr(ssh.shutil, "which", lambda _name: str(rsync_dir / "rsync"))
+    assert ssh._ssh_executable() == "ssh"
+
+
+def test_ssh_target_push_uses_sibling_ssh_in_command(monkeypatch, tmp_path: Path):
+    """End-to-end: push()'s constructed rsync -e command must carry the
+    resolved sibling ssh path, not a bare "ssh"."""
+    from agent_logger.sync.targets import base as sync_base
+    from agent_logger.sync.targets import ssh as ssh_mod
+
+    bin_dir = tmp_path / "msys64" / "usr" / "bin"
+    bin_dir.mkdir(parents=True)
+    rsync_exe = bin_dir / "rsync.exe"
+    rsync_exe.write_text("", encoding="utf-8")
+    ssh_exe = bin_dir / "ssh.exe"
+    ssh_exe.write_text("", encoding="utf-8")
+    source = _make_source(tmp_path / "home")
+
+    monkeypatch.setattr(ssh_mod, "_IS_WINDOWS", True)
+    monkeypatch.setattr(ssh_mod.shutil, "which", lambda _name: str(rsync_exe))
+    # This exercises the native-Windows (no WSL) sibling-ssh fallback
+    # specifically -- disable the WSL-preferred path so the test is
+    # deterministic regardless of whether the test host actually has WSL.
+    monkeypatch.setattr(sync_base, "wsl_rsync_available", lambda **_kwargs: False)
+
+    captured_commands: list[list[str]] = []
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd, **kwargs):
+        captured_commands.append(cmd)
+        return _Proc()
+
+    monkeypatch.setattr(ssh_mod.subprocess, "run", _fake_run)
+    SshTarget({"host": "user@example", "remote_path": "/srv"}).push(source, "m1")
+
+    ssh_arg_index = captured_commands[-1].index("-e") + 1
+    # Compare against the quoted form, not the bare path: push() quotes
+    # whenever the (test-generated, potentially space-containing) tmp_path
+    # happens to contain a space or apostrophe -- independent of the
+    # temporary directory's own name.
+    from agent_logger.sync.targets.ssh import _quote_executable
+
+    assert captured_commands[-1][ssh_arg_index].startswith(
+        _quote_executable(str(ssh_exe))
+    )
+
+
+def test_ssh_executable_quoting_handles_spaces_in_path():
+    from agent_logger.sync.targets.ssh import _quote_executable
+
+    assert _quote_executable("ssh") == "ssh"
+    assert _quote_executable(r"C:\no-spaces\ssh.exe") == r"C:\no-spaces\ssh.exe"
+    quoted = _quote_executable(r"C:\Program Files\msys64\usr\bin\ssh.exe")
+    assert quoted == r'"C:\Program Files\msys64\usr\bin\ssh.exe"'
+
+
+def test_ssh_executable_quoting_handles_apostrophe_in_path():
+    """An apostrophe needs quoting even with no space: rsync's `-e` parser
+    treats it as an opening quote and rejects the command for having no
+    closing one."""
+    from agent_logger.sync.targets.ssh import _quote_executable
+
+    path = r"C:\Users\O'Brien\msys64\usr\bin\ssh.exe"
+    assert _quote_executable(path) == f'"{path}"'
+
+
+
+def test_ssh_target_push_quotes_sibling_path_with_spaces(monkeypatch, tmp_path: Path):
+    """The constructed `-e` command string must quote a sibling ssh path
+    that contains a space (rsync re-splits that string on whitespace to
+    build the command it execs)."""
+    from agent_logger.sync.targets import base as sync_base
+    from agent_logger.sync.targets import ssh as ssh_mod
+
+    bin_dir = tmp_path / "Program Files" / "msys64" / "usr" / "bin"
+    bin_dir.mkdir(parents=True)
+    rsync_exe = bin_dir / "rsync.exe"
+    rsync_exe.write_text("", encoding="utf-8")
+    ssh_exe = bin_dir / "ssh.exe"
+    ssh_exe.write_text("", encoding="utf-8")
+    source = _make_source(tmp_path / "home")
+
+    monkeypatch.setattr(ssh_mod, "_IS_WINDOWS", True)
+    monkeypatch.setattr(ssh_mod.shutil, "which", lambda _name: str(rsync_exe))
+    monkeypatch.setattr(sync_base, "wsl_rsync_available", lambda **_kwargs: False)
+
+    captured_commands: list[list[str]] = []
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd, **kwargs):
+        captured_commands.append(cmd)
+        return _Proc()
+
+    monkeypatch.setattr(ssh_mod.subprocess, "run", _fake_run)
+    SshTarget({"host": "user@example", "remote_path": "/srv"}).push(source, "m1")
+
+    ssh_arg_index = captured_commands[-1].index("-e") + 1
+    assert captured_commands[-1][ssh_arg_index].startswith(f'"{ssh_exe}"')
+
+
 def test_rsync_children_suppress_console_window(monkeypatch, tmp_path: Path) -> None:
     """ssh/ingest pushes must pass the windowless kwargs to their rsync child.
 
@@ -460,6 +1232,10 @@ def test_rsync_children_suppress_console_window(monkeypatch, tmp_path: Path) -> 
         return _Proc()
 
     monkeypatch.setattr("shutil.which", lambda _name: "rsync")
+    # Keep this test's NO_WINDOW_KWARGS/filter-arg assertions independent of
+    # whether the test host actually has WSL -- it exercises the native
+    # rsync invocation, not the WSL-wrapped one (covered separately).
+    monkeypatch.setattr(base, "wsl_rsync_available", lambda **_kwargs: False)
 
     monkeypatch.setattr(ssh.subprocess, "run", _fake_run)
     SshTarget({"host": "user@example", "remote_path": "/srv"}).push(
@@ -468,12 +1244,464 @@ def test_rsync_children_suppress_console_window(monkeypatch, tmp_path: Path) -> 
     for key, val in base.NO_WINDOW_KWARGS.items():
         assert captured.get(key) == val
     assert "--include=provenance/abc-123.json" in captured_commands[-1]
+    assert "--exclude=*.hold" in captured_commands[-1]
+    assert "--delete-excluded" not in captured_commands[-1]
 
     monkeypatch.setattr(ingest.subprocess, "run", _fake_run)
     IngestTarget({"url": "rsync://h/mod"}).push(tmp_path, "m1", {"abc-123"})
     for key, val in base.NO_WINDOW_KWARGS.items():
         assert captured.get(key) == val
     assert "--include=provenance/abc-123.json" in captured_commands[-1]
+    assert "--exclude=*.hold" in captured_commands[-1]
+    assert "--delete-excluded" not in captured_commands[-1]
+
+
+def test_wsl_rsync_available_false_on_posix(monkeypatch) -> None:
+    from agent_logger.sync.targets import base
+
+    monkeypatch.setattr(base, "_IS_WINDOWS", False)
+    assert base.wsl_rsync_available() is False
+
+
+def test_wsl_rsync_available_false_without_wsl_exe(monkeypatch) -> None:
+    from agent_logger.sync.targets import base
+
+    monkeypatch.setattr(base, "_IS_WINDOWS", True)
+    monkeypatch.setattr(base.shutil, "which", lambda _name: None)
+    assert base.wsl_rsync_available() is False
+
+
+def test_wsl_rsync_available_true_when_probe_succeeds(monkeypatch) -> None:
+    from agent_logger.sync.targets import base
+
+    monkeypatch.setattr(base, "_IS_WINDOWS", True)
+    monkeypatch.setattr(base.shutil, "which", lambda _name: r"C:\Windows\System32\wsl.exe")
+
+    class _Proc:
+        returncode = 0
+
+    monkeypatch.setattr(base.subprocess, "run", lambda *a, **k: _Proc())
+    assert base.wsl_rsync_available() is True
+
+
+def test_wsl_rsync_available_false_when_probe_fails(monkeypatch) -> None:
+    """wsl.exe exists but has no distro with both rsync and ssh on PATH."""
+    from agent_logger.sync.targets import base
+
+    monkeypatch.setattr(base, "_IS_WINDOWS", True)
+    monkeypatch.setattr(base.shutil, "which", lambda _name: r"C:\Windows\System32\wsl.exe")
+
+    class _Proc:
+        returncode = 1
+
+    monkeypatch.setattr(base.subprocess, "run", lambda *a, **k: _Proc())
+    assert base.wsl_rsync_available() is False
+
+
+def test_wsl_rsync_available_require_ssh_false_only_checks_rsync(monkeypatch) -> None:
+    """ingest speaks rsync's daemon protocol directly and never shells out to
+    ssh -- a WSL distro with rsync but no ssh client must still count."""
+    from agent_logger.sync.targets import base
+
+    monkeypatch.setattr(base, "_IS_WINDOWS", True)
+    monkeypatch.setattr(base.shutil, "which", lambda _name: r"C:\Windows\System32\wsl.exe")
+
+    captured_checks: list[str] = []
+
+    class _Proc:
+        returncode = 0
+
+    def _fake_run(cmd, **kwargs):
+        captured_checks.append(cmd[-1])
+        return _Proc()
+
+    monkeypatch.setattr(base.subprocess, "run", _fake_run)
+    assert base.wsl_rsync_available(require_ssh=False) is True
+    assert "ssh" not in captured_checks[-1]
+    assert "rsync" in captured_checks[-1]
+
+
+def test_resolve_rsync_runtime_prefers_wsl_when_available(monkeypatch) -> None:
+    from agent_logger.sync.targets import base
+
+    monkeypatch.setattr(base, "wsl_rsync_available", lambda **_kwargs: True)
+    runtime = base.resolve_rsync_runtime()
+    assert runtime.use_wsl is True
+    assert runtime.command_prefix == ["wsl.exe", "-e"]
+
+
+def test_resolve_rsync_runtime_native_without_wsl(monkeypatch) -> None:
+    from agent_logger.sync.targets import base
+
+    monkeypatch.setattr(base, "wsl_rsync_available", lambda **_kwargs: False)
+    runtime = base.resolve_rsync_runtime()
+    assert runtime.use_wsl is False
+    assert runtime.command_prefix == []
+
+
+def test_rsync_runtime_source_arg_converts_via_wslpath(monkeypatch, tmp_path: Path) -> None:
+    from agent_logger.sync.targets import base
+
+    class _Proc:
+        returncode = 0
+        stdout = "/mnt/c/Users/someuser/.copilot\n"
+
+    monkeypatch.setattr(base.subprocess, "run", lambda *a, **k: _Proc())
+    runtime = base.RsyncRuntime(command_prefix=["wsl.exe", "-e"], use_wsl=True)
+    assert runtime.source_arg(tmp_path) == "/mnt/c/Users/someuser/.copilot/"
+
+
+def test_rsync_runtime_source_arg_is_none_when_wslpath_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A failed wslpath conversion must be a hard error, never a silent
+    fallback to the raw Windows path -- WSL rsync would misparse or simply
+    fail to find it."""
+    from agent_logger.sync.targets import base
+
+    class _Proc:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(base.subprocess, "run", lambda *a, **k: _Proc())
+    runtime = base.RsyncRuntime(command_prefix=["wsl.exe", "-e"], use_wsl=True)
+    assert runtime.source_arg(tmp_path) is None
+
+
+def test_stage_wsl_secret_file_passes_content_as_stdin_and_sets_perms(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Content must flow to the WSL-native staged file via stdin (never a
+    converted DrvFS path), with 0600 permissions set in a separate call so a
+    write failure can still clean up the file mktemp already created."""
+    from agent_logger.sync.targets import base
+
+    secret = tmp_path / "secret.txt"
+    secret.write_bytes(b"hunter2")
+
+    captured_calls: list[tuple[list[str], dict]] = []
+
+    def _fake_run(cmd, **kwargs):
+        captured_calls.append((cmd, kwargs))
+        if cmd[2:3] == ["mktemp"]:
+            return type("P", (), {"returncode": 0, "stdout": b"/tmp/tmp.abc123\n"})()
+        return type("P", (), {"returncode": 0, "stdout": b""})()
+
+    monkeypatch.setattr(base.subprocess, "run", _fake_run)
+    assert base.stage_wsl_secret_file(str(secret)) == "/tmp/tmp.abc123"
+    write_kwargs = next(
+        k for c, k in captured_calls if c[2:3] != ["mktemp"]
+    )
+    assert write_kwargs.get("input") == b"hunter2"
+
+
+def test_stage_wsl_secret_file_expands_tilde_prefixed_paths(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The shipped config example uses password_file: ~/.agent-logger/...;
+    a bare Path never expands that, so every configured ~-path must resolve
+    through the real home directory before reading."""
+    from agent_logger.sync.targets import base
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    secret = tmp_path / "secret.txt"
+    secret.write_bytes(b"hunter2")
+
+    captured_calls: list[tuple[list[str], dict]] = []
+
+    def _fake_run(cmd, **kwargs):
+        captured_calls.append((cmd, kwargs))
+        if cmd[2:3] == ["mktemp"]:
+            return type("P", (), {"returncode": 0, "stdout": b"/tmp/tmp.abc123\n"})()
+        return type("P", (), {"returncode": 0, "stdout": b""})()
+
+    monkeypatch.setattr(base.subprocess, "run", _fake_run)
+    assert base.stage_wsl_secret_file("~/secret.txt") == "/tmp/tmp.abc123"
+    write_kwargs = next(k for c, k in captured_calls if c[2:3] != ["mktemp"])
+    assert write_kwargs.get("input") == b"hunter2"
+
+
+def test_stage_wsl_secret_file_none_when_mktemp_fails(monkeypatch, tmp_path: Path) -> None:
+    from agent_logger.sync.targets import base
+
+    secret = tmp_path / "secret.txt"
+    secret.write_bytes(b"hunter2")
+
+    class _Proc:
+        returncode = 1
+        stdout = b""
+
+    monkeypatch.setattr(base.subprocess, "run", lambda *a, **k: _Proc())
+    assert base.stage_wsl_secret_file(str(secret)) is None
+
+
+def test_stage_wsl_secret_file_cleans_up_when_write_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """If mktemp succeeds but the write/chmod step fails, the already-created
+    temp file must not be leaked in WSL's filesystem indefinitely."""
+    from agent_logger.sync.targets import base
+
+    secret = tmp_path / "secret.txt"
+    secret.write_bytes(b"hunter2")
+
+    def _fake_run(cmd, **kwargs):
+        if cmd[2:3] == ["mktemp"]:
+            return type("P", (), {"returncode": 0, "stdout": b"/tmp/tmp.abc123\n"})()
+        return type("P", (), {"returncode": 1, "stdout": b""})()
+
+    monkeypatch.setattr(base.subprocess, "run", _fake_run)
+    cleanup_calls: list[str] = []
+    monkeypatch.setattr(base, "cleanup_wsl_staged_file", cleanup_calls.append)
+
+    assert base.stage_wsl_secret_file(str(secret)) is None
+    assert cleanup_calls == ["/tmp/tmp.abc123"]
+
+
+def test_cleanup_wsl_staged_file_invokes_rm(monkeypatch) -> None:
+    from agent_logger.sync.targets import base
+
+    captured_commands: list[list[str]] = []
+
+    class _Proc:
+        returncode = 0
+
+    def _fake_run(cmd, **kwargs):
+        captured_commands.append(cmd)
+        return _Proc()
+
+    monkeypatch.setattr(base.subprocess, "run", _fake_run)
+    base.cleanup_wsl_staged_file("/tmp/tmp.abc123")
+    assert captured_commands[-1][-2:] == ["-f", "/tmp/tmp.abc123"]
+
+
+def test_cleanup_wsl_staged_file_swallows_errors(monkeypatch) -> None:
+    """Cleanup is best-effort -- a failure here must never raise and mask the
+    push's own result."""
+    from agent_logger.sync.targets import base
+
+    def _raise(*_a, **_k):
+        raise OSError("wsl.exe not found")
+
+    monkeypatch.setattr(base.subprocess, "run", _raise)
+    base.cleanup_wsl_staged_file("/tmp/tmp.abc123")  # must not raise
+
+
+def test_rsync_runtime_source_arg_noop_without_wsl(tmp_path: Path) -> None:
+    from agent_logger.sync.targets import base
+
+    runtime = base.RsyncRuntime(command_prefix=[], use_wsl=False)
+    assert runtime.source_arg(tmp_path) == f"{tmp_path}/"
+
+
+def test_ssh_target_push_uses_wsl_wrapped_rsync(monkeypatch, tmp_path: Path) -> None:
+    """When WSL is available, push() must run rsync wrapped in `wsl.exe -e`,
+    with a bare "ssh" (WSL's own, no cross-runtime sibling needed) and the
+    source path converted via wslpath instead of a raw Windows path."""
+    from agent_logger.sync.targets import base as sync_base
+    from agent_logger.sync.targets import ssh as ssh_mod
+
+    source = _make_source(tmp_path / "home")
+
+    monkeypatch.setattr(sync_base, "wsl_rsync_available", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        sync_base, "wsl_posix_path", lambda _p: "/mnt/c/Users/someuser/.copilot"
+    )
+
+    captured_commands: list[list[str]] = []
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd, **kwargs):
+        captured_commands.append(cmd)
+        return _Proc()
+
+    monkeypatch.setattr(ssh_mod.subprocess, "run", _fake_run)
+    result = SshTarget({"host": "user@example", "remote_path": "/srv"}).push(source, "m1")
+
+    assert result.ok
+    cmd = captured_commands[-1]
+    assert cmd[:3] == ["wsl.exe", "-e", "rsync"]
+    # Search for rsync's own -e flag past the wsl.exe -e prefix (index 1).
+    ssh_arg_index = cmd.index("-e", 2) + 1
+    assert cmd[ssh_arg_index].startswith("ssh ")
+    assert "/mnt/c/Users/someuser/.copilot/" in cmd
+
+
+def test_ssh_target_push_fails_explicitly_when_wsl_conversion_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A failed wslpath conversion must surface as a push failure, never
+    silently fall back to a raw Windows source path that WSL rsync would
+    misparse or fail to find."""
+    from agent_logger.sync.targets import base as sync_base
+    from agent_logger.sync.targets import ssh as ssh_mod
+
+    source = _make_source(tmp_path / "home")
+
+    monkeypatch.setattr(sync_base, "wsl_rsync_available", lambda **_kwargs: True)
+    monkeypatch.setattr(sync_base, "wsl_posix_path", lambda _p: None)
+
+    captured_commands: list[list[str]] = []
+    monkeypatch.setattr(
+        ssh_mod.subprocess,
+        "run",
+        lambda cmd, **kwargs: captured_commands.append(cmd),
+    )
+    result = SshTarget({"host": "user@example", "remote_path": "/srv"}).push(source, "m1")
+
+    assert not result.ok
+    assert "convert" in result.detail
+    assert not captured_commands  # rsync must never be invoked
+
+
+def test_ingest_target_push_uses_wsl_wrapped_rsync(monkeypatch, tmp_path: Path) -> None:
+    from agent_logger.sync.targets import base as sync_base
+    from agent_logger.sync.targets import ingest as ingest_mod
+
+    source = _make_source(tmp_path / "home")
+
+    monkeypatch.setattr(sync_base, "wsl_rsync_available", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        sync_base, "wsl_posix_path", lambda _p: "/mnt/c/Users/someuser/.copilot"
+    )
+
+    captured_commands: list[list[str]] = []
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd, **kwargs):
+        captured_commands.append(cmd)
+        return _Proc()
+
+    monkeypatch.setattr(ingest_mod.subprocess, "run", _fake_run)
+    result = IngestTarget({"url": "rsync://h/mod"}).push(source, "m1")
+
+    assert result.ok
+    cmd = captured_commands[-1]
+    assert cmd[:3] == ["wsl.exe", "-e", "rsync"]
+    assert "/mnt/c/Users/someuser/.copilot/" in cmd
+
+
+def test_ingest_target_push_stages_password_file_under_wsl(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A WSL-wrapped rsync must use a restrictive-permission copy of a
+    configured native Windows password-file staged inside WSL's own
+    filesystem -- DrvFS normally exposes the raw Windows file as
+    group/world-readable, which rsync refuses for --password-file -- and
+    that staged file must be cleaned up afterward."""
+    from agent_logger.sync.targets import base as sync_base
+    from agent_logger.sync.targets import ingest as ingest_mod
+
+    source = _make_source(tmp_path / "home")
+    pw_file = tmp_path / "secret.txt"
+    pw_file.write_text("hunter2", encoding="utf-8")
+
+    monkeypatch.setattr(sync_base, "wsl_rsync_available", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        sync_base, "wsl_posix_path", lambda _p: "/mnt/c/Users/someuser/.copilot"
+    )
+    monkeypatch.setattr(
+        sync_base, "stage_wsl_secret_file", lambda _p: "/tmp/staged-secret"
+    )
+    cleanup_calls: list[str] = []
+    monkeypatch.setattr(
+        sync_base, "cleanup_wsl_staged_file", cleanup_calls.append
+    )
+
+    captured_commands: list[list[str]] = []
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd, **kwargs):
+        captured_commands.append(cmd)
+        return _Proc()
+
+    monkeypatch.setattr(ingest_mod.subprocess, "run", _fake_run)
+    result = IngestTarget(
+        {"url": "rsync://h/mod", "password_file": str(pw_file)}
+    ).push(source, "m1")
+
+    assert result.ok
+    assert "--password-file=/tmp/staged-secret" in captured_commands[-1]
+    assert cleanup_calls == ["/tmp/staged-secret"]
+
+
+def test_ingest_target_push_fails_explicitly_when_password_file_staging_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from agent_logger.sync.targets import base as sync_base
+    from agent_logger.sync.targets import ingest as ingest_mod
+
+    source = _make_source(tmp_path / "home")
+    pw_file = tmp_path / "secret.txt"
+    pw_file.write_text("hunter2", encoding="utf-8")
+
+    monkeypatch.setattr(sync_base, "wsl_rsync_available", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        sync_base, "wsl_posix_path", lambda _p: "/mnt/c/Users/someuser/.copilot"
+    )
+    monkeypatch.setattr(sync_base, "stage_wsl_secret_file", lambda _p: None)
+
+    captured_commands: list[list[str]] = []
+    monkeypatch.setattr(
+        ingest_mod.subprocess,
+        "run",
+        lambda cmd, **kwargs: captured_commands.append(cmd),
+    )
+    result = IngestTarget(
+        {"url": "rsync://h/mod", "password_file": str(pw_file)}
+    ).push(source, "m1")
+
+    assert not result.ok
+    assert "stage" in result.detail
+    assert not captured_commands
+
+
+def test_ssh_target_doctor_reports_wsl_rsync(monkeypatch) -> None:
+    from agent_logger.sync.targets import base as sync_base
+    from agent_logger.sync.targets import ssh as ssh_mod
+
+    monkeypatch.setattr(sync_base, "wsl_rsync_available", lambda **_kwargs: True)
+
+    captured_commands: list[list[str]] = []
+
+    class _Proc:
+        returncode = 0
+
+    def _fake_run(cmd, **kwargs):
+        captured_commands.append(cmd)
+        return _Proc()
+
+    monkeypatch.setattr(ssh_mod.subprocess, "run", _fake_run)
+    result = SshTarget({"host": "user@example", "remote_path": "/srv"}).doctor()
+    detail_by_name = {name: detail for name, _ok, detail in result.checks}
+    assert detail_by_name["rsync present"] == "via WSL"
+    assert detail_by_name["ssh present"] == "via WSL"
+    # Regression guard: the reachability probe must use -e (direct exec),
+    # never -- (which silently drops positional arguments after the
+    # command name when wsl.exe re-shells the joined command line).
+    assert captured_commands[-1][:2] == ["wsl.exe", "-e"]
+
+
+def test_ingest_target_doctor_reports_wsl_rsync(monkeypatch) -> None:
+    from agent_logger.sync.targets import base as sync_base
+
+    monkeypatch.setattr(sync_base, "wsl_rsync_available", lambda **_kwargs: True)
+    result = IngestTarget({"url": "rsync://h/mod"}).doctor()
+    detail_by_name = {name: detail for name, _ok, detail in result.checks}
+    assert detail_by_name["rsync present"] == "via WSL"
 
 
 def _cfg(home: Path, source: Path, dest: Path) -> Config:
@@ -481,6 +1709,486 @@ def _cfg(home: Path, source: Path, dest: Path) -> Config:
     data["sync"]["source"] = str(source)
     data["sync"]["targets"]["local"]["path"] = str(dest)
     return Config(data, home)
+
+
+def test_sync_meta_bounds_deferred_file_samples(tmp_path: Path) -> None:
+    from agent_logger.sync import meta
+
+    deferred = [f"path-{index}-{'x' * 600}" for index in range(20)]
+    meta.write_sync_meta(
+        tmp_path,
+        "m" * 1000,
+        "t" * 1000,
+        "s" * 1000,
+        12,
+        deferred_files=deferred,
+    )
+
+    payload = meta.read_sync_meta(tmp_path)
+
+    assert payload is not None
+    assert len(payload["machine_id"]) == meta.MAX_META_FIELD_CHARS
+    assert len(payload["transport"]) == meta.MAX_META_FIELD_CHARS
+    assert len(payload["status"]) == meta.MAX_META_FIELD_CHARS
+    assert payload["deferred_file_count"] == 20
+    assert len(payload["deferred_files"]) == meta.MAX_DEFERRED_FILE_SAMPLES
+    assert all(
+        len(path) <= meta.MAX_DEFERRED_PATH_CHARS
+        for path in payload["deferred_files"]
+    )
+
+
+def test_heartbeat_sync_meta_preserves_fields_only_touching_timestamp(
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync import meta
+
+    meta.write_sync_meta(
+        tmp_path,
+        "machine",
+        "local",
+        "partial",
+        session_count=5,
+        deferred_files=[f"path-{i}" for i in range(20)],
+    )
+    before = meta.read_sync_meta(tmp_path)
+    assert before["consecutive_partial_count"] == 1
+    assert before["deferred_file_count"] == 20
+
+    meta.heartbeat_sync_meta(tmp_path, "machine", "local", fallback_session_count=5)
+    after = meta.read_sync_meta(tmp_path)
+
+    # Only the timestamp may change -- status/counts/samples untouched.
+    assert after["status"] == "partial"
+    assert after["consecutive_partial_count"] == 1
+    assert after["deferred_file_count"] == 20
+    assert after["session_count"] == 5
+    assert after["last_sync_utc"] != "" and after["last_sync_utc"] is not None
+
+
+def test_heartbeat_sync_meta_writes_fresh_when_nothing_exists(tmp_path: Path) -> None:
+    from agent_logger.sync import meta
+
+    meta.heartbeat_sync_meta(tmp_path, "machine", "local", fallback_session_count=3)
+    payload = meta.read_sync_meta(tmp_path)
+    assert payload is not None
+    assert payload["status"] == "ok"
+    assert payload["session_count"] == 3
+
+
+def test_heartbeat_sync_meta_preserves_unreadable_metadata(tmp_path: Path) -> None:
+    """A malformed/unreadable sync-meta.json is a visible error signal --
+    a no-op heartbeat must never paper over it with a fresh 'ok' status."""
+    from agent_logger.sync import meta
+
+    meta_file = tmp_path / "sync-meta.json"
+    meta_file.write_bytes(b"\xff" * (meta.MAX_SYNC_META_BYTES + 100))
+
+    meta.heartbeat_sync_meta(tmp_path, "machine", "local", fallback_session_count=1)
+
+    assert meta_file.read_bytes() == b"\xff" * (meta.MAX_SYNC_META_BYTES + 100)
+
+
+def test_filesystem_target_heartbeat_noop_for_missing_destination(
+    tmp_path: Path,
+) -> None:
+    """A deleted destination (never re-created by a heartbeat) must not get
+    a fresh 'ok' sync-meta.json -- that would mask the fact its sessions
+    are actually gone until the next full reconciliation."""
+    root = tmp_path / "hub"
+    target = LocalTarget({"path": str(root)})
+
+    target.heartbeat("machine")  # root doesn't exist at all yet
+
+    assert not (root / "machine").exists()
+
+
+def test_filesystem_target_heartbeat_refreshes_existing_destination(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "hub"
+    target = LocalTarget({"path": str(root)})
+    src = _make_source(tmp_path)
+    assert target.push(src, "machine").ok
+
+    target.heartbeat("machine")
+    from agent_logger.sync import meta
+
+    payload = meta.read_sync_meta(root / "machine")
+    assert payload is not None
+
+
+def test_sync_meta_tracks_and_resets_consecutive_partial_count(
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync import meta
+
+    meta.write_sync_meta(tmp_path, "machine", "local", "partial")
+    assert meta.read_sync_meta(tmp_path)["consecutive_partial_count"] == 1
+
+    meta.write_sync_meta(tmp_path, "machine", "local", "partial")
+    assert meta.read_sync_meta(tmp_path)["consecutive_partial_count"] == 2
+
+    meta.write_sync_meta(tmp_path, "machine", "local", "ok")
+    assert meta.read_sync_meta(tmp_path)["consecutive_partial_count"] == 0
+
+
+def test_sync_meta_rejects_parser_recursion_payload(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync import meta
+
+    (tmp_path / "sync-meta.json").write_text("{}", encoding="utf-8")
+
+    def raise_recursion_error(_raw):
+        raise RecursionError
+
+    monkeypatch.setattr(meta.json, "loads", raise_recursion_error)
+
+    with pytest.raises(OSError, match="invalid sync metadata"):
+        meta.read_sync_meta(tmp_path)
+
+
+def test_status_prints_latest_partial_sync(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync import meta
+
+    source = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    machine_root = dest / "machine"
+    meta.write_sync_meta(
+        machine_root,
+        "machine",
+        "local",
+        "partial",
+        12,
+        deferred_files=["session-state/one/locked.db"],
+    )
+    cfg = _cfg(tmp_path / "home", source, dest)
+    monkeypatch.setattr(engine, "_machine", lambda _cfg: "machine")
+
+    assert engine.do_status(cfg) == 0
+
+    output = capsys.readouterr().out
+    assert "latest_status:  partial" in output
+    assert "partial_streak: 1" in output
+    assert "sessions:       12" in output
+    assert "deferred_files: 1" in output
+    assert "session-state/one/locked.db" in output
+
+
+def test_status_distinguishes_missing_sync_metadata(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    cfg = _cfg(tmp_path / "home", _make_source(tmp_path), tmp_path / "dest")
+    monkeypatch.setattr(engine, "_machine", lambda _cfg: "machine")
+
+    assert engine.do_status(cfg) == 0
+
+    assert "latest_sync:    (none)" in capsys.readouterr().out
+
+
+def test_status_handles_malformed_and_control_metadata(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    dest = tmp_path / "dest"
+    machine_root = dest / "machine"
+    machine_root.mkdir(parents=True)
+    (machine_root / "sync-meta.json").write_text(
+        json.dumps(
+            {
+                "last_sync_utc": {"invalid": True},
+                "status": "partial\u001b[31m",
+                "session_count": [],
+                "deferred_file_count": 2,
+                "deferred_files": 5,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = _cfg(tmp_path / "home", _make_source(tmp_path), dest)
+    monkeypatch.setattr(engine, "_machine", lambda _cfg: "machine")
+
+    assert engine.do_status(cfg) == 0
+
+    output = capsys.readouterr().out
+    assert "latest_sync:    (unknown)" in output
+    assert "latest_status:  partial[31m" in output
+    assert "\u001b" not in output
+    assert "sessions:       (unknown)" in output
+    assert "(invalid deferred_files metadata)" in output
+
+
+def test_status_sanitizes_unreadable_metadata_error(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    cfg = _cfg(tmp_path / "home", _make_source(tmp_path), tmp_path / "dest")
+    monkeypatch.setattr(engine, "_machine", lambda _cfg: "machine")
+
+    class InvalidStatusTarget:
+        def describe(self) -> str:
+            return "invalid"
+
+        def sync_status(self, _machine):
+            from agent_logger.sync.targets.base import SyncStatus
+
+            return SyncStatus(supported=True, error="bad\u001b[31m\nmetadata")
+
+    monkeypatch.setattr(engine, "build_target", lambda *_args: InvalidStatusTarget())
+
+    assert engine.do_status(cfg) == 0
+
+    output = capsys.readouterr().out
+    assert "unreadable (bad[31mmetadata)" in output
+    assert "\u001b" not in output
+
+
+def test_health_allows_one_fresh_partial_pass(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync import meta
+
+    source = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    meta.write_sync_meta(
+        dest / "machine",
+        "machine",
+        "local",
+        "partial",
+        deferred_files=["session-state/one/locked.db"],
+    )
+    cfg = _cfg(tmp_path / "home", source, dest)
+    monkeypatch.setattr(engine, "_machine", lambda _cfg: "machine")
+
+    assert engine.do_health(
+        cfg,
+        fleet=False,
+        machines=[],
+        max_age_hours=12,
+        partial_threshold=3,
+        json_output=False,
+    ) == 0
+
+    output = capsys.readouterr().out
+    assert "machine: degraded (transient_partial)" in output
+    assert "partial_streak=1" in output
+
+
+def test_health_fleet_json_fails_on_repeated_partial(
+    capsys,
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync import meta
+
+    source = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    meta.write_sync_meta(dest / "healthy", "healthy", "local", "ok", 10)
+    for _ in range(3):
+        meta.write_sync_meta(
+            dest / ".codespaces" / "repeated",
+            ".codespaces/repeated",
+            "local",
+            "partial",
+            4,
+            deferred_files=["session-state/one/locked.db"],
+        )
+    cfg = _cfg(tmp_path / "home", source, dest)
+
+    assert engine.do_health(
+        cfg,
+        fleet=True,
+        machines=[],
+        max_age_hours=12,
+        partial_threshold=3,
+        json_output=True,
+    ) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["health"] == "unhealthy"
+    assert payload["summary"] == {
+        "healthy": 1,
+        "degraded": 0,
+        "unhealthy": 1,
+    }
+    repeated = next(
+        machine
+        for machine in payload["machines"]
+        if machine["machine"] == ".codespaces/repeated"
+    )
+    assert repeated["reason"] == "repeated_partial"
+    assert repeated["consecutive_partial_count"] == 3
+
+
+def test_health_fleet_can_select_active_machine_subset(
+    capsys,
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync import meta
+
+    source = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    meta.write_sync_meta(dest / "active", "active", "local", "ok", 10)
+    meta.write_sync_meta(dest / "retired", "retired", "local", "partial", 4)
+    cfg = _cfg(tmp_path / "home", source, dest)
+
+    assert engine.do_health(
+        cfg,
+        fleet=True,
+        machines=["active"],
+        max_age_hours=12,
+        partial_threshold=1,
+        json_output=True,
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["health"] == "healthy"
+    assert [machine["machine"] for machine in payload["machines"]] == ["active"]
+
+
+def test_health_fleet_ignores_root_metadata_and_scans_machine_dirs(
+    capsys,
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync import meta
+
+    source = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    meta.write_sync_meta(dest, "not-a-machine", "local", "ok", 1)
+    meta.write_sync_meta(dest / "machine", "machine", "local", "ok", 2)
+    cfg = _cfg(tmp_path / "home", source, dest)
+
+    assert engine.do_health(
+        cfg,
+        fleet=True,
+        machines=[],
+        max_age_hours=12,
+        partial_threshold=3,
+        json_output=True,
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert [machine["machine"] for machine in payload["machines"]] == ["machine"]
+
+
+def test_health_fleet_reports_machine_missing_metadata(
+    capsys,
+    tmp_path: Path,
+) -> None:
+    source = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    (dest / "missing" / "session-state").mkdir(parents=True)
+    cfg = _cfg(tmp_path / "home", source, dest)
+
+    assert engine.do_health(
+        cfg,
+        fleet=True,
+        machines=[],
+        max_age_hours=12,
+        partial_threshold=3,
+        json_output=True,
+    ) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["machines"][0]["machine"] == "missing"
+    assert payload["machines"][0]["reason"] == "missing_metadata"
+
+
+def test_health_fleet_scan_is_globally_bounded(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync.targets import filesystem
+
+    source = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    (dest / "one").mkdir(parents=True)
+    (dest / "two").mkdir()
+    cfg = _cfg(tmp_path / "home", source, dest)
+    monkeypatch.setattr(filesystem, "_MAX_FLEET_ENTRIES", 1)
+
+    assert engine.do_health(
+        cfg,
+        fleet=True,
+        machines=[],
+        max_age_hours=12,
+        partial_threshold=3,
+        json_output=False,
+    ) == 1
+
+    assert "fleet scan exceeds 1 entries" in capsys.readouterr().err
+
+
+def test_health_fleet_keeps_other_machines_when_one_directory_is_unreadable(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    from agent_logger.sync import meta
+    from agent_logger.sync.targets import filesystem
+
+    source = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    meta.write_sync_meta(dest / "healthy", "healthy", "local", "ok", 10)
+    (dest / "unreadable").mkdir(parents=True)
+    real_scandir = filesystem.os.scandir
+
+    def fail_one_directory(path):
+        if str(path).endswith("unreadable"):
+            raise PermissionError("blocked")
+        return real_scandir(path)
+
+    monkeypatch.setattr(filesystem.os, "scandir", fail_one_directory)
+    cfg = _cfg(tmp_path / "home", source, dest)
+
+    assert engine.do_health(
+        cfg,
+        fleet=True,
+        machines=[],
+        max_age_hours=12,
+        partial_threshold=3,
+        json_output=True,
+    ) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["summary"] == {
+        "healthy": 1,
+        "degraded": 0,
+        "unhealthy": 1,
+    }
+    assert {
+        machine["machine"]: machine["reason"]
+        for machine in payload["machines"]
+    } == {
+        "healthy": "fresh_complete",
+        "unreadable": "unreadable_metadata",
+    }
+
+
+@pytest.mark.parametrize("threshold", ["nan", "inf", "-inf", "0"])
+def test_health_cli_rejects_invalid_freshness_threshold(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+    threshold: str,
+) -> None:
+    monkeypatch.setenv("AGENT_LOGGER_HOME", str(tmp_path / "home"))
+
+    assert engine.main(["health", f"--max-age-hours={threshold}"]) == 2
+
+    assert "thresholds must be finite and positive" in capsys.readouterr().err
 
 
 def test_engine_run_sync_local(tmp_path: Path) -> None:
@@ -501,6 +2209,343 @@ def test_engine_dry_run_makes_no_dest(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path / "home", src, dest)
     assert engine.run_sync(cfg, dry_run=True) == 0
     assert not dest.exists()
+
+
+def test_engine_run_sync_second_run_skips_push_when_unchanged(
+    monkeypatch, capsys, tmp_path: Path,
+) -> None:
+    """Change tracking is enabled by default: after a first (full) sync, a
+    second run with no local changes must not invoke the target's push at
+    all."""
+    src = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    cfg = _cfg(tmp_path / "home", src, dest)
+
+    assert engine.run_sync(cfg) == 0
+    capsys.readouterr()
+
+    calls: list[object] = []
+    real_push = LocalTarget.push
+
+    def _tracking_push(self, *a, **k):
+        calls.append((a, k))
+        return real_push(self, *a, **k)
+
+    monkeypatch.setattr(LocalTarget, "push", _tracking_push)
+
+    assert engine.run_sync(cfg, verbose=True) == 0
+    assert calls == []
+    assert "no session changes detected" in capsys.readouterr().out
+
+
+def test_engine_run_sync_repushes_modified_session(tmp_path: Path) -> None:
+    src = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    cfg = _cfg(tmp_path / "home", src, dest)
+
+    assert engine.run_sync(cfg) == 0
+    (src / "session-state" / "abc-123" / "events.jsonl").write_text(
+        '{"ts": 2}\n', encoding="utf-8"
+    )
+
+    assert engine.run_sync(cfg) == 0
+    machine_dir = next(dest.iterdir())
+    assert (
+        machine_dir / "session-state" / "abc-123" / "events.jsonl"
+    ).read_text(encoding="utf-8") == '{"ts": 2}\n'
+
+
+def test_engine_run_sync_full_flag_forces_reconciliation_detail(
+    capsys, tmp_path: Path,
+) -> None:
+    src = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    cfg = _cfg(tmp_path / "home", src, dest)
+
+    assert engine.run_sync(cfg) == 0
+    capsys.readouterr()
+
+    assert engine.run_sync(cfg, full=True) == 0
+    assert "full reconciliation" in capsys.readouterr().out
+
+
+def test_engine_run_sync_change_tracking_disabled_pushes_every_run(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """``sync.change_tracking.enabled: false`` restores the pre-feature
+    behavior: every run pushes via the plain ``include`` set, with no
+    incremental skip and no segmented batching."""
+    src = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    cfg = _cfg(tmp_path / "home", src, dest)
+    cfg._data["sync"]["change_tracking"] = {"enabled": False}
+
+    calls: list[object] = []
+    real_push = LocalTarget.push
+
+    def _tracking_push(self, *a, **k):
+        calls.append((a, k))
+        return real_push(self, *a, **k)
+
+    monkeypatch.setattr(LocalTarget, "push", _tracking_push)
+
+    assert engine.run_sync(cfg) == 0
+    assert len(calls) == 1
+    assert calls[0][0][-1] is None  # include=None, the legacy single-call shape
+
+    assert engine.run_sync(cfg) == 0
+    assert len(calls) == 2
+
+
+def test_engine_run_sync_batches_full_reconciliation(tmp_path: Path) -> None:
+    """A from-scratch full sync with more sessions than ``batch_size`` must
+    still land every session, split across multiple bounded pushes."""
+    src = tmp_path / "copilot"
+    for i in range(5):
+        sess = src / "session-state" / f"sess-{i}"
+        sess.mkdir(parents=True)
+        (sess / "events.jsonl").write_text(f'{{"ts": {i}}}\n', encoding="utf-8")
+    dest = tmp_path / "dest"
+    cfg = _cfg(tmp_path / "home", src, dest)
+    cfg._data["sync"]["change_tracking"] = {"batch_size": 2}
+
+    assert engine.run_sync(cfg, verbose=True) == 0
+    machine_dir = next(dest.iterdir())
+    for i in range(5):
+        assert (
+            machine_dir / "session-state" / f"sess-{i}" / "events.jsonl"
+        ).is_file()
+
+
+def test_engine_run_sync_forgets_vanished_session_on_full_sync(
+    tmp_path: Path,
+) -> None:
+    import shutil
+
+    src = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    cfg = _cfg(tmp_path / "home", src, dest)
+
+    assert engine.run_sync(cfg) == 0
+
+    from agent_logger.sync.change_tracker import ChangeTracker, resolve_db_path
+
+    tracker = ChangeTracker(resolve_db_path(cfg.sync_change_tracking["db_path"], cfg.home))
+    assert tracker.known_session_ids() == {"abc-123"}
+
+    shutil.rmtree(src / "session-state" / "abc-123")
+    assert engine.run_sync(cfg, full=True) == 0
+    assert tracker.known_session_ids() == set()
+
+
+def test_engine_run_sync_forces_full_when_destination_target_changes(
+    tmp_path: Path,
+) -> None:
+    """Changing the sync target/path after the tracker has already recorded
+    signatures against the old one must trigger a fresh full reconciliation,
+    not silently skip pushing to the new destination."""
+    src = _make_source(tmp_path)
+    dest_a = tmp_path / "dest-a"
+    cfg = _cfg(tmp_path / "home", src, dest_a)
+
+    assert engine.run_sync(cfg) == 0
+    assert (dest_a / next(dest_a.iterdir()).name / "session-state" / "abc-123").is_dir()
+
+    dest_b = tmp_path / "dest-b"
+    cfg._data["sync"]["targets"]["local"]["path"] = str(dest_b)
+
+    assert engine.run_sync(cfg) == 0
+    machine_dir = next(dest_b.iterdir())
+    assert (
+        machine_dir / "session-state" / "abc-123" / "events.jsonl"
+    ).is_file()
+
+
+def test_engine_run_sync_heartbeats_destination_on_no_change_skip(
+    tmp_path: Path,
+) -> None:
+    """A skipped (no-change) push must still refresh the destination's own
+    health metadata, or a routine health check reports a perfectly healthy,
+    unchanged destination as stale between full-reconciliation passes."""
+    from agent_logger.sync import meta
+
+    src = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    cfg = _cfg(tmp_path / "home", src, dest)
+
+    assert engine.run_sync(cfg) == 0
+    machine_dir = next(dest.iterdir())
+    first_meta = meta.read_sync_meta(machine_dir)
+    assert first_meta is not None
+
+    import time as time_module
+
+    time_module.sleep(1.1)
+    assert engine.run_sync(cfg) == 0
+    second_meta = meta.read_sync_meta(machine_dir)
+    assert second_meta is not None
+    assert second_meta["last_sync_utc"] != first_meta["last_sync_utc"]
+
+
+def test_engine_run_sync_preserves_index_for_unfiltered_incremental_push(
+    tmp_path: Path,
+) -> None:
+    """An unfiltered incremental/segmented push must still eventually
+    refresh the global session-store.db index, even though any one call
+    only carries a transport-size batch of sessions."""
+    src = _make_source(tmp_path)
+    (src / "session-store.db").write_text("index-v1", encoding="utf-8")
+    dest = tmp_path / "dest"
+    cfg = _cfg(tmp_path / "home", src, dest)
+
+    assert engine.run_sync(cfg) == 0
+    machine_dir = next(dest.iterdir())
+    assert (machine_dir / "session-store.db").read_text(encoding="utf-8") == "index-v1"
+
+    (src / "session-store.db").write_text("index-v2", encoding="utf-8")
+    (src / "session-state" / "abc-123" / "events.jsonl").write_text(
+        '{"ts": 2}\n', encoding="utf-8"
+    )
+    assert engine.run_sync(cfg) == 0
+    assert (machine_dir / "session-store.db").read_text(encoding="utf-8") == "index-v2"
+
+
+def test_engine_run_sync_pushes_index_only_change_with_no_session_changes(
+    tmp_path: Path,
+) -> None:
+    """An index-only change (no individual session touched) must still be
+    detected and pushed on the next incremental run, not silently skipped."""
+    src = _make_source(tmp_path)
+    (src / "session-store.db").write_text("index-v1", encoding="utf-8")
+    dest = tmp_path / "dest"
+    cfg = _cfg(tmp_path / "home", src, dest)
+
+    assert engine.run_sync(cfg) == 0
+    machine_dir = next(dest.iterdir())
+    assert (machine_dir / "session-store.db").read_text(encoding="utf-8") == "index-v1"
+
+    (src / "session-store.db").write_text("index-v2-only", encoding="utf-8")
+    assert engine.run_sync(cfg) == 0
+    assert (
+        machine_dir / "session-store.db"
+    ).read_text(encoding="utf-8") == "index-v2-only"
+
+
+def test_engine_run_sync_full_pushes_index_only_source_with_no_sessions(
+    tmp_path: Path,
+) -> None:
+    """A full reconciliation must still carry an index-only source (zero
+    session directories) -- an empty batch list must not skip the index."""
+    src = tmp_path / "copilot"
+    src.mkdir()
+    (src / "session-store.db").write_text("index-only", encoding="utf-8")
+    dest = tmp_path / "dest"
+    cfg = _cfg(tmp_path / "home", src, dest)
+
+    assert engine.run_sync(cfg, full=True) == 0
+    machine_dir = next(dest.iterdir())
+    assert (
+        machine_dir / "session-store.db"
+    ).read_text(encoding="utf-8") == "index-only"
+
+
+def test_engine_run_sync_resets_stale_signatures_on_identity_change(
+    tmp_path: Path,
+) -> None:
+    """A session unchanged since it was last synced to destination A must
+    still be pushed to a NEW destination B -- its stale, content-only
+    signature from A must not fool B's incremental check into skipping it."""
+    src = tmp_path / "copilot"
+    for name in ("x", "y"):
+        sess = src / "session-state" / name
+        sess.mkdir(parents=True)
+        (sess / "events.jsonl").write_text(f'{{"id": "{name}"}}\n', encoding="utf-8")
+    dest_a = tmp_path / "dest-a"
+    cfg = _cfg(tmp_path / "home", src, dest_a)
+    cfg._data["sync"]["repo_allowlist"] = []
+
+    assert engine.run_sync(cfg) == 0
+    assert (dest_a / next(dest_a.iterdir()).name / "session-state" / "y").is_dir()
+
+    dest_b = tmp_path / "dest-b"
+    cfg._data["sync"]["targets"]["local"]["path"] = str(dest_b)
+
+    # y's content never changes -- only the destination does.
+    assert engine.run_sync(cfg) == 0
+    machine_dir = next(dest_b.iterdir())
+    assert (machine_dir / "session-state" / "x").is_dir()
+    assert (machine_dir / "session-state" / "y").is_dir()
+
+
+def test_engine_run_sync_does_not_record_deferred_session_signature(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """A session with a deferred (locked) file during the push must not be
+    recorded as synced -- it must still show up as changed next run."""
+    src = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    cfg = _cfg(tmp_path / "home", src, dest)
+
+    from agent_logger.sync.targets.base import PushResult
+
+    real_push = LocalTarget.push
+    calls: list[set] = []
+
+    def _deferring_push(self, source, machine, include_sessions=None, *, batch_mode=False):
+        result = real_push(
+            self, source, machine, include_sessions, batch_mode=batch_mode
+        )
+        calls.append(include_sessions)
+        if len(calls) == 1:
+            return PushResult(
+                ok=True,
+                detail=result.detail,
+                file_count=result.file_count,
+                deferred_sessions=("abc-123",),
+            )
+        return result
+
+    monkeypatch.setattr(LocalTarget, "push", _deferring_push)
+
+    assert engine.run_sync(cfg) == 0  # first (full) pass "defers" abc-123
+
+    from agent_logger.sync.change_tracker import ChangeTracker, resolve_db_path
+
+    tracker = ChangeTracker(resolve_db_path(cfg.sync_change_tracking["db_path"], cfg.home))
+    assert tracker.changed_sessions(src) == {"abc-123"}
+
+    assert engine.run_sync(cfg) == 0  # second pass retries it, this time clean
+    assert tracker.changed_sessions(src) == set()
+
+
+def test_hub_compaction_fails_closed_when_tracked_lookup_unresolved(
+    monkeypatch, capsys, tmp_path: Path,
+) -> None:
+    """An unresolved (not confirmed-empty) tracked-worktree lookup must skip
+    hub compaction rather than proceed as if nothing needed protecting."""
+    from agent_logger.sync import compact as compact_mod
+
+    src = _make_source(tmp_path)
+    dest = tmp_path / "dest"
+    cfg = _cfg(tmp_path / "home", src, dest)
+    cfg._data["sync"]["compact"] = {"enabled": True}
+    calls: list[object] = []
+    monkeypatch.setattr(
+        compact_mod, "resolve_hub_tracked_paths", lambda require: (None, True),
+    )
+    monkeypatch.setattr(
+        LocalTarget, "compact_backlog",
+        lambda *a, **k: calls.append((a, k)) or 0,
+    )
+
+    assert engine.run_sync(cfg) == 0
+    assert calls == []
+    assert "unresolved this pass" in capsys.readouterr().err
+
+    calls.clear()
+    assert engine.do_compact_hub(cfg, dry_run=False, verbose=False) == 0
+    assert calls == []
+    assert "unresolved this pass" in capsys.readouterr().err
 
 
 def test_engine_run_sync_disabled(monkeypatch, tmp_path: Path) -> None:
@@ -811,6 +2856,52 @@ def test_rsync_session_filters_scope_without_allowlist() -> None:
     assert filtered[-1] == "--exclude=*"
 
 
+def test_rsync_session_filters_exclude_lock_sidecars_before_includes() -> None:
+    """Lock/temp/hold sidecars must never reach an rsync-based target either.
+
+    Mirrors the filesystem targets' ``_EXCLUDE_NAMES``/``_EXCLUDE_SUFFIXES``:
+    a live ``inuse.<pid>.hold`` marker (or a ``.lock``/``.tmp`` sidecar) must
+    be excluded before the recursive include, since rsync's filter list uses
+    first-match-wins semantics.
+    """
+    from agent_logger.sync.targets.base import rsync_session_filters
+
+    filters = rsync_session_filters(None)
+
+    for pattern in ("--exclude=.lock", "--exclude=lock", "--exclude=*.lock",
+                    "--exclude=*.tmp", "--exclude=*.hold"):
+        assert pattern in filters
+        assert filters.index(pattern) < filters.index("--include=session-state/***")
+
+
+def test_rsync_session_filters_exclude_detected_detritus_first() -> None:
+    from agent_logger.sync.targets.base import rsync_session_filters
+
+    root = Path("session-state") / "abc-123" / "files" / "tool" / "browser"
+    filters = rsync_session_filters(None, (root,))
+
+    assert f"--exclude=/{root.as_posix()}/***" in filters
+    assert (
+        filters.index(f"--exclude=/{root.as_posix()}/***")
+        < filters.index("--include=session-state/***")
+    )
+    # Lock/temp/hold sidecar excludes precede detected-detritus excludes.
+    assert filters.index("--exclude=*.hold") < filters.index(
+        f"--exclude=/{root.as_posix()}/***"
+    )
+
+
+def test_rsync_session_filters_escape_pattern_characters() -> None:
+    from agent_logger.sync.targets.base import rsync_session_filters
+
+    root = Path("session-state") / "abc" / "files" / "run[1]*?"
+    filters = rsync_session_filters(None, (root,))
+
+    assert (
+        "--exclude=/session-state/abc/files/run\\[1\\]\\*\\?/***"
+    ) in filters
+
+
 def test_local_target_push_includes_only_selected_provenance(tmp_path: Path) -> None:
     src = _make_source(tmp_path)
     provenance = src / "provenance"
@@ -909,3 +3000,53 @@ def test_engine_no_notify_without_url(monkeypatch, tmp_path):
     monkeypatch.setattr(engine, "post_notify", lambda *a, **k: calls.append(a) or True)
     assert engine.run_sync(cfg) == 0
     assert calls == []
+
+
+@pytest.mark.no_autotrust
+def test_main_honors_repo_local_sync_local_path(monkeypatch, tmp_path):
+    """engine.main() -- the actual session-sync CLI entry point every
+    scheduled sync invokes -- must resolve schema v3's repo-local
+    sync.local_path, not just the ambient CLI config command. This was
+    missed when schema v3 was added: main() hardcoded
+    load_config(include_repo=False), a pre-v3 boundary that made the whole
+    feature inert for the one thing it exists to fix."""
+    from .conftest import init_git_repo
+
+    repo = tmp_path / "repo"
+    init_git_repo(repo, remote="https://example.test/example-owner/demo.git", branch="main")
+    (repo / ".agent-logger.yaml").write_text(
+        "schema_version: 3\nsync:\n  local_path: "
+        + str(tmp_path / "declared-target")
+        + "\n",
+        encoding="utf-8",
+    )
+    registry = tmp_path / "repos.yaml"
+    import yaml
+
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "repos": {
+                    "demo": {
+                        "remote": "https://example.test/example-owner/demo.git",
+                        "default_branch": "main",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_WORKTREES_REPOS_YAML", str(registry))
+    monkeypatch.setenv("AGENT_LOGGER_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(repo)
+
+    captured = {}
+
+    def _fake_run_sync(cfg, **kwargs):
+        captured["sync_path"] = cfg.sync_path
+        return 0
+
+    monkeypatch.setattr(engine, "run_sync", _fake_run_sync)
+
+    assert engine.main(["run"]) == 0
+    assert captured["sync_path"] == tmp_path / "declared-target"

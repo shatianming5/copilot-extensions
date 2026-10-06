@@ -11,6 +11,7 @@
 #   bash plugins/agent-codespaces/scripts/install.sh install
 #   bash plugins/agent-codespaces/scripts/install.sh stamp      # cheap: binstub only, defer runtime to first use
 #   bash plugins/agent-codespaces/scripts/install.sh provision  # heavy: build the runtime venv (what the binstub calls on first use)
+#   bash plugins/agent-codespaces/scripts/install.sh provision --install-dir DIR
 #   bash plugins/agent-codespaces/scripts/install.sh status
 #   bash plugins/agent-codespaces/scripts/install.sh update
 # =============================================================================
@@ -167,10 +168,14 @@ ACTION="${1:-status}"
 shift || true
 
 FORCE=false
+DRY_RUN=false
+INSTALL_DIR=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --install-dir) INSTALL_DIR="$2"; shift 2 ;;
         --force) FORCE=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
         *)       echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -178,7 +183,7 @@ done
 # -- Metadata --------------------------------------------------------------
 
 SERVICE_NAME="Agent Codespaces"
-INSTALL_DIR="$HOME/.agent-codespaces"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/.agent-codespaces}"
 LOCAL_BIN="$HOME/.local/bin"
 VENV_DIR="$INSTALL_DIR/.venv"
 VENV_PYTHON="$VENV_DIR/bin/python"
@@ -260,6 +265,38 @@ fi
 CFG_MIGRATE_DIR="$PLUGIN_DIR/libs/config-migrate"
 if [[ ! -f "$CFG_MIGRATE_DIR/pyproject.toml" ]]; then
     CFG_MIGRATE_DIR="$REPO_ROOT/libs/config-migrate"
+fi
+# zdd dir (uv-editable canonical reference in a dev checkout, real copy in a
+# materialized release payload): plugin-vendored or repo-root.
+ZDD_DIR="$PLUGIN_DIR/libs/zdd"
+if [[ ! -f "$ZDD_DIR/pyproject.toml" ]]; then
+    ZDD_DIR="$REPO_ROOT/libs/zdd"
+fi
+# venue-copilot dir (uv-editable canonical reference in a dev checkout, real
+# copy in a materialized release payload): plugin-vendored or repo-root.
+VENUE_COPILOT_DIR="$PLUGIN_DIR/libs/venue-copilot"
+if [[ ! -f "$VENUE_COPILOT_DIR/pyproject.toml" ]]; then
+    VENUE_COPILOT_DIR="$REPO_ROOT/libs/venue-copilot"
+fi
+# session-liveness-probe dir (uv-editable canonical reference in a dev
+# checkout, real copy in a materialized release payload): plugin-vendored or
+# repo-root.
+SESSION_LIVENESS_PROBE_DIR="$PLUGIN_DIR/libs/session-liveness-probe"
+if [[ ! -f "$SESSION_LIVENESS_PROBE_DIR/pyproject.toml" ]]; then
+    SESSION_LIVENESS_PROBE_DIR="$REPO_ROOT/libs/session-liveness-probe"
+fi
+# single-instance-lease dir (uv-editable canonical reference in a dev
+# checkout, real copy in a materialized release payload): plugin-vendored or
+# repo-root.
+SINGLE_INSTANCE_LEASE_DIR="$PLUGIN_DIR/libs/single-instance-lease"
+if [[ ! -f "$SINGLE_INSTANCE_LEASE_DIR/pyproject.toml" ]]; then
+    SINGLE_INSTANCE_LEASE_DIR="$REPO_ROOT/libs/single-instance-lease"
+fi
+# remote-login-shell dir (uv-editable canonical reference in a dev checkout,
+# real copy in a materialized release payload): plugin-vendored or repo-root.
+REMOTE_LOGIN_SHELL_DIR="$PLUGIN_DIR/libs/remote-login-shell"
+if [[ ! -f "$REMOTE_LOGIN_SHELL_DIR/pyproject.toml" ]]; then
+    REMOTE_LOGIN_SHELL_DIR="$REPO_ROOT/libs/remote-login-shell"
 fi
 
 DEPLOY_SOURCE_PATHS=("plugins/agent-codespaces/")
@@ -415,13 +452,22 @@ PY
     exit 1
 }
 
-# uv pip install the vendored libs (ssh-manager, credential-relay) then
-# agent-codespaces into the given venv python. Non-editable; deps resolved from
-# pyproject.toml. The vendored libs are force-reinstalled so a local code change
-# propagates even without a version bump (uv otherwise skips a same-version path
-# dep, leaving the venv stale).
+# uv pip install the vendored libs (ssh-manager, credential-relay, zdd,
+# venue-copilot, session-liveness-probe, single-instance-lease,
+# remote-login-shell) then agent-codespaces into the given
+# venv python. Non-editable by default; deps
+# resolved from pyproject.toml. The vendored libs are force-reinstalled so a
+# local code change propagates even without a version bump (uv otherwise skips
+# a same-version path dep, leaving the venv stale).
+#
+# Pass "--editable" as $2 (mutable-dev-slot, #3376) to install every one of
+# these path-dependencies with `uv pip install -e` instead, so the venv's
+# site-packages resolve straight back to this worktree's own checkout -- an
+# ordinary source edit takes effect without re-running the installer. Used
+# only for the mutable `versions/dev` slot; never for a real (numbered)
+# version.
 _install_package_into() {
-    local py="$1"
+    local py="$1" mode="${2:-}"
     if [[ ! -f "$SSH_MGR_DIR/pyproject.toml" ]]; then
         _fail "ssh-manager source not found at $SSH_MGR_DIR"
         return 1
@@ -434,12 +480,63 @@ _install_package_into() {
         _fail "config-migrate source not found at $CFG_MIGRATE_DIR"
         return 1
     fi
+    if [[ ! -f "$ZDD_DIR/pyproject.toml" ]]; then
+        _fail "zdd source not found at $ZDD_DIR"
+        return 1
+    fi
+    if [[ ! -f "$VENUE_COPILOT_DIR/pyproject.toml" ]]; then
+        _fail "venue-copilot source not found at $VENUE_COPILOT_DIR"
+        return 1
+    fi
+    if [[ ! -f "$SESSION_LIVENESS_PROBE_DIR/pyproject.toml" ]]; then
+        _fail "session-liveness-probe source not found at $SESSION_LIVENESS_PROBE_DIR"
+        return 1
+    fi
+    if [[ ! -f "$SINGLE_INSTANCE_LEASE_DIR/pyproject.toml" ]]; then
+        _fail "single-instance-lease source not found at $SINGLE_INSTANCE_LEASE_DIR"
+        return 1
+    fi
+    if [[ ! -f "$REMOTE_LOGIN_SHELL_DIR/pyproject.toml" ]]; then
+        _fail "remote-login-shell source not found at $REMOTE_LOGIN_SHELL_DIR"
+        return 1
+    fi
+    if [[ "$mode" == "--editable" ]]; then
+        uv pip install --python "$py" --editable "$SSH_MGR_DIR" --quiet || {
+            _fail "ssh-manager install failed"; return 1; }
+        uv pip install --python "$py" --editable "$CRED_RELAY_DIR" --quiet || {
+            _fail "credential-relay install failed"; return 1; }
+        uv pip install --python "$py" --editable "$CFG_MIGRATE_DIR" --quiet || {
+            _fail "config-migrate install failed"; return 1; }
+        uv pip install --python "$py" --editable "$ZDD_DIR" --quiet || {
+            _fail "zdd install failed"; return 1; }
+        uv pip install --python "$py" --editable "$VENUE_COPILOT_DIR" --quiet || {
+            _fail "venue-copilot install failed"; return 1; }
+        uv pip install --python "$py" --editable "$SESSION_LIVENESS_PROBE_DIR" --quiet || {
+            _fail "session-liveness-probe install failed"; return 1; }
+        uv pip install --python "$py" --editable "$SINGLE_INSTANCE_LEASE_DIR" --quiet || {
+            _fail "single-instance-lease install failed"; return 1; }
+        uv pip install --python "$py" --editable "$REMOTE_LOGIN_SHELL_DIR" --quiet || {
+            _fail "remote-login-shell install failed"; return 1; }
+        uv pip install --python "$py" --editable "$PLUGIN_DIR" --quiet || {
+            _fail "agent-codespaces install failed"; return 1; }
+        return 0
+    fi
     uv pip install --python "$py" --reinstall-package agent-ssh-manager "$SSH_MGR_DIR" --quiet || {
         _fail "ssh-manager install failed"; return 1; }
     uv pip install --python "$py" --reinstall-package agent-credential-relay "$CRED_RELAY_DIR" --quiet || {
         _fail "credential-relay install failed"; return 1; }
     uv pip install --python "$py" --reinstall-package agent-config-migrate "$CFG_MIGRATE_DIR" --quiet || {
         _fail "config-migrate install failed"; return 1; }
+    uv pip install --python "$py" --reinstall-package agent-zdd "$ZDD_DIR" --quiet || {
+        _fail "zdd install failed"; return 1; }
+    uv pip install --python "$py" --reinstall-package agent-venue-copilot "$VENUE_COPILOT_DIR" --quiet || {
+        _fail "venue-copilot install failed"; return 1; }
+    uv pip install --python "$py" --reinstall-package agent-session-liveness-probe "$SESSION_LIVENESS_PROBE_DIR" --quiet || {
+        _fail "session-liveness-probe install failed"; return 1; }
+    uv pip install --python "$py" --reinstall-package agent-single-instance-lease "$SINGLE_INSTANCE_LEASE_DIR" --quiet || {
+        _fail "single-instance-lease install failed"; return 1; }
+    uv pip install --python "$py" --reinstall-package agent-remote-login-shell "$REMOTE_LOGIN_SHELL_DIR" --quiet || {
+        _fail "remote-login-shell install failed"; return 1; }
     uv pip install --python "$py" --reinstall-package agent-codespaces "$PLUGIN_DIR" --quiet || {
         _fail "agent-codespaces install failed"; return 1; }
 }
@@ -524,6 +621,120 @@ deploy_package() {
     # issue-#14 sync). agent-bridge's own installer prunes any stale copy and
     # guards against one lingering.
 }
+
+# === mutable-dev-slot (#3376/Phase 2) ===
+# Copy versioned_runtime.py into the plugin's own root (sibling of versions/),
+# so the DEPLOYED agent-codespaces CLI's `dev-release`/`dev-status` verbs can
+# shell out to it even when the operator is not standing in a source checkout
+# (docs/patterns/mutable-dev-slot.md Runtime accessibility, option 1).
+# Best-effort -- never fatal.
+_deploy_versioned_runtime_helper() {
+    cp -f "$SCRIPT_DIR/versioned_runtime.py" "$INSTALL_DIR/versioned_runtime.py" 2>/dev/null \
+        || _warn "Could not stage versioned_runtime.py into $INSTALL_DIR"
+}
+
+# The absolute worktree checkout path claiming/releasing the mutable dev slot
+# -- the same value + resolution agent-codespaces' own cross-machine CodeSpace
+# claims already use as their `owner` (docs/patterns/mutable-dev-slot.md).
+# Falls back to this repo checkout's own root when agent-worktrees is
+# unavailable (e.g. a bare clone).
+_resolve_dev_slot_owner() {
+    local out
+    if command -v agent-worktrees &>/dev/null; then
+        out="$(agent-worktrees get worktree-dir 2>/dev/null || true)"
+        [[ -n "$out" ]] && { printf '%s\n' "$out"; return 0; }
+    fi
+    printf '%s\n' "$REPO_ROOT"
+}
+
+# Claim + (re)build the mutable `versions/dev` slot IN PLACE (an editable
+# install against THIS checkout), then activate it. Safe to call repeatedly
+# across an iteration loop: the dev venv is reused, only the editable package
+# links are refreshed -- not a fresh venv every call. Release with the
+# deployed CLI's own `dev-release` verb (not this installer -- see
+# docs/patterns/mutable-dev-slot.md). Accepts an optional "--force" arg.
+do_dev() {
+    local force_flag="${1:-}"
+    _header "$SERVICE_NAME (dev slot)"
+    if [[ -z "$SRC_VERSION" ]]; then
+        _fail "dev mode requires the versioned-runtime layout (no version in pyproject.toml?)"
+        return 1
+    fi
+    mkdir -p "$INSTALL_DIR" "$LOCAL_BIN"
+    _deploy_versioned_runtime_helper
+
+    local owner dev_dir dev_python
+    owner="$(_resolve_dev_slot_owner)"
+    dev_dir="$INSTALL_DIR/versions/dev"
+    dev_python="$dev_dir/bin/python"
+
+    _assert_uv
+    _ensure_uv_index
+    if [[ ! -f "$dev_python" ]]; then
+        mkdir -p "$dev_dir"
+        if ! uv venv "$dev_dir" --python 3.11 --allow-existing 2>/dev/null; then
+            uv venv "$dev_dir" --allow-existing 2>/dev/null || true
+        fi
+        if [[ ! -f "$dev_python" ]]; then
+            _fail "dev venv creation failed at $dev_dir"
+            return 1
+        fi
+        _ok "dev venv created at $dev_dir"
+    else
+        _ok "Reusing existing dev venv at $dev_dir (mutable in place)"
+    fi
+
+    local prev_version claim_args=(--root "$INSTALL_DIR" dev-claim --owner "$owner")
+    prev_version="$(_run_versioned_runtime --root "$INSTALL_DIR" --link-name .venv current 2>/dev/null || true)"
+    [[ -n "$prev_version" ]] && claim_args+=(--previous-version "$prev_version")
+    [[ "$force_flag" == "--force" ]] && claim_args+=(--force)
+    local claim_out claim_rc
+    claim_out="$(_run_versioned_runtime "${claim_args[@]}" 2>&1)"; claim_rc=$?
+    if [[ $claim_rc -eq 2 ]]; then
+        _fail "dev slot is already claimed by a different owner: $claim_out"
+        _fail "Pass --force to override, or release it from its current owner first."
+        return 1
+    elif [[ $claim_rc -ne 0 ]]; then
+        _fail "dev-claim failed: $claim_out"
+        return 1
+    fi
+    if [[ -n "$prev_version" ]]; then
+        _ok "dev slot claimed by $owner (restores to '$prev_version' on release)"
+    else
+        _ok "dev slot claimed by $owner"
+    fi
+
+    _install_package_into "$dev_python" --editable || return 1
+    # NOTE: deliberately do NOT call _stamp_build_info here -- an editable
+    # install's "package dir" resolves straight back to src/agent_codespaces/
+    # in THIS checkout, so stamping would write _build_info.py into tracked
+    # source rather than an installed copy. `agent-codespaces version` in dev
+    # mode falls back to the plain importlib-derived __version__, which is
+    # enough for dev-mode diagnostics.
+
+    local check
+    check="$("$dev_python" -c 'import agent_codespaces; print("OK")' 2>/dev/null || true)"
+    if [[ "$check" != "OK" ]]; then
+        _fail "dev slot failed its health gate (import agent_codespaces) -- not activating"
+        return 1
+    fi
+
+    if ! _run_versioned_runtime --root "$INSTALL_DIR" --link-name .venv mark-complete dev; then
+        _fail "Failed to mark dev slot complete"
+        return 1
+    fi
+    if ! _run_versioned_runtime --root "$INSTALL_DIR" --link-name .venv activate dev --no-link; then
+        _fail "Failed to activate dev slot"
+        return 1
+    fi
+    _ok "dev slot active (current-version -> dev, editable install from $PLUGIN_DIR)"
+
+    deploy_binstub
+    echo ""
+    _ok "$SERVICE_NAME dev slot ready. Edit $PLUGIN_DIR and re-run 'dev' to refresh."
+    _ok "Release when done: agent-codespaces dev-release"
+}
+# === end mutable-dev-slot ===
 
 deploy_binstub() {
     mkdir -p "$LOCAL_BIN"
@@ -683,24 +894,41 @@ MANIFEST
 
 # -- Actions ---------------------------------------------------------------
 
-# -- Connection Owner service (config-gated; default off) ------------------
+# -- Connection Owner service (config-gated; default on, on-demand) --------
 # The persistent per-machine Connection Owner relay daemon (dotfiles#1320/#1333)
 # is provisioned as a systemd --user service, but ONLY when connection_owner is
-# enabled in config. Default off -> the unit is ensured ABSENT, so a machine with
-# the feature disabled is unchanged (truly inert). Enabling it is "flip the
-# config, run update" (the install/update convergence contract, ce#488). ExecStart
-# resolves through the stable `.venv` symlink so it survives version cutover.
+# enabled in config -- default is now ON (the daemon + defer wiring finished
+# rolling out; this is the login-triggered convenience, not the only way it
+# starts: a tenant (ssh/dispatch) also spins it up itself on-demand if it isn't
+# already running, and the daemon exits on its own once idle -- see
+# connection_owner.idle_shutdown_after; `Restart=on-failure` below means a
+# clean idle-exit is NOT treated as a failure to restart-loop). An explicit
+# opt-out -> the unit is ensured ABSENT, so a machine that disabled the feature
+# is unchanged (truly inert; on-demand spin-up also respects the disabled
+# config). ExecStart resolves through the stable `.venv` symlink so it
+# survives version cutover.
 SYSTEMD_OWNER_UNIT="agent-codespaces-owner.service"
 
-# Echo "1" if the Connection Owner is enabled in the merged config, else "0".
-# Never fails the caller (disabled on any error).
+# Echo "enabled", "disabled", or "unknown" for the merged Connection Owner config.
+# Unknown means leave any existing unit untouched: only affirmative disabled removes.
 _owner_enabled() {
-    PYTHONUTF8=1 "$LINK_PYTHON" -m agent_codespaces owner --status 2>/dev/null \
-        | "$LINK_PYTHON" -c 'import sys, json
+    local json state
+    json="$(PYTHONUTF8=1 "$LINK_PYTHON" -m agent_codespaces owner --status 2>/dev/null)" || {
+        echo "unknown"
+        return 0
+    }
+    state="$(printf '%s\n' "$json" | "$LINK_PYTHON" -c 'import sys, json
 try:
-    print("1" if json.load(sys.stdin).get("enabled") else "0")
+    data = json.load(sys.stdin)
+    enabled = data.get("enabled") if isinstance(data, dict) else None
+    # Only a real boolean decides; {} / null / a schema mismatch stays unknown.
+    print(("enabled" if enabled else "disabled") if isinstance(enabled, bool) else "unknown")
 except Exception:
-    print("0")' 2>/dev/null || echo "0"
+    print("unknown")' 2>/dev/null)" || state="unknown"
+    case "$state" in
+        enabled|disabled) echo "$state" ;;
+        *) echo "unknown" ;;
+    esac
 }
 
 _remove_owner_service() {
@@ -717,7 +945,13 @@ _remove_owner_service() {
 _sync_owner_service() {
     # Config-gated provisioning: enabled -> install + (re)start the systemd --user
     # unit; disabled (default) -> ensure it is absent. Idempotent + additive.
-    if [[ "$(_owner_enabled)" != "1" ]]; then
+    local owner_state
+    owner_state="$(_owner_enabled)"
+    if [[ "$owner_state" == "unknown" ]]; then
+        _warn "Connection Owner config query failed; leaving any existing systemd unit unchanged"
+        return 0
+    fi
+    if [[ "$owner_state" == "disabled" ]]; then
         _remove_owner_service
         return 0
     fi
@@ -767,6 +1001,10 @@ do_install() {
     # Versioned layout (#581): health-gate the slot + swap the `.venv` symlink.
     _versioned_activate || return 1
 
+    # Stage versioned_runtime.py at the root so the deployed CLI's
+    # dev-release/dev-status verbs work without a source checkout (#3376).
+    _deploy_versioned_runtime_helper
+
     # Deploy binstub
     deploy_binstub
 
@@ -788,7 +1026,7 @@ do_install() {
         return 1
     fi
 
-    # Connection Owner daemon (config-gated; default off -> ensured absent).
+    # Connection Owner daemon (config-gated; default on unless opted out).
     _sync_owner_service
 
     echo ""
@@ -797,44 +1035,65 @@ do_install() {
 
 do_uninstall() {
     _header "$SERVICE_NAME Uninstall"
+    $DRY_RUN && echo "(dry run -- nothing will be changed)"
 
-    # Remove the Connection Owner systemd unit (if provisioned).
-    _remove_owner_service
+    if $DRY_RUN; then
+        [[ -f "$HOME/.config/systemd/user/agent-codespaces-owner.service" ]] && \
+            echo "[dry-run] would stop + remove Connection Owner systemd unit"
+        local socket_dir="$INSTALL_DIR/sockets"
+        [[ -d "$socket_dir" ]] && echo "[dry-run] would stop managed SSH connections under: $socket_dir"
+    else
+        # Remove the Connection Owner systemd unit (if provisioned).
+        _remove_owner_service
 
-    # Stop managed SSH ControlMaster connections before removing files. They
-    # multiplex connections to CodeSpaces via sockets under
-    # ~/.agent-codespaces/sockets. Close each via `ssh -O exit` (best-effort),
-    # then kill any lingering ssh master referencing the socket dir.
-    local socket_dir="$INSTALL_DIR/sockets"
-    if [[ -d "$socket_dir" ]]; then
-        for sock in "$socket_dir"/*; do
-            [[ -e "$sock" ]] || continue
-            ssh -o "ControlPath=$sock" -O exit placeholder >/dev/null 2>&1 || true
-        done
-    fi
-    if command -v pkill &>/dev/null; then
-        pkill -f "ControlPath=$INSTALL_DIR/sockets" 2>/dev/null && \
-            _changed "Stopped managed SSH ControlMaster processes" || true
+        # Stop managed SSH ControlMaster connections before removing files. They
+        # multiplex connections to CodeSpaces via sockets under
+        # ~/.agent-codespaces/sockets. Close each via `ssh -O exit` (best-effort),
+        # then kill any lingering ssh master referencing the socket dir.
+        local socket_dir="$INSTALL_DIR/sockets"
+        if [[ -d "$socket_dir" ]]; then
+            for sock in "$socket_dir"/*; do
+                [[ -e "$sock" ]] || continue
+                ssh -o "ControlPath=$sock" -O exit placeholder >/dev/null 2>&1 || true
+            done
+        fi
+        if command -v pkill &>/dev/null; then
+            pkill -f "ControlPath=$INSTALL_DIR/sockets" 2>/dev/null && \
+                _changed "Stopped managed SSH ControlMaster processes" || true
+        fi
     fi
 
     # Remove binstub
     local stub_path="$LOCAL_BIN/agent-codespaces"
     if [[ -f "$stub_path" ]]; then
-        rm -f "$stub_path"
-        _changed "Removed binstub: $stub_path"
+        if $DRY_RUN; then
+            echo "[dry-run] would remove binstub: $stub_path"
+        else
+            rm -f "$stub_path"
+            _changed "Removed binstub: $stub_path"
+        fi
     else
         _skip "Binstub not found"
     fi
 
-    # Remove install directory
+    # Remove install directory (config, DB, venv -- agent-codespaces has no
+    # --purge distinction; uninstall always removes the whole install dir).
     if [[ -d "$INSTALL_DIR" ]]; then
-        rm -rf "$INSTALL_DIR"
-        _changed "Removed: $INSTALL_DIR"
+        if $DRY_RUN; then
+            echo "[dry-run] would remove (config + DB + venv): $INSTALL_DIR"
+        else
+            rm -rf "$INSTALL_DIR"
+            _changed "Removed: $INSTALL_DIR"
+        fi
     else
         _skip "Install directory not found"
     fi
 
-    _ok "$SERVICE_NAME uninstalled"
+    if $DRY_RUN; then
+        echo "$SERVICE_NAME uninstall dry run complete -- nothing was changed"
+    else
+        _ok "$SERVICE_NAME uninstalled"
+    fi
 }
 
 do_status() {
@@ -942,6 +1201,10 @@ do_update() {
     # Versioned layout (#581): health-gate the slot + swap the `.venv` symlink.
     _versioned_activate || return 1
 
+    # Stage versioned_runtime.py at the root so the deployed CLI's
+    # dev-release/dev-status verbs work without a source checkout (#3376).
+    _deploy_versioned_runtime_helper
+
     # Re-deploy binstub
     deploy_binstub
 
@@ -953,7 +1216,7 @@ do_update() {
     # Update manifest
     write_deploy_manifest
 
-    # Connection Owner daemon (config-gated; default off -> ensured absent).
+    # Connection Owner daemon (config-gated; default on unless opted out).
     _sync_owner_service
 
     _ok "$SERVICE_NAME updated"
@@ -995,7 +1258,7 @@ do_provision() {
         _fail "Verification: module import failed"
         return 1
     fi
-    # Connection Owner daemon (config-gated; default off -> ensured absent).
+    # Connection Owner daemon (config-gated; default on unless opted out).
     _sync_owner_service
     _ok "$SERVICE_NAME runtime provisioned"
 }
@@ -1009,8 +1272,9 @@ case "$ACTION" in
     uninstall) do_uninstall ;;
     status)    do_status ;;
     update)    do_update ;;
+    dev)       do_dev "${2:-}" ;;
     *)
-        echo "Usage: $0 {install|stamp|provision|uninstall|status|update}" >&2
+        echo "Usage: $0 {install|stamp|provision|uninstall|status|update|dev}" >&2
         exit 1
         ;;
 esac

@@ -14,48 +14,91 @@
 # the only machine-local config it needs is the project marker (repo_name +
 # headless). Read by agent-worktrees >= v1.5.3-dev34.
 
-default_branch: main
+default_branch: dev
 remote: origin
+
+# `main` is still this repo's actual GitHub default branch (releases are cut
+# from it), but `dev` is the contribution branch every agent forks worktrees
+# from and targets with PRs (see `default_branch` above + the PR workflow
+# note below). The pre-commit hook guard must therefore protect BOTH names
+# from direct in-worktree commits, not just `default_branch` -- list both
+# explicitly rather than relying on the single-branch default.
+protected_branches: [main, dev]
 
 # PR workflow (agent-worktrees hook facility + create-pr flow) — REQUIRED.
 #
 # copilot-extensions lands changes through pull requests, not direct pushes to
-# `main`. This is enforced on three layers that agree:
+# `dev` (the contribution branch -- see below). This is enforced on four
+# layers that agree:
 #
-#   1. This config (`required: true`) — `push-changes` REFUSES direct-to-`main`
+#   1. This config (`required: true`) — `push-changes` REFUSES direct-to-`dev`
 #      and steers every change through `create-pr`. `required` implies
 #      `enabled`, which also arms the plugin's PR-workflow git-hook shims
 #      (installed by `agent-worktrees register`, armed via
 #      `AGENT_WORKTREES_HOOKS=1` for `pr.enabled` repos): they block committing
-#      to `main` from a worktree and block pushing a worktree branch directly.
+#      to `dev` from a worktree and block pushing a worktree branch directly.
 #      The legitimate `create-pr` / `push-changes` push bypasses the pre-push
 #      guard via `AGENT_WORKTREES_PR_PUSH=1`.
-#   2. A GitHub repository ruleset ("Default-branch policy: PR-required +
-#      non-blocking Copilot review", id 18553911) with a `pull_request` rule --
-#      the FORMAL branch policy that blocks direct pushes to `main` server-side,
-#      so the enforcement holds even for a tool/path that predates or bypasses
-#      layer 1. (One nuance: a commit that is the head of an OPEN PR can still
-#      fast-forward `main` because GitHub counts it as "made through a PR"; an
+#   2. A GitHub repository ruleset ("dev branch policy: PR-required",
+#      id 23904550) with a `pull_request` rule -- the FORMAL branch policy
+#      that blocks direct pushes to `dev` server-side, so the enforcement
+#      holds even for a tool/path that predates or bypasses layer 1. (One
+#      nuance: a commit that is the head of an OPEN PR can still
+#      fast-forward `dev` because GitHub counts it as "made through a PR"; an
 #      unassociated direct commit is rejected. Layer 1 keeps agents off that
 #      path regardless.)
-#   3. The same ruleset's `copilot_code_review` rule auto-requests a
-#      **non-blocking** Copilot review on every PR (review_on_push: true). It is
-#      a review, not a required status check, so it never gates the merge.
+#   3. `.github/workflows/copilot-review-gate.yml` requests a **non-blocking**
+#      Copilot review on every PR authored by a Maintainer (see
+#      CONTRIBUTING.md's "Contribution flow" for why it's Maintainer-only,
+#      not "any invited collaborator"). It is a review, not a required
+#      status check, so it never gates the merge. (The ruleset-native
+#      `copilot_code_review` rule that used to do this unconditionally for
+#      anyone has been removed -- it had no "collaborators only" condition.)
+#   4. Workflow/CODEOWNERS lockdown: `.github/workflows/workflow-lockdown-guard.yml`
+#      (a required status check, no bypass actors, its own ruleset) hard-fails
+#      any PR touching `.github/workflows/`, `.github/actions/`, or
+#      `.github/CODEOWNERS` unless the PR's registered author is ThomasMichon
+#      -- see CONTRIBUTING.md's "Contribution flow" for the accepted
+#      residual risks and structural limitations this layer does NOT close.
 #
-# Flow for every agent (see CONTRIBUTING.md § "Contribution flow"):
+# `dev` is the contribution branch; `main` ships releases. Plugins are
+# published/deployed from `main`, so `dev` is periodically promoted to `main`
+# through the release pipeline -- never by an individual contributor's PR.
+# The ONLY sanctioned exception is unsticking a broken release pipeline itself
+# (e.g. `main` needs a direct hotfix because the promotion job is down); that
+# is a deliberate, explicitly-called-out operator action, never a routine
+# contribution, and every other agent still defaults to `dev`.
+#
+# Flow for every agent (see CONTRIBUTING.md § "Waiting for a verdict"):
 #   copilot-extensions create  ->  edit  ->  create-pr  (auto_open opens the PR)
-#   ->  Copilot posts its (non-blocking) review  ->  the submitter self-merges:
-#       agent-worktrees pr-merge <#> --now      (direct squash merge)
+#   ->  wait for Copilot's review, address findings, re-request as needed
+#   until a passing verdict lands (a genuine Approve for a contributor PR; a
+#   clean Comment -- zero Medium/High findings open -- for this repo's own
+#   owner-authored PRs, which structurally never get Approve)  ->  the
+#   submitter merges: agent-worktrees pr-merge <#> --now (direct squash
+#   merge onto `dev`)
 #
-# This repo is a **submitter-self-merge** repo: it is PR-required, but the only
-# review is a NON-BLOCKING Copilot pass, so the PR author (the owner) approves
-# and merges their own PR directly rather than waiting on a separate human or a
-# consent-label gate. The matrix below makes that contract legible to the pr-*
-# verbs, which classify it as the `pr-self-merge` flow profile:
+# This repo is a **submitter-self-merge** repo: it is PR-required, and the
+# PR author (the owner) approves and merges their own PR directly rather
+# than waiting on a separate human or a consent-label gate. The matrix
+# below makes that contract legible to the pr-* verbs, which classify it
+# as the `pr-self-merge` flow profile:
 #
 #   - no `automerge_label` bound (there is no consent-label gate here);
 #   - `self_approve: true` + `merge_actor: submitter-direct` -> pr-self-merge;
-#   - `reviewer: copilot`, `review_blocking: false` -> the review never gates;
+#   - `reviewer: copilot`, `review_blocking: false` -> **the tooling itself
+#     still does not gate the merge on Copilot's verdict** (`pr-merge --now`
+#     passes `--admin`, bypassing GitHub's own review-gate check
+#     unconditionally) -- CONTRIBUTING.md's own "Waiting for a verdict"
+#     protocol requires waiting for a real passing verdict before merging
+#     anyway (Approve for a contributor PR; a clean Comment for this
+#     repo's own owner-authored PRs, which structurally never get Approve);
+#     that is agent discipline layered on top of this config, not something
+#     this flag currently enforces. Flipping this to `true` is a real lever
+#     for closing that gap but is its own decision (this repo's ruleset
+#     already exempts the maintainer from any required approving review
+#     count, so its practical effect here needs its own validation) --
+#     not changed here;
 #   - `pr-merge <#> --now` performs the sanctioned direct squash-merge, so an
 #     agent never falls back to a raw `gh pr merge`.
 #
@@ -67,10 +110,21 @@ pr:
   required: true
   provider: github
   auto_open: true
+  strategy: keep-alive  # keep the worktree to shepherd the PR to merge; detach is the rare opt-out
   # Hidden source markers carry raw machine/worktree/session identifiers.
-  # This public repo must never publish them; closed-circuit repos may opt in.
-  source_attribution: false
-  strategy: detach
+  # This public repo must never publish the raw marker (source_attribution:
+  # true); closed-circuit repos may opt into that. This repo relies on the
+  # implicit "codename" default (codename-attribution-by-default) --
+  # source_attribution is deliberately OMITTED, not set explicitly to
+  # "codename": an explicit codename value sets
+  # source_attribution_configured=True, which (per may_publish_codename's
+  # round-32 rule) permits a KNOWN "custom" codename_source to publish --
+  # a legacy/unrecognized codename_source still never publishes either way.
+  # Explicit "codename" would still authorize a custom-vocabulary codename
+  # this repo has never manually verified; omitting the key keeps this
+  # repo's fail-closed posture even for that narrower case. Every
+  # WorktreeRecord's own persisted codename_source stays authoritative,
+  # exactly as before this key was removed.
   # PR-flow legibility matrix (surfaced as reminders by the pr-* verbs) -->
   # classifies this repo as `pr-self-merge`.
   self_approve: true
@@ -79,9 +133,17 @@ pr:
   review_blocking: false
   review_latency_hint: "~2m"
   conflict_retriggers_review: true
-  # Merge/update policy (#225). This repo's bot review is non-blocking and is a
-  # review, not a required status check, so nothing gates the merge -- the owner
-  # self-merges immediately. Opt out of prefer-auto-merge so `pr-merge --now`
-  # performs the intended immediate squash self-merge rather than arming a
-  # CI-gated auto-merge that has no required check to wait on.
+  # Merge/update policy (#225). `review_blocking: false` means the tooling
+  # itself does not gate the merge on Copilot's review (it's a review, not
+  # a required status check) -- the owner can self-merge immediately as far
+  # as this flag is concerned. CONTRIBUTING.md's "Waiting for a verdict"
+  # protocol requires waiting for a real passing verdict before doing so
+  # anyway (a genuine Approve for a contributor PR; a clean Comment -- zero
+  # Medium/High findings open -- for this repo's own owner-authored PRs,
+  # which structurally never get Approve); that is agent discipline
+  # layered on top of this config, not something
+  # this flag currently enforces. Opt out of prefer-auto-merge so
+  # `pr-merge --now` performs the intended immediate squash self-merge
+  # rather than arming a CI-gated auto-merge that has no required check to
+  # wait on.
   prefer_auto_merge: false

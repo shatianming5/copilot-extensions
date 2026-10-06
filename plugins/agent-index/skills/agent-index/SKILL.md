@@ -15,14 +15,28 @@ service, or retrieval through its read CLI.
 
 ## Readiness
 
-- A new session's hook stamps a setup-gated payload command when needed. Before
-role adoption, `status` reports structured `setup_required` state and no command
-provisions a runtime or starts a daemon. An operator explicitly chooses
+- The command catalog appears only when the current repository has a valid
+checked-in `.agent-index/config.yaml`, optionally supplemented by a repo-local
+`.copilot-extensions/agent-index/config.yaml` overlay and marketplace overlay.
+For repositories that require external state, the bound knowledge repo's
+checked-in `.agent-index/config.yaml` is the middle **knowledge-overlay** tier.
+This follows the standard `.agent-*` precedence model that agent-worktrees
+documents (machine-local > knowledge overlay > in-repo), with one
+deliberate exception: `corpus.sources` unions by source name instead of list
+replacement so the tiers can compose. A present invalid local config never
+falls through. Outside that scope, `status` reports `inactive` and other
+commands are refused.
+- Session start is non-mutating: it does not stamp or provision a runtime and
+does not start a service. After repository opt-in, an operator explicitly chooses
 `setup --single` or `setup --indexer <machine> --ssh <alias>`; that setup call
-then provisions (`::agent-provisioning::`, usually ~30-120s). Automation must
-also pass `--yes` and an explicit role choice. If the command is missing, the
-session command catalog reports it as unavailable; surface that exact failure
-rather than searching `PATH` or improvising an install.
+may provision only the lightweight client/base CLI (`::agent-provisioning::`).
+The configured host's light `[store,server]` runtime is then provisioned and
+supervised by the plugin's own installer/runtime lifecycle (`install`, `start`,
+`update`, `deploy`); the durable engine remains on its own explicit `engine` /
+`engine-update` path. Setup never starts the host. Automation must also pass
+`--yes` and an explicit role choice. If the command is missing, the session
+command catalog reports it as unavailable; surface that exact failure rather
+than searching `PATH` or improvising an install.
 - `<catalog argv[0]> status` is the first health check in a configured
   repository. It reports service reachability,
 version, index availability, total chunks, per-source coverage, and indexing
@@ -58,16 +72,18 @@ Use the CLI directly when operating the runtime:
 - Setup/routing: `<catalog argv[0]> setup --single`, `<catalog argv[0]> setup
   --indexer <machine> --ssh <alias>`, `<catalog argv[0]> role`,
   `<catalog argv[0]> capability --json`.
-- Service: `<catalog argv[0]> start`, `<catalog argv[0]> stop`,
-  `<catalog argv[0]> status`, `<catalog argv[0]> deploy --recover`.
+- Service: `<catalog argv[0]> status`. `start`, `serve`, `restart`, and
+  `deploy` manage the local host directly. `install` / `update` own the same
+  lifecycle and use zdd cutover for live replacement. Stop remains
+  ownership-checked.
 - Index refresh: `<catalog argv[0]> index [--source S] [--full]`. Incremental is the
 default; `--full` is explicit.
 - Engine daemon: `<catalog argv[0]> engine status|start|stop|run`.
 
 ## Scope and fallback
 
-- The session-start scope-binding hook emits configured scopes from the current
-repo's `.agent-index/config.yaml` `corpus.sources` when present.
+- The session-start scope-binding hook emits `corpus.sources` from the same
+layered config used by the CLI gate.
 - For a plain repo with no corpus config, the catalog command's `index`
 subcommand defaults to the
 current git checkout (`git`) and its commits.
@@ -78,13 +94,15 @@ clearly scoped, pass `source` or `repo` rather than doing an unscoped search.
 
 ## Troubleshooting
 
-- Service down on a host: run/check `<catalog argv[0]> status`; session-start
-`ensure-service` should start the user-mode daemon in the background.
+- Service down on a host: run/check `<catalog argv[0]> status`, then use the
+installer/runtime lifecycle that owns the host (`install`, `start`, `update`,
+`deploy --recover`). Session start never starts the daemon.
 - Client cannot search: run inside a repo with `.agent-index/config.yaml`
 `indexer.ssh` or set `AGENT_INDEX_REPO`; the CLI read transport needs a project
 to choose the SSH target.
 - Engine issues: `<catalog argv[0]> engine status` shows durable engine health, PID,
 endpoint, and venv provisioning state.
-- Interrupted cutover: `<catalog argv[0]> deploy --recover`.
+- Interrupted host cutover: inspect the local zdd routing/runtime state and use
+`deploy --recover`; do not hand-edit markers or manifests to pick a generation.
 
 Architecture details live in `plugins/agent-index/docs/architecture.md`.

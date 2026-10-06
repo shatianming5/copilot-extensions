@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 from agent_worktrees import __main__ as m
+from agent_worktrees import output
 from agent_worktrees import config as cfg
 from agent_worktrees import profile_assignment as assignment
 from agent_worktrees import tracking
@@ -28,6 +29,11 @@ def _profiles(count: int = 6) -> list[cfg.CopilotProfile]:
         )
         for index in range(count)
     ]
+
+
+def _inner_command(command: list[str]) -> list[str]:
+    delimiter = command.index("--")
+    return command[delimiter + 1 :]
 
 
 def _policy(
@@ -527,6 +533,12 @@ def test_lifecycle_mismatch_bind_does_not_break_session_start(
         "render_registry_context",
         lambda *_args, **_kwargs: "registry context",
     )
+    config_calls = []
+    monkeypatch.setattr(
+        m.cfg,
+        "load_config",
+        lambda **kwargs: config_calls.append(kwargs) or argparse.Namespace(),
+    )
     args = argparse.Namespace(
         worktree_id="wt-slow",
         session_id=f"session-{mismatch}",
@@ -548,6 +560,7 @@ def test_lifecycle_mismatch_bind_does_not_break_session_start(
     )
     assert any(event[0] == ("session_started",) for event in activity_events)
     assert updater_calls == [("wt-slow", str(tmp_path / "wt-slow"))]
+    assert config_calls == [{"include_control_plane_related_pr": False}]
 
 
 def test_handoff_redraws_after_binding_only_when_armed(assignment_home):
@@ -621,7 +634,7 @@ def test_handoff_cutover_wires_assignment_profile_and_token(
         profile_assignment=_policy(profiles),
     )
     monkeypatch.setattr(m, "_infer_worktree_id_from_cwd", lambda: "wt-cutover")
-    monkeypatch.setattr(m.cfg, "load_config", lambda: config)
+    monkeypatch.setattr(m.cfg, "load_config", lambda **_kwargs: config)
     monkeypatch.setattr(m.sessions, "has_mux_session", lambda _wt: True)
     monkeypatch.setattr(m.sessions, "mux_active_pane", lambda _wt: "%1")
     monkeypatch.setattr(
@@ -645,7 +658,7 @@ def test_handoff_cutover_wires_assignment_profile_and_token(
     monkeypatch.setattr(m, "_build_launch_cmd", _build)
     monkeypatch.setattr(m, "_build_env", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(m, "_repo_session_env", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(m.sessions, "mux_new_window", _window)
+    monkeypatch.setattr(m.pane_lifecycle, "pane_create", _window)
     monkeypatch.setattr(m.activity, "log_event", lambda *_args, **_kwargs: None)
     args = argparse.Namespace(
         seed="continue",
@@ -794,7 +807,11 @@ def test_armed_picker_base_repo_keeps_default_profile_args_and_env(
     )
 
     assert m._resolve_base_repo(config, args, profile=selected) == 0
-    assert plans[-1]["cmd"][:3] == ["copilot", "--model", "model-0"]
+    assert _inner_command(plans[-1]["cmd"])[:3] == [
+        "copilot",
+        "--model",
+        "model-0",
+    ]
     assert plans[-1]["env"]["PROFILE_ENV"] == "0"
 
 
@@ -1476,13 +1493,13 @@ def test_new_worktree_survives_optional_assignment_state_failure(
         "add_trusted_folder",
         lambda *_args, **_kwargs: False,
     )
-    monkeypatch.setattr(
-        m,
-        "_reconcile_marketplaces_for_checkout",
-        lambda *_args, **_kwargs: None,
-    )
     monkeypatch.setattr(m.activity, "log_event", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(m, "_repo_session_env", lambda *_args, **_kwargs: {})
+    # codename-attribution-by-default (PR #3037 review finding): the
+    # allocation-policy second revalidation reloads config fresh -- this
+    # test's config is a bare, in-memory `cfg.Config`, never registered as
+    # a real project on disk, so resolve the reload back to it directly.
+    monkeypatch.setattr(m.cfg, "load_config", lambda *a, **k: config)
 
     result = m._create_worktree_core(
         config,
@@ -1493,7 +1510,11 @@ def test_new_worktree_survives_optional_assignment_state_failure(
     )
 
     assert Path(result["worktree"]["path"]).exists()
-    assert result["launch"]["cmd"][:3] == ["copilot", "--model", "model-0"]
+    assert _inner_command(result["launch"]["cmd"])[:3] == [
+        "copilot",
+        "--model",
+        "model-0",
+    ]
     assert result["launch"]["env"]["PROFILE_ENV"] == "0"
     assert "profile_assignment" not in result["launch"]
 
@@ -1838,7 +1859,7 @@ def test_cache_only_and_cache_hit_lists_skip_assignment_maintenance(
         "maintain",
         lambda: pytest.fail("fast list path ran assignment maintenance"),
     )
-    monkeypatch.setattr(m, "_json_output", lambda _payload: None)
+    monkeypatch.setattr(output, "_json_output", lambda _payload: None)
 
     base = dict(
         json=True,
@@ -2082,5 +2103,6 @@ def test_selected_profile_remains_an_ordinary_launch_profile():
         "/worktrees/wt",
         profile=profile,
     )
-    assert command[:1] == ["copilot"]
-    assert profile.copilot_args == command[1:-1]
+    inner = _inner_command(command)
+    assert inner[:1] == ["copilot"]
+    assert profile.copilot_args == inner[1:-2]

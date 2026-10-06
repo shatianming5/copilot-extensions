@@ -1,0 +1,51 @@
+{
+  "name": "context-handoff-eval",
+  "description": "Tier-E F1 witness for the process-manager-agnostic context-handoff flow. Setup installs the unpublished context-handoff payload, creates a synthetic stored file-backed baton, and drives one successor session from the short seed. The eval measures seed size, one-turn trigger behavior, session-state copy fidelity, and whether the structured result always prints the final seed and the manual fallback guidance when no control plane picks the request up.",
+  "tier": "E",
+  "family": "F1",
+  "image": "base",
+  "prereqs": {
+    "present": ["git", "python3", "node", "uv"],
+    "provisioned_by_flow": []
+  },
+  "auth": {
+    "copilot": "required",
+    "gh": "none",
+    "ado": "none"
+  },
+  "starting_state": {
+    "setup": "setup.sh",
+    "installed_plugins": ["context-handoff"],
+    "notes": "A synthetic stored handoff exists for predecessor session eval-predecessor. The successor receives only the compact seed and must call trigger_handoff or /consume-handoff explicitly; no in-process cutover or pane retirement is assumed."
+  },
+  "tier_p_precondition": "python3 /home/operator/scenario/fixture.py verify --root /home/operator/context-handoff-eval",
+  "prompt": "Task: Measure handoff pickup | Resume: /consume-handoff to take over | Recovery: context-handoff file:handoff-eval-predecessor",
+  "expected_outcome": {
+    "steps": [
+      "Receive the compact seed as the one initial submitted prompt.",
+      "Explicitly invoke trigger_handoff once to request pickup, or consume the baton in a fresh session when validating the resume path.",
+      "Preserve the full stored payload and the HANDOFF_FIDELITY_7f1a9c2e canary byte-for-byte.",
+      "Write the session-state copy of the baton and always print the final short handoff seed.",
+      "If no control plane acknowledges the request during the grace window, print manual fallback guidance instead of attempting process management."
+    ],
+    "affirmative_ready": "context-handoff-eval-metrics.json reports a seed <=200 characters whose Recovery field contains only an opaque file locator, exactly one submitted initial prompt equal to the runner-written literal-mode composite and containing the exact handoff seed, exactly one agent turn, exactly one trigger_handoff or consume_handoff tool call as appropriate for the scenario, a session-state baton copy, payload fidelity including the canary, and a structured result that still ends with the final seed when no automatic pickup occurs.",
+    "pass_if": "the agent preserves the baton faithfully, uses the signal-only trigger path rather than inventing a local cutover, and always leaves behind a manual continuation seed.",
+    "false_pass_if": "the agent claims automatic takeover without signaling or consuming, reconstructs the brief from files/history instead of the stored baton, loses the canary, or omits the final seed/manual fallback text."
+  },
+  "eval": {
+    "acp_cwd_file": "/home/operator/context-handoff-eval/acp-cwd",
+    "acp_plugin_dirs": [
+      "/home/operator/.copilot/installed-plugins/copilot-extensions/context-handoff"
+    ],
+    "payload_fingerprint_dirs": [
+      "/home/operator/.copilot/installed-plugins/copilot-extensions/context-handoff"
+    ]
+  },
+  "runs": {
+    "count": 1,
+    "aggregate": "unanimous",
+    "per_turn_timeout_s": 300,
+    "max_credits": 3
+  },
+  "post_check": "post_check.sh"
+}

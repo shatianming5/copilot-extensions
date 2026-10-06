@@ -128,7 +128,15 @@ _KNOWN_ACTIONS = frozenset({
     "get-azure-token",
     "get-access-token",
     "ping",
+    "capabilities",
 })
+
+# Advertised by the ``capabilities`` action so a client can tell this relay
+# from an older one (which answers that unknown action with nothing).
+# ``git-credential-username-cache``: git credentials are cached per
+# (protocol, host, username), so a request naming a GitHub account never
+# receives another account's cached credential.
+RELAY_CAPABILITIES = ("git-credential-username-cache",)
 
 # git-credential "get" semantics -- a request asking for a username/password.
 # When one of these cannot be resolved we must FAIL FAST (see below) rather
@@ -146,6 +154,22 @@ _HOSTLESS_ACTIONS = frozenset({"get-github-token", "get-azure-token"})
 # prompting. This converts a silent ~52-min ``git credential fill`` hang into a
 # prompt, explicit auth failure surfaced to the Copilot caller.
 _FAILFAST_RESPONSE = "quit=1\n\n"
+
+# Explicit, wire-visible denial for a *recognized* credential whose specific
+# resource/scope is not permitted (#4367) -- as opposed to an unknown/invalid
+# token, which stays fully silent (a bare closed connection) so an
+# unauthenticated caller learns nothing. Shared with
+# :mod:`credential_relay.sources.az_login`'s own allowlist denial so both
+# denial paths present one consistent response.
+ACCESS_DENIED_RESPONSE = "error=access_denied\nreason=resource_not_allowed\n\n"
+
+
+class ScopeDenied(Exception):
+    """Raise from a ``token_authorizer`` to report an authenticated-but-
+    scope-denied request, distinct from returning ``False`` (an unknown/
+    invalid token). Only actions with a response-producing denial (currently
+    ``get-azure-token``) turn this into :data:`ACCESS_DENIED_RESPONSE`; other
+    actions are denied exactly as a plain ``False`` would (silently)."""
 
 
 @dataclass
@@ -361,6 +385,11 @@ class CredentialRelayServer:
                 writer.write(b"pong\n\n")
                 await writer.drain()
                 return
+            if action == "capabilities":
+                caps = ",".join(RELAY_CAPABILITIES)
+                writer.write(f"capabilities={caps}\n\n".encode())
+                await writer.drain()
+                return
 
             # Policy check
             rejection = self.policy.check(action, fields)
@@ -377,18 +406,33 @@ class CredentialRelayServer:
             # it can't leak into a source response or confuse a source.
             token = fields.pop("auth", "")
             if action in self.token_required_actions:
-                authorized = (
-                    self.token_authorizer(token, action, dict(fields))
-                    if self.token_authorizer else
-                    bool(self.token_validator and self.token_validator(token))
-                )
+                scope_denied = False
+                try:
+                    authorized = (
+                        self.token_authorizer(token, action, dict(fields))
+                        if self.token_authorizer else
+                        bool(self.token_validator and self.token_validator(token))
+                    )
+                except ScopeDenied:
+                    authorized = False
+                    scope_denied = True
                 if not authorized:
                     log.warning(
-                        "[%s] Token gate denied action=%s (missing/invalid token)",
+                        "[%s] Token gate denied action=%s (%s)",
                         addr, action,
+                        "recognized token, scope denied" if scope_denied
+                        else "missing/invalid token",
                     )
                     self.stats.token_rejections += 1
-                    await self._maybe_failfast(action, writer, addr, "token rejected")
+                    # A recognized token whose specific resource/scope is not
+                    # permitted gets the same wire-visible denial az_login's
+                    # own allowlist uses (#4367) -- an unknown/invalid token
+                    # (scope_denied is False here) stays fully silent.
+                    if scope_denied and action == "get-azure-token":
+                        writer.write(ACCESS_DENIED_RESPONSE.encode("utf-8"))
+                        await writer.drain()
+                    else:
+                        await self._maybe_failfast(action, writer, addr, "token rejected")
                     return
 
             # Handle get-access-token: synthesize a credential request for ADO

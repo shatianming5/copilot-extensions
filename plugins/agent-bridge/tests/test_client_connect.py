@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import urllib.error
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
@@ -16,6 +17,10 @@ from agent_bridge.client import (
     BridgeClientError,
     BridgeConnectionError,
 )
+
+
+FORWARDED_ROUTE = {"bind": "127.0.0.1", "port": 62254, "forwarded": True}
+LEGACY_FORWARDED_ROUTE = {"port": 62255}
 
 
 class _FakeResp:
@@ -38,6 +43,21 @@ def _not_found(detail: str = "Session not found") -> urllib.error.HTTPError:
         "http://127.0.0.1/api/v1/sessions/s1",
         404,
         "Not Found",
+        {},
+        io.BytesIO(json.dumps({"detail": detail}).encode()),
+    )
+
+
+def _draining(
+    detail: str = (
+        "agent-bridge is draining for a redeploy and is not "
+        "accepting a new session; retry shortly."
+    ),
+) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        "http://127.0.0.1/api/v1/sessions",
+        503,
+        "Service Unavailable",
         {},
         io.BytesIO(json.dumps({"detail": detail}).encode()),
     )
@@ -313,6 +333,63 @@ class TestReresolveOnRejection:
         assert seen[0].startswith("http://127.0.0.1:57585")  # tried old first
         assert seen[-1].startswith("http://127.0.0.1:47000")  # then the new one
 
+    def test_idempotent_lookup_reresolves_after_connection_reset(self) -> None:
+        old_base = "http://127.0.0.1:57585"
+        new_base = "http://127.0.0.1:47000"
+        client = BridgeClient(
+            old_base,
+            "tok",
+            connect_grace=0.0,
+            reresolve=lambda: new_base,
+        )
+        seen: list[str] = []
+
+        def reset_old_endpoint(req, timeout=None):
+            seen.append(req.full_url)
+            if req.full_url.startswith(old_base):
+                raise urllib.error.URLError(
+                    ConnectionResetError("daemon generation retired")
+                )
+            return _FakeResp({"session_id": "s1"})
+
+        with patch(
+            "agent_bridge.client.urllib.request.urlopen",
+            side_effect=reset_old_endpoint,
+        ):
+            result = client._request("GET", "/api/v1/sessions/s1")
+
+        assert result == {"session_id": "s1"}
+        assert seen == [
+            f"{old_base}/api/v1/sessions/s1",
+            f"{new_base}/api/v1/sessions/s1",
+        ]
+
+    def test_non_idempotent_request_is_not_retried_after_reset(self) -> None:
+        reresolves = {"count": 0}
+
+        def reresolve():
+            reresolves["count"] += 1
+            return "http://127.0.0.1:47000"
+
+        client = BridgeClient(
+            "http://127.0.0.1:57585",
+            "tok",
+            connect_grace=30.0,
+            reresolve=reresolve,
+        )
+        with patch(
+            "agent_bridge.client.urllib.request.urlopen",
+            side_effect=urllib.error.URLError(
+                ConnectionResetError("response lost")
+            ),
+        ):
+            with pytest.raises(
+                BridgeConnectionError, match="non-idempotent POST",
+            ):
+                client._request("POST", "/api/v1/sessions", {"agent": "local"})
+
+        assert reresolves["count"] == 0
+
     def test_reresolve_preserves_encoded_query(self) -> None:
         old_base = "http://127.0.0.1:57585"
         new_base = "http://127.0.0.1:47000"
@@ -515,6 +592,127 @@ class TestSessionNotFoundGrace:
         reresolve.assert_not_called()
 
 
+class TestDrainGrace:
+    """A 503 "draining" from a retiring daemon mid-cutover (#3179) is a normal,
+    bounded, self-resolving condition -- follow the routing table to the
+    successor and retry within the connect grace, exactly like the
+    session-404-settle case above, instead of raising immediately."""
+
+    def test_follows_new_endpoint_after_drain_503(self) -> None:
+        old_base = "http://127.0.0.1:57585"
+        new_base = "http://127.0.0.1:47000"
+        client = BridgeClient(
+            old_base,
+            "tok",
+            connect_grace=0.0,
+            reresolve=lambda: new_base,
+        )
+        seen: list[str] = []
+
+        def by_port(req, timeout=None):
+            seen.append(req.full_url)
+            if req.full_url.startswith(old_base):
+                raise _draining()
+            return _FakeResp({"session_id": "s1"})
+
+        with patch("agent_bridge.client.urllib.request.urlopen", side_effect=by_port):
+            result = client._request("POST", "/api/v1/sessions", {"agent": "local"})
+
+        assert result == {"session_id": "s1"}
+        assert seen == [
+            f"{old_base}/api/v1/sessions",
+            f"{new_base}/api/v1/sessions",
+        ]
+
+    def test_retries_a_result_read_while_its_history_is_merging(self) -> None:
+        """The result routes answer 503 "history is merging" while a session-id
+        merge copies events: a refusal, retried within the grace like
+        "initializing", so the reader sees the merged history, not an error."""
+        client = BridgeClient("http://127.0.0.1:57585", "tok", connect_grace=2.0)
+        merging = urllib.error.HTTPError(
+            "http://127.0.0.1/api/v1/live-sessions/s1/result", 503, "Service Unavailable", {},
+            io.BytesIO(json.dumps({"detail": "represented history is merging (a session-id "
+                                             "change); retry shortly"}).encode()))
+        answers = iter([merging, _FakeResp({"items": []})])
+
+        def respond(req, timeout=None):
+            answer = next(answers)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        with (
+            patch("agent_bridge.client.urllib.request.urlopen", side_effect=respond),
+            patch("time.sleep"),
+        ):
+            assert client._request("GET", "/api/v1/live-sessions/s1/result") == {"items": []}
+
+    def test_waits_for_routing_flip_after_drain_503(self) -> None:
+        old_base = "http://127.0.0.1:57585"
+        new_base = "http://127.0.0.1:47000"
+        endpoints = iter((old_base, new_base))
+        client = BridgeClient(
+            old_base,
+            "tok",
+            connect_grace=2.0,
+            reresolve=lambda: next(endpoints),
+        )
+        seen: list[str] = []
+
+        def by_port(req, timeout=None):
+            seen.append(req.full_url)
+            if req.full_url.startswith(old_base):
+                raise _draining()
+            return _FakeResp({"session_id": "s1"})
+
+        with (
+            patch("agent_bridge.client.urllib.request.urlopen", side_effect=by_port),
+            patch("time.sleep"),
+        ):
+            result = client._request("POST", "/api/v1/sessions", {"agent": "local"})
+
+        assert result == {"session_id": "s1"}
+        assert seen == [
+            f"{old_base}/api/v1/sessions",
+            f"{old_base}/api/v1/sessions",
+            f"{new_base}/api/v1/sessions",
+        ]
+
+    def test_sustained_drain_is_reported_cleanly_after_grace(self) -> None:
+        # Both endpoints keep draining (e.g. the successor hasn't opened its
+        # gate yet) -- a bounded BridgeClientError, never an infinite loop or
+        # an unhandled traceback escaping the caller.
+        client = BridgeClient(
+            "http://127.0.0.1:57585",
+            "tok",
+            connect_grace=0.0,
+            reresolve=lambda: "http://127.0.0.1:57585",
+        )
+
+        with patch(
+            "agent_bridge.client.urllib.request.urlopen",
+            side_effect=_draining(),
+        ):
+            with pytest.raises(BridgeClientError) as exc_info:
+                client._request("POST", "/api/v1/sessions", {"agent": "local"})
+
+        assert exc_info.value.status == 503
+
+    def test_no_reresolver_still_bounded_by_grace(self) -> None:
+        # No reresolver at all -- must not loop forever; falls through to a
+        # clean BridgeClientError once the connect grace elapses.
+        client = BridgeClient(
+            "http://127.0.0.1:57585", "tok", connect_grace=0.0,
+        )
+
+        with patch(
+            "agent_bridge.client.urllib.request.urlopen",
+            side_effect=_draining(),
+        ):
+            with pytest.raises(BridgeClientError):
+                client._request("POST", "/api/v1/sessions", {"agent": "local"})
+
+
 class TestRefreshEndpoint:
     """BridgeClient.refresh_endpoint() follows a routing-table cutover so the
     streaming path can be re-pointed at a new dynamic port (dotfiles#1713)."""
@@ -532,12 +730,16 @@ class TestRefreshEndpoint:
             "http://127.0.0.1:9280", "tok",
             reresolve=lambda: "http://127.0.0.1:9280",
         )
+        client._daemon_proto = (10, 1)
         assert client.refresh_endpoint() is False
         assert client._base == "http://127.0.0.1:9280"
+        assert client._daemon_proto is None
 
     def test_refresh_noop_without_resolver(self):
         client = BridgeClient("http://127.0.0.1:9280", "tok")
+        client._daemon_proto = (10, 1)
         assert client.refresh_endpoint() is False
+        assert client._daemon_proto is None
 
     def test_refresh_noop_when_resolver_returns_none(self):
         client = BridgeClient(
@@ -545,3 +747,42 @@ class TestRefreshEndpoint:
         )
         assert client.refresh_endpoint() is False
         assert client._base == "http://127.0.0.1:9280"
+
+
+def _client_config(tmp_path: Path, active: dict) -> None:
+    (tmp_path / "config.yaml").write_text("port: 9280\n", encoding="utf-8")
+    (tmp_path / "auth.yaml").write_text("token: tok\n", encoding="utf-8")
+    (tmp_path / "active.json").write_text(
+        json.dumps({"active": active}), encoding="utf-8"
+    )
+
+
+def test_from_config_uses_explicit_forwarded_route(tmp_path, monkeypatch):
+    from agent_bridge import config
+
+    _client_config(tmp_path, FORWARDED_ROUTE)
+    monkeypatch.setattr(config, "config_dir", lambda: tmp_path)
+    client = BridgeClient.from_config()
+    assert client._base == "http://127.0.0.1:62254"
+
+
+def test_from_config_uses_legacy_bindless_forwarded_route(tmp_path, monkeypatch):
+    from agent_bridge import config
+
+    _client_config(tmp_path, LEGACY_FORWARDED_ROUTE)
+    monkeypatch.setattr(config, "config_dir", lambda: tmp_path)
+    client = BridgeClient.from_config()
+    assert client._base == "http://127.0.0.1:62255"
+
+
+def test_refresh_endpoint_follows_legacy_forwarded_route(tmp_path, monkeypatch):
+    from agent_bridge import config
+
+    _client_config(tmp_path, FORWARDED_ROUTE)
+    monkeypatch.setattr(config, "config_dir", lambda: tmp_path)
+    client = BridgeClient.from_config()
+    (tmp_path / "active.json").write_text(
+        json.dumps({"active": LEGACY_FORWARDED_ROUTE}), encoding="utf-8"
+    )
+    assert client.refresh_endpoint() is True
+    assert client._base == "http://127.0.0.1:62255"

@@ -10,6 +10,8 @@ import yaml
 
 from agent_bridge.config import (
     adopt_topology,
+    default_db_path,
+    config_dir,
     load_config,
     load_repo_bridge_config,
     remove_topology,
@@ -41,6 +43,23 @@ def fake_repo(tmp_path):
 
 
 class TestSaveConfig:
+    def test_default_db_path_scopes_to_active_config_dir(self, tmp_path, monkeypatch):
+        root = tmp_path / "cell"
+        monkeypatch.setenv("AGENT_BRIDGE_INSTALL_DIR", str(root))
+        monkeypatch.delenv("AGENT_BRIDGE_CONFIG_DIR", raising=False)
+        assert config_dir() == root
+        assert default_db_path() == root / "sessions.db"
+        assert ServiceConfig().db_path == str(root / "sessions.db")
+
+    def test_legacy_db_path_is_rewritten_under_scoped_root(self, tmp_path, monkeypatch):
+        root = tmp_path / "cell"
+        root.mkdir()
+        monkeypatch.setenv("AGENT_BRIDGE_CONFIG_DIR", str(root))
+        (root / "config.yaml").write_text(
+            yaml.dump({"db_path": "~/.agent-bridge/sessions.db", "port": 0})
+        )
+        assert load_config().db_path == str(root / "sessions.db")
+
     def test_roundtrip(self, config_home):
         cfg = ServiceConfig(port=9999, bind="0.0.0.0")
         save_config(cfg)
@@ -355,14 +374,14 @@ class TestValidateConfig:
 
 
 class TestInRepoBridgeConfig:
-    """<repo>/.agent-bridge/config.yaml -- repo-portable multi-machine system spawn defaults."""
+    """Repo-portable multi-machine system spawn defaults."""
 
     def test_missing_file_returns_none(self, tmp_path: Path):
         assert load_repo_bridge_config(tmp_path) is None
 
     def test_loads_default_copilot_args(self, tmp_path: Path):
-        cfg_dir = tmp_path / ".agent-bridge"
-        cfg_dir.mkdir()
+        cfg_dir = tmp_path / ".copilot-extensions" / "agent-bridge"
+        cfg_dir.mkdir(parents=True)
         (cfg_dir / "config.yaml").write_text(
             yaml.dump({"default_copilot_args": ["--model", "some-model"]}),
         )
@@ -371,15 +390,15 @@ class TestInRepoBridgeConfig:
         assert cfg.default_copilot_args == ["--model", "some-model"]
 
     def test_loads_default_env(self, tmp_path: Path):
-        cfg_dir = tmp_path / ".agent-bridge"
-        cfg_dir.mkdir()
+        cfg_dir = tmp_path / ".copilot-extensions" / "agent-bridge"
+        cfg_dir.mkdir(parents=True)
         (cfg_dir / "config.yaml").write_text(yaml.dump({"default_env": {"K": "v"}}))
         cfg = load_repo_bridge_config(tmp_path)
         assert cfg is not None and cfg.default_env == {"K": "v"}
 
     def test_unknown_keys_ignored(self, tmp_path: Path):
-        cfg_dir = tmp_path / ".agent-bridge"
-        cfg_dir.mkdir()
+        cfg_dir = tmp_path / ".copilot-extensions" / "agent-bridge"
+        cfg_dir.mkdir(parents=True)
         (cfg_dir / "config.yaml").write_text(
             yaml.dump({"default_copilot_args": ["--model", "m"], "future_key": 123}),
         )
@@ -387,16 +406,94 @@ class TestInRepoBridgeConfig:
         assert cfg is not None and cfg.default_copilot_args == ["--model", "m"]
 
     def test_bad_yaml_returns_none(self, tmp_path: Path):
-        cfg_dir = tmp_path / ".agent-bridge"
-        cfg_dir.mkdir()
+        cfg_dir = tmp_path / ".copilot-extensions" / "agent-bridge"
+        cfg_dir.mkdir(parents=True)
         (cfg_dir / "config.yaml").write_text("{ not: valid: yaml:")
         assert load_repo_bridge_config(tmp_path) is None
 
     def test_empty_file_is_defaults(self, tmp_path: Path):
-        cfg_dir = tmp_path / ".agent-bridge"
-        cfg_dir.mkdir()
+        cfg_dir = tmp_path / ".copilot-extensions" / "agent-bridge"
+        cfg_dir.mkdir(parents=True)
         (cfg_dir / "config.yaml").write_text("")
         cfg = load_repo_bridge_config(tmp_path)
         assert cfg is not None
         assert cfg.default_copilot_args == []
         assert cfg.default_env == {}
+
+    def test_legacy_path_remains_readable(self, tmp_path: Path):
+        cfg_dir = tmp_path / ".agent-bridge"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config.yaml").write_text(
+            yaml.dump({"default_copilot_args": ["--model", "legacy"]}),
+        )
+
+        cfg = load_repo_bridge_config(tmp_path)
+
+        assert cfg is not None
+        assert cfg.default_copilot_args == ["--model", "legacy"]
+
+    def test_canonical_path_wins_over_legacy(self, tmp_path: Path):
+        legacy_dir = tmp_path / ".agent-bridge"
+        legacy_dir.mkdir()
+        (legacy_dir / "config.yaml").write_text(
+            yaml.dump({"default_copilot_args": ["--model", "legacy"]}),
+        )
+        cfg_dir = tmp_path / ".copilot-extensions" / "agent-bridge"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config.yaml").write_text(
+            yaml.dump({"default_copilot_args": ["--model", "canonical"]}),
+        )
+
+        cfg = load_repo_bridge_config(tmp_path)
+
+        assert cfg is not None
+        assert cfg.default_copilot_args == ["--model", "canonical"]
+
+    def test_marketplace_overlay_merges_over_base(self, tmp_path: Path, monkeypatch):
+        cfg_dir = tmp_path / ".copilot-extensions" / "agent-bridge"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config.yaml").write_text(
+            yaml.dump({"default_copilot_args": ["--model", "base"]}),
+        )
+        overlay = (
+            cfg_dir / "marketplaces" / "example-marketplace" / "config.yaml"
+        )
+        overlay.parent.mkdir(parents=True)
+        overlay.write_text(yaml.dump({"default_env": {"K": "v"}}))
+        monkeypatch.setenv(
+            "COPILOT_EXTENSIONS_CONTEXT",
+            '{"marketplaceId":"example-marketplace"}',
+        )
+
+        cfg = load_repo_bridge_config(tmp_path)
+
+        assert cfg is not None
+        assert cfg.default_copilot_args == ["--model", "base"]
+        assert cfg.default_env == {"K": "v"}
+
+
+class TestAgentRosterCacheIntervalValidation:
+    """Phase 3b: `agent_roster_cache_interval` must stay a finite number of
+    seconds, at least 1.0 -- `AgentRosterCache.__init__` silently clamps
+    anything below 1.0 up to it (`max(1.0, refresh_interval)`), so accepting
+    a smaller value here would validate a cadence the cache never actually
+    honors. An infinite value would make the cache's freshness deadline and
+    watchdog timeout infinite too, so a successful roster could stay
+    "fresh" forever and background supervision would never run again."""
+
+    @pytest.mark.parametrize(
+        "value", [0, 0.5, -1.0, float("-inf"), float("inf"), float("nan")],
+    )
+    def test_rejects_below_the_caches_own_floor_and_non_finite_values(self, value):
+        with pytest.raises(Exception):
+            ServiceConfig(agent_roster_cache_interval=value)
+
+    def test_accepts_a_normal_value_at_or_above_the_floor(self):
+        cfg = ServiceConfig(agent_roster_cache_interval=30.0)
+        assert cfg.agent_roster_cache_interval == 30.0
+        cfg_at_floor = ServiceConfig(agent_roster_cache_interval=1.0)
+        assert cfg_at_floor.agent_roster_cache_interval == 1.0
+
+    def test_default_is_unaffected(self):
+        cfg = ServiceConfig()
+        assert cfg.agent_roster_cache_interval == 12.0

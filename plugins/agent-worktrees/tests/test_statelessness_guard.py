@@ -51,6 +51,32 @@ def test_read_tool_allows(harness):
     assert guard.decide(p, env={}, home=harness) is None
 
 
+def test_invalid_explicit_context_never_reads_legacy_registry(
+    harness, monkeypatch, tmp_path
+):
+    invalid = tmp_path / "invalid" / "install.json"
+    invalid.parent.mkdir()
+    invalid.write_text("{", encoding="utf-8")
+    monkeypatch.setattr(
+        guard,
+        "project_name",
+        lambda *_args: pytest.fail("legacy registry must not be read"),
+    )
+    env = {
+        "COPILOT_EXTENSIONS_CONTEXT": str(invalid),
+        "AGENT_WORKTREES_PAYLOAD_ROOT": str(
+            Path(__file__).resolve().parents[1]
+        ),
+    }
+
+    with pytest.raises(ValueError):
+        guard.decide(
+            _write("create", harness / "efforts" / "x.md", harness),
+            env=env,
+            home=tmp_path,
+        )
+
+
 def test_write_into_harness_docs_allows(harness):
     # docs/ and visions/ are legit harness content, not personal state.
     for ok in ("docs/x.md", "visions/harbor.md", "AGENTS.md", ".github/x.json"):
@@ -104,9 +130,34 @@ def test_break_glass_allows(harness, tmp_path):
         "grants": {"citadel-harness": {"expires_at_ms": (time.time() + 600) * 1000}}
     }), encoding="utf-8")
     p = _write("create", harness / "efforts/x.md", harness)
-    # repo name comes from WORKTREE_PROJECT
-    env = {"WORKTREE_PROJECT": "citadel-harness"}
-    assert guard.decide(p, env=env, home=home) is None
+    assert guard.decide(p, env={}, home=home) is None
+
+
+def test_break_glass_resolves_anchor_name_from_worktree_gitfile(harness, tmp_path):
+    home = tmp_path / "home"
+    (home / ".agent-worktrees").mkdir(parents=True)
+    (home / ".agent-worktrees" / "allow-edits.json").write_text(json.dumps({
+        "grants": {"registered-name": {"expires_at_ms": (time.time() + 600) * 1000}}
+    }), encoding="utf-8")
+    (home / ".agent-worktrees" / "repos.yaml").write_text(
+        "repos:\n"
+        "  registered-name:\n"
+        "    class: worktree\n"
+        f"    windows: \"{str(harness).replace(chr(92), chr(92) * 2)}\"\n",
+        encoding="utf-8",
+    )
+    worktree = tmp_path / "worktrees" / "task-123"
+    worktree.mkdir(parents=True)
+    (worktree / ".git").write_text(
+        f"gitdir: {harness / '.git' / 'worktrees' / 'task-123'}\n",
+        encoding="utf-8",
+    )
+    (worktree / ".agent-worktrees").mkdir()
+    (worktree / ".agent-worktrees" / "config.yaml").write_text(
+        "default_branch: main\nstateless: true\n", encoding="utf-8"
+    )
+    p = _write("create", worktree / "efforts/x.md", worktree)
+    assert guard.decide(p, env={}, home=home) is None
 
 
 def test_expired_break_glass_denies(harness, tmp_path):
@@ -116,7 +167,7 @@ def test_expired_break_glass_denies(harness, tmp_path):
         "grants": {"citadel-harness": {"expires_at_ms": (time.time() - 10) * 1000}}
     }), encoding="utf-8")
     p = _write("create", harness / "efforts/x.md", harness)
-    d = guard.decide(p, env={"WORKTREE_PROJECT": "citadel-harness"}, home=home)
+    d = guard.decide(p, env={}, home=home)
     assert d and d["permissionDecision"] == "deny"
 
 

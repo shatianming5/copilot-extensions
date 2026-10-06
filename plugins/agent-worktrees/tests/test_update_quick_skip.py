@@ -11,14 +11,17 @@ safe.
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from agent_worktrees import __main__ as m
 from agent_worktrees import config as cfg
+from agent_worktrees import picker_profiles_cli
 from agent_worktrees import reconcile
 
 
@@ -34,6 +37,7 @@ def _args(force: bool = False) -> argparse.Namespace:
         recreate_venv=False,
         skip_modules=None,
         no_anchor_sync=True,
+        no_prune_pivots=True,
         force=force,
         no_manager=True,
     )
@@ -63,9 +67,11 @@ def wired(monkeypatch, plugin_dir):
 
     monkeypatch.setattr(subprocess, "run", _run)
     monkeypatch.setattr(m.subprocess, "run", _run)
-    monkeypatch.setattr(m, "_update_registered_plugins", lambda: None)
+    monkeypatch.setattr(m, "_registered_plugin_targets", lambda: {})
+    monkeypatch.setattr(m, "_update_registered_plugins", lambda targets: None)
     monkeypatch.setattr(m, "_update_modules", lambda *a, **k: None)
     monkeypatch.setattr(m, "_fast_forward_project_anchors", lambda: None)
+    monkeypatch.setattr(m, "_prune_stale_pivots_after_update", lambda: None)
     monkeypatch.setattr(m, "_find_installed_plugin_dir", lambda: plugin_dir)
     monkeypatch.setattr(m, "_project_update_context", lambda: plugin_dir)
     monkeypatch.setattr(cfg, "detect_platform", lambda: "linux")
@@ -101,36 +107,108 @@ def test_force_reruns_installer_when_current(wired, monkeypatch):
     assert _installer_ran(wired), "--force must re-deploy even when current"
 
 
-def test_selected_context_never_runs_self_legacy_installer(
+def test_required_runtime_failure_makes_update_fail(wired, monkeypatch):
+    monkeypatch.setattr(reconcile, "payload_version", lambda d: "1.5.3-dev9")
+    monkeypatch.setattr(
+        reconcile,
+        "runtime_deployed_version",
+        lambda name, home=None, **kwargs: "1.5.3-dev9",
+    )
+    monkeypatch.setattr(m, "_update_modules", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        m,
+        "_reconcile_registered_runtimes",
+        lambda *args, **kwargs: True,
+    )
+
+    assert m.cmd_update(_args()) == 1
+
+
+@pytest.mark.parametrize("status", ["ready", "deactivation-required"])
+@pytest.mark.parametrize("inherited_context", [None, "/caller/install.json"])
+def test_selected_context_runs_self_installer_with_validated_environment(
     wired,
     monkeypatch,
     plugin_dir,
+    status,
+    inherited_context,
 ):
+    context = Path("/cell/agent-worktrees/install.json")
+    cell_root = context.parent
+    if inherited_context is None:
+        monkeypatch.delenv("COPILOT_EXTENSIONS_CONTEXT", raising=False)
+    else:
+        monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", inherited_context)
+    monkeypatch.setenv("COPILOT_PLUGIN_ROOT", "/caller/payload")
+    monkeypatch.setenv("PYTHONPATH", "/caller/python")
     monkeypatch.setattr(reconcile, "payload_version", lambda d: "1.5.3-dev10")
     monkeypatch.setattr(
         reconcile,
-        "_selected_runtime_root",
-        lambda name, selected_plugin_dir: (Path("/cell/agent-worktrees"), True),
+        "resolve_runtime_installation",
+        lambda name, selected_plugin_dir, **kwargs: (
+            reconcile.RuntimeInstallationResolution(
+                runtime_root=cell_root,
+                context=context,
+                actual_mode="namespaced",
+                desired_mode=(
+                    "namespaced" if status == "ready" else "legacy"
+                ),
+                status=status,
+                reason=(
+                    "namespaced-active"
+                    if status == "ready"
+                    else "policy-disabled-active"
+                ),
+            )
+        ),
     )
     monkeypatch.setattr(
         reconcile,
         "runtime_deployed_version",
         lambda name, home=None, **kwargs: "1.5.3-dev9",
     )
+    installer_environments: list[dict[str, str]] = []
+    installer_argv: list[list[str]] = []
+
+    def run(argv, *args, **kwargs):
+        if "install.sh" in " ".join(argv):
+            installer_environments.append(kwargs["env"])
+            installer_argv.append(list(argv))
+        return _Completed()
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(m.subprocess, "run", run)
 
     assert m.cmd_update(_args(force=True)) == 0
 
-    assert not _installer_ran(wired)
+    assert installer_environments
+    environment = installer_environments[0]
+    assert environment["COPILOT_EXTENSIONS_CONTEXT"] == str(context)
+    assert "COPILOT_PLUGIN_ROOT" not in environment
+    assert "PYTHONPATH" not in environment
+    assert installer_argv[0][-2:] == ["--install-dir", str(cell_root)]
 
 
-def test_prelaunch_selected_context_suppresses_self_legacy_installer(
+@pytest.mark.parametrize("status", ["ready", "deactivation-required"])
+@pytest.mark.parametrize("inherited_context", [None, "/caller/install.json"])
+def test_prelaunch_selected_context_uses_validated_installer_environment(
     tmp_path,
     monkeypatch,
     plugin_dir,
+    status,
+    inherited_context,
 ):
     repo = tmp_path / "repo"
     repo.mkdir()
     cell_root = tmp_path / "cell" / "plugins" / "agent-worktrees"
+    cell_root.mkdir(parents=True)
+    context = cell_root / "install.json"
+    context.write_text("{}", encoding="utf-8")
+    (cell_root / "deploy-manifest.json").write_text("{}", encoding="utf-8")
+    if inherited_context is None:
+        monkeypatch.delenv("COPILOT_EXTENSIONS_CONTEXT", raising=False)
+    else:
+        monkeypatch.setenv("COPILOT_EXTENSIONS_CONTEXT", inherited_context)
     monkeypatch.setattr(m, "_find_repo_dir", lambda: repo)
     monkeypatch.setattr(
         cfg,
@@ -140,7 +218,7 @@ def test_prelaunch_selected_context_suppresses_self_legacy_installer(
         ),
     )
     monkeypatch.setattr(m, "_resolve_environment", lambda config: "test")
-    monkeypatch.setattr(m.svc, "discover_services", lambda *args, **kwargs: [])
+    monkeypatch.setattr(m._svc, "discover_services", lambda *args, **kwargs: [])
     monkeypatch.setattr(
         reconcile,
         "core_installed_payload_dir",
@@ -148,26 +226,248 @@ def test_prelaunch_selected_context_suppresses_self_legacy_installer(
     )
     monkeypatch.setattr(
         reconcile,
-        "_explicit_context_target",
-        lambda: (Path("/context/install.json"), "agent-worktrees"),
+        "resolve_runtime_installation",
+        lambda name, selected_plugin_dir, **kwargs: (
+            reconcile.RuntimeInstallationResolution(
+                runtime_root=cell_root,
+                context=context,
+                actual_mode="namespaced",
+                desired_mode=(
+                    "namespaced" if status == "ready" else "legacy"
+                ),
+                status=status,
+                reason=(
+                    "namespaced-active"
+                    if status == "ready"
+                    else "policy-disabled-active"
+                ),
+            )
+        ),
+    )
+    monkeypatch.setattr(m._svc, "check_staleness", lambda *args: "behind")
+
+    plan = m.plan_pre_launch()
+
+    assert plan["action"] == "self-update"
+    update = plan["updates"][0]
+    assert update["service"] == "agent-worktrees"
+    assert update["runtime_root"] == str(cell_root)
+    assert update["environment"] == {
+        "COPILOT_EXTENSIONS_CONTEXT": str(context)
+    }
+    assert update["unset_environment"] == list(reconcile._RUNTIME_ENV_UNSET)
+    expected_flag = "-InstallDir" if m.platform.system() == "Windows" else "--install-dir"
+    assert update["argv"][-2:] == [expected_flag, str(cell_root)]
+
+
+def test_prelaunch_uses_marketplace_fingerprint_staleness_for_marketplace_kind(
+    tmp_path,
+    monkeypatch,
+    plugin_dir,
+):
+    """#2174: a `marketplace`-kind manifest must be staleness-checked via the
+    content-fingerprint comparison, never the git-commit-based check_staleness
+    -- which always reads "unknown" for a marketplace deploy (it never has a
+    real commit recorded) and would therefore force the full self-update
+    pipeline to re-run on every single launch, even when nothing changed."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    legacy_root = tmp_path / "legacy"
+    legacy_root.mkdir()
+    (legacy_root / "deploy-manifest.json").write_text(
+        json.dumps(
+            {"source": {"kind": "marketplace", "payload_fingerprint": "abc"}}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("COPILOT_EXTENSIONS_CONTEXT", raising=False)
+    monkeypatch.setattr(m, "_find_repo_dir", lambda: repo)
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda: types.SimpleNamespace(
+            default_repo=types.SimpleNamespace(service_paths=None)
+        ),
+    )
+    monkeypatch.setattr(m, "_resolve_environment", lambda config: "test")
+    monkeypatch.setattr(m._svc, "discover_services", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        reconcile,
+        "core_installed_payload_dir",
+        lambda name: plugin_dir,
     )
     monkeypatch.setattr(
         reconcile,
-        "_selected_runtime_root",
-        lambda name, selected_plugin_dir: (cell_root, True),
+        "resolve_runtime_installation",
+        lambda name, selected_plugin_dir, **kwargs: (
+            reconcile.RuntimeInstallationResolution(
+                runtime_root=legacy_root,
+                context=None,
+                actual_mode="legacy",
+                desired_mode="legacy",
+                status="ready",
+                reason="policy-default-false",
+            )
+        ),
     )
-    monkeypatch.setattr(reconcile, "payload_version", lambda d: "1.5.3-dev10")
+    calls: dict[str, list] = {"staleness": [], "marketplace": []}
     monkeypatch.setattr(
-        reconcile,
-        "runtime_deployed_version",
-        lambda name, home=None, **kwargs: "1.5.3-dev9",
+        m._svc,
+        "check_staleness",
+        lambda *a: calls["staleness"].append(a) or "unknown",
+    )
+    monkeypatch.setattr(
+        m._svc,
+        "check_marketplace_staleness",
+        lambda *a: calls["marketplace"].append(a) or "current",
     )
 
     plan = m.plan_pre_launch()
 
+    assert calls["marketplace"], (
+        "must use the fingerprint check for a marketplace manifest"
+    )
+    assert not calls["staleness"], (
+        "must never use the git-commit check for a marketplace manifest"
+    )
     assert plan["action"] == "continue"
-    assert plan["diagnostics"][0]["reason"] == "context-runtime-version-drift"
-    assert "updates" not in plan
+
+
+def test_prelaunch_legacy_default_uses_conventional_runtime(
+    tmp_path,
+    monkeypatch,
+    plugin_dir,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    legacy_root = tmp_path / "legacy"
+    legacy_root.mkdir()
+    (legacy_root / "deploy-manifest.json").write_text("{}", encoding="utf-8")
+    monkeypatch.delenv("COPILOT_EXTENSIONS_CONTEXT", raising=False)
+    monkeypatch.setattr(m, "_find_repo_dir", lambda: repo)
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda: types.SimpleNamespace(
+            default_repo=types.SimpleNamespace(service_paths=None)
+        ),
+    )
+    monkeypatch.setattr(m, "_resolve_environment", lambda config: "test")
+    monkeypatch.setattr(m._svc, "discover_services", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        reconcile,
+        "core_installed_payload_dir",
+        lambda name: plugin_dir,
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "resolve_runtime_installation",
+        lambda name, selected_plugin_dir, **kwargs: (
+            reconcile.RuntimeInstallationResolution(
+                runtime_root=legacy_root,
+                context=None,
+                actual_mode="legacy",
+                desired_mode="legacy",
+                status="ready",
+                reason="policy-default-false",
+            )
+        ),
+    )
+    monkeypatch.setattr(m._svc, "check_staleness", lambda *args: "behind")
+
+    update = m.plan_pre_launch()["updates"][0]
+
+    assert update["runtime_root"] == str(legacy_root)
+    assert update["environment"] == {}
+    assert update["unset_environment"] == list(reconcile._RUNTIME_ENV_UNSET)
+    expected_flag = "-InstallDir" if m.platform.system() == "Windows" else "--install-dir"
+    assert update["argv"][-2:] == [expected_flag, str(legacy_root)]
+
+
+def _fake_service(tmp_path: Path, name: str) -> Any:
+    """A minimal ServiceInfo-shaped stand-in with a real installer on disk
+    (so ``_append_update_if_stale`` doesn't bail on a missing installer)."""
+    installer = tmp_path / "repo" / "services" / name / "install.ps1"
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    installer.write_text("# installer\n", encoding="utf-8")
+    return types.SimpleNamespace(
+        name=name,
+        installer_path=f"services/{name}/install.ps1",
+    )
+
+
+@pytest.mark.parametrize(
+    "bootstrap_services, expect_vault_update",
+    [(None, False), ([], False), (["vault"], True)],
+)
+def test_prelaunch_repo_service_only_bootstrapped_when_opted_in(
+    tmp_path,
+    monkeypatch,
+    plugin_dir,
+    bootstrap_services,
+    expect_vault_update,
+):
+    """#regression: agent-worktrees must not hardcode a facility-specific
+    service name (formerly a bare "vault" literal in ``_BOOTSTRAP_SERVICES``)
+    as a launch-blocking bootstrap check for every repo it drives. A
+    same-named repo service is only force-updated at launch when the repo's
+    own config explicitly opts it in via ``bootstrap_services``."""
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    legacy_root = tmp_path / "legacy"
+    legacy_root.mkdir()
+    (legacy_root / "deploy-manifest.json").write_text("{}", encoding="utf-8")
+    monkeypatch.delenv("COPILOT_EXTENSIONS_CONTEXT", raising=False)
+    monkeypatch.setattr(m, "_find_repo_dir", lambda: repo)
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda: types.SimpleNamespace(
+            default_repo=types.SimpleNamespace(
+                service_paths=None, bootstrap_services=bootstrap_services
+            )
+        ),
+    )
+    monkeypatch.setattr(m, "_resolve_environment", lambda config: "test")
+    vault_service = _fake_service(tmp_path, "vault")
+    monkeypatch.setattr(
+        m._svc, "discover_services", lambda *args, **kwargs: [vault_service]
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "core_installed_payload_dir",
+        lambda name: plugin_dir,
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "resolve_runtime_installation",
+        lambda name, selected_plugin_dir, **kwargs: (
+            reconcile.RuntimeInstallationResolution(
+                runtime_root=legacy_root,
+                context=None,
+                actual_mode="legacy",
+                desired_mode="legacy",
+                status="ready",
+                reason="policy-default-false",
+            )
+        ),
+    )
+    # agent-worktrees itself is current -- only the repo service's staleness
+    # (if bootstrapped at all) can produce an update.
+    monkeypatch.setattr(m._svc, "check_staleness", lambda *args: "current")
+    monkeypatch.setattr(
+        m._svc,
+        "get_service_status",
+        lambda service, repo_dir: types.SimpleNamespace(staleness="behind"),
+    )
+
+    plan = m.plan_pre_launch()
+
+    if expect_vault_update:
+        assert plan["action"] == "self-update"
+        assert [u["service"] for u in plan["updates"]] == ["vault"]
+    else:
+        assert plan["action"] == "continue"
 
 
 def test_prelaunch_invalid_other_context_fails_closed(
@@ -186,7 +486,7 @@ def test_prelaunch_invalid_other_context_fails_closed(
         ),
     )
     monkeypatch.setattr(m, "_resolve_environment", lambda config: "test")
-    monkeypatch.setattr(m.svc, "discover_services", lambda *args, **kwargs: [])
+    monkeypatch.setattr(m._svc, "discover_services", lambda *args, **kwargs: [])
     monkeypatch.setattr(
         reconcile,
         "core_installed_payload_dir",
@@ -194,13 +494,8 @@ def test_prelaunch_invalid_other_context_fails_closed(
     )
     monkeypatch.setattr(
         reconcile,
-        "_explicit_context_target",
-        lambda: (Path("/context/install.json"), "agent-index"),
-    )
-    monkeypatch.setattr(
-        reconcile,
-        "_selected_runtime_root",
-        lambda name, selected_plugin_dir: (_ for _ in ()).throw(
+        "runtime_installer_environment",
+        lambda name, selected_plugin_dir, **kwargs: (_ for _ in ()).throw(
             ValueError("invalid cross-plugin context")
         ),
     )
@@ -231,7 +526,7 @@ def test_skip_still_reconciles_terminal_state_on_windows(wired, monkeypatch):
                         lambda name, home=None, **kwargs: "1.5.3-dev9")
     monkeypatch.setattr(cfg, "detect_platform", lambda: "windows")
     refreshed = {"n": 0}
-    monkeypatch.setattr(m, "_refresh_terminal_profiles",
+    monkeypatch.setattr(picker_profiles_cli, "_refresh_terminal_profiles",
                         lambda: refreshed.__setitem__("n", refreshed["n"] + 1) or True)
     assert m.cmd_update(_args()) == 0
     assert not _installer_ran(wired), "heavy installer still skipped when current"
@@ -245,7 +540,7 @@ def test_skip_does_not_reconcile_terminal_on_non_windows(wired, monkeypatch):
                         lambda name, home=None, **kwargs: "1.5.3-dev9")
     monkeypatch.setattr(cfg, "detect_platform", lambda: "linux")
     refreshed = {"n": 0}
-    monkeypatch.setattr(m, "_refresh_terminal_profiles",
+    monkeypatch.setattr(picker_profiles_cli, "_refresh_terminal_profiles",
                         lambda: refreshed.__setitem__("n", refreshed["n"] + 1) or True)
     assert m.cmd_update(_args()) == 0
     assert refreshed["n"] == 0

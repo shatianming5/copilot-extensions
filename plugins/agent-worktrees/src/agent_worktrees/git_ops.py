@@ -8,15 +8,19 @@ from __future__ import annotations
 
 import base64
 import functools
+import hashlib
 import logging
 import os
 import platform
 import re
 import shutil
 import subprocess
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+
+from . import env_scrub, push_timeout
 
 log = logging.getLogger("agent-worktrees")
 
@@ -47,11 +51,10 @@ _REPOSITORY_CONTEXT_ENV = frozenset({
 def repository_identity_env() -> dict[str, str]:
     """Return ambient process state without inherited Git context.
 
-    Repository identity probes supply their checkout explicitly with ``git -C``.
-    Inherited repository/config-selection variables can override or alter that
-    selection, so they are removed. Unrelated process and Git settings remain.
+    Repository identity probes supply their checkout via ``git -C``; inherited
+    repo/config-selection vars are removed so they cannot override it (others remain).
     """
-    env = os.environ.copy()
+    env = env_scrub.scrub_python_runtime_env(os.environ.copy())
     for name in list(env):
         upper = name.upper()
         if (
@@ -136,11 +139,10 @@ class GitError(Exception):
 
 
 #: A hooks directory guaranteed to hold no hooks, used to disable a repo's
-#: *client-side* guard hooks for the plugin's own trusted mechanical git ops
-#: (squash re-commit / rebase / push -- see :func:`git` ``no_hooks``). ``/dev/null``
-#: is the portable idiom: git looks for hook files under this path, finds none,
-#: and runs no hook -- on POSIX and on Git-for-Windows alike. Server-side branch
-#: protection is unaffected (it is not a client hook). #3707.
+#: client-side guard hooks for trusted mechanical git ops (squash re-commit /
+#: rebase -- NOT ``push()``, which must let a repo's real pre-push release
+#: guard run -- #3561; see :func:`git` ``no_hooks``). Server-side branch
+#: protection is unaffected. #3707.
 _NO_HOOKS_PATH = "/dev/null"
 
 
@@ -151,6 +153,7 @@ def git(
     capture: bool = True,
     timeout: float | None = None,
     no_hooks: bool = False,
+    kill_tree: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run a git command with consistent error handling.
 
@@ -165,34 +168,26 @@ def git(
             network ops like ``fetch``/``push``). Read-only inspection callers
             (worktree classification) pass a bound so a single stalled ``git``
             spawn cannot hang them indefinitely.
-        no_hooks: If True, run with ``-c core.hooksPath=<empty>`` so a repo's
-            **client-side** guard hooks (a branch-protection ``pre-commit`` /
-            ``pre-push`` / ``pre-rebase``) cannot block or corrupt the tool's own
-            trusted, mechanical plumbing (the squash re-commit, rebase, push).
-            Only *client-side* hooks are disabled -- server-side branch
-            protection (Gitea/GitHub rulesets) is untouched -- and only for
-            operations that re-arrange or re-commit ALREADY-committed content, so
-            content-quality checks that ran at original-commit time still hold.
-            This is **not** ``--no-verify`` (disallowed for agent-authored
-            commits): it scopes the disable to the plugin's internal git ops via
-            a config override. See #3707.
-
+        no_hooks: If True, run with ``-c core.hooksPath=<empty>`` so a repo's client-side
+            guard hooks cannot block/corrupt trusted plumbing that only re-arranges
+            ALREADY-committed content (squash re-commit, rebase). **``push()`` never passes
+            this** (#3561): a real pre-push release guard (e.g. ``check-changefile-presence.py``)
+            must be allowed to block a non-compliant push (not ``--no-verify``; scopes the
+            disable to internal git ops). #3707.
+        kill_tree: If True (real timeout), kill the whole tree on a stall -- :mod:`push_timeout`.
     Returns:
         CompletedProcess with stdout/stderr as strings.
     """
     prefix = ["-c", f"core.hooksPath={_NO_HOOKS_PATH}"] if no_hooks else []
     cmd = ["git", *prefix, *args]
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    result = subprocess.run(
-        cmd,
-        cwd=cwd,
-        capture_output=capture,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-        timeout=timeout,
-    )
+    env = env_scrub.scrub_python_runtime_env({**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    if kill_tree and timeout is not None:
+        result = push_timeout.run_bounded(cmd, cwd=cwd, env=env, timeout=timeout)
+    else:
+        result = subprocess.run(
+            cmd, cwd=cwd, capture_output=capture, text=True,
+            encoding="utf-8", errors="replace", env=env, timeout=timeout,
+        )
     if check and result.returncode != 0:
         raise GitError(cmd, result.returncode, result.stderr.strip())
     return result
@@ -254,6 +249,23 @@ class WorktreeStateInfo:
     """The worktree's actual HEAD branch (None if detached or unreadable)."""
     branch_drift: bool = False
     """True when the worktree's HEAD is on a different branch than tracked."""
+    fetch_failed: bool = False
+    """True when a requested fetch either failed outright (network down,
+    remote unreachable -- classification proceeded on stale local refs) OR
+    could not be confirmed (a timeout anywhere in classification, since a
+    stalled classify may have stalled ON the fetch itself, before it could
+    even attempt the later git calls) -- both cases mean a `fetch=True`
+    caller must not treat the result as refreshed evidence. Always False
+    when ``fetch=False`` (no fetch was attempted) or classification short-
+    circuited before reaching the fetch (GONE/zombie/ACTIVE)."""
+    fetch_requested: bool = False
+    """True only when ``fetch=True`` actually reached the point of
+    attempting a fetch (i.e. classification proceeded past the GONE/zombie/
+    ACTIVE short-circuits). A caller must derive "was this genuinely
+    refreshed" as ``fetch_requested and not fetch_failed`` -- `fetch_failed`
+    alone is insufficient, since it stays False when no fetch was ever
+    attempted (e.g. the caller passed ``fetch=False``), which would
+    otherwise let a fetch-free classification masquerade as refreshed."""
 
 
 @dataclass
@@ -414,6 +426,13 @@ def classify_worktree(
         return WorktreeStateInfo(
             state=WorktreeState.UNKNOWN,
             current_branch=actual_branch, branch_drift=drift,
+            # A timeout gives no confirmation the requested fetch (if any)
+            # ever completed -- it may have stalled on the fetch itself or on
+            # a later git call. Either way, the classification is NOT
+            # confirmed refreshed, so a `fetch=True` caller must not treat
+            # this as authoritative current-state evidence.
+            fetch_requested=fetch,
+            fetch_failed=fetch,
         )
 
 
@@ -446,28 +465,55 @@ def _classify_git_state(
     def _g(*args):
         return git(*args, cwd=path, check=False, timeout=_CLASSIFY_GIT_TIMEOUT)
 
+    # worktree-finality-and-obligations (Phase 5 follow-up): a fetch that
+    # fails (network down, remote unreachable) must not be silently treated
+    # as refreshed evidence -- the classification below still proceeds
+    # (offline callers need SOME answer), but every WorktreeStateInfo this
+    # function returns carries the honest ``fetch_failed`` flag so a
+    # destructive-freshness-sensitive caller (e.g. the closure descriptor)
+    # never treats a failed fetch attempt as authoritative current state.
+    fetch_failed = False
     if fetch:
-        _g("fetch", remote, default_branch, "--quiet")
+        fetch_r = _g("fetch", remote, default_branch, "--quiet")
+        fetch_failed = fetch_r.returncode != 0
 
     # Dirty check
     result = _g("status", "--porcelain")
     dirty_lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
     dirty_count = len(dirty_lines)
 
-    # Merge base -- use effective_branch (actual HEAD when drifted)
-    mb = _g("merge-base", upstream, effective_branch)
-    if mb.returncode != 0:
+    # Ahead / behind in one spawn.  A symmetric-difference count also lets us
+    # defer merge-base: unrelated histories necessarily have commits on both
+    # sides, while an all-ahead or all-behind pair already shares an ancestor.
+    counts_r = _g(
+        "rev-list", "--left-right", "--count",
+        f"{effective_branch}...{upstream}",
+    )
+    counts_ok = counts_r.returncode == 0
+    try:
+        ahead_s, behind_s = counts_r.stdout.split()
+        ahead = int(ahead_s) if counts_ok else 0
+        behind = int(behind_s) if counts_ok else 0
+    except (AttributeError, TypeError, ValueError):
+        ahead = behind = 0
+
+    merge_base: str | None = None
+
+    def _merge_base() -> str | None:
+        nonlocal merge_base
+        if merge_base is None:
+            mb = _g("merge-base", upstream, effective_branch)
+            if mb.returncode != 0:
+                return None
+            merge_base = mb.stdout.strip()
+        return merge_base
+
+    if (not counts_ok or (ahead > 0 and behind > 0)) and _merge_base() is None:
         return WorktreeStateInfo(
             state=WorktreeState.ORPHAN, dirty=dirty_count,
             current_branch=actual_branch, branch_drift=drift,
+            fetch_requested=fetch, fetch_failed=fetch_failed,
         )
-    merge_base = mb.stdout.strip()
-
-    # Ahead / behind
-    ahead_r = _g("rev-list", "--count", f"{merge_base}..{effective_branch}")
-    behind_r = _g("rev-list", "--count", f"{effective_branch}..{upstream}")
-    ahead = int(ahead_r.stdout.strip()) if ahead_r.returncode == 0 else 0
-    behind = int(behind_r.stdout.strip()) if behind_r.returncode == 0 else 0
 
     # Last commit subject as fallback title
     title = ""
@@ -480,7 +526,10 @@ def _classify_git_state(
             if len(title) > 60:
                 title = title[:57] + "..."
 
-    _drift_fields = dict(current_branch=actual_branch, branch_drift=drift)
+    _drift_fields = dict(
+        current_branch=actual_branch, branch_drift=drift,
+        fetch_requested=fetch, fetch_failed=fetch_failed,
+    )
 
     if dirty_count > 0:
         return WorktreeStateInfo(
@@ -523,6 +572,13 @@ def _classify_git_state(
 
     # Fallback: direct blob comparison for cases git-cherry can't match
     # (e.g. content arrived on upstream via a different patch shape).
+    merge_base = _merge_base()
+    if merge_base is None:
+        return WorktreeStateInfo(
+            state=WorktreeState.ORPHAN, dirty=dirty_count,
+            current_branch=actual_branch, branch_drift=drift,
+            fetch_requested=fetch, fetch_failed=fetch_failed,
+        )
     diff_r = _g("diff", "--name-only", merge_base, effective_branch)
     changed_files = [f for f in diff_r.stdout.splitlines() if f.strip()]
 
@@ -561,6 +617,34 @@ def has_remote(remote: str, *, cwd: str | Path) -> bool:
         return False
     remotes = (result.stdout or "").split()
     return remote in remotes
+
+
+def remote_url(remote: str, *, cwd: str | Path) -> str | None:
+    """Return *remote*'s configured fetch URL, or ``None`` if unset/absent."""
+    result = git("remote", "get-url", remote, cwd=cwd, check=False)
+    if result.returncode != 0:
+        return None
+    url = (result.stdout or "").strip()
+    return url or None
+
+
+def ensure_remote(name: str, url: str, *, cwd: str | Path) -> bool:
+    """Idempotently point local remote *name* at *url* (add or repoint it).
+
+    The role-aware fork-PR flow's remote-setup primitive: a repo's ``origin``
+    stays the upstream fetch/rebase source of truth throughout, while a
+    separate remote (conventionally ``fork``) is added/repointed to the
+    caller's personal fork for the actual publish step. Never touches any
+    OTHER remote. Returns ``True`` on success (added, repointed, or already
+    correct), ``False`` on a git failure (never raises).
+    """
+    if has_remote(name, cwd=cwd):
+        if remote_url(name, cwd=cwd) == url:
+            return True
+        result = git("remote", "set-url", name, url, cwd=cwd, check=False)
+    else:
+        result = git("remote", "add", name, url, cwd=cwd, check=False)
+    return result.returncode == 0
 
 
 #: Default bound (seconds) for a network ``fetch``. An unbounded fetch hangs the
@@ -683,6 +767,26 @@ def fast_forward_worktree(
     return FastForwardResult(updated=True, reason="updated", behind=behind)
 
 
+def worktree_suffix(worktree_id: str) -> str:
+    """The final dash-delimited token of a worktree id (its short hash).
+
+    Worktree ids embed the authoring machine name and creation timestamp
+    (e.g. ``example-host-20260917-125245-3a94``). This suffix is the only
+    part safe to surface in content that may leave the machine (a commit
+    message, a PR title, a branch name): callers that need a fallback label
+    for an untitled worktree must use this instead of the raw ``worktree_id``,
+    which would otherwise leak the machine name and timestamp into public
+    repos.
+
+    A worktree id with no dash has no trailing token to extract -- returning
+    it verbatim would publish the whole (potentially identifying) id, so that
+    case instead derives a short, deterministic, non-reversible digest.
+    """
+    if "-" in worktree_id:
+        return worktree_id.rsplit("-", 1)[-1]
+    return hashlib.sha256(worktree_id.encode("utf-8")).hexdigest()[:8]
+
+
 def merge_squash(branch: str, worktree_id: str, *, cwd: str | Path) -> bool:
     """Squash merge with auto-commit. Returns True on success."""
     result = git("merge", branch, "--squash", "--quiet", cwd=cwd, check=False)
@@ -693,8 +797,11 @@ def merge_squash(branch: str, worktree_id: str, *, cwd: str | Path) -> bool:
     # the client-side guard hooks (the anchor-commit / default-branch pre-commit
     # guard), which exist to stop *stray* human/agent commits -- not this
     # mechanical finalize step. Mirrors the sibling squash path + rebase/push.
+    # The commit message uses only the worktree's short suffix, never the raw
+    # worktree_id -- which embeds the authoring machine name and timestamp and
+    # must not leak into a commit that can land on a public default branch.
     commit_r = git(
-        "commit", "--no-edit", "-m", f"squash: merge worktree/{worktree_id}",
+        "commit", "--no-edit", "-m", f"squash: merge worktree {worktree_suffix(worktree_id)}",
         cwd=cwd, check=False, no_hooks=True,
     )
     return commit_r.returncode == 0
@@ -703,8 +810,19 @@ def merge_squash(branch: str, worktree_id: str, *, cwd: str | Path) -> bool:
 @dataclass
 class PushResult:
     """Outcome of :func:`push` -- truthy on success, but also carrying git's
-    stderr and a retry classification so callers can surface the *real* reason
-    a push failed instead of a generic "rejected".
+    stderr/stdout and a retry classification so callers can surface the *real*
+    reason a push failed instead of a generic "rejected".
+
+    Both streams matter: git's OWN protocol messages (``! [rejected] ...``,
+    ``error: failed to push some refs ...``) land on stderr, but a pre-push
+    hook's own check output is whatever THAT hook script wrote to -- many
+    (a plain ``print()``/``echo`` in a lint/contract check) write to stdout,
+    not stderr. Surfacing only ``stderr`` silently dropped exactly that
+    detail: a caller saw a bare "failed to push some refs" with no hint
+    which check failed, even though the hook had already printed the
+    specific ``[FAIL] ...`` reason to stdout (confirmed live: a
+    module-size-cap violation's full detail was invisible this way across
+    six retries).
 
     ``__bool__`` returns ``ok`` so every existing ``if git_ops.push(...)`` /
     ``pushed = git_ops.push(...)`` call keeps working unchanged.
@@ -712,6 +830,7 @@ class PushResult:
 
     ok: bool
     stderr: str = ""
+    stdout: str = ""
 
     def __bool__(self) -> bool:
         return self.ok
@@ -738,6 +857,28 @@ class PushResult:
             or "the remote contains work that you do" in s
         )
 
+    @property
+    def failure_detail(self) -> str:
+        """Render both streams for a failed push's error message.
+
+        Never just ``stderr``: git's own protocol messages (``error: failed
+        to push some refs ...``) land on stderr, but a pre-push hook's own
+        check output is whatever THAT hook script wrote to -- many (a plain
+        ``print()``/``echo`` in a lint/contract check) write to stdout, not
+        stderr. Surfacing only stderr silently dropped exactly that detail: a
+        caller saw a bare "failed to push some refs" with no hint which check
+        failed or why, even though the hook had already printed the specific
+        reason -- confirmed live, a module-size-cap violation's full
+        ``[FAIL] ...`` detail was invisible this way across six retries.
+        Empty string when both streams are empty (nothing to add).
+        """
+        parts = []
+        if self.stdout and self.stdout.strip():
+            parts.append(f"git (stdout): {self.stdout.strip()}")
+        if self.stderr and self.stderr.strip():
+            parts.append(f"git (stderr): {self.stderr.strip()}")
+        return ("\n" + "\n".join(parts)) if parts else ""
+
 
 def push(
     remote: str,
@@ -745,6 +886,7 @@ def push(
     *,
     cwd: str | Path,
     force_with_lease: bool = False,
+    timeout: float | None = push_timeout.DEFAULT_PUSH_TIMEOUT,
 ) -> PushResult:
     """Push a branch to remote. Returns a :class:`PushResult` (truthy on success).
 
@@ -759,31 +901,31 @@ def push(
     caller's retry loop can surface the real error (a pre-push hook decline, an
     auth 403, a protected-branch block) and fail fast instead of masking every
     failure as a generic "rejected" and retrying a doomed push (#993).
+    Bounded by ``timeout`` (:mod:`push_timeout`); a stall kills the whole process tree.
+
+    Unlike ``rebase``, this is NEVER given ``no_hooks=True`` (#3561): a real
+    pre-push release guard must be allowed to block a non-compliant push.
+    Worktree-originated callers wrap this with ``hooks.allow_pr_push()``.
     """
     extra = ["--force-with-lease"] if force_with_lease else []
     auth_args = _auth_config_args(remote, cwd=cwd)
-    result = git(
-        *auth_args,
-        "push", remote, branch, *extra, "--quiet",
-        cwd=cwd, check=False, no_hooks=True,
-    )
-    if result.returncode == 0:
-        return PushResult(ok=True)
-    last_stderr = result.stderr or ""
-    # Defense-in-depth: if we injected a cross-account token and the push
-    # still failed, the injected gh OAuth token may lack push scope (#900).
-    # Retry once *without* the override so the default credential helper
-    # (git-credential-vault / GCM) can authenticate -- which often succeeds
-    # where the OAuth token 403s.
-    if auth_args:
-        retry = git(
-            "push", remote, branch, *extra, "--quiet",
-            cwd=cwd, check=False, no_hooks=True,
-        )
-        if retry.returncode == 0:
+    # Retry without an injected auth override on failure (#900).
+    attempts = [auth_args, []] if auth_args else [[]]
+    last_stderr = ""
+    last_stdout = ""
+    for prefix in attempts:
+        try:
+            result = git(
+                *prefix, "push", remote, branch, *extra, "--quiet",
+                cwd=cwd, check=False, timeout=timeout, kill_tree=True,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return PushResult(ok=False, stderr=push_timeout.message(exc, timeout))
+        if result.returncode == 0:
             return PushResult(ok=True)
-        last_stderr = retry.stderr or last_stderr
-    return PushResult(ok=False, stderr=last_stderr)
+        last_stderr = result.stderr or last_stderr
+        last_stdout = result.stdout or last_stdout
+    return PushResult(ok=False, stderr=last_stderr, stdout=last_stdout)
 
 
 # --- Cross-account authentication (#29) -------------------------------------
@@ -826,15 +968,18 @@ def resolve_remote_name(remote_or_url: str, *, cwd: str | Path) -> str:
 
 
 def _parse_github_owner(url: str) -> str | None:
-    """Extract the owner from a github.com remote URL (https or ssh form)."""
-    url = url.strip()
-    m = re.match(r"https?://[^/]*github\.com/([^/]+)/", url)
-    if m:
-        return m.group(1)
-    m = re.match(r"(?:ssh://)?git@[^:/]*github\.com[:/]([^/]+)/", url)
-    if m:
-        return m.group(1)
-    return None
+    """Extract the owner from a github.com remote URL (https or ssh form).
+
+    Delegates to :func:`repos.github_owner`, whose host matching is
+    boundary-aware (the host must actually *be* ``github.com``, not merely
+    contain that substring) -- this function decides which host a minted
+    token gets sent to (see :func:`_auth_config_args_for_url`), so a
+    lookalike host such as ``evilgithub.com`` must never match.
+    """
+    if not url:
+        return None
+    from . import repos
+    return repos.github_owner(url)
 
 
 def slug_from_url(url: str | None) -> str | None:
@@ -920,6 +1065,184 @@ def gh_token_for_account(account: str) -> str | None:
     return _gh_token_for_owner(account)
 
 
+@contextmanager
+def _credential_pin_lock(repo_path: Path, git_dir: str):
+    """Serialize concurrent :func:`pin_git_credential` calls on one checkout.
+
+    An interprocess file lock (same OS-native primitive as the binstub
+    installer's own lock) keyed on the resolved ``--git-dir``, so two
+    processes racing to pin the same repo (e.g. a registration and a
+    concurrent backfill) can never interleave the helper-reset/username/
+    helper-append writes into a mixed-account result.
+    """
+    git_dir_path = Path(git_dir)
+    if not git_dir_path.is_absolute():
+        git_dir_path = repo_path / git_dir_path
+    lock_path = git_dir_path / "agent-worktrees-credential-pin.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        stream = lock_path.open("a+b")
+    except OSError:
+        # No writable git-dir (unexpected, but never worth failing the pin
+        # attempt over) -- proceed unlocked rather than raise.
+        yield
+        return
+    try:
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+        if platform.system() == "Windows":
+            import msvcrt
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if platform.system() == "Windows":
+                import msvcrt
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    finally:
+        stream.close()
+
+
+def pin_git_credential(repo_path: str | Path, login: str, host: str = "github.com") -> bool:
+    """Persist a repo-local git credential pin for ``login`` on ``host``.
+
+    The account resolved at register/clone/adopt time (repos.yaml's
+    ``account_map``, an explicit ``account:``, or an authenticated owner
+    login) is only advisory to *this* tool's own commands: they inject a
+    per-invocation token override (:func:`_auth_config_args`) and never touch
+    the repo's actual git config. Any *other* tool that runs a plain ``git
+    fetch``/``git pull`` in that checkout (a CI job, an IDE, an unattended
+    machine-maintenance task, ...) instead gets whatever account ``gh``'s
+    own generic ``credential.https://<host>.helper`` currently considers
+    *active* -- which drifts independently of which account this repo
+    actually needs and can silently authenticate as the wrong identity
+    against a private repo.
+
+    This writes a **local**, repo-scoped override so any plain git client
+    resolves the same login this tool already knows is correct, regardless of
+    which ``gh`` account happens to be active right now:
+
+        [credential "https://<host>"]
+            helper =
+            username = <login>
+            helper = !f() { if test x$1 = xget; then token=$(gh auth token \\
+                --hostname <host> --user '<login>') || exit $?; printf \\
+                '%s\\n' "password=$token"; fi; }; f
+
+    The leading empty ``helper =`` resets any inherited (global/system)
+    helper list for this exact host before appending the pinned one -- git's
+    credential-helper chain is otherwise cumulative across scopes, so without
+    the reset the pinned helper would just be appended after (not replace) a
+    generic ``gh auth git-credential`` helper that resolves the wrong
+    account. That reset, the username write, and the helper append are three
+    independent ``git config`` processes; an interprocess lock (keyed on the
+    resolved ``--git-dir``) serializes concurrent pins of the same checkout
+    (e.g. two registrations/backfills racing) so they can never interleave
+    into a helper/username combination pulled from different accounts.
+
+    No-ops (returns ``False``, never raises) when ``repo_path`` is not a git
+    working directory, ``login``/``host`` is empty or contains a character
+    outside ``[A-Za-z0-9_.-]`` (the helper is a ``!``-prefixed shell script;
+    a stray quote/backtick/``$``/separator in either would either break the
+    single-quoting around ``login`` or inject a command that runs whenever
+    git invokes this helper -- reject rather than attempt to escape), ``gh``
+    is not on ``PATH``, or ``login`` **is** the currently active ``gh``
+    account. That last case mirrors :func:`_auth_config_args`'s own
+    same-account skip (#900): when the login is already active, the
+    inherited default credential helper (GCM, a vault-backed helper, ...)
+    already authenticates correctly, and forcing it to a ``gh auth
+    token``-backed helper here could turn a working plain push into a 403
+    if that OAuth token happens to lack push scope -- callers treat this as
+    a best-effort convenience, not a required step.
+    """
+    _safe = re.compile(r"[A-Za-z0-9_.-]+")
+    # ``fullmatch`` (not ``match``): with a trailing ``$`` anchor, ``match``
+    # still accepts a string ending in a single newline (Python regex ``$``
+    # matches before a trailing "\n" as well as at the true end of string),
+    # so e.g. "evil.com\n" would slip past a "^...$" match check and get
+    # written into the stored helper as an embedded newline.
+    if not login or not host or not _safe.fullmatch(login) or not _safe.fullmatch(host):
+        return False
+    path = Path(repo_path)
+    if not path.is_dir() or shutil.which("gh") is None:
+        return False
+    env = repository_identity_env()
+    try:
+        # ``--git-dir`` (not ``--is-inside-work-tree``) so this also pins a
+        # *bare* anchor repo (agent-worktrees' own pattern for a checkout
+        # that must never be edited directly, e.g. a repo with core.bare set
+        # after conversion from a normal clone) -- a bare repo has no work
+        # tree to be "inside", but plain `git fetch`/`pull` there is exactly
+        # the case this pin protects. Inherited repository-selection env vars
+        # (GIT_DIR/GIT_WORK_TREE/GIT_CONFIG/...) are stripped so this always
+        # targets ``path``, never whatever repo the caller's own process
+        # context points at (see :func:`repository_identity_env`).
+        probe = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--git-dir"],
+            capture_output=True, text=True, timeout=10, env=env,
+        )
+        if probe.returncode != 0:
+            return False
+        git_dir = probe.stdout.strip()
+        key = f"credential.https://{host}"
+        active = _active_gh_account()
+        if active and active.casefold() == login.casefold():
+            # login is already the active gh account: the inherited default
+            # helper already authenticates correctly, so don't force a
+            # gh-auth-token-backed helper on top of it (see the docstring
+            # above). But a *stale* pin from a previous, different login left
+            # in .git/config (e.g. this repo's account_map mapping was later
+            # corrected to what is now the active account) would otherwise
+            # keep forcing that old identity -- clear it so "the active
+            # helper already works" is actually true for this checkout.
+            with _credential_pin_lock(path, git_dir):
+                subprocess.run(
+                    ["git", "-C", str(path), "config", "--local", "--unset-all", f"{key}.helper"],
+                    capture_output=True, text=True, timeout=10, env=env,
+                )
+                subprocess.run(
+                    ["git", "-C", str(path), "config", "--local", "--unset-all",
+                     f"{key}.username"],
+                    capture_output=True, text=True, timeout=10, env=env,
+                )
+            return False
+        with _credential_pin_lock(path, git_dir):
+            helper_script = (
+                "!f() { if test x$1 = xget; then "
+                f"token=$(gh auth token --hostname {host} --user '{login}') || exit $?; "
+                "printf '%s\\n' \"password=$token\"; fi; }; f"
+            )
+            subprocess.run(
+                ["git", "-C", str(path), "config", "--local", "--unset-all", f"{key}.helper"],
+                capture_output=True, text=True, timeout=10, env=env,
+            )
+            subprocess.run(
+                ["git", "-C", str(path), "config", "--local", "--add", f"{key}.helper", ""],
+                capture_output=True, text=True, timeout=10, env=env,
+            )
+            subprocess.run(
+                ["git", "-C", str(path), "config", "--local", f"{key}.username", login],
+                capture_output=True, text=True, timeout=10, env=env,
+            )
+            result = subprocess.run(
+                ["git", "-C", str(path), "config", "--local", "--add",
+                 f"{key}.helper", helper_script],
+                capture_output=True, text=True, timeout=10, env=env,
+            )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 @functools.cache
 def _active_gh_account() -> str | None:
     """Return the login of the **active** ``gh`` account, or None.
@@ -994,6 +1317,40 @@ def list_gh_accounts() -> list[str]:
     return seen
 
 
+def _auth_config_args_for_url(url: str) -> list[str]:
+    """Build ``-c http.extraheader=...`` args to auth as ``url``'s owner.
+
+    The URL-based core of :func:`_auth_config_args`, usable *before* a repo
+    exists (e.g. the initial ``git clone`` -- there is no checked-out remote
+    to resolve a name against yet). See :func:`_auth_config_args` for the
+    full cross-account rationale and the same-account skip.
+
+    HTTPS-only: a plain ``http://`` remote would otherwise send the bearer
+    token over an unencrypted connection (``_parse_github_owner`` itself
+    matches ``https?://``, since it also backs the account-*resolution*
+    path where scheme doesn't matter -- the credential-*injection* callers
+    must gate separately).
+    """
+    if not url.strip().lower().startswith("https://"):
+        return []
+    owner = _parse_github_owner(url)
+    if not owner:
+        return []
+    try:
+        from . import repos
+        account = repos.account_for_github_owner(owner) or owner
+    except Exception:
+        account = owner
+    active = _active_gh_account()
+    if active and active.casefold() == account.casefold():
+        return []
+    token = _gh_token_for_owner(account)
+    if not token:
+        return []
+    cred = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    return ["-c", f"http.extraheader=AUTHORIZATION: basic {cred}"]
+
+
 def _auth_config_args(remote: str, *, cwd: str | Path) -> list[str]:
     """Build ``-c http.extraheader=...`` args to auth as the remote's owner.
 
@@ -1012,25 +1369,7 @@ def _auth_config_args(remote: str, *, cwd: str | Path) -> list[str]:
     url = _remote_url(remote, cwd=cwd)
     if not url:
         return []
-    owner = _parse_github_owner(url)
-    if not owner:
-        return []
-    # Honor an explicit repos.yaml ``account:`` override (owner != account is
-    # possible for EMU accounts spanning orgs); absent an override the account
-    # *is* the owner, preserving the derive-from-owner behavior (#29).
-    try:
-        from . import repos
-        account = repos.account_for_github_owner(owner) or owner
-    except Exception:
-        account = owner
-    active = _active_gh_account()
-    if active and active.casefold() == account.casefold():
-        return []
-    token = _gh_token_for_owner(account)
-    if not token:
-        return []
-    cred = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-    return ["-c", f"http.extraheader=AUTHORIZATION: basic {cred}"]
+    return _auth_config_args_for_url(url)
 
 
 def ref_exists(ref: str, *, cwd: str | Path) -> bool:
@@ -1304,17 +1643,24 @@ def prune_worktrees(*, cwd: str | Path) -> None:
     git("worktree", "prune", cwd=cwd, check=False)
 
 
-def list_worktree_paths(*, cwd: str | Path) -> list[Path]:
+def list_worktree_paths(
+    *,
+    cwd: str | Path,
+    fail_on_error: bool = False,
+) -> list[Path]:
     """Return the on-disk paths of every worktree registered on this repo.
 
     Parses ``git worktree list --porcelain`` -- one ``worktree <path>`` line per
     registered tree, including the main checkout. Returns ``[]`` if the command
-    fails (e.g. *cwd* is not a git repo). Used by the garbage collector to tell a
-    real, registered worktree from an orphaned on-disk directory left behind by
-    an interrupted/forced removal.
+    fails unless *fail_on_error* is true, in which case the Git error is raised.
+    Used by the garbage collector to tell a real, registered worktree from an
+    orphaned on-disk directory left behind by an interrupted/forced removal.
     """
     res = git("worktree", "list", "--porcelain", cwd=cwd, check=False)
     if res.returncode != 0:
+        if fail_on_error:
+            detail = (res.stderr or res.stdout or "git worktree list failed").strip()
+            raise RuntimeError(detail)
         return []
     paths: list[Path] = []
     for line in (res.stdout or "").splitlines():

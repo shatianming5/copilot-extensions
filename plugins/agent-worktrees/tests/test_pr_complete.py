@@ -9,8 +9,9 @@ worktree's work lands as one upstream commit, and pr-complete must fast-forward
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
-from agent_worktrees import git_ops, pr_complete
+from agent_worktrees import git_ops, pr_complete, pr_ops, tracking
 
 
 def _git(*args: str, cwd) -> str:
@@ -127,6 +128,227 @@ class TestPrComplete:
         # The new commit is preserved on top of the updated upstream.
         assert (wt_path / "new.txt").exists()
         assert _ahead(f"worktree/{wid}", "origin/master", cwd=wt_path) == 1
+
+    def test_recorded_pr_boundary_skips_merged_commits_after_overlap(self, pr_repo):
+        """Replay only post-PR commits after later upstream edits overlap."""
+        config, wid, wt_path, _ = pr_repo
+        anchor = Path(config.default_repo.anchor)
+        branch = f"worktree/{wid}"
+        base = _git("merge-base", "origin/master", branch, cwd=wt_path)
+        pr_head = _git("rev-parse", branch, cwd=wt_path)
+        rec = tracking.load_record_by_id(wid)
+        assert rec is not None
+        rec.pr = tracking.PRRecord(
+            state="merged",
+            base_sha=base,
+            head_sha=pr_head,
+            patch_id=pr_ops._patch_id(base, pr_head, cwd=str(wt_path)),
+        )
+        rec.prs.append(tracking.PRRecord(
+            state="open",
+            base_sha=pr_head,
+            head_sha=pr_head,
+            patch_id="not-merged",
+        ))
+        tracking.save_record(rec)
+
+        _squash_merge_upstream(
+            anchor, files={"a.txt": "one\n", "b.txt": "two\n"}, msg="squash")
+        (anchor / "a.txt").write_text("later upstream edit\n")
+        _git("add", "-A", cwd=anchor)
+        _git("commit", "-m", "later overlapping upstream edit", cwd=anchor)
+        _git("push", "origin", "master", cwd=anchor)
+
+        (wt_path / "status.txt").write_text("local follow-up\n")
+        _git("add", "-A", cwd=wt_path)
+        _git("commit", "-m", "record follow-up status", cwd=wt_path)
+
+        res = pr_complete.complete_worktree(wid, config)
+
+        assert res["success"] is True, res
+        assert res["action"] == "rebased"
+        assert res["kept"] == 1
+        assert res["dropped"] == 2
+        assert (wt_path / "a.txt").read_text() == "later upstream edit\n"
+        assert (wt_path / "status.txt").read_text() == "local follow-up\n"
+        assert _ahead(branch, "origin/master", cwd=wt_path) == 1
+
+    def test_backup_ref_failure_leaves_branch_unchanged(self, pr_repo, monkeypatch):
+        """History mutation requires a durable recovery ref."""
+        config, wid, wt_path, _ = pr_repo
+        anchor = Path(config.default_repo.anchor)
+        _squash_merge_upstream(
+            anchor, files={"a.txt": "one\n", "b.txt": "two\n"}, msg="squash")
+        before = _git("rev-parse", "HEAD", cwd=wt_path)
+        real_git = git_ops.git
+
+        def fail_backup(*args, **kwargs):
+            if args[:2] == ("update-ref", pr_complete.BACKUP_REF):
+                return subprocess.CompletedProcess(args, 1, "", "ref locked")
+            return real_git(*args, **kwargs)
+
+        monkeypatch.setattr(git_ops, "git", fail_backup)
+
+        res = pr_complete.complete_worktree(wid, config)
+
+        assert res["success"] is False
+        assert res["action"] == "error"
+        assert "recovery ref" in res["error"]
+        assert "ref locked" in res["error"]
+        assert _git("rev-parse", "HEAD", cwd=wt_path) == before
+
+    def test_unreadable_branch_tip_leaves_branch_unchanged(self, pr_repo, monkeypatch):
+        """A recovery ref cannot be optional when the branch tip is unreadable."""
+        config, wid, wt_path, _ = pr_repo
+        anchor = Path(config.default_repo.anchor)
+        branch = f"worktree/{wid}"
+        (anchor / "upstream.txt").write_text("advance\n")
+        _git("add", "-A", cwd=anchor)
+        _git("commit", "-m", "upstream advance", cwd=anchor)
+        _git("push", "origin", "master", cwd=anchor)
+        before = _git("rev-parse", "HEAD", cwd=wt_path)
+        real_git = git_ops.git
+
+        def fail_branch_tip(*args, **kwargs):
+            if args == ("rev-parse", branch):
+                return subprocess.CompletedProcess(args, 1, "", "bad ref")
+            return real_git(*args, **kwargs)
+
+        monkeypatch.setattr(git_ops, "git", fail_branch_tip)
+
+        res = pr_complete.complete_worktree(wid, config)
+
+        assert res["success"] is False
+        assert res["action"] == "error"
+        assert "Could not read branch tip" in res["error"]
+        assert "bad ref" in res["error"]
+        assert _git("rev-parse", "HEAD", cwd=wt_path) == before
+
+    def test_recorded_stale_base_uses_effective_merge_base(self, pr_repo):
+        """Base movement before squash-merge still verifies the PR boundary."""
+        config, wid, wt_path, _ = pr_repo
+        anchor = Path(config.default_repo.anchor)
+        branch = f"worktree/{wid}"
+        original_base = _git("merge-base", "origin/master", branch, cwd=wt_path)
+        _git("reset", "--hard", original_base, cwd=wt_path)
+
+        (wt_path / "shared.txt").write_text("shared advance\n")
+        _git("add", "-A", cwd=wt_path)
+        _git("commit", "-m", "shared advance", cwd=wt_path)
+        effective_base = _git("rev-parse", "HEAD", cwd=wt_path)
+        (wt_path / "a.txt").write_text("one\n")
+        _git("add", "-A", cwd=wt_path)
+        _git("commit", "-m", "PR work 1", cwd=wt_path)
+        (wt_path / "b.txt").write_text("two\n")
+        _git("add", "-A", cwd=wt_path)
+        _git("commit", "-m", "PR work 2", cwd=wt_path)
+        pr_head = _git("rev-parse", "HEAD", cwd=wt_path)
+
+        rec = tracking.load_record_by_id(wid)
+        assert rec is not None
+        rec.pr = tracking.PRRecord(
+            state="merged",
+            base_sha=original_base,
+            head_sha=pr_head,
+            patch_id=pr_ops._patch_id(original_base, pr_head, cwd=str(wt_path)),
+        )
+        tracking.save_record(rec)
+
+        _git("reset", "--hard", effective_base, cwd=anchor)
+        _git("push", "origin", "master", cwd=anchor)
+        _squash_merge_upstream(
+            anchor, files={"a.txt": "one\n", "b.txt": "two\n"}, msg="squash PR")
+        (anchor / "a.txt").write_text("later upstream edit\n")
+        _git("add", "-A", cwd=anchor)
+        _git("commit", "-m", "later overlap", cwd=anchor)
+        _git("push", "origin", "master", cwd=anchor)
+
+        (wt_path / "status.txt").write_text("local follow-up\n")
+        _git("add", "-A", cwd=wt_path)
+        _git("commit", "-m", "record status", cwd=wt_path)
+
+        res = pr_complete.complete_worktree(wid, config)
+
+        assert res["success"] is True, res
+        assert res["action"] == "rebased"
+        assert res["kept"] == 1
+        assert (wt_path / "a.txt").read_text() == "later upstream edit\n"
+        assert (wt_path / "status.txt").read_text() == "local follow-up\n"
+        assert _ahead(branch, "origin/master", cwd=wt_path) == 1
+
+    def test_patch_id_shortlist_requires_exact_squash_tree(
+        self, pr_repo, monkeypatch
+    ):
+        """A patch-id collision cannot authorize dropping PR commits."""
+        _config, wid, wt_path, _ = pr_repo
+        branch = f"worktree/{wid}"
+        base = _git("merge-base", "origin/master", branch, cwd=wt_path)
+        head = _git("rev-parse", branch, cwd=wt_path)
+        rec = tracking.load_record_by_id(wid)
+        assert rec is not None
+        rec.pr = tracking.PRRecord(state="merged", head_sha=head)
+        tracking.save_record(rec)
+
+        anchor = Path(_config.default_repo.anchor)
+        (anchor / "unrelated.txt").write_text("unrelated\n")
+        _git("add", "-A", cwd=anchor)
+        _git("commit", "-m", "unrelated upstream", cwd=anchor)
+        _git("push", "origin", "master", cwd=anchor)
+        candidate = _git("rev-parse", "origin/master", cwd=wt_path)
+        effective_patch = pr_ops._patch_id(base, head, cwd=str(wt_path))
+        monkeypatch.setattr(
+            pr_ops,
+            "_commit_patch_ids",
+            lambda *_args, **_kwargs: {effective_patch: {candidate}},
+        )
+
+        assert pr_complete._merged_pr_head(
+            wid, branch, "origin/master", cwd=str(wt_path),
+        ) is None
+
+    def test_exact_squash_tree_preserves_crlf_bytes(self, pr_repo, monkeypatch):
+        """Tree verification must not normalize text diff bytes."""
+        _config, _wid, wt_path, _ = pr_repo
+        anchor = Path(_config.default_repo.anchor)
+        base = _git("merge-base", "origin/master", "HEAD", cwd=wt_path)
+        _git("reset", "--hard", base, cwd=wt_path)
+        (wt_path / "crlf.txt").write_bytes(b"one\r\ntwo\r\n")
+        _git("add", "-A", cwd=wt_path)
+        _git("commit", "-m", "PR with CRLF", cwd=wt_path)
+        pr_head = _git("rev-parse", "HEAD", cwd=wt_path)
+
+        (anchor / "crlf.txt").write_bytes(b"one\r\ntwo\r\n")
+        _git("add", "-A", cwd=anchor)
+        _git("commit", "-m", "squash PR with CRLF", cwd=anchor)
+        candidate = _git("rev-parse", "HEAD", cwd=anchor)
+        monkeypatch.setenv("GIT_DIR", str(anchor / ".git"))
+        monkeypatch.setenv("GIT_INDEX_FILE", str(anchor / "wrong-index"))
+
+        assert pr_complete._is_exact_squash_result(
+            base, pr_head, candidate, cwd=str(wt_path),
+        )
+
+    def test_boundary_rejects_unreadable_post_pr_distance(
+        self, pr_repo, monkeypatch
+    ):
+        """A failed revision count cannot be interpreted as zero commits."""
+        _config, wid, wt_path, _ = pr_repo
+        anchor = Path(_config.default_repo.anchor)
+        branch = f"worktree/{wid}"
+        head = _git("rev-parse", branch, cwd=wt_path)
+        rec = tracking.load_record_by_id(wid)
+        assert rec is not None
+        rec.pr = tracking.PRRecord(state="merged", head_sha=head)
+        tracking.save_record(rec)
+        _squash_merge_upstream(
+            anchor, files={"a.txt": "one\n", "b.txt": "two\n"}, msg="squash")
+        monkeypatch.setattr(
+            pr_complete, "_rev_count_checked", lambda *_args, **_kwargs: None,
+        )
+
+        assert pr_complete._merged_pr_head(
+            wid, branch, "origin/master", cwd=str(wt_path),
+        ) is None
 
     def test_reconcile_preserves_post_merge_divergence_net_zero(self, pr_repo):
         """A post-merge commit that diverges from upstream but nets to the

@@ -68,6 +68,15 @@ Plugin agents cannot override personal or project agents.
 > see `authoring-skills` § *Two ways to add an in-repo skill or agent*). See
 > `installing-plugins` → *the `.ai` local marketplace* for the required
 > marketplace declaration.
+>
+> **Always declare the `agents` field explicitly, even though the runtime
+> currently falls back to `plugin_root/agents` when it is absent.** Explicit
+> is more robust than implicit here: it matches every shipped example
+> (`copilot-extensions-harness`, etc.), survives a future change to the
+> default-path fallback, and gives a human/reviewer an unambiguous manifest to
+> read. The **`reviewing-customizations`** scan hard-flags a plugin with agent
+> files on disk and no such manifest declaration (BLOCKING for a
+> controlled/in-repo plugin) — do not defeat that check by omitting the field.
 
 ## Agent file format
 
@@ -124,6 +133,16 @@ tools with `'server-name/*'` or `'server-name/tool-name'` in the tools list.
 > — including as the `task` tool's `agent_type`. A bare name is reserved for an
 > agent defined in the *same* plugin. The identical convention covers cross-plugin
 > **skill** references (see the authoring-skills skill).
+>
+> **Known runtime limitation.** On some Copilot CLI runtime versions, the
+> `task` tool's `agent_type` is validated against a fixed built-in allowlist
+> with no plugin/marketplace-agent slot at all, so a delegated/background
+> sub-agent cannot reach a `plugin:name` agent through `task` regardless of
+> qualification, and a freshly spawned nested `copilot` process does not
+> inherit the parent session's resolved `enabledPlugins` either. If a
+> delegated/background sub-agent needs to reach a plugin-defined agent on an
+> affected version, see **`hoisting-plugin-agents`** for a repo-local
+> mechanical workaround.
 
 ## Execution contract
 
@@ -170,6 +189,84 @@ decorators (`rename`, `defer`, `code-mode`, `transform`, `storage`) also vanish;
 their fallback is the wider raw catalog and must be documented honestly. A raw
 `curl`/HTTP/product-API bypass is never this fallback.
 
+## Per-toolset ownership: consolidate CLI/REST alongside MCP, not just the MCP
+
+A domain/service agent's job is to be the **one** place the host reaches that
+toolset — not only its MCP server. Most real backends are reachable through
+more than one surface (an MCP server, a CLI like `az`/`gh`/`kubectl`, a REST
+API, a vendor SDK); when the agent wraps only the MCP tools and leaves the
+CLI/REST surface unclaimed, the primary agent (or another plugin) ends up
+calling that CLI directly for the exact same backend. That reintroduces the
+problem per-agent MCP ownership exists to solve: authenticated access and
+noisy round-trips back on the primary context, now through a second,
+unguarded path alongside the sub-agent's guarded one.
+
+**Design every domain agent to own the whole toolset, not one transport into
+it.** Concretely:
+
+- If the domain has a CLI (or REST surface) that reaches the **same** backend
+  the agent's MCP server wraps, document and drive that CLI **from inside the
+  agent** — the same write-safety rules (bounded writes, confirmation,
+  attribution, read-back) apply to a CLI-driven mutation exactly as they do to
+  an MCP-driven one. Don't let the CLI surface stay an implicit, undocumented
+  side door.
+- A direct caller-level CLI/REST call to that backend is a **fallback for the
+  owning agent's own unavailability** (its MCP catalog and materialized/
+  one-shot recovery paths all failed) — not a routine parallel path a caller
+  reaches for merely because a local credential or CLI happens to also work.
+  State this boundary explicitly in the agent's own doc, so callers and
+  reviewers have one place to check it.
+- When review finds the primary agent (or a different plugin) running that
+  domain's CLI directly as a matter of routine, that's a signal to **extend**
+  the owning agent to cover it — not to leave two co-equal paths into the same
+  backend.
+
+**This is about the raw adapter, not every script that happens to call the
+backend.** A skill may freely ship (or reference) its own dedicated,
+purpose-built script or tool that itself calls the backend's API/CLI directly
+— that is not a violation, even when the agent that normally owns the domain
+exists and is healthy. The distinction is **raw vs. dedicated access**:
+
+- **Raw access** means the host (the primary agent, or a skill's own prose
+  guidance) is handed the backend's general-purpose adapter itself —
+  unrestricted `az <anything>`, hand-rolled REST calls built inline from a
+  minted token, or equivalent open-ended MCP tool access — and can compose
+  arbitrary requests against it. *This* is what a domain agent must wrap: the
+  raw adapter should not be something the primary agent (or a skill's
+  narrative instructions) reaches for directly, request by request.
+- **A dedicated script or tool** is a fixed, narrow, reviewed, checked-in
+  artifact that performs **one well-defined operation** against the backend
+  (e.g. a script that authors a specific kind of page, or looks up one
+  specific relationship) — not a general-purpose way to call the backend.
+  It may legitimately use the backend's raw CLI/REST internally (sometimes
+  for a good structural reason, like needing to run in an execution
+  environment the owning agent cannot reach), and skills may reference such
+  scripts without routing through the owning agent.
+
+When you find a skill reaching for the backend directly, the fix depends on
+which shape it is: inline raw-adapter guidance (prose instructions to mint a
+token and construct ad hoc calls) should either move behind the owning agent
+or be converted into its own small, dedicated script — either resolves it. An
+already-dedicated script performing one fixed operation needs no further
+change on this axis.
+
+**Worked example (generic).** A domain agent that wraps an issue-tracker MCP
+server is the natural place to also drive that same tracker's CLI/REST calls
+reaching the identical backend — item creation, label updates, link
+verification, token minting for a downstream call. The agent's own doc states
+this scope explicitly (e.g. "the preferred path for this tracker's CLI/REST
+calls too, not just the MCP's own tools"), and a host-level direct CLI call to
+that backend is reserved for the agent being genuinely down, not a shortcut
+taken because a locally available credential/CLI happens to also work. A
+different skill in the same repo may still ship its own dedicated script that
+creates one specific kind of linked artifact directly against the tracker's
+REST API — that script is not expected to route through the domain agent.
+
+This is a design posture, not (yet) a `reviewing-customizations` machine
+check — audit for it by reading a domain agent's actual scope against what
+CLI/REST surfaces exist for its backend, and by grepping the consuming repo
+for direct CLI calls to a backend an agent already owns.
+
 ## Anti-recursion and tool access
 
 Give agents `tools: ["*"]` (or omit the field) so they have full access to file
@@ -178,6 +275,19 @@ anti-recursion mechanism -- it cripples agents that need to read docs, inspect
 config, or run commands. Narrow tools only when the agent genuinely must not
 have a capability. An agent whose explicit tools list omits `agent` / Task is
 Task-disabled and exempt from the self-delegation guard.
+
+**A related, now-obsolete pattern: restricting an MCP-owning agent's `tools`
+to *only* its MCP surface** (dropping shell/bash) to force MCP usage and keep
+the agent from working around a missing/misbehaving tool. That rationale
+predates `agent-mcp`'s `materialize`/`call` subcommands: the materialized CLI
+fleet is not a workaround, it is a second, equally-authenticated, equally-scoped
+invocation surface over the *same* bridge config -- the bridge's own top-level
+`tools:` allow/deny filter enforces identical scope on both surfaces (see
+*MCP fallback with agent-mcp* above). Restricting an agent to MCP-only tools
+no longer buys any safety; it only disables the required `## MCP Readiness`
+fallback below, which needs shell access to invoke the materialized fleet
+when the native catalog fails to register. Give an MCP-owning agent full
+tool access like any other.
 
 Every Task-capable agent -- including a coordinator that may spawn other agent
 types -- must include this literal, agent-specific line:
@@ -257,16 +367,37 @@ equivalence. An agent **fails** review if any applicable box is unchecked:
 - [ ] **Tools are not narrowed for anti-recursion.** `tools` is omitted or
       `["*"]` (or lists only *additive* MCP grants); it is **never** trimmed to
       "prevent recursion" — that cripples the agent, it doesn't protect it.
+- [ ] **Tools are not narrowed to force MCP-only usage.** An MCP-owning agent's
+      `tools` is not restricted to its MCP surface alone to compel MCP calls or
+      block workarounds -- `agent-mcp`'s `materialize`/`call` subcommands are an
+      equally-authenticated, equally-scoped invocation surface over the same
+      bridge, not a workaround, and this restriction only disables the required
+      MCP Readiness fallback. **If `tools` is restricted for another, legitimate
+      reason (a narrower blast radius, a plugin-specific scope contract), it
+      must still include `execute` (or `*`)** -- the materialized-CLI-fallback
+      recipe shells out to a `.ps1`/`.cmd` stub and is unusable without
+      shell/PowerShell execution, no matter how thoroughly the body documents
+      it. `reviewing-customizations` flags this combination as
+      `mcp-fallback-needs-shell-tool`.
 - [ ] **Every MCP-owning agent has a `## MCP Readiness` section.** If the
       frontmatter declares `mcp-servers`, the body must carry the section that
       houses the readiness, equivalent-fallback, and anti-recursion guards.
 - [ ] **Readiness probe present.** The section instructs the agent to probe one
       MCP tool on startup and preserve the specific error (or, absent one, name
       the server/tool that failed), then report it even if fallback succeeds.
-- [ ] **Equivalent CLI fallback present.** Every agent-mcp-backed server names
-      its materialized fleet, uses the same bridge config/identity/top-level
-      `tools:` filter, probes a read-only stub with `--no-serve`, and stops only
-      after both surfaces fail. Raw product/API bypasses are not accepted.
+- [ ] **Equivalent CLI fallback present, always enabled.** Every agent-mcp-backed
+      server names its materialized fleet, uses the same bridge config/
+      identity/top-level `tools:` filter, probes a read-only stub with
+      `--no-serve`, and stops only after both surfaces fail. Raw product/API
+      bypasses are not accepted. **A blanket "disabled by the authorization/
+      conditional gate" opt-out is never acceptable, regardless of how
+      privileged, credential-minting, or destructive-capable the wrapped MCP
+      is** -- see *Decorator boundary reviewed* below for why. Without this
+      fallback the agent has **zero recourse, not even by the operator**, when
+      Copilot's native MCP catalog fails to register in-session (a Copilot
+      CLI-side extension/session-registration gap with no in-session repair):
+      every request simply fails outright. `reviewing-customizations` flags the
+      obsolete marker as `mcp-fallback-disabled`.
 - [ ] **Plugin recovery is discoverable.** A plugin-packaged MCP agent has a
       troubleshooting/diagnostic skill that covers its MCP or bridge failure
       modes, and the plugin README explicitly documents dependencies and
@@ -275,11 +406,19 @@ equivalence. An agent **fails** review if any applicable box is unchecked:
       bridge config or overlay, not only in `mcp-servers.env`.
 - [ ] **Fleet provenance matches.** `manifest.json.bridge` resolves to the same
       config path used by the primary frontmatter before the fleet is trusted.
-- [ ] **Decorator boundary reviewed.** Duplicate static restrictions in
-      top-level `tools:`. Conditional `gate`/argument-dependent authorization
-      requires the explicit marker `Materialized CLI fallback: disabled
-      (conditional authorization gate)`; shape-only decorators yield a wider
-      raw catalog that the agent documents.
+- [ ] **Decorator boundary reviewed, never used to justify disabling the
+      fallback.** Duplicate static restrictions in top-level `tools:` are
+      redundant with the bridge's own decorators. A bridge's `decorators:`
+      (`filter`/`transform`/`gate`) run inside **agent-mcp's own bridge
+      runtime**, not the invocation transport -- they are enforced identically
+      no matter which surface calls them: the native attached catalog, the
+      one-shot `call` subcommand, or a materialized stub. A conditional/
+      argument-dependent `gate` therefore does **not** justify disabling the
+      fallback (the now-obsolete `Materialized CLI fallback: disabled
+      (conditional authorization gate)` marker); it is exactly the case the
+      fallback must keep working for. Review only that shape-only decorators
+      (a static `filter`/`transform` with no runtime branching) yield a wider
+      raw catalog than intended, which the agent should document.
 - [ ] **MCP anti-self-delegation line present.** The section contains an explicit
       "Do NOT … (task tool / spawn / delegate) …" directive — canonically the
       literal line "Do NOT use the task tool to spawn another `<agent-name>`
@@ -307,7 +446,7 @@ the exact config path** the frontmatter uses — e.g. the `--config <path>` the
   single upstream tool and print the result (pipeable; also reads the args JSON on
   stdin).
 - **`<agent-mcp catalog argv[0]> materialize <bridge>`** — project the whole `tools/list` catalog
-  into a discoverable CLI stub fleet under `~/.agent-mcp/materialized/<server>/`
+  into a discoverable CLI stub fleet under `~/.agent-mcp/materialized/<server>/` <!-- marketplace-isolation: allow doc-example -->
   (each stub forwards through the legacy global `agent-mcp call` management <!-- marketplace-isolation: allow materialized-stub-management -->
   wrapper, so tools are invocable by name and pipe
   like any command; `--windows` emits a `.ps1`/`.cmd` shim farm). Re-running

@@ -7,17 +7,20 @@ checkout and must be worked in a GitHub CodeSpace (via agent-codespaces /
 agent-bridge) rather than edited in place.
 
 The map is derived, never hardcoded: it reads ``agent-worktrees related list
---json`` and keeps the entries whose ``delegate`` is ``agent-codespaces`` (the
-same registration ``agent-worktrees related resolve <name>`` and the
-``codespace:<name>`` dispatcher consume). Each row surfaces the CodeSpaces
-vessel repo, the in-CodeSpace checkout folder, and the machine, so a session can
-dispatch correctly at a glance.
+--json --require-managed`` and keeps the entries whose ``delegate`` is
+``agent-codespaces`` (the same registration ``agent-worktrees related resolve
+<name>`` and the ``codespace:<name>`` dispatcher consume). The explicit gate
+keeps the hook silent outside an adopted project without requiring a second
+runtime start. Each row surfaces the CodeSpaces vessel repo, the in-CodeSpace
+checkout folder, and the machine, so a session can dispatch correctly at a
+glance.
 
 Output contract (Copilot CLI sessionStart hook): a single JSON object on stdout
 -- ``{"additionalContext": "<markdown>"}`` when there is at least one
 CodeSpace-delegated repo, else ``{}``. cwd-gated to a managed agent-worktrees
-project so nothing leaks into unrelated repos. Never raises: any error degrades
-to ``{}``.
+project so nothing leaks into unrelated repos. Legacy lookup errors degrade to
+``{}``; explicit installation context refusal is a nonzero failure, never an
+ambient worktrees lookup.
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ import sys
 
 
 def _emit_empty() -> None:
-    print("{}")
+    sys.stdout.write("{}")
     raise SystemExit(0)
 
 
@@ -43,7 +46,7 @@ def _aw_binstub() -> str | None:
     ``current-version`` marker (#1106). PATH first, then the conventional
     ``~/.local/bin`` install location.
     """
-    exe = shutil.which("agent-worktrees")
+    exe = shutil.which("agent-worktrees")  # marketplace-isolation: allow no-context legacy map fallback; explicit context uses worktrees.run
     if exe:
         return exe
     local = os.path.join(os.path.expanduser("~"), ".local", "bin")
@@ -54,8 +57,35 @@ def _aw_binstub() -> str | None:
     return None
 
 
-def _aw(*args: str) -> str | None:
+def _agent_procutil_src(payload: Path) -> str:
+    """Resolve ``agent_procutil``'s ``src/`` directory across layouts:
+    the materialized payload copy (a real release -- ``materialize_main.py``
+    copies canonical in at promotion time) if present, else the canonical
+    repo-root ``libs/agent-procutil/src`` (a dev checkout -- agent-procutil
+    is now a `uv`-editable canonical reference, vendor-pointer-
+    generalization effort Phase 1, so this plugin carries no local copy at
+    all there)."""
+    local = payload / "libs" / "agent-procutil" / "src"
+    if local.is_dir():
+        return str(local)
+    return str(payload.parents[1] / "libs" / "agent-procutil" / "src")
+
+
+def _aw(*args: str, cwd: str | None = None) -> str | None:
     """Run ``agent-worktrees`` via its own binstub and return stdout."""
+    if os.environ.get("COPILOT_EXTENSIONS_CONTEXT", ""):
+        # The hook also runs directly from a deployed payload, outside its venv.
+        payload = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(payload / "src"))
+        sys.path.insert(0, _agent_procutil_src(payload))
+        from agent_codespaces import worktrees
+
+        proc = worktrees.run(*args, cwd=cwd, timeout=20)
+        if proc is not None and proc.returncode != 0:
+            raise worktrees.ContextRefused(
+                proc.stderr.strip() or f"Same-cell map command exited {proc.returncode}"
+            )
+        return proc.stdout if proc is not None else None
     exe = _aw_binstub()
     if not exe:
         return None
@@ -63,6 +93,7 @@ def _aw(*args: str) -> str | None:
         proc = subprocess.run(
             [exe, *args],
             capture_output=True, text=True, timeout=20,
+            cwd=cwd or None,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -77,9 +108,16 @@ def _codespace_delegated(related: list[dict]) -> list[dict]:
         if (entry.get("delegate") or "").strip() != "agent-codespaces":
             continue
         locus = entry.get("locus") or {}
+        preferred = (locus.get("preferred") or "local").strip()
+        preferred_kind = preferred.lower()
+        if preferred_kind != "codespace":
+            continue
         cs = locus.get("codespace") or {}
         rows.append({
             "name": entry.get("name", "?"),
+            "role": (entry.get("role") or "").strip(),
+            "locus": preferred_kind,
+            "delegate": (entry.get("delegate") or "").strip(),
             "summary": (entry.get("summary") or "").strip(),
             "vessel": cs.get("repo", ""),
             "workspace_folder": cs.get("workspace_folder", ""),
@@ -114,36 +152,57 @@ def _render(rows: list[dict]) -> str:
 
 
 def _render_aggregate(rows: list[dict], version: str) -> str:
-    names = [str(row.get("name") or "?") for row in rows]
-    shown = names[:3]
-    label = ", ".join(f"`{name}`" for name in shown)
-    if len(names) > len(shown):
-        label += f", +{len(names) - len(shown)} more"
-    context = (
+    prefix = (
         f"[owner: agent-codespaces@{version}]\n"
-        f"CodeSpace-delegated repos ({len(names)}): {label}. They have no local "
-        "checkout: resolve the exact venue with `agent-worktrees related resolve "
-        "<name>` and dispatch through the exact agent-bridge catalog command. "
-        "Use the `agent-codespaces` skill for lifecycle details."
+        "CodeSpace routes (delegate=agent-codespaces): "
     )
-    if len(context.encode("utf-8")) > 384:
-        context = (
-            f"[owner: agent-codespaces@{version}]\n"
-            f"{len(names)} related repos require CodeSpace delegation and have no "
-            "local checkout. Resolve each with `agent-worktrees related resolve "
-            "<name>` and use the exact agent-bridge catalog command. Load the "
-            "`agent-codespaces` skill for details."
+    suffix = (
+        "\nNo local checkout; resolve with "
+        "`agent-worktrees related resolve <name>`."
+    )
+    entries = []
+    for index, row in enumerate(rows):
+        entry = (
+            f"{row.get('name') or '?'}("
+            f"role={row.get('role') or '-'},"
+            f"locus={row.get('locus') or '-'})"
         )
-    return context
+        remaining = len(rows) - index - 1
+        label = "; ".join([*entries, entry])
+        if remaining:
+            label += f"; +{remaining} more"
+        candidate = f"{prefix}{label}.{suffix}"
+        if len(_serialize_context(candidate).encode("utf-8")) > 384:
+            break
+        entries.append(entry)
+    omitted = len(rows) - len(entries)
+    label = "; ".join(entries)
+    if omitted:
+        label += (f"; +{omitted} more" if label else f"+{omitted} more")
+    return f"{prefix}{label}.{suffix}"
+
+
+def _serialize_context(context: str) -> str:
+    return json.dumps(
+        {"additionalContext": context},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _cwd_arg() -> str | None:
+    argv = sys.argv[1:]
+    for index, value in enumerate(argv):
+        if value == "--cwd" and index + 1 < len(argv):
+            return argv[index + 1]
+        if value.startswith("--cwd="):
+            return value.split("=", 1)[1]
+    return None
 
 
 def main() -> None:
-    # cwd-gate: only emit inside a managed agent-worktrees project.
-    project = (_aw("get", "project") or "").strip()
-    if not project:
-        _emit_empty()
-
-    raw = _aw("related", "list", "--json")
+    cwd = _cwd_arg()
+    raw = _aw("related", "list", "--json", "--require-managed", cwd=cwd)
     if not raw:
         _emit_empty()
     try:
@@ -158,9 +217,9 @@ def main() -> None:
     if "--aggregate" in sys.argv[1:]:
         manifest = Path(__file__).resolve().parents[1] / "plugin.json"
         version = json.loads(manifest.read_text(encoding="utf-8"))["version"]
-        print(json.dumps({"additionalContext": _render_aggregate(rows, version)}))
+        sys.stdout.write(_serialize_context(_render_aggregate(rows, version)))
     else:
-        print(json.dumps({"additionalContext": _render(rows)}))
+        sys.stdout.write(_serialize_context(_render(rows)))
 
 
 if __name__ == "__main__":
@@ -168,5 +227,8 @@ if __name__ == "__main__":
         main()
     except SystemExit:
         raise
-    except Exception:
-        print("{}")
+    except Exception as error:
+        if os.environ.get("COPILOT_EXTENSIONS_CONTEXT", ""):
+            print(f"CodeSpaces guidance refused: {error}", file=sys.stderr)
+            raise SystemExit(126)
+        sys.stdout.write("{}")

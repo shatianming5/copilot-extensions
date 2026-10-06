@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -100,6 +101,7 @@ _AUTOFIXABLE = {
     "overlay_redundant_base_repo",
     "overlay_conflicting_srcroot",
     "overlay_conflicting_branch",
+    "project_identity_invalid",
 }
 
 
@@ -121,7 +123,10 @@ class Finding:
 # ---------------------------------------------------------------------------
 
 def _projects_path() -> Path:
-    return Path.home() / ".agent-worktrees" / "projects.yaml"
+    from . import registry_paths
+
+    _legacy = Path.home() / ".agent-worktrees"  # marketplace-isolation: allow legacy
+    return registry_paths.registry_path("projects.yaml", legacy_root=_legacy)
 
 
 def _read_projects() -> dict[str, dict]:
@@ -209,9 +214,12 @@ def _wsl_install_present(distro: str | None) -> bool | None:
     if not wsl_exe:
         return None
     probe = (
-        'v="$(cat "$HOME/.agent-worktrees/current-version" 2>/dev/null)"; '
-        'test -x "$HOME/.agent-worktrees/versions/$v/bin/agent-worktrees" '
-        '-o -x "$HOME/.agent-worktrees/versions/$v/bin/python"'
+        'v="$(cat "$HOME/'
+        '.agent-worktrees/current-version" 2>/dev/null)"; '  # marketplace-isolation: allow legacy
+        'test -x "$HOME/'
+        '.agent-worktrees/versions/$v/bin/agent-worktrees" '  # marketplace-isolation: allow legacy
+        '-o -x "$HOME/'
+        '.agent-worktrees/versions/$v/bin/python"'  # marketplace-isolation: allow legacy
     )
     argv = [wsl_exe]
     if distro:
@@ -234,7 +242,10 @@ def _wsl_install_present(distro: str | None) -> bool | None:
 
 def _read_global_config() -> dict:
     """Machine-wide ``~/.agent-worktrees/config.yaml`` (srcroot/machine/platform)."""
-    path = Path.home() / ".agent-worktrees" / "config.yaml"
+    from . import registry_paths
+
+    _legacy = Path.home() / ".agent-worktrees"  # marketplace-isolation: allow legacy
+    path = registry_paths.registry_path("config.yaml", legacy_root=_legacy)
     if not path.exists():
         return {}
     try:
@@ -244,8 +255,14 @@ def _read_global_config() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _overlay_path(config_dir: str | None) -> Path | None:
+def _overlay_path(config_dir: str | None, project: str = "") -> Path | None:
     """Resolve a project's overlay ``config.yaml`` from its ``config_dir``."""
+    from . import project_state
+
+    if project and project_state.namespaced():
+        from . import config as _cfg
+
+        return _cfg.project_dir(project) / "config.yaml"
     if not config_dir:
         return None
     return Path(os.path.expanduser(config_dir)) / "config.yaml"
@@ -316,7 +333,30 @@ def _overlay_findings(
     gcfg = _read_global_config()
     for pname in sorted(projects):
         proj = projects[pname]
-        opath = _overlay_path(proj.get("config_dir"))
+        try:
+            opath = _overlay_path(proj.get("config_dir"), pname)
+        except ValueError as error:
+            finding = Finding(
+                repo=pname,
+                kind="project_identity_invalid",
+                severity=SEV_ERROR,
+                detail=str(error),
+                fixable=True,
+                fix_detail="create or repair the cell-local repository identity",
+            )
+            if fix:
+                try:
+                    from . import project_state
+
+                    project_state.ensure_project_state(pname)
+                    finding.fixed = True
+                except (OSError, ValueError) as fix_error:
+                    finding.fixable = False
+                    finding.fix_detail = str(fix_error)
+            findings.append(finding)
+            if not finding.fixed:
+                continue
+            opath = _overlay_path(proj.get("config_dir"), pname)
         overlay = _read_overlay(opath)
         if not overlay:
             continue
@@ -441,6 +481,77 @@ def _overlay_findings(
 # Diagnose / reconcile
 # ---------------------------------------------------------------------------
 
+def _agent_rt_root_findings(fix: bool) -> list[Finding]:
+    """Flag a persisted ``AGENT_RT_ROOT`` as unexpected drift.
+
+    ``AGENT_RT_ROOT`` is a shared runtime-resolution override every plugin's
+    ``resolve-runtime.ps1``/``.sh`` accepts; the contract is that a binstub
+    sets it itself, per-invocation, immediately before dot-sourcing the
+    resolver -- it should never persist beyond a single process. A stray
+    persisted value (typically left over from ad-hoc debugging) silently
+    hijacks any later invocation of a plugin resolver that -- unlike this
+    plugin's own binstub (fixed alongside this check) -- trusts an inherited
+    value instead of scoping its own. See
+    ThomasMichon/copilot-extensions#3220.
+    """
+    findings: list[Finding] = []
+    if sys.platform == "win32":
+        import winreg  # local import; Windows-only stdlib module
+
+        for scope, hive, subkey in (
+            ("User", winreg.HKEY_CURRENT_USER, "Environment"),
+            ("Machine", winreg.HKEY_LOCAL_MACHINE,
+             r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+        ):
+            try:
+                with winreg.OpenKey(hive, subkey) as key:
+                    value, _ = winreg.QueryValueEx(key, "AGENT_RT_ROOT")
+            except OSError:
+                continue
+            fixed = False
+            if fix:
+                try:
+                    with winreg.OpenKey(hive, subkey, 0, winreg.KEY_SET_VALUE) as wkey:
+                        winreg.DeleteValue(wkey, "AGENT_RT_ROOT")
+                    fixed = True
+                except OSError:
+                    fixed = False
+            findings.append(Finding(
+                repo="*",
+                kind="leaked_agent_rt_root",
+                severity=SEV_WARNING,
+                detail=(
+                    f"persisted {scope}-scope AGENT_RT_ROOT={value!r} found in "
+                    "the Windows registry; this should only ever be a "
+                    "transient, per-invocation process variable a binstub "
+                    "sets itself -- a persisted value silently hijacks any "
+                    "plugin resolver that trusts an inherited value"
+                ),
+                fixable=True,
+                fix_detail=f"clear {scope}-scope AGENT_RT_ROOT from the registry",
+                fixed=fixed,
+            ))
+    else:
+        # A process-level check can't tell "exported in this process only"
+        # apart from "exported by a shell rc file"; report only -- blind-
+        # editing an operator's rc file is unsafe.
+        if os.environ.get("AGENT_RT_ROOT"):
+            findings.append(Finding(
+                repo="*",
+                kind="leaked_agent_rt_root",
+                severity=SEV_WARNING,
+                detail=(
+                    "AGENT_RT_ROOT is set in this process' environment; if "
+                    "it is exported from a shell rc file rather than set "
+                    "per-invocation by a binstub, remove it there -- a "
+                    "persisted value silently hijacks any plugin resolver "
+                    "that trusts an inherited value"
+                ),
+                fixable=False,
+            ))
+    return findings
+
+
 def reconcile(fix: bool = False, plat: str | None = None) -> list[Finding]:
     """Diagnose drift and, when ``fix`` is set, reconcile the data-only cases.
 
@@ -452,6 +563,7 @@ def reconcile(fix: bool = False, plat: str | None = None) -> list[Finding]:
     registry = repos.read_registry()
     projects = _read_projects()
     findings: list[Finding] = []
+    findings.extend(_agent_rt_root_findings(fix))
 
     # Index repos.yaml entries by normalized current-platform path for
     # collision detection.
@@ -648,6 +760,34 @@ def reconcile(fix: bool = False, plat: str | None = None) -> list[Finding]:
                 detail=f"path for {plat} does not exist: {p}",
                 fixable=False,
                 fix_detail=f"re-clone or remove with: repos remove {name}",
+            ))
+
+    # Identity repair needs the repo entry on disk because project-state
+    # validation deliberately re-reads the registry rather than trusting an
+    # in-memory mutation.
+    if fix and dirty_repos:
+        try:
+            repos.write_registry(registry)
+            dirty_repos = False
+        except OSError as error:
+            dirty_repos = False
+            for finding in findings:
+                if finding.fixed and finding.kind in {
+                    "missing_repo_entry",
+                    "wrong_class",
+                    "anchor_mismatch",
+                    "name_collision",
+                }:
+                    finding.fixed = False
+                    finding.fixable = False
+                    finding.fix_detail = str(error)
+            findings.append(Finding(
+                repo="*",
+                kind="registry_write_failed",
+                severity=SEV_ERROR,
+                detail=f"could not write repos.yaml: {error}",
+                fixable=False,
+                fix_detail=str(error),
             ))
 
     # --- per-project overlay reconciliation (redundant/conflicting keys) ----

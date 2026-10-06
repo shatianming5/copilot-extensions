@@ -7,14 +7,19 @@ that need SSH go through this manager to share multiplexed connections.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
+from .carrier import CarrierLease, CarrierUnavailable, PersistentCarrier
 from .config_sources import ConfigSource, SSHConfig
 from .platform import (
     PlatformInfo,
@@ -22,6 +27,8 @@ from .platform import (
     ensure_socket_dir,
     socket_path_for_host,
 )
+from .process import terminate_ssh_process_tree
+from .proxy import create_ssh_subprocess
 
 log = logging.getLogger("ssh-manager")
 
@@ -32,6 +39,26 @@ log = logging.getLogger("ssh-manager")
 # closed"). Mirror the acp library's 50 MB default so remote ACP sessions match
 # local ones.
 _STDIO_CHANNEL_LIMIT_BYTES = 50 * 1024 * 1024
+
+
+def _carrier_transport_identity(info: ConnectionInfo) -> str:
+    """Key a carrier by SSH routing plus tunnels inherited by its process."""
+    forwards = sorted(
+        " ".join(str(forward).split())
+        for forward in getattr(info, "port_forwards", [])
+    )
+    if not forwards:
+        return info.connection_identity
+    encoded = json.dumps(
+        {
+            "connection_identity": info.connection_identity,
+            "port_forwards": forwards,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 # Module-level default instance (lazy-initialized)
 _default_manager: ConnectionManager | None = None
@@ -53,14 +80,6 @@ def _creation_flags() -> int:
     if sys.platform == "win32":
         return subprocess.CREATE_NO_WINDOW
     return 0
-
-
-def _subprocess_kwargs(**kwargs):  # noqa: ANN003, ANN202
-    """Common subprocess isolation kwargs for SSH children."""
-    kwargs["creationflags"] = _creation_flags()
-    if sys.platform != "win32":
-        kwargs["start_new_session"] = True
-    return kwargs
 
 
 async def _terminate_process_tree(
@@ -131,6 +150,77 @@ class CommandResult:
             )
 
 
+# The dev-tunnel service behind CodeSpace SSH resets a share of connections
+# mid-flight ("An existing connection was forcibly closed", "error getting
+# tunnel", an RPC "Unavailable", a bare exit 255). These signatures classify
+# such a transient transport failure so idempotent callers can retry instead
+# of failing an operation that would succeed on a second try. ssh_manager owns
+# CommandResult, so this is the one shared definition for every plugin.
+_TRANSIENT_SSH_EXIT = 255
+TRANSIENT_SSH_STDERR = re.compile(
+    r"forcibly closed|connection reset|broken pipe|closed network connection|"
+    r"connection closed|wsarecv|kex_exchange_identification|error getting tunnel|"
+    r"code = Unavailable|server preface|Connection timed out|"
+    r"Timeout, server .* not responding",
+    re.IGNORECASE,
+)
+
+
+def is_transient_ssh_failure(result: CommandResult) -> bool:
+    """True when ``result`` is a transient SSH/tunnel failure, not a genuine
+    nonzero exit of the remote command."""
+    if getattr(result, "timed_out", False):
+        return True
+    code = getattr(result, "exit_code", None)
+    if code == _TRANSIENT_SSH_EXIT:
+        return True
+    return bool(
+        code not in (0, None)
+        and TRANSIENT_SSH_STDERR.search(getattr(result, "stderr", "") or "")
+    )
+
+
+async def exec_with_retry(
+    manager: "ConnectionManager",
+    host: str,
+    command: str,
+    *,
+    timeout: float | None = 60.0,
+    input_bytes: bytes | None = None,
+    attempts: int = 3,
+    reconnect=None,
+) -> CommandResult:
+    """``exec_command`` with retry and backoff on transient SSH/tunnel failures.
+
+    Only for IDEMPOTENT commands -- a retry may re-run the command. A genuine
+    nonzero exit of the remote command is returned at once. Between attempts
+    it best-effort awaits ``reconnect()`` to heal a dropped ControlMaster (a
+    no-op for direct SSH, where each exec is a fresh connection).
+    """
+    kwargs: dict = {"timeout": timeout}
+    if input_bytes is not None:
+        kwargs["input_bytes"] = input_bytes
+    result = await manager.exec_command(host, command, **kwargs)
+    delay = 2.0
+    for attempt in range(1, attempts):
+        if not is_transient_ssh_failure(result):
+            return result
+        log.warning(
+            "Transient SSH failure on %s (attempt %d/%d, exit %s); retrying in %.0fs: %s",
+            host, attempt, attempts, getattr(result, "exit_code", None), delay,
+            (getattr(result, "stderr", "") or "").strip()[:200],
+        )
+        if reconnect is not None:
+            try:
+                await reconnect()
+            except Exception as exc:  # noqa: BLE001 -- best-effort heal
+                log.debug("Reconnect before retry on %s failed: %s", host, exc)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 8.0)
+        result = await manager.exec_command(host, command, **kwargs)
+    return result
+
+
 @dataclass
 class ConnectionInfo:
     """Information about an active SSH master connection."""
@@ -143,6 +233,22 @@ class ConnectionInfo:
     port_forwards: list[str] = field(default_factory=list)
     connection_identity: str = ""
     child_processes: list[asyncio.subprocess.Process] = field(default_factory=list)
+    # Environment override for every SSH subprocess spawned for this
+    # connection (control master, exec_command, open_stdio_channel,
+    # disconnect's ``-O exit``, and -- critically -- the Windows proxy
+    # broker's actual ProxyCommand child, e.g. ``gh cs ssh --stdio``).
+    # Sourced from the ``ConfigSource`` used to establish this connection
+    # (see ``ensure_connected``): a multi-account ``ConfigSource`` such as
+    # ``CodespaceConfigSource``/``CodespaceSource`` already pins its own
+    # *config-fetch* subprocess (``gh codespace ssh --config``) to the
+    # right account via this same env, but until this field existed nothing
+    # threaded it onward to the actual connection -- every SSH spawn after
+    # that point silently fell back to the ambient process environment's gh
+    # identity, producing a confusing 404 ("getting full codespace details")
+    # whenever that ambient account differs from the CodeSpace's owner.
+    # ``None`` preserves the historical ambient-inherit behavior for any
+    # ``ConfigSource`` that doesn't expose one.
+    env: dict[str, str] | None = None
 
     @property
     def multiplexed(self) -> bool:
@@ -160,8 +266,11 @@ class ConnectionManager:
     def __init__(self, platform: PlatformInfo | None = None) -> None:
         self._platform = platform or detect_platform()
         self._connections: dict[str, ConnectionInfo] = {}
+        self._carriers: dict[str, PersistentCarrier] = {}
+        self._carrier_hosts: dict[str, str] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
+        self._carrier_lock = asyncio.Lock()
 
     @property
     def platform(self) -> PlatformInfo:
@@ -179,6 +288,8 @@ class ConnectionManager:
         host: str,
         config_source: ConfigSource,
         port_forwards: list[str] | None = None,
+        *,
+        preserve_existing_forwards: bool = False,
     ) -> ConnectionInfo:
         """Ensure a master connection exists for the given host.
 
@@ -188,7 +299,12 @@ class ConnectionManager:
         """
         lock = await self._get_lock(host)
         async with lock:
-            forwards = port_forwards or []
+            existing = self._connections.get(host)
+            forwards = (
+                list(existing.port_forwards)
+                if preserve_existing_forwards and existing is not None
+                else port_forwards or []
+            )
 
             # Check existing connection
             if host in self._connections:
@@ -227,13 +343,16 @@ class ConnectionManager:
 
             # Establish new connection
             config = await asyncio.to_thread(config_source.get_ssh_config)
-            return await self._connect(host, config, forwards)
+            env = getattr(config_source, "gh_env", None)
+            return await self._connect(host, config, forwards, env=env)
 
     async def _connect(
         self,
         host: str,
         config: SSHConfig,
         port_forwards: list[str],
+        *,
+        env: dict[str, str] | None = None,
     ) -> ConnectionInfo:
         """Establish a new master SSH connection."""
         ensure_socket_dir(self._platform)
@@ -243,10 +362,13 @@ class ConnectionManager:
             config.hostname or config.host_alias,
             config.user,
             config.port,
+            namespace=host,
         )
 
         if self._platform.supports_control_master:
-            proc = await self._start_control_master(config, socket, port_forwards)
+            proc = await self._connect_with_retry(
+                config, socket, port_forwards, env=env,
+            )
         else:
             # Direct mode -- no persistent master process
             proc = None
@@ -263,6 +385,7 @@ class ConnectionManager:
             platform=self._platform,
             port_forwards=port_forwards,
             connection_identity=config.connection_identity,
+            env=env,
         )
         self._connections[host] = info
 
@@ -274,11 +397,40 @@ class ConnectionManager:
         )
         return info
 
+    async def _connect_with_retry(
+        self,
+        config: SSHConfig,
+        socket: Path,
+        port_forwards: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        attempts: int = 3,
+    ) -> asyncio.subprocess.Process:
+        """Start the ControlMaster, retrying a transient tunnel reset (2 s, 4 s)."""
+        delay = 2.0
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._start_control_master(
+                    config, socket, port_forwards, env=env,
+                )
+            except ConnectionError as exc:
+                if attempt >= attempts:
+                    raise
+                log.warning(
+                    "SSH connect to %s failed (attempt %d/%d); retrying in %.0fs: %s",
+                    config.ssh_target, attempt, attempts, delay, exc,
+                )
+                await asyncio.sleep(delay)
+                delay *= 2
+        raise ConnectionError(f"ControlMaster failed to establish for {config.ssh_target}")
+
     async def _start_control_master(
         self,
         config: SSHConfig,
         socket: Path,
         port_forwards: list[str],
+        *,
+        env: dict[str, str] | None = None,
     ) -> asyncio.subprocess.Process:
         """Start an SSH ControlMaster process."""
         args = self._base_ssh_args(config)
@@ -296,12 +448,13 @@ class ConnectionManager:
 
         log.debug("Starting ControlMaster: %s", " ".join(args))
 
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_ssh_subprocess(
             *args,
+            config=config,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **_subprocess_kwargs(),
+            env=env,
         )
 
         # Wait briefly for connection to establish or fail
@@ -347,6 +500,10 @@ class ConnectionManager:
         args.extend([
             "-o", "ConnectTimeout=15",
             "-o", "ServerAliveInterval=30",
+            # Ride out a brief tunnel stall (30 s x 6 = 180 s, up from
+            # OpenSSH's default of 3) instead of dropping a live session.
+            "-o", "ServerAliveCountMax=6",
+            "-o", "TCPKeepAlive=yes",
             "-o", "BatchMode=yes",
             "-T",  # no PTY
         ])
@@ -388,11 +545,7 @@ class ConnectionManager:
         """Run a command over the multiplexed (or direct) SSH connection.
 
         When ``input_bytes`` is given it is written to the remote command's
-        **stdin** (and stdin is a pipe rather than ``/dev/null``). This lets a
-        caller stream a large payload -- e.g. a base64 plugin tarball for
-        ``--plugin-dir`` staging -- without embedding it in the command string,
-        which would overrun the Windows ~32 KB command-line limit (``[WinError
-        206]``).
+        stdin instead of embedding large payloads in the command line.
 
         Returns a CommandResult with stdout, stderr, exit code, and
         timeout status. Does not raise on nonzero exit -- call
@@ -410,8 +563,9 @@ class ConnectionManager:
 
         log.debug("exec_command on %s: %s", host, command)
 
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_ssh_subprocess(
             *args,
+            config=info.config,
             stdin=(
                 asyncio.subprocess.PIPE
                 if input_bytes is not None
@@ -419,7 +573,7 @@ class ConnectionManager:
             ),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **_subprocess_kwargs(),
+            env=info.env,
         )
 
         timed_out = False
@@ -455,6 +609,8 @@ class ConnectionManager:
         self,
         host: str,
         remote_cmd: str,
+        *,
+        discard_stderr: bool = False,
     ) -> asyncio.subprocess.Process:
         """Open a bidirectional stdin/stdout channel for ACP sessions.
 
@@ -474,19 +630,175 @@ class ConnectionManager:
 
         log.debug("open_stdio_channel on %s: %s", host, remote_cmd)
 
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_ssh_subprocess(
             *args,
+            config=info.config,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=(
+                asyncio.subprocess.DEVNULL
+                if discard_stderr
+                else asyncio.subprocess.PIPE
+            ),
+            env=info.env,
             # POSIX: give the ssh child its own session/process group so
             # teardown signals only the ssh process tree -- never the parent's
             # group. Windows uses taskkill /T against the root pid.
-            **_subprocess_kwargs(limit=_STDIO_CHANNEL_LIMIT_BYTES),
+            limit=_STDIO_CHANNEL_LIMIT_BYTES,
         )
 
         info.child_processes.append(proc)
         return proc
+
+    async def close_stdio_channel(
+        self,
+        host: str,
+        proc: asyncio.subprocess.Process,
+        *,
+        grace: float = 2.0,
+    ) -> None:
+        """Close a stdio channel by EOF, then reap its isolated SSH tree."""
+        if proc.stdin is not None and not proc.stdin.is_closing():
+            proc.stdin.close()
+            try:
+                await proc.stdin.wait_closed()
+            except (AttributeError, ConnectionError, OSError):
+                pass
+        if proc.returncode is None:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=grace)
+            except (TimeoutError, asyncio.TimeoutError):
+                await terminate_ssh_process_tree(proc)
+        info = self._connections.get(host)
+        if info is not None and proc in info.child_processes:
+            info.child_processes.remove(proc)
+
+    async def acquire_carrier(
+        self,
+        host: str,
+        remote_command: str,
+        **options: Any,
+    ) -> CarrierLease:
+        """Acquire the one persistent carrier for this connection identity.
+
+        ``ensure_connected`` remains the authority for SSH configuration. The
+        carrier registry is keyed by its complete normalized identity so two
+        aliases resolving to the same connection cannot race up duplicate
+        long-lived SSH processes.
+        """
+        info = self._connections.get(host)
+        if info is None:
+            raise RuntimeError(
+                f"No connection to {host}. Call ensure_connected() first."
+            )
+        identity = _carrier_transport_identity(info)
+        process_hosts: dict[int, str] = {}
+
+        async def _open() -> asyncio.subprocess.Process:
+            active_host = next(
+                (
+                    candidate
+                    for candidate, connection in self._connections.items()
+                    if _carrier_transport_identity(connection) == identity
+                ),
+                None,
+            )
+            if active_host is None:
+                raise RuntimeError(
+                    "no active SSH connection for carrier identity"
+                )
+            process = await self.open_stdio_channel(
+                active_host,
+                remote_command,
+                discard_stderr=True,
+            )
+            process_hosts[id(process)] = active_host
+            self._carrier_hosts[identity] = active_host
+            return process
+
+        async def _close(proc: asyncio.subprocess.Process) -> None:
+            active_host = process_hosts.pop(id(proc), None)
+            if self._carrier_hosts.get(identity) == active_host:
+                self._carrier_hosts.pop(identity, None)
+            if active_host is not None:
+                await self.close_stdio_channel(active_host, proc)
+            elif proc.returncode is None:
+                await _terminate_process_tree(proc)
+
+        def _new_carrier() -> PersistentCarrier:
+            return PersistentCarrier(
+                identity,
+                remote_command,
+                _open,
+                _close,
+                on_retired=self._carrier_retired,
+                **options,
+            )
+
+        async with self._carrier_lock:
+            carrier = self._carriers.get(identity)
+            if carrier is not None and carrier.retired:
+                self._carriers.pop(identity, None)
+                carrier = None
+            if carrier is None:
+                carrier = _new_carrier()
+                self._carriers[identity] = carrier
+            elif carrier.remote_command != remote_command:
+                raise RuntimeError(
+                    "connection identity already has a different carrier endpoint"
+                )
+
+        try:
+            return await carrier.acquire()
+        except CarrierUnavailable:
+            if not carrier.retired:
+                raise
+            async with self._carrier_lock:
+                replacement = self._carriers.get(identity)
+                if replacement is carrier or replacement is None or replacement.retired:
+                    if self._carriers.get(identity) is carrier:
+                        self._carriers.pop(identity, None)
+                        self._carrier_hosts.pop(identity, None)
+                    replacement = _new_carrier()
+                    self._carriers[identity] = replacement
+                elif replacement.remote_command != remote_command:
+                    raise RuntimeError(
+                        "connection identity already has a different carrier endpoint"
+                    )
+            return await replacement.acquire()
+        except Exception:
+            async with self._carrier_lock:
+                if self._carriers.get(identity) is carrier:
+                    self._carriers.pop(identity, None)
+            await carrier.close()
+            raise
+
+    def _carrier_retired(
+        self,
+        identity: str,
+        carrier: PersistentCarrier,
+    ) -> None:
+        if self._carriers.get(identity) is carrier:
+            self._carriers.pop(identity, None)
+
+    def carrier_diagnostics(self) -> dict[str, Any]:
+        """Return aggregate carrier health/counts without identities or payloads."""
+        snapshots = [carrier.diagnostics() for carrier in self._carriers.values()]
+        return {
+            "total": len(snapshots),
+            "healthy": sum(item["state"] == "healthy" for item in snapshots),
+            "degraded": sum(item["state"] == "degraded" for item in snapshots),
+            "logical_clients": sum(item["logical_clients"] for item in snapshots),
+            "active_requests": sum(item["active_requests"] for item in snapshots),
+            "active_subscriptions": sum(
+                item["active_subscriptions"] for item in snapshots
+            ),
+            "queued_frames": sum(item["queued_frames"] for item in snapshots),
+            "buffered_bytes": sum(
+                item["queued_bytes"] + item["buffered_event_bytes"]
+                for item in snapshots
+            ),
+        }
 
     async def disconnect(self, host: str) -> None:
         """Tear down the master connection for a host."""
@@ -500,6 +812,20 @@ class ConnectionManager:
             return
 
         info = self._connections.pop(host)
+        carrier_identity = _carrier_transport_identity(info)
+        carrier = self._carriers.get(carrier_identity)
+        if carrier is not None:
+            identity_remains = any(
+                _carrier_transport_identity(connection) == carrier_identity
+                for connection in self._connections.values()
+            )
+            if identity_remains:
+                if self._carrier_hosts.get(carrier_identity) == host:
+                    await carrier.invalidate_transport(
+                        "carrier SSH alias disconnected"
+                    )
+            else:
+                await carrier.close()
 
         for child in list(info.child_processes):
             if child.returncode is None:
@@ -516,15 +842,19 @@ class ConnectionManager:
                 info.config.ssh_target,
             ])
             try:
-                proc = await asyncio.create_subprocess_exec(
+                proc = await create_ssh_subprocess(
                     *args,
+                    config=info.config,
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
-                    **_subprocess_kwargs(),
+                    env=info.env,
                 )
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except (TimeoutError, asyncio.TimeoutError, OSError) as e:
+            except (TimeoutError, asyncio.TimeoutError) as e:
+                await _terminate_process_tree(proc)
+                log.warning("Graceful disconnect failed for %s: %s", host, e)
+            except OSError as e:
                 log.warning("Graceful disconnect failed for %s: %s", host, e)
 
         # Kill master process if still running

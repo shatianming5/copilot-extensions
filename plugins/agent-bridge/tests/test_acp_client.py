@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1038,3 +1039,100 @@ def test_apply_model_config_emits_loud_fallback_when_unoffered(monkeypatch) -> N
     assert fb["fallbacks"][0]["config"] == "model"
     assert fb["fallbacks"][0]["reason"] == "not-offered"
     assert fb["fallbacks"][0]["requested"] == "gpt-9-imaginary"
+
+
+def test_new_session_reports_substep_timings(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "agent_bridge.acp_client.resolve_acp_model_config",
+        lambda: {"model": "claude-opus-4.8"},
+    )
+    client = _apply_client()
+    client._connection.new_session = AsyncMock(
+        return_value=SimpleNamespace(
+            session_id="sess-new",
+            config_options=_model_config_options(),
+        )
+    )
+    timings: list[tuple[str, float]] = []
+
+    sid = asyncio.run(
+        client.new_session(
+            cwd="/tmp/repo",
+            timing_callback=lambda label, elapsed: timings.append((label, elapsed)),
+        )
+    )
+
+    assert sid == "sess-new"
+    labels = [label for label, _elapsed in timings]
+    assert labels == [
+        "session_new_mcp_build",
+        "session_new_rpc",
+        "session_new_model_config",
+    ]
+    assert all(elapsed >= 0 for _label, elapsed in timings)
+
+
+def test_load_session_reports_substep_timings(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "agent_bridge.acp_client.resolve_acp_model_config",
+        lambda: {"model": "claude-opus-4.8"},
+    )
+    client = _apply_client()
+    client._connection.load_session = AsyncMock(
+        return_value=SimpleNamespace(config_options=_model_config_options())
+    )
+    timings: list[tuple[str, float]] = []
+
+    asyncio.run(
+        client.load_session(
+            cwd="/tmp/repo",
+            session_id="sess-load",
+            timing_callback=lambda label, elapsed: timings.append((label, elapsed)),
+        )
+    )
+
+    labels = [label for label, _elapsed in timings]
+    assert labels == [
+        "session_load_mcp_build",
+        "session_load_rpc",
+        "session_load_model_config",
+    ]
+    assert all(elapsed >= 0 for _label, elapsed in timings)
+
+
+# --- _terminate_process_tree: delegates to procgroup on Windows (#4031) -----
+
+from unittest.mock import patch  # noqa: E402
+
+from agent_bridge.acp_client import _terminate_process_tree  # noqa: E402
+
+
+def test_terminate_process_tree_delegates_to_windows_helper_on_win32() -> None:
+    """The graceful-then-forceful Windows kill logic lives once in
+    procgroup.terminate_windows_tree (shared with transport.AgentProcess.kill);
+    this pins that _terminate_process_tree still delegates to it on win32."""
+    proc = MagicMock()
+    proc.wait = AsyncMock(return_value=0)
+
+    with patch("agent_bridge.acp_client.sys") as mock_sys, \
+         patch("agent_bridge.acp_client.terminate_windows_tree", AsyncMock()) as mock_win:
+        mock_sys.platform = "win32"
+        asyncio.run(_terminate_process_tree(proc))
+
+    mock_win.assert_awaited_once_with(proc)
+
+
+def test_terminate_process_tree_posix_unchanged() -> None:
+    """POSIX already sends SIGTERM to the process group before escalating --
+    unaffected by the Windows-only shared helper."""
+    proc = MagicMock()
+    proc.wait = AsyncMock(return_value=0)
+
+    with patch("agent_bridge.acp_client.sys") as mock_sys, \
+         patch("agent_bridge.acp_client.safe_killpg", return_value=True) as mock_killpg, \
+         patch("agent_bridge.acp_client.terminate_windows_tree", AsyncMock()) as mock_win:
+        mock_sys.platform = "linux"
+        asyncio.run(_terminate_process_tree(proc))
+
+    mock_killpg.assert_called_once()
+    mock_win.assert_not_awaited()

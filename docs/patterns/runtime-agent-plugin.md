@@ -1,4 +1,4 @@
-# Pattern: So You Want to Add an `agent-*` Plugin with Services and Tools
+# Pattern: So You Want to Add a Runtime Plugin with Services and Tools
 
 **Serves:** *Vision plugin-services* §Features/`self-contained-runtime`,
 `self-provisioning-runtime`, `uniform-deploy-contract`,
@@ -11,10 +11,15 @@ agent-codespaces / agent-containers (runtime CLI + namespace provider).
 
 ## The question
 
-You want to add an `agent-*` plugin that gives agents a command, perhaps owns a
+You want to add a runtime plugin that gives agents a command, perhaps owns a
 long-running service, and may compose with other plugins. What must it carry so
 it works alone, identifies its own installation, and never captures a same-named
 tool from another marketplace?
+
+The plugin id need not use the `agent-*` prefix. That prefix identifies the core
+agent-fabric family and its installation-cell eligibility; payload-local command
+generation and the ordinary runtime contract also support other lowercase
+plugin ids.
 
 The answer is not "add a Python package and put its command on `PATH`." A runtime
 plugin is a complete delivery unit with four distinct surfaces:
@@ -167,38 +172,11 @@ payload path or runtime layout.
 
 ## 4. Emit the session command glossary
 
-Every runtime plugin complete-declares its `sessionStart` behavior in
-`session-context.json`. Runtime bootstrap remains a direct,
-restart-safe-idempotent hook that emits `{}`. The read-only command glossary is
-a pure contributor invoked through the engine-v2 producer wrapper:
-
-```json
-{
-  "schema": "copilot-extensions.session-context-contributors",
-  "version": 1,
-  "complete": true,
-  "sessionStart": {
-    "sideEffects": "restart-safe-idempotent",
-    "context": "authority-aware"
-  },
-  "contributors": [
-    {
-      "id": "command-catalog",
-      "pure": true,
-      "order": 300,
-      "timeoutSeconds": 10,
-      "maxBytes": 8192,
-      "bash": ["scripts/emit-command-catalog.sh"],
-      "powershell": ["scripts/emit-command-catalog.ps1"]
-    }
-  ]
-}
-```
-
-`hooks.json` keeps the bootstrap hook direct and registers one synchronized
-wrapper hook for the contributor. The wrapper receives the exact
-`plugin@marketplace` identity, contributor id, and payload-relative command,
-and its host timeout is 30 seconds:
+Every runtime plugin that needs an ambient command glossary projects a checked-in
+static pointer and registers a side-effect-only `sessionStart` writer. Runtime
+bootstrap remains a direct, restart-safe-idempotent hook that emits `{}`. The
+writer invokes the plugin's payload-relative read-only emitters and atomically
+writes the result beneath the exact session root:
 
 ```json
 {
@@ -213,23 +191,18 @@ and its host timeout is 30 seconds:
       },
       {
         "type": "command",
-        "bash": "<payload-root>/scripts/invoke-context-contributor.sh agent-example@copilot-extensions command-catalog scripts/emit-command-catalog.sh",
-        "powershell": "<payload-root>\\scripts\\invoke-context-contributor.ps1 agent-example@copilot-extensions command-catalog scripts\\emit-command-catalog.ps1",
-        "timeoutSec": 30
+        "bash": "<payload-root>/scripts/write-session-guidance.sh",
+        "powershell": "<payload-root>\\scripts\\write-session-guidance.ps1",
+        "timeoutSec": 45
       }
     ]
   }
 }
 ```
 
-Use the repository synchronizer rather than copying those schematic hook
-commands literally. Before exact aggregate-authority proof, the wrapper runs
-this plugin's contributor directly. After proof, it joins the pair-key
-rendezvous and emits `{}`; only `context-injection` emits the aggregate.
-
-The bootstrap hook prepares only this plugin and never runs through the
-aggregator. The catalog contributor emits structured entries for every command
-declared by this payload:
+The bootstrap hook prepares only this plugin. The guidance writer and catalog
+emitter resolve only their own payload. The catalog emitter produces structured
+entries for every command declared by this payload:
 
 ```text
 id · argv · shell · purpose · availability=ready|unavailable
@@ -313,8 +286,6 @@ Before landing:
 
 ```text
 python libs/payload-invocation/generate.py --all --check
-python plugins/context-injection/scripts/aggregate_context.py --validate \
-  --marketplace-root . --json
 python tools/sync-versioned-runtime.py --check
 python -m pytest -q libs/payload-invocation/tests
 python tools/check-install-contract.py
@@ -326,6 +297,11 @@ python tools/check-docs-consistency.py
 python tools/check-skills.py
 python tools/run-plugin-tests.py agent-example
 ```
+
+Prefer `python tools/run_tests_in_devcontainer.py agent-example` over the
+bare runner's last line when Docker + the devcontainers CLI are available
+(Linux only) — see `AGENTS.md` § *Test Before PR Publication* and
+`TESTING.md` § *Optional devcontainer-based isolation*.
 
 `check-marketplace-isolation.py` is report-only during migration. A new plugin's
 one required legacy root/wrapper may be an expected baseline finding; adding

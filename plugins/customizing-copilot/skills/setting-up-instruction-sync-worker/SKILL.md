@@ -1,0 +1,206 @@
+---
+name: setting-up-instruction-sync-worker
+description: >
+  Scaffold the `projection-reflect` deterministic sync worker for a repo that
+  wants its enabled plugins' static instruction-projection content kept
+  current automatically, instead of only at the next session's proactive
+  resync. Requires the adopting repo's own explicit, committed opt-in before
+  scaffolding the scheduler, bypass profile, or reconciler agent -- never
+  merely an operator request in the current session. (The `.gitignore`
+  local-cache convention is the one exception -- see its own section below.)
+  Use when a repo asks to automate instruction-projection sync, add a
+  scheduled projection-reflect worker, or enable a projection bypass profile
+  for its review gate.
+  Trigger phrases include:
+  - 'set up instruction sync'
+  - 'automate projection sync'
+  - 'scheduled projection-reflect worker'
+  - 'projection-reflect bypass profile'
+  - 'enable projection sync automation'
+  - 'scaffold the sync worker'
+---
+
+# Setting Up the Instruction Sync Worker
+
+Scaffolds `projection-reflect` (`efforts/2026/10/02
+ambient-guidance-navigability` Phase 2) for a repo that wants its own scheduled, non-agentic worker to keep
+enabled plugins' checked-in static instruction projections current, closing
+the sync-freshness gap the immediate/proactive resync trigger
+(`copilot-extensions-harness:cross-repo-debug-tracking`) only covers when a
+session happens to be active.
+
+This skill is a **scaffolder**, not a turnkey installer: the scheduler
+mechanism (a systemd timer, a scheduled GitHub Action, a cron entry) and the
+review-gate bypass mechanism (branch protection exceptions, a labeled-PR
+auto-merge rule) are unavoidably repo-specific. What this skill provides is
+generic across any adopting repo: the decision layer
+(`projection_reflect.py`), the conflict-dispatch primitive
+(`agent_dispatch.conflict_dispatch`), the reconciler agent template
+(`projection-reconciler-agent-template.md`), and -- the piece unique to this
+skill -- the **consent gate** that must guard all of the above, plus templates
+for the two repo-specific pieces to adapt.
+
+## The consent gate comes first -- always
+
+**Never scaffold the reconciler agent, scheduler config, or bypass profile
+without the adopting repo's explicit, committed, in-repo opt-in already
+present.** (The `.gitignore` local-cache convention is the one exception --
+see its own section below, which carries its own, different authority
+requirement instead.) Per
+[`docs/patterns/install-vs-adopt-boundary.md`](../../../../docs/patterns/install-vs-adopt-boundary.md):
+granting a scheduler repo-write authority and a review-bypass profile is repo
+mutation, not a machine-local install/update concern -- and "the operator
+asked for it in this session" or "the repo is PR-gated" are **not**
+ownership signals (a repo you only contribute to is often PR-gated too).
+
+The ownership signal is a committed `.github/copilot/projection-reflect.json`
+matching this schema (validated by the sibling
+`reviewing-customizations` skill's
+`scripts/projection_reflect_consent.py`'s `load_consent`):
+
+```json
+{
+  "schema": "copilot-extensions.projection-reflect-consent",
+  "version": 1,
+  "enabled": true,
+  "reconcilerAgent": "projection-reconciler",
+  "dispatchLabel": "projection-conflict",
+  "trustedMarketplaces": ["copilot-extensions"],
+  "requireImmutablePin": false
+}
+```
+
+`requireImmutablePin` is optional (defaults to `false` when absent). Most
+adopters sync externally-installed marketplace plugins, which
+`scan_plugin_sources.resolve_pinned_commits()` cannot pin at all today (only
+a self-hosted/directory-marketplace source resolves a commit, via `git
+rev-parse HEAD` inside its own payload root) -- setting this `true`
+unconditionally would silently disable the bypass path entirely for that
+common case. Only set it `true` once you understand that tradeoff (see
+issue #3132 for the still-open externally-installed-source half of this
+gap).
+
+- **No file present, or `enabled` is not literally `true`:** decline to
+  scaffold the reconciler agent, scheduler, or bypass profile. You may
+  still report what drift exists (`scan --from-settings`) -- report-only
+  mode never requires consent -- but never open an auto-mergeable PR or
+  install a scheduler. (The `.gitignore` convention below is unaffected by
+  this.)
+- **A repo genuinely wants this:** its own maintainer commits this file
+  through the repo's normal contribution flow (a PR, reviewed like any other
+  change) *before* asking this skill to scaffold the reconciler, scheduler,
+  or bypass profile. If the file is missing, walk the operator through
+  authoring and landing it first -- do not write it yourself as a side
+  effect of "setting up the worker."
+- **Consent is rechecked live, not only at setup time.** Both the scheduled
+  worker and the bypass profile call `load_consent` on every run/every PR --
+  there is no cache. The moment the file is deleted, edited to
+  `"enabled": false`, or otherwise fails validation, both the worker and the
+  bypass fail closed on their very next run, without a second `setup`
+  invocation. Withdrawing consent is exactly: edit or delete the file.
+
+## The `.gitignore` convention -- not gated by this skill's consent file, but still a repo mutation
+
+This scaffolding step is **not** gated by the `projection-reflect.json`
+consent file above: `render_local_cache()` (Phase 7,
+`docs/patterns/worktree-scoped-dynamic-guidance.md`) is permissionless by
+design -- a local, gitignored file write, no commit, no PR -- regardless of
+whether a repo ever adopts the scheduler/bypass pieces this skill otherwise
+scaffolds. So scaffolding this rule never needs that specific opt-in file
+to exist first.
+
+But committing a `.gitignore` rule is still an ordinary **repo mutation**,
+not a machine-local concern -- per
+[`docs/patterns/install-vs-adopt-boundary.md`](../../../../docs/patterns/install-vs-adopt-boundary.md):
+repo-write authority comes from the repository's ownership and its own
+contribution flow, never merely from an operator's in-session request. Only
+propose this rule through that repo's normal PR flow, as you would any
+other change to a repo you don't unilaterally own -- never commit it
+directly as a side effect of an unrelated session. Keep the *render*
+permissionless; gate the *ignore-rule commit* like any other repo change.
+
+Scaffold, from
+[`references/templates/gitignore-rule.md`](references/templates/gitignore-rule.md):
+`**/*.local.instructions.md` under `.github/instructions/` (a dedicated
+`.github/instructions/.gitignore`, or an equivalent repo-root recursive
+rule). This rule does not make the orphan scan's git-tracked check work --
+`git ls-files` already excludes every untracked file regardless of ignore
+matching, so a freshly rendered, unignored local-cache file is still
+excluded correctly without it. What the rule actually prevents is a later
+`git add -A` (or an editor's "stage all") turning that file into a *tracked*
+one by accident -- and only a tracked file is no longer excluded from the
+checked-in orphan scan
+(`instruction_projections._iter_projection_files`), where it is instead
+caught and reported as `projection-orphan-file` rather than hidden. Add the
+rule to close off that accidental-staging path up front, not because the
+scan depends on it.
+
+## What to scaffold, once consent is present
+
+1. **A `projection-reconciler` agent** for the adopting repo, from
+   [`projection-reconciler-agent-template.md`](../reviewing-customizations/references/projection-reconciler-agent-template.md).
+   Copy it to that repo's `.github/agents/projection-reconciler.agent.md`,
+   filling in its own PR-review/merge tooling reference (per the template's
+   own "Adapting this template" section) and wiring any MCP servers its own
+   review flow needs -- the template ships with none, since PR/issue tooling
+   is repo-specific.
+
+2. **A scheduler config**, adapted from
+   [`references/templates/scheduler-config.md`](references/templates/scheduler-config.md)
+   to whichever mechanism the repo already uses for scheduled automation
+   (a systemd timer, a scheduled Action, cron). It must: call
+   `load_consent` first and exit immediately (no PR, no scheduler action) if
+   it returns `None`; refresh enabled plugin payloads; then call
+   `projection_sync_worker.run_sync_pass()` -- never hand-roll the
+   sync/scan/decide sequence separately, which risks dropping a lock-only
+   change, a sync-side failure, or a race between two workers, exactly the
+   failure modes `run_sync_pass` exists to close. When
+   `outcome.bypass_eligible`, open or update the stamp-labeled PR. When not
+   eligible, distinguish *why*: only `outcome.needs_conflict_dispatch` (a
+   real conflict-classified finding) is dispatched to the reconciler via
+   `agent_dispatch.conflict_dispatch.build_dispatch`, naming the consent
+   file's own `reconcilerAgent`/`dispatchLabel` -- an otherwise-clean change
+   from an untrusted source alone stays review-only and is never dispatched
+   to an agent (the reconciler is only authorized to resolve real
+   conflicts).
+
+3. **A bypass-config profile**, adapted from
+   [`references/templates/bypass-profile.md`](references/templates/bypass-profile.md)
+   for whichever review gate the repo already uses. It must re-check
+   `load_consent` on every PR (not cache a prior check), and restrict itself
+   to: the stamp label present, every changed path inside
+   `.github/instructions/**` and the lock file, a diff shape of regular-file
+   adds/modifies only, a byte-exact recompute match, and every changed
+   source's marketplace inside the consent file's own
+   `trustedMarketplaces` -- the same conjunction `projection_reflect.py`'s
+   `bypass_decision` already proves, never identity alone.
+
+4. **Reuse the repo's existing trusted deterministic identity** for this
+   reflect kind, per the Plan's own requirement -- never mint a new one as a
+   side effect of this skill. If the repo has no existing reflect-style
+   identity, this skill must **decline outright** (report-only mode still
+   available) until that identity is provisioned and registered through the
+   repo's own normal, reviewed account/credential process -- or walk the
+   operator through that one-time registration explicitly. Never do it as an
+   automatic side effect of "set up the instruction sync worker."
+
+## Validation before calling it done
+
+- A negative-proof check: with no opt-in file present, confirm the worker
+  refuses to scaffold (see `test_projection_reflect_consent.py`'s own
+  no-file/`enabled: false` cases for the pattern to replicate against the
+  live scheduler/bypass code once built).
+- A live-revocation check: opt-in present at setup, then removed -- confirm
+  both the worker and the bypass fail closed on their very next run without
+  a second `setup` call.
+- Re-run `customizing-copilot`'s own test suite
+  (`tools/run-plugin-tests.py customizing-copilot`) and this repo's
+  `check-version-bump`/`check-version-consistency`/`check-docs-consistency`.
+
+## See also
+
+- `efforts/2026/10/02 ambient-guidance-navigability/README.md` -- the full
+  Phase 2 plan and Journal this skill is one slice of.
+- `reviewing-customizations`'s own `SKILL.md` -- the `sync`/`scan` mechanism,
+  the `projection_reflect.py` decision layer, and the coverage registry this
+  automation composes with.

@@ -11,6 +11,9 @@ importing plugin code — so the dependency-free boundary holds:
 * **projects registry** — ``~/.agent-worktrees/projects.yaml`` (which repos are
   *projects* — harness repos worthy of binstubs + profiles — with ``config_dir``,
   ``expose_agent``, wsl).
+* **per-project machine roster** — ``<repo>/.agent-worktrees/machines.yaml``
+  (legacy fallback: ``<repo>/machines.yaml``) — the host x SSH-environment
+  roster a project's terminal-profile fragment is built against.
 * **per-project harness config** — ``~/.<project>/config.yaml`` (``knowledge_repo``
   link, ``terminal_profiles``).
 * **per-project enabled plugins** — the project checkout's own
@@ -24,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -116,6 +120,38 @@ class RepoInfo:
 
 
 @dataclass(frozen=True)
+class SshEnvironment:
+    """One ``ssh.environments`` entry from a project's ``machines.yaml``."""
+
+    name: str            # windows | wsl | linux
+    alias: str
+    shell: str = ""      # pwsh | bash
+
+
+@dataclass(frozen=True)
+class RosterMachine:
+    """One machine from a project's ``machines.yaml`` roster."""
+
+    key: str
+    display_name: str
+    ssh_ready: bool = False
+    hostname: str | None = None
+    environments: tuple[SshEnvironment, ...] = ()
+
+    def identities(self) -> set[str]:
+        """Lower-cased ids used to recognise the local host (self-skip)."""
+        ids = {self.key}
+        if self.display_name:
+            ids.add(self.display_name)
+        if self.hostname:
+            ids.add(self.hostname)
+        for e in self.environments:
+            if e.alias:
+                ids.add(e.alias)
+        return {i.lower() for i in ids if i}
+
+
+@dataclass(frozen=True)
 class ProjectInfo:
     """A registered project (projects.yaml) joined with its repo + config."""
 
@@ -126,6 +162,17 @@ class ProjectInfo:
     profiles: int
     repo: RepoInfo | None
     enabled_plugins: tuple[str, ...] = field(default=())
+    wsl_distro: str | None = None
+    wsl_state: str | None = None
+    roster: tuple[RosterMachine, ...] = field(default=())
+    display_name: str | None = None
+    anchor: str | None = None
+    """This project's resolved checkout path: ``repo.path`` (repos.yaml) when
+    a matching repos.yaml entry exists, else this project's own
+    ``projects.yaml``-level ``anchor:`` override -- a real, actively-used
+    field for a project registered without (or overriding) a repos.yaml
+    entry (ported from ``agent_worktrees.terminal_fragment.anchor_for``,
+    copilot-extensions#3390 Phase 3e Step 3b)."""
 
 
 def repos_registry(home_dir: Path | None = None) -> dict:
@@ -138,6 +185,65 @@ def projects_registry(home_dir: Path | None = None) -> dict:
 
 def project_config(name: str, home_dir: Path | None = None) -> dict:
     return _read_yaml((home_dir or home()) / f".{name}" / "config.yaml")
+
+
+def _load_roster(machines_yaml: Path) -> tuple[RosterMachine, ...]:
+    """Parse a ``machines.yaml`` file into :class:`RosterMachine` rows.
+
+    Ported verbatim from ``agent_worktrees.terminal_fragment._load_roster``
+    (copilot-extensions#3390, Phase 3e Step 2) -- same tolerant, degrade-to-
+    empty behavior on a missing/malformed file.
+    """
+    if not machines_yaml.exists():
+        return ()
+    try:
+        data = yaml.safe_load(machines_yaml.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return ()
+    machines = data.get("machines") if isinstance(data, dict) else None
+    if not isinstance(machines, dict):
+        return ()
+    out: list[RosterMachine] = []
+    for key, entry in machines.items():
+        if not isinstance(entry, dict):
+            continue
+        ssh = entry.get("ssh") if isinstance(entry.get("ssh"), dict) else {}
+        envs = []
+        for e in (ssh.get("environments") or []):
+            if not isinstance(e, dict):
+                continue
+            name = str(e.get("name") or "").strip()
+            if not name:
+                continue
+            envs.append(SshEnvironment(
+                name=name,
+                alias=str(e.get("alias") or "").strip(),
+                shell=str(e.get("shell") or "").strip(),
+            ))
+        out.append(RosterMachine(
+            key=str(key),
+            display_name=str(entry.get("display_name") or key),
+            ssh_ready=bool(ssh.get("ready")),
+            hostname=(str(entry.get("hostname")) if entry.get("hostname") else None),
+            environments=tuple(envs),
+        ))
+    return tuple(out)
+
+
+def project_roster(repo_path: str | None) -> tuple[RosterMachine, ...]:
+    """This project's ``machines.yaml`` roster, given its resolved repo path.
+
+    Checks ``<repo_path>/.agent-worktrees/machines.yaml`` first, falling back
+    to the legacy repo-root ``<repo_path>/machines.yaml`` -- matching
+    ``terminal_fragment.collect_local_projects``'s existing fallback order.
+    """
+    if not repo_path:
+        return ()
+    root = Path(repo_path)
+    machines_yaml = root / ".agent-worktrees" / "machines.yaml"
+    if not machines_yaml.is_file():
+        machines_yaml = root / "machines.yaml"
+    return _load_roster(machines_yaml)
 
 
 def _account_for(name: str, entry: dict, account_map: dict) -> str | None:
@@ -214,6 +320,123 @@ def build_repos(home_dir: Path | None = None) -> list[RepoInfo]:
     return sorted(out, key=lambda r: (not r.is_project, r.name))
 
 
+def _exact_platform_key() -> str:
+    """This platform's own ``repos.yaml`` key, with no cross-platform fallback.
+
+    Unlike ``_platform_key()`` (used by ``build_repos()``'s deliberate
+    cross-platform fallback chain, so a repo without its *own* machine's
+    entry still resolves to whichever path is registered), this never falls
+    back to another OS's entry and distinguishes WSL from plain Linux (the
+    same ``/proc/version`` probe ``terminal_fragment.detect_platform()``
+    uses) — ``mis_registered_repos()`` must only ever inspect the path a repo
+    actually registered for *this exact* platform, never borrow a sibling
+    platform's path and judge it as if it were this machine's own.
+
+    ``repos.yaml`` itself only ever carries ``windows``/``wsl``/``linux``
+    keys — agent-worktrees' own platform resolver maps macOS to ``linux``
+    too (there is no ``macos`` key), so this never returns anything else.
+    """
+    if os.name == "nt":
+        return "windows"
+    try:
+        with open("/proc/version") as f:
+            if "microsoft" in f.read().lower():
+                return "wsl"
+    except OSError:
+        pass
+    return "linux"
+
+
+def _is_real_git_checkout(path: Path) -> bool | None:
+    """Probe git itself rather than trust `.git`/``HEAD``+``objects`` markers.
+
+    A marker-only check (a bare, possibly empty ``.git`` directory; a
+    ``HEAD``+``objects`` pair left over from a partial/corrupt bare clone)
+    can pass a filesystem-only test while being unusable to git. Ask git
+    directly whether ``path`` is a bare repository or is the exact top-level
+    of a working-tree checkout, with ambient ``GIT_*`` overrides cleared so
+    an unrelated repo's env (``GIT_DIR``, ``GIT_WORK_TREE``) can't skew the
+    probe.
+
+    Returns ``True``/``False`` when the probe ran conclusively, or ``None``
+    when git itself couldn't be probed (binary missing, timeout) — an
+    inconclusive probe must never be reported as proof of mis-registration.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    try:
+        bare = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--is-bare-repository"],
+            capture_output=True, text=True, timeout=5, env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if bare.stdout.strip() == "true":
+        return True
+    if bare.returncode != 0:
+        return False
+    try:
+        top = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5, env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if top.returncode != 0:
+        return False
+    try:
+        return Path(top.stdout.strip()).resolve() == path.resolve()
+    except OSError:
+        return False
+
+
+def mis_registered_repos(home_dir: Path | None = None) -> list[tuple[str, str, str]]:
+    """``repos.yaml`` entries whose registered checkout doesn't actually resolve.
+
+    Read-only counterpart to a ``repos.yaml`` entry going stale (moved,
+    renamed, or never actually checked out on this machine) — surfaced by
+    ``worktree-manager doctor`` alongside plugin-catalog alignment. Each
+    result is ``(repo_name, status, detail)`` where ``status`` is one of:
+
+    * ``"missing"`` — the registered path doesn't exist on disk.
+    * ``"not-git"`` — the path exists but doesn't resolve to a real git
+      checkout (confirmed by probing git itself).
+    * ``"unknown"`` — the git probe itself couldn't run (git missing,
+      timed out). This is **not** confirmed drift — `doctor`'s own
+      prerequisite section separately reports git availability — but it
+      must not be silently folded into a clean report either; the caller
+      decides how to surface it.
+
+    A repo without a path registered for *this exact* platform is not
+    itself flagged here (a legitimate reference-only entry can be pathless
+    on a given machine, and another platform's entry is never a stand-in
+    for this one). A home-relative path (``~/src/repo``) is expanded before
+    checking, matching how ``agent-worktrees`` itself resolves a registered
+    path.
+    """
+    reg = repos_registry(home_dir)
+    pkey = _exact_platform_key()
+    findings: list[tuple[str, str, str]] = []
+    for name, entry in (reg.get("repos") or {}).items():
+        entry = entry or {}
+        raw_path = entry.get(pkey)
+        if not raw_path:
+            continue
+        path = Path(raw_path).expanduser()
+        if not path.exists():
+            findings.append((name, "missing", f"registered path does not exist: {raw_path}"))
+            continue
+        is_checkout = _is_real_git_checkout(path)
+        if is_checkout is False:
+            findings.append((name, "not-git", f"registered path is not a git checkout: {raw_path}"))
+        elif is_checkout is None:
+            findings.append((
+                name, "unknown",
+                f"could not verify (git probe failed/unavailable): {raw_path}",
+            ))
+    return findings
+
+
+
 def build_projects(home_dir: Path | None = None) -> list[ProjectInfo]:
     reg = projects_registry(home_dir)
     repos = {r.name: r for r in build_repos(home_dir)}
@@ -222,6 +445,12 @@ def build_projects(home_dir: Path | None = None) -> list[ProjectInfo]:
         entry = entry or {}
         cfg = project_config(name, home_dir)
         repo = repos.get(name)
+        wsl = entry.get("wsl") if isinstance(entry.get("wsl"), dict) else {}
+        # Prefer the repos.yaml-resolved path; fall back to this project's
+        # own projects.yaml `anchor:` override for a project registered
+        # without (or overriding) a repos.yaml entry.
+        anchor_override = entry.get("anchor") if isinstance(entry.get("anchor"), str) else None
+        anchor = (repo.path if repo else None) or anchor_override
         out.append(ProjectInfo(
             name=name,
             config_dir=entry.get("config_dir"),
@@ -230,6 +459,11 @@ def build_projects(home_dir: Path | None = None) -> list[ProjectInfo]:
             profiles=len(cfg.get("terminal_profiles") or []),
             repo=repo,
             enabled_plugins=tuple(repo_enabled_plugins(repo.path) if repo else ()),
+            wsl_distro=wsl.get("distro"),
+            wsl_state=wsl.get("state"),
+            roster=project_roster(anchor),
+            display_name=entry.get("display_name"),
+            anchor=anchor,
         ))
     return sorted(out, key=lambda p: p.name)
 
