@@ -25,6 +25,7 @@ import tempfile
 import time
 from functools import cache
 from pathlib import Path
+from urllib.parse import quote
 
 _CONNECT_TIMEOUT_S = 0.5
 _SESSION_START_TIMEOUT_S = 12.0
@@ -428,6 +429,24 @@ def _write_session_guidance(
         if os.name != "nt":
             temporary.chmod(0o600)
         os.replace(temporary, target)
+        workspace = payload.get("workspaceRoot") or payload.get("cwd") or os.environ.get(
+            "GROK_WORKSPACE_ROOT"
+        )
+        if os.environ.get("GROK_SESSION_ID") or os.environ.get("GROK_HOOK_EVENT"):
+            sessions = home / ".grok" / "sessions"
+            grok_dir = None
+            if isinstance(workspace, str) and workspace:
+                grok_dir = sessions / quote(workspace, safe="") / session_id
+            elif sessions.is_dir():
+                for child in sessions.iterdir():
+                    candidate = child / session_id
+                    if candidate.is_dir():
+                        grok_dir = candidate
+                        break
+            if grok_dir is not None:
+                mirror = grok_dir / "instructions" / "agent-worktrees"
+                mirror.mkdir(parents=True, exist_ok=True)
+                (mirror / "session-guidance.instructions.md").write_text(content, encoding="utf-8")
         return True
     except (OSError, RuntimeError, ValueError):
         try:
