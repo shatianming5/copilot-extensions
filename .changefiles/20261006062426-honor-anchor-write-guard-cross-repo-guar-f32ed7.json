@@ -1,0 +1,9 @@
+{
+  "comment": "Honor ANCHOR_WRITE_GUARD/CROSS_REPO_GUARD from the calling session when the resident service decided",
+  "changes": [
+    {
+      "plugin": "agent-worktrees",
+      "type": "patch"
+    }
+  ]
+}

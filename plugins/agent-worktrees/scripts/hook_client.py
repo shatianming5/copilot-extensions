@@ -872,6 +872,24 @@ def _fallback_post(payload: dict, home: Path) -> dict:
     )
 
 
+# The guards' documented kill switches must hold for the calling session even
+# when the resident service -- which does not share this session's environment
+# -- made the decision: drop a deny that came from a guard the caller disabled.
+_GUARD_SWITCHES = (
+    ("ANCHOR_WRITE_GUARD", ("anchor-write-guard:",)),
+    ("CROSS_REPO_GUARD", ("anchor-write-guard:", "cross-repo-guard:", "stateless-harness guard:")),
+)
+
+
+def _honor_guard_switches(result: dict) -> dict:
+    reason = str(result.get("permissionDecisionReason") or "")
+    for variable, prefixes in _GUARD_SWITCHES:
+        off = os.environ.get(variable, "").strip().lower() in {"off", "0", "false", "no"}
+        if off and reason.startswith(prefixes):
+            return {k: v for k, v in result.items() if not k.startswith("permissionDecision")}
+    return result
+
+
 def decide(kind: str, payload: dict, *, home: Path | None = None) -> dict:
     home = home or Path.home()
     contextual = bool(os.environ.get("COPILOT_EXTENSIONS_CONTEXT", "").strip())
@@ -882,7 +900,7 @@ def decide(kind: str, payload: dict, *, home: Path | None = None) -> dict:
         payload = _enrich_session_payload(payload)
     remote = _request(kind, payload, home)
     if remote is not None:
-        return remote
+        return _honor_guard_switches(remote) if kind == "preToolUse" else remote
     if kind == "sessionStart" and not contextual and _resident_started(payload, home):
         return {}
     if kind == "preToolUse":
