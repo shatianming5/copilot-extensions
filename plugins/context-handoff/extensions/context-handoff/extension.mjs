@@ -712,9 +712,16 @@ const session = await joinSession({
       handler: async (args, invocation) => {
         ensureState(invocation);
         await handoffConfigPromise;
+        // Native bootstrap owns a receiver's first moments; never save over it.
+        await nativeStartup;
+        if (nativeStartupError) throw nativeStartupError;
         const sid = state.sessionId || invocation?.sessionId;
         if (!sid || sid === "unknown") {
           return "Cannot save handoff prompt: sessionId is unavailable.";
+        }
+        const pendingPermissions = await session.rpc.permissions?.pendingRequests?.();
+        if (pendingPermissions?.items?.length) {
+          throw new Error("Resolve pending permission confirmations before handing off.");
         }
 
         const text = (args?.prompt_text ?? args?.prompt ?? "").toString().trim();
@@ -788,6 +795,8 @@ const session = await joinSession({
         }, required: ["seed"],
       },
       handler: async args => {
+        await nativeStartup;
+        if (nativeStartupError) throw nativeStartupError;
         state.pendingHandoff ||= recoverPendingHandoff(session.sessionId);
         if (state.pendingHandoff?.seed && state.pendingHandoff.seed !== args.seed) {
           throw new Error("Use the exact current saved handoff seed; no receiver was created.");

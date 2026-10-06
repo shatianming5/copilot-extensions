@@ -45,7 +45,9 @@
 //   --defer-complete       retain an agent-dispatch task until the handoff goal completes
 //   --json                 machine-readable output
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { parseRecoveryLocator } from "./cutover-seed.mjs";
 import { loadContextHandoffConfig } from "./config.mjs";
 import {
@@ -62,7 +64,35 @@ import {
   getPreviousSession,
   abortHandoffTask,
   abortFileHandoff,
+  readFileHandoff,
+  readSessionStateHandoff,
+  safePathSegment,
 } from "./handoff-core.mjs";
+
+// Native goals (Copilot /goal) move only through the in-session extension,
+// which freezes the objective, mode and permissions; this SDK-free fallback
+// must neither drop them on save nor consume or relaunch a native baton.
+function nativeObjectiveExists(sid) {
+  if (!sid) return false;
+  const base = process.env.COPILOT_HOME || join(homedir(), ".copilot");
+  return existsSync(join(base, "session-state", safePathSegment(sid), "autopilot-objective.json"));
+}
+
+function nativeRequestPending(sid) {
+  const request = sid ? readSessionStateHandoff(sid)?.record : null;
+  return Boolean(request?.nativeGoal || request?.nativeState || request?.nativeContinuation);
+}
+
+function fileHandoffHasNativeContinuation(cwd, sid, handoffId, path) {
+  const found = readFileHandoff(cwd, sid, handoffId, path || null);
+  return Boolean(found?.record?.nativeContinuation || found?.record?.nativeState
+    || found?.record?.nativeGoalCheckpoint);
+}
+
+function refuseNative(command, message) {
+  process.stderr.write(`handoff-cli ${command}: ${message}\n`);
+  process.exit(1);
+}
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -155,6 +185,11 @@ function cmdSave(args) {
     process.exit(2);
   }
   const sid = requireSid("save", args);
+  if (nativeObjectiveExists(sid)) {
+    refuseNative("save", "this session has a native autopilot objective. The SDK-free " +
+      "fallback cannot transfer native mode and permissions; use the in-session " +
+      "context-handoff tools instead. Nothing was written.");
+  }
   const cwd = args.cwd || process.cwd();
   const stored = storeHandoff({
     promptText,
@@ -193,6 +228,10 @@ function cmdSave(args) {
 
 async function cmdTrigger(args) {
   const sid = requireSid("trigger", args);
+  if (nativeObjectiveExists(sid) || nativeRequestPending(sid)) {
+    refuseNative("trigger", "this session has a native autopilot objective; native " +
+      "handoff must be continued by the in-session extension. Nothing was written or launched.");
+  }
   const cwd = args.cwd || process.cwd();
   const config = resolveHandoffConfig(cwd);
   const promptText = readPrompt(args);
@@ -294,6 +333,10 @@ async function cmdConsume(args) {
   const cwd = args.cwd || process.cwd();
   const sid = requireSid("consume", args);
   const { taskId, handoffId, path, deferComplete } = resolveHandoffTarget("consume", args);
+  if (!taskId && fileHandoffHasNativeContinuation(cwd, sid, handoffId, path)) {
+    refuseNative("consume", "this baton carries native session state and must be " +
+      "consumed by the in-session extension. It remains unconsumed.");
+  }
   if (deferComplete && !taskId) {
     process.stderr.write(
       "handoff-cli consume: --defer-complete is only valid with a task target\n",
@@ -375,6 +418,10 @@ function cmdCheckHeads(args) {
 function cmdRetryCutover(args) {
   const cwd = args.cwd || process.cwd();
   const sid = requireSid("retry-cutover", args);
+  if (nativeObjectiveExists(sid) || nativeRequestPending(sid)) {
+    refuseNative("retry-cutover", "native handoff must be continued by the in-session " +
+      "extension (retry_handoff_cutover). Nothing was launched.");
+  }
   const result = retryStoredHandoffCutover(cwd, sid);
   if (!result.ok) {
     process.stderr.write(

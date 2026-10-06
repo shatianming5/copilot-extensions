@@ -38,6 +38,7 @@ for (const tool of ["continue_handoff", "retry_handoff_cutover"]) {
     const context = vm.createContext({
       ObservationHandoffError, process: { env: {} }, session: { sessionId: "source" },
       state: { pendingHandoff: { seed: "fixed-seed", nativeGoalCheckpoint: "fixed-checkpoint" } },
+      nativeStartup: Promise.resolve(), nativeStartupError: null,
       nativeCutoverPath: null,
       requestNativeCutover: async () => { throw failure; },
     });
