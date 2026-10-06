@@ -1,0 +1,17 @@
+{
+  "comment": "Run agent-worktrees, agent-dispatch and context-handoff on Copilot, Grok and Claude Code, and carry the fork's native-goal handoff onto upstream",
+  "changes": [
+    {
+      "plugin": "agent-worktrees",
+      "type": "minor"
+    },
+    {
+      "plugin": "agent-dispatch",
+      "type": "minor"
+    },
+    {
+      "plugin": "context-handoff",
+      "type": "minor"
+    }
+  ]
+}
