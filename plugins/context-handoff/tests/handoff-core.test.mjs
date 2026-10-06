@@ -288,6 +288,24 @@ test("Herdr predecessor identity is persisted with pane and session", () => {
   });
 });
 
+test("Claude and Grok Herdr panes record a handoff predecessor; other agents do not", () => {
+  const identity = (agent) => resolveHerdrPredecessorIdentity("predecessor-session", {
+    env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p2" },
+    home: "/home/tester",
+    execute: () => JSON.stringify({
+      result: { agent: { agent, pane_id: "w1:p2", terminal_id: "term-p" } },
+    }),
+  });
+  for (const agent of ["claude", "grok"]) {
+    const resolved = identity(agent);
+    assert.equal(resolved.error, null);
+    assert.equal(resolved.predecessor.terminalId, "term-p");
+  }
+  const other = identity("codex");
+  assert.equal(other.predecessor, null);
+  assert.match(other.error, /does not report a copilot\/grok\/claude session identity/);
+});
+
 test("null Herdr agent name still persists and retires exact predecessor", () => {
   const resolved = resolveHerdrPredecessorIdentity("predecessor-session", {
     env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p2" },

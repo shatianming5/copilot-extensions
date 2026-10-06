@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "context-handoff": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/handoff-mcp.sh",
+      "alwaysLoad": true
+    }
+  }
+}
