@@ -1016,8 +1016,9 @@ print(str(leg.get('state', '')) if isinstance(leg, dict) and leg.get('provider')
         fi
         # The tmux server does not see our ancestry; hand the decision over.
         TMUX_ENV_FLAGS+=(-e "AGENT_WORKTREES_HOST=$AGENT_HOST")
-        if [[ "$AGENT_HOST" == "grok" && -n "${GROK_SESSION_ID:-}" ]]; then
-            TMUX_ENV_FLAGS+=(-e "GROK_SESSION_ID=$GROK_SESSION_ID")
+        if [[ "$AGENT_HOST" == "grok" ]]; then
+            if [[ -n "${GROK_HOME:-}" ]]; then TMUX_ENV_FLAGS+=(-e "GROK_HOME=$GROK_HOME"); fi
+            if [[ -n "${GROK_SESSION_ID:-}" ]]; then TMUX_ENV_FLAGS+=(-e "GROK_SESSION_ID=$GROK_SESSION_ID"); fi
         fi
         if [[ -n "$ENV_EXPORTS" ]]; then
             while IFS= read -r line; do
