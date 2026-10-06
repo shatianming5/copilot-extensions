@@ -2,5 +2,10 @@
   "name": "context-handoff",
   "description": "Context window monitoring and native goal continuity for Copilot CLI -- durable task/file handoffs, exact remaining soft caps, profile-preserving successor admission, and identity-checked live cutover through Herdr or agent-worktrees",
   "hooks": "./hooks/claude-hooks.json",
-  "mcpServers": "./.mcp.json"
+  "mcpServers": {
+    "context-handoff": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/handoff-mcp.sh",
+      "alwaysLoad": true
+    }
+  }
 }
