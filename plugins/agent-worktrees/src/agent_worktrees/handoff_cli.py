@@ -99,6 +99,8 @@ def add_parsers(sub) -> None:
     p.add_argument("--worktree-id", dest="worktree_id", default=None, help="Target worktree (default: infer from cwd)")
     p.add_argument("--session-id", dest="session_id", default=None, help="Resumed session id -- authoritative worktree fallback when cwd is HOME (bare resume); resolves the worktree from the session registry")
     p.add_argument("--handoff-token", default=None, help="Pending handoff token to associate with the successor after its initial prompt creates a real session")
+    p.add_argument("--native-handoff", default=None, help="Frozen native-goal handoff checkpoint (context-handoff).")
+    p.add_argument("--native-launcher", default=None, help="Payload-local native preparation/resume runner (context-handoff native-launch.mjs).")
     p.add_argument("--mux-session", dest="mux_session", default=None, help="Retire mode: expected mux session containing the pane; a mismatch is treated as predecessor already gone")
     p.add_argument("--require-mux-identity", action="store_true", help="Retire mode: never signal a pane unless --mux-session was recorded and still matches; reap by session id only")
     p.add_argument("--old-pane", dest="old_pane", default=None, help="Explicit pane id to report as the old pane (default: the session's active pane)")

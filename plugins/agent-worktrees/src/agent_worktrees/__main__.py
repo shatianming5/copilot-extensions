@@ -2987,6 +2987,18 @@ def _pending_handoff_retire_requests(
         old_pane = str(spawn.get("old_pane") or "").strip() or None
         if not predecessor_session or not old_pane:
             continue
+        if spawn.get("native_handoff"):
+            # A native successor retires its predecessor only once admission
+            # completed and it owns the worktree head.
+            native_request = _monitor_read_session_state_handoff(spawn["native_handoff"])
+            native_goal = (native_request or {}).get("nativeGoal") or {}
+            if (
+                not native_goal.get("admissionComplete")
+                or native_goal.get("hydratedBySession") != successor_session
+                or getattr(handoff, "successor", None) != successor_session
+                or record.resolved_head_session != successor_session
+            ):
+                continue
         predecessor_pid = spawn.get("predecessor_copilot_pid")
         try:
             predecessor_pid = (
@@ -3181,7 +3193,7 @@ def _monitor_trigger_handoff_cutover(
         )
     )
     candidate_session = str(response.get("candidate_session") or "").strip() if rc == 0 else ""
-    if candidate_session and response.get("old_pane"):
+    if candidate_session and response.get("old_pane") and not response.get("native_handoff"):
         _monitor_retire_handoff_predecessor(
             {
                 "handoff_token": request.get("token"),
