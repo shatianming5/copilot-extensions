@@ -1009,6 +1009,13 @@ print(str(leg.get('state', '')) if isinstance(leg, dict) and leg.get('provider')
         if [[ -n "${LAUNCH_ID:-}" ]]; then
             TMUX_ENV_FLAGS+=(-e "WORKTREE_LAUNCH_ID=$LAUNCH_ID")
         fi
+        if [[ -n "${GROK_SESSION_ID:-}" || "${GROK_PANE:-}" == "1" || "${AGENT_WORKTREES_HOST:-}" == "grok" ]]; then
+            TMUX_ENV_FLAGS+=(-e "GROK_PANE=1" -e "AGENT_WORKTREES_HOST=grok")
+            TMUX_ENV_FLAGS+=(-e "GROK_HOME=${GROK_HOME:-$HOME/.grok}")
+            if [[ -n "${GROK_SESSION_ID:-}" ]]; then
+                TMUX_ENV_FLAGS+=(-e "GROK_SESSION_ID=$GROK_SESSION_ID")
+            fi
+        fi
         if [[ -n "$ENV_EXPORTS" ]]; then
             while IFS= read -r line; do
                 # Strip 'export ' prefix → KEY=VALUE
@@ -1181,7 +1188,11 @@ print(str(leg.get('state', '')) if isinstance(leg, dict) and leg.get('provider')
     fi
 
     setup_log INFO "Handing off to setup script"
-    echo "Launching Copilot..."
+    if [[ -n "${GROK_SESSION_ID:-}" || "${GROK_PANE:-}" == "1" || "${AGENT_WORKTREES_HOST:-}" == "grok" ]]; then
+        echo "Launching Grok..."
+    else
+        echo "Launching Copilot..."
+    fi
     echo ""
 
     set +e

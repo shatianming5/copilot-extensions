@@ -4,7 +4,7 @@
 # Used by agent-worktrees as the normalized launcher. Prepends any
 # repo-provided session PATH directories, runs an optional repo setup hook
 # (vault / MCP; context passed by argument, not ambient env), displays a brief
-# welcome banner, and launches the Copilot CLI.
+# welcome banner, and launches Copilot or Grok for the current host.
 #
 # A repo opts into this normalized flow by declaring a setup_hook in its
 # .agent-worktrees/config.yaml. When absent, this script is still used as the
@@ -185,7 +185,76 @@ _log_copilot_invoked() {
         --worktree-id "$wt" --source launcher >/dev/null 2>&1 & ) || true
 }
 
-# -- Launch Copilot -------------------------------------------------------
+# -- Launch Copilot or Grok ----------------------------------------------
+_is_grok_host() {
+    [[ "${AGENT_WORKTREES_HOST:-}" == "grok" ]] && return 0
+    [[ -n "${GROK_SESSION_ID:-}" || "${GROK_PANE:-}" == "1" ]] && return 0
+    return 1
+}
+
+_resolve_grok_bin() {
+    local override="${COPILOT_PATH_OVERRIDE:-}" base
+    if [[ -n "$override" ]]; then
+        base="${override##*/}"
+        if [[ "$base" == "grok" && -x "$override" ]]; then
+            printf '%s\n' "$override"
+            return 0
+        fi
+    fi
+    if [[ -n "${GROK_BIN:-}" && -x "$GROK_BIN" ]]; then
+        printf '%s\n' "$GROK_BIN"
+        return 0
+    fi
+    if [[ -x "$HOME/.grok/bin/grok" ]]; then
+        printf '%s\n' "$HOME/.grok/bin/grok"
+        return 0
+    fi
+    type -P grok 2>/dev/null || true
+}
+
+_grok_cli_args() {
+    GROK_ARGS=()
+    local skip=0 arg
+    for arg in "${COPILOT_ARGS[@]+"${COPILOT_ARGS[@]}"}"; do
+        if [[ "$skip" == 1 ]]; then
+            skip=0
+            continue
+        fi
+        case "$arg" in
+            --allow-all)
+                GROK_ARGS+=(--always-approve)
+                ;;
+            --stdio|--acp|--experimental)
+                ;;
+            --ahp|--context|--mode|--name|--worker-selectors|--copilot-path|--plugin-dir)
+                skip=1
+                ;;
+            --ahp=*|--context=*|--mode=*|--name=*|--worker-selectors=*|--copilot-path=*|--plugin-dir=*)
+                ;;
+            --resume=*)
+                GROK_ARGS+=(--resume "${arg#--resume=}")
+                ;;
+            *)
+                GROK_ARGS+=("$arg")
+                ;;
+        esac
+    done
+}
+
+if _is_grok_host; then
+    grok_bin=$(_resolve_grok_bin)
+    if [[ -z "$grok_bin" || ! -x "$grok_bin" ]]; then
+        echo "ERROR: Grok host mux needs an executable grok; Copilot was not started." >&2
+        exit 2
+    fi
+    export GROK_HOME="${GROK_HOME:-$HOME/.grok}"
+    export GROK_PANE=1
+    export AGENT_WORKTREES_HOST=grok
+    _grok_cli_args
+    say "Launching Grok..."
+    _log_copilot_invoked
+    exec "$grok_bin" ${GROK_ARGS[@]+"${GROK_ARGS[@]}"}
+fi
 if [[ -n "$COPILOT_PATH_OVERRIDE" ]]; then
     if command -v "$COPILOT_PATH_OVERRIDE" &>/dev/null; then
         _log_copilot_invoked
