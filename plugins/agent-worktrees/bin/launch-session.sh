@@ -69,6 +69,11 @@ LAUNCH_PROJECT=""
 RECOVERY_MODE=0
 FILTERED_ARGS=()
 COPILOT_PASSTHROUGH=()
+
+# _agent_host: which agent CLI (grok/claude/copilot) the session runs.
+# shellcheck source=../scripts/agent-host.sh
+. "${BASH_SOURCE[0]%/*}/../scripts/agent-host.sh"
+AGENT_HOST="$(_agent_host)"
 _SEEN_SEPARATOR=0
 while [[ $# -gt 0 ]]; do
     arg="$1"
@@ -1009,8 +1014,10 @@ print(str(leg.get('state', '')) if isinstance(leg, dict) and leg.get('provider')
         if [[ -n "${LAUNCH_ID:-}" ]]; then
             TMUX_ENV_FLAGS+=(-e "WORKTREE_LAUNCH_ID=$LAUNCH_ID")
         fi
-        if [[ -n "${GROK_SESSION_ID:-}" || "${GROK_PANE:-}" == "1" || "${AGENT_WORKTREES_HOST:-}" == "grok" ]]; then
-            TMUX_ENV_FLAGS+=(-e "GROK_PANE=1" -e "AGENT_WORKTREES_HOST=grok")
+        # The tmux server does not see our ancestry; hand the decision over.
+        TMUX_ENV_FLAGS+=(-e "AGENT_WORKTREES_HOST=$AGENT_HOST")
+        if [[ "$AGENT_HOST" == "grok" ]]; then
+            TMUX_ENV_FLAGS+=(-e "GROK_PANE=1")
             TMUX_ENV_FLAGS+=(-e "GROK_HOME=${GROK_HOME:-$HOME/.grok}")
             if [[ -n "${GROK_SESSION_ID:-}" ]]; then
                 TMUX_ENV_FLAGS+=(-e "GROK_SESSION_ID=$GROK_SESSION_ID")
@@ -1188,11 +1195,11 @@ print(str(leg.get('state', '')) if isinstance(leg, dict) and leg.get('provider')
     fi
 
     setup_log INFO "Handing off to setup script"
-    if [[ -n "${GROK_SESSION_ID:-}" || "${GROK_PANE:-}" == "1" || "${AGENT_WORKTREES_HOST:-}" == "grok" ]]; then
-        echo "Launching Grok..."
-    else
-        echo "Launching Copilot..."
-    fi
+    case "$AGENT_HOST" in
+        grok)   echo "Launching Grok..." ;;
+        claude) echo "Launching Claude..." ;;
+        *)      echo "Launching Copilot..." ;;
+    esac
     echo ""
 
     set +e

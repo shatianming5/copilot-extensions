@@ -4,7 +4,7 @@
 # Used by agent-worktrees as the normalized launcher. Prepends any
 # repo-provided session PATH directories, runs an optional repo setup hook
 # (vault / MCP; context passed by argument, not ambient env), displays a brief
-# welcome banner, and launches Copilot or Grok for the current host.
+# welcome banner, and launches Copilot, Grok or Claude for the current host.
 #
 # A repo opts into this normalized flow by declaring a setup_hook in its
 # .agent-worktrees/config.yaml. When absent, this script is still used as the
@@ -185,12 +185,11 @@ _log_copilot_invoked() {
         --worktree-id "$wt" --source launcher >/dev/null 2>&1 & ) || true
 }
 
-# -- Launch Copilot or Grok ----------------------------------------------
-_is_grok_host() {
-    [[ "${AGENT_WORKTREES_HOST:-}" == "grok" ]] && return 0
-    [[ -n "${GROK_SESSION_ID:-}" || "${GROK_PANE:-}" == "1" ]] && return 0
-    return 1
-}
+# -- Launch Copilot, Grok or Claude --------------------------------------
+# shellcheck source=agent-host.sh
+. "${BASH_SOURCE[0]%/*}/agent-host.sh"
+AGENT_HOST="$(_agent_host)"
+_is_grok_host() { [[ "$AGENT_HOST" == "grok" ]]; }
 
 _resolve_grok_bin() {
     local override="${COPILOT_PATH_OVERRIDE:-}" base
@@ -240,6 +239,60 @@ _grok_cli_args() {
         esac
     done
 }
+
+_is_claude_host() { [[ "$AGENT_HOST" == "claude" ]]; }
+
+# Map the Copilot launch args onto Claude Code's CLI. Copilot session ids are
+# not Claude ids, so a resume becomes --continue (latest session in this
+# worktree's directory); a handoff seed (-i) becomes the initial prompt.
+# Copilot-only flags are dropped.
+_claude_cli_args() {
+    CLAUDE_ARGS=()
+    local prompt="" arg
+    local -a rest=("${COPILOT_ARGS[@]+"${COPILOT_ARGS[@]}"}")
+    local i=0 n=${#rest[@]}
+    while (( i < n )); do
+        arg="${rest[i]}"
+        case "$arg" in
+            --allow-all|--allow-all-tools|--yolo)
+                CLAUDE_ARGS+=(--dangerously-skip-permissions) ;;
+            --resume|--continue)
+                CLAUDE_ARGS+=(--continue)
+                if [[ "$arg" == "--resume" && $((i + 1)) -lt $n && "${rest[i+1]}" != -* ]]; then
+                    i=$((i + 1))
+                fi ;;
+            --resume=*)
+                CLAUDE_ARGS+=(--continue) ;;
+            -i|--interactive|-p|--prompt)
+                i=$((i + 1)); prompt="${rest[i]:-}" ;;
+            --model|--add-dir)
+                CLAUDE_ARGS+=("$arg" "${rest[i+1]:-}"); i=$((i + 1)) ;;
+            --model=*|--add-dir=*)
+                CLAUDE_ARGS+=("$arg") ;;
+            --ahp|--context|--mode|--name|--worker-selectors|--copilot-path|--plugin-dir|--agent)
+                i=$((i + 1)) ;;
+            *) ;;
+        esac
+        i=$((i + 1))
+    done
+    if [[ -n "$prompt" ]]; then CLAUDE_ARGS+=("$prompt"); fi
+    return 0
+}
+
+if _is_claude_host; then
+    claude_bin="${CLAUDE_BIN:-$(type -P claude 2>/dev/null || true)}"
+    if [[ -z "$claude_bin" || ! -x "$claude_bin" ]]; then
+        echo "ERROR: Claude host mux needs an executable claude; Copilot was not started." >&2
+        exit 2
+    fi
+    # The parent Claude Code's markers would make the new session look nested.
+    unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID
+    export AGENT_WORKTREES_HOST=claude
+    _claude_cli_args
+    say "Launching Claude..."
+    _log_copilot_invoked
+    exec "$claude_bin" ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}
+fi
 
 if _is_grok_host; then
     grok_bin=$(_resolve_grok_bin)
