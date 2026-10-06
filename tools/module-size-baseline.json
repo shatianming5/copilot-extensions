@@ -68,6 +68,7 @@
   "plugins/agent-worktrees/src/agent_worktrees/config.py": 2178,
   "plugins/agent-worktrees/src/agent_worktrees/finalize.py": 2185,
   "plugins/agent-worktrees/src/agent_worktrees/git_ops.py": 1731,
+  "plugins/agent-worktrees/src/agent_worktrees/handoff_cutover.py": 1004,
   "plugins/agent-worktrees/src/agent_worktrees/installer.py": 1780,
   "plugins/agent-worktrees/src/agent_worktrees/pr_contract.py": 1612,
   "plugins/agent-worktrees/src/agent_worktrees/pr_ops.py": 2595,

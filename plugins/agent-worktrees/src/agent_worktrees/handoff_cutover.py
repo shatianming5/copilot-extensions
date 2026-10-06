@@ -25,7 +25,6 @@ makes the call, exactly as ``_self_override`` already guarantees for
 from __future__ import annotations
 
 import argparse
-import json
 import contextlib
 import hashlib
 import os
@@ -36,6 +35,7 @@ from . import (
     activity,
     config as cfg,
     locks,
+    native_cutover,
     obligations,
     pane_lifecycle,
     procs,
@@ -165,32 +165,9 @@ def _handoff_cutover_spawn_result(
     raw_id = getattr(args, "worktree_id", None)
     session_id = getattr(args, "session_id", None)
     headless = bool(getattr(args, "headless", False))
-    # Native-goal handoff (context-handoff native-source.mjs): the successor
-    # starts through the payload-local native launcher with a frozen checkpoint
-    # and no seed prompt; the source extension owns freeze and admission.
-    native_checkpoint = getattr(args, "native_handoff", None)
-    native_launcher = getattr(args, "native_launcher", None)
-    native_successor = None
-    if native_checkpoint or native_launcher:
-        if not native_checkpoint or not native_launcher:
-            return 1, {"ok": False, "error": "Native handoff requires both checkpoint and launcher."}
-        if headless:
-            return 1, {"ok": False, "error": "Native handoff needs a mux pane; --headless was given."}
-        try:
-            native_record = json.loads(Path(native_checkpoint).read_text(encoding="utf-8"))
-            native_goal = native_record["nativeGoal"]
-            native_successor = native_goal["successorSessionId"]
-            if native_goal.get("permissionMode") != "allow-all":
-                raise ValueError(
-                    f"Native handoff cannot preserve {native_goal.get('permissionMode')}; "
-                    "no pane was created."
-                )
-            if native_record["sessionId"] != session_id:
-                raise ValueError("Native checkpoint source does not match the cutover owner.")
-            if native_goal["phase"] != "frozen":
-                raise ValueError("Native successor is already being prepared; do not replay.")
-        except (OSError, ValueError, KeyError) as exc:
-            return 1, {"ok": False, "error": str(exc)}
+    native, native_failure = native_cutover.plan(args, session_id, headless)
+    if native_failure:
+        return 1, native_failure
     rc, resolved = core._resolve_handoff_cutover_target(raw_id, session_id)
     if rc != 0:
         return rc, resolved
@@ -331,13 +308,7 @@ def _handoff_cutover_spawn_result(
     handoff_token = getattr(args, "handoff_token", None)
     if handoff_token:
         env[core._SESSION_HANDOFF_TOKEN] = handoff_token
-    if native_checkpoint:
-        launch_cmd = [
-            "node", native_launcher, "--checkpoint", native_checkpoint,
-            "--cli", launch_cmd[0], "--", *launch_cmd[1:],
-            "--session-id", native_successor,
-        ]
-
+    launch_cmd = native_cutover.wrap(native, launch_cmd)
     if headless:
         # No pane, no mux session, no seed-typing choreography: the seed is
         # passed as a native ``-i <seed>`` argument directly by
@@ -453,8 +424,7 @@ def _handoff_cutover_spawn_result(
         "worktree_id": wt_id, "session_id": session_id, "source": "python",
         "handoff_token": handoff_token, "old_pane": old_pane,
         "expected_mux_session": expected_mux_session,
-        "method": "mux_new_window_interactive_argv",
-        **({"native_handoff": native_checkpoint} if native_checkpoint else {}),
+        "method": "mux_new_window_interactive_argv", **native_cutover.marker(native),
     }
     def _spawn_failed(error: object) -> None:
         activity.log_event(
@@ -463,7 +433,7 @@ def _handoff_cutover_spawn_result(
     try:
         result = pane_lifecycle.pane_create(
             wt_id, work_dir, launch_cmd, env,
-            initial_prompt=None if native_checkpoint else seed, session_name=mux_session)
+            initial_prompt=None if native else seed, session_name=mux_session)
     except Exception as exc:
         # mux_new_window guards only a known subset; an uncaught exception
         # must not leave the spawn stuck at "started".
@@ -517,8 +487,7 @@ def _handoff_cutover_spawn_result(
             "seed_len": len(seed),
             "seeded": bool(result.get("prompt_received")),
             "seed_ready": bool(result.get("prompt_received")),
-            "seed_method": "interactive-argv",
-            **({"native_handoff": native_checkpoint, "startup_pending": True} if native_checkpoint else {}),
+            "seed_method": "interactive-argv", **native_cutover.marker(native, startup_pending=True),
         }
     )
     if candidate_session:

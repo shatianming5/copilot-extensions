@@ -957,11 +957,7 @@ def _monitor_pending_handoff_request(
             fallback = _monitor_session_state_handoff_path(predecessor_session)
             session_state = str(fallback) if fallback is not None else None
         request = _monitor_read_session_state_handoff(session_state)
-        if request is None or request.get("consumed"):
-            continue
-        if request.get("nativeGoal") or request.get("liveCutover"):
-            # The source extension owns native freeze/provision/launch. A
-            # pending saved goal is not a signal-only monitor launch request.
+        if request is None or any(request.get(k) for k in ("consumed", "nativeGoal", "liveCutover")):
             continue
         request_token = str(request.get("handoffId") or "").strip()
         if request_token and request_token != token:
