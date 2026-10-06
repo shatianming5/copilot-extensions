@@ -4,7 +4,7 @@
 # Used by agent-worktrees as the normalized launcher. Prepends any
 # repo-provided session PATH directories, runs an optional repo setup hook
 # (vault / MCP; context passed by argument, not ambient env), displays a brief
-# welcome banner, and launches the Copilot CLI.
+# welcome banner, and launches Copilot, Grok or Claude for the current host.
 #
 # A repo opts into this normalized flow by declaring a setup_hook in its
 # .agent-worktrees/config.yaml. When absent, this script is still used as the
@@ -151,7 +151,127 @@ say "  Machine:  $MACHINE"
 say "  Path:     $PWD"
 say ""
 
-# -- Launch Copilot -------------------------------------------------------
+# -- Launch Copilot, Grok or Claude --------------------------------------
+# shellcheck source=agent-host.sh
+. "${BASH_SOURCE[0]%/*}/agent-host.sh"
+AGENT_HOST="$(_agent_host)"
+_is_grok_host() { [[ "$AGENT_HOST" == "grok" ]]; }
+
+_resolve_grok_bin() {
+    local override="${COPILOT_PATH_OVERRIDE:-}" base
+    if [[ -n "$override" ]]; then
+        base="${override##*/}"
+        if [[ "$base" == "grok" && -x "$override" ]]; then
+            printf '%s\n' "$override"
+            return 0
+        fi
+    fi
+    if [[ -n "${GROK_BIN:-}" && -x "$GROK_BIN" ]]; then
+        printf '%s\n' "$GROK_BIN"
+        return 0
+    fi
+    if [[ -x "$HOME/.grok/bin/grok" ]]; then
+        printf '%s\n' "$HOME/.grok/bin/grok"
+        return 0
+    fi
+    type -P grok 2>/dev/null || true
+}
+
+_grok_cli_args() {
+    GROK_ARGS=()
+    local skip=0 arg
+    for arg in "${COPILOT_ARGS[@]+"${COPILOT_ARGS[@]}"}"; do
+        if [[ "$skip" == 1 ]]; then
+            skip=0
+            continue
+        fi
+        case "$arg" in
+            --allow-all)
+                GROK_ARGS+=(--always-approve)
+                ;;
+            --stdio|--acp|--experimental)
+                ;;
+            --ahp|--context|--mode|--name|--worker-selectors|--copilot-path|--plugin-dir)
+                skip=1
+                ;;
+            --ahp=*|--context=*|--mode=*|--name=*|--worker-selectors=*|--copilot-path=*|--plugin-dir=*)
+                ;;
+            --resume=*)
+                GROK_ARGS+=(--resume "${arg#--resume=}")
+                ;;
+            *)
+                GROK_ARGS+=("$arg")
+                ;;
+        esac
+    done
+}
+
+_is_claude_host() { [[ "$AGENT_HOST" == "claude" ]]; }
+
+# Map the Copilot launch args onto Claude Code's CLI. Copilot session ids are
+# not Claude ids, so a resume becomes --continue (latest session in this
+# worktree's directory); a handoff seed (-i) becomes the initial prompt.
+# Copilot-only flags are dropped.
+_claude_cli_args() {
+    CLAUDE_ARGS=()
+    local prompt="" arg
+    local -a rest=("${COPILOT_ARGS[@]+"${COPILOT_ARGS[@]}"}")
+    local i=0 n=${#rest[@]}
+    while (( i < n )); do
+        arg="${rest[i]}"
+        case "$arg" in
+            --allow-all|--allow-all-tools|--yolo)
+                CLAUDE_ARGS+=(--dangerously-skip-permissions) ;;
+            --resume|--continue)
+                CLAUDE_ARGS+=(--continue)
+                if [[ "$arg" == "--resume" && $((i + 1)) -lt $n && "${rest[i+1]}" != -* ]]; then
+                    i=$((i + 1))
+                fi ;;
+            --resume=*)
+                CLAUDE_ARGS+=(--continue) ;;
+            -i|--interactive|-p|--prompt)
+                i=$((i + 1)); prompt="${rest[i]:-}" ;;
+            --model|--add-dir)
+                CLAUDE_ARGS+=("$arg" "${rest[i+1]:-}"); i=$((i + 1)) ;;
+            --model=*|--add-dir=*)
+                CLAUDE_ARGS+=("$arg") ;;
+            --ahp|--context|--mode|--name|--worker-selectors|--copilot-path|--plugin-dir|--agent)
+                i=$((i + 1)) ;;
+            *) ;;
+        esac
+        i=$((i + 1))
+    done
+    if [[ -n "$prompt" ]]; then CLAUDE_ARGS+=("$prompt"); fi
+    return 0
+}
+
+if _is_claude_host; then
+    claude_bin="${CLAUDE_BIN:-$(type -P claude 2>/dev/null || true)}"
+    if [[ -z "$claude_bin" || ! -x "$claude_bin" ]]; then
+        echo "ERROR: Claude host mux needs an executable claude; Copilot was not started." >&2
+        exit 2
+    fi
+    # The parent Claude Code's markers would make the new session look nested.
+    unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID
+    export AGENT_WORKTREES_HOST=claude
+    _claude_cli_args
+    say "Launching Claude..."
+    exec "$claude_bin" ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}
+fi
+
+if _is_grok_host; then
+    grok_bin=$(_resolve_grok_bin)
+    if [[ -z "$grok_bin" || ! -x "$grok_bin" ]]; then
+        echo "ERROR: Grok host mux needs an executable grok; Copilot was not started." >&2
+        exit 2
+    fi
+    export GROK_HOME="${GROK_HOME:-$HOME/.grok}"
+    export GROK_PANE=1
+    export AGENT_WORKTREES_HOST=grok
+    _grok_cli_args
+    say "Launching Grok..."
+    exec "$grok_bin" ${GROK_ARGS[@]+"${GROK_ARGS[@]}"}
+fi
 if [[ -n "$COPILOT_PATH_OVERRIDE" ]]; then
     if command -v "$COPILOT_PATH_OVERRIDE" &>/dev/null; then
         exec "$COPILOT_PATH_OVERRIDE" "${COPILOT_ARGS[@]}"

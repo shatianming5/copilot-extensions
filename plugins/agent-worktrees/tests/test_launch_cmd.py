@@ -444,6 +444,13 @@ def test_default_setup_sh_supports_hook_and_session_path():
     assert 'export PATH="${SESSION_PATH}:${PATH}"' in text
     assert "exec copilot" in text
     assert 'exec "$COPILOT_PATH_OVERRIDE"' in text
+    assert "_is_grok_host" in text
+    assert "Launching Grok..." in text
+    assert "AGENT_WORKTREES_HOST=grok" in text
+    assert "Copilot was not started." in text
+    assert "_is_claude_host" in text
+    assert "Launching Claude..." in text
+    assert "--dangerously-skip-permissions" in text
     # --stdio (ACP) mode keeps human output off the JSON-RPC channel
     assert "STDIO=true" in text
     assert 'bash "$SETUP_HOOK" --machine "$MACHINE" >&2' in text
