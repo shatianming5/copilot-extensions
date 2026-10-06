@@ -127,11 +127,9 @@ def call(name: str, arguments: dict) -> str:
         text = str(arguments.get("prompt_text") or arguments.get("prompt") or "")
         if not text.strip():
             raise ValueError("save_handoff_prompt needs prompt_text")
-        save = ["save", "--title", str(arguments.get("title") or "Continue the current work")]
-        try:
-            return _handoff_cli(save, text)
-        except RuntimeError:  # no agent-dispatch task store here: one-time file
-            return _handoff_cli([*save, "--no-task"], text)
+        # handoff-cli stores an agent-dispatch task, else a one-time file.
+        return _handoff_cli(["save", "--title",
+                             str(arguments.get("title") or "Continue the current work")], text)
     if name == "consume_handoff":
         if arguments.get("task_id"):
             defer = ["--defer-complete"] if arguments.get("defer_complete") else []
