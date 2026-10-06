@@ -29,7 +29,17 @@ def _read_stdin() -> dict:
     return value if isinstance(value, dict) else {}
 
 
+# Claude and Grok tool names -> the Copilot names the guards match on
+# (case-sensitive: "Write" from Claude would otherwise never be checked).
+TOOLS = {
+    "multiedit": "edit", "notebookedit": "edit",
+    "run_terminal_command": "bash", "write_file": "write", "search_replace": "edit",
+}
+
+
 def _map_payload(data: dict) -> dict:
+    """Translate a Claude (snake_case) or Grok (camelCase) hook payload into the
+    Copilot payload hook_client expects."""
     mapped = dict(data)
     session_id = data.get("session_id") or data.get("sessionId") or ""
     cwd = data.get("cwd") or os.getcwd()
@@ -38,10 +48,14 @@ def _map_payload(data: dict) -> dict:
     mapped["workspaceRoot"] = data.get("workspaceRoot") or cwd
     mapped.setdefault("source", data.get("source") or data.get("hook_event_name") or "startup")
     mapped.setdefault("timestamp", time.time())
-    if "tool_name" in data and "toolName" not in mapped:
-        mapped["toolName"] = data["tool_name"]
-    if "tool_input" in data and "toolArgs" not in mapped:
-        mapped["toolArgs"] = data["tool_input"]
+    tool = data.get("tool_name") or data.get("toolName")
+    if tool:
+        name = str(tool).lower()
+        mapped["toolName"] = TOOLS.get(name, name)
+        args = dict(data.get("tool_input") or data.get("toolInput") or data.get("toolArgs") or {})
+        if "notebook_path" in args:  # the guards look for path/file_path
+            args.setdefault("path", args["notebook_path"])
+        mapped["toolArgs"] = args
     return mapped
 
 
