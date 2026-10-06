@@ -1104,6 +1104,7 @@ deploy_wrappers() {
     for setup in \
         default-setup.ps1 \
         default-setup.sh \
+        agent-host.sh \
         launch-command.ps1 \
         launch-command.sh \
         reconcile-machine-settings.ps1 \

@@ -418,6 +418,7 @@ def deploy_wrappers(repo_dir: str | Path) -> bool:
     for name in (
         "default-setup.ps1",
         "default-setup.sh",
+        "agent-host.sh",  # sourced by default-setup.sh and bin/launch-session.sh
         "launch-command.ps1",
         "launch-command.sh",
         "reconcile-machine-settings.ps1",
