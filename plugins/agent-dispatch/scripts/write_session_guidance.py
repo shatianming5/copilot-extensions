@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 _SESSION_IDENTIFIER = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,127})$")
 _MAX_INPUT_BYTES = 64 * 1024
@@ -44,9 +45,10 @@ def _additional_context(raw: bytes) -> str:
 
 
 def _plugin_root() -> Path:
-    root = os.environ.get("COPILOT_PLUGIN_ROOT")
-    if root:
-        return Path(root)
+    for name in ("CLAUDE_PLUGIN_ROOT", "COPILOT_PLUGIN_ROOT", "PLUGIN_ROOT"):
+        root = os.environ.get(name)
+        if root:
+            return Path(root)
     return Path(__file__).resolve().parents[1]
 
 
@@ -172,6 +174,24 @@ def write_session_guidance(payload: dict, *, home: Path | None = None) -> bool:
         if os.name != "nt":
             temporary.chmod(0o600)
         os.replace(temporary, target)
+        workspace = payload.get("workspaceRoot") or payload.get("cwd") or os.environ.get(
+            "GROK_WORKSPACE_ROOT"
+        )
+        if os.environ.get("GROK_SESSION_ID") or os.environ.get("GROK_HOOK_EVENT"):
+            sessions = home / ".grok" / "sessions"
+            grok_dir = None
+            if isinstance(workspace, str) and workspace:
+                grok_dir = sessions / quote(workspace, safe="") / session_id
+            elif sessions.is_dir():
+                for child in sessions.iterdir():
+                    candidate = child / session_id
+                    if candidate.is_dir():
+                        grok_dir = candidate
+                        break
+            if grok_dir is not None:
+                mirror = grok_dir / "instructions" / "agent-dispatch"
+                mirror.mkdir(parents=True, exist_ok=True)
+                (mirror / "session-guidance.instructions.md").write_text(content, encoding="utf-8")
         return True
     except (OSError, RuntimeError, ValueError):
         if temporary is not None:
