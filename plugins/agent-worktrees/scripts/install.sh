@@ -781,7 +781,8 @@ deploy_wrappers() {
     # sync -- otherwise spawning a worktree agent fails at LAUNCH_ACP because
     # the setup script is missing. Mirrors installer.py deploy_wrappers().
     mkdir -p "$INSTALL_DIR/scripts"
-    for setup in default-setup.ps1 default-setup.sh; do
+    # agent-host.sh: sourced by default-setup.sh and bin/launch-session.sh.
+    for setup in default-setup.ps1 default-setup.sh agent-host.sh; do
         local setup_src="$SCRIPT_DIR/$setup"
         if [[ -f "$setup_src" ]]; then
             tmp="$(mktemp "$INSTALL_DIR/scripts/$setup.XXXXXX")"

@@ -165,11 +165,16 @@ export function resolveHandoffCwd(
   }
 }
 
+// Agents whose Herdr pane may record a handoff predecessor. Retiring a
+// predecessor pane stays Copilot-only (it goes through copilot-pane stop).
+const HANDOFF_AGENTS = ["copilot", "grok", "claude"];
+
 function herdrAgentIdentity(
   paneId,
   {
     execute = runCli,
     home = homedir(),
+    agents = HANDOFF_AGENTS,
   } = {},
 ) {
   try {
@@ -181,19 +186,20 @@ function herdrAgentIdentity(
     const agent = JSON.parse(output)?.result?.agent;
     const reportedSessionId = agent?.agent_session?.value || null;
     if (
-      agent?.agent !== "copilot"
+      !agents.includes(agent?.agent)
       || agent?.pane_id !== paneId
       || typeof agent?.terminal_id !== "string"
       || !agent.terminal_id
     ) {
       return {
         identity: null,
-        error: `Herdr pane ${paneId} does not report a Copilot session identity.`,
+        error: `Herdr pane ${paneId} does not report a ${agents.join("/")} session identity.`,
       };
     }
     return {
       identity: {
         paneId,
+        agent: agent.agent,
         sessionId: reportedSessionId,
         agentName:
           typeof agent?.name === "string" && agent.name
@@ -208,7 +214,7 @@ function herdrAgentIdentity(
       identity: null,
       error:
         commandErrorDetail(error)
-        || `Unable to resolve Copilot identity for Herdr pane ${paneId}.`,
+        || `Unable to resolve the agent identity for Herdr pane ${paneId}.`,
     };
   }
 }
@@ -234,7 +240,7 @@ export function resolveHerdrPredecessorIdentity(
     return {
       predecessor: null,
       error:
-        `Herdr pane ${paneId} belongs to Copilot session ` +
+        `Herdr pane ${paneId} belongs to ${found.identity.agent} session ` +
         `${found.identity.sessionId}, not ${expectedSessionId}.`,
     };
   }
@@ -298,7 +304,7 @@ export function retireHerdrPredecessorAfterConsume(
       status: "current-pane",
     };
   }
-  const successor = herdrAgentIdentity(currentPane, { execute, home });
+  const successor = herdrAgentIdentity(currentPane, { execute, home, agents: ["copilot"] });
   if (
     !successor.identity
     || (
@@ -315,7 +321,7 @@ export function retireHerdrPredecessorAfterConsume(
       error: successor.error,
     };
   }
-  const target = herdrAgentIdentity(predecessor.paneId, { execute, home });
+  const target = herdrAgentIdentity(predecessor.paneId, { execute, home, agents: ["copilot"] });
   if (
     !target.identity
     || target.identity.terminalId !== predecessor.terminalId

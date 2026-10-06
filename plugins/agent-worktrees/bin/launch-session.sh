@@ -116,6 +116,11 @@ activity_log() {
 # --: everything after this separator is copilot passthrough args (e.g. --acp --stdio)
 FILTERED_ARGS=()
 COPILOT_PASSTHROUGH=()
+
+# _agent_host: which agent CLI (grok/claude/copilot) the session runs.
+# shellcheck source=../scripts/agent-host.sh
+. "${BASH_SOURCE[0]%/*}/../scripts/agent-host.sh"
+AGENT_HOST="$(_agent_host)"
 _SEEN_SEPARATOR=0
 for arg in "$@"; do
     if [[ $_SEEN_SEPARATOR -eq 1 ]]; then
@@ -755,6 +760,12 @@ print(' '.join(shlex.quote(a) for a in d.get('cmd', [])))
         if [[ -n "${LAUNCH_ID:-}" ]]; then
             TMUX_ENV_FLAGS+=(-e "WORKTREE_LAUNCH_ID=$LAUNCH_ID")
         fi
+        # The tmux server does not see our ancestry; hand the decision over.
+        TMUX_ENV_FLAGS+=(-e "AGENT_WORKTREES_HOST=$AGENT_HOST")
+        if [[ "$AGENT_HOST" == "grok" ]]; then
+            if [[ -n "${GROK_HOME:-}" ]]; then TMUX_ENV_FLAGS+=(-e "GROK_HOME=$GROK_HOME"); fi
+            if [[ -n "${GROK_SESSION_ID:-}" ]]; then TMUX_ENV_FLAGS+=(-e "GROK_SESSION_ID=$GROK_SESSION_ID"); fi
+        fi
         if [[ -n "$ENV_EXPORTS" ]]; then
             while IFS= read -r line; do
                 # Strip 'export ' prefix → KEY=VALUE
@@ -875,7 +886,11 @@ print(' '.join(shlex.quote(a) for a in d.get('cmd', [])))
     fi
 
     setup_log INFO "Handing off to setup script"
-    echo "Launching Copilot..."
+    case "$AGENT_HOST" in
+        grok)   echo "Launching Grok..." ;;
+        claude) echo "Launching Claude..." ;;
+        *)      echo "Launching Copilot..." ;;
+    esac
     echo ""
 
     set +e
