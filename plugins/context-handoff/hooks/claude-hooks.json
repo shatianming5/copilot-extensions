@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-adapter.py\" SessionStart",
-            "timeout": 120
+            "timeout": 40
           }
         ]
       }

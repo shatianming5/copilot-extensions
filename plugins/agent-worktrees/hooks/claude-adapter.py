@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Run this plugin's Copilot ``hooks.json`` under Claude Code.
+"""Run this plugin's Copilot ``hooks.json`` under Claude Code (or Grok).
 
-Claude Code calls ``claude-adapter.py <Event>`` (see claude-hooks.json). The
-matching Copilot hooks run with a Copilot-shaped payload on stdin and the
-plugin root in COPILOT_PLUGIN_ROOT, exactly as Copilot runs them, and their
-JSON answers fold into one Claude answer: ``additionalContext`` is joined, and
-the first ``deny`` (else ``ask``) ``permissionDecision`` wins. A hook that
-fails, times out or prints nothing contributes nothing.
+Claude Code calls ``claude-adapter.py <Event>`` (see claude-hooks.json); Grok,
+which loads ``.claude-plugin`` manifests, sends the same events with camelCase
+payload keys and its own tool names. The matching Copilot hooks run with a
+Copilot-shaped payload on stdin and the plugin root in COPILOT_PLUGIN_ROOT,
+exactly as Copilot runs them, and their JSON answers fold into one Claude-style
+answer: ``additionalContext`` is joined, and the first ``deny`` (else ``ask``)
+``permissionDecision`` wins. A hook that fails, times out or prints nothing
+contributes nothing.
 
 The same file ships in every plugin with a Claude layer; only the plugin root
 differs. ``--self-test`` runs the check at the bottom.
@@ -27,32 +29,38 @@ EVENTS = {
     "SessionEnd": "sessionEnd",
     "PreToolUse": "preToolUse",
     "PostToolUse": "postToolUse",
-    "UserPromptSubmit": "userPromptSubmitted",
 }
 
-# Claude tool names -> the Copilot names the hook scripts match on.
-TOOLS = {"multiedit": "edit", "notebookedit": "edit"}
+# Claude and Grok tool names -> the Copilot names the hook scripts match on.
+TOOLS = {
+    "multiedit": "edit", "notebookedit": "edit",
+    "run_terminal_command": "bash", "write_file": "write", "search_replace": "edit",
+}
 
 
 def copilot_payload(data: dict) -> dict:
+    """Translate a Claude (snake_case) or Grok (camelCase) hook payload."""
     cwd = data.get("cwd") or os.getcwd()
     payload = {
-        "sessionId": data.get("session_id") or "",
+        "sessionId": data.get("session_id") or data.get("sessionId") or "",
         "cwd": cwd,
-        "workspaceRoot": cwd,
+        "workspaceRoot": data.get("workspaceRoot") or cwd,
         "timestamp": int(time.time() * 1000),
         "source": data.get("source") or "startup",
     }
-    if "tool_name" in data:
-        name = str(data["tool_name"]).lower()
+    tool = data.get("tool_name") or data.get("toolName")
+    if tool:
+        name = str(tool).lower()
         payload["toolName"] = TOOLS.get(name, name)
-        payload["toolArgs"] = data.get("tool_input") or {}
-    if "prompt" in data:
-        payload["prompt"] = data["prompt"]
+        args = dict(data.get("tool_input") or data.get("toolInput") or {})
+        if "notebook_path" in args:  # the guards look for path/file_path
+            args.setdefault("path", args["notebook_path"])
+        payload["toolArgs"] = args
     return payload
 
 
 def run_hooks(kind: str, payload: dict) -> list[dict]:
+    """Run the plugin's ``hooks.json`` entries for ``kind``; collect their JSON."""
     try:
         spec = json.loads((ROOT / "hooks.json").read_text("utf-8"))
     except (OSError, ValueError):
@@ -87,6 +95,7 @@ def run_hooks(kind: str, payload: dict) -> list[dict]:
 
 
 def claude_answer(event: str, answers: list[dict]) -> dict:
+    """Fold Copilot hook answers into one ``hookSpecificOutput`` (or nothing)."""
     out: dict = {"hookEventName": event}
     context = "\n\n".join(
         a["additionalContext"].strip()
@@ -105,6 +114,7 @@ def claude_answer(event: str, answers: list[dict]) -> dict:
 
 
 def main(argv: list[str]) -> int:
+    """Hook entry point: ``claude-adapter.py <ClaudeEventName>``, payload on stdin."""
     event = argv[0] if argv else ""
     kind = EVENTS.get(event)
     if not kind:
@@ -123,6 +133,11 @@ def self_test() -> None:
     p = copilot_payload({"session_id": "s", "cwd": "/w", "tool_name": "MultiEdit",
                          "tool_input": {"file_path": "/w/a"}})
     assert p["toolName"] == "edit" and p["toolArgs"] == {"file_path": "/w/a"}
+    g = copilot_payload({"sessionId": "g", "cwd": "/w", "toolName": "run_terminal_command",
+                         "toolInput": {"command": "ls"}})
+    assert (g["sessionId"], g["toolName"], g["toolArgs"]) == ("g", "bash", {"command": "ls"})
+    n = copilot_payload({"tool_name": "NotebookEdit", "tool_input": {"notebook_path": "/w/n"}})
+    assert n["toolArgs"]["path"] == "/w/n"
     assert claude_answer("PreToolUse", [{}, {"permissionDecision": "ask"},
                                         {"permissionDecision": "deny",
                                          "permissionDecisionReason": "r"}]) == {

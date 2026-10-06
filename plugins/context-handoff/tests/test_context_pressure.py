@@ -25,3 +25,32 @@ def test_nudges_once_per_level_and_rearms(tmp_path, monkeypatch):
     assert at(600) == ""          # hard already covers soft
     assert at(100) == ""          # re-arm
     assert "soft threshold" in at(600)
+
+
+def test_window_follows_env_then_model_catalog(monkeypatch):
+    window = runpy.run_path(str(HOOK))["window"]
+    for name in ("CONTEXT_HANDOFF_TOKEN_LIMIT", "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+                 "CLAUDE_CODE_DISABLE_1M_CONTEXT"):
+        monkeypatch.delenv(name, raising=False)
+    assert window("claude-opus-5-5") == 1_000_000
+    assert window("claude-sonnet-4-6") == 200_000
+    assert window("claude-sonnet-4-6[1m]") == 1_000_000
+    monkeypatch.setenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "256000")
+    assert window("claude-opus-5-5") == 256_000
+
+
+def test_defaults_match_thresholds_mjs():
+    mod = runpy.run_path(str(HOOK))
+    text = (HOOK.parents[1] / "extensions" / "context-handoff" / "thresholds.mjs").read_text()
+    assert f"SOFT_UTILIZATION_PERCENT = {mod['SOFT_PERCENT']};" in text
+    assert f"HARD_UTILIZATION_PERCENT = {mod['HARD_PERCENT']};" in text
+
+
+def test_repository_config_overrides_thresholds(tmp_path):
+    thresholds = runpy.run_path(str(HOOK))["thresholds"]
+    assert thresholds(str(tmp_path)) == (55, 70)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".context-handoff").mkdir()
+    (tmp_path / ".context-handoff" / "config.yaml").write_text(
+        "thresholds:\n  soft_percent: 40\n  hard_percent: 60\n")
+    assert thresholds(str(tmp_path)) == (40, 60)

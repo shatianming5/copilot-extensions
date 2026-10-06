@@ -444,13 +444,10 @@ def test_default_setup_sh_supports_hook_and_session_path():
     assert 'export PATH="${SESSION_PATH}:${PATH}"' in text
     assert "exec copilot" in text
     assert 'exec "$COPILOT_PATH_OVERRIDE"' in text
-    assert "_is_grok_host" in text
-    assert "Launching Grok..." in text
-    assert "AGENT_WORKTREES_HOST=grok" in text
+    assert ". \"${BASH_SOURCE[0]%/*}/agent-host.sh\"" in text
+    assert "_agent_cli_args --dangerously-skip-permissions" in text
+    assert "_agent_cli_args --always-approve" in text
     assert "Copilot was not started." in text
-    assert "_is_claude_host" in text
-    assert "Launching Claude..." in text
-    assert "--dangerously-skip-permissions" in text
     # --stdio (ACP) mode keeps human output off the JSON-RPC channel
     assert "STDIO=true" in text
     assert 'bash "$SETUP_HOOK" --machine "$MACHINE" >&2' in text
@@ -652,3 +649,14 @@ def test_windows_interactive_falls_back_to_cmd_when_ps1_absent(monkeypatch, tmp_
         m.cmd_launch([])
     argv = captured[0]
     assert argv[0] == "cmd.exe"
+
+
+def test_installers_deploy_the_sourced_agent_host_helper():
+    """default-setup.sh and bin/launch-session.sh source scripts/agent-host.sh
+    (at runtime, ~/.agent-worktrees/scripts/agent-host.sh); a launcher whose
+    helper is missing exits under ``set -e``, so both installers deploy it."""
+    plugin = Path(__file__).resolve().parents[1]
+    assert '"agent-host.sh"' in (plugin / "src" / "agent_worktrees" / "installer.py").read_text()
+    assert "default-setup.sh agent-host.sh" in (plugin / "scripts" / "install.sh").read_text()
+    for launcher in ("scripts/default-setup.sh", "bin/launch-session.sh"):
+        assert "agent-host.sh" in (plugin / launcher).read_text()

@@ -17,7 +17,7 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-adapter.py\" PreToolUse",
-            "timeout": 30
+            "timeout": 55
           }
         ]
       }
@@ -28,7 +28,7 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-adapter.py\" SessionEnd",
-            "timeout": 30
+            "timeout": 20
           }
         ]
       }
@@ -40,7 +40,7 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-adapter.py\" SessionStart",
-            "timeout": 120
+            "timeout": 150
           }
         ]
       }
