@@ -11,7 +11,7 @@ const core = readFileSync(new URL(
   "../extensions/context-handoff/handoff-core.mjs", import.meta.url,
 ), "utf8");
 const runCliSource = core.slice(core.indexOf("export function runCli("),
-  core.indexOf("// True if an agent-dispatch")).replace("export ", "");
+  core.indexOf("\nexport ", core.indexOf("export function runCli(") + 1)).replace("export ", "");
 const source = readFileSync(new URL(
   "../extensions/context-handoff/native-source.mjs", import.meta.url,
 ), "utf8").replace(/^import[\s\S]*?from "[^"]+";\n/gm, "")

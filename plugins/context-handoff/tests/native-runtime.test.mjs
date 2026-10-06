@@ -136,7 +136,7 @@ test("the actual extension initializer returns before native UI selection", { ti
     "../extensions/context-handoff/extension.mjs", import.meta.url,
   ), "utf8");
   const start = source.indexOf("nativeStartup = bootstrapNativeHandoff(session)");
-  const end = source.indexOf("if (handoffConfig.warning)", start);
+  const end = source.indexOf("handoffConfigPromise.then(", start);
   assert.ok(start >= 0 && end > start);
   let select;
   const selection = new Promise(resolve => { select = resolve; });
