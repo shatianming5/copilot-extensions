@@ -5,7 +5,7 @@ set -uo pipefail
 
 max_kernel_bytes=2048
 max_combined_bytes=3072
-plugin_root="${COPILOT_PLUGIN_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P)}"
+plugin_root="${CLAUDE_PLUGIN_ROOT:-${COPILOT_PLUGIN_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P)}}"
 manifest="$plugin_root/plugin.json"
 skill="$plugin_root/skills/context-handoff/SKILL.md"
 

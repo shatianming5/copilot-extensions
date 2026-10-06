@@ -33,6 +33,7 @@ install step:
 
 Native live handoff requires Node.js, the tested Copilot CLI 1.0.84-3 native API,
 and either the native-aware Herdr `copilot-pane` launcher or agent-worktrees.
+On Grok inside Herdr, use `grok-pane` (`--kind grok`) instead; never start Copilot.
 This plugin does not install those hosts. Legacy text-only signal pickup does
 not require them. Do not reload an older CLI and claim that its runtime upgraded.
 

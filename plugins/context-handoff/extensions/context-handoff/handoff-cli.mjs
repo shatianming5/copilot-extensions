@@ -94,7 +94,12 @@ function readPrompt(args) {
 }
 
 function resolveSid(args) {
-  return args["session-id"] || process.env.COPILOT_AGENT_SESSION_ID || null;
+  return args["session-id"]
+    || process.env.GROK_SESSION_ID
+    || process.env.COPILOT_AGENT_SESSION_ID
+    || process.env.CLAUDE_SESSION_ID
+    || process.env.CLAUDE_CODE_SESSION_ID
+    || null;
 }
 
 function emit(obj, args) {

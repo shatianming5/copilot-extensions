@@ -121,6 +121,8 @@ export async function requestNativeCutover(session, seed, observers) {
     model: await session.rpc.model.getCurrent(),
     agentId: (await session.rpc.agent.getCurrent()).agent?.id || null,
     copilotHome: process.env.COPILOT_HOME || null,
+    grokHome: process.env.GROK_HOME
+      || (process.env.GROK_SESSION_ID ? `${process.env.HOME}/.grok` : null),
   };
   const pause = await session.rpc.mode.set({ mode: "interactive" });
   if (pause.confirmation || pause.deferImplementation) {

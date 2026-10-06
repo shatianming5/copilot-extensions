@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 _SESSION_IDENTIFIER = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,127})$")
 _MAX_INPUT_BYTES = 64 * 1024
@@ -91,9 +92,57 @@ def _is_link_or_reparse(path: Path) -> bool:
     )
 
 
+def grok_session_dir(home: Path, session_id: str, workspace: str | None) -> Path | None:
+    sessions = home / ".grok" / "sessions"
+    if workspace:
+        encoded = quote(workspace, safe="")
+        return sessions / encoded / session_id
+    if not sessions.is_dir():
+        return None
+    direct = sessions / session_id
+    if direct.is_dir():
+        return direct
+    for child in sessions.iterdir():
+        candidate = child / session_id
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _write_guidance_file(target_dir: Path, content: str) -> bool:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    if _is_link_or_reparse(target_dir):
+        return False
+    target = target_dir / "session-guidance.instructions.md"
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=target_dir,
+            prefix=".session-guidance.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+        if os.name != "nt":
+            temporary.chmod(0o600)
+        os.replace(temporary, target)
+        return True
+    except OSError:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+        return False
+
+
 def write_session_guidance(payload: dict, *, home: Path | None = None) -> bool:
     home = home or Path.home()
-    session_id = payload.get("sessionId")
+    session_id = payload.get("sessionId") or os.environ.get("GROK_SESSION_ID")
     if (
         not isinstance(session_id, str)
         or not _SESSION_IDENTIFIER.fullmatch(session_id)
@@ -147,22 +196,15 @@ def write_session_guidance(payload: dict, *, home: Path | None = None) -> bool:
         if _is_link_or_reparse(target_dir):
             return False
 
-        target = target_dir / "session-guidance.instructions.md"
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            newline="\n",
-            dir=target_dir,
-            prefix=".session-guidance.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(content)
-        if os.name != "nt":
-            temporary.chmod(0o600)
-        os.replace(temporary, target)
-        return True
+        wrote = _write_guidance_file(target_dir, content)
+        workspace = payload.get("workspaceRoot") or payload.get("cwd") or os.environ.get(
+            "GROK_WORKSPACE_ROOT"
+        )
+        if os.environ.get("GROK_SESSION_ID") or os.environ.get("GROK_HOOK_EVENT"):
+            grok_dir = grok_session_dir(home, session_id, workspace if isinstance(workspace, str) else None)
+            if grok_dir is not None:
+                _write_guidance_file(grok_dir / "instructions" / "context-handoff", content)
+        return wrote
     except (OSError, RuntimeError, ValueError):
         if temporary is not None:
             try:

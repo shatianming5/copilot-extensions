@@ -1493,9 +1493,11 @@ export function makeHandoffMetadata(
   get = agentWorktreesGet,
 ) {
   const resolvedCwd = resolveHerdrCwd(cwd, runCli);
-  const { wtDir, worktree, stateDir } = isHerdrPane()
+  const info = isHerdrPane()
     ? { wtDir: resolvedCwd, worktree: null, stateDir: herdrStateDir(resolvedCwd) }
     : worktreeInfo(cwd, sid, get);
+  const { wtDir, worktree } = info;
+  const stateDir = info.stateDir || herdrStateDir(resolvedCwd);
   const id = `handoff-${safePathSegment(sid)}`;
   return {
     kind: "context-handoff",
@@ -1544,7 +1546,7 @@ export function decodeHandoffPayload(raw) {
 
 export function handoffDirFor(cwd, sid, get = agentWorktreesGet) {
   if (isHerdrPane()) return join(herdrStateDir(resolveHerdrCwd(cwd, runCli)), "handoff");
-  const stateDir = get("worktree-state-dir", cwd, sid);
+  const stateDir = get("worktree-state-dir", cwd, sid) || herdrStateDir(resolve(cwd));
   return stateDir ? join(stateDir, "handoff") : null;
 }
 

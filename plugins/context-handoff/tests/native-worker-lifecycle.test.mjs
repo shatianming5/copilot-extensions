@@ -10,7 +10,7 @@ import { retireHerdrPredecessor, advertiseWorkerLifecycle } from "../extensions/
 
 test("paired reload refreshes an already managed frontend registration", t => {
   const root = mkdtempSync(join(tmpdir(), "native-registration-"));
-  const keys = ["COPILOT_HOME", "HERDR_ENV", "HERDR_PANE_ID"];
+  const keys = ["COPILOT_HOME", "HERDR_ENV", "HERDR_PANE_ID", "GROK_SESSION_ID", "GROK_HOME", "GROK_PANE"];
   const before = Object.fromEntries(keys.map(key => [key, process.env[key]]));
   t.after(() => {
     for (const key of keys) {
@@ -19,6 +19,9 @@ test("paired reload refreshes an already managed frontend registration", t => {
     }
     rmSync(root, { recursive: true, force: true });
   });
+  delete process.env.GROK_SESSION_ID;
+  delete process.env.GROK_HOME;
+  delete process.env.GROK_PANE;
   Object.assign(process.env, { COPILOT_HOME: root, HERDR_ENV: "1", HERDR_PANE_ID: "owned-pane" });
   mkdirSync(join(root, "worker-lifecycle"));
   writeFileSync(join(root, "worker-lifecycle", "installation.json"), "{}");
@@ -124,9 +127,18 @@ test("managed native admission commits ownership after hydration/consumption and
 });
 
 test("native Herdr owner checks the lifecycle source identity and recovers a lost close receipt", () => {
-  const previous = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
+  const previous = {
+    HERDR_ENV: process.env.HERDR_ENV,
+    HERDR_PANE_ID: process.env.HERDR_PANE_ID,
+    GROK_SESSION_ID: process.env.GROK_SESSION_ID,
+    GROK_HOME: process.env.GROK_HOME,
+    GROK_PANE: process.env.GROK_PANE,
+  };
   process.env.HERDR_ENV = "1";
   process.env.HERDR_PANE_ID = "receiver-pane";
+  delete process.env.GROK_SESSION_ID;
+  delete process.env.GROK_HOME;
+  delete process.env.GROK_PANE;
   try {
     const record = {
       predecessor: { paneId: "source-pane", sessionId: "source", terminalId: "source-terminal" },

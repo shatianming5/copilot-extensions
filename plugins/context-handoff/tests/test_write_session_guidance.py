@@ -50,6 +50,29 @@ def test_writes_full_continuity_guidance(monkeypatch, tmp_path):
     )
 
 
+def test_grok_hook_also_writes_the_grok_session_folder(monkeypatch, tmp_path):
+    monkeypatch.setenv("GROK_SESSION_ID", "session-1")
+    monkeypatch.setenv("GROK_HOOK_EVENT", "session_start")
+    monkeypatch.setattr(writer, "_run_contributor", lambda *args: "grok-guidance")
+    assert writer.write_session_guidance(
+        {"sessionId": "session-1", "workspaceRoot": "/home/ubuntu/repos/RSI"},
+        home=tmp_path,
+    )
+    encoded = "%2Fhome%2Fubuntu%2Frepos%2FRSI"
+    grok_target = (
+        tmp_path
+        / ".grok"
+        / "sessions"
+        / encoded
+        / "session-1"
+        / "instructions"
+        / "context-handoff"
+        / "session-guidance.instructions.md"
+    )
+    assert "grok-guidance" in grok_target.read_text(encoding="utf-8")
+    assert _target(tmp_path).is_file()
+
+
 def test_no_content_replaces_stale_guidance(monkeypatch, tmp_path):
     monkeypatch.setattr(writer, "_run_contributor", lambda *args: "")
     target = _target(tmp_path)

@@ -7,8 +7,20 @@ export function isHerdrPane() {
   return process.env.HERDR_ENV === "1" && Boolean(process.env.HERDR_PANE_ID);
 }
 
+export function isGrokHost() {
+  if (process.env.GROK_PANE === "1") return true;
+  if (process.env.GROK_SESSION_ID) return true;
+  if (process.env.COPILOT_AGENT_SESSION_ID) return false;
+  return Boolean(process.env.GROK_HOME);
+}
+
+function paneLauncher() {
+  return join(homedir(), ".local", "bin", isGrokHost() ? "grok-pane" : "copilot-pane");
+}
+
 export function workerLifecycle(record, checkpoint, action, sessionId, execute) {
   const goal = record.nativeGoal;
+  if (isGrokHost()) return { managed: false };
   const home = goal.workerLifecycle?.config_home || goal.profile?.copilotHome
     || process.env.COPILOT_HOME || join(homedir(), ".copilot");
   const reference = join(home, "session-state", goal.sourceSessionId, "files", "worker-lifecycle.json");
@@ -21,7 +33,7 @@ export function workerLifecycle(record, checkpoint, action, sessionId, execute) 
 }
 
 export function advertiseWorkerLifecycle(sessionId, execute) {
-  if (!isHerdrPane()) return;
+  if (!isHerdrPane() || isGrokHost()) return;
   const home = process.env.COPILOT_HOME || join(homedir(), ".copilot");
   if (!existsSync(join(home, "worker-lifecycle", "installation.json"))) return;
   execute(join(homedir(), ".local", "bin", "copilot-pane"), [
@@ -30,9 +42,17 @@ export function advertiseWorkerLifecycle(sessionId, execute) {
   ], { timeout: 30000 });
 }
 
+function agentHome() {
+  if (process.env.GROK_HOME) return process.env.GROK_HOME;
+  if (process.env.GROK_SESSION_ID && !process.env.COPILOT_AGENT_SESSION_ID) {
+    return join(homedir(), ".grok");
+  }
+  return process.env.COPILOT_HOME || join(homedir(), ".copilot");
+}
+
 export function herdrStateDir(cwd) {
   const absolute = resolve(cwd);
-  return join(process.env.COPILOT_HOME || join(homedir(), ".copilot"), "context-handoff", "checkouts",
+  return join(agentHome(), "context-handoff", "checkouts",
     relative(parse(absolute).root, absolute) || "_root");
 }
 
@@ -51,8 +71,9 @@ function agentIdentity(paneId, execute) {
   const response = JSON.parse(execute(join(homedir(), ".local", "bin", "herdr"),
     ["agent", "get", paneId], { timeout: 5000 }));
   const agent = response?.result?.agent;
-  if (agent?.agent !== "copilot" || agent.pane_id !== paneId || !agent.terminal_id) {
-    throw new Error(`Herdr pane ${paneId} does not report a Copilot terminal identity.`);
+  const allowed = new Set(["copilot", "grok", "claude"]);
+  if (!allowed.has(agent?.agent) || agent.pane_id !== paneId || !agent.terminal_id) {
+    throw new Error(`Herdr pane ${paneId} does not report a Copilot, Grok, or Claude terminal identity.`);
   }
   return {
     paneId, sessionId: agent.agent_session?.value || null,
@@ -91,19 +112,25 @@ export function retireHerdrPredecessor(metadata, successorSessionId, execute, ch
     || (target.agentName && predecessor.agentName && target.agentName !== predecessor.agentName)) {
     throw new Error("Herdr predecessor identity changed; no pane was stopped.");
   }
-  execute(join(homedir(), ".local", "bin", "copilot-pane"),
+  execute(paneLauncher(),
     ["stop", "--pane", predecessor.paneId], { timeout: 30000 });
   return { host: "herdr", successorVerified: true, retired: true, pane: predecessor.paneId };
 }
 
 export function launchHerdrSuccessor(cwd, seed, execute, permissionMode, native = null) {
-  if (!["manual", "assisted", "allow-all"].includes(permissionMode)) {
+  const grok = isGrokHost();
+  const allowedModes = grok
+    ? ["manual", "assisted", "allow-all", "always-approve"]
+    : ["manual", "assisted", "allow-all"];
+  if (!allowedModes.includes(permissionMode)) {
     throw new Error("Current predecessor permission mode is required; no pane was created.");
   }
   const launchCwd = resolveHerdrCwd(cwd, execute);
   const stateDir = herdrStateDir(launchCwd);
   mkdirSync(stateDir, { recursive: true });
   const taskDir = mkdtempSync(join(stateDir, "launch-"));
+  const launcher = paneLauncher();
+  const launcherName = grok ? "grok-pane" : "copilot-pane";
   try {
     const taskFile = join(taskDir, "task.txt");
     writeFileSync(taskFile, seed, { mode: 0o600 });
@@ -112,18 +139,18 @@ export function launchHerdrSuccessor(cwd, seed, execute, permissionMode, native 
       "--host", "local", "--task-file", taskFile, "--permission-mode", permissionMode,
     ];
     if (native) args.push("--native-handoff", native.checkpoint, "--native-launcher", native.launcher);
-    const output = execute(join(homedir(), ".local", "bin", "copilot-pane"), args,
-      { cwd: launchCwd, timeout: 180000 });
+    const output = execute(launcher, args, { cwd: launchCwd, timeout: 180000 });
     const values = Object.fromEntries(String(output).trim().split(/\r?\n/).map(line => {
       const at = line.indexOf("=");
       return [line.slice(0, at), line.slice(at + 1)];
     }));
-    if (!values.pane_handle || !values.copilot_session_id) {
-      throw new Error("copilot-pane did not report its receiver; do not launch another pane.");
+    const newSession = values.grok_session_id || values.copilot_session_id;
+    if (!values.pane_handle || !newSession) {
+      throw new Error(`${launcherName} did not report its receiver; do not launch another pane.`);
     }
     return {
       ok: true, host: "herdr", new_pane: values.pane_handle,
-      new_session: values.copilot_session_id, startup_pending: values.startup_pending === "true",
+      new_session: newSession, startup_pending: values.startup_pending === "true",
       ...(values.native_startup_error ? { native_startup_error: values.native_startup_error } : {}),
     };
   } finally {
