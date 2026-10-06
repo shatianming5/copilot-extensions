@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-adapter.py\" PostToolUse",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/context-pressure.mjs\"",
             "timeout": 10
           }
         ]
