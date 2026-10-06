@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """stdio MCP server exposing Copilot-compatible context-handoff tools.
 
-Used by Claude Code (plugin .mcp.json) and Grok CLI (config.toml mcp_servers).
+Used by Claude Code (.claude-plugin/plugin.json mcpServers) and Grok CLI (config.toml mcp_servers).
 Wraps handoff-cli.mjs plus grok-handoff.sh continue --kind grok|claude.
 """
 from __future__ import annotations

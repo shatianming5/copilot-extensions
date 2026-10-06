@@ -7,11 +7,13 @@ export function isHerdrPane() {
   return process.env.HERDR_ENV === "1" && Boolean(process.env.HERDR_PANE_ID);
 }
 
+// The calling session's own identity wins: GROK_PANE and GROK_HOME leak into
+// every process a Grok pane or shell starts, including Copilot and Claude.
 export function isGrokHost() {
-  if (process.env.GROK_PANE === "1") return true;
-  if (process.env.GROK_SESSION_ID) return true;
   if (process.env.COPILOT_AGENT_SESSION_ID) return false;
-  return Boolean(process.env.GROK_HOME);
+  if (process.env.CLAUDECODE || process.env.CLAUDE_CODE_SESSION_ID) return false;
+  if (process.env.GROK_SESSION_ID) return true;
+  return process.env.GROK_PANE === "1";
 }
 
 function paneLauncher() {
@@ -43,10 +45,7 @@ export function advertiseWorkerLifecycle(sessionId, execute) {
 }
 
 function agentHome() {
-  if (process.env.GROK_HOME) return process.env.GROK_HOME;
-  if (process.env.GROK_SESSION_ID && !process.env.COPILOT_AGENT_SESSION_ID) {
-    return join(homedir(), ".grok");
-  }
+  if (isGrokHost()) return process.env.GROK_HOME || join(homedir(), ".grok");
   return process.env.COPILOT_HOME || join(homedir(), ".copilot");
 }
 

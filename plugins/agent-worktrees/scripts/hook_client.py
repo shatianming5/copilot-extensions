@@ -433,7 +433,7 @@ def _write_session_guidance(
             "GROK_WORKSPACE_ROOT"
         )
         if os.environ.get("GROK_SESSION_ID") or os.environ.get("GROK_HOOK_EVENT"):
-            sessions = home / ".grok" / "sessions"
+            sessions = Path(os.environ.get("GROK_HOME") or home / ".grok") / "sessions"
             grok_dir = None
             if isinstance(workspace, str) and workspace:
                 grok_dir = sessions / quote(workspace, safe="") / session_id
@@ -444,9 +444,12 @@ def _write_session_guidance(
                         grok_dir = candidate
                         break
             if grok_dir is not None:
-                mirror = grok_dir / "instructions" / "agent-worktrees"
-                mirror.mkdir(parents=True, exist_ok=True)
-                (mirror / "session-guidance.instructions.md").write_text(content, encoding="utf-8")
+                try:  # Grok's copy is best effort; the guidance file is written
+                    mirror = grok_dir / "instructions" / "agent-worktrees"
+                    mirror.mkdir(parents=True, exist_ok=True)
+                    (mirror / "session-guidance.instructions.md").write_text(content, encoding="utf-8")
+                except OSError:
+                    pass
         return True
     except (OSError, RuntimeError, ValueError):
         try:

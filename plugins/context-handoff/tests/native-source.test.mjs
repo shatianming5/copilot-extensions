@@ -47,7 +47,7 @@ function fixture({ status = 0, output = '{"ok":true,"new_pane":"%5"}',
     readSessionStateHandoff: () => ({ path: "owned-checkpoint", record }),
     writeJsonAtomic: (_path, value) => { record = structuredClone(value); },
     readNativeGoal: async () => ({ state: null }),
-    isHerdrPane: () => herdr,
+    isHerdrPane: () => herdr, isGrokHost: () => false,
     launchHerdrSuccessor: () => assert.fail("No Herdr launch expected"),
     workerLifecycle: lifecycle,
   });

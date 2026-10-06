@@ -402,6 +402,22 @@ const CONSUME_HANDOFF_START_GRACE_MS = 500;
 // stored, as pure best-effort: it can never block or delay the capture
 // itself, only report its own outcome via session.log once it settles.
 async function autoForceHandoff(sid, cwd) {
+  // A plain automatic handoff would drop a running native goal (and a stale
+  // native request would keep the monitor from picking it up): hand the force
+  // tier to the agent's continue_handoff path instead.
+  if ((await readNativeGoal(sid).catch(() => ({}))).state) {
+    session.log(
+      "[Context Handoff] Force tier reached with a native goal active; no plain " +
+      "handoff was auto-triggered. The goal must move through continue_handoff.",
+      { level: "warning" },
+    );
+    await session.send(
+      "[Context Handoff -- automated] The force threshold was reached while a native " +
+      "goal is active. Save the baton now with save_handoff_prompt and call " +
+      "continue_handoff with its HANDOFF_SEED; an automatic plain handoff would drop the goal.",
+    ).catch(() => {});
+    return;
+  }
   let markdown;
   try {
     const { data } = collectHandoffData(sid);
@@ -1047,7 +1063,8 @@ const session = await joinSession({
             worktree: stored.metadata.worktree, stored, promptText: text,
           };
         }
-        if (state.pendingHandoff?.nativeGoalCheckpoint) {
+        if (state.pendingHandoff?.nativeGoalCheckpoint
+            && state.pendingHandoff.stored?.metadata?.nativeGoalState !== "none") {
           return `Native goal migration requires continue_handoff, not a signal-only pickup. Use the already-saved seed:\nHANDOFF_SEED: ${state.pendingHandoff.seed}`;
         }
         const result = await triggerHandoff({
@@ -1165,9 +1182,9 @@ const session = await joinSession({
             "generate_handoff_prompt to collect session facts; (3) compose " +
             "continuation markdown per the context-handoff skill -- use its " +
             "compact effort-backed shape when a valid open active effort exists, " +
-            "otherwise the full standalone shape; (3) call save_handoff_prompt with " +
+            "otherwise the full standalone shape; (4) call save_handoff_prompt with " +
             "that markdown as `prompt_text` and a short specific `title`; " +
-            "(4) call continue_handoff with the exact returned HANDOFF_SEED. " +
+            "(5) call continue_handoff with the exact returned HANDOFF_SEED. " +
             "End this turn so native usage can settle before the successor launches. " +
             "Do NOT claim the baton auto-loads on restart; if no control system " +
             "picks it up, follow the manual instructions it printed.",

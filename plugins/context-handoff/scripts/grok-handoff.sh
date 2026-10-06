@@ -2,9 +2,10 @@
 # Grok wrapper around the native-goal context-handoff CLI (extension-free).
 set -euo pipefail
 
-ROOT="${CONTEXT_HANDOFF_ROOT:-${COPILOT_PLUGIN_ROOT:-${PLUGIN_ROOT:-${GROK_PLUGIN_ROOT:-}}}}"
+ROOT="${CONTEXT_HANDOFF_ROOT:-${CLAUDE_PLUGIN_ROOT:-${COPILOT_PLUGIN_ROOT:-${PLUGIN_ROOT:-${GROK_PLUGIN_ROOT:-}}}}}"
 if [[ -z "$ROOT" || ! -f "$ROOT/plugin.json" ]]; then
-  ROOT="$HOME/.grok/plugins/context-handoff"
+  # This script's own plugin copy, not whichever host installed one elsewhere.
+  ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fi
 CLI="$ROOT/extensions/context-handoff/handoff-cli.mjs"
 SID="${GROK_SESSION_ID:-${COPILOT_AGENT_SESSION_ID:-${CLAUDE_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-}}}}"

@@ -93,7 +93,7 @@ def _is_link_or_reparse(path: Path) -> bool:
 
 
 def grok_session_dir(home: Path, session_id: str, workspace: str | None) -> Path | None:
-    sessions = home / ".grok" / "sessions"
+    sessions = Path(os.environ.get("GROK_HOME") or home / ".grok") / "sessions"
     if workspace:
         encoded = quote(workspace, safe="")
         return sessions / encoded / session_id
@@ -203,7 +203,10 @@ def write_session_guidance(payload: dict, *, home: Path | None = None) -> bool:
         if os.environ.get("GROK_SESSION_ID") or os.environ.get("GROK_HOOK_EVENT"):
             grok_dir = grok_session_dir(home, session_id, workspace if isinstance(workspace, str) else None)
             if grok_dir is not None:
-                _write_guidance_file(grok_dir / "instructions" / "context-handoff", content)
+                try:  # Grok's copy is best effort; the guidance file is written
+                    _write_guidance_file(grok_dir / "instructions" / "context-handoff", content)
+                except OSError:
+                    pass
         return wrote
     except (OSError, RuntimeError, ValueError):
         if temporary is not None:

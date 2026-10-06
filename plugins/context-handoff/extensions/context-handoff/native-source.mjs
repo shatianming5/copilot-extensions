@@ -8,7 +8,7 @@ import {
 import { readNativeGoal } from "./native-transport.mjs";
 import { freezeNativeGoal } from "./native-goal.mjs";
 import { prepareObservationHandoff } from "./native-observation.mjs";
-import { isHerdrPane, resolveHerdrCwd, launchHerdrSuccessor, workerLifecycle } from "./herdr.mjs";
+import { isGrokHost, isHerdrPane, resolveHerdrCwd, launchHerdrSuccessor, workerLifecycle } from "./herdr.mjs";
 
 export const NATIVE_LAUNCHER = join(dirname(fileURLToPath(import.meta.url)), "native-launch.mjs");
 
@@ -121,8 +121,7 @@ export async function requestNativeCutover(session, seed, observers) {
     model: await session.rpc.model.getCurrent(),
     agentId: (await session.rpc.agent.getCurrent()).agent?.id || null,
     copilotHome: process.env.COPILOT_HOME || null,
-    grokHome: process.env.GROK_HOME
-      || (process.env.GROK_SESSION_ID ? `${process.env.HOME}/.grok` : null),
+    grokHome: isGrokHost() ? process.env.GROK_HOME || `${process.env.HOME}/.grok` : null,
   };
   const pause = await session.rpc.mode.set({ mode: "interactive" });
   if (pause.confirmation || pause.deferImplementation) {

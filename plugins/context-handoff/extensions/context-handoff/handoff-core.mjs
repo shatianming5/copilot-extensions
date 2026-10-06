@@ -2326,7 +2326,12 @@ export function readNativeHandoffCheckpoint(metadata, handoffId) {
 export function nativeHandoffConsumeError(metadata, sid, handoffId) {
   try {
     const checkpoint = readNativeHandoffCheckpoint(metadata, handoffId);
-    return checkpoint ? nativeConsumeError({ nativeGoal: checkpoint.record.nativeGoal }, sid) : null;
+    if (!checkpoint) return null;
+    // A baton without a native goal stays manually consumable (upstream's
+    // pickup in a fresh session) until a native launch was actually requested.
+    const goal = checkpoint.record.nativeGoal;
+    if (metadata.nativeGoalState === "none" && !goal.launchRequested) return null;
+    return nativeConsumeError({ nativeGoal: goal }, sid);
   } catch (error) {
     return `Cannot read native handoff checkpoint: ${error.message}`;
   }
