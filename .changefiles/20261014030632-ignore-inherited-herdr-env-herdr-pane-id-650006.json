@@ -1,0 +1,9 @@
+{
+  "comment": "Ignore inherited HERDR_ENV/HERDR_PANE_ID when the pane no longer exists",
+  "changes": [
+    {
+      "plugin": "context-handoff",
+      "type": "patch"
+    }
+  ]
+}

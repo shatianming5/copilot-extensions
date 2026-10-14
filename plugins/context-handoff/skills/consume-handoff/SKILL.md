@@ -14,8 +14,8 @@ H="$HOME/.grok/plugins/context-handoff/scripts/grok-handoff.sh"
 ```
 
 If the user passed `task:<id>`, `file:<id>`, or a seed Recovery locator, consume
-that. Otherwise `bash "$H" facts` and prefer this worktree's newest pending
-agent-dispatch task, else the newest unconsumed file. No global search.
+that. Otherwise `bash "$H" facts` and prefer this worktree's newest
+pending agent-dispatch task, else the newest unconsumed file. No global search.
 
 ```bash
 bash "$H" consume --locator "task:<id>"

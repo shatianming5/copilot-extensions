@@ -7,10 +7,11 @@ import vm from "node:vm";
 import { observationBrief } from "../extensions/context-handoff/native-observation.mjs";
 import { runNativeSuccessor } from "../extensions/context-handoff/native-launch.mjs";
 import { retireHerdrPredecessor, advertiseWorkerLifecycle } from "../extensions/context-handoff/herdr.mjs";
+import { installFakeHerdr } from "./fixtures/fake-herdr.mjs";
 
 test("paired reload refreshes an already managed frontend registration", t => {
   const root = mkdtempSync(join(tmpdir(), "native-registration-"));
-  const keys = ["COPILOT_HOME", "HERDR_ENV", "HERDR_PANE_ID", "GROK_SESSION_ID", "GROK_HOME", "GROK_PANE"];
+  const keys = ["HOME", "COPILOT_HOME", "HERDR_ENV", "HERDR_PANE_ID", "GROK_SESSION_ID", "GROK_HOME", "GROK_PANE"];
   const before = Object.fromEntries(keys.map(key => [key, process.env[key]]));
   t.after(() => {
     for (const key of keys) {
@@ -22,7 +23,8 @@ test("paired reload refreshes an already managed frontend registration", t => {
   delete process.env.GROK_SESSION_ID;
   delete process.env.GROK_HOME;
   delete process.env.GROK_PANE;
-  Object.assign(process.env, { COPILOT_HOME: root, HERDR_ENV: "1", HERDR_PANE_ID: "owned-pane" });
+  installFakeHerdr(root, "owned-pane");
+  Object.assign(process.env, { HOME: root, COPILOT_HOME: root, HERDR_ENV: "1", HERDR_PANE_ID: "owned-pane" });
   mkdirSync(join(root, "worker-lifecycle"));
   writeFileSync(join(root, "worker-lifecycle", "installation.json"), "{}");
   const files = join(root, "session-state", "owned-session", "files");
@@ -127,7 +129,10 @@ test("managed native admission commits ownership after hydration/consumption and
 });
 
 test("native Herdr owner checks the lifecycle source identity and recovers a lost close receipt", () => {
+  const home = mkdtempSync(join(tmpdir(), "native-herdr-home-"));
+  installFakeHerdr(home, "receiver-pane");
   const previous = {
+    HOME: process.env.HOME,
     HERDR_ENV: process.env.HERDR_ENV,
     HERDR_PANE_ID: process.env.HERDR_PANE_ID,
     GROK_SESSION_ID: process.env.GROK_SESSION_ID,
@@ -136,6 +141,7 @@ test("native Herdr owner checks the lifecycle source identity and recovers a los
   };
   process.env.HERDR_ENV = "1";
   process.env.HERDR_PANE_ID = "receiver-pane";
+  process.env.HOME = home;
   delete process.env.GROK_SESSION_ID;
   delete process.env.GROK_HOME;
   delete process.env.GROK_PANE;
@@ -163,7 +169,7 @@ test("native Herdr owner checks the lifecycle source identity and recovers a los
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
-    }
+    }    rmSync(home, { recursive: true, force: true });
   }
 });
 
