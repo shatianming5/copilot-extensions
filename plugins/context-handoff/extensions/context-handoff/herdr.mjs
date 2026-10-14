@@ -1,10 +1,28 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, parse, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+let paneProbe = null;
+
+// HERDR_ENV and HERDR_PANE_ID leak into processes started from a pane that
+// may since have closed (e.g. a Claude background session), so trust them only
+// while herdr still reports that pane. Probed once per herdr binary and pane.
 export function isHerdrPane() {
-  return process.env.HERDR_ENV === "1" && Boolean(process.env.HERDR_PANE_ID);
+  const paneId = process.env.HERDR_PANE_ID;
+  if (process.env.HERDR_ENV !== "1" || !paneId) return false;
+  const herdr = join(homedir(), ".local", "bin", "herdr");
+  const key = `${herdr}\0${paneId}`;
+  if (paneProbe?.key !== key) {
+    let live = false;
+    try {
+      live = Boolean(JSON.parse(execFileSync(herdr, ["pane", "get", paneId],
+        { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }))?.result?.pane);
+    } catch {}
+    paneProbe = { key, live };
+  }
+  return paneProbe.live;
 }
 
 // The calling session's own identity wins: GROK_PANE and GROK_HOME leak into
